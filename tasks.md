@@ -14,7 +14,7 @@ A task is considered complete only when it meets the following criteria:
 ---
 
 ## Phase 1: Workspace Setup & Infrastructure Configuration
-- [ ] **Task 1.1:** Initialize the Nx monorepo workspace structure with empty configurations.
+- [x] **Task 1.1:** Initialize the Nx monorepo workspace structure with empty configurations.
 - [ ] **Task 1.2:** Scaffold the Go backend application in `apps/identity-api` with base directory structure, dependencies (`go.mod`), and a basic health check server.
 - [ ] **Task 1.3:** Scaffold the Next.js frontend application in `apps/web` integrated with the Nx workspace, Tailwind CSS, and a shared UI library in `libs/ui` (shadcn/ui setup).
 - [ ] **Task 1.4:** Create the local backing services configuration (`docker-compose.dev.yml`) containing PostgreSQL, Redis, and NATS JetStream.
