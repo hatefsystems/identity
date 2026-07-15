@@ -4,8 +4,10 @@ This playbook provides configuration specifications, deployment practices, secre
 
 ---
 
-## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes & No ClickHouse)
-In the current MVP phase, the system is deployed using standard **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. Additionally, **ClickHouse is completely bypassed** in this phase to reduce RAM utilization by ~1.2 GB, using PostgreSQL fallback tables for logging instead.
+## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes, No ClickHouse & No Traefik)
+In the current MVP phase, the system is deployed using standard **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. Additionally, **ClickHouse is completely bypassed** in this phase to reduce RAM utilization by ~1.2 GB (using PostgreSQL fallback tables for logging instead).
+
+Furthermore, **Traefik is not provisioned in the MVP phase**. Instead, the platform leverages the **existing host-level Nginx** on the Ubuntu host to handle Reverse Proxying, TLS Termination, and path-based routing directly to the Docker containers. Traefik Ingress will be adopted post-MVP when migrating to a production Kubernetes cluster.
 
 The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monitoring configurations documented below are strictly for the post-MVP production deployment and **must not be provisioned in the current MVP phase**.
 
@@ -14,6 +16,88 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 ## 1. Kubernetes Deployment & Networking
 
 The platform leverages **Traefik** as the Ingress Controller and API Gateway at the cluster boundary, and **SPIRE** to orchestrate dynamic zero-trust workloads.
+
+### 1.0 MVP Phase: Host-Level Nginx Configuration (Reverse Proxy & TLS Termination)
+
+In the MVP phase, we use the host's existing **Nginx** web server running on Ubuntu. Nginx handles SSL/TLS termination, routes the traffic to the corresponding Docker containers (Next.js frontend on port `3000`, Go Backend on port `8080`), and handles base HTTP security headers.
+
+Below is the production-ready Nginx configuration file (`/etc/nginx/sites-available/identity.hatef.ir`) for the MVP:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name identity.hatef.ir;
+
+    # SSL Certificate Configuration (Certbot / Let's Encrypt)
+    ssl_certificate /etc/letsencrypt/live/identity.hatef.ir/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/identity.hatef.ir/privkey.pem;
+    
+    # Secure SSL Protocols and Ciphers
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # Secure HTTP Headers (XSS, Framing, Content-Type sniffing)
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # 1. Route for public UI, dashboard, admin panel, and OAuth authorize/error screens (Next.js)
+    location ~ ^/(login|register|forgot-password|reset-password|verify-email|dashboard|admin|_next|static) {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSockets support for Next.js Fast Refresh
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # OIDC UI Page Exceptions
+    location = /oauth2/authorize {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /oauth2/error {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 2. Route for Core IdP API operations, token exchange, and JWKS endpoints (Go Backend)
+    location ~ ^/(api|\.well-known|oauth2) {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Forward OAuth Authorization and DPoP headers verbatim
+        proxy_pass_header Authorization;
+        proxy_pass_header DPoP;
+    }
+
+    # 3. Default route (routes back to Next.js frontend app)
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
 
 ### 1.1 Traefik Ingress Configuration
 

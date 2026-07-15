@@ -17,7 +17,10 @@ While external clients interact with the IdP via standard HTTP/REST or OIDC endp
 - **Method-Level gRPC RBAC (SAN Verification):** To prevent lateral movement if an internal node or microservice (such as the Search Core) is compromised, the Go gRPC interceptors inspect the client's **SPIFFE ID** inside the certificate's **Subject Alternative Name (SAN)** (e.g., `spiffe://hatef.ir/ns/identity/sa/email-service`). It then strictly enforces method-level Role-Based Access Control (RBAC), ensuring that only authorized services can invoke specific RPC APIs (such as token validation or direct identity resolution).
 
 ### Network Flow & API Gateway (Ingress)
-To ensure optimal performance and security, an API Gateway / Ingress Controller (**Traefik**) is deployed at the network edge. Traefik is chosen for its native Go synergy, lightweight memory footprint, and automated SSL provisioning.
+To ensure optimal performance and security, an API Gateway / Ingress Controller (**Traefik**) is designed for the network edge. Traefik is chosen for its native Go synergy, lightweight memory footprint, and automated SSL provisioning.
+
+*(Note: In the current **MVP Phase**, Traefik is not deployed. Instead, an existing **host-level Nginx** on the Ubuntu host performs the Reverse Proxying, TLS Termination, and path-based routing directly to the Docker containers to minimize memory and system overhead. Traefik will be adopted post-MVP).*
+
 - **Path-Based Routing:** 
   - Requests for UI, static assets, and Server-Side Rendered (SSR) pages (e.g., `/login`, `/dashboard`, `/_next/*`) are routed directly to the **Next.js** containers.
   - Requests for authentication, API endpoints, and identity management (e.g., `/api/v1/*`, `/.well-known/*`, `/oauth2/*`) are routed directly to the **Go IdP** containers.
@@ -101,9 +104,11 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 
 ### Privacy & GDPR Compliance
 - **PII Masking:** Personally Identifiable Information is masked at the application layer before logging or analytics processing.
-- **Soft Deletes:** User data deletion requests trigger soft deletes initially, ensuring data recovery windows while complying with "Right to Be Forgotten" mandates through scheduled hard sweeps.
-- **Data Minimization:** Only essential data required for service operation is collected.
-- **Hard Delete Cron Jobs:** While initial deletions are "soft", a Go worker (Cron Job) is scheduled to permanently purge soft-deleted records from PostgreSQL once the legal retention window (e.g., 30 days) expires, satisfying GDPR requirements.
+- **Grace Period & Soft Deletes (Right to be Forgotten):** User data deletion requests do not trigger immediate physical deletion. Instead, they initiate a **30-day Grace Period (Deactivation window)**, which aligns with industry best practices and global compliance standards (GDPR Article 17, CCPA/CPRA).
+  - **The 30-Day Recovery Window:** Upon initiating deletion, the user's account status is set to `pending_deletion`, and all active sessions/refresh tokens are instantly revoked across the ecosystem. The account is suspended from all user-facing services.
+  - **Account Reclamation (Cancellation of Deletion):** If the deletion was accidental, impulsive, or triggered during an Account Takeover (ATO) by an attacker, the legitimate user has 30 days to reclaim their account. To cancel deletion, the user must perform a secure login (including WebAuthn/MFA) and explicit step-up authentication. An automated alert is also sent to their primary and backup emails at the start of the deletion queue.
+  - **Data Minimization:** Only essential data required for service operation is collected.
+- **Hard Delete Cron Jobs:** Once the 30-day legal retention and grace window expires, a Go worker (Cron Job) is scheduled to permanently purge soft-deleted records (`pending_deletion` users where `deleted_at < NOW() - INTERVAL '30 days'`) from PostgreSQL. This completely and physically wipes the user's records across all tables (ACID transactions), fully satisfying GDPR "Right to be Forgotten" mandates.
 - **Append-Only Log Management (ClickHouse / PostgreSQL MVP Fallback):** System logs and audit trails are designed to be stored in a high-performance, append-only column-oriented database (**ClickHouse**), rather than the transactional database, preventing database write bottlenecks. However, **during the MVP phase, ClickHouse is completely bypassed to reduce server memory overhead by ~1.2 GB**. Instead, logs are written to PostgreSQL using a dedicated `mvp_audit_logs` table, while strictly maintaining the same cryptographic chaining and append-only access controls (administrative database roles do not possess `UPDATE` or `DELETE` permissions on the audit logs table, guaranteeing that audit trails are permanent and tamper-proof).
 
 ## 3. Observability & Secret Management

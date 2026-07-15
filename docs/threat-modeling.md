@@ -79,6 +79,9 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 * **Threat T2: Audit Log Alteration (Repudiation & Cover-up)**
   * *Description:* A malicious administrator or attacker gains access to logs and tries to delete trace events to cover their tracks.
   * *Mitigation:* Logs are stored in ClickHouse which is configured to be strictly Append-Only (administrative DB roles lack `ALTER...DELETE` privileges). Every audit log row's cryptographic hash is chained to the preceding row's hash. Any tampering breaks the chain and triggers immediate system alerts.
+* **Threat T3: Malicious Account Deletion (Account Takeover / ATO)**
+  * *Description:* An attacker gains access to a user's active session or credentials and initiates immediate account deletion to destroy their data or lock them out permanently.
+  * *Mitigation:* Deleting an account requires high-risk Step-Up authentication (WebAuthn User Verification). Furthermore, deletion requests are queued under a **30-day Grace Period (`pending_deletion` status)**. Legitimate users are notified immediately via primary and backup emails, and can log in with multi-factor authentication within 30 days to cancel the request and recover their account, neutralizing the threat of irreversible malicious deletion.
 
 ### 2.3 Repudiation (Denying Actions)
 

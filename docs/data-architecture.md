@@ -19,7 +19,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- 1. Users Table (Core Identity)
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email VARCHAR(255) UNIQUE NOT NULL,
+    email VARCHAR(255) NOT NULL, -- Global UNIQUE constraint removed to allow reuse after Soft Delete/Deactivation
     password_hash VARCHAR(255) NULL, -- NULL for passwordless WebAuthn-only accounts
     backup_email_encrypted BYTEA NULL, -- Wrapped PII (AES-GCM-256)
     backup_email_blind_index VARCHAR(64) NULL, -- Cryptographic blind index: SHA-256(Email + Pepper)
@@ -27,13 +27,14 @@ CREATE TABLE users (
     phone_blind_index VARCHAR(64) NULL, -- Cryptographic blind index: SHA-256(Phone + Pepper)
     mfa_totp_secret_encrypted BYTEA NULL, -- Wrapped PII (AES-GCM-256)
     is_mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'pending_verification')),
+    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'pending_verification', 'pending_deletion')),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP WITH TIME ZONE NULL -- Support soft deletion for Right to be Forgotten retention windows
+    deleted_at TIMESTAMP WITH TIME ZONE NULL -- Support soft deletion for Right to be Forgotten retention windows (30-day Grace Period)
 );
 
-CREATE INDEX idx_users_email ON users(email) WHERE deleted_at IS NULL;
+-- Partial Unique Index to enforce email uniqueness only for active accounts, permitting reuse after soft-deletion
+CREATE UNIQUE INDEX idx_users_email ON users(email) WHERE deleted_at IS NULL;
 CREATE INDEX idx_users_status ON users(status);
 CREATE UNIQUE INDEX idx_users_phone_blind ON users(phone_blind_index) WHERE deleted_at IS NULL AND phone_blind_index IS NOT NULL;
 CREATE UNIQUE INDEX idx_users_backup_email_blind ON users(backup_email_blind_index) WHERE deleted_at IS NULL AND backup_email_blind_index IS NOT NULL;
