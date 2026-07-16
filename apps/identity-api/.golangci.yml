@@ -1,0 +1,33 @@
+# golangci-lint configuration for identity-api (v2 schema).
+# Satisfies Definition of Done #4: lint/type-checks must pass clean.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+    - gosec
+  exclusions:
+    rules:
+      # Allow the intentional error-drop when writing JSON to a broken connection.
+      - path: internal/server/health.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/hatefsystems/identity

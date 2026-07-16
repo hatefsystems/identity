@@ -1,0 +1,13 @@
+# Compiled binaries
+/bin/
+*.exe
+*.out
+
+# Go test / coverage artifacts
+*.test
+coverage.out
+coverage.html
+
+# Local environment overrides (never commit secrets)
+.env
+.env.local
