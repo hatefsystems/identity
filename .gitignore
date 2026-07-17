@@ -12,3 +12,9 @@ node_modules
 dist
 .env
 .nx
+.next
+
+# Next.js
+.next
+out
+test-output
