@@ -1,0 +1,114 @@
+# Local backing services for the Hatef Identity Platform (MVP single-node dev).
+#
+# Provides the three stateful dependencies the Go IdP relies on:
+#   - PostgreSQL : primary transactional store (users, RBAC, recovery codes,
+#                  mvp_audit_logs) with ACID guarantees.
+#   - Redis      : sessions, DPoP jti replay cache, and OTP rate-limit sliding
+#                  windows (persisted via AOF so windows survive restarts).
+#   - NATS       : async event broadcasting (identity.user.*) and the durable
+#                  audit-log queue (identity.audit.logs) via JetStream.
+#
+# No secrets are hardcoded (see DoD #3). Values are read from a root `.env`
+# file (gitignored) with safe non-secret dev defaults for out-of-the-box local
+# runs. Copy `.env.example` to `.env` to override. Ports bind to loopback only
+# so the backing services are never exposed on the host's public interface.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml down            # keep data
+#   docker compose -f docker-compose.dev.yml down -v         # wipe volumes
+
+name: hatef-idp-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hatef-idp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-identity}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-identity_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-identity}
+      # Fail fast on auth misconfig instead of silently trusting local conns.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-identity} -d ${POSTGRES_DB:-identity}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - hatef-idp-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: hatef-idp-redis
+    restart: unless-stopped
+    # --appendonly yes : durable AOF so OTP sliding-window ZSETs and session
+    #                    state survive container restarts (data-architecture §3).
+    # --requirepass    : optional auth; enabled only when REDIS_PASSWORD is set.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - "${REDIS_PASSWORD:-}"
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # Uses REDISCLI_AUTH (picked up by redis-cli) so the check works whether
+      # or not a password is configured, without leaking it into the command.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"${REDIS_PASSWORD:-}\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - hatef-idp-net
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: hatef-idp-nats
+    restart: unless-stopped
+    # -js  : enable JetStream (persistence for events + audit queue).
+    # -sd  : JetStream store directory (backed by a named volume).
+    # -m   : HTTP monitoring endpoint (used for the healthcheck /healthz probe).
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+    ports:
+      - "127.0.0.1:${NATS_PORT:-4222}:4222" # client connections
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222" # monitoring / healthz
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - hatef-idp-net
+
+volumes:
+  pg_data:
+    name: hatef-idp-pg-data
+  redis_data:
+    name: hatef-idp-redis-data
+  nats_data:
+    name: hatef-idp-nats-data
+
+networks:
+  hatef-idp-net:
+    name: hatef-idp-net
+    driver: bridge
