@@ -80,7 +80,11 @@ Ensure the following prerequisites are installed locally:
 * **Go (latest stable release)**
 * **Node.js (LTS version)**
 * **Nx CLI** (global or local runner)
-* **buf** (for Protobuf compilation)
+
+> Note: `buf` (Protobuf) and `sqlc` (SQL codegen) are **not** installed
+> globally. They are pinned as Go `tool` dependencies (in `libs/schemas/go.mod`
+> and `apps/identity-api/go.mod` respectively) and invoked via `go tool`, so the
+> Go toolchain is the only requirement.
 
 ### Getting Started
 
@@ -103,10 +107,12 @@ Ensure the following prerequisites are installed locally:
 4. **Compile schemas and generate database code:**
    ```bash
    # Generate TypeScript and Go contracts from Proto definitions
-   buf generate
-   
+   # (buf, pinned as a go tool in libs/schemas)
+   nx generate schemas
+
    # Generate type-safe SQL queries from raw SQL definitions
-   sqlc generate
+   # (sqlc, pinned as a go tool in apps/identity-api)
+   nx run identity-api:sqlc-generate
    ```
 
 5. **Start frontend and backend development servers simultaneously:**

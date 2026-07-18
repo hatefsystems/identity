@@ -1,0 +1,38 @@
+# buf code generation template (v2).
+#
+# Generates the four artifacts the platform consumes from a single source of
+# truth (architecture.md §4):
+#   - Go structs        (gen/go, protoc-gen-go)       -> consumed by identity-api
+#   - Go gRPC stubs     (gen/go, protoc-gen-go-grpc)  -> consumed by identity-api
+#   - TypeScript types  (gen/ts, protobuf-es)         -> consumed by apps/web
+#
+# Go plugins are resolved locally via the pinned `go tool` binaries (see go.mod
+# tool directives) so no global installs or network access are required. The
+# TypeScript plugin is a remote BSR plugin. Run generation with:
+#   buf generate            (or: nx generate schemas)
+version: v2
+managed:
+  enabled: true
+  override:
+    # Emit Go packages under the schemas module's gen/go tree so imports resolve
+    # to github.com/hatefsystems/identity/libs/schemas/gen/go/...
+    - file_option: go_package_prefix
+      value: github.com/hatefsystems/identity/libs/schemas/gen/go
+plugins:
+  # --- Go structs -----------------------------------------------------------
+  # Invoked via `go tool` so the plugin binary is resolved from the pinned
+  # tool directive in go.mod rather than requiring a global install / PATH entry.
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: gen/go
+    opt:
+      - paths=source_relative
+  # --- Go gRPC service stubs ------------------------------------------------
+  - local: ["go", "tool", "protoc-gen-go-grpc"]
+    out: gen/go
+    opt:
+      - paths=source_relative
+  # --- TypeScript types (consumed by the Next.js frontend) ------------------
+  - remote: buf.build/bufbuild/es
+    out: gen/ts
+    opt:
+      - target=ts

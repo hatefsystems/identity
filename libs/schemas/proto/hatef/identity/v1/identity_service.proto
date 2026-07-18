@@ -1,0 +1,61 @@
+// Internal gRPC contract for the Hatef Identity Platform.
+//
+// IdentityService is consumed by other Hatef microservices (e.g. the Email
+// Service and Search Core) strictly over mTLS with SPIFFE/SPIRE identities
+// (see architecture.md "Inter-Service Communication" and client-integration.md
+// §3.3). Every RPC is method-level RBAC gated on the caller's SPIFFE ID.
+//
+// This is a seed contract for Task 1.5 (tooling wiring). The full method set
+// and validation semantics are implemented in Phase 6 (Tasks 6.1–6.3).
+syntax = "proto3";
+
+package hatef.identity.v1;
+
+import "hatef/identity/v1/common.proto";
+
+// IdentityService exposes low-latency identity and authorization primitives to
+// trusted internal services. See api-design.md §2.2.
+service IdentityService {
+  // ValidateToken parses a JWT, checks Redis revocation, and returns claims.
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+  // CheckPermission evaluates whether a user holds a specific permission (RBAC).
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+  // GetInternalUserInfo fetches basic profile data needed by other services.
+  rpc GetInternalUserInfo(GetInternalUserInfoRequest) returns (GetInternalUserInfoResponse);
+}
+
+message ValidateTokenRequest {
+  string access_token = 1;
+  // Required when the presented token is DPoP-bound (RFC 9449).
+  string dpop_proof = 2;
+}
+
+message ValidateTokenResponse {
+  bool active = 1;
+  string user_id = 2;
+  repeated string scopes = 3;
+  string client_id = 4;
+  int64 expires_at = 5;
+}
+
+message CheckPermissionRequest {
+  string user_id = 1;
+  string permission = 2;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+}
+
+message GetInternalUserInfoRequest {
+  string user_id = 1;
+}
+
+message GetInternalUserInfoResponse {
+  string user_id = 1;
+  string email = 2;
+  string display_name = 3;
+  UserStatus status = 4;
+}

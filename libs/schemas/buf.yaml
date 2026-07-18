@@ -1,0 +1,19 @@
+# buf module configuration (v2) for the Hatef Identity Platform schemas.
+#
+# Protocol Buffers are the single source of truth for the platform's API
+# contracts (architecture.md §4 "Type Safety"): gRPC service stubs, REST/OIDC
+# gateway bindings, Go structs, and TypeScript types are all generated from the
+# .proto files under ./proto. See buf.gen.yaml for the codegen plugin wiring.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  # Enforce the versioned package/directory layout: proto files must live under
+  # a path matching their package (e.g. hatef/identity/v1/...).
+  except:
+    - PACKAGE_NO_IMPORT_CYCLE
+breaking:
+  use:
+    - FILE

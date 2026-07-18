@@ -18,7 +18,7 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 1.2:** Scaffold the Go backend application in `apps/identity-api` with base directory structure, dependencies (`go.mod`), and a basic health check server.
 - [x] **Task 1.3:** Scaffold the Next.js frontend application in `apps/web` integrated with the Nx workspace, Tailwind CSS, and a shared UI library in `libs/ui` (shadcn/ui setup).
 - [x] **Task 1.4:** Create the local backing services configuration (`docker-compose.dev.yml`) containing PostgreSQL, Redis, and NATS JetStream.
-- [ ] **Task 1.5:** Configure Protocol Buffers building (`buf`) in `libs/schemas` and compile-time database access code generation (`sqlc`) in `apps/identity-api`.
+- [x] **Task 1.5:** Configure Protocol Buffers building (`buf`) in `libs/schemas` and compile-time database access code generation (`sqlc`) in `apps/identity-api`.
 
 ## Phase 2: Database Schemas & Cryptography Engine
 - [ ] **Task 2.1:** Implement initial database migrations in `apps/identity-api/db/migrations` covering tables: `users`, `roles`, `permissions`, `role_permissions`, `user_roles`, `webauthn_credentials`, `recovery_codes`, and `mvp_audit_logs`.

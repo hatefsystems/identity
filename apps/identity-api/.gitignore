@@ -11,3 +11,7 @@ coverage.html
 # Local environment overrides (never commit secrets)
 .env
 .env.local
+
+# sqlc-generated code is a build artifact regenerated from db/migrations and
+# db/queries via `go tool sqlc generate` (nx sqlc-generate identity-api).
+/internal/db/

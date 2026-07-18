@@ -1,0 +1,41 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "schemas",
+  "projectType": "library",
+  "sourceRoot": "libs/schemas/proto",
+  "tags": ["lang:proto", "scope:shared"],
+  "targets": {
+    "generate": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "libs/schemas",
+        "command": "go tool buf generate"
+      },
+      "inputs": ["{projectRoot}/proto/**/*", "{projectRoot}/buf.gen.yaml", "{projectRoot}/buf.yaml"],
+      "outputs": ["{projectRoot}/gen"],
+      "cache": true
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "libs/schemas",
+        "command": "go tool buf lint"
+      },
+      "cache": true
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "libs/schemas",
+        "command": "go tool buf format -w"
+      }
+    },
+    "breaking": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "libs/schemas",
+        "command": "go tool buf breaking --against .git#branch=main,subdir=libs/schemas"
+      }
+    }
+  }
+}

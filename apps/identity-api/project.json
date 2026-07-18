@@ -11,7 +11,29 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/identity-api ./cmd/server"
       },
+      "dependsOn": ["sqlc-generate"],
       "cache": true
+    },
+    "sqlc-generate": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go tool sqlc generate"
+      },
+      "inputs": [
+        "{projectRoot}/sqlc.yaml",
+        "{projectRoot}/db/migrations/**/*.sql",
+        "{projectRoot}/db/queries/**/*.sql"
+      ],
+      "outputs": ["{projectRoot}/internal/db"],
+      "cache": true
+    },
+    "sqlc-vet": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go tool sqlc vet"
+      }
     },
     "serve": {
       "executor": "nx:run-commands",

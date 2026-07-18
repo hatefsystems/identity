@@ -1,0 +1,5 @@
+# Generated code is a build artifact regenerated from the .proto sources via
+# `buf generate` (nx generate schemas). It is intentionally not committed to
+# keep reviews focused on the source contracts and avoid drift. Consumers run
+# generation as a build step.
+/gen/

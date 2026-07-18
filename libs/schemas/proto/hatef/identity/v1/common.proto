@@ -1,0 +1,19 @@
+// Common shared messages for the Hatef Identity Platform gRPC contracts.
+//
+// This package (hatef.identity.v1) is the single source of truth for the
+// platform's internal API contracts. Concrete service bodies are filled in
+// during Phase 6 (gRPC Microservices); this file seeds the shared types the
+// services reference.
+syntax = "proto3";
+
+package hatef.identity.v1;
+
+// User account lifecycle status, mirroring the PostgreSQL `users.status` CHECK
+// constraint defined in data-architecture.md §1.1.
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_SUSPENDED = 2;
+  USER_STATUS_PENDING_VERIFICATION = 3;
+  USER_STATUS_PENDING_DELETION = 4;
+}

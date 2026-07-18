@@ -1,0 +1,9 @@
+{
+  "name": "@hatef/schemas",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Protocol Buffers contracts (single source of truth) for the Hatef Identity Platform: gRPC stubs, Go structs, and TypeScript types generated via buf.",
+  "nx": {
+    "name": "schemas"
+  }
+}
