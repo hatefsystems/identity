@@ -8,12 +8,16 @@ this scaffolding stage (Task 1.2) it exposes health and readiness probes only.
 
 ```
 apps/identity-api/
-├── cmd/server/          # main entry point (HTTP server + graceful shutdown)
+├── cmd/
+│   ├── server/          # main entry point (HTTP server + graceful shutdown)
+│   └── migrate/         # goose migration runner CLI (up/down/reset/status)
 ├── internal/
 │   ├── config/          # env-based configuration (no hardcoded secrets)
+│   ├── migrate/         # goose wrapper over the embedded migrations
 │   └── server/          # router, middleware, health handlers
 └── db/
-    ├── migrations/      # SQL schema/migrations (Task 2.1) — sqlc reads schema here
+    ├── embed.go         # go:embed of migrations for the runner + tests
+    ├── migrations/      # goose SQL migrations — sqlc reads schema here
     └── queries/         # sqlc query definitions (Task 2.2)
 ```
 
@@ -37,10 +41,36 @@ pnpm nx run identity-api:sqlc-vet        # go tool sqlc vet (static query checks
 `nx build identity-api` depends on `sqlc-generate`, so a fresh checkout
 regenerates the DB layer before compiling.
 
-> Note: the current `db/migrations/0000_placeholder.sql` and
-> `db/queries/0000_placeholder.sql` are minimal placeholders that only exist to
-> keep the pipeline green. They are replaced by the real schema in Task 2.1 and
-> real queries in Task 2.2.
+## Database migrations (goose)
+
+Schema changes are versioned SQL files in `db/migrations`, managed by
+[`goose`](https://github.com/pressly/goose) and embedded into the migration
+runner binary (`cmd/migrate`) via `go:embed`. sqlc parses the same files as its
+schema source, so the generated Go code and the applied schema never drift.
+
+The initial migration (`00001_initial_schema.sql`, Task 2.1) creates the eight
+core tables from `docs/data-architecture.md` §1.1 — `users`, `roles`,
+`permissions`, `role_permissions`, `user_roles`, `webauthn_credentials`,
+`recovery_codes`, `mvp_audit_logs` — including the partial unique indexes
+(soft-delete-aware email/blind-index/recovery-code uniqueness) and the
+append-only triggers + `REVOKE` hardening on `mvp_audit_logs` (only the GDPR
+purge's FK `ON DELETE SET NULL` mutation is permitted).
+
+`DATABASE_URL` must be set in the environment (see `.env.example`); it is never
+hardcoded. With the dev stack running (`docker compose -f
+docker-compose.dev.yml up -d`):
+
+```bash
+pnpm nx run identity-api:migrate-up       # apply pending migrations
+pnpm nx run identity-api:migrate-down     # roll back the latest migration
+pnpm nx run identity-api:migrate-status   # show per-migration applied state
+```
+
+Or directly: `go run ./cmd/migrate <up|down|reset|status>`.
+
+The integration tests in `internal/migrate` apply the full up/down cycle and
+verify schema invariants against the real database; they skip automatically
+when `DATABASE_URL` is unset or unreachable so `go test ./...` works offline.
 
 ## Endpoints
 

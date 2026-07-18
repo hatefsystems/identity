@@ -35,6 +35,27 @@
         "command": "go tool sqlc vet"
       }
     },
+    "migrate-up": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/migrate up"
+      }
+    },
+    "migrate-down": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/migrate down"
+      }
+    },
+    "migrate-status": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/migrate status"
+      }
+    },
     "serve": {
       "executor": "nx:run-commands",
       "options": {
