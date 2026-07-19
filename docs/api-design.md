@@ -81,6 +81,14 @@ Protected by strict RBAC. Accessed only by authorized Admin/Moderator roles.
 - `POST /api/v1/admin/roles/assign`: Assign a role (e.g., Moderator, DPO) to a user (Super Admin only).
 - `GET /api/v1/admin/audit-logs`: Query system audit logs. **(MVP Fallback: During the MVP phase, queries are executed against the `mvp_audit_logs` table in PostgreSQL. Post-MVP, this is migrated to ClickHouse without API changes).** Requires mandatory query parameters `start_time` and `end_time` (Unix timestamp or RFC 3339) to restrict query limits and prevent Denial of Service (DoS) overhead. Returns a JSON list of immutable audit events, including the cryptographic chaining hash (`sha256_chain_hash`) of each row to allow client-side validation of the integrity and ordering of the logs.
 
+#### Legal Hold & Preservation (DPO / Legal role only)
+Endpoints supporting lawful-request handling. A Legal Hold is a **precedence lock** over all retention timers (holds > retention): while active, it prevents both the 30-day hard-delete Cron and the `security_event_ledger` purge from removing the subject's data. See `compliance-and-data-governance.md` and the `legal_holds` / `security_event_ledger` schemas in `data-architecture.md`.
+- `POST /api/v1/admin/legal-holds`: Apply a Legal Hold on a subject (`account_ref`). Body requires `reason`, `requesting_authority` (court/agency/case reference), and `legal_basis`. Every application is audit-logged. A hold has no time cap and stays until explicitly released.
+- `GET /api/v1/admin/legal-holds`: List active/historical holds (with pagination and filtering by `account_ref` or status).
+- `DELETE /api/v1/admin/legal-holds/{hold_id}`: Release a Legal Hold. Sets `is_active = false` and records `released_by`/`released_at`. Released data returns to normal retention timers and is purged on the next cycle if already past its window.
+- `POST /api/v1/admin/preservation-requests`: Record a preservation ("freeze-before-order") request and immediately apply a Legal Hold on the target `account_ref`, freezing the subject's data before a full order arrives. Body requires `requesting_authority`, `reason`, and optional `expires_at` (advisory review date). *Note: preservation cannot resurrect data already hard-deleted; it only prevents future purge of data still present.*
+- `GET /api/v1/admin/legal-inquiry/lookup`: Attribution lookup. Given an identity value provided by an authority, the server computes the blind index and returns matching `security_event_ledger` rows (non-PII metadata) within the retention window. Read-only; the lookup itself is audit-logged.
+
 ---
 
 ## 2. Internal APIs (gRPC)

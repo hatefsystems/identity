@@ -113,7 +113,63 @@ CREATE TABLE mvp_audit_logs (
 
 CREATE INDEX idx_mvp_audit_logs_event_type ON mvp_audit_logs(event_type);
 CREATE INDEX idx_mvp_audit_logs_timestamp ON mvp_audit_logs(timestamp DESC);
+
+-- 5. Security Event Ledger (Class B - Minimal, Persistent, Survives Account Deletion)
+-- Purpose: retain the minimum non-PII metadata needed to attribute an abusive or
+-- security-relevant action AFTER an account is hard-deleted (e.g., a court inquiry
+-- arriving at day 60 about an action taken before a day-30 deletion).
+-- CRITICAL: rows here are decoupled from users(id). There is NO foreign key that would
+-- cascade or null on account deletion; the stable account_ref persists independently.
+CREATE TABLE security_event_ledger (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    account_ref UUID NOT NULL,               -- Stable identity reference; survives hard-delete (NO FK to users)
+    identity_blind_index VARCHAR(64) NULL,   -- SHA-256(email/phone + pepper); enables attribution without raw PII
+    event_type VARCHAR(100) NOT NULL,        -- e.g., 'auth.login', 'token.issued', 'security.rtr_breach'
+    client_ip VARCHAR(50) NULL,
+    ip_subnet VARCHAR(50) NULL,              -- /24 (IPv4) or /48 (IPv6) grouping
+    user_agent TEXT NULL,
+    device_fingerprint VARCHAR(128) NULL,
+    client_id VARCHAR(100) NULL,             -- OAuth client that received an authorization, if any
+    scope TEXT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    retain_until TIMESTAMP WITH TIME ZONE NOT NULL, -- Independent retention (e.g., NOW() + 6..18 months)
+    chain_hash VARCHAR(64) NOT NULL          -- Same cryptographic chaining as audit logs
+);
+
+-- Attribution lookups by identity (court supplies an identifier -> we compute the blind index)
+CREATE INDEX idx_security_ledger_blind_index ON security_event_ledger(identity_blind_index);
+CREATE INDEX idx_security_ledger_account_ref ON security_event_ledger(account_ref);
+CREATE INDEX idx_security_ledger_retain_until ON security_event_ledger(retain_until);
+CREATE INDEX idx_security_ledger_event_type ON security_event_ledger(event_type);
+
+-- 6. Legal Holds (Precedence Lock over ALL retention timers)
+-- An active hold overrides the 30-day grace window AND the security-ledger retention.
+-- Holds > retention. A hold has no predefined duration; it stays until explicitly released.
+CREATE TABLE legal_holds (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    account_ref UUID NOT NULL,               -- Subject reference (matches security_event_ledger.account_ref)
+    reason TEXT NOT NULL,                    -- Why the hold exists
+    requesting_authority VARCHAR(255) NOT NULL, -- Court / agency / case reference
+    legal_basis VARCHAR(255) NOT NULL,       -- e.g., 'legal obligation', 'legal claims / investigation'
+    applied_by UUID NOT NULL,                -- Actor (e.g., DPO / Legal) who created the hold
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    review_at TIMESTAMP WITH TIME ZONE NULL, -- Optional expected review date (advisory only)
+    released_at TIMESTAMP WITH TIME ZONE NULL,
+    released_by UUID NULL
+);
+
+-- The hard-delete Cron and the ledger purge job MUST consult this index before purging.
+CREATE INDEX idx_legal_holds_active ON legal_holds(account_ref) WHERE is_active = TRUE;
 ```
+
+### 1.1.1 Persistence & Deletion Rules for Ledger and Holds
+
+- **`security_event_ledger` is intentionally NOT linked to `users(id)`.** Unlike `mvp_audit_logs` (whose `user_id` is `ON DELETE SET NULL` and whose `payload` is PII-masked), the ledger keeps a stable `account_ref` and an `identity_blind_index` so an action remains attributable after the account row is physically deleted - within the bounded `retain_until` window.
+- **Purge of the ledger** is driven solely by `retain_until` (scheduled job), never by account deletion.
+- **Legal Hold precedence:** Before any purge - the 30-day hard-delete Cron on `users`, or the ledger purge job - the worker MUST check `legal_holds` for an active row matching the `account_ref`. If one exists, the purge is skipped and the skip is recorded in the audit log.
+- **No raw PII in the ledger.** Only the blind index is stored; raw email/phone stay in Class A and are erased on hard-delete.
+
 
 ### 1.2 `sqlc` & `pgx` Configurations
 

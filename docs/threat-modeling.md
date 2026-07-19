@@ -88,6 +88,9 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 * **Threat R1: Admin Denies Performing Unauthorized Account Ban or Deletion**
   * *Description:* An admin performs a sensitive action (e.g., banning a user, changing roles) and claims they did not initiate it.
   * *Mitigation:* ClickHouse immutable append-only logs record every single state change initiated by an administrator. Every row contains the admin's verified user ID, SPIFFE SVID details, IP address, and a cryptographic signature. This immutable log is checked during periodic compliance audits.
+* **Threat R2: Deletion-to-Evade-Attribution (User Destroys Trail to Escape Accountability)**
+  * *Description:* A user performs a harmful, security-relevant action (e.g., sends a malicious/abusive email through the ecosystem), then requests account deletion to erase attribution. A lawful inquiry (e.g., a court order) may arrive *after* the account has been hard-deleted - for example, at day 60 about an action taken before a day-30 deletion. With only the standard audit table (`user_id ON DELETE SET NULL`, PII-masked `payload`), no attributable trace would remain.
+  * *Mitigation:* A minimal, non-PII **`security_event_ledger`** (Class B) is written at the time of security-relevant actions and is **decoupled from the account lifecycle** - it survives hard-delete and purges only on its own independent retention schedule (e.g., 6-18 months). It stores a stable `account_ref` and an identity **blind index** (never raw PII), so an action stays attributable to an identity within a bounded, documented window. For inquiries known *before* deletion, a **Legal Hold** (precedence lock, holds > retention) freezes the subject's data ahead of any purge. Legal basis for retention is legitimate interest / legal obligation, not consent. Full policy and schema: `compliance-and-data-governance.md` and `data-architecture.md`.
 
 ### 2.4 Information Disclosure (Exposing Secrets)
 
