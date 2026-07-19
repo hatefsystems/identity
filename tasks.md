@@ -25,7 +25,8 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 2.2:** Define `sqlc` queries in `apps/identity-api/db/queries` for transactional entities and generate Go models/repository code.
 - [x] **Task 2.3:** Implement the AES-GCM-256 Application-Layer Envelope Encryption module with secure serialization (Version, Nonces, Tag, DEK, Ciphertext) and a mock/stub driver for Infisical Key Management Service (KMS), along with SHA-256 Cryptographic Blind Indexing for search lookups.
 
-- [ ] **Task 2.4:** Implement the Argon2id password hashing library with strict parameters ($m=64\text{MB}, t=3, p=4$) and constant-time comparison helpers (`crypto/subtle`).
+- [x] **Task 2.4:** Implement the Argon2id password hashing library with strict parameters ($m=64\text{MB}, t=3, p=4$) and constant-time comparison helpers (`crypto/subtle`).
+
 
 ## Phase 3: OIDC & OAuth 2.1 Protocol Engine (Go Backend)
 - [ ] **Task 3.1:** Implement the OIDC Discovery endpoint (`/.well-known/openid-configuration`) and JSON Web Key Set (JWKS) endpoint (`/oauth2/jwks`) featuring a graceful 3-key active/next/previous rotation cycle (RS256/ES256).
