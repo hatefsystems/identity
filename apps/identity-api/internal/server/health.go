@@ -20,7 +20,7 @@ const serviceName = "identity-api"
 // It performs no dependency checks and should always return 200 while the
 // process is running, making it suitable for a Kubernetes liveness probe.
 func (s *Server) handleLiveness() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, healthResponse{
 			Status:  "ok",
 			Service: serviceName,
@@ -34,7 +34,7 @@ func (s *Server) handleLiveness() http.HandlerFunc {
 // Redis, NATS) wired in yet, so it mirrors the liveness result. Dependency
 // checks will be added here as those integrations land in later tasks.
 func (s *Server) handleReadiness() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, healthResponse{
 			Status:  "ready",
 			Service: serviceName,

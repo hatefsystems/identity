@@ -10,13 +10,20 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 )
 
-func newTestServer(t *testing.T) *Server {
+// testConfig loads the default configuration for handler tests, failing the
+// test if the environment produces an invalid config.
+func testConfig(t *testing.T) config.Config {
 	t.Helper()
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load() error: %v", err)
 	}
-	return New(cfg, nil)
+	return cfg
+}
+
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	return New(testConfig(t), nil, Deps{})
 }
 
 func TestHealthzEndpoint(t *testing.T) {
