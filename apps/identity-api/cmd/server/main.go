@@ -46,9 +46,15 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	clientRegistry, err := config.LoadClients(cfg.Environment)
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
-		OIDC: oidcCfg,
-		Keys: keyManager,
+		OIDC:    oidcCfg,
+		Keys:    keyManager,
+		Clients: clientRegistry,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.

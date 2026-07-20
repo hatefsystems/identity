@@ -13,10 +13,16 @@ import (
 const jwksCacheControl = "public, max-age=300, must-revalidate"
 
 // registerOIDCRoutes mounts the discovery and JWKS endpoints. It is only
-// called when a key manager is configured (Deps.Keys != nil).
+// called when a key manager is configured (Deps.Keys != nil). The
+// authorization endpoint is additionally gated on a configured client registry
+// (Deps.Clients != nil), since it cannot validate a client_id without one.
 func (s *Server) registerOIDCRoutes() {
 	s.router.Get("/.well-known/openid-configuration", s.handleDiscovery())
 	s.router.Get("/oauth2/jwks", s.handleJWKS())
+
+	if s.deps.Clients != nil {
+		s.router.Get("/oauth2/auth", s.handleAuthorize())
+	}
 }
 
 // handleDiscovery serves the OpenID Provider Metadata document. The document

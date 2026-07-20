@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
 
@@ -25,11 +26,16 @@ type Deps struct {
 	// Keys is the signing keystore backing /oauth2/jwks; when nil, the OIDC
 	// discovery and JWKS routes are not mounted.
 	Keys *keys.Manager
+	// Clients is the OAuth/OIDC client registry backing the authorization
+	// endpoint (/oauth2/auth); when nil, the authorization route is not
+	// mounted.
+	Clients clients.Registry
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
 type Server struct {
-	cfg    config.Config
+	cfg config.Config
+
 	deps   Deps
 	logger *slog.Logger
 	router chi.Router
