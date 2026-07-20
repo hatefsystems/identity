@@ -15,6 +15,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 )
 
 // Deps carries the optional service dependencies injected into the Server.
@@ -30,6 +31,9 @@ type Deps struct {
 	// endpoint (/oauth2/auth); when nil, the authorization route is not
 	// mounted.
 	Clients clients.Registry
+	// TokenService implements the /oauth2/token grant exchanges; when nil,
+	// the token route is not mounted.
+	TokenService *token.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.

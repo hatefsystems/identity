@@ -33,7 +33,7 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 3.1:** Implement the OIDC Discovery endpoint (`/.well-known/openid-configuration`) and JSON Web Key Set (JWKS) endpoint (`/oauth2/jwks`) featuring a graceful 3-key active/next/previous rotation cycle (RS256/ES256).
 - [x] **Task 3.2:** Implement the OIDC Authorization endpoint (`/oauth2/auth`) with strict Proof Key for Code Exchange (PKCE S256) validation.
 
-- [ ] **Task 3.3:** Implement the Token endpoint (`/oauth2/token`) with PKCE exchange, client credentials grant, and Refresh Token Rotation (RTR) coupled with session breach detection (instant revocation of all active keys upon duplicate reuse).
+- [x] **Task 3.3:** Implement the Token endpoint (`/oauth2/token`) with PKCE exchange, client credentials grant, and Refresh Token Rotation (RTR) coupled with session breach detection (instant revocation of all active keys upon duplicate reuse).
 - [ ] **Task 3.4:** Implement RFC 7523 Private Key JWT Client Authentication (`private_key_jwt`) for confidential internal clients (Search Engine, Email Service).
 - [ ] **Task 3.5:** Implement the Sender-Constraining DPoP (RFC 9449) validation middleware, checking short-lived proof JWTs, tracking `jti` in Redis to prevent replay attacks, and enforcing the `DPoP-Nonce` header lifecycle.
 
