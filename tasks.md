@@ -34,7 +34,8 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 3.2:** Implement the OIDC Authorization endpoint (`/oauth2/auth`) with strict Proof Key for Code Exchange (PKCE S256) validation.
 
 - [x] **Task 3.3:** Implement the Token endpoint (`/oauth2/token`) with PKCE exchange, client credentials grant, and Refresh Token Rotation (RTR) coupled with session breach detection (instant revocation of all active keys upon duplicate reuse).
-- [ ] **Task 3.4:** Implement RFC 7523 Private Key JWT Client Authentication (`private_key_jwt`) for confidential internal clients (Search Engine, Email Service).
+- [x] **Task 3.4:** Implement RFC 7523 Private Key JWT Client Authentication (`private_key_jwt`) for confidential internal clients (Search Engine, Email Service).
+
 - [ ] **Task 3.5:** Implement the Sender-Constraining DPoP (RFC 9449) validation middleware, checking short-lived proof JWTs, tracking `jti` in Redis to prevent replay attacks, and enforcing the `DPoP-Nonce` header lifecycle.
 
 ## Phase 4: User Authentication & Device Hardening

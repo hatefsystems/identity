@@ -3,7 +3,24 @@ package clients
 import (
 	"errors"
 	"testing"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
+
+// testPublicKey returns a freshly generated ES256 public key usable as a
+// confidential client's registered verification key.
+func testPublicKey(t *testing.T) *keys.PublicKey {
+	t.Helper()
+	sk, err := keys.NewEphemeralES256()
+	if err != nil {
+		t.Fatalf("NewEphemeralES256: %v", err)
+	}
+	pub, err := keys.ParsePublicJWK(sk.PublicJWK)
+	if err != nil {
+		t.Fatalf("ParsePublicJWK: %v", err)
+	}
+	return pub
+}
 
 func validClient() Client {
 	return Client{
@@ -99,9 +116,15 @@ func TestAllowsScope(t *testing.T) {
 }
 
 func TestIDsSorted(t *testing.T) {
+	key := testPublicKey(t)
 	reg, err := NewStaticRegistry([]Client{
 		{ID: "zeta", RedirectURIs: []string{"https://z"}, TokenEndpointAuthMethod: AuthMethodNone},
-		{ID: "alpha", RedirectURIs: []string{"https://a"}, TokenEndpointAuthMethod: AuthMethodPrivateKeyJWT},
+		{
+			ID:                      "alpha",
+			RedirectURIs:            []string{"https://a"},
+			TokenEndpointAuthMethod: AuthMethodPrivateKeyJWT,
+			PublicKeys:              map[string]*keys.PublicKey{key.KID: key},
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewStaticRegistry: %v", err)
@@ -109,5 +132,57 @@ func TestIDsSorted(t *testing.T) {
 	ids := reg.IDs()
 	if len(ids) != 2 || ids[0] != "alpha" || ids[1] != "zeta" {
 		t.Fatalf("IDs = %v, want [alpha zeta]", ids)
+	}
+}
+
+// confidentialClient returns a private_key_jwt client with one registered key.
+func confidentialClient(t *testing.T) Client {
+	t.Helper()
+	key := testPublicKey(t)
+	return Client{
+		ID:                      "svc-search",
+		RedirectURIs:            []string{"https://search.hatef.ir/callback"},
+		TokenEndpointAuthMethod: AuthMethodPrivateKeyJWT,
+		AllowedScopes:           []string{"search.full"},
+		PublicKeys:              map[string]*keys.PublicKey{key.KID: key},
+	}
+}
+
+func TestNewStaticRegistryConfidentialRequiresKeys(t *testing.T) {
+	c := confidentialClient(t)
+	c.PublicKeys = nil
+	if _, err := NewStaticRegistry([]Client{c}); err == nil {
+		t.Fatal("private_key_jwt client without keys must be rejected")
+	}
+}
+
+func TestNewStaticRegistryRejectsNilKey(t *testing.T) {
+	c := confidentialClient(t)
+	c.PublicKeys = map[string]*keys.PublicKey{"broken": nil}
+	if _, err := NewStaticRegistry([]Client{c}); err == nil {
+		t.Fatal("nil public key must be rejected")
+	}
+}
+
+func TestNewStaticRegistryPublicClientRejectsKeys(t *testing.T) {
+	key := testPublicKey(t)
+	c := validClient()
+	c.PublicKeys = map[string]*keys.PublicKey{key.KID: key}
+	if _, err := NewStaticRegistry([]Client{c}); err == nil {
+		t.Fatal("public client with registered keys must be rejected")
+	}
+}
+
+func TestClientPublicKeyLookup(t *testing.T) {
+	c := confidentialClient(t)
+	var kid string
+	for k := range c.PublicKeys {
+		kid = k
+	}
+	if _, ok := c.PublicKey(kid); !ok {
+		t.Errorf("expected to find key %q", kid)
+	}
+	if _, ok := c.PublicKey("missing"); ok {
+		t.Error("unknown kid must not resolve")
 	}
 }

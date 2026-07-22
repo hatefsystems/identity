@@ -30,7 +30,7 @@ const testTimeout = 2 * time.Minute
 
 // openTestDB connects to DATABASE_URL, skipping the test when the variable is
 // unset or the database is unreachable (no Docker in the environment).
-func openTestDB(t *testing.T, ctx context.Context) *sql.DB {
+func openTestDB(ctx context.Context, t *testing.T) *sql.DB {
 	t.Helper()
 
 	url := os.Getenv("DATABASE_URL")
@@ -47,7 +47,7 @@ func openTestDB(t *testing.T, ctx context.Context) *sql.DB {
 
 // resetToClean rolls back all migrations so each test starts from an empty
 // schema regardless of previous runs.
-func resetToClean(t *testing.T, ctx context.Context, sqldb *sql.DB) {
+func resetToClean(ctx context.Context, t *testing.T, sqldb *sql.DB) {
 	t.Helper()
 	if err := Reset(ctx, sqldb); err != nil {
 		t.Fatalf("reset to clean state: %v", err)
@@ -58,8 +58,8 @@ func TestInitialSchemaMigration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	sqldb := openTestDB(t, ctx)
-	resetToClean(t, ctx, sqldb)
+	sqldb := openTestDB(ctx, t)
+	resetToClean(ctx, t, sqldb)
 
 	if err := Up(ctx, sqldb); err != nil {
 		t.Fatalf("apply migrations: %v", err)

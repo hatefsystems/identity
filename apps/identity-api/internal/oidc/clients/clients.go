@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
 
 // Token endpoint authentication methods permitted by the platform. Secret-based
@@ -40,6 +42,20 @@ type Client struct {
 	// AllowedScopes is the set of scopes the client may request. A request for
 	// any scope outside this set is rejected.
 	AllowedScopes []string
+	// PublicKeys holds the confidential client's registered verification keys,
+	// keyed by their kid. It is populated only for private_key_jwt clients and
+	// is used by the token endpoint to verify RFC 7523 client assertions
+	// against the client's pre-registered public keys. Public clients
+	// (AuthMethodNone) must leave this empty.
+	PublicKeys map[string]*keys.PublicKey
+}
+
+// PublicKey returns the registered verification key with the given kid, along
+// with true when it exists. A confidential client selects its signing key by
+// kid in the assertion header; an unknown kid yields a failed authentication.
+func (c Client) PublicKey(kid string) (*keys.PublicKey, bool) {
+	k, ok := c.PublicKeys[kid]
+	return k, ok
 }
 
 // IsPublic reports whether the client is a public client (no credentials at the
@@ -109,7 +125,23 @@ func NewStaticRegistry(list []Client) (*StaticRegistry, error) {
 			return nil, fmt.Errorf("clients: client %q has no redirect URIs", c.ID)
 		}
 		switch c.TokenEndpointAuthMethod {
-		case AuthMethodNone, AuthMethodPrivateKeyJWT:
+		case AuthMethodNone:
+			// Public clients hold no credentials and therefore must not carry
+			// verification keys; a key here signals a misconfiguration.
+			if len(c.PublicKeys) > 0 {
+				return nil, fmt.Errorf("clients: public client %q must not register public keys", c.ID)
+			}
+		case AuthMethodPrivateKeyJWT:
+			// Confidential clients authenticate with signed assertions and are
+			// unusable without at least one registered verification key.
+			if len(c.PublicKeys) == 0 {
+				return nil, fmt.Errorf("clients: private_key_jwt client %q has no registered public keys", c.ID)
+			}
+			for kid, key := range c.PublicKeys {
+				if key == nil {
+					return nil, fmt.Errorf("clients: client %q has a nil public key for kid %q", c.ID, kid)
+				}
+			}
 		default:
 			return nil, fmt.Errorf(
 				"clients: client %q has unsupported token_endpoint_auth_method %q (only %q and %q are allowed)",

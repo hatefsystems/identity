@@ -13,7 +13,10 @@ import (
 	"syscall"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 )
 
@@ -51,10 +54,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	tokenService, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger)
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
-		OIDC:    oidcCfg,
-		Keys:    keyManager,
-		Clients: clientRegistry,
+		OIDC:         oidcCfg,
+		Keys:         keyManager,
+		Clients:      clientRegistry,
+		TokenService: tokenService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -122,4 +131,38 @@ func buildKeyManager(cfg config.OIDCConfig, environment string, logger *slog.Log
 	}
 
 	return keys.NewManager(active, next, previous)
+}
+
+// buildTokenService assembles the /oauth2/token service: in-memory code and
+// refresh-token stores (the MVP backing; both sit behind interfaces so a Redis
+// store can replace them later) plus the RFC 7523 private_key_jwt client
+// authenticator for the client_credentials grant. The authenticator's expected
+// audience is the fully-qualified token endpoint URL so an assertion minted for
+// a different endpoint is rejected (audience-confusion defence).
+func buildTokenService(
+	oidcCfg config.OIDCConfig,
+	keyManager *keys.Manager,
+	clientRegistry *clients.StaticRegistry,
+	logger *slog.Logger,
+) (*token.Service, error) {
+	tokenEndpoint := oidcCfg.Issuer + "/oauth2/token"
+	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, clientauth.NewMemoryJTIGuard())
+	if err != nil {
+		return nil, fmt.Errorf("main: build client authenticator: %w", err)
+	}
+
+	svc, err := token.NewService(
+		token.Config{Issuer: oidcCfg.Issuer},
+		keyManager,
+		clientRegistry,
+		token.NewMemoryCodeStore(),
+		token.NewMemoryRefreshTokenStore(),
+		authenticator,
+		nil,
+		logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("main: build token service: %w", err)
+	}
+	return svc, nil
 }

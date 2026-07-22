@@ -14,6 +14,7 @@ import (
 	"fmt"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
 
 // EnvOIDCClients is the environment variable holding the JSON-encoded client
@@ -42,6 +43,38 @@ type clientJSON struct {
 	RedirectURIs            []string `json:"redirect_uris"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	AllowedScopes           []string `json:"allowed_scopes"`
+	// JWKS carries the confidential client's public verification keys (RFC 7517
+	// §5). It is required for private_key_jwt clients — their RFC 7523 client
+	// assertions are verified against these pre-registered public keys — and
+	// must be omitted for public (none) clients.
+	JWKS *jwksJSON `json:"jwks,omitempty"`
+}
+
+// jwksJSON is a JWK Set as embedded in a client definition.
+type jwksJSON struct {
+	Keys []keys.JWK `json:"keys"`
+}
+
+// publicKeys parses the client's embedded JWK Set into the keyed map consumed
+// by the clients registry. Each key is validated against the RS256/ES256
+// profile and indexed by its (declared or thumbprint) kid; a duplicate kid is
+// rejected so key selection at the token endpoint is unambiguous.
+func (c clientJSON) publicKeys() (map[string]*keys.PublicKey, error) {
+	if c.JWKS == nil || len(c.JWKS.Keys) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]*keys.PublicKey, len(c.JWKS.Keys))
+	for i, jwk := range c.JWKS.Keys {
+		pub, err := keys.ParsePublicJWK(jwk)
+		if err != nil {
+			return nil, fmt.Errorf("config: client %q jwks[%d]: %w", c.ClientID, i, err)
+		}
+		if _, dup := out[pub.KID]; dup {
+			return nil, fmt.Errorf("config: client %q has duplicate key id %q", c.ClientID, pub.KID)
+		}
+		out[pub.KID] = pub
+	}
+	return out, nil
 }
 
 // LoadClients builds the client registry from OIDC_CLIENTS_JSON. Outside
@@ -70,11 +103,16 @@ func LoadClients(environment string) (*clients.StaticRegistry, error) {
 
 	list := make([]clients.Client, 0, len(decoded))
 	for _, c := range decoded {
+		publicKeys, err := c.publicKeys()
+		if err != nil {
+			return nil, err
+		}
 		list = append(list, clients.Client{
 			ID:                      c.ClientID,
 			RedirectURIs:            c.RedirectURIs,
 			TokenEndpointAuthMethod: c.TokenEndpointAuthMethod,
 			AllowedScopes:           c.AllowedScopes,
+			PublicKeys:              publicKeys,
 		})
 	}
 	return clients.NewStaticRegistry(list)
