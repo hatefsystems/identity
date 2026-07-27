@@ -15,6 +15,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
@@ -59,11 +60,17 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	dpopValidator, err := buildDPoPValidator()
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
-		OIDC:         oidcCfg,
-		Keys:         keyManager,
-		Clients:      clientRegistry,
-		TokenService: tokenService,
+		OIDC:          oidcCfg,
+		Keys:          keyManager,
+		Clients:       clientRegistry,
+		TokenService:  tokenService,
+		DPoPValidator: dpopValidator,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -165,4 +172,18 @@ func buildTokenService(
 		return nil, fmt.Errorf("main: build token service: %w", err)
 	}
 	return svc, nil
+}
+
+// buildDPoPValidator assembles the RFC 9449 DPoP validator used to
+// sender-constrain tokens issued at /oauth2/token. It uses in-memory single-use
+// jti replay tracking and a server-issued DPoP-Nonce store (the MVP backing;
+// both sit behind interfaces so a Redis-backed guard — key dpop:jti:{jti},
+// TTL 60s per docs/data-architecture.md §3.1 — can replace them cluster-wide
+// without touching the validator).
+func buildDPoPValidator() (*dpop.Validator, error) {
+	validator, err := dpop.NewValidator(dpop.NewMemoryReplayGuard(), dpop.NewMemoryNonceStore())
+	if err != nil {
+		return nil, fmt.Errorf("main: build DPoP validator: %w", err)
+	}
+	return validator, nil
 }

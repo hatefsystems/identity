@@ -14,6 +14,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 )
@@ -34,6 +35,11 @@ type Deps struct {
 	// TokenService implements the /oauth2/token grant exchanges; when nil,
 	// the token route is not mounted.
 	TokenService *token.Service
+	// DPoPValidator sender-constrains tokens issued at /oauth2/token (RFC
+	// 9449). When nil, the endpoint ignores any DPoP proof header and only
+	// issues plain Bearer tokens; when set, a presented proof is validated
+	// (with the server-nonce lifecycle) and its key bound into the token.
+	DPoPValidator *dpop.Validator
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.

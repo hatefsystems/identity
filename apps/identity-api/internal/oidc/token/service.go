@@ -25,7 +25,16 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
+)
+
+// Token type values (RFC 6749 §7.1 / RFC 9449 §5). A token confirmed to a DPoP
+// key is issued as token_type "DPoP" so the client presents it with the DPoP
+// auth scheme; otherwise it is a plain "Bearer" token.
+const (
+	TokenTypeBearer = "Bearer"
+	TokenTypeDPoP   = "DPoP"
 )
 
 // OAuth 2.0 token endpoint error codes (RFC 6749 §5.2).
@@ -262,7 +271,10 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 	}
 
 	now := s.now()
-	accessToken, err := s.signAccessToken(data.UserID, clientID, data.Scope, now)
+	// Sender-constrain the access token to the client's DPoP key when the
+	// request carried a validated proof (RFC 9449 §5); otherwise Bearer.
+	jkt, tokenType := s.tokenBinding(ctx)
+	accessToken, err := s.signAccessToken(data.UserID, clientID, data.Scope, jkt, now)
 	if err != nil {
 		return nil, s.serverError("sign access token", err)
 	}
@@ -277,10 +289,9 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 		return nil, s.serverError("issue refresh token", err)
 	}
 
-	_ = ctx // reserved for DPoP binding and audit hooks in later tasks
 	return &Response{
 		AccessToken:  accessToken,
-		TokenType:    "Bearer",
+		TokenType:    tokenType,
 		ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
 		RefreshToken: refreshToken,
 		IDToken:      idToken,
@@ -348,14 +359,15 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 	if err != nil {
 		return nil, s.serverError("issue rotated refresh token", err)
 	}
-	accessToken, err := s.signAccessToken(data.UserID, data.ClientID, data.Scope, now)
+	jkt, tokenType := s.tokenBinding(ctx)
+	accessToken, err := s.signAccessToken(data.UserID, data.ClientID, data.Scope, jkt, now)
 	if err != nil {
 		return nil, s.serverError("sign access token", err)
 	}
 
 	return &Response{
 		AccessToken:  accessToken,
-		TokenType:    "Bearer",
+		TokenType:    tokenType,
 		ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
 		RefreshToken: newRefreshToken,
 		Scope:        data.Scope,
@@ -388,14 +400,15 @@ func (s *Service) exchangeClientCredentials(ctx context.Context, form url.Values
 
 	now := s.now()
 	// sub == client_id for machine tokens: the client acts on its own behalf.
-	accessToken, err := s.signAccessToken(client.ID, client.ID, scope, now)
+	jkt, tokenType := s.tokenBinding(ctx)
+	accessToken, err := s.signAccessToken(client.ID, client.ID, scope, jkt, now)
 	if err != nil {
 		return nil, s.serverError("sign access token", err)
 	}
 
 	return &Response{
 		AccessToken: accessToken,
-		TokenType:   "Bearer",
+		TokenType:   tokenType,
 		ExpiresIn:   int64(s.cfg.AccessTokenTTL.Seconds()),
 		Scope:       scope,
 	}, nil
@@ -439,9 +452,11 @@ func (s *Service) issueRefreshToken(familyID, userID, clientID, scope string, no
 	return tokenValue, nil
 }
 
-// signAccessToken builds and signs an RFC 9068 JWT access token.
-func (s *Service) signAccessToken(sub, clientID, scope string, now time.Time) (string, error) {
-	return Sign(s.keys.ActiveSigner(), TypAccessToken, Claims{
+// signAccessToken builds and signs an RFC 9068 JWT access token. When jkt is
+// non-empty the token is sender-constrained to the client's DPoP key via the
+// RFC 9449 §6 cnf.jkt confirmation claim.
+func (s *Service) signAccessToken(sub, clientID, scope, jkt string, now time.Time) (string, error) {
+	claims := Claims{
 		"iss":       s.cfg.Issuer,
 		"sub":       sub,
 		"aud":       s.cfg.Issuer,
@@ -450,7 +465,23 @@ func (s *Service) signAccessToken(sub, clientID, scope string, now time.Time) (s
 		"jti":       uuid.NewString(),
 		"iat":       now.Unix(),
 		"exp":       now.Add(s.cfg.AccessTokenTTL).Unix(),
-	})
+	}
+	if jkt != "" {
+		claims["cnf"] = map[string]string{"jkt": jkt}
+	}
+	return Sign(s.keys.ActiveSigner(), TypAccessToken, claims)
+}
+
+// tokenBinding resolves the DPoP confirmation thumbprint (cnf.jkt) and the
+// token_type the response must advertise for this request. When the request
+// carried a validated DPoP proof (injected by the token handler via
+// dpop.WithProof), the issued token is confirmed to that key and typed "DPoP";
+// otherwise a plain "Bearer" token is issued.
+func (s *Service) tokenBinding(ctx context.Context) (jkt, tokenType string) {
+	if proof := dpop.ProofFromContext(ctx); proof != nil {
+		return proof.JKT, TokenTypeDPoP
+	}
+	return "", TokenTypeBearer
 }
 
 // signIDToken builds and signs the OIDC ID token for the auth-code grant.
