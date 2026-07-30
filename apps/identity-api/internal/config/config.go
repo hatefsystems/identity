@@ -22,6 +22,14 @@ const (
 	defaultWriteTimeout    = 10 * time.Second
 	defaultIdleTimeout     = 60 * time.Second
 	defaultShutdownTimeout = 15 * time.Second
+
+	// Session defaults: 24h absolute lifetime, 2h idle window, __Host- prefix
+	// with Secure=true for production. Set SESSION_COOKIE_SECURE=false and
+	// SESSION_COOKIE_NAME to a non-prefixed name for plain-HTTP local dev.
+	defaultSessionCookieName   = "__Host-session"
+	defaultSessionCookieSecure = true
+	defaultSessionAbsoluteTTL  = 24 * time.Hour
+	defaultSessionIdleTTL      = 2 * time.Hour
 )
 
 // Config holds the runtime configuration for the HTTP server.
@@ -46,6 +54,59 @@ type Config struct {
 // Addr returns the host:port address string the server should listen on.
 func (c Config) Addr() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// SessionConfig holds the stateful-session cookie and lifetime policy. The
+// cookie is hardened per docs/architecture.md ("Session Management & Transport
+// Hardening"): the __Host- name prefix plus Secure pin it to the exact origin.
+type SessionConfig struct {
+	// CookieName is the session cookie name. In production it must carry the
+	// __Host- prefix, which the browser only honors alongside Secure=true.
+	CookieName string
+	// CookieSecure sets the cookie Secure attribute. It must be true whenever
+	// CookieName uses the __Host- prefix; it is only disabled for plain-HTTP
+	// local development (with a non-prefixed cookie name).
+	CookieSecure bool
+	// AbsoluteTTL is the hard ceiling on a session's lifetime regardless of
+	// activity; it also bounds the cookie MaxAge.
+	AbsoluteTTL time.Duration
+	// IdleTTL is the inactivity window after which a session lapses. It must
+	// not exceed AbsoluteTTL.
+	IdleTTL time.Duration
+}
+
+// LoadSession builds the SessionConfig from environment variables, applying the
+// production-safe defaults (24h absolute, 2h idle, __Host- prefixed Secure
+// cookie). It fails fast on a malformed value or an idle window that exceeds
+// the absolute window; the __Host-/Secure invariant itself is enforced when the
+// cookie codec is constructed.
+func LoadSession() (SessionConfig, error) {
+	secure, err := getEnvBool("SESSION_COOKIE_SECURE", defaultSessionCookieSecure)
+	if err != nil {
+		return SessionConfig{}, err
+	}
+
+	absoluteTTL, err := getEnvDuration("SESSION_ABSOLUTE_TTL", defaultSessionAbsoluteTTL)
+	if err != nil {
+		return SessionConfig{}, err
+	}
+
+	idleTTL, err := getEnvDuration("SESSION_IDLE_TTL", defaultSessionIdleTTL)
+	if err != nil {
+		return SessionConfig{}, err
+	}
+
+	if idleTTL > absoluteTTL {
+		return SessionConfig{}, fmt.Errorf(
+			"config: SESSION_IDLE_TTL %v must not exceed SESSION_ABSOLUTE_TTL %v", idleTTL, absoluteTTL)
+	}
+
+	return SessionConfig{
+		CookieName:   getEnv("SESSION_COOKIE_NAME", defaultSessionCookieName),
+		CookieSecure: secure,
+		AbsoluteTTL:  absoluteTTL,
+		IdleTTL:      idleTTL,
+	}, nil
 }
 
 // Load builds a Config from environment variables, applying sane defaults for
@@ -84,4 +145,38 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvBool parses a boolean environment variable, returning fallback when it
+// is unset or empty and an error when it is set to an unparseable value (so a
+// typo like SESSION_COOKIE_SECURE=yes fails fast rather than silently
+// disabling Secure).
+func getEnvBool(key string, fallback bool) (bool, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("config: invalid %s %q: %w", key, raw, err)
+	}
+	return v, nil
+}
+
+// getEnvDuration parses a Go duration string (e.g. "24h", "30m") from the named
+// environment variable, returning fallback when unset/empty and an error when
+// the value is unparseable or non-positive.
+func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: invalid %s %q: %w", key, raw, err)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("config: %s %v must be positive", key, v)
+	}
+	return v, nil
 }

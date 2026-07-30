@@ -19,6 +19,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 func main() {
@@ -27,6 +28,7 @@ func main() {
 
 	if err := run(logger); err != nil {
 		logger.Error("server terminated with error", slog.String("error", err.Error()))
+
 		os.Exit(1)
 	}
 }
@@ -65,15 +67,22 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	sessionManager, err := buildSessionManager()
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
-		OIDC:          oidcCfg,
-		Keys:          keyManager,
-		Clients:       clientRegistry,
-		TokenService:  tokenService,
-		DPoPValidator: dpopValidator,
+		OIDC:           oidcCfg,
+		Keys:           keyManager,
+		Clients:        clientRegistry,
+		TokenService:   tokenService,
+		DPoPValidator:  dpopValidator,
+		SessionManager: sessionManager,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -186,4 +195,38 @@ func buildDPoPValidator() (*dpop.Validator, error) {
 		return nil, fmt.Errorf("main: build DPoP validator: %w", err)
 	}
 	return validator, nil
+}
+
+// buildSessionManager assembles the stateful browser-session lifecycle: the
+// hardened __Host- cookie codec, the in-memory session store (the MVP backing;
+// it sits behind the session.Store interface so a Redis-backed store — key
+// session:token:{token_hash}, Hash type, 24h TTL per docs/data-architecture.md
+// §3.1 — can replace it without touching the manager or handlers), and the
+// Manager that owns the absolute/idle lifetime policy. Configuration (cookie
+// name/Secure and the two TTLs) is loaded from the environment; the
+// __Host-/Secure invariant is enforced inside NewCookieCodec so a misconfigured
+// dev override fails fast at startup.
+func buildSessionManager() (*session.Manager, error) {
+	sc, err := config.LoadSession()
+	if err != nil {
+		return nil, err
+	}
+
+	codec, err := session.NewCookieCodec(session.CookieConfig{
+		Name:   sc.CookieName,
+		Secure: sc.CookieSecure,
+		TTL:    sc.AbsoluteTTL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("main: build session cookie codec: %w", err)
+	}
+
+	manager, err := session.NewManager(session.NewMemoryStore(), codec, session.ManagerConfig{
+		AbsoluteTTL: sc.AbsoluteTTL,
+		IdleTTL:     sc.IdleTTL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("main: build session manager: %w", err)
+	}
+	return manager, nil
 }

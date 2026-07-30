@@ -17,6 +17,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // Deps carries the optional service dependencies injected into the Server.
@@ -40,6 +41,10 @@ type Deps struct {
 	// issues plain Bearer tokens; when set, a presented proof is validated
 	// (with the server-nonce lifecycle) and its key bound into the token.
 	DPoPValidator *dpop.Validator
+	// SessionManager backs the browser session lifecycle: the logout endpoint
+	// and the self-service session list/revoke routes
+	// (/api/v1/users/me/sessions). When nil, those routes are not mounted.
+	SessionManager *session.Manager
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -103,6 +108,12 @@ func (s *Server) registerRoutes() {
 	// been provisioned; without keys there is nothing meaningful to publish.
 	if s.deps.Keys != nil {
 		s.registerOIDCRoutes()
+	}
+
+	// Session lifecycle routes (logout, self-service session list/revoke) are
+	// only mounted when a session manager has been provisioned.
+	if s.deps.SessionManager != nil {
+		s.registerSessionRoutes()
 	}
 }
 
