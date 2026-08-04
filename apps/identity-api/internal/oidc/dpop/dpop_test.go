@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -245,13 +246,29 @@ func TestParseProofRejectsHeaderKeyMismatch(t *testing.T) {
 func TestParseProofRejectsTamperedSignature(t *testing.T) {
 	s := newES256Signer(t)
 	compact := s.signValid(t, time.Now())
-	// Flip the last character of the signature.
-	tampered := compact[:len(compact)-1]
-	if compact[len(compact)-1] == 'A' {
-		tampered += "B"
-	} else {
-		tampered += "A"
+
+	// Tamper with the decoded signature bytes rather than the last base64
+	// character. An ES256 signature is 64 bytes, so its base64url encoding ends
+	// on a partial group whose trailing bits are padding: substituting that
+	// character can decode to the identical byte string, leaving the proof
+	// valid. Flipping a bit in the first byte always changes the signature.
+	dot := strings.LastIndex(compact, ".")
+	if dot < 0 {
+		t.Fatalf("compact proof %q has no signature segment", compact)
 	}
+	signature, err := base64.RawURLEncoding.DecodeString(compact[dot+1:])
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+	if len(signature) == 0 {
+		t.Fatal("signature segment is empty")
+	}
+	signature[0] ^= 0x01
+	tampered := compact[:dot+1] + base64.RawURLEncoding.EncodeToString(signature)
+	if tampered == compact {
+		t.Fatal("tampering did not change the proof")
+	}
+
 	if _, err := ParseProof(tampered); !errors.Is(err, ErrSignature) && !errors.Is(err, ErrMalformedProof) {
 		t.Fatalf("err = %v, want ErrSignature/ErrMalformedProof", err)
 	}

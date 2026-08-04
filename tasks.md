@@ -39,8 +39,8 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 3.5:** Implement the Sender-Constraining DPoP (RFC 9449) validation middleware, checking short-lived proof JWTs, tracking `jti` in Redis to prevent replay attacks, and enforcing the `DPoP-Nonce` header lifecycle.
 
 ## Phase 4: User Authentication & Device Hardening
-- [ ] **Task 4.1:** Implement stateful session management utilizing secure cookies with the strict `__Host-` prefix and `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/` attributes.
-- [ ] **Task 4.2:** Implement WebAuthn/FIDO2 passwordless registration and verification flows (origin checks, RP ID binding, signature counter validation, random 64-bit user ID challenge mapping).
+- [x] **Task 4.1:** Implement stateful session management utilizing secure cookies with the strict `__Host-` prefix and `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/` attributes.
+- [x] **Task 4.2:** Implement WebAuthn/FIDO2 passwordless registration and verification flows (origin checks, RP ID binding, signature counter validation, random 64-bit user ID challenge mapping).
 - [ ] **Task 4.3:** Implement WebAuthn discoverable credentials (usernameless login) as the primary secure path, plus mock challenge fallback for legacy user-named flows to mitigate account harvesting.
 - [ ] **Task 4.4:** Implement Multi-Factor Authentication (MFA) via TOTP, including secret generation, QR code mapping, and verification.
 - [ ] **Task 4.5:** Implement SMS OTP workflows with independent Redis-based rate limiting via sorted sets (ZSET) Lua scripts (rate-limiting per phone number and per IP `/24` or `/48` subnet window), plus failed-attempt brute-force lockout.

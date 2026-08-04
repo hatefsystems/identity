@@ -176,14 +176,28 @@ func TestClientCredentialsTamperedAssertionRejected(t *testing.T) {
 	srv, audience := newClientCredentialsServer(t, sk)
 
 	assertion := sk.assertion(t, ccClaims(audience, time.Now()))
-	// Flip the last character of the signature segment to a different valid
-	// base64url character so decoding still succeeds but verification fails.
-	last := assertion[len(assertion)-1]
-	repl := byte('A')
-	if last == 'A' {
-		repl = 'B'
+
+	// Flip a bit in the decoded signature rather than substituting the last
+	// base64 character. An ES256 signature is 64 bytes, so its base64url
+	// encoding ends on a partial group whose trailing bits are padding:
+	// swapping that character can decode to the identical bytes, leaving the
+	// assertion valid and the test passing only by luck.
+	dot := strings.LastIndex(assertion, ".")
+	if dot < 0 {
+		t.Fatalf("assertion %q has no signature segment", assertion)
 	}
-	tampered := assertion[:len(assertion)-1] + string(repl)
+	signature, err := base64.RawURLEncoding.DecodeString(assertion[dot+1:])
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+	if len(signature) == 0 {
+		t.Fatal("signature segment is empty")
+	}
+	signature[0] ^= 0x01
+	tampered := assertion[:dot+1] + base64.RawURLEncoding.EncodeToString(signature)
+	if tampered == assertion {
+		t.Fatal("tampering did not change the assertion")
+	}
 
 	rec := postForm(t, srv, ccForm(tampered, "search.full"))
 	if rec.Code != http.StatusUnauthorized {

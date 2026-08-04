@@ -15,6 +15,27 @@ INSERT INTO users (email, password_hash, status)
 VALUES ($1, $2, $3)
 RETURNING *;
 
+-- name: SetWebauthnUserHandle :execrows
+-- Task 4.2: Persists the CSPRNG-generated random 64-bit WebAuthn user handle
+-- on first passkey registration (api-design.md §1.3). The handle is the stable
+-- WebAuthn user.id (never the UUID PK) used to prevent identity correlation and
+-- to map discoverable-credential logins (Task 4.3) back to the account. Only
+-- sets it when currently NULL so the handle can never silently change.
+UPDATE users
+SET webauthn_user_handle = $2,
+    updated_at = NOW()
+WHERE id = $1
+  AND webauthn_user_handle IS NULL
+  AND deleted_at IS NULL;
+
+-- name: GetUserByWebauthnUserHandle :one
+-- Discoverable-credential login (Task 4.3) maps an authenticator's returned
+-- userHandle back to the account via the unique idx_users_webauthn_handle.
+SELECT * FROM users
+WHERE webauthn_user_handle = $1
+  AND deleted_at IS NULL;
+
+
 -- name: GetUserByID :one
 SELECT * FROM users
 WHERE id = $1

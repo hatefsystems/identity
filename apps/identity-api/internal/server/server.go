@@ -18,6 +18,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
 // Deps carries the optional service dependencies injected into the Server.
@@ -45,6 +46,12 @@ type Deps struct {
 	// and the self-service session list/revoke routes
 	// (/api/v1/users/me/sessions). When nil, those routes are not mounted.
 	SessionManager *session.Manager
+	// WebAuthn drives the passkey ceremonies at /api/v1/auth/webauthn. It
+	// requires a database, so when nil (no DATABASE_URL configured) those
+	// routes are not mounted. The enrolment subset additionally requires
+	// SessionManager, since a passkey may only be added to an account the
+	// caller already holds a live session for.
+	WebAuthn *webauthn.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -114,6 +121,12 @@ func (s *Server) registerRoutes() {
 	// only mounted when a session manager has been provisioned.
 	if s.deps.SessionManager != nil {
 		s.registerSessionRoutes()
+	}
+
+	// Passkey ceremony routes are only mounted when a WebAuthn service has
+	// been provisioned (it requires a database).
+	if s.deps.WebAuthn != nil {
+		s.registerWebAuthnRoutes()
 	}
 }
 

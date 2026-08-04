@@ -11,8 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
@@ -20,6 +24,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
 func main() {
@@ -72,6 +77,14 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	webauthnService, pool, err := buildWebAuthnService(cfg.Environment, logger)
+	if err != nil {
+		return err
+	}
+	if pool != nil {
+		defer pool.Close()
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
 		OIDC:           oidcCfg,
 		Keys:           keyManager,
@@ -79,6 +92,7 @@ func run(logger *slog.Logger) error {
 		TokenService:   tokenService,
 		DPoPValidator:  dpopValidator,
 		SessionManager: sessionManager,
+		WebAuthn:       webauthnService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -229,4 +243,76 @@ func buildSessionManager() (*session.Manager, error) {
 		return nil, fmt.Errorf("main: build session manager: %w", err)
 	}
 	return manager, nil
+}
+
+// dbConnectTimeout bounds the startup connectivity probe against PostgreSQL so
+// an unreachable database fails the boot quickly instead of hanging the process.
+const dbConnectTimeout = 10 * time.Second
+
+// buildWebAuthnService assembles the passkey ceremony service: the Relying Party
+// identity from the environment, the sqlc-generated queries as the user and
+// credential stores, and the in-memory challenge store (the MVP backing; it sits
+// behind the webauthn.ChallengeStore interface so a Redis-backed store — key
+// webauthn:challenge:{challenge} with the ceremony TTL per
+// docs/data-architecture.md §3.1 — can replace it cluster-wide without touching
+// the service).
+//
+// Unlike the other subsystems this one needs durable storage: credentials and
+// the anonymised user handle live in PostgreSQL. When DATABASE_URL is unset the
+// service is skipped entirely (returning a nil service, which leaves the passkey
+// routes unmounted) so the rest of the API still boots for local work on
+// unrelated endpoints — the same philosophy as the ephemeral development signing
+// keys. Outside development a database is mandatory, so a missing DATABASE_URL
+// is a startup error there.
+//
+// It returns the pool alongside the service so the caller owns its lifetime and
+// can close it on shutdown.
+func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Service, *pgxpool.Pool, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		if environment != "development" {
+			return nil, nil, fmt.Errorf("main: DATABASE_URL is required in %q environment", environment)
+		}
+		logger.Warn("no DATABASE_URL configured; WebAuthn passkey routes are disabled")
+		return nil, nil, nil
+	}
+
+	wc, err := config.LoadWebAuthn(environment)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbConnectTimeout)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("main: open database pool: %w", err)
+	}
+	// Probe once at startup: a misconfigured DSN should fail the boot rather
+	// than surface as a 500 on the first passkey ceremony.
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("main: ping database: %w", err)
+	}
+
+	queries := db.New(pool)
+	svc, err := webauthn.New(webauthn.Config{
+		RPID:             wc.RPID,
+		RPDisplayName:    wc.RPDisplayName,
+		RPOrigins:        wc.RPOrigins,
+		ChallengeTTL:     wc.ChallengeTTL,
+		UserVerification: wc.UserVerification,
+	}, queries, queries, webauthn.NewMemoryChallengeStore(), webauthn.WithTransacter(pool))
+	if err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("main: build webauthn service: %w", err)
+	}
+
+	logger.Info("webauthn relying party configured",
+		slog.String("rp_id", wc.RPID),
+		slog.Int("origins", len(wc.RPOrigins)),
+		slog.String("user_verification", wc.UserVerification),
+	)
+	return svc, pool, nil
 }
