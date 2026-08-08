@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
@@ -52,6 +53,9 @@ type Deps struct {
 	// SessionManager, since a passkey may only be added to an account the
 	// caller already holds a live session for.
 	WebAuthn *webauthn.Service
+	// MFA drives the TOTP MFA setup, verification, and teardown routes
+	// at /api/v1/auth/mfa.
+	MFA *mfa.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -127,6 +131,11 @@ func (s *Server) registerRoutes() {
 	// been provisioned (it requires a database).
 	if s.deps.WebAuthn != nil {
 		s.registerWebAuthnRoutes()
+	}
+
+	// TOTP MFA routes are mounted when an MFA service is provisioned.
+	if s.deps.MFA != nil {
+		s.registerMFARoutes()
 	}
 }
 

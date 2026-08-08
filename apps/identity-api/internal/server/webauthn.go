@@ -1,14 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -29,9 +32,13 @@ type webauthnErrorResponse struct {
 	Error string `json:"error"`
 }
 
-// webauthnLoginOptionsRequest is the body of the login options request. The
-// email names the account whose credentials populate allowCredentials; the
-// usernameless (discoverable) variant arrives in Task 4.3.
+// webauthnLoginOptionsRequest is the body of the login options request.
+//
+// Email is optional and selects the flow. Omitted or empty runs the
+// discoverable (usernameless) ceremony, which is the primary path: no identity
+// is named, so there is nothing to enumerate. Supplying an email runs the
+// legacy user-named ceremony, which answers with a decoy rather than an error
+// when the identity cannot sign in (docs/api-design.md §1.3).
 type webauthnLoginOptionsRequest struct {
 	Email string `json:"email"`
 }
@@ -186,12 +193,18 @@ func (s *Server) handleWebAuthnListKeys() http.HandlerFunc {
 }
 
 // handleWebAuthnLoginOptions serves POST
-// /api/v1/auth/webauthn/login/generate-options for the user-named login path.
+// /api/v1/auth/webauthn/login/generate-options for both login paths.
 //
-// An unknown account and an account with no passkeys currently produce the same
-// 401 so this endpoint cannot be used to enumerate registered emails. Task 4.3
-// replaces that with an indistinguishable mock challenge, which closes the
-// remaining signal (that a 401 here means "not registered") entirely.
+// With no email (or an empty one) it runs the discoverable ceremony: the
+// response is identical for every caller because the server resolves nothing
+// before answering. With an email it runs the user-named ceremony, which is
+// account-harvesting resistant in a different way — an identity that cannot sign
+// in gets a decoy ceremony rather than an error, so a 200 here says nothing
+// about whether the account exists (docs/api-design.md §1.3,
+// docs/frontend-pages.md §5.4).
+//
+// An empty body is accepted and treated as the discoverable flow, so a client
+// that has nothing to send does not have to POST "{}".
 func (s *Server) handleWebAuthnLoginOptions() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, ok := s.readWebAuthnBody(w, r)
@@ -200,14 +213,27 @@ func (s *Server) handleWebAuthnLoginOptions() http.HandlerFunc {
 		}
 
 		var req webauthnLoginOptionsRequest
-		if err := json.Unmarshal(body, &req); err != nil || req.Email == "" {
-			writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
-			return
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &req); err != nil {
+				writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+				return
+			}
 		}
 
-		options, err := s.deps.WebAuthn.BeginLogin(r.Context(), req.Email)
+		var (
+			options *protocol.CredentialAssertion
+			err     error
+			op      string
+		)
+		if email := strings.TrimSpace(req.Email); email == "" {
+			op = "begin discoverable login"
+			options, err = s.deps.WebAuthn.BeginDiscoverableLogin(r.Context())
+		} else {
+			op = "begin login"
+			options, err = s.deps.WebAuthn.BeginLogin(r.Context(), email)
+		}
 		if err != nil {
-			s.writeWebAuthnLoginError(w, "begin login", err)
+			s.writeWebAuthnLoginError(w, op, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, options)
@@ -326,8 +352,17 @@ func (s *Server) writeWebAuthnLoginError(w http.ResponseWriter, op string, err e
 		errors.Is(err, webauthn.ErrNoCredentials),
 		errors.Is(err, webauthn.ErrChallengeNotFound),
 		errors.Is(err, webauthn.ErrChallengeExpired),
-		errors.Is(err, webauthn.ErrVerification):
+		errors.Is(err, webauthn.ErrVerification),
+		// The caller completed a decoy ceremony. Rendering it exactly like a
+		// failed real assertion is the entire point: any distinct status or
+		// code here would re-expose whether the named account exists.
+		errors.Is(err, webauthn.ErrMockChallenge),
+		// A suspended, unverified, or pending-deletion account. Also opaque:
+		// "this account is banned" is itself an existence oracle.
+		errors.Is(err, webauthn.ErrAccountNotActive),
+		errors.Is(err, webauthn.ErrChallengeFlowMismatch):
 		writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "invalid_credentials"})
+
 	default:
 		s.logger.Error("webauthn: "+op+" failed", "error", err.Error())
 		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})

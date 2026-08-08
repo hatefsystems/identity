@@ -1,11 +1,19 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// testMockChallengeKey is a fixed, obviously-fake mock-derivation key long
+// enough to pass the minimum-length check. Real deployments receive this from
+// the KMS; it is only spelled out here so the production-environment cases can
+// satisfy the requirement without inventing a secret per test.
+const testMockChallengeKey = "test-only-mock-challenge-key-not-a-real-secret"
 
 // clearWebAuthnEnv unsets every WebAuthn variable for the duration of the test
 // so a value leaking in from the developer's shell cannot change the outcome.
@@ -18,6 +26,9 @@ func clearWebAuthnEnv(t *testing.T) {
 		EnvWebAuthnRPOrigins,
 		EnvWebAuthnChallengeTTL,
 		EnvWebAuthnUserVerification,
+		EnvWebAuthnResidentKey,
+		EnvWebAuthnNamedLoginFloor,
+		EnvWebAuthnMockChallengeKey,
 	} {
 		t.Setenv(key, "")
 	}
@@ -56,6 +67,11 @@ func TestLoadWebAuthnExplicitValues(t *testing.T) {
 	t.Setenv(EnvWebAuthnRPOrigins, "https://identity.hatef.ir,https://hatef.ir")
 	t.Setenv(EnvWebAuthnChallengeTTL, "2m")
 	t.Setenv(EnvWebAuthnUserVerification, "required")
+	t.Setenv(EnvWebAuthnResidentKey, "preferred")
+	t.Setenv(EnvWebAuthnNamedLoginFloor, "250ms")
+	// Required outside development, so every production-environment case must
+	// supply it.
+	t.Setenv(EnvWebAuthnMockChallengeKey, testMockChallengeKey)
 
 	cfg, err := LoadWebAuthn("production")
 	if err != nil {
@@ -64,6 +80,7 @@ func TestLoadWebAuthnExplicitValues(t *testing.T) {
 	if cfg.RPID != "identity.hatef.ir" {
 		t.Errorf("RPID = %q, want %q", cfg.RPID, "identity.hatef.ir")
 	}
+
 	if cfg.RPDisplayName != "Hatef ID" {
 		t.Errorf("RPDisplayName = %q, want %q", cfg.RPDisplayName, "Hatef ID")
 	}
@@ -82,6 +99,16 @@ func TestLoadWebAuthnExplicitValues(t *testing.T) {
 	if cfg.UserVerification != "required" {
 		t.Errorf("UserVerification = %q, want %q", cfg.UserVerification, "required")
 	}
+	if cfg.ResidentKey != "preferred" {
+		t.Errorf("ResidentKey = %q, want %q", cfg.ResidentKey, "preferred")
+	}
+	if cfg.NamedLoginFloor != 250*time.Millisecond {
+		t.Errorf("NamedLoginFloor = %v, want %v", cfg.NamedLoginFloor, 250*time.Millisecond)
+	}
+	if len(cfg.MockChallengeKey) < minWebAuthnMockChallengeKeyLen {
+		t.Errorf("len(MockChallengeKey) = %d, want at least %d",
+			len(cfg.MockChallengeKey), minWebAuthnMockChallengeKeyLen)
+	}
 }
 
 // TestLoadWebAuthnTrimsRPID covers a stray-whitespace value, which would
@@ -90,8 +117,10 @@ func TestLoadWebAuthnTrimsRPID(t *testing.T) {
 	clearWebAuthnEnv(t)
 	t.Setenv(EnvWebAuthnRPID, "  identity.hatef.ir  ")
 	t.Setenv(EnvWebAuthnRPOrigins, "https://identity.hatef.ir")
+	t.Setenv(EnvWebAuthnMockChallengeKey, testMockChallengeKey)
 
 	cfg, err := LoadWebAuthn("production")
+
 	if err != nil {
 		t.Fatalf("LoadWebAuthn: %v", err)
 	}
@@ -288,8 +317,175 @@ func TestLoadWebAuthnUserVerificationValues(t *testing.T) {
 	}
 }
 
+// TestLoadWebAuthnResidentKeyDefaultsToRequired proves discoverable credentials
+// are the default outcome of registration. If this ever silently relaxed,
+// authenticators could create non-discoverable credentials and usernameless
+// login — the primary path — would stop working for those accounts.
+func TestLoadWebAuthnResidentKeyDefaultsToRequired(t *testing.T) {
+	clearWebAuthnEnv(t)
+
+	cfg, err := LoadWebAuthn("development")
+	if err != nil {
+		t.Fatalf("LoadWebAuthn: %v", err)
+	}
+	if cfg.ResidentKey != "required" {
+		t.Errorf("ResidentKey = %q, want %q", cfg.ResidentKey, "required")
+	}
+}
+
+func TestLoadWebAuthnResidentKeyValues(t *testing.T) {
+	for _, rk := range []string{"required", "preferred", "discouraged"} {
+		t.Run("accepts "+rk, func(t *testing.T) {
+			clearWebAuthnEnv(t)
+			t.Setenv(EnvWebAuthnResidentKey, rk)
+
+			cfg, err := LoadWebAuthn("development")
+			if err != nil {
+				t.Fatalf("LoadWebAuthn(%q): %v", rk, err)
+			}
+			if cfg.ResidentKey != rk {
+				t.Errorf("ResidentKey = %q, want %q", cfg.ResidentKey, rk)
+			}
+		})
+	}
+
+	for _, rk := range []string{"Required", "yes", "resident"} {
+		t.Run("rejects "+rk, func(t *testing.T) {
+			clearWebAuthnEnv(t)
+			t.Setenv(EnvWebAuthnResidentKey, rk)
+
+			_, err := LoadWebAuthn("development")
+			if err == nil {
+				t.Fatalf("LoadWebAuthn(%q) succeeded, want an error", rk)
+			}
+			if !strings.Contains(err.Error(), EnvWebAuthnResidentKey) {
+				t.Errorf("error = %q, want it to name %s", err.Error(), EnvWebAuthnResidentKey)
+			}
+		})
+	}
+}
+
+func TestLoadWebAuthnNamedLoginFloorBounds(t *testing.T) {
+	tests := []struct {
+		name       string
+		floor      string
+		wantErr    bool
+		wantSubstr string
+		want       time.Duration
+	}{
+		{name: "default", floor: "", want: defaultWebAuthnNamedLoginFloor},
+		{name: "accepted", floor: "300ms", want: 300 * time.Millisecond},
+		{name: "at the cap", floor: "2s", want: 2 * time.Second},
+		{name: "over the cap", floor: "3s", wantErr: true, wantSubstr: "must not exceed"},
+		{name: "unparseable rejected", floor: "soon", wantErr: true, wantSubstr: "invalid"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearWebAuthnEnv(t)
+			if tc.floor != "" {
+				t.Setenv(EnvWebAuthnNamedLoginFloor, tc.floor)
+			}
+
+			cfg, err := LoadWebAuthn("development")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("LoadWebAuthn(floor=%q) succeeded, want an error", tc.floor)
+				}
+				if !strings.Contains(err.Error(), tc.wantSubstr) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadWebAuthn(floor=%q): %v", tc.floor, err)
+			}
+			if cfg.NamedLoginFloor != tc.want {
+				t.Errorf("NamedLoginFloor = %v, want %v", cfg.NamedLoginFloor, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadWebAuthnRequiresMockKeyOutsideDevelopment enforces the
+// no-hardcoded-secrets rule for the one WebAuthn secret. Booting production
+// without it would make every decoy locally computable, quietly restoring the
+// account-enumeration oracle the mock ceremony exists to close.
+func TestLoadWebAuthnRequiresMockKeyOutsideDevelopment(t *testing.T) {
+	for _, env := range []string{"staging", "production"} {
+		t.Run(env, func(t *testing.T) {
+			clearWebAuthnEnv(t)
+			t.Setenv(EnvWebAuthnRPID, "identity.hatef.ir")
+			t.Setenv(EnvWebAuthnRPOrigins, "https://identity.hatef.ir")
+
+			_, err := LoadWebAuthn(env)
+			if err == nil {
+				t.Fatalf("LoadWebAuthn(%q) succeeded without %s, want an error",
+					env, EnvWebAuthnMockChallengeKey)
+			}
+			if !strings.Contains(err.Error(), EnvWebAuthnMockChallengeKey) {
+				t.Errorf("error = %q, want it to name %s", err.Error(), EnvWebAuthnMockChallengeKey)
+			}
+		})
+	}
+}
+
+// TestLoadWebAuthnRejectsShortMockKey proves a too-short key is refused rather
+// than silently accepted: a guessable key is as good as no key at all.
+func TestLoadWebAuthnRejectsShortMockKey(t *testing.T) {
+	clearWebAuthnEnv(t)
+	t.Setenv(EnvWebAuthnMockChallengeKey, "too-short")
+
+	_, err := LoadWebAuthn("development")
+	if err == nil {
+		t.Fatal("LoadWebAuthn succeeded with a short mock key, want an error")
+	}
+	if !strings.Contains(err.Error(), "at least") {
+		t.Errorf("error = %q, want it to state the minimum length", err.Error())
+	}
+}
+
+// TestLoadWebAuthnGeneratesDevelopmentMockKey proves development needs no
+// configuration at all: a random per-process key is minted so the service boots.
+func TestLoadWebAuthnGeneratesDevelopmentMockKey(t *testing.T) {
+	clearWebAuthnEnv(t)
+
+	first, err := LoadWebAuthn("development")
+	if err != nil {
+		t.Fatalf("LoadWebAuthn: %v", err)
+	}
+	if len(first.MockChallengeKey) < minWebAuthnMockChallengeKeyLen {
+		t.Fatalf("len(MockChallengeKey) = %d, want at least %d",
+			len(first.MockChallengeKey), minWebAuthnMockChallengeKeyLen)
+	}
+
+	second, err := LoadWebAuthn("development")
+	if err != nil {
+		t.Fatalf("LoadWebAuthn: %v", err)
+	}
+	if reflect.DeepEqual(first.MockChallengeKey, second.MockChallengeKey) {
+		t.Error("the generated development key repeated; it must be random per load")
+	}
+}
+
+// TestLoadWebAuthnAcceptsBase64MockKey proves the KMS-shaped form (base64 key
+// material) is decoded rather than used as literal text.
+func TestLoadWebAuthnAcceptsBase64MockKey(t *testing.T) {
+	clearWebAuthnEnv(t)
+	raw := bytes.Repeat([]byte{0x5A}, 32)
+	t.Setenv(EnvWebAuthnMockChallengeKey, base64.StdEncoding.EncodeToString(raw))
+
+	cfg, err := LoadWebAuthn("development")
+	if err != nil {
+		t.Fatalf("LoadWebAuthn: %v", err)
+	}
+	if !bytes.Equal(cfg.MockChallengeKey, raw) {
+		t.Errorf("MockChallengeKey = %x, want the decoded %x", cfg.MockChallengeKey, raw)
+	}
+}
+
 // TestLoadWebAuthnErrorsReturnZeroConfig guards against a caller accidentally
 // using a partially-populated config after ignoring the error.
+
 func TestLoadWebAuthnErrorsReturnZeroConfig(t *testing.T) {
 	clearWebAuthnEnv(t)
 	t.Setenv(EnvWebAuthnRPID, "identity.hatef.ir")

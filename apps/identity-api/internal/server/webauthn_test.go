@@ -8,9 +8,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -98,7 +100,19 @@ func (f *fakeWebAuthnCredentialStore) GetWebauthnCredentialForUpdate(_ context.C
 	return db.WebauthnCredential{}, pgx.ErrNoRows
 }
 
+// GetUserByWebauthnUserHandle resolves the account a discoverable assertion
+// names from its anonymised user handle.
+func (f *fakeWebAuthnUserStore) GetUserByWebauthnUserHandle(_ context.Context, handle []byte) (db.User, error) {
+	for _, u := range f.byID {
+		if len(u.WebauthnUserHandle) > 0 && bytes.Equal(u.WebauthnUserHandle, handle) {
+			return u, nil
+		}
+	}
+	return db.User{}, pgx.ErrNoRows
+}
+
 func (f *fakeWebAuthnCredentialStore) UpdateWebauthnSignCount(_ context.Context, arg db.UpdateWebauthnSignCountParams) (int64, error) {
+
 	for userID, rows := range f.byUser {
 		for i, row := range rows {
 			if bytes.Equal(row.ID, arg.ID) {
@@ -144,7 +158,8 @@ func newWebAuthnTestServer(t *testing.T) *webAuthnTestServer {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	user := db.User{ID: uuid.New(), Email: "passkey@example.com"}
+	// Only active accounts may authenticate, so the seeded account is active.
+	user := db.User{ID: uuid.New(), Email: "passkey@example.com", Status: "active"}
 	users := &fakeWebAuthnUserStore{
 		byID:    map[uuid.UUID]db.User{user.ID: user},
 		byEmail: map[string]uuid.UUID{user.Email: user.ID},
@@ -157,7 +172,15 @@ func newWebAuthnTestServer(t *testing.T) *webAuthnTestServer {
 		RPOrigins:        []string{"http://localhost:8080"},
 		ChallengeTTL:     5 * time.Minute,
 		UserVerification: "preferred",
+		ResidentKey:      "required",
+		// A fixed, obviously-fake derivation key: these tests assert on HTTP
+		// status codes, not on the decoy bytes themselves.
+		MockChallengeKey: bytes.Repeat([]byte{0x2A}, 32),
+		// No timing pad: the handler tests would otherwise sleep on every
+		// user-named request for no assertion value.
+		NamedLoginFloor: 0,
 	}, users, creds, webauthn.NewMemoryChallengeStore())
+
 	if err != nil {
 		t.Fatalf("webauthn.New: %v", err)
 	}
@@ -311,19 +334,24 @@ func TestWebAuthnAccountRoutesRequireSession(t *testing.T) {
 }
 
 // TestWebAuthnLoginRoutesAreUnauthenticated proves the login endpoints are
-// reachable without a session — they are how a user signs in — by asserting they
-// fail on their own merits (400/401) rather than on the session guard.
+// reachable without a session — they are how a user signs in — rather than being
+// short-circuited by the session guard that protects the enrolment routes.
 func TestWebAuthnLoginRoutesAreUnauthenticated(t *testing.T) {
 	fx := newWebAuthnTestServer(t)
 
+	// Since Task 4.3 this succeeds even though the account has no passkey: the
+	// service answers with a mock ceremony rather than an error, which is what
+	// makes the endpoint useless for enumeration. Reaching 200 without a cookie
+	// is itself the proof the guard is not in front of this route.
 	rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", []byte(`{"email":"passkey@example.com"}`), nil)
-	// The account exists but has no passkeys yet, so this is a 401 from the
-	// service, not the 401 the guard would produce before reaching it.
-	if rec.Code == http.StatusOK {
-		t.Fatal("login options succeeded for an account with no credentials")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if got := decodeWebAuthnError(t, rec); got.Error != "invalid_credentials" {
-		t.Errorf("error = %q, want %q (proving the handler ran, not the session guard)", got.Error, "invalid_credentials")
+
+	// The usernameless variant is likewise reachable unauthenticated.
+	discoverable := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", []byte(`{}`), nil)
+	if discoverable.Code != http.StatusOK {
+		t.Fatalf("discoverable status = %d, want %d", discoverable.Code, http.StatusOK)
 	}
 }
 
@@ -505,50 +533,141 @@ func TestWebAuthnErrorMapping(t *testing.T) {
 	})
 }
 
-// TestLoginOptionsRequiresEmail proves the user-named login path rejects a
-// request that does not name an account.
-func TestLoginOptionsRequiresEmail(t *testing.T) {
-	fx := newWebAuthnTestServer(t)
-
+// TestLoginOptionsOmittedEmailRunsDiscoverableFlow proves a request that names
+// no account is not an error but a request for the primary, usernameless
+// ceremony: the response carries an empty allowCredentials list.
+func TestLoginOptionsOmittedEmailRunsDiscoverableFlow(t *testing.T) {
 	bodies := map[string][]byte{
-		"empty":        {},
-		"not json":     []byte("nope"),
+		"absent body":  nil,
+		"empty body":   {},
 		"empty object": []byte(`{}`),
 		"other field":  []byte(`{"other":"field"}`),
 		"empty string": []byte(`{"email":""}`),
+		"blank string": []byte(`{"email":"   "}`),
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
+			fx := newWebAuthnTestServer(t)
 			rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", body, nil)
 
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 			}
-			if got := decodeWebAuthnError(t, rec); got.Error != "invalid_request" {
-				t.Errorf("error = %q, want %q", got.Error, "invalid_request")
+
+			var options struct {
+				PublicKey struct {
+					Challenge          string `json:"challenge"`
+					AllowedCredentials []struct {
+						ID string `json:"id"`
+					} `json:"allowCredentials"`
+				} `json:"publicKey"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&options); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if options.PublicKey.Challenge == "" {
+				t.Error("publicKey.challenge is empty")
+			}
+			if n := len(options.PublicKey.AllowedCredentials); n != 0 {
+				t.Errorf("len(allowCredentials) = %d, want 0 for a usernameless ceremony", n)
 			}
 		})
 	}
 }
 
-// TestLoginOptionsIsNotAnEnumerationOracle proves an unknown account and a
-// known-but-passkey-less account are indistinguishable on the wire. Task 4.3
-// replaces this with a mock challenge, which removes the remaining signal that a
-// 401 means "not registered".
+// TestLoginOptionsMalformedJSONReturns400 proves a body that is present but not
+// valid JSON is still a client error: it cannot be silently reinterpreted as the
+// discoverable flow, which would hide a broken client.
+func TestLoginOptionsMalformedJSONReturns400(t *testing.T) {
+	fx := newWebAuthnTestServer(t)
+
+	rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", []byte("nope"), nil)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if got := decodeWebAuthnError(t, rec); got.Error != "invalid_request" {
+		t.Errorf("error = %q, want %q", got.Error, "invalid_request")
+	}
+}
+
+// TestLoginOptionsIsNotAnEnumerationOracle is the account-harvesting assertion
+// at the HTTP boundary: a registered account, a registered account with no
+// passkey, and an address that was never registered must all produce the same
+// status and the same response shape, so the endpoint answers no question about
+// who has an account (docs/api-design.md §1.3).
 func TestLoginOptionsIsNotAnEnumerationOracle(t *testing.T) {
 	fx := newWebAuthnTestServer(t)
 
-	unknown := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", []byte(`{"email":"nobody@example.com"}`), nil)
-	known := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", []byte(`{"email":"passkey@example.com"}`), nil)
+	// An account that can genuinely log in, so the comparison is against a real
+	// ceremony rather than two flavours of failure.
+	enrolled := db.User{
+		ID:                 uuid.New(),
+		Email:              "enrolled@example.com",
+		Status:             "active",
+		WebauthnUserHandle: bytes.Repeat([]byte{0x11}, 8),
+	}
+	fx.users.byID[enrolled.ID] = enrolled
+	fx.users.byEmail[enrolled.Email] = enrolled.ID
+	fx.creds.byUser[enrolled.ID] = []db.WebauthnCredential{{
+		ID:     bytes.Repeat([]byte{0x22}, 32),
+		UserID: enrolled.ID,
+	}}
 
-	if unknown.Code != http.StatusUnauthorized {
-		t.Errorf("unknown account status = %d, want %d", unknown.Code, http.StatusUnauthorized)
+	shapes := make(map[string][]string)
+	for _, email := range []string{
+		enrolled.Email,        // real, usable
+		"passkey@example.com", // real, no passkey
+		"nobody@example.com",  // never registered
+	} {
+		body, err := json.Marshal(map[string]string{"email": email})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/login/generate-options", body, nil)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want %d", email, rec.Code, http.StatusOK)
+		}
+
+		var wire struct {
+			PublicKey struct {
+				RelyingPartyID     string `json:"rpId"`
+				UserVerification   string `json:"userVerification"`
+				Timeout            int    `json:"timeout"`
+				Challenge          string `json:"challenge"`
+				AllowedCredentials []struct {
+					ID   string `json:"id"`
+					Type string `json:"type"`
+				} `json:"allowCredentials"`
+			} `json:"publicKey"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&wire); err != nil {
+			t.Fatalf("%s: decode body: %v", email, err)
+		}
+
+		// The fingerprint deliberately excludes the challenge and credential ID
+		// *values* (which must differ) but keeps their lengths and every other
+		// field, since any of those differing would be an enumeration signal.
+		fingerprint := []string{
+			wire.PublicKey.RelyingPartyID,
+			wire.PublicKey.UserVerification,
+			fmt.Sprint(wire.PublicKey.Timeout),
+			fmt.Sprint(len(wire.PublicKey.Challenge)),
+			fmt.Sprint(len(wire.PublicKey.AllowedCredentials)),
+		}
+		for _, cred := range wire.PublicKey.AllowedCredentials {
+			fingerprint = append(fingerprint, cred.Type, fmt.Sprint(len(cred.ID)))
+		}
+		shapes[email] = fingerprint
 	}
-	if known.Code != unknown.Code {
-		t.Errorf("known-account status = %d, unknown-account status = %d; they must match", known.Code, unknown.Code)
-	}
-	if got, want := decodeWebAuthnError(t, known), decodeWebAuthnError(t, unknown); got != want {
-		t.Errorf("known-account error = %+v, unknown-account error = %+v; they must match", got, want)
+
+	want := shapes[enrolled.Email]
+	for email, got := range shapes {
+		if !slices.Equal(got, want) {
+			t.Errorf("%s response shape = %v, enrolled-account shape = %v; they must be identical",
+				email, got, want)
+		}
 	}
 }
 

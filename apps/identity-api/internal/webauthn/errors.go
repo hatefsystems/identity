@@ -40,4 +40,46 @@ var (
 	// not strictly increase, signalling a possible cloned authenticator
 	// (docs/architecture.md "Signature Counter Auditing").
 	ErrCredentialCloned = errors.New("webauthn: cloned authenticator detected")
+
+	// ErrMockChallenge indicates the completed ceremony was started against a
+	// mock challenge issued for an identity that cannot log in (unknown email,
+	// or an account with no usable passkey). It is returned only from the
+	// verify step, and only because the caller cannot possibly produce a valid
+	// signature for a credential that does not exist; the handler maps it to
+	// the same opaque 401 as every other login failure so the mock remains
+	// indistinguishable from a real ceremony (docs/api-design.md §1.3).
+	ErrMockChallenge = errors.New("webauthn: mock challenge cannot be completed")
+
+	// ErrChallengeFlowMismatch indicates a challenge issued for one ceremony
+	// was replayed into another — e.g. a registration challenge submitted to
+	// the login verifier. The clientDataJSON ceremony type would also catch
+	// this inside the library, but failing early keeps each flow's verifier
+	// operating only on challenges it actually issued.
+	ErrChallengeFlowMismatch = errors.New("webauthn: challenge belongs to a different ceremony")
+
+	// ErrAccountNotActive indicates the assertion was cryptographically valid
+	// but the account is suspended, awaiting verification, or queued for
+	// deletion, so no session may be issued for it.
+	ErrAccountNotActive = errors.New("webauthn: account is not active")
 )
+
+// isDomainError reports whether err is one of this package's sentinels, i.e. an
+// expected authentication outcome rather than an infrastructure fault.
+//
+// It exists for the discoverable-login callback: the library wraps whatever the
+// handler returns inside its own lookup error, so by the time the error comes
+// back out it can no longer be told apart from a failed signature. Classifying
+// it on the way in preserves the distinction that decides between an opaque 401
+// and a 500 — without which a database outage would be silently reported to
+// every user as "invalid credentials".
+func isDomainError(err error) bool {
+	switch {
+	case errors.Is(err, ErrUserNotFound),
+		errors.Is(err, ErrNoCredentials),
+		errors.Is(err, ErrAccountNotActive),
+		errors.Is(err, ErrVerification):
+		return true
+	default:
+		return false
+	}
+}

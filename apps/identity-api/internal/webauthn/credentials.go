@@ -22,7 +22,14 @@ type UserStore interface {
 	GetUserByEmail(ctx context.Context, email string) (db.User, error)
 	// GetUserByID resolves an active account by its UUID primary key.
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
+	// GetUserByWebauthnUserHandle resolves an active account from the
+	// anonymised user handle an authenticator returns in a discoverable
+	// (usernameless) assertion. This is the User-Handle-first lookup path the
+	// passkey flow depends on, and the reason the handle is persisted per user
+	// rather than per credential.
+	GetUserByWebauthnUserHandle(ctx context.Context, webauthnUserHandle []byte) (db.User, error)
 	// SetWebauthnUserHandle persists the CSPRNG user handle on first passkey
+
 	// registration; it only writes when the column is currently NULL and
 	// reports the number of rows affected.
 	SetWebauthnUserHandle(ctx context.Context, arg db.SetWebauthnUserHandleParams) (int64, error)
@@ -38,6 +45,7 @@ type CredentialStore interface {
 	// used to build the allowCredentials list for a user-named login ceremony.
 	ListWebauthnCredentialsByUser(ctx context.Context, userID uuid.UUID) ([]db.WebauthnCredential, error)
 	// GetWebauthnCredentialForUpdate row-locks a credential (SELECT ... FOR
+
 	// UPDATE) so the sign-count check-then-write during login is atomic across
 	// concurrent assertions.
 	GetWebauthnCredentialForUpdate(ctx context.Context, id []byte) (db.WebauthnCredential, error)

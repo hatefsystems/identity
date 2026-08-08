@@ -303,7 +303,11 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 		RPOrigins:        wc.RPOrigins,
 		ChallengeTTL:     wc.ChallengeTTL,
 		UserVerification: wc.UserVerification,
+		ResidentKey:      wc.ResidentKey,
+		MockChallengeKey: wc.MockChallengeKey,
+		NamedLoginFloor:  wc.NamedLoginFloor,
 	}, queries, queries, webauthn.NewMemoryChallengeStore(), webauthn.WithTransacter(pool))
+
 	if err != nil {
 		pool.Close()
 		return nil, nil, fmt.Errorf("main: build webauthn service: %w", err)
@@ -313,6 +317,8 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 		slog.String("rp_id", wc.RPID),
 		slog.Int("origins", len(wc.RPOrigins)),
 		slog.String("user_verification", wc.UserVerification),
+		slog.String("resident_key", wc.ResidentKey),
 	)
+
 	return svc, pool, nil
 }

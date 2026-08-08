@@ -1,6 +1,7 @@
 package webauthn
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -11,6 +12,16 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// testNamedLoginFloor is the constant-time budget the fixtures configure for
+// user-named login options. It is asserted against rather than slept through:
+// the fixture replaces Service.sleep with a recorder.
+const testNamedLoginFloor = 150 * time.Millisecond
+
+// testMockKey is the mock-derivation secret used across the suite. It is a
+// fixed, obviously-fake value so decoy derivations are reproducible between
+// runs; production keys come from the KMS (see config.LoadWebAuthn).
+var testMockKey = bytes.Repeat([]byte{0x2A}, 32)
+
 // testConfig returns a valid development-shaped RP configuration for the
 // localhost origin the software authenticator in service_test.go signs for.
 func testConfig() Config {
@@ -20,6 +31,9 @@ func testConfig() Config {
 		RPOrigins:        []string{"http://localhost:8080"},
 		ChallengeTTL:     5 * time.Minute,
 		UserVerification: "preferred",
+		ResidentKey:      "required",
+		MockChallengeKey: testMockKey,
+		NamedLoginFloor:  testNamedLoginFloor,
 	}
 }
 
@@ -89,6 +103,24 @@ func TestNewFailsFast(t *testing.T) {
 			name:       "negative TTL",
 			mutate:     func(c *Config) { c.ChallengeTTL = -time.Second },
 			wantSubstr: "challenge TTL must be positive",
+		},
+		{
+			// Without a key the decoys are computable by anyone, so the mock
+			// ceremony becomes recognisable and the user-named path silently
+			// regains the enumeration oracle it exists to remove.
+			name:       "missing mock challenge key",
+			mutate:     func(c *Config) { c.MockChallengeKey = nil },
+			wantSubstr: "mock challenge key is required",
+		},
+		{
+			name:       "negative login floor",
+			mutate:     func(c *Config) { c.NamedLoginFloor = -time.Second },
+			wantSubstr: "named login floor must not be negative",
+		},
+		{
+			name:       "unknown resident key requirement",
+			mutate:     func(c *Config) { c.ResidentKey = "sometimes" },
+			wantSubstr: "resident key requirement",
 		},
 	}
 
@@ -178,25 +210,25 @@ type fakeTx struct {
 	ft *fakeTransacter
 }
 
-func (f *fakeTx) Begin(ctx context.Context) (pgx.Tx, error) {
+func (f *fakeTx) Begin(_ context.Context) (pgx.Tx, error) {
 	return f, nil
 }
 
-func (f *fakeTx) Commit(ctx context.Context) error {
+func (f *fakeTx) Commit(_ context.Context) error {
 	f.ft.commitCalled = true
 	return f.ft.commitErr
 }
 
-func (f *fakeTx) Rollback(ctx context.Context) error {
+func (f *fakeTx) Rollback(_ context.Context) error {
 	f.ft.rollbackCalled = true
 	return nil
 }
 
-func (f *fakeTx) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
+func (f *fakeTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
 	return 0, nil
 }
 
-func (f *fakeTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+func (f *fakeTx) SendBatch(_ context.Context, _ *pgx.Batch) pgx.BatchResults {
 	return nil
 }
 
@@ -204,19 +236,19 @@ func (f *fakeTx) LargeObjects() pgx.LargeObjects {
 	return pgx.LargeObjects{}
 }
 
-func (f *fakeTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
+func (f *fakeTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescription, error) {
 	return nil, nil
 }
 
-func (f *fakeTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+func (f *fakeTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
 
-func (f *fakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+func (f *fakeTx) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
 	return nil, nil
 }
 
-func (f *fakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+func (f *fakeTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
 	return nil
 }
 
@@ -224,7 +256,7 @@ func (f *fakeTx) Conn() *pgx.Conn {
 	return nil
 }
 
-func (ft *fakeTransacter) Begin(ctx context.Context) (pgx.Tx, error) {
+func (ft *fakeTransacter) Begin(_ context.Context) (pgx.Tx, error) {
 	ft.beginCalled = true
 	if ft.beginErr != nil {
 		return nil, ft.beginErr
@@ -243,7 +275,7 @@ func TestWithTransacterOption(t *testing.T) {
 	}
 
 	// Verify runInTx commits on success
-	err = svc.runInTx(context.Background(), func(u UserStore, c CredentialStore) error {
+	err = svc.runInTx(context.Background(), func(_ UserStore, _ CredentialStore) error {
 		return nil
 	})
 	if err != nil {
@@ -257,7 +289,7 @@ func TestWithTransacterOption(t *testing.T) {
 	ftErr := &fakeTransacter{}
 	svcErr, _ := New(testConfig(), &fakeUserStore{}, &fakeCredentialStore{}, NewMemoryChallengeStore(), WithTransacter(ftErr))
 	expectedErr := errors.New("fn failed")
-	err = svcErr.runInTx(context.Background(), func(u UserStore, c CredentialStore) error {
+	err = svcErr.runInTx(context.Background(), func(_ UserStore, _ CredentialStore) error {
 		return expectedErr
 	})
 	if !errors.Is(err, expectedErr) {
