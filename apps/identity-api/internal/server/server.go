@@ -19,6 +19,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -56,6 +57,11 @@ type Deps struct {
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
 	// at /api/v1/auth/mfa.
 	MFA *mfa.Service
+	// SMSOTP drives the SMS OTP phone-verification routes at
+	// /api/v1/users/me/phone. It requires both Redis (rate limiting + code
+	// store) and a database (persisting the verified phone), so when nil
+	// (no REDIS_URL/DATABASE_URL configured) those routes are not mounted.
+	SMSOTP *smsotp.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -136,6 +142,12 @@ func (s *Server) registerRoutes() {
 	// TOTP MFA routes are mounted when an MFA service is provisioned.
 	if s.deps.MFA != nil {
 		s.registerMFARoutes()
+	}
+
+	// SMS OTP phone-verification routes are mounted when the service is
+	// provisioned (it requires Redis and a database).
+	if s.deps.SMSOTP != nil {
+		s.registerPhoneRoutes()
 	}
 }
 

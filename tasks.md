@@ -43,7 +43,8 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 4.2:** Implement WebAuthn/FIDO2 passwordless registration and verification flows (origin checks, RP ID binding, signature counter validation, random 64-bit user ID challenge mapping).
 - [x] **Task 4.3:** Implement WebAuthn discoverable credentials (usernameless login) as the primary secure path, plus mock challenge fallback for legacy user-named flows to mitigate account harvesting.
 - [x] **Task 4.4:** Implement Multi-Factor Authentication (MFA) via TOTP, including secret generation, QR code mapping, and verification.
-- [ ] **Task 4.5:** Implement SMS OTP workflows with independent Redis-based rate limiting via sorted sets (ZSET) Lua scripts (rate-limiting per phone number and per IP `/24` or `/48` subnet window), plus failed-attempt brute-force lockout.
+- [x] **Task 4.5:** Implement SMS OTP workflows with independent Redis-based rate limiting via sorted sets (ZSET) Lua scripts (rate-limiting per phone number and per IP `/24` or `/48` subnet window), plus failed-attempt brute-force lockout.
+
 - [ ] **Task 4.6:** Implement high-entropy (minimum 128-bit) recovery backup codes stored hashed with SHA-256, performing verification and physical deletion in an atomic ACID database transaction.
 - [ ] **Task 4.7:** Implement the Step-up Authentication framework, issuing short-lived ACR tokens (`https://ref.hatef.ir/acr/stepup`) upon successful MFA/WebAuthn UV challenge, required for high-risk endpoints.
 

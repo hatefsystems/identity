@@ -14,16 +14,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -85,6 +91,23 @@ func run(logger *slog.Logger) error {
 		defer pool.Close()
 	}
 
+	redisClient, err := buildRedisClient(cfg.Environment, logger)
+	if err != nil {
+		return err
+	}
+	if redisClient != nil {
+		defer func() { _ = redisClient.Close() }()
+	}
+
+	// The SMS OTP service shares the WebAuthn database pool (it persists the
+	// verified phone) and the Redis client (rate limiting + code store). When
+	// either backing store is absent in development the service is skipped and
+	// its routes are left unmounted.
+	smsotpService, err := buildSMSOTPService(cfg.Environment, pool, redisClient, logger)
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
 		OIDC:           oidcCfg,
 		Keys:           keyManager,
@@ -93,6 +116,7 @@ func run(logger *slog.Logger) error {
 		DPoPValidator:  dpopValidator,
 		SessionManager: sessionManager,
 		WebAuthn:       webauthnService,
+		SMSOTP:         smsotpService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -321,4 +345,116 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 	)
 
 	return svc, pool, nil
+}
+
+// redisConnectTimeout bounds the startup connectivity probe against Redis so an
+// unreachable cache fails the boot quickly instead of hanging the process.
+const redisConnectTimeout = 5 * time.Second
+
+// buildRedisClient opens the Redis connection backing the SMS OTP rate limiter
+// and code store. It parses REDIS_URL (redis://... — the same variable used by
+// docker-compose.dev.yml) and probes connectivity once at startup.
+//
+// Following the WebAuthn precedent, a missing REDIS_URL is tolerated in
+// development: the client is skipped (nil return), which leaves the phone
+// routes unmounted so the rest of the API still boots for local work. Outside
+// development Redis is mandatory, so a missing REDIS_URL is a startup error.
+func buildRedisClient(environment string, logger *slog.Logger) (*redis.Client, error) {
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		if environment != "development" {
+			return nil, fmt.Errorf("main: REDIS_URL is required in %q environment", environment)
+		}
+		logger.Warn("no REDIS_URL configured; SMS OTP phone routes are disabled")
+		return nil, nil
+	}
+
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("main: parse REDIS_URL: %w", err)
+	}
+	client := redis.NewClient(opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), redisConnectTimeout)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("main: ping redis: %w", err)
+	}
+	return client, nil
+}
+
+// buildSMSOTPService assembles the SMS OTP phone-verification service (Task
+// 4.5). It needs both a database (to persist the verified, envelope-encrypted
+// phone and its blind index) and Redis (for the independent-dimension sliding
+// window rate limits and the pending-code / lockout store), plus the crypto
+// module secrets.
+//
+// When either backing store is absent — which only happens in development,
+// since buildWebAuthnService/buildRedisClient already make them mandatory
+// elsewhere — the service is skipped (nil return) and its routes are left
+// unmounted, matching the WebAuthn precedent. In development the log-only
+// sender is used so no real SMS gateway credential is required.
+func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) (*smsotp.Service, error) {
+	if pool == nil || redisClient == nil {
+		logger.Warn("SMS OTP service disabled (requires both DATABASE_URL and REDIS_URL)")
+		return nil, nil
+	}
+
+	smsCfg, err := config.LoadSMS(environment)
+	if err != nil {
+		return nil, err
+	}
+
+	cryptoCfg, err := config.LoadCrypto()
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := kms.NewMockProvider(cryptoCfg.MasterKEK, cryptoCfg.MasterKEKVersion)
+	if err != nil {
+		return nil, fmt.Errorf("main: build KMS provider: %w", err)
+	}
+	encryptor, err := envelope.New(provider)
+	if err != nil {
+		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
+	}
+	indexer, err := blindindex.New(cryptoCfg.BlindIndexPepper)
+	if err != nil {
+		return nil, fmt.Errorf("main: build blind indexer: %w", err)
+	}
+
+	limiter, err := ratelimit.NewRedisLimiter(redisClient)
+	if err != nil {
+		return nil, fmt.Errorf("main: build rate limiter: %w", err)
+	}
+	otpStore, err := smsotp.NewRedisOTPStore(redisClient)
+	if err != nil {
+		return nil, fmt.Errorf("main: build OTP store: %w", err)
+	}
+
+	// Development uses the log-only sender (no real gateway/toll cost). A real
+	// gateway client is wired here in production once the provider is chosen.
+	sender := smsotp.NewLogSender(logger)
+
+	svc, err := smsotp.New(smsotp.Config{
+		CodeTTL:           smsCfg.CodeTTL,
+		MaxAttempts:       smsCfg.MaxAttempts,
+		LockoutTTL:        smsCfg.LockoutTTL,
+		PerPhonePerMinute: smsCfg.PerPhonePerMinute,
+		PerPhonePerHour:   smsCfg.PerPhonePerHour,
+		PerSubnetPerHour:  smsCfg.PerSubnetPerHour,
+		HashPepper:        smsCfg.HashPepper,
+	}, db.New(pool), encryptor, indexer, limiter, otpStore, sender)
+	if err != nil {
+		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)
+	}
+
+	logger.Info("sms otp service configured",
+		slog.Int("per_phone_per_minute", smsCfg.PerPhonePerMinute),
+		slog.Int("per_phone_per_hour", smsCfg.PerPhonePerHour),
+		slog.Int("per_subnet_per_hour", smsCfg.PerSubnetPerHour),
+		slog.Int("max_attempts", smsCfg.MaxAttempts),
+	)
+	return svc, nil
 }
