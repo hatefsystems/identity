@@ -21,12 +21,14 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
@@ -108,6 +110,23 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// The TOTP MFA service reuses the WebAuthn database pool. When no database
+	// is configured (development only) it is skipped and its routes are left
+	// unmounted.
+	mfaService, err := buildMFAService(pool, logger)
+	if err != nil {
+		return err
+	}
+
+	// The recovery-code service reuses the WebAuthn database pool and, when
+	// present, the Redis client for its optional rate limits. When no database
+	// is configured (development only) it is skipped and its routes are left
+	// unmounted.
+	recoveryService, err := buildRecoveryService(pool, redisClient, logger)
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
 		OIDC:           oidcCfg,
 		Keys:           keyManager,
@@ -116,11 +135,12 @@ func run(logger *slog.Logger) error {
 		DPoPValidator:  dpopValidator,
 		SessionManager: sessionManager,
 		WebAuthn:       webauthnService,
+		MFA:            mfaService,
 		SMSOTP:         smsotpService,
+		Recovery:       recoveryService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -455,6 +475,97 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		slog.Int("per_phone_per_hour", smsCfg.PerPhonePerHour),
 		slog.Int("per_subnet_per_hour", smsCfg.PerSubnetPerHour),
 		slog.Int("max_attempts", smsCfg.MaxAttempts),
+	)
+	return svc, nil
+}
+
+// buildMFAService assembles the TOTP MFA service (Task 4.4). It reuses the
+// WebAuthn database pool for the user store and the crypto module for
+// envelope-encrypting the stored TOTP secret.
+//
+// When no database is configured — development only, since buildWebAuthnService
+// already makes it mandatory elsewhere — the service is skipped (nil return)
+// and its routes are left unmounted, matching the WebAuthn precedent.
+func buildMFAService(pool *pgxpool.Pool, logger *slog.Logger) (*mfa.Service, error) {
+	if pool == nil {
+		logger.Warn("MFA service disabled (requires DATABASE_URL)")
+		return nil, nil
+	}
+
+	cryptoCfg, err := config.LoadCrypto()
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := kms.NewMockProvider(cryptoCfg.MasterKEK, cryptoCfg.MasterKEKVersion)
+	if err != nil {
+		return nil, fmt.Errorf("main: build KMS provider: %w", err)
+	}
+	encryptor, err := envelope.New(provider)
+	if err != nil {
+		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
+	}
+
+	svc, err := mfa.New(mfa.Config{}, db.New(pool), encryptor)
+	if err != nil {
+		return nil, fmt.Errorf("main: build MFA service: %w", err)
+	}
+
+	logger.Info("totp mfa service configured")
+	return svc, nil
+}
+
+// buildRecoveryService assembles the recovery (backup) code service (Task 4.6).
+// It reuses the WebAuthn database pool for the code store and, when Redis is
+// configured, the shared sliding-window limiter to throttle generate/verify by
+// account and subnet. The optional hash pepper is injected from the
+// environment/KMS; when unset the service falls back to plain SHA-256.
+//
+// When no database is configured — development only, since buildWebAuthnService
+// already makes it mandatory elsewhere — the service is skipped (nil return)
+// and its routes are left unmounted, matching the WebAuthn precedent.
+func buildRecoveryService(pool *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) (*recovery.Service, error) {
+	if pool == nil {
+		logger.Warn("recovery-code service disabled (requires DATABASE_URL)")
+		return nil, nil
+	}
+
+	rc, err := config.LoadRecovery()
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []recovery.Option{recovery.WithTransacter(pool)}
+
+	// The recovery limiter is best-effort hardening: when Redis is present it
+	// throttles brute force against the verify endpoint and abuse of generate,
+	// but its absence (development) must not disable the codes themselves.
+	if redisClient != nil {
+		limiter, err := ratelimit.NewRedisLimiter(redisClient)
+		if err != nil {
+			return nil, fmt.Errorf("main: build rate limiter: %w", err)
+		}
+		opts = append(opts, recovery.WithRateLimiter(limiter))
+	}
+
+	svc, err := recovery.New(recovery.Config{
+		Count:             rc.Count,
+		EntropyBits:       rc.EntropyBits,
+		LowThreshold:      rc.LowThreshold,
+		HashPepper:        rc.HashPepper,
+		PerAccountPerHour: rc.PerAccountPerHour,
+		PerSubnetPerHour:  rc.PerSubnetPerHour,
+	}, db.New(pool), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("main: build recovery service: %w", err)
+	}
+
+	logger.Info("recovery code service configured",
+		slog.Int("count", rc.Count),
+		slog.Int("entropy_bits", rc.EntropyBits),
+		slog.Int("low_threshold", rc.LowThreshold),
+		slog.Bool("rate_limited", redisClient != nil),
+		slog.Bool("peppered", len(rc.HashPepper) > 0),
 	)
 	return svc, nil
 }

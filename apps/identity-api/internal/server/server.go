@@ -18,6 +18,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
@@ -62,6 +63,12 @@ type Deps struct {
 	// store) and a database (persisting the verified phone), so when nil
 	// (no REDIS_URL/DATABASE_URL configured) those routes are not mounted.
 	SMSOTP *smsotp.Service
+	// Recovery drives the recovery (backup) code routes at
+	// /api/v1/auth/recovery-codes and /api/v1/auth/mfa/verify-recovery-code. It
+	// requires a database, so when nil (no DATABASE_URL configured) those
+	// routes are not mounted; the routes additionally require SessionManager,
+	// since every recovery-code operation is scoped to the caller's session.
+	Recovery *recovery.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -148,6 +155,12 @@ func (s *Server) registerRoutes() {
 	// provisioned (it requires Redis and a database).
 	if s.deps.SMSOTP != nil {
 		s.registerPhoneRoutes()
+	}
+
+	// Recovery (backup) code routes are mounted when the service is
+	// provisioned (it requires a database).
+	if s.deps.Recovery != nil {
+		s.registerRecoveryRoutes()
 	}
 }
 
