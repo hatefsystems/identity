@@ -47,11 +47,22 @@ type recoveryVerifyResponse struct {
 // live session, so codes can only be minted for, inspected on, or consumed
 // against the account the caller already holds a session for.
 //
-// NOTE: docs/api-design.md marks recovery-codes/generate as requiring Step-up
-// authentication (re-assert a strong factor before minting fresh codes). That
-// enforcement is intentionally deferred to the Step-up framework in Task 4.7,
-// mirroring the same deferral on DELETE /api/v1/users/me/phone; the guard will
-// be layered onto the generate route there without changing the handler.
+// NOTE: two enforcement gaps here are deliberately owned by the Step-up/ACR
+// framework in Task 4.7, not by this task:
+//
+//  1. docs/api-design.md marks recovery-codes/generate as requiring Step-up
+//     authentication (re-assert a strong factor before minting fresh codes).
+//     That guard is deferred to Task 4.7, mirroring the same deferral on
+//     DELETE /api/v1/users/me/phone; it will be layered onto the generate route
+//     there without changing the handler.
+//  2. docs/api-design.md §1.3 describes verify-recovery-code as a *login bypass*
+//     — the factor a user presents when every passkey and the TOTP authenticator
+//     are gone — which implies it must be reachable from a half-authenticated
+//     (MFA-pending) state. No such state exists yet: session.Session carries no
+//     ACR/AMR field, so there is no partial session to accept. Rather than
+//     invent one here, the route requires a full session; Task 4.7 owns the
+//     partial-session state and will widen acceptance at this layer only,
+//     leaving recovery.Service untouched.
 func (s *Server) registerRecoveryRoutes() {
 	if s.deps.SessionManager == nil {
 		s.logger.Warn("recovery: no session manager configured; recovery-code routes not mounted")
@@ -176,15 +187,16 @@ func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 }
 
 // writeRecoveryError maps domain recovery errors to HTTP responses. A bad code
-// is an opaque 401 (never revealing why it failed), an exhausted batch is 401
-// as well (the caller simply cannot authenticate this way), a saturated limit
-// is 429, and a missing account is 401.
+// is an opaque 401 that never reveals why it failed (unknown, spent, or foreign
+// all render identically), a saturated limit is 429, and a missing or
+// non-active account is an equally opaque 401 — surfacing "suspended" here would
+// turn account state into an oracle, matching writeWebAuthnLoginError.
 func (s *Server) writeRecoveryError(w http.ResponseWriter, op string, err error) {
 	switch {
-	case errors.Is(err, recovery.ErrUserNotFound):
+	case errors.Is(err, recovery.ErrUserNotFound),
+		errors.Is(err, recovery.ErrAccountNotActive):
 		writeJSON(w, http.StatusUnauthorized, recoveryErrorResponse{Error: "unauthorized"})
-	case errors.Is(err, recovery.ErrInvalidCode),
-		errors.Is(err, recovery.ErrNoCodesRemaining):
+	case errors.Is(err, recovery.ErrInvalidCode):
 		writeJSON(w, http.StatusUnauthorized, recoveryErrorResponse{Error: "invalid_code"})
 	case errors.Is(err, recovery.ErrRateLimited):
 		writeJSON(w, http.StatusTooManyRequests, recoveryErrorResponse{Error: "rate_limited"})

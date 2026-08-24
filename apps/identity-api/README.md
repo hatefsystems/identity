@@ -1,8 +1,11 @@
 # identity-api
 
-The Go backend for the Hatef Identity Platform (IdP). This service will implement
-OIDC/OAuth 2.1, RBAC, token issuance, WebAuthn, and gRPC inter-service APIs. At
-this scaffolding stage (Task 1.2) it exposes health and readiness probes only.
+The Go backend for the Hatef Identity Platform (IdP). This service implements
+OIDC/OAuth 2.1, RBAC, token issuance, WebAuthn, MFA, and gRPC inter-service APIs.
+Alongside the health and readiness probes it currently serves the OIDC discovery
+and token endpoints, session management, WebAuthn passkey ceremonies, TOTP MFA,
+SMS OTP phone verification, and recovery (backup) codes; each route group is
+mounted only when its dependency is configured.
 
 ## Layout
 
@@ -71,24 +74,68 @@ Or directly: `go run ./cmd/migrate <up|down|reset|status>`.
 The integration tests in `internal/migrate` apply the full up/down cycle and
 verify schema invariants against the real database; they skip automatically
 when `DATABASE_URL` is unset or unreachable so `go test ./...` works offline.
+The same gating applies to `internal/db` (query layer) and `internal/recovery`
+(recovery-code atomicity).
+
+Those three packages all drive goose against the one shared schema, and
+`internal/migrate` resets it, so when `DATABASE_URL` **is** set they must not run
+in parallel:
+
+```bash
+go test -p 1 ./...   # DB-backed packages serialized
+```
 
 ## Endpoints
 
-| Method | Path       | Purpose                                     |
-| :----- | :--------- | :------------------------------------------ |
-| GET    | `/healthz` | Liveness probe. Always 200 while running.   |
-| GET    | `/readyz`  | Readiness probe. Reports service readiness. |
+| Method | Path                                        | Purpose                                              |
+| :----- | :------------------------------------------ | :--------------------------------------------------- |
+| GET    | `/healthz`                                  | Liveness probe. Always 200 while running.            |
+| GET    | `/readyz`                                   | Readiness probe. Reports service readiness.          |
+| POST   | `/api/v1/auth/recovery-codes/generate`      | Mint a one-time recovery-code batch (Task 4.6).      |
+| GET    | `/api/v1/auth/recovery-codes/status`        | Report how many unused recovery codes remain.        |
+| POST   | `/api/v1/auth/mfa/verify-recovery-code`     | Consume one recovery code as a second factor.        |
+
+Earlier tasks also mount the OIDC discovery/JWKS, token, session, WebAuthn, TOTP
+MFA, and SMS OTP routes; each is registered only when its dependency is
+configured (see `Deps` in `internal/server/server.go`).
+
+### Recovery (backup) codes
+
+Codes are high-entropy (>=128-bit, default 160) values drawn from Crockford
+base32 and stored only as a SHA-256 hash — HMAC-SHA-256 when
+`RECOVERY_CODES_HASH_PEPPER` is set. A memory-hard KDF is deliberately *not*
+used: the codes are already unguessable, so Argon2id would only add a
+CPU-exhaustion vector on the verify path and break the O(1) indexed lookup
+through `idx_recovery_codes_hash`.
+
+`generate` destroys the previous batch in the same transaction that inserts the
+replacement, so exactly one batch is ever live. `verify-recovery-code` matches
+the hash under `FOR UPDATE` and **physically deletes** the row inside that same
+ACID transaction (`used_at` is never stamped), so two concurrent submissions of
+one code cannot both succeed. Every code failure — unknown, already spent,
+belonging to another account, or absent — returns one indistinguishable
+`401 invalid_code`. All three routes require a live session and refuse any
+account whose status is not `active`.
 
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at
 runtime (via Infisical/KMS or the container environment) and never committed.
 
-| Variable  | Default       | Description                          |
-| :-------- | :------------ | :----------------------------------- |
-| `HOST`    | `0.0.0.0`     | Bind interface.                      |
-| `PORT`    | `8080`        | HTTP listen port.                    |
-| `APP_ENV` | `development` | Deployment environment label.        |
+| Variable                              | Default       | Description                                                              |
+| :------------------------------------ | :------------ | :----------------------------------------------------------------------- |
+| `HOST`                                | `0.0.0.0`     | Bind interface.                                                          |
+| `PORT`                                | `8080`        | HTTP listen port.                                                        |
+| `APP_ENV`                             | `development` | Deployment environment label.                                            |
+| `RECOVERY_CODES_COUNT`                | `10`          | Recovery codes minted per batch.                                         |
+| `RECOVERY_CODE_ENTROPY_BITS`          | `160`         | Per-code entropy; values below `128` are rejected at startup.            |
+| `RECOVERY_CODES_LOW_THRESHOLD`        | `3`           | Remaining count at or below which `status` reports `low`.                |
+| `RECOVERY_CODES_PER_ACCOUNT_PER_HOUR` | `10`          | Per-account generate/verify budget per hour.                             |
+| `RECOVERY_CODES_PER_SUBNET_PER_HOUR`  | `20`          | Per-subnet generate/verify budget per hour (checked before the account). |
+| `RECOVERY_CODES_HASH_PEPPER`          | _unset_       | **Optional secret** (KMS/Infisical): base64, >=16 bytes. Keys the stored hash. |
+
+See `.env.example` for the full set, including the database, Redis, OIDC,
+WebAuthn, and SMS OTP variables.
 
 ## Local development
 

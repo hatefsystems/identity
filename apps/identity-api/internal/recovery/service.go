@@ -360,8 +360,16 @@ func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error
 	return nil
 }
 
-// loadUser confirms the account exists, mapping a missing row to
-// ErrUserNotFound.
+// loadUser confirms the account exists and is permitted to authenticate,
+// mapping a missing row to ErrUserNotFound and a non-active status to
+// ErrAccountNotActive.
+//
+// The status gate lives here rather than in each caller so Generate, Status, and
+// Verify all inherit it. It is load-bearing: session validation does not
+// re-check account status, so without this a user who is suspended while holding
+// a live session could still mint and consume recovery codes. GetUserByID
+// filters deleted_at IS NULL but not status, so the check cannot be delegated to
+// the query.
 func (s *Service) loadUser(ctx context.Context, userID uuid.UUID) (db.User, error) {
 	user, err := s.store.GetUserByID(ctx, userID)
 	if err != nil {
@@ -370,7 +378,18 @@ func (s *Service) loadUser(ctx context.Context, userID uuid.UUID) (db.User, erro
 		}
 		return db.User{}, fmt.Errorf("recovery: load user: %w", err)
 	}
+	if !isRecoveryEligible(user.Status) {
+		return db.User{}, ErrAccountNotActive
+	}
 	return user, nil
+}
+
+// isRecoveryEligible reports whether an account's status permits recovery-code
+// operations. Only fully active accounts qualify, matching
+// webauthn.isLoginEligible so a suspended, unverified, or pending-deletion
+// account cannot authenticate through any factor.
+func isRecoveryEligible(status string) bool {
+	return status == "active"
 }
 
 // checkRateLimits enforces the per-subnet then per-account windows for op when a

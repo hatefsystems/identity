@@ -18,8 +18,8 @@ func TestCharsForBits(t *testing.T) {
 		want int
 	}{
 		{bits: 5, want: 1},
-		{bits: 6, want: 2},   // 6 bits needs 2 chars (10 bits)
-		{bits: 10, want: 2},  // exact multiple
+		{bits: 6, want: 2},    // 6 bits needs 2 chars (10 bits)
+		{bits: 10, want: 2},   // exact multiple
 		{bits: 128, want: 26}, // 128/5 = 25.6 -> 26 chars (130 bits)
 		{bits: 160, want: 32}, // exact multiple -> 32 chars
 	}
@@ -94,7 +94,11 @@ func TestGenerateCodeIsRandom(t *testing.T) {
 	}
 }
 
-var formatShape = regexp.MustCompile(`^[0-9A-Z]{5}(-[0-9A-Z]{5})*$`)
+// formatShape matches the display form: 5-character blocks joined by dashes,
+// with an optional shorter final block. The tail is not padded — a 32-character
+// code (the 160-bit default) is 6 full groups plus 2 characters — so a shape
+// that demanded every group be exactly 5 would reject every real code.
+var formatShape = regexp.MustCompile(`^[0-9A-Z]{5}(-[0-9A-Z]{5})*(-[0-9A-Z]{1,4})?$`)
 
 // TestFormatGrouping proves the display form groups into 5-char blocks joined by
 // dashes, and that stripping the dashes recovers the original code — the
@@ -114,8 +118,8 @@ func TestFormatGrouping(t *testing.T) {
 	}
 	// A 32-char code splits into groups of 5: 6 full groups + a 2-char tail = 6
 	// separators.
-	if want := strings.Count(formatted, "-"); want != 6 {
-		t.Errorf("32-char code produced %d separators, want 6", want)
+	if got := strings.Count(formatted, "-"); got != 6 {
+		t.Errorf("32-char code produced %d separators, want 6", got)
 	}
 }
 
@@ -230,11 +234,27 @@ func TestHashCodePepperedHMAC(t *testing.T) {
 }
 
 // TestHashCodeDeterministic confirms the same input always yields the same hash
-// (indexable lookup depends on this) and different inputs diverge.
+// (the indexed lookup in Verify depends on this: the hash *is* the search key)
+// and that different inputs diverge.
 func TestHashCodeDeterministic(t *testing.T) {
-	if hashCode(nil, "SAME") != hashCode(nil, "SAME") {
+	const input = "SAME"
+	// strings.Clone gives an equal string in separate memory, so this stays a
+	// genuine runtime comparison of two independent hashCode calls instead of
+	// two syntactically identical expressions a static analyser folds away
+	// (staticcheck SA4000).
+	if hashCode(nil, input) != hashCode(nil, strings.Clone(input)) {
 		t.Error("plain hash is not deterministic")
 	}
+
+	// Determinism must also hold across calls separated by other work, and with
+	// a pepper in play.
+	pepper := []byte("pepper-for-determinism")
+	first := hashCode(pepper, input)
+	_ = hashCode(pepper, "UNRELATED")
+	if second := hashCode(pepper, strings.Clone(input)); first != second {
+		t.Error("peppered hash is not deterministic")
+	}
+
 	if hashCode(nil, "ONE") == hashCode(nil, "TWO") {
 		t.Error("distinct codes hashed to the same value")
 	}

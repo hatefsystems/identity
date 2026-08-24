@@ -48,10 +48,17 @@ func newFakeStore() *fakeRecoveryStore {
 	}
 }
 
-// addUser registers an account so loadUser succeeds for it.
+// addUser registers an active account so loadUser succeeds for it.
 func (f *fakeRecoveryStore) addUser() uuid.UUID {
+	return f.addUserWithStatus("active")
+}
+
+// addUserWithStatus registers an account carrying an explicit users.status
+// value, so the account-status gate in loadUser can be exercised for each state
+// the CHECK constraint allows.
+func (f *fakeRecoveryStore) addUserWithStatus(status string) uuid.UUID {
 	id := uuid.New()
-	f.users[id] = db.User{ID: id}
+	f.users[id] = db.User{ID: id, Status: status}
 	return id
 }
 
@@ -486,6 +493,106 @@ func TestStatusPropagatesCountError(t *testing.T) {
 	store.countErr = sentinel
 	if _, err := svc.Status(context.Background(), userID); !errors.Is(err, sentinel) {
 		t.Errorf("Status with a count error = %v, want it to wrap %v", err, sentinel)
+	}
+}
+
+// ── Account status gate ──────────────────────────────────────────────────────
+
+// nonActiveStatuses is every users.status value the CHECK constraint in
+// 00001_initial_schema.sql permits other than 'active'. None of them may
+// authenticate, so none may touch recovery codes.
+var nonActiveStatuses = []string{"suspended", "pending_verification", "pending_deletion"}
+
+// TestGenerateRequiresActiveAccount proves a non-active account cannot mint a
+// fresh batch. Sessions are validated without re-reading account status, so
+// loadUser is the only place a mid-session suspension can be caught.
+func TestGenerateRequiresActiveAccount(t *testing.T) {
+	for _, status := range nonActiveStatuses {
+		store := newFakeStore()
+		userID := store.addUserWithStatus(status)
+		svc, _ := New(Config{}, store)
+
+		if _, err := svc.Generate(context.Background(), userID, ""); !errors.Is(err, ErrAccountNotActive) {
+			t.Errorf("Generate for a %s account = %v, want ErrAccountNotActive", status, err)
+		}
+		if got := len(store.codes[userID]); got != 0 {
+			t.Errorf("Generate for a %s account wrote %d codes, want 0", status, got)
+		}
+	}
+}
+
+// TestVerifyRequiresActiveAccount proves a code minted while active stops
+// working the moment the account leaves the active state, and that the refusal
+// does not consume it.
+func TestVerifyRequiresActiveAccount(t *testing.T) {
+	for _, status := range nonActiveStatuses {
+		store := newFakeStore()
+		userID := store.addUser()
+		svc, _ := New(Config{}, store)
+
+		res, err := svc.Generate(context.Background(), userID, "")
+		if err != nil {
+			t.Fatalf("Generate while active: %v", err)
+		}
+
+		// The account is suspended after the batch was issued, which is exactly
+		// the window a live session would otherwise keep open.
+		store.users[userID] = db.User{ID: userID, Status: status}
+
+		if err := svc.Verify(context.Background(), userID, res.Codes[0], ""); !errors.Is(err, ErrAccountNotActive) {
+			t.Errorf("Verify for a %s account = %v, want ErrAccountNotActive", status, err)
+		}
+		if got := len(store.codes[userID]); got != defaultCount {
+			t.Errorf("a refused verify on a %s account consumed a code: stored = %d, want %d", status, got, defaultCount)
+		}
+	}
+}
+
+// TestStatusRequiresActiveAccount proves the status endpoint is gated too, so a
+// non-active account cannot even enumerate how many codes it holds.
+func TestStatusRequiresActiveAccount(t *testing.T) {
+	for _, status := range nonActiveStatuses {
+		store := newFakeStore()
+		userID := store.addUserWithStatus(status)
+		svc, _ := New(Config{}, store)
+
+		if _, err := svc.Status(context.Background(), userID); !errors.Is(err, ErrAccountNotActive) {
+			t.Errorf("Status for a %s account = %v, want ErrAccountNotActive", status, err)
+		}
+	}
+}
+
+// TestActiveAccountStillSucceeds guards against the gate being over-broad: an
+// 'active' account must retain the full generate/status/verify path.
+func TestActiveAccountStillSucceeds(t *testing.T) {
+	store := newFakeStore()
+	userID := store.addUserWithStatus("active")
+	svc, _ := New(Config{}, store)
+
+	res, err := svc.Generate(context.Background(), userID, "")
+	if err != nil {
+		t.Fatalf("Generate for an active account = %v, want nil", err)
+	}
+	if _, err := svc.Status(context.Background(), userID); err != nil {
+		t.Errorf("Status for an active account = %v, want nil", err)
+	}
+	if err := svc.Verify(context.Background(), userID, res.Codes[0], ""); err != nil {
+		t.Errorf("Verify for an active account = %v, want nil", err)
+	}
+}
+
+// TestUnknownStatusIsRefused pins the gate as an allow-list: a status value not
+// yet in the CHECK constraint (or an empty one from a partially-populated row)
+// must fail closed rather than be treated as active.
+func TestUnknownStatusIsRefused(t *testing.T) {
+	for _, status := range []string{"", "banned", "ACTIVE", "active "} {
+		store := newFakeStore()
+		userID := store.addUserWithStatus(status)
+		svc, _ := New(Config{}, store)
+
+		if _, err := svc.Status(context.Background(), userID); !errors.Is(err, ErrAccountNotActive) {
+			t.Errorf("Status for status %q = %v, want ErrAccountNotActive", status, err)
+		}
 	}
 }
 
