@@ -54,6 +54,9 @@ type IssueParams struct {
 	// DPoPJKT binds the session to a DPoP key thumbprint (RFC 9449). Leave
 	// empty for a bearer (non-sender-constrained) session.
 	DPoPJKT string
+	// Kind defaults to KindAuthenticated. Callers may request only the
+	// restricted KindRecoveryEnrollment variant for recovery flows.
+	Kind Kind
 }
 
 // Manager sentinel errors.
@@ -106,9 +109,23 @@ func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
 		return Session{}, err
 	}
 
+	kind := p.Kind
+	if kind == "" {
+		kind = KindAuthenticated
+	}
+	if kind != KindAuthenticated && kind != KindRecoveryEnrollment {
+		return Session{}, fmt.Errorf("session: unsupported kind %q", kind)
+	}
+
 	now := m.now()
-	idleExpiry := now.Add(m.idleTTL)
-	absoluteExpiry := now.Add(m.absoluteTTL)
+	absoluteTTL := m.absoluteTTL
+	idleTTL := m.idleTTL
+	if kind == KindRecoveryEnrollment {
+		absoluteTTL = RecoveryEnrollmentTTL
+		idleTTL = RecoveryEnrollmentTTL
+	}
+	idleExpiry := now.Add(idleTTL)
+	absoluteExpiry := now.Add(absoluteTTL)
 	// Clamp the idle deadline to the absolute ceiling so it can never outlive
 	// the session (defensive; the config guarantees idleTTL <= absoluteTTL).
 	if idleExpiry.After(absoluteExpiry) {
@@ -117,6 +134,7 @@ func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
 
 	s := Session{
 		ID:             uuid.NewString(),
+		Kind:           kind,
 		UserID:         p.UserID,
 		IP:             p.IP,
 		UserAgent:      p.UserAgent,
@@ -164,6 +182,18 @@ func (m *Manager) Authenticate(r *http.Request) (Session, error) {
 	s.IdleExpiry = newIdle
 	s.LastSeenAt = m.now()
 	return s, nil
+}
+
+// ClaimRecoveryEnrollment atomically reserves a restricted session for one
+// enrollment completion. A successful caller must revoke the session; a
+// conclusively failed ceremony may release it to permit a retry.
+func (m *Manager) ClaimRecoveryEnrollment(userID, sessionID string) (bool, error) {
+	return m.store.ClaimRecoveryEnrollment(userID, sessionID)
+}
+
+// ReleaseRecoveryEnrollment releases a failed enrollment claim.
+func (m *Manager) ReleaseRecoveryEnrollment(userID, sessionID string) error {
+	return m.store.ReleaseRecoveryEnrollment(userID, sessionID)
 }
 
 // Revoke deletes the session bound to the request cookie and clears the cookie

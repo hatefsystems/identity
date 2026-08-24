@@ -101,6 +101,29 @@ func TestManagerIssueWritesCookieAndPersists(t *testing.T) {
 	}
 }
 
+func TestManagerIssueRecoveryEnrollmentIsRestrictedToTenMinutes(t *testing.T) {
+	now := time.Now()
+	m := newTestManager(t, &now)
+	rec := httptest.NewRecorder()
+
+	s, err := m.Issue(rec, IssueParams{UserID: "user-1", Kind: KindRecoveryEnrollment})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if s.Kind != KindRecoveryEnrollment {
+		t.Fatalf("Kind = %q, want %q", s.Kind, KindRecoveryEnrollment)
+	}
+	want := now.Add(RecoveryEnrollmentTTL)
+	if !s.AbsoluteExpiry.Equal(want) || !s.IdleExpiry.Equal(want) {
+		t.Fatalf("restricted expiries = %v / %v, want %v", s.AbsoluteExpiry, s.IdleExpiry, want)
+	}
+
+	now = want.Add(time.Nanosecond)
+	if _, err := m.Authenticate(requestWithCookies(rec)); err != ErrSessionNotFound {
+		t.Fatalf("Authenticate after restricted TTL = %v, want ErrSessionNotFound", err)
+	}
+}
+
 func TestManagerAuthenticateNoCookie(t *testing.T) {
 	now := time.Now()
 	m := newTestManager(t, &now)

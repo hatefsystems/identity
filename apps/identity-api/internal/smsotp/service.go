@@ -15,11 +15,14 @@ package smsotp
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,10 +33,12 @@ import (
 )
 
 // UserStore is the database query subset the SMS OTP service needs: loading the
-// account (to confirm it exists / is active) and writing the verified phone.
+// account (to confirm it exists / is active) and writing or clearing the verified
+// phone.
 type UserStore interface {
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
 	SetUserPhone(ctx context.Context, arg db.SetUserPhoneParams) (int64, error)
+	RemoveUserPhone(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // Encryptor performs envelope encryption of the phone number prior to storage.
@@ -99,6 +104,7 @@ type Service struct {
 
 // Default policy values applied when the corresponding Config field is zero.
 const (
+	verificationIDBytes      = 32
 	defaultCodeTTL           = 3 * time.Minute
 	defaultMaxAttempts       = 3
 	defaultLockoutTTL        = 15 * time.Minute
@@ -172,30 +178,32 @@ func New(cfg Config, users UserStore, encryptor Encryptor, indexer BlindIndexer,
 	return s, nil
 }
 
-// SendCode issues a fresh OTP to rawPhone on behalf of userID, subject to the
-// lockout and both independent rate-limit dimensions. clientIP is the caller's
-// source address (host or host:port); it is reduced to its /24 or /48 subnet for
-// the per-subnet limit. It returns ErrRateLimited when any window is saturated,
-// ErrLockedOut when the phone is in its brute-force lockout, or ErrInvalidPhone
-// when rawPhone is not E.164.
-func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, rawPhone, clientIP string) error {
+// SendCode issues a fresh OTP to rawPhone on behalf of userID and the exact
+// initiating session. On success it returns a cryptographically random 256-bit
+// verification ID; the client must present that ID from the same session to
+// verify the code. clientIP is reduced to its /24 or /48 subnet for the
+// independent per-subnet rate limit.
+func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, sessionID, rawPhone, clientIP string) (string, error) {
 	if _, err := s.loadUser(ctx, userID); err != nil {
-		return err
+		return "", err
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return "", errors.New("smsotp: session ID is required")
 	}
 
 	phone, err := NormalizePhone(rawPhone)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// A phone serving out its brute-force lockout cannot request new codes
 	// either, so a locked-out attacker cannot refresh the guessing budget.
 	locked, err := s.otps.IsLockedOut(ctx, phone)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if locked {
-		return ErrLockedOut
+		return "", ErrLockedOut
 	}
 
 	// Per-subnet limit: 10/hour grouped to /24 (IPv4) or /48 (IPv6).
@@ -204,10 +212,10 @@ func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, rawPhone, clie
 	subnet := ratelimit.Subnet(clientIP)
 	okSubnet, err := s.limiter.Allow(ctx, subnetRateKey(subnet), s.perSubnetPerHour, time.Hour)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !okSubnet {
-		return ErrRateLimited
+		return "", ErrRateLimited
 	}
 
 	// Per-phone limit: enforce BOTH the 1/min burst guard and the 5/hour cap.
@@ -215,53 +223,76 @@ func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, rawPhone, clie
 	// consumes only the (already-full) minute window on a rejected request.
 	okMinute, err := s.limiter.Allow(ctx, phoneRateKey(phone, "1m"), s.perPhonePerMinute, time.Minute)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !okMinute {
-		return ErrRateLimited
+		return "", ErrRateLimited
 	}
 	okHour, err := s.limiter.Allow(ctx, phoneRateKey(phone, "1h"), s.perPhonePerHour, time.Hour)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !okHour {
-		return ErrRateLimited
+		return "", ErrRateLimited
 	}
 
 	code, err := generateCode()
 	if err != nil {
-		return fmt.Errorf("smsotp: generate code: %w", err)
+		return "", fmt.Errorf("smsotp: generate code: %w", err)
+	}
+	verificationID, err := generateVerificationID()
+	if err != nil {
+		return "", fmt.Errorf("smsotp: generate verification ID: %w", err)
 	}
 
-	if err := s.otps.Store(ctx, phone, s.hashCode(phone, code), s.codeTTL); err != nil {
-		return err
+	record := OTPRecord{
+		UserID:    userID.String(),
+		SessionID: sessionID,
+		Phone:     phone,
+		CodeHash:  s.hashCode(phone, code),
+	}
+	if err := s.otps.Store(ctx, verificationID, record, s.codeTTL); err != nil {
+		return "", err
 	}
 
 	message := fmt.Sprintf(s.messageTemplate, code)
 	if err := s.sender.Send(ctx, phone, message); err != nil {
 		// Best-effort cleanup: drop the pending code so a delivery failure does
-		// not leave an unusable code occupying the phone's slot.
-		_ = s.otps.Delete(ctx, phone)
-		return fmt.Errorf("%w: %v", ErrSendFailed, err)
+		// not leave an unusable challenge behind.
+		_ = s.otps.Delete(ctx, verificationID)
+		return "", fmt.Errorf("%w: %v", ErrSendFailed, err)
 	}
 
-	return nil
+	return verificationID, nil
 }
 
-// Verify checks code against the pending OTP for rawPhone and, on success,
-// persists the envelope-encrypted phone number plus its blind index to userID's
-// account and purges the code. On the MaxAttempts-th failure it purges the code
-// and locks the phone out (returning ErrLockedOut); earlier failures return
-// ErrInvalidCode. A verification against a phone with no pending code returns
-// ErrNoActiveCode.
-func (s *Service) Verify(ctx context.Context, userID uuid.UUID, rawPhone, code string) error {
+// Verify checks code against the pending challenge identified by
+// verificationID. The record must belong to both userID and the exact initiating
+// sessionID. A foreign account/session receives the same ErrNoActiveCode as an
+// unknown ID, and crucially does not consume the code or burn an attempt.
+func (s *Service) Verify(ctx context.Context, userID uuid.UUID, sessionID, verificationID, code string) error {
 	if _, err := s.loadUser(ctx, userID); err != nil {
 		return err
 	}
 
-	phone, err := NormalizePhone(rawPhone)
+	if strings.TrimSpace(sessionID) == "" || !validVerificationID(verificationID) {
+		return ErrNoActiveCode
+	}
+
+	record, err := s.otps.Get(ctx, verificationID)
 	if err != nil {
 		return err
+	}
+	if record.UserID != userID.String() || record.SessionID != sessionID {
+		return ErrNoActiveCode
+	}
+
+	// Records are created only from normalized input. Re-validating on read
+	// fails closed if Redis was corrupted or an older incompatible record is
+	// encountered; the client can never choose the phone during verification.
+	phone, err := NormalizePhone(record.Phone)
+	if err != nil || phone != record.Phone {
+		return ErrNoActiveCode
 	}
 
 	locked, err := s.otps.IsLockedOut(ctx, phone)
@@ -272,27 +303,22 @@ func (s *Service) Verify(ctx context.Context, userID uuid.UUID, rawPhone, code s
 		return ErrLockedOut
 	}
 
-	record, err := s.otps.Get(ctx, phone)
-	if err != nil {
-		return err
-	}
-
 	if s.codeMatches(phone, code, record.CodeHash) {
 		if err := s.persistPhone(ctx, userID, phone); err != nil {
 			return err
 		}
 		// Consume the code so it cannot be replayed.
-		_ = s.otps.Delete(ctx, phone)
+		_ = s.otps.Delete(ctx, verificationID)
 		return nil
 	}
 
 	// Wrong code: burn an attempt. On reaching the cap, purge and lock out.
-	attempts, err := s.otps.IncrementAttempts(ctx, phone)
+	attempts, err := s.otps.IncrementAttempts(ctx, verificationID)
 	if err != nil {
 		return err
 	}
 	if attempts >= s.maxAttempts {
-		_ = s.otps.Delete(ctx, phone)
+		_ = s.otps.Delete(ctx, verificationID)
 		if err := s.otps.Lockout(ctx, phone, s.lockoutTTL); err != nil {
 			return err
 		}
@@ -300,6 +326,24 @@ func (s *Service) Verify(ctx context.Context, userID uuid.UUID, rawPhone, code s
 	}
 
 	return ErrInvalidCode
+}
+
+// generateVerificationID returns 256 bits of OS entropy encoded as unpadded
+// base64url. The encoding is safe in JSON and Redis keys and is 43 characters
+// long for the fixed 32-byte payload.
+func generateVerificationID() (string, error) {
+	raw := make([]byte, verificationIDBytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// validVerificationID rejects user-controlled Redis key suffixes that were not
+// produced by generateVerificationID.
+func validVerificationID(value string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(raw) == verificationIDBytes
 }
 
 // persistPhone envelope-encrypts the normalized phone and writes it together
@@ -325,6 +369,33 @@ func (s *Service) persistPhone(ctx context.Context, userID uuid.UUID, phone stri
 	return nil
 }
 
+// RemovePhone clears the verified phone number from an account
+// (DELETE /api/v1/users/me/phone, step-up gated per docs/api-design.md §1.5).
+//
+// The encrypted payload and its blind index are cleared together by the single
+// RemoveUserPhone statement, so they cannot drift apart — the same invariant
+// persistPhone maintains on the way in. There is no separate "verified" flag to
+// reset: a phone is verified precisely while phone_encrypted is non-NULL.
+//
+// It is idempotent with respect to the phone itself (removing an absent phone is
+// a no-op success) but not with respect to the account: a missing or soft-deleted
+// account still reports ErrUserNotFound, because the caller's session should not
+// outlive its account.
+func (s *Service) RemovePhone(ctx context.Context, userID uuid.UUID) error {
+	if _, err := s.loadUser(ctx, userID); err != nil {
+		return err
+	}
+
+	affected, err := s.users.RemoveUserPhone(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("smsotp: remove phone: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
 // loadUser confirms the account exists and is active, mapping a missing row to
 // ErrUserNotFound.
 func (s *Service) loadUser(ctx context.Context, userID uuid.UUID) (db.User, error) {
@@ -334,6 +405,9 @@ func (s *Service) loadUser(ctx context.Context, userID uuid.UUID) (db.User, erro
 			return db.User{}, ErrUserNotFound
 		}
 		return db.User{}, fmt.Errorf("smsotp: load user: %w", err)
+	}
+	if user.Status != "active" {
+		return db.User{}, ErrAccountNotActive
 	}
 	return user, nil
 }

@@ -19,7 +19,9 @@ The platform leverages **Traefik** as the Ingress Controller and API Gateway at 
 
 ### 1.0 MVP Phase: Host-Level Nginx Configuration (Reverse Proxy & TLS Termination)
 
-In the MVP phase, we use the host's existing **Nginx** web server running on Ubuntu. Nginx handles SSL/TLS termination, routes the traffic to the corresponding Docker containers (Next.js frontend on port `3000`, Go Backend on port `8080`), and handles base HTTP security headers.
+In the MVP phase, we use the host's existing **Nginx** web server running on Ubuntu. Nginx handles SSL/TLS termination, routes the traffic to the corresponding Docker containers (Next.js frontend on port `3000`, Go Backend on port `8080`), and handles base HTTP security headers. Port `8080` must be published only on loopback or a private container network; it must never be reachable from an untrusted network that can bypass Nginx.
+
+The API trusts `X-Forwarded-For` only when its immediate socket peer is listed in `TRUSTED_PROXY_CIDRS`. For host Nginx connecting over loopback, use `TRUSTED_PROXY_CIDRS=127.0.0.1/32` (and `::1/128` only when that path is actually used). If Docker NAT makes the peer appear as a bridge gateway, inspect the API's observed peer and allow only that exact address or narrowly controlled ingress CIDR. Empty means no proxy is trusted, malformed entries and `/0` networks are rejected, and broad Docker or public ranges are prohibited. Nginx must overwrite any client-supplied forwarding chain with `$remote_addr`; do not use `$proxy_add_x_forwarded_for` at this single public edge. The API deliberately ignores `X-Real-IP` and `True-Client-IP`.
 
 Below is the production-ready Nginx configuration file (`/etc/nginx/sites-available/identity.hatef.ir`) for the MVP:
 
@@ -48,8 +50,8 @@ server {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Overwrite untrusted inbound forwarding headers at the public edge.
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         
         # WebSockets support for Next.js Fast Refresh
@@ -61,16 +63,14 @@ server {
     location = /oauth2/authorize {
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location = /oauth2/error {
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
@@ -79,8 +79,7 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         
         # Forward OAuth Authorization and DPoP headers verbatim
@@ -92,8 +91,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
@@ -252,6 +250,9 @@ spec:
     - secretKey: SMS_GATEWAY_API_KEY
       remoteRef:
         key: /production/services/sms_gateway_api_key
+    - secretKey: STEPUP_REPLAY_HMAC_KEY
+      remoteRef:
+        key: /production/crypto/stepup_replay_hmac_key
 ```
 
 Application Pods bind this generated secret as standard environment variables or files:
@@ -263,7 +264,23 @@ env:
       secretKeyRef:
         name: idp-runtime-secrets
         key: POSTGRES_PASSWORD
+  - name: STEPUP_REPLAY_HMAC_KEY
+    valueFrom:
+      secretKeyRef:
+        name: idp-runtime-secrets
+        key: STEPUP_REPLAY_HMAC_KEY
 ```
+
+### 2.2 Step-up Replay Key Deployment and Rotation
+
+`STEPUP_REPLAY_HMAC_KEY` is an independent secret for deriving opaque Redis replay-key names; it is not the OIDC signing key. Supply standard base64 that decodes to at least 32 random bytes (for example, `openssl rand -base64 32`). It is required outside explicit development, must be identical on every API replica, and requires a healthy shared Redis deployment. Redis `SET NX` claims enforce one redemption across the cluster and replay-guard errors fail closed.
+
+Do not rotate this key with an ordinary mixed-version rolling deployment. Replicas using different values create disjoint replay domains, allowing the same still-valid grant or TOTP proof to be claimed once per domain. The current implementation does not support dual-key overlap. Use this coordinated runbook:
+
+1. Stop issuing and accepting Step-up-protected operations, then drain or stop all API replicas.
+2. From the last issued grant, wait at least the larger of the configured grant lifetime and TOTP replay window. With the current policy, the maximum `STEPUP_TOKEN_TTL` is five minutes and is the controlling interval.
+3. Replace the Infisical/ExternalSecret value, ensure every replica observes the same decoded key, and restart all replicas as one coordinated cutover.
+4. Restore protected traffic, verify Redis health and a single-use grant across replicas, and let old versioned replay entries expire naturally by TTL.
 
 ---
 

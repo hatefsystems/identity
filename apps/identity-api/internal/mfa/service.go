@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
@@ -18,9 +19,21 @@ const defaultIssuer = "Hatef Identity"
 // UserStore defines the database query subset required by the MFA service.
 type UserStore interface {
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
-	SetMfaTotpSecret(ctx context.Context, arg db.SetMfaTotpSecretParams) (int64, error)
-	EnableMfa(ctx context.Context, id uuid.UUID) (int64, error)
+	GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error)
 	DisableMfa(ctx context.Context, id uuid.UUID) (int64, error)
+	CountWebauthnCredentialsByUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	DeleteMfaTotpEnrollmentsForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	CreateMfaTotpEnrollment(ctx context.Context, arg db.CreateMfaTotpEnrollmentParams) (db.MfaTotpEnrollment, error)
+	GetMfaTotpEnrollmentForUpdate(ctx context.Context, arg db.GetMfaTotpEnrollmentForUpdateParams) (db.MfaTotpEnrollment, error)
+	IncrementMfaTotpEnrollmentAttempts(ctx context.Context, id uuid.UUID) (int64, error)
+	DeleteMfaTotpEnrollment(ctx context.Context, id uuid.UUID) (int64, error)
+	CompleteMfaTotpEnrollment(ctx context.Context, arg db.CompleteMfaTotpEnrollmentParams) (int64, error)
+}
+
+// Transacter opens PostgreSQL transactions for enrollment completion and
+// cross-factor teardown. *pgxpool.Pool satisfies it.
+type Transacter interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // Encryptor performs envelope encryption and decryption for sensitive PII/secrets.
@@ -31,30 +44,49 @@ type Encryptor interface {
 
 // Config carries MFA service configuration.
 type Config struct {
-	Issuer      string
-	WindowSteps int
+	Issuer                string
+	WindowSteps           int
+	EnrollmentTTL         time.Duration
+	MaxEnrollmentAttempts int
 }
 
 // SetupResponse contains the unencrypted TOTP secret and QR code URI returned
 // during initial MFA setup (Task 4.4).
 type SetupResponse struct {
-	Secret      string `json:"secret"`
-	OtpauthURL  string `json:"otpauth_url"`
-	Issuer      string `json:"issuer"`
-	AccountName string `json:"account_name"`
+	EnrollmentID string `json:"enrollment_id"`
+	Secret       string `json:"secret"`
+	OtpauthURL   string `json:"otpauth_url"`
+	Issuer       string `json:"issuer"`
+	AccountName  string `json:"account_name"`
 }
 
 // Service orchestrates TOTP MFA enrollment, verification, and teardown.
 type Service struct {
-	users       UserStore
-	encryptor   Encryptor
-	issuer      string
-	windowSteps int
-	now         func() time.Time
+	users                 UserStore
+	tx                    Transacter
+	encryptor             Encryptor
+	issuer                string
+	windowSteps           int
+	now                   func() time.Time
+	enrollmentTTL         time.Duration
+	maxEnrollmentAttempts int
 }
 
+// Option configures optional service behavior.
+type Option func(*Service)
+
+// WithTransacter enables the production ACID paths.
+func WithTransacter(tx Transacter) Option {
+	return func(s *Service) { s.tx = tx }
+}
+
+const (
+	defaultEnrollmentTTL         = 10 * time.Minute
+	defaultMaxEnrollmentAttempts = 5
+)
+
 // New constructs a Service from dependencies and config.
-func New(cfg Config, users UserStore, encryptor Encryptor) (*Service, error) {
+func New(cfg Config, users UserStore, encryptor Encryptor, opts ...Option) (*Service, error) {
 	if users == nil {
 		return nil, errors.New("mfa: user store is required")
 	}
@@ -72,31 +104,35 @@ func New(cfg Config, users UserStore, encryptor Encryptor) (*Service, error) {
 		windowSteps = 1 // ±1 time step (30 seconds) window drift
 	}
 
-	return &Service{
-		users:       users,
-		encryptor:   encryptor,
-		issuer:      issuer,
-		windowSteps: windowSteps,
-		now:         time.Now,
-	}, nil
+	s := &Service{
+		users:                 users,
+		encryptor:             encryptor,
+		issuer:                issuer,
+		windowSteps:           windowSteps,
+		now:                   time.Now,
+		enrollmentTTL:         cfg.EnrollmentTTL,
+		maxEnrollmentAttempts: cfg.MaxEnrollmentAttempts,
+	}
+	if s.enrollmentTTL <= 0 {
+		s.enrollmentTTL = defaultEnrollmentTTL
+	}
+	if s.maxEnrollmentAttempts <= 0 {
+		s.maxEnrollmentAttempts = defaultMaxEnrollmentAttempts
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // GenerateSetup initiates TOTP MFA setup for an account. It generates a fresh
 // TOTP secret, envelope-encrypts it, persists it in the database, and returns
 // the setup details including the otpauth:// URI for QR code mapping.
-func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID) (*SetupResponse, error) {
-	user, err := s.users.GetUserByID(ctx, userID)
+func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, sessionID string) (*SetupResponse, error) {
+	sessionUUID, err := uuid.Parse(sessionID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrUserNotFound
-		}
-		return nil, fmt.Errorf("mfa: load user: %w", err)
+		return nil, ErrMfaNotSetup
 	}
-
-	if user.IsMfaEnabled {
-		return nil, ErrMfaAlreadyEnabled
-	}
-
 	secret, err := totp.GenerateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("mfa: generate secret: %w", err)
@@ -107,78 +143,179 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID) (*SetupRe
 		return nil, fmt.Errorf("%w: %v", ErrEncryptFailed, err)
 	}
 
-	affected, err := s.users.SetMfaTotpSecret(ctx, db.SetMfaTotpSecretParams{
-		ID:                     user.ID,
-		MfaTotpSecretEncrypted: encSecret,
+	var user db.User
+	var enrollment db.MfaTotpEnrollment
+	err = s.runInTx(ctx, func(store UserStore) error {
+		user, err = store.GetUserByIDForUpdate(ctx, userID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("mfa: lock user: %w", err)
+		}
+		if user.Status != "active" {
+			return ErrAccountNotActive
+		}
+		if user.IsMfaEnabled {
+			return ErrMfaAlreadyEnabled
+		}
+		if _, err := store.DeleteMfaTotpEnrollmentsForUser(ctx, userID); err != nil {
+			return fmt.Errorf("mfa: replace pending enrollment: %w", err)
+		}
+		enrollment, err = store.CreateMfaTotpEnrollment(ctx, db.CreateMfaTotpEnrollmentParams{
+			UserID:          userID,
+			SessionID:       sessionUUID,
+			Purpose:         "maintenance",
+			SecretEncrypted: encSecret,
+			ExpiresAt:       pgtype.Timestamptz{Time: s.now().Add(s.enrollmentTTL), Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("mfa: store pending enrollment: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("mfa: store secret: %w", err)
-	}
-	if affected == 0 {
-		return nil, ErrUserNotFound
+		return nil, err
 	}
 
 	uri := totp.GenerateURI(secret, user.Email, s.issuer)
 
 	return &SetupResponse{
-		Secret:      secret,
-		OtpauthURL:  uri,
-		Issuer:      s.issuer,
-		AccountName: user.Email,
+		EnrollmentID: enrollment.ID.String(),
+		Secret:       secret,
+		OtpauthURL:   uri,
+		Issuer:       s.issuer,
+		AccountName:  user.Email,
 	}, nil
 }
 
 // VerifyAndEnable verifies the submitted 6-digit passcode against the pending
 // stored TOTP secret and flips is_mfa_enabled to true.
-func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, code string) error {
-	user, err := s.users.GetUserByID(ctx, userID)
+func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, sessionID, enrollmentID, code string) error {
+	sessionUUID, err := uuid.Parse(sessionID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrUserNotFound
-		}
-		return fmt.Errorf("mfa: load user: %w", err)
-	}
-
-	if len(user.MfaTotpSecretEncrypted) == 0 {
 		return ErrMfaNotSetup
 	}
-
-	rawSecret, err := s.encryptor.Decrypt(ctx, user.MfaTotpSecretEncrypted)
+	enrollmentUUID, err := uuid.Parse(enrollmentID)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDecryptFailed, err)
+		return ErrMfaNotSetup
 	}
+	var outcome error
+	err = s.runInTx(ctx, func(store UserStore) error {
+		user, err := store.GetUserByIDForUpdate(ctx, userID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("mfa: lock user: %w", err)
+		}
+		if user.Status != "active" {
+			return ErrAccountNotActive
+		}
+		// An enabled account is rejected before loading or decrypting any
+		// pending material, so this endpoint can never test the active secret.
+		if user.IsMfaEnabled {
+			return ErrMfaAlreadyEnabled
+		}
 
-	if !totp.ValidateCode(string(rawSecret), code, s.now(), s.windowSteps) {
-		return ErrInvalidCode
-	}
+		enrollment, err := store.GetMfaTotpEnrollmentForUpdate(ctx, db.GetMfaTotpEnrollmentForUpdateParams{
+			ID:        enrollmentUUID,
+			UserID:    userID,
+			SessionID: sessionUUID,
+			Purpose:   "maintenance",
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrMfaNotSetup
+			}
+			return fmt.Errorf("mfa: lock pending enrollment: %w", err)
+		}
+		if !enrollment.ExpiresAt.Valid || !s.now().Before(enrollment.ExpiresAt.Time) {
+			if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
+				return fmt.Errorf("mfa: delete expired enrollment: %w", err)
+			}
+			outcome = ErrEnrollmentExpired
+			return nil
+		}
 
-	affected, err := s.users.EnableMfa(ctx, user.ID)
+		rawSecret, err := s.encryptor.Decrypt(ctx, enrollment.SecretEncrypted)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrDecryptFailed, err)
+		}
+		if !totp.ValidateCode(string(rawSecret), code, s.now(), s.windowSteps) {
+			if int(enrollment.FailedAttempts)+1 >= s.maxEnrollmentAttempts {
+				_, err = store.DeleteMfaTotpEnrollment(ctx, enrollment.ID)
+			} else {
+				_, err = store.IncrementMfaTotpEnrollmentAttempts(ctx, enrollment.ID)
+			}
+			if err != nil {
+				return fmt.Errorf("mfa: record failed enrollment attempt: %w", err)
+			}
+			outcome = ErrInvalidCode
+			return nil
+		}
+
+		affected, err := store.CompleteMfaTotpEnrollment(ctx, db.CompleteMfaTotpEnrollmentParams{
+			ID:                     userID,
+			MfaTotpSecretEncrypted: enrollment.SecretEncrypted,
+		})
+		if err != nil {
+			return fmt.Errorf("mfa: enable mfa: %w", err)
+		}
+		if affected == 0 {
+			return ErrMfaAlreadyEnabled
+		}
+		if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
+			return fmt.Errorf("mfa: delete completed enrollment: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("mfa: enable mfa: %w", err)
+		return err
 	}
-	if affected == 0 {
-		return ErrUserNotFound
-	}
-
-	return nil
+	return outcome
 }
 
 // Disable disables TOTP MFA for the user, wiping the encrypted secret and
 // setting is_mfa_enabled to false.
 func (s *Service) Disable(ctx context.Context, userID uuid.UUID) error {
-	affected, err := s.users.DisableMfa(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("mfa: disable mfa: %w", err)
-	}
-	if affected == 0 {
-		return ErrUserNotFound
-	}
-	return nil
+	return s.runInTx(ctx, func(store UserStore) error {
+		user, err := store.GetUserByIDForUpdate(ctx, userID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("mfa: lock user: %w", err)
+		}
+		if user.Status != "active" {
+			return ErrAccountNotActive
+		}
+		if user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0 {
+			count, err := store.CountWebauthnCredentialsByUser(ctx, userID)
+			if err != nil {
+				return fmt.Errorf("mfa: count passkeys: %w", err)
+			}
+			if count == 0 {
+				return ErrLastFactor
+			}
+		}
+		affected, err := store.DisableMfa(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("mfa: disable mfa: %w", err)
+		}
+		if affected == 0 {
+			return ErrUserNotFound
+		}
+		if _, err := store.DeleteMfaTotpEnrollmentsForUser(ctx, userID); err != nil {
+			return fmt.Errorf("mfa: clear pending enrollments: %w", err)
+		}
+		return nil
+	})
 }
 
-// VerifyCode verifies a submitted 6-digit TOTP code for an already enabled
-// account (used during login or step-up authentication).
-func (s *Service) VerifyCode(ctx context.Context, userID uuid.UUID, code string) error {
+// VerifyEnabledCode verifies a submitted 6-digit TOTP code only against an
+// already enabled account (used during login or step-up authentication).
+func (s *Service) VerifyEnabledCode(ctx context.Context, userID uuid.UUID, code string) error {
 	user, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -200,5 +337,29 @@ func (s *Service) VerifyCode(ctx context.Context, userID uuid.UUID, code string)
 		return ErrInvalidCode
 	}
 
+	return nil
+}
+
+func (s *Service) runInTx(ctx context.Context, fn func(UserStore) error) error {
+	if s.tx == nil {
+		return fn(s.users)
+	}
+	tx, err := s.tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mfa: begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := fn(db.New(tx)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("mfa: commit transaction: %w", err)
+	}
+	committed = true
 	return nil
 }

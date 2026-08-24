@@ -12,7 +12,7 @@ These pages are accessible to unauthenticated users and handle the entry points 
 
 - `/login` : Primary login page (Username/Password).
 - `/login/webauthn` : Passwordless login flow using hardware keys or platform biometrics (FaceID/TouchID).
-- `/login/recovery` : Form to enter a backup recovery code if the user has lost access to their primary MFA/WebAuthn device.
+- `/login/recovery` : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
 - `/register` : Account creation form.
 - `/forgot-password` : Request a password reset. Users can choose to receive the recovery OTP/Link via Primary Email, Backup Email, or Verified Phone (SMS).
 - `/reset-password` : The page users land on from the email link to set a new password.
@@ -35,12 +35,13 @@ Protected routes. Requires a valid user session. This is the central hub for use
 - `/dashboard/profile` : Manage personal information (Name, Avatar, Contact info).
 - `/dashboard/security` : The core security center.
   - Change Password.
-  - Setup/Manage **Multi-Factor Authentication (TOTP)**.
-  - Setup/Manage **WebAuthn Passkeys** (Register new YubiKey or Laptop Fingerprint).
+  - Setup/Manage **Multi-Factor Authentication (TOTP)**. Starting setup requires a fresh Step-up grant. Keep the returned `enrollment_id` in memory and submit it with the code from the same authenticated session; completion does not request a second grant. There is no general-purpose `/auth/mfa/verify-code` endpoint for probing whether an enabled TOTP is valid.
+  - Setup/Manage **WebAuthn Passkeys** (Register new YubiKey or Laptop Fingerprint). Ordinary registration consumes a fresh Step-up grant when options are generated; attestation must finish in the same session and does not request a second grant. Deleting the final passkey returns `409 {"error":"last_credential"}` even when TOTP is enabled because passkeys are the current browser login credential.
   - Setup/Manage **Backup Recovery Methods**:
-    - Add/Verify **Phone Number** (Used for SMS Password Reset and Anti-Abuse verification for Hatef Mail).
+    - Add/Verify **Phone Number** (Used for SMS Password Reset and Anti-Abuse verification for Hatef Mail). Sending a code consumes a fresh Step-up grant and returns a `verification_id`; verification submits only that ID plus the code from the same session, without accepting a replacement phone value or another grant.
     - Add/Verify **Alternative Email** (Backup email for password recovery).
     - Generate/View **Recovery Codes** (Backup Codes) for emergency account access.
+  - Disabling TOTP returns `409 {"error":"last_factor"}` if no passkey remains. Treat both factor-removal conflicts as actionable security guidance rather than generic failures.
 - `/dashboard/sessions` : View active sessions across devices (e.g., "Windows PC - Chrome", "iPhone - Safari"). Includes a button to "Revoke Session" remotely.
 - `/dashboard/privacy` : GDPR & Data Privacy center.
   - View privacy policy consents.
@@ -94,13 +95,15 @@ To maintain absolute client-side security and resist advanced threat vectors (su
 
 ### 5.3 UX Step-up Authentication Trigger Flow
 To protect highly critical administrative or identity operations (such as Password Change, TOTP MFA disablement, Backup contact removal, or Account Deletion), the frontend enforces an inline Step-up verification pattern:
-1. **Trigger Condition:** The user clicks on any sensitive action button in the Dashboard (e.g., *Remove Backup Phone* or *Delete Account*).
-2. **Step-up Overlay:** Instead of directing to a separate page, a secure, modal dialog (overlay) interrupts the flow.
+1. **Trigger Condition:** The user clicks on any sensitive action button in the Dashboard (e.g., *Remove Backup Phone* or *Delete Account*). Alternatively, the flow is entered reactively: a sensitive request sent without a grant is answered with `403 {"error": "insufficient_user_authentication", "acr_values": "https://ref.hatef.ir/acr/stepup"}`, which is the signal to open the overlay. Note this is deliberately **not** a `401` — the session is still valid, so a `401` would send the user through a full re-login instead of this inline flow.
+2. **Step-up Overlay:** Instead of directing to a separate page, a secure, modal dialog (overlay) interrupts the flow. `POST /api/v1/auth/stepup/challenge` reports which factors the account can present (`methods`) plus the WebAuthn assertion options when a passkey is enrolled. Keep the returned challenge state in memory and complete it from the same authenticated session: the server binds the challenge to its exact user, session, and Step-up flow, and a mismatched session cannot consume the legitimate challenge. A `409 {"error": "no_stepup_factor"}` means the account has neither a passkey nor TOTP and must enrol one before sensitive operations become reachable.
 3. **MFA/Biometric Challenge:**
    - The dialog triggers a WebAuthn prompt utilizing platform authenticators (TouchID, FaceID, Windows Hello) with **`userVerification: "required"`** to confirm biometrics/PIN, OR requests the user's active TOTP token.
-4. **Step-up Assertion:** Upon user confirmation, the frontend sends this assertion to the Go backend step-up verify API.
-5. **Short-Lived Authorization:** On success, the frontend receives a temporary **Step-up ACR token** (valid for 3-5 minutes).
-6. **Execution:** The frontend automatically executes the original sensitive request, embedding the Step-up ACR token in the authorization header along with the required DPoP proof. Once executed, the state is cleared.
+   - Recovery codes are **not** accepted here. They are a login bypass, so honouring one would let a stolen code authorise the very operations this gate protects — including regenerating the code batch itself.
+4. **Step-up Assertion:** Upon user confirmation, the frontend sends this assertion to `POST /api/v1/auth/stepup/verify`. A `403 {"error": "user_verification_required"}` means the authenticator only proved presence (a security key tapped without a PIN); the remedy is a PIN/biometric-capable device, or TOTP.
+5. **Short-Lived Authorization:** On success, the frontend receives a temporary **Step-up ACR token** (valid for 3-5 minutes) carrying the ACR claim `https://ref.hatef.ir/acr/stepup`.
+6. **Execution:** The frontend automatically executes the original sensitive request, embedding the Step-up ACR token in the **`X-Step-Up-Auth`** header (not `Authorization`, which continues to carry the session or access token) along with the required DPoP proof. Once executed, the state is cleared.
+7. **Single Use:** A grant authorises exactly one request. It is consumed on presentation, so a retry — including a retry after a client-side validation failure — requires a fresh challenge. It is also bound to the session that earned it, so it cannot be carried to another tab, device, or session.
 
 ### 5.4 Account-Harvesting Resistant Login UX & Discoverable Credentials
 To completely prevent user-enumeration (account harvesting) through timing side-channels, the platform implements two distinct defenses:

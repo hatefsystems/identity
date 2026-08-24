@@ -37,6 +37,53 @@ func TestNewRequireSessionNilManager(t *testing.T) {
 	}
 }
 
+func TestSessionKindsAreMutuallyExclusive(t *testing.T) {
+	now := time.Now()
+	m := newTestManager(t, &now)
+	normal := newGuard(t, m)
+	recovery, err := NewRequireRecoveryEnrollment(m)
+	if err != nil {
+		t.Fatalf("NewRequireRecoveryEnrollment: %v", err)
+	}
+
+	issue := func(kind Kind) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		if _, err := m.Issue(rec, IssueParams{UserID: "user-1", Kind: kind}); err != nil {
+			t.Fatalf("Issue(%q): %v", kind, err)
+		}
+		return rec
+	}
+
+	authenticated := issue(KindAuthenticated)
+	restricted := issue(KindRecoveryEnrollment)
+	tests := []struct {
+		name   string
+		guard  func(http.Handler) http.Handler
+		cookie *httptest.ResponseRecorder
+		want   int
+	}{
+		{name: "normal accepts authenticated", guard: normal.Handler, cookie: authenticated, want: http.StatusOK},
+		{name: "normal rejects restricted", guard: normal.Handler, cookie: restricted, want: http.StatusUnauthorized},
+		{name: "recovery rejects authenticated", guard: recovery.Handler, cookie: authenticated, want: http.StatusUnauthorized},
+		{name: "recovery accepts restricted", guard: recovery.Handler, cookie: restricted, want: http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran bool
+			var seen Session
+			rec := httptest.NewRecorder()
+			tc.guard(okHandler(&ran, &seen)).ServeHTTP(rec, requestWithCookies(tc.cookie))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if ran != (tc.want == http.StatusOK) {
+				t.Fatalf("handler ran = %v for status %d", ran, tc.want)
+			}
+		})
+	}
+}
+
 func TestMiddlewareNoCookieUnauthorized(t *testing.T) {
 	now := time.Now()
 	m := newTestManager(t, &now)

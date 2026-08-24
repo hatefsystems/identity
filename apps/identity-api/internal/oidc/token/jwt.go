@@ -37,6 +37,14 @@ import (
 const (
 	TypAccessToken = "at+jwt"
 	TypJWT         = "JWT"
+	// TypStepUpToken is the media type of a step-up authentication grant
+	// (Task 4.7, internal/stepup). It exists for the same reason as the RFC
+	// 9068 profile above and matters more here: access tokens, ID tokens, and
+	// step-up grants are all signed by the same keys.Manager and access tokens
+	// already use aud == iss, so without a distinct typ an access token would
+	// satisfy every other check the step-up validator performs. The validator
+	// rejects any other typ before it looks at a single claim.
+	TypStepUpToken = "stepup+jwt"
 )
 
 // p256SigComponentSize is the byte length of each of the R and S components in

@@ -22,6 +22,8 @@
       },
       "inputs": [
         "{projectRoot}/sqlc.yaml",
+        "{projectRoot}/go.mod",
+        "{projectRoot}/go.sum",
         "{projectRoot}/db/migrations/**/*.sql",
         "{projectRoot}/db/queries/**/*.sql"
       ],
@@ -61,15 +63,39 @@
       "options": {
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/server"
-      }
+      },
+      "dependsOn": ["sqlc-generate"]
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
         "cwd": "apps/identity-api",
-        "command": "go test ./..."
+        "command": "go test -count=1 ./..."
       },
+      "dependsOn": ["sqlc-generate", "^build"],
       "cache": true
+    },
+    "test-race": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go test -race -count=1 ./..."
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-security-db": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "commands": [
+          "node -e \"if (!process.env.DATABASE_URL) { throw new Error('DATABASE_URL is required') }\"",
+          "go test -tags=integration -count=1 -p=1 ./internal/dbintegration ./internal/recovery ./internal/webauthn ./internal/server"
+        ],
+        "parallel": false
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
     },
     "lint": {
       "executor": "nx:run-commands",
@@ -77,6 +103,7 @@
         "cwd": "apps/identity-api",
         "command": "golangci-lint run ./..."
       },
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "vet": {
@@ -84,7 +111,8 @@
       "options": {
         "cwd": "apps/identity-api",
         "command": "go vet ./..."
-      }
+      },
+      "dependsOn": ["sqlc-generate"]
     },
     "tidy": {
       "executor": "nx:run-commands",

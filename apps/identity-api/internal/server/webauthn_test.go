@@ -21,6 +21,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -48,6 +49,10 @@ func (f *fakeWebAuthnUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db
 		return db.User{}, pgx.ErrNoRows
 	}
 	return u, nil
+}
+
+func (f *fakeWebAuthnUserStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error) {
+	return f.GetUserByID(ctx, id)
 }
 
 func (f *fakeWebAuthnUserStore) SetWebauthnUserHandle(_ context.Context, arg db.SetWebauthnUserHandleParams) (int64, error) {
@@ -111,6 +116,26 @@ func (f *fakeWebAuthnUserStore) GetUserByWebauthnUserHandle(_ context.Context, h
 	return db.User{}, pgx.ErrNoRows
 }
 
+func (f *fakeWebAuthnCredentialStore) LockWebauthnCredentialsByUser(_ context.Context, userID uuid.UUID) ([][]byte, error) {
+	rows := f.byUser[userID]
+	out := make([][]byte, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.ID)
+	}
+	return out, nil
+}
+
+func (f *fakeWebAuthnCredentialStore) DeleteWebauthnCredential(_ context.Context, arg db.DeleteWebauthnCredentialParams) (int64, error) {
+	rows := f.byUser[arg.UserID]
+	for i, row := range rows {
+		if bytes.Equal(row.ID, arg.ID) {
+			f.byUser[arg.UserID] = append(rows[:i:i], rows[i+1:]...)
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
 func (f *fakeWebAuthnCredentialStore) UpdateWebauthnSignCount(_ context.Context, arg db.UpdateWebauthnSignCountParams) (int64, error) {
 
 	for userID, rows := range f.byUser {
@@ -129,16 +154,24 @@ func (f *fakeWebAuthnCredentialStore) UpdateWebauthnSignCount(_ context.Context,
 // real WebAuthn service over in-memory stores, plus the seeded account the
 // authenticated routes act on.
 type webAuthnTestServer struct {
-	srv   *Server
-	mgr   *session.Manager
-	users *fakeWebAuthnUserStore
-	creds *fakeWebAuthnCredentialStore
-	user  db.User
+	srv    *Server
+	mgr    *session.Manager
+	users  *fakeWebAuthnUserStore
+	creds  *fakeWebAuthnCredentialStore
+	user   db.User
+	stepUp *stepup.Service
 }
 
 // newWebAuthnTestServer builds that fixture. The session cookie is non-Secure so
 // it survives the plain-HTTP httptest transport, matching newSessionTestServer.
 func newWebAuthnTestServer(t *testing.T) *webAuthnTestServer {
+	t.Helper()
+	return newWebAuthnTestServerWithStepUp(t, false)
+}
+
+// newWebAuthnTestServerWithStepUp additionally wires a step-up service, which is
+// what mounts DELETE /api/v1/auth/webauthn/keys/{id} at all.
+func newWebAuthnTestServerWithStepUp(t *testing.T, withStepUp bool) *webAuthnTestServer {
 	t.Helper()
 
 	codec, err := session.NewCookieCodec(session.CookieConfig{
@@ -185,12 +218,22 @@ func newWebAuthnTestServer(t *testing.T) *webAuthnTestServer {
 		t.Fatalf("webauthn.New: %v", err)
 	}
 
+	var stepUpSvc *stepup.Service
+	if withStepUp {
+		stepUpSvc, _ = newTestStepUpService(t,
+			newStepUpFakeUserStore(db.User{ID: user.ID, Status: "active", IsMfaEnabled: true}),
+			svc,
+			&stepUpFakeTOTP{valid: "000000"},
+		)
+	}
+
 	return &webAuthnTestServer{
-		srv:   New(testConfig(t), nil, Deps{SessionManager: mgr, WebAuthn: svc}),
-		mgr:   mgr,
-		users: users,
-		creds: creds,
-		user:  user,
+		srv:    New(testConfig(t), nil, Deps{SessionManager: mgr, WebAuthn: svc, StepUp: stepUpSvc}),
+		mgr:    mgr,
+		users:  users,
+		creds:  creds,
+		user:   user,
+		stepUp: stepUpSvc,
 	}
 }
 
@@ -212,6 +255,33 @@ func (w *webAuthnTestServer) do(method, path string, body []byte, cookies []*htt
 	rec := httptest.NewRecorder()
 	w.srv.Handler().ServeHTTP(rec, req)
 	return rec
+}
+
+// doWithGrant executes a request carrying both the session cookies and a fresh
+// single-use step-up grant.
+func (w *webAuthnTestServer) doWithGrant(
+	t *testing.T,
+	method, path string,
+	cookies []*http.Cookie,
+	sess session.Session,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(method, path, nil)
+	addCookies(req, cookies)
+	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, w.stepUp, sess.UserID, sess.ID))
+	rec := httptest.NewRecorder()
+	w.srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// seedCredential inserts a credential directly, bypassing the ceremony, so the
+// deletion tests are not coupled to attestation mechanics (covered in
+// internal/webauthn).
+func (w *webAuthnTestServer) seedCredential(id []byte) db.WebauthnCredential {
+	row := db.WebauthnCredential{ID: id, UserID: w.user.ID, PublicKey: []byte("cose")}
+	w.creds.byUser[w.user.ID] = append(w.creds.byUser[w.user.ID], row)
+	return row
 }
 
 // decodeWebAuthnError reads the JSON error envelope from a response.
@@ -311,7 +381,7 @@ func TestWebAuthnRoutesAbsentWithoutService(t *testing.T) {
 // gated behind a live session: without one, an attacker could graft their own
 // authenticator onto someone else's account.
 func TestWebAuthnAccountRoutesRequireSession(t *testing.T) {
-	fx := newWebAuthnTestServer(t)
+	fx := newWebAuthnTestServerWithStepUp(t, true)
 
 	routes := []struct {
 		method string
@@ -330,6 +400,41 @@ func TestWebAuthnAccountRoutesRequireSession(t *testing.T) {
 			}
 			_, _ = io.Copy(io.Discard, rec.Body)
 		})
+	}
+}
+
+func TestRecoveryEnrollmentRoutesAcceptOnlyRestrictedSession(t *testing.T) {
+	fx := newWebAuthnTestServerWithStepUp(t, true)
+	_, fullCookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	_, recoveryCookies := issueSession(t, fx.mgr, session.IssueParams{
+		UserID: fx.user.ID.String(),
+		Kind:   session.KindRecoveryEnrollment,
+	})
+	path := "/api/v1/auth/enrollment/webauthn/register/generate-options"
+
+	if rec := fx.do(http.MethodPost, path, nil, fullCookies); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("full session on recovery enrollment = %d, want 401", rec.Code)
+	}
+	rec := fx.do(http.MethodPost, path, nil, recoveryCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restricted session on recovery enrollment = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var options struct {
+		PublicKey struct {
+			AuthenticatorSelection struct {
+				UserVerification string `json:"userVerification"`
+			} `json:"authenticatorSelection"`
+		} `json:"publicKey"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &options); err != nil {
+		t.Fatalf("decode recovery options: %v", err)
+	}
+	if options.PublicKey.AuthenticatorSelection.UserVerification != "required" {
+		t.Fatalf("recovery userVerification = %q, want required", options.PublicKey.AuthenticatorSelection.UserVerification)
+	}
+
+	if rec := fx.do(http.MethodGet, "/api/v1/auth/webauthn/keys", nil, recoveryCookies); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("restricted session on normal key route = %d, want 401", rec.Code)
 	}
 }
 
@@ -358,9 +463,10 @@ func TestWebAuthnLoginRoutesAreUnauthenticated(t *testing.T) {
 // TestRegisterOptionsReturns200 proves the authenticated options handler emits a
 // well-formed CredentialCreation payload.
 func TestRegisterOptionsReturns200(t *testing.T) {
-	fx := newWebAuthnTestServer(t)
+	fx := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
 
-	rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", nil, fx.login(t))
+	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -404,11 +510,11 @@ func TestRegisterOptionsReturns200(t *testing.T) {
 // TestRegisterOptionsForDeletedAccountReturns401 proves a session that outlived
 // its account cannot start an enrolment.
 func TestRegisterOptionsForDeletedAccountReturns401(t *testing.T) {
-	fx := newWebAuthnTestServer(t)
-	cookies := fx.login(t)
+	fx := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
 	delete(fx.users.byID, fx.user.ID)
 
-	rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", nil, cookies)
+	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
@@ -422,7 +528,7 @@ func TestRegisterOptionsForDeletedAccountReturns401(t *testing.T) {
 // response is a client error, distinguishable from a stale challenge because
 // this route already runs inside an authenticated session.
 func TestRegisterVerifyMalformedBodyReturns400(t *testing.T) {
-	fx := newWebAuthnTestServer(t)
+	fx := newWebAuthnTestServerWithStepUp(t, true)
 	cookies := fx.login(t)
 
 	bodies := map[string][]byte{
@@ -442,6 +548,14 @@ func TestRegisterVerifyMalformedBodyReturns400(t *testing.T) {
 				t.Errorf("error = %q, want %q", got.Error, "invalid_request")
 			}
 		})
+	}
+}
+
+func TestRegisterOptionsRejectsSessionWithoutStepUp(t *testing.T) {
+	fx := newWebAuthnTestServerWithStepUp(t, true)
+	rec := fx.do(http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", nil, fx.login(t))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("registration start without step-up = %d, want 403", rec.Code)
 	}
 }
 
@@ -805,5 +919,143 @@ func TestListKeysIsScopedToTheSession(t *testing.T) {
 	}
 	if len(list) != 0 {
 		t.Errorf("len(keys) = %d, want 0; another account's credentials were exposed", len(list))
+	}
+}
+
+// --- DELETE /api/v1/auth/webauthn/keys/{id} (step-up gated) -----------------
+
+// TestWebAuthnDeleteKeyRequiresAGrant confirms a live session alone cannot
+// unenrol an authenticator: unenrolling is how an attacker holding a hijacked
+// session locks the legitimate owner out.
+func TestWebAuthnDeleteKeyRequiresAGrant(t *testing.T) {
+	ts := newWebAuthnTestServerWithStepUp(t, true)
+	cookies := ts.login(t)
+	row := ts.seedCredential([]byte("cred-a"))
+	ts.seedCredential([]byte("cred-b"))
+
+	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)
+	rec := ts.do(http.MethodDelete, path, nil, cookies)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(ts.creds.byUser[ts.user.ID]) != 2 {
+		t.Error("a rejected request removed a credential")
+	}
+}
+
+// TestWebAuthnDeleteKeyWithGrant is the happy path.
+func TestWebAuthnDeleteKeyWithGrant(t *testing.T) {
+	ts := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	row := ts.seedCredential([]byte("cred-a"))
+	ts.seedCredential([]byte("cred-b"))
+
+	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)
+	rec := ts.doWithGrant(t, http.MethodDelete, path, cookies, sess)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (body: %s)", rec.Code, rec.Body.String())
+	}
+	remaining := ts.creds.byUser[ts.user.ID]
+	if len(remaining) != 1 || !bytes.Equal(remaining[0].ID, []byte("cred-b")) {
+		t.Fatalf("expected only cred-b to remain, got %d credentials", len(remaining))
+	}
+}
+
+// TestWebAuthnDeleteKeyRefusesTheLastFactor surfaces the lockout guard as a 409
+// with a distinct code, since it is the one outcome the user must understand in
+// order to act on it (enrol another passkey, enable TOTP, or set a password).
+func TestWebAuthnDeleteKeyRefusesTheLastFactor(t *testing.T) {
+	ts := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	row := ts.seedCredential([]byte("only-cred"))
+
+	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)
+	rec := ts.doWithGrant(t, http.MethodDelete, path, cookies, sess)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeWebAuthnError(t, rec).Error; got != "last_credential" {
+		t.Fatalf("error = %q, want last_credential", got)
+	}
+	if len(ts.creds.byUser[ts.user.ID]) != 1 {
+		t.Error("the last credential was removed despite the refusal")
+	}
+}
+
+// TestWebAuthnDeleteKeyUnknownAndMalformedIDs confirms both render as 404, so a
+// caller cannot probe for credential IDs belonging to other accounts.
+func TestWebAuthnDeleteKeyUnknownAndMalformedIDs(t *testing.T) {
+	ts := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	ts.seedCredential([]byte("cred-a"))
+	ts.seedCredential([]byte("cred-b"))
+
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{"unknown credential", base64.RawURLEncoding.EncodeToString([]byte("nope"))},
+		{"not base64url", "!!!not-base64!!!"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := ts.doWithGrant(t, http.MethodDelete,
+				"/api/v1/auth/webauthn/keys/"+tc.id, cookies, sess)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if got := decodeWebAuthnError(t, rec).Error; got != "credential_not_found" {
+				t.Fatalf("error = %q, want credential_not_found", got)
+			}
+		})
+	}
+}
+
+// TestWebAuthnDeleteKeyIsScopedToTheOwner confirms one account cannot unenrol
+// another's authenticator, and that the refusal is indistinguishable from "no
+// such credential".
+func TestWebAuthnDeleteKeyIsScopedToTheOwner(t *testing.T) {
+	ts := newWebAuthnTestServerWithStepUp(t, true)
+	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	ts.seedCredential([]byte("mine-a"))
+	ts.seedCredential([]byte("mine-b"))
+
+	// A credential owned by a different account.
+	other := uuid.New()
+	victimID := []byte{0x09, 0x09}
+	ts.creds.byUser[other] = []db.WebauthnCredential{{ID: victimID, UserID: other}}
+
+	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(victimID)
+	rec := ts.doWithGrant(t, http.MethodDelete, path, cookies, sess)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(ts.creds.byUser[other]) != 1 {
+		t.Error("a foreign account's credential was removed")
+	}
+}
+
+// TestWebAuthnDeleteKeyAbsentWithoutStepUpService is the fail-closed guarantee for
+// this route: without a step-up service it must not be reachable at all.
+func TestWebAuthnDeleteKeyAbsentWithoutStepUpService(t *testing.T) {
+	ts := newWebAuthnTestServer(t)
+	cookies := ts.login(t)
+	row := ts.seedCredential([]byte("cred-a"))
+
+	// The sibling listing route proves the group is otherwise mounted.
+	if rec := ts.do(http.MethodGet, "/api/v1/auth/webauthn/keys", nil, cookies); rec.Code != http.StatusOK {
+		t.Fatalf("GET /keys = %d, want 200", rec.Code)
+	}
+
+	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)
+	rec := ts.do(http.MethodDelete, path, nil, cookies)
+	if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE /keys/{id} = %d, want the route to be withheld", rec.Code)
+	}
+	if len(ts.creds.byUser[ts.user.ID]) != 1 {
+		t.Error("the credential was removed by an unmounted route")
 	}
 }

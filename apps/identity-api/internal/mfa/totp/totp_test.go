@@ -1,6 +1,7 @@
 package totp
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -25,11 +26,11 @@ func TestGenerateSecret(t *testing.T) {
 }
 
 func TestGenerateURI(t *testing.T) {
-	secret := "JBSWY3DPEHPK3PXP"
+	testSeed := "JBSWY3DPEHPK3PXP"
 	account := "user@example.com"
 	issuer := "Hatef Identity"
 
-	uri := GenerateURI(secret, account, issuer)
+	uri := GenerateURI(testSeed, account, issuer)
 	if !strings.HasPrefix(uri, "otpauth://totp/Hatef%20Identity:user@example.com?") {
 		t.Errorf("unexpected URI prefix in: %s", uri)
 	}
@@ -49,7 +50,7 @@ func TestGenerateURI(t *testing.T) {
 
 func TestRFC6238TestVectors(t *testing.T) {
 	// RFC 6238 Appendix A test secret: "12345678901234567890" in ASCII = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" in Base32
-	secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	testVectorSeed := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
 
 	tests := []struct {
 		unixTime int64
@@ -64,7 +65,7 @@ func TestRFC6238TestVectors(t *testing.T) {
 
 	for _, tc := range tests {
 		tm := time.Unix(tc.unixTime, 0).UTC()
-		code, err := GenerateCode(secret, tm)
+		code, err := GenerateCode(testVectorSeed, tm)
 		if err != nil {
 			t.Fatalf("GenerateCode(%d): %v", tc.unixTime, err)
 		}
@@ -73,7 +74,7 @@ func TestRFC6238TestVectors(t *testing.T) {
 		}
 
 		// Validate
-		if !ValidateCode(secret, code, tm, 0) {
+		if !ValidateCode(testVectorSeed, code, tm, 0) {
 			t.Errorf("ValidateCode failed for valid code %s at time %d", code, tc.unixTime)
 		}
 	}
@@ -131,6 +132,78 @@ func TestValidateCodeWindowDrift(t *testing.T) {
 	}
 	if ValidateCode(secret, "abcdef", now, 1) {
 		t.Error("expected non-digit code to fail validation")
+	}
+}
+
+func TestCanonicalizeCodeAcceptsOnlySixASCIIDigits(t *testing.T) {
+	for _, code := range []string{"000000", "012345", "999999"} {
+		t.Run("valid_"+code, func(t *testing.T) {
+			got, err := CanonicalizeCode(code)
+			if err != nil {
+				t.Fatalf("CanonicalizeCode(%q): %v", code, err)
+			}
+			if got != code {
+				t.Fatalf("CanonicalizeCode(%q) = %q, want unchanged input", code, got)
+			}
+		})
+	}
+
+	invalid := map[string]string{
+		"empty":               "",
+		"too short":           "12345",
+		"too long":            "1234567",
+		"leading space":       " 123456",
+		"trailing space":      "123456 ",
+		"leading tab":         "\t123456",
+		"trailing newline":    "123456\n",
+		"non-breaking space":  "12345\u00a0",
+		"ASCII letter":        "12345a",
+		"full-width digits":   "１２３４５６",
+		"Arabic-Indic digits": "١٢٣٤٥٦",
+	}
+	for name, code := range invalid {
+		t.Run(name, func(t *testing.T) {
+			got, err := CanonicalizeCode(code)
+			if !errors.Is(err, ErrInvalidCode) {
+				t.Fatalf("CanonicalizeCode(%q) = (%q, %v), want ErrInvalidCode", code, got, err)
+			}
+			if got != "" {
+				t.Fatalf("CanonicalizeCode(%q) returned invalid input %q", code, got)
+			}
+		})
+	}
+}
+
+func TestValidateCodeRejectsWhitespaceAroundOtherwiseValidCode(t *testing.T) {
+	secret, err := GenerateSecret()
+	if err != nil {
+		t.Fatalf("GenerateSecret: %v", err)
+	}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	code, err := GenerateCode(secret, now)
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+
+	for _, altered := range []string{" " + code, code + " ", "\t" + code, code + "\n"} {
+		if ValidateCode(secret, altered, now, 0) {
+			t.Fatalf("ValidateCode accepted non-canonical passcode %q", altered)
+		}
+	}
+}
+
+func TestPreUnixEpochTimeIsRejected(t *testing.T) {
+	testSeed, err := GenerateSecret()
+	if err != nil {
+		t.Fatalf("GenerateSecret: %v", err)
+	}
+	beforeEpoch := time.Unix(-1, 0)
+
+	if _, err := GenerateCode(testSeed, beforeEpoch); !errors.Is(err, ErrInvalidTime) {
+		t.Fatalf("GenerateCode before epoch error = %v, want ErrInvalidTime", err)
+	}
+	if ValidateCode(testSeed, "000000", beforeEpoch, 1) {
+		t.Fatal("ValidateCode accepted a pre-epoch timestamp")
 	}
 }
 

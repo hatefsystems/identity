@@ -91,13 +91,67 @@ go test -p 1 ./...   # DB-backed packages serialized
 | :----- | :------------------------------------------ | :--------------------------------------------------- |
 | GET    | `/healthz`                                  | Liveness probe. Always 200 while running.            |
 | GET    | `/readyz`                                   | Readiness probe. Reports service readiness.          |
-| POST   | `/api/v1/auth/recovery-codes/generate`      | Mint a one-time recovery-code batch (Task 4.6).      |
+| POST   | `/api/v1/auth/stepup/challenge`             | List available Step-up factors; start a session-bound UV ceremony. |
+| POST   | `/api/v1/auth/stepup/verify`                | Exchange WebAuthn UV/TOTP for a single-use ACR grant. |
+| POST   | `/api/v1/auth/mfa/generate`                 | Start session-bound TOTP enrollment. **Step-up.**    |
+| POST   | `/api/v1/auth/mfa/verify`                   | Complete TOTP enrollment by `enrollment_id` in the same session. |
+| POST   | `/api/v1/auth/recovery-codes/generate`      | Mint a one-time recovery-code batch. **Step-up.**    |
 | GET    | `/api/v1/auth/recovery-codes/status`        | Report how many unused recovery codes remain.        |
-| POST   | `/api/v1/auth/mfa/verify-recovery-code`     | Consume one recovery code as a second factor.        |
+| POST   | `/api/v1/auth/recovery/start`               | Start an enumeration-resistant recovery transaction. |
+| POST   | `/api/v1/auth/mfa/verify-recovery-code`     | Consume the transaction and code; issue only a restricted session. |
+| POST   | `/api/v1/auth/enrollment/webauthn/register/generate-options` | Start restricted replacement-passkey enrollment. |
+| POST   | `/api/v1/auth/enrollment/webauthn/register/verify` | Finish one replacement passkey, revoke recovery session. |
+| POST   | `/api/v1/auth/webauthn/register/generate-options` | Start ordinary same-session passkey enrollment. **Step-up.** |
+| DELETE | `/api/v1/auth/mfa`                          | Disable TOTP; requires a remaining passkey. **Step-up.** |
+| DELETE | `/api/v1/auth/webauthn/keys/{id}`           | Unenrol a passkey; final passkey is refused. **Step-up.** |
+| POST   | `/api/v1/users/me/phone/send-code`          | Start same-session phone verification. **Step-up.**  |
+| DELETE | `/api/v1/users/me/phone`                    | Remove the verified phone. **Step-up.**              |
 
 Earlier tasks also mount the OIDC discovery/JWKS, token, session, WebAuthn, TOTP
 MFA, and SMS OTP routes; each is registered only when its dependency is
 configured (see `Deps` in `internal/server/server.go`).
+
+### Step-up authentication (ACR grants)
+
+Routes marked **Step-up** require a grant in the `X-Step-Up-Auth` header, minted
+by `/api/v1/auth/stepup/verify` after the user re-asserts a WebAuthn UV assertion
+or a TOTP passcode. The grant is a compact JWS (`typ: stepup+jwt`) signed by the
+same rotating keystore as access tokens, carrying
+`acr: https://ref.hatef.ir/acr/stepup`.
+
+Three properties are enforced on every presentation, in this order:
+
+1. **Purpose.** The `typ` header must be `stepup+jwt` and `acr` must be the
+   step-up value. Access tokens are signed by the same keys and already use
+   `aud == iss`, so this is what stops one being replayed as a grant.
+2. **Session.** The `sid` claim must match the caller's live session, checked
+   *before* consumption so a grant presented against the wrong session is not
+   burned for its legitimate owner.
+3. **Single use.** The `jti` is consumed on success, so one grant authorises one
+   operation rather than a 5-minute window of elevated privilege. Outside
+   explicit development, shared Redis claims an HMAC-derived opaque replay key
+   atomically for the remaining lifetime; Redis errors fail closed.
+
+Recovery codes are **not** a step-up factor: they are a login bypass, so
+accepting one would let a stolen code authorise account deletion or mint a
+replacement batch. TOTP passcodes are single-use across their whole ±1-step
+acceptance window.
+
+Adding TOTP, a passkey, or a verified phone also changes future account
+authority. Those flows therefore consume the grant at their generate/send
+endpoint, bind the pending enrollment to that exact session, and complete from
+the same session without asking for a second grant. There is no generic enabled-
+TOTP `/api/v1/auth/mfa/verify-code` oracle.
+
+The gate fails closed. When the service cannot be constructed in development,
+gated routes are left **unmounted** rather than served without their check.
+Outside development, missing Redis or `STEPUP_REPLAY_HMAC_KEY` prevents startup.
+A user without an enrolled factor gets `409 no_stepup_factor`; no failure mode
+turns a protected route into an unprotected one. A request that reaches a gated
+route without a valid grant gets
+`403 {"error": "insufficient_user_authentication", "acr_values": "..."}`;
+`403` rather than `401` because the session is valid and `401` already means
+"re-authenticate" to the portal.
 
 ### Recovery (backup) codes
 
@@ -108,14 +162,23 @@ used: the codes are already unguessable, so Argon2id would only add a
 CPU-exhaustion vector on the verify path and break the O(1) indexed lookup
 through `idx_recovery_codes_hash`.
 
-`generate` destroys the previous batch in the same transaction that inserts the
-replacement, so exactly one batch is ever live. `verify-recovery-code` matches
-the hash under `FOR UPDATE` and **physically deletes** the row inside that same
-ACID transaction (`used_at` is never stamped), so two concurrent submissions of
-one code cannot both succeed. Every code failure — unknown, already spent,
-belonging to another account, or absent — returns one indistinguishable
-`401 invalid_code`. All three routes require a live session and refuse any
-account whose status is not `active`.
+Authenticated batch `generate` destroys the previous batch in the same
+transaction that inserts the replacement, so exactly one batch is ever live;
+it requires a fresh Step-up grant. `status` requires a normal authenticated
+session.
+
+Emergency recovery is deliberately separate. Anonymous `recovery/start`
+accepts an email but returns the same no-store `202` response for known, unknown,
+inactive, and deleted identities, including a 256-bit `transaction_id` with a
+ten-minute TTL. `verify-recovery-code` atomically consumes that transaction
+before checking the code, then matches the code hash under `FOR UPDATE` and
+**physically deletes** the row inside the same ACID transaction. Success issues
+only a ten-minute `recovery_enrollment` session. It can claim one UV-required
+replacement-passkey ceremony at `/api/v1/auth/enrollment/webauthn/register/*`,
+cannot reach normal account or Step-up routes, is revoked after completion, and
+then requires normal login. Invalid, spent, foreign, and decoy transactions all
+return `401 invalid_credentials`; duplicate enrollment claims return
+`409 enrollment_already_used`.
 
 ## Configuration
 
@@ -127,6 +190,8 @@ runtime (via Infisical/KMS or the container environment) and never committed.
 | `HOST`                                | `0.0.0.0`     | Bind interface.                                                          |
 | `PORT`                                | `8080`        | HTTP listen port.                                                        |
 | `APP_ENV`                             | `development` | Deployment environment label.                                            |
+| `TRUSTED_PROXY_CIDRS`                 | _empty_       | Exact immediate proxies allowed to assert `X-Forwarded-For`; `/0` is rejected. |
+| `STEPUP_REPLAY_HMAC_KEY`              | _unset_       | **Required outside development:** standard base64, >=32 decoded bytes, identical on every replica. |
 | `RECOVERY_CODES_COUNT`                | `10`          | Recovery codes minted per batch.                                         |
 | `RECOVERY_CODE_ENTROPY_BITS`          | `160`         | Per-code entropy; values below `128` are rejected at startup.            |
 | `RECOVERY_CODES_LOW_THRESHOLD`        | `3`           | Remaining count at or below which `status` reports `low`.                |

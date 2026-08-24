@@ -17,48 +17,60 @@ const (
 	otpKeyPrefix     = "otp:sms:secret:"
 	lockoutKeyPrefix = "otp:sms:lockout:"
 
-	// Hash field names inside the otp:sms:secret:{phone} record.
+	// Hash field names inside the otp:sms:secret:{verification_id} record.
+	fieldUserID    = "user_id"
+	fieldSessionID = "session_id"
+	fieldPhone     = "phone"
 	fieldCodeHash  = "code_hash"
 	fieldAttempts  = "attempts"
 	fieldCreatedAt = "created_at"
 )
 
-// OTPRecord is the pending SMS OTP state for a phone: the hashed code and the
-// number of failed verification attempts so far.
+// OTPRecord is a pending SMS OTP challenge. The challenge is addressed by an
+// opaque verification ID, while these fields bind it to the exact account,
+// initiating browser session, and normalized phone number.
 type OTPRecord struct {
+	// UserID is the UUID string of the account that initiated enrollment.
+	UserID string
+	// SessionID is the public ID of the authenticated session that initiated
+	// enrollment. It is not the secret session token.
+	SessionID string
+	// Phone is the E.164-normalized phone number the code was delivered to.
+	Phone string
 	// CodeHash is the HMAC-SHA-256 hash of the issued OTP (never the plaintext).
 	CodeHash string
 	// Attempts is the count of failed verification attempts recorded so far.
 	Attempts int
 }
 
-// OTPStore persists the short-lived pending OTP and the brute-force lockout for
-// a phone number. The production implementation is Redis-backed (RedisOTPStore);
-// tests substitute an in-memory fake. Phone numbers passed here must already be
-// E.164-normalized so keys are stable.
+// OTPStore persists short-lived pending OTP challenges and per-phone
+// brute-force lockouts. Pending records are keyed by high-entropy verification
+// IDs rather than phone numbers, so callers cannot transplant a challenge
+// between accounts or sessions. Lockout methods still receive an
+// E.164-normalized phone so the lockout remains shared across challenges.
 type OTPStore interface {
-	// Store writes the hashed code for phone with a fresh zero attempt counter,
-	// replacing any previous pending code, and applies ttl to the record.
-	Store(ctx context.Context, phone, codeHash string, ttl time.Duration) error
-	// Get returns the pending record for phone, or ErrNoActiveCode when none is
-	// present (never issued, expired, or already consumed).
-	Get(ctx context.Context, phone string) (OTPRecord, error)
+	// Store writes record under verificationID with a fresh zero attempt
+	// counter and applies ttl to the record.
+	Store(ctx context.Context, verificationID string, record OTPRecord, ttl time.Duration) error
+	// Get returns the pending record for verificationID, or ErrNoActiveCode
+	// when none is present (never issued, expired, malformed, or consumed).
+	Get(ctx context.Context, verificationID string) (OTPRecord, error)
 	// IncrementAttempts atomically increments and returns the failed-attempt
-	// counter for phone.
-	IncrementAttempts(ctx context.Context, phone string) (int, error)
-	// Delete removes any pending code for phone (called on success and on
-	// lockout purge).
-	Delete(ctx context.Context, phone string) error
+	// counter for verificationID without extending the challenge lifetime.
+	IncrementAttempts(ctx context.Context, verificationID string) (int, error)
+	// Delete removes the pending challenge identified by verificationID.
+	Delete(ctx context.Context, verificationID string) error
 	// Lockout marks phone as locked out for ttl, blocking further verification.
 	Lockout(ctx context.Context, phone string, ttl time.Duration) error
 	// IsLockedOut reports whether phone currently has an active lockout.
 	IsLockedOut(ctx context.Context, phone string) (bool, error)
 }
 
-// RedisOTPStore is the Redis-backed OTPStore. The pending code is a Hash keyed
-// otp:sms:secret:{phone} carrying the code hash, attempt counter, and issue
-// timestamp; the lockout is a string keyed otp:sms:lockout:{phone}. Both rely on
-// Redis TTLs for expiry so no sweeper is needed.
+// RedisOTPStore is the Redis-backed OTPStore. A pending challenge is a Hash
+// keyed otp:sms:secret:{verification_id} carrying its account/session/phone
+// binding, code hash, attempt counter, and issue timestamp. The lockout is a
+// string keyed otp:sms:lockout:{phone}. Both rely on Redis TTLs for expiry so no
+// sweeper is needed.
 type RedisOTPStore struct {
 	client redis.Cmdable
 }
@@ -71,17 +83,26 @@ func NewRedisOTPStore(client redis.Cmdable) (*RedisOTPStore, error) {
 	return &RedisOTPStore{client: client}, nil
 }
 
-func otpKey(phone string) string     { return otpKeyPrefix + phone }
-func lockoutKey(phone string) string { return lockoutKeyPrefix + phone }
+func otpKey(verificationID string) string { return otpKeyPrefix + verificationID }
+func lockoutKey(phone string) string      { return lockoutKeyPrefix + phone }
 
-// Store implements OTPStore. It overwrites any prior record and resets the
-// attempt counter so a re-request always starts a clean 3-attempt budget.
-func (s *RedisOTPStore) Store(ctx context.Context, phone, codeHash string, ttl time.Duration) error {
-	key := otpKey(phone)
+// Store implements OTPStore.
+func (s *RedisOTPStore) Store(ctx context.Context, verificationID string, record OTPRecord, ttl time.Duration) error {
+	if !validVerificationID(verificationID) {
+		return errors.New("smsotp: invalid verification ID")
+	}
+	if record.UserID == "" || record.SessionID == "" || record.Phone == "" || record.CodeHash == "" {
+		return errors.New("smsotp: incomplete OTP record")
+	}
+
+	key := otpKey(verificationID)
 	pipe := s.client.TxPipeline()
 	pipe.Del(ctx, key)
 	pipe.HSet(ctx, key, map[string]any{
-		fieldCodeHash:  codeHash,
+		fieldUserID:    record.UserID,
+		fieldSessionID: record.SessionID,
+		fieldPhone:     record.Phone,
+		fieldCodeHash:  record.CodeHash,
 		fieldAttempts:  0,
 		fieldCreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
@@ -93,8 +114,8 @@ func (s *RedisOTPStore) Store(ctx context.Context, phone, codeHash string, ttl t
 }
 
 // Get implements OTPStore.
-func (s *RedisOTPStore) Get(ctx context.Context, phone string) (OTPRecord, error) {
-	vals, err := s.client.HGetAll(ctx, otpKey(phone)).Result()
+func (s *RedisOTPStore) Get(ctx context.Context, verificationID string) (OTPRecord, error) {
+	vals, err := s.client.HGetAll(ctx, otpKey(verificationID)).Result()
 	if err != nil {
 		return OTPRecord{}, fmt.Errorf("smsotp: load code: %w", err)
 	}
@@ -102,8 +123,11 @@ func (s *RedisOTPStore) Get(ctx context.Context, phone string) (OTPRecord, error
 		return OTPRecord{}, ErrNoActiveCode
 	}
 
-	hash, ok := vals[fieldCodeHash]
-	if !ok || hash == "" {
+	userID := vals[fieldUserID]
+	sessionID := vals[fieldSessionID]
+	phone := vals[fieldPhone]
+	hash := vals[fieldCodeHash]
+	if userID == "" || sessionID == "" || phone == "" || hash == "" {
 		return OTPRecord{}, ErrNoActiveCode
 	}
 
@@ -116,24 +140,39 @@ func (s *RedisOTPStore) Get(ctx context.Context, phone string) (OTPRecord, error
 		}
 	}
 
-	return OTPRecord{CodeHash: hash, Attempts: attempts}, nil
+	return OTPRecord{
+		UserID:    userID,
+		SessionID: sessionID,
+		Phone:     phone,
+		CodeHash:  hash,
+		Attempts:  attempts,
+	}, nil
 }
 
 // IncrementAttempts implements OTPStore.
-func (s *RedisOTPStore) IncrementAttempts(ctx context.Context, phone string) (int, error) {
-	key := otpKey(phone)
-	pipe := s.client.TxPipeline()
-	incrCmd := pipe.HIncrBy(ctx, key, fieldAttempts, 1)
-	pipe.Expire(ctx, key, 5*time.Minute)
-	if _, err := pipe.Exec(ctx); err != nil {
+func (s *RedisOTPStore) IncrementAttempts(ctx context.Context, verificationID string) (int, error) {
+	// Check-and-increment in one Redis command. A plain HINCRBY would recreate
+	// an expired challenge with only an attempts field, and resetting the TTL
+	// here would silently extend the original code lifetime.
+	const incrementIfPresent = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+`
+	result, err := s.client.Eval(ctx, incrementIfPresent, []string{otpKey(verificationID)}, fieldAttempts).Int64()
+	if err != nil {
 		return 0, fmt.Errorf("smsotp: increment attempts: %w", err)
 	}
-	return int(incrCmd.Val()), nil
+	if result < 0 {
+		return 0, ErrNoActiveCode
+	}
+	return int(result), nil
 }
 
 // Delete implements OTPStore.
-func (s *RedisOTPStore) Delete(ctx context.Context, phone string) error {
-	if err := s.client.Del(ctx, otpKey(phone)).Err(); err != nil {
+func (s *RedisOTPStore) Delete(ctx context.Context, verificationID string) error {
+	if err := s.client.Del(ctx, otpKey(verificationID)).Err(); err != nil {
 		return fmt.Errorf("smsotp: delete code: %w", err)
 	}
 	return nil

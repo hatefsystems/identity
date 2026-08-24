@@ -21,13 +21,15 @@ LDP is architected as a decentralized, highly scalable client-agnostic system co
 * **OAuth 2.1 & OpenID Connect Compliance:** Enforces Proof Key for Code Exchange (PKCE S256), Refresh Token Rotation (RTR), and sender-constrained access tokens via **DPoP (RFC 9449)**.
 * **Phishing-Resistant Passwordless (WebAuthn / FIDO2):** Primary secure path using passkeys, platform authenticators, and discoverable credentials.
 * **Advanced Cryptography:** NIST-compliant Argon2id password hashing, AES-GCM-256 Application-Layer Envelope Encryption for sensitive PII (via Infisical KMS), and SHA-256 for database-indexed recovery codes to prevent CPU DoS.
+* **Restricted Recovery:** A backup code is physically deleted in the same ACID transaction that verifies it and yields only a ten-minute `recovery_enrollment` session, limited to one UV-required replacement passkey before normal login.
+* **Single-Use Step-up Authorization:** High-risk factor and contact operations consume short-lived ACR grants bound to the authenticated session. Redis enforces replay claims cluster-wide under opaque HMAC-derived keys.
 
 ---
 
 ## 2. MVP Resource Optimization Strategy
 
 To support early development and minimize hosting overhead during the **MVP (Minimum Viable Product) Phase**, the system incorporates lightweight fallbacks while retaining robust post-MVP production schemas in design:
-* **Nginx Edge Ingress:** Replaces Traefik temporarily to route traffic based on path rules directly to container ports, conserving memory.
+* **Nginx Edge Ingress:** Replaces Traefik temporarily to route traffic based on path rules directly to loopback/private container ports, conserving memory. The API trusts forwarding headers only from exact `TRUSTED_PROXY_CIDRS`, and Nginx overwrites client-supplied `X-Forwarded-For`.
 * **PostgreSQL Audit Ledger (`mvp_audit_logs`):** Replaces the ~1.2 GB RAM ClickHouse analytical cluster. Audit logs are written asynchronously via NATS to PostgreSQL, strictly maintaining append-only database policies and cryptographic ledger-chain integrity.
 
 ---
@@ -99,12 +101,18 @@ Ensure the following prerequisites are installed locally:
    npm install
    ```
 
-3. **Spin up local backing services (PostgreSQL, Redis, NATS):**
+3. **Create the local environment file:**
+   ```bash
+   cp .env.example .env
+   ```
+   Keep `TRUSTED_PROXY_CIDRS` empty when the API is reached directly. The empty `STEPUP_REPLAY_HMAC_KEY` is an explicit development-only fallback; staging and production require a base64 key that decodes to at least 32 bytes and is identical on every API replica. See the deployment and coordinated-rotation runbook in `docs/devops-operations.md` §2.2.
+
+4. **Spin up local backing services (PostgreSQL, Redis, NATS):**
    ```bash
    docker compose -f docker-compose.dev.yml up -d
    ```
 
-4. **Compile schemas and generate database code:**
+5. **Compile schemas and generate database code:**
    ```bash
    # Generate TypeScript and Go contracts from Proto definitions
    # (buf, pinned as a go tool in libs/schemas)
@@ -115,7 +123,7 @@ Ensure the following prerequisites are installed locally:
    nx run identity-api:sqlc-generate
    ```
 
-5. **Start frontend and backend development servers simultaneously:**
+6. **Start frontend and backend development servers simultaneously:**
    ```bash
    nx run-many --target=serve --all
    ```

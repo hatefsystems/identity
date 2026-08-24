@@ -46,7 +46,7 @@ A task is considered complete only when it meets the following criteria:
 - [x] **Task 4.5:** Implement SMS OTP workflows with independent Redis-based rate limiting via sorted sets (ZSET) Lua scripts (rate-limiting per phone number and per IP `/24` or `/48` subnet window), plus failed-attempt brute-force lockout.
 
 - [x] **Task 4.6:** Implement high-entropy (minimum 128-bit) recovery backup codes stored hashed with SHA-256, performing verification and physical deletion in an atomic ACID database transaction.
-- [ ] **Task 4.7:** Implement the Step-up Authentication framework, issuing short-lived ACR tokens (`https://ref.hatef.ir/acr/stepup`) upon successful MFA/WebAuthn UV challenge, required for high-risk endpoints.
+- [x] **Task 4.7:** Implement the Step-up Authentication framework, issuing short-lived ACR tokens (`https://ref.hatef.ir/acr/stepup`) upon successful MFA/WebAuthn UV challenge, required for high-risk endpoints.
 
 ## Phase 5: Privacy (GDPR), Admin Mod, & Cryptographic Logging
 - [ ] **Task 5.1:** Implement user-initiated "Right to be Forgotten" soft deactivation, instantly revoking all tokens, setting account status to `pending_deletion`, and starting a 30-day grace/recovery period. Create a Go cron worker to physically hard-delete records older than 30 days. **The worker MUST call `HasActiveLegalHold(account_ref)` before purging any subject and skip the purge entirely when an active hold exists (holds > retention, compliance-and-data-governance.md §6); each skip is audit-logged. The 30-day window is strictly a user-recovery mechanism and is independent of Legal Hold and security-ledger retention. Hard-delete removes only Class A PII and MUST NOT touch `security_event_ledger`.**

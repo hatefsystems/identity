@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -17,7 +19,18 @@ type recoveryErrorResponse struct {
 }
 
 type recoveryVerifyRequest struct {
-	Code string `json:"code"`
+	TransactionID string `json:"transaction_id"`
+	Code          string `json:"code"`
+}
+
+type recoveryStartRequest struct {
+	Email string `json:"email"`
+}
+
+type recoveryStartResponse struct {
+	TransactionID string    `json:"transaction_id"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	ExpiresIn     int       `json:"expires_in"`
 }
 
 // recoveryGenerateResponse is the one-time batch returned by the generate
@@ -35,60 +48,86 @@ type recoveryStatusResponse struct {
 }
 
 type recoveryVerifyResponse struct {
-	Status    string `json:"status"`
-	Remaining int    `json:"remaining"`
+	Next      string `json:"next"`
+	ExpiresIn int    `json:"expires_in"`
 }
 
 // registerRecoveryRoutes mounts the recovery (backup) code endpoints from
 // docs/api-design.md §1.3. Generation and status are self-service management
 // routes under /api/v1/auth/recovery-codes; the verify route lives under the
 // MFA namespace (/api/v1/auth/mfa/verify-recovery-code) because it is an
-// alternative second factor consumed during authentication. All three require a
-// live session, so codes can only be minted for, inspected on, or consumed
-// against the account the caller already holds a session for.
+// anonymous recovery alternative. A normal authenticated session protects only
+// management (generate/status); start and verify intentionally run without one
+// and can mint only a restricted recovery-enrollment session.
 //
-// NOTE: two enforcement gaps here are deliberately owned by the Step-up/ACR
-// framework in Task 4.7, not by this task:
+// POST /generate additionally requires a Step-up grant: a fresh batch of codes is
+// a set of long-lived bypasses for every other factor, so minting one must cost a
+// re-asserted strong factor. It is left unmounted when no step-up service is
+// configured, rather than served ungated. Note that recovery codes are
+// deliberately not accepted *as* a step-up factor (see internal/stepup), which
+// keeps this from being circular: a stolen code cannot mint the grant needed to
+// replace the batch.
 //
-//  1. docs/api-design.md marks recovery-codes/generate as requiring Step-up
-//     authentication (re-assert a strong factor before minting fresh codes).
-//     That guard is deferred to Task 4.7, mirroring the same deferral on
-//     DELETE /api/v1/users/me/phone; it will be layered onto the generate route
-//     there without changing the handler.
-//  2. docs/api-design.md §1.3 describes verify-recovery-code as a *login bypass*
-//     — the factor a user presents when every passkey and the TOTP authenticator
-//     are gone — which implies it must be reachable from a half-authenticated
-//     (MFA-pending) state. No such state exists yet: session.Session carries no
-//     ACR/AMR field, so there is no partial session to accept. Rather than
-//     invent one here, the route requires a full session; Task 4.7 owns the
-//     partial-session state and will widen acceptance at this layer only,
-//     leaving recovery.Service untouched.
+// Successful verification consumes the code and permits exactly one UV passkey
+// enrollment through the dedicated /api/v1/auth/enrollment/webauthn routes. It
+// never promotes the restricted session; the replacement credential must then
+// be used for a fresh login.
 func (s *Server) registerRecoveryRoutes() {
-	if s.deps.SessionManager == nil {
-		s.logger.Warn("recovery: no session manager configured; recovery-code routes not mounted")
+	if s.deps.RecoveryFlow != nil && s.deps.SessionManager != nil {
+		s.router.Post("/api/v1/auth/recovery/start", s.handleRecoveryStart())
+		s.router.Post("/api/v1/auth/mfa/verify-recovery-code", s.handleRecoveryVerify())
+	}
+	if s.deps.Recovery == nil {
 		return
 	}
 
-	guard, err := session.NewRequireSession(s.deps.SessionManager)
-	if err != nil {
-		s.logger.Error("recovery: failed to build RequireSession middleware", "error", err.Error())
+	guard, ok := s.sessionGuard("recovery")
+	if !ok {
 		return
 	}
+	stepGuard, hasStepUp := s.stepUpGuard("recovery")
 
 	s.router.Route("/api/v1/auth/recovery-codes", func(r chi.Router) {
 		r.Use(guard.Handler)
 
-		r.Post("/generate", s.handleRecoveryGenerate())
 		r.Get("/status", s.handleRecoveryStatus())
-	})
 
-	// The verify route is a distinct second factor rather than account
-	// management, so it is namespaced alongside the other MFA verifiers.
-	s.router.Route("/api/v1/auth/mfa/verify-recovery-code", func(r chi.Router) {
-		r.Use(guard.Handler)
-
-		r.Post("/", s.handleRecoveryVerify())
+		if !hasStepUp {
+			return
+		}
+		r.Group(func(pr chi.Router) {
+			pr.Use(stepGuard.Handler)
+			pr.Post("/generate", s.handleRecoveryGenerate())
+		})
 	})
+}
+
+// handleRecoveryStart creates a single-use opaque recovery transaction. Real,
+// inactive, deleted, and unknown accounts all receive the same 202 shape.
+func (s *Server) handleRecoveryStart() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, ok := s.readWebAuthnBody(w, r)
+		if !ok {
+			return
+		}
+		var req recoveryStartRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, recoveryErrorResponse{Error: "invalid_request"})
+			return
+		}
+		result, err := s.deps.RecoveryFlow.Start(r.Context(), req.Email)
+		if err != nil {
+			s.logger.Error("recovery: start failed", "error", err.Error())
+			writeJSON(w, http.StatusInternalServerError, recoveryErrorResponse{Error: "server_error"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusAccepted, recoveryStartResponse{
+			TransactionID: result.TransactionID,
+			ExpiresAt:     result.ExpiresAt,
+			ExpiresIn:     int(recovery.RecoveryTransactionTTL.Seconds()),
+		})
+	}
 }
 
 // handleRecoveryGenerate serves POST /api/v1/auth/recovery-codes/generate.
@@ -102,10 +141,7 @@ func (s *Server) handleRecoveryGenerate() http.HandlerFunc {
 			return
 		}
 
-		// r.RemoteAddr is the real client IP (middleware.RealIP resolved it from
-		// the proxy headers), so the per-subnet limit groups by the genuine
-		// source rather than the ingress address.
-		result, err := s.deps.Recovery.Generate(r.Context(), userID, r.RemoteAddr)
+		result, err := s.deps.Recovery.Generate(r.Context(), userID, clientip.FromRequest(r))
 		if err != nil {
 			s.writeRecoveryError(w, "generate recovery codes", err)
 			return
@@ -151,11 +187,6 @@ func (s *Server) handleRecoveryStatus() http.HandlerFunc {
 // foreign code.
 func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := s.webauthnSessionUser(w, r)
-		if !ok {
-			return
-		}
-
 		body, ok := s.readWebAuthnBody(w, r)
 		if !ok {
 			return
@@ -169,21 +200,44 @@ func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 			}
 		}
 
-		if err := s.deps.Recovery.Verify(r.Context(), userID, req.Code, r.RemoteAddr); err != nil {
-			s.writeRecoveryError(w, "verify recovery code", err)
+		userID, err := s.deps.RecoveryFlow.Verify(r.Context(), req.TransactionID, req.Code, clientip.FromRequest(r))
+		if err != nil {
+			s.writeRecoveryFlowError(w, err)
 			return
 		}
 
-		// Surface the remaining count so a client can prompt regeneration as the
-		// user burns through the batch. A count failure here must not undo the
-		// successful consumption, so it degrades to omitting the number.
-		remaining := 0
-		if status, err := s.deps.Recovery.Status(r.Context(), userID); err == nil {
-			remaining = status.Remaining
+		if _, err := s.deps.SessionManager.Issue(w, session.IssueParams{
+			UserID:    userID.String(),
+			IP:        clientip.FromRequest(r),
+			UserAgent: r.UserAgent(),
+			Kind:      session.KindRecoveryEnrollment,
+		}); err != nil {
+			// The code has already been physically deleted. Fail closed rather
+			// than attempting to resurrect a credential after session failure.
+			s.logger.Error("recovery: issue restricted session after consumed code failed", "error", err.Error())
+			writeJSON(w, http.StatusInternalServerError, recoveryErrorResponse{Error: "server_error"})
+			return
 		}
 
-		writeJSON(w, http.StatusOK, recoveryVerifyResponse{Status: "verified", Remaining: remaining})
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, recoveryVerifyResponse{
+			Next:      "enroll_factor",
+			ExpiresIn: int(session.RecoveryEnrollmentTTL.Seconds()),
+		})
 	}
+}
+
+func (s *Server) writeRecoveryFlowError(w http.ResponseWriter, err error) {
+	if errors.Is(err, recovery.ErrRateLimited) {
+		writeJSON(w, http.StatusTooManyRequests, recoveryErrorResponse{Error: "rate_limited"})
+		return
+	}
+	if errors.Is(err, recovery.ErrInvalidCode) || errors.Is(err, recovery.ErrUserNotFound) || errors.Is(err, recovery.ErrAccountNotActive) {
+		writeJSON(w, http.StatusUnauthorized, recoveryErrorResponse{Error: "invalid_credentials"})
+		return
+	}
+	s.logger.Error("recovery: verify flow failed", "error", err.Error())
+	writeJSON(w, http.StatusInternalServerError, recoveryErrorResponse{Error: "server_error"})
 }
 
 // writeRecoveryError maps domain recovery errors to HTTP responses. A bad code

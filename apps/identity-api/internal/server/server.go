@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
@@ -21,6 +22,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -69,6 +71,18 @@ type Deps struct {
 	// routes are not mounted; the routes additionally require SessionManager,
 	// since every recovery-code operation is scoped to the caller's session.
 	Recovery *recovery.Service
+	// RecoveryFlow is the anonymous, enumeration-resistant transaction that
+	// converts one physical recovery code into a restricted enrollment session.
+	RecoveryFlow *recovery.FlowService
+	// StepUp drives the step-up challenge/verify routes at
+	// /api/v1/auth/stepup and gates every high-risk endpoint documented as
+	// requiring the X-Step-Up-Auth grant (docs/api-design.md §1.3-1.5).
+	//
+	// When nil, those routes are not mounted AND neither is any step-up-gated
+	// route. That is deliberate: a route documented as step-up gated must never
+	// be reachable without the gate, so an absent service fails closed
+	// (404/route-absent) rather than open.
+	StepUp *stepup.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -119,7 +133,7 @@ func (s *Server) Handler() http.Handler {
 // tasks.
 func (s *Server) registerMiddleware() {
 	s.router.Use(middleware.RequestID)
-	s.router.Use(middleware.RealIP)
+	s.router.Use(clientip.Middleware(s.cfg.TrustedProxyCIDRs))
 	s.router.Use(middleware.Recoverer)
 }
 
@@ -159,9 +173,56 @@ func (s *Server) registerRoutes() {
 
 	// Recovery (backup) code routes are mounted when the service is
 	// provisioned (it requires a database).
-	if s.deps.Recovery != nil {
+	if s.deps.Recovery != nil || s.deps.RecoveryFlow != nil {
 		s.registerRecoveryRoutes()
 	}
+
+	// Step-up challenge/verify routes are mounted when the service is
+	// provisioned (it requires a database and at least one verifiable factor).
+	if s.deps.StepUp != nil {
+		s.registerStepUpRoutes()
+	}
+}
+
+// sessionGuard builds the session-enforcement middleware shared by every
+// first-party account route, reporting false when it cannot be constructed.
+//
+// A false return means the caller must leave its routes unmounted rather than
+// expose them unguarded: without a session manager there is no way to
+// authenticate the caller at all. subsystem names the caller in the log line.
+func (s *Server) sessionGuard(subsystem string) (*session.RequireSession, bool) {
+	if s.deps.SessionManager == nil {
+		s.logger.Warn(subsystem + ": no session manager configured; routes not mounted")
+		return nil, false
+	}
+	guard, err := session.NewRequireSession(s.deps.SessionManager)
+	if err != nil {
+		// Unreachable given the non-nil manager, but surface it rather than
+		// mounting unguarded routes.
+		s.logger.Error(subsystem+": failed to build RequireSession middleware", "error", err.Error())
+		return nil, false
+	}
+	return guard, true
+}
+
+// stepUpGuard builds the step-up enforcement middleware for the high-risk routes,
+// reporting false when it cannot be constructed.
+//
+// A false return must leave the gated routes unmounted. This is the fail-closed
+// half of the Deps.StepUp contract: an endpoint documented as requiring
+// X-Step-Up-Auth is strictly less safe if it becomes reachable without the
+// header, so "no gate" resolves to "no route" rather than "no check".
+func (s *Server) stepUpGuard(subsystem string) (*stepup.RequireStepUp, bool) {
+	if s.deps.StepUp == nil {
+		s.logger.Warn(subsystem + ": no step-up service configured; step-up gated routes not mounted")
+		return nil, false
+	}
+	guard, err := stepup.NewRequireStepUp(s.deps.StepUp, s.logger)
+	if err != nil {
+		s.logger.Error(subsystem+": failed to build RequireStepUp middleware", "error", err.Error())
+		return nil, false
+	}
+	return guard, true
 }
 
 // Start begins serving HTTP requests and blocks until the server is shut down.

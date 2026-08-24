@@ -61,6 +61,26 @@ var (
 	// but the account is suspended, awaiting verification, or queued for
 	// deletion, so no session may be issued for it.
 	ErrAccountNotActive = errors.New("webauthn: account is not active")
+
+	// ErrUserVerificationRequired indicates a step-up assertion verified
+	// cryptographically but the authenticator did not perform user verification
+	// (no PIN or biometric). The assertion therefore proves only that the
+	// authenticator was present, not that the account holder was — which is
+	// exactly the distinction a step-up challenge exists to establish
+	// (docs/architecture.md "User Presence (UP) vs. User Verification (UV)").
+	ErrUserVerificationRequired = errors.New("webauthn: user verification was not performed")
+
+	// ErrCredentialNotFound indicates the credential targeted for deletion does
+	// not exist or is not owned by the caller. The two cases are deliberately
+	// merged so a caller cannot probe for credential IDs belonging to other
+	// accounts.
+	ErrCredentialNotFound = errors.New("webauthn: credential not found")
+
+	// ErrLastCredential indicates the credential targeted for deletion is the
+	// account's only remaining authentication factor, so removing it would lock
+	// the owner out permanently. The account must enrol another passkey, enable
+	// TOTP, or set a password first.
+	ErrLastCredential = errors.New("webauthn: cannot remove the account's last authentication factor")
 )
 
 // isDomainError reports whether err is one of this package's sentinels, i.e. an
@@ -77,6 +97,7 @@ func isDomainError(err error) bool {
 	case errors.Is(err, ErrUserNotFound),
 		errors.Is(err, ErrNoCredentials),
 		errors.Is(err, ErrAccountNotActive),
+		errors.Is(err, ErrUserVerificationRequired),
 		errors.Is(err, ErrVerification):
 		return true
 	default:

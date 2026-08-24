@@ -83,11 +83,26 @@ CREATE TABLE webauthn_credentials (
 
 CREATE INDEX idx_webauthn_user_id ON webauthn_credentials(user_id);
 
--- 4. Recovery Codes (Backup Codes) Table
+-- 4. Pending, session-bound TOTP enrollment state (active secrets stay on users)
+CREATE TABLE mfa_totp_enrollments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), -- public enrollment_id
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id UUID NOT NULL,
+    purpose VARCHAR(32) NOT NULL CHECK (purpose IN ('maintenance')),
+    secret_encrypted BYTEA NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_mfa_totp_enrollments_user ON mfa_totp_enrollments(user_id);
+CREATE INDEX idx_mfa_totp_enrollments_expires ON mfa_totp_enrollments(expires_at);
+
+-- 5. Recovery Codes (Backup Codes) Table
 CREATE TABLE recovery_codes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    code_hash VARCHAR(64) NOT NULL, -- SHA-256 hash of the recovery code
+    code_hash VARCHAR(64) NOT NULL, -- deterministic SHA-256, or HMAC-SHA-256 with deployment pepper
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     used_at TIMESTAMP WITH TIME ZONE NULL
 );
@@ -96,7 +111,7 @@ CREATE TABLE recovery_codes (
 CREATE UNIQUE INDEX idx_recovery_codes_hash ON recovery_codes(code_hash) WHERE used_at IS NULL;
 CREATE INDEX idx_recovery_codes_user_id ON recovery_codes(user_id);
 
--- MVP FALLBACK: Audit Logs Table (Used in place of ClickHouse during the MVP Phase to reduce memory)
+-- 6. MVP FALLBACK: Audit Logs Table (Used in place of ClickHouse during the MVP Phase to reduce memory)
 CREATE TABLE mvp_audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
@@ -114,7 +129,7 @@ CREATE TABLE mvp_audit_logs (
 CREATE INDEX idx_mvp_audit_logs_event_type ON mvp_audit_logs(event_type);
 CREATE INDEX idx_mvp_audit_logs_timestamp ON mvp_audit_logs(timestamp DESC);
 
--- 5. Security Event Ledger (Class B - Minimal, Persistent, Survives Account Deletion)
+-- 7. Security Event Ledger (Class B - Minimal, Persistent, Survives Account Deletion)
 -- Purpose: retain the minimum non-PII metadata needed to attribute an abusive or
 -- security-relevant action AFTER an account is hard-deleted (e.g., a court inquiry
 -- arriving at day 60 about an action taken before a day-30 deletion).
@@ -142,7 +157,7 @@ CREATE INDEX idx_security_ledger_account_ref ON security_event_ledger(account_re
 CREATE INDEX idx_security_ledger_retain_until ON security_event_ledger(retain_until);
 CREATE INDEX idx_security_ledger_event_type ON security_event_ledger(event_type);
 
--- 6. Legal Holds (Precedence Lock over ALL retention timers)
+-- 8. Legal Holds (Precedence Lock over ALL retention timers)
 -- An active hold overrides the 30-day grace window AND the security-ledger retention.
 -- Holds > retention. A hold has no predefined duration; it stays until explicitly released.
 CREATE TABLE legal_holds (
@@ -192,6 +207,10 @@ WHERE id = $1;
 1. When a user supplies a recovery code, the Go backend SHA-256 hashes the code.
 2. The hash is used in a single query via `GetActiveRecoveryCodeForUpdate` passing both the hash and the authenticating `user_id`. The database uses `idx_recovery_codes_hash` to locate it in $O(1)$ time and applies a row-level lock (`FOR UPDATE`).
 3. If a match is found, the backend directly triggers its permanent, transactional physical deletion (`DeleteRecoveryCodePhysically`) in the same ACID database transaction, avoiding redundant intermediate database UPDATE operations.
+
+#### Factor-mutation lock invariant:
+
+Passkey deletion and TOTP disablement both begin a transaction and acquire `GetUserByIDForUpdate` first. Passkey deletion then locks that user's WebAuthn rows in stable credential-ID order before it counts and deletes. TOTP disablement counts passkeys while holding the same user-row mutex before clearing the secret. This common lock order serializes cross-factor races and guarantees at least one passkey remains, reflecting that WebAuthn is currently the only browser session-issuing login surface.
 
 ---
 
@@ -263,11 +282,23 @@ Redis acts as a low-latency data cache for session tokens, DPoP nonces, and temp
 
 | Keyspace Pattern | Data Type | TTL Value | Purpose |
 | :--- | :--- | :--- | :--- |
-| `session:token:{token_hash}` | Hash | 24 Hours | Stored session meta (User ID, IP, Client Device, DPoP key fingerprint). |
+| `session:token:{token_hash}` | Hash | By session kind | Stored session meta: User ID, kind, IP, client device, DPoP key fingerprint, absolute/idle expiry, and the recovery-enrollment claim flag. Normal `authenticated` sessions use the configured lifetime; `recovery_enrollment` sessions have a hard ten-minute lifetime and may claim at most one replacement passkey. |
 | `dpop:jti:{jti}` | String | 60 Seconds | Caches the DPoP proof identifier `jti` to prevent replay attacks. |
-| `otp:sms:secret:{phone}` | Hash | 3 Minutes | Contains the cryptographically hashed OTP code, generation timestamp, and attempt counter. |
+| `otp:sms:secret:{verification_id}` | Hash | 3 Minutes | Pending phone proof addressed by a 256-bit opaque ID and bound to the exact user, initiating session, normalized phone, HMAC-SHA-256 code hash, issue time, and attempt counter. |
+| `recovery:transaction:{sha256(transaction_id)}` | String | 10 Minutes | One-time recovery-start subject. `GETDEL` consumes the transaction before the submitted recovery code is evaluated, so spent, invalid, and replayed transactions converge on the same failure surface. |
 | `rate:otp:phone:{phone}` | String | 1 Hour | Tracks SMS OTP requests made to a specific phone number. |
 | `rate:otp:subnet:{ip_subnet}` | String | 1 Hour | Tracks SMS OTP requests made by an IP subnet to prevent distributed spam. |
+| `stepup:replay:v1:{hmac_sha256}` | String | Remaining logical lifetime (<=5 min) | Cluster-wide replay claim for either a grant JTI or a TOTP exchange. The suffix is HMAC-SHA-256 over the namespaced logical identity with `STEPUP_REPLAY_HMAC_KEY`; Redis never receives a raw JTI, user ID, or guessable TOTP-derived value. Atomic `SET NX` permits exactly one claimant. |
+| `rate:stepup:verify:subnet:{ip_subnet}` | ZSET | 1 Hour | Bounds Step-up verification attempts per IP subnet. |
+| `rate:stepup:verify:account:minute:{user_id}` | ZSET | 1 Minute | Bounds Step-up verification attempts per account per minute. This is the window that keeps a 6-digit TOTP passcode out of brute-force reach. |
+| `rate:stepup:verify:account:hour:{user_id}` | ZSET | 1 Hour | Bounds sustained Step-up verification attempts per account. |
+
+> **Deployment invariant:** outside explicit development, Step-up replay claims
+> use Redis and every replica must share the same `STEPUP_REPLAY_HMAC_KEY`.
+> `SET NX` failures and Redis errors fail closed. The in-process replay guard is a
+> development-only fallback; it is not safe for horizontally scaled deployment.
+> The session store remains separately abstracted and may still use its documented
+> single-node MVP implementation.
 
 ### 3.2 OTP Rate Limiting Structure
 

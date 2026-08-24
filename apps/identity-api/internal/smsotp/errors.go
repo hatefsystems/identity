@@ -6,6 +6,8 @@ var (
 	// ErrUserNotFound indicates the target account does not exist or is
 	// soft-deleted.
 	ErrUserNotFound = errors.New("smsotp: user not found")
+	// ErrAccountNotActive indicates a suspended or otherwise ineligible account.
+	ErrAccountNotActive = errors.New("smsotp: account is not active")
 
 	// ErrInvalidPhone indicates the submitted phone number is empty or not a
 	// well-formed E.164 number.
@@ -19,8 +21,9 @@ var (
 	// failed attempts (the 15-minute brute-force lockout).
 	ErrLockedOut = errors.New("smsotp: too many failed attempts; temporarily locked out")
 
-	// ErrNoActiveCode indicates there is no pending OTP for the phone (never
-	// requested, already consumed, or expired).
+	// ErrNoActiveCode indicates there is no pending OTP challenge usable by the
+	// caller (unknown, expired, consumed, malformed, or bound to another
+	// account/session).
 	ErrNoActiveCode = errors.New("smsotp: no active verification code")
 
 	// ErrInvalidCode indicates the submitted OTP did not match the stored hash.

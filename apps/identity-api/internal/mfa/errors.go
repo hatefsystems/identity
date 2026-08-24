@@ -1,3 +1,4 @@
+// Package mfa implements TOTP enrollment, verification, and factor teardown.
 package mfa
 
 import "errors"
@@ -20,4 +21,11 @@ var (
 
 	// ErrDecryptFailed indicates the secret envelope decryption failed.
 	ErrDecryptFailed = errors.New("mfa: failed to decrypt MFA secret")
+
+	// ErrAccountNotActive indicates the account cannot perform MFA maintenance.
+	ErrAccountNotActive = errors.New("mfa: account is not active")
+	// ErrLastFactor indicates teardown would remove the account's final login factor.
+	ErrLastFactor = errors.New("mfa: cannot disable the last login factor")
+	// ErrEnrollmentExpired indicates a pending TOTP enrollment exceeded its TTL.
+	ErrEnrollmentExpired = errors.New("mfa: enrollment expired")
 )

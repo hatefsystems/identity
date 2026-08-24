@@ -43,6 +43,10 @@ func (rs *RequireSession) Handler(next http.Handler) http.Handler {
 			rs.writeUnauthorized(w)
 			return
 		}
+		if sess.Kind != "" && sess.Kind != KindAuthenticated {
+			rs.writeUnauthorized(w)
+			return
+		}
 
 		// When the session was sender-constrained at issuance, require that the
 		// request also carries a DPoP proof bound to the same key (RFC 9449).
@@ -58,6 +62,44 @@ func (rs *RequireSession) Handler(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(WithSession(r.Context(), sess)))
 	})
+}
+
+// RequireRecoveryEnrollment gates the two dedicated replacement-passkey
+// endpoints. It rejects full sessions as well as every other session kind.
+type RequireRecoveryEnrollment struct {
+	manager *Manager
+}
+
+// NewRequireRecoveryEnrollment constructs restricted-session middleware.
+func NewRequireRecoveryEnrollment(manager *Manager) (*RequireRecoveryEnrollment, error) {
+	if manager == nil {
+		return nil, errors.New("session: manager is required")
+	}
+	return &RequireRecoveryEnrollment{manager: manager}, nil
+}
+
+// Handler wraps next with restricted recovery-session enforcement.
+func (rs *RequireRecoveryEnrollment) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sess, err := rs.manager.Authenticate(r)
+		if err != nil || sess.Kind != KindRecoveryEnrollment {
+			rs.writeUnauthorized(w)
+			return
+		}
+		if sess.DPoPJKT != "" {
+			proof := dpop.ProofFromContext(r.Context())
+			if proof == nil || proof.JKT != sess.DPoPJKT {
+				rs.writeUnauthorized(w)
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(WithSession(r.Context(), sess)))
+	})
+}
+
+func (rs *RequireRecoveryEnrollment) writeUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Cookie")
+	w.WriteHeader(http.StatusUnauthorized)
 }
 
 // writeUnauthorized emits a cookie-based auth challenge. Unlike the DPoP

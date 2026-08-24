@@ -1,9 +1,51 @@
 package session
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestMemoryClaimRecoveryEnrollmentIsAtomicAndReleasable(t *testing.T) {
+	base := time.Now()
+	now := base
+	store := newFixedStore(&now)
+	s := liveSession(base, "user-1", "recovery-1")
+	s.Kind = KindRecoveryEnrollment
+	if err := store.Create("hash-1", s); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var winners atomic.Int32
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claimed, err := store.ClaimRecoveryEnrollment("user-1", "recovery-1")
+			if err != nil {
+				t.Errorf("ClaimRecoveryEnrollment: %v", err)
+				return
+			}
+			if claimed {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := winners.Load(); got != 1 {
+		t.Fatalf("successful claims = %d, want 1", got)
+	}
+
+	if err := store.ReleaseRecoveryEnrollment("user-1", "recovery-1"); err != nil {
+		t.Fatalf("ReleaseRecoveryEnrollment: %v", err)
+	}
+	claimed, err := store.ClaimRecoveryEnrollment("user-1", "recovery-1")
+	if err != nil || !claimed {
+		t.Fatalf("claim after release = %v, %v; want true, nil", claimed, err)
+	}
+}
 
 // newFixedStore returns a MemoryStore whose clock is pinned to *at, so tests
 // can advance time deterministically by reassigning the pointed-to value.

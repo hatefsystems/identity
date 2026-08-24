@@ -22,6 +22,9 @@ type UserStore interface {
 	GetUserByEmail(ctx context.Context, email string) (db.User, error)
 	// GetUserByID resolves an active account by its UUID primary key.
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
+	// GetUserByIDForUpdate is the common account mutex for cross-factor
+	// security mutations. It must be acquired before credential-row locks.
+	GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error)
 	// GetUserByWebauthnUserHandle resolves an active account from the
 	// anonymised user handle an authenticator returns in a discoverable
 	// (usernameless) assertion. This is the User-Handle-first lookup path the
@@ -51,6 +54,13 @@ type CredentialStore interface {
 	GetWebauthnCredentialForUpdate(ctx context.Context, id []byte) (db.WebauthnCredential, error)
 	// UpdateWebauthnSignCount persists the new counter and stamps last_used_at.
 	UpdateWebauthnSignCount(ctx context.Context, arg db.UpdateWebauthnSignCountParams) (int64, error)
+	// LockWebauthnCredentialsByUser row-locks every credential a user owns
+	// (SELECT id ... FOR UPDATE) so the "don't remove the last authentication
+	// factor" guard on deletion cannot be raced by two concurrent deletions.
+	LockWebauthnCredentialsByUser(ctx context.Context, userID uuid.UUID) ([][]byte, error)
+	// DeleteWebauthnCredential removes a credential, scoped to its owner so one
+	// user can never delete another's authenticator. It reports rows affected.
+	DeleteWebauthnCredential(ctx context.Context, arg db.DeleteWebauthnCredentialParams) (int64, error)
 }
 
 // signCountToUint32 clamps the DB's int64 sign_count into the uint32 domain the

@@ -41,6 +41,16 @@ SELECT * FROM users
 WHERE id = $1
   AND deleted_at IS NULL;
 
+-- name: GetUserByIDForUpdate :one
+-- Stable per-account mutex for security-sensitive mutations that span child
+-- tables. Permanent lock order is users first, then WebAuthn credentials ordered
+-- by id, then recovery/enrollment rows. This serializes regeneration and
+-- cross-factor teardown even when no child row exists yet.
+SELECT * FROM users
+WHERE id = $1
+  AND deleted_at IS NULL
+FOR UPDATE;
+
 -- name: GetUserByEmail :one
 -- Uses the partial unique index idx_users_email (active accounts only).
 SELECT * FROM users

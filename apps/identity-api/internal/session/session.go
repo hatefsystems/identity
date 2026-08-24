@@ -30,6 +30,22 @@ import (
 // crypto/rand, matching the authorization-code / refresh-token strength.
 const tokenByteLen = 32
 
+// RecoveryEnrollmentTTL is the hard lifetime of a restricted recovery
+// session. These sessions may only enroll one replacement UV passkey and can
+// never authenticate normal account routes.
+const RecoveryEnrollmentTTL = 10 * time.Minute
+
+// Kind describes the authority carried by a server-side session.
+type Kind string
+
+const (
+	// KindAuthenticated is a normal, fully authenticated browser session.
+	KindAuthenticated Kind = "authenticated"
+	// KindRecoveryEnrollment is a restricted session issued only after a
+	// recovery code is consumed. It authorizes one replacement passkey.
+	KindRecoveryEnrollment Kind = "recovery_enrollment"
+)
+
 // Store sentinel errors.
 var (
 	// ErrSessionNotFound indicates the session token is unknown, was revoked,
@@ -47,6 +63,11 @@ type Session struct {
 	// (GET/DELETE /api/v1/users/me/sessions). It is NOT the session token and
 	// cannot be used to authenticate a request.
 	ID string
+	// Kind separates full authenticated sessions from deliberately restricted
+	// recovery-enrollment sessions. The zero value is treated as authenticated
+	// only while reading legacy in-memory records created before this field was
+	// introduced.
+	Kind Kind
 	// UserID is the authenticated subject the session belongs to.
 	UserID string
 	// IP is the client source address captured at session creation.
@@ -68,6 +89,9 @@ type Session struct {
 	// IdleExpiry slides forward on activity but is always clamped to
 	// AbsoluteExpiry. A session lapses if it is idle past this instant.
 	IdleExpiry time.Time
+	// EnrollmentClaimed is an internal compare-and-set flag used to ensure a
+	// recovery-enrollment session can persist at most one replacement factor.
+	EnrollmentClaimed bool
 }
 
 // Store persists sessions keyed by the SHA-256 hash of the session token.
@@ -99,6 +123,13 @@ type Store interface {
 	// "log out everywhere" action and the RTR breach response
 	// (docs/architecture.md "Refresh Token Rotation").
 	DeleteAllForUser(userID string) error
+	// ClaimRecoveryEnrollment atomically claims the live restricted session
+	// identified by its public ID. It returns false when the session is absent,
+	// expired, the wrong kind, or was already claimed.
+	ClaimRecoveryEnrollment(userID, sessionID string) (bool, error)
+	// ReleaseRecoveryEnrollment releases a prior claim after a conclusively
+	// failed enrollment ceremony so the caller may retry.
+	ReleaseRecoveryEnrollment(userID, sessionID string) error
 }
 
 // NewToken generates a 256-bit random session token encoded as base64url, plus

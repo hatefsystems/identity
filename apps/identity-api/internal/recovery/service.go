@@ -35,6 +35,14 @@ type Store interface {
 	DeleteRecoveryCodePhysically(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
+// userLockingStore is implemented by the sqlc query set after it is bound to a
+// PostgreSQL transaction. Keeping it separate from Store preserves lightweight
+// map-backed HTTP/unit fakes, while a configured production Transacter fails
+// closed if its transaction-bound query set ever stops providing the mutex.
+type userLockingStore interface {
+	GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error)
+}
+
 // Transacter opens database transactions for the atomic verify and regenerate
 // commits. *pgxpool.Pool satisfies it.
 type Transacter interface {
@@ -205,6 +213,13 @@ func (s *Service) Generate(ctx context.Context, userID uuid.UUID, clientIP strin
 		}
 
 		err = s.runInTx(ctx, func(store Store) error {
+			// Lock a row that always exists for this account before touching the
+			// replaceable child rows. Locking only recovery_codes is insufficient:
+			// an empty account gives concurrent regenerations nothing to contend
+			// on, allowing both batches to be inserted under READ COMMITTED.
+			if _, err := s.lockUserForRegeneration(ctx, store, userID); err != nil {
+				return err
+			}
 			if _, err := store.DeleteAllRecoveryCodesForUser(ctx, userID); err != nil {
 				return fmt.Errorf("recovery: delete existing codes: %w", err)
 			}
@@ -256,10 +271,13 @@ func (s *Service) Status(ctx context.Context, userID uuid.UUID) (*StatusResult, 
 // ErrInvalidCode so nothing distinguishes them to the caller. clientIP feeds the
 // optional per-subnet rate limit.
 func (s *Service) Verify(ctx context.Context, userID uuid.UUID, code, clientIP string) error {
-	if _, err := s.loadUser(ctx, userID); err != nil {
+	if err := s.checkRateLimits(ctx, userID, clientIP, "verify"); err != nil {
 		return err
 	}
-	if err := s.checkRateLimits(ctx, userID, clientIP, "verify"); err != nil {
+	// Apply limits before resolving the account. Anonymous recovery uses a
+	// deterministic decoy subject for unknown identities, so real and decoy
+	// attempts consume the same account/subnet budgets and follow the same path.
+	if _, err := s.loadUser(ctx, userID); err != nil {
 		return err
 	}
 
@@ -371,7 +389,33 @@ func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error
 // filters deleted_at IS NULL but not status, so the check cannot be delegated to
 // the query.
 func (s *Service) loadUser(ctx context.Context, userID uuid.UUID) (db.User, error) {
-	user, err := s.store.GetUserByID(ctx, userID)
+	return loadUserFromStore(ctx, s.store.GetUserByID, userID)
+}
+
+// lockUserForRegeneration takes the stable users-row mutex when the closure is
+// backed by a real transaction. The plain Store fallback exists only for the
+// package/server's in-memory fakes, where runInTx intentionally has no database
+// transaction to make atomic.
+func (s *Service) lockUserForRegeneration(ctx context.Context, store Store, userID uuid.UUID) (db.User, error) {
+	if s.tx == nil {
+		return loadUserFromStore(ctx, store.GetUserByID, userID)
+	}
+	if lockingStore, ok := store.(userLockingStore); ok {
+		return loadUserFromStore(ctx, lockingStore.GetUserByIDForUpdate, userID)
+	}
+	return db.User{}, errors.New("recovery: transaction store does not support user row locking")
+}
+
+// loadUserFromStore applies the common existence and status policy to either a
+// normal lookup or the transaction-bound FOR UPDATE lookup used by Generate.
+// Keeping the policy in one helper prevents the authoritative in-transaction
+// recheck from drifting from Status and Verify.
+func loadUserFromStore(
+	ctx context.Context,
+	get func(context.Context, uuid.UUID) (db.User, error),
+	userID uuid.UUID,
+) (db.User, error) {
+	user, err := get(ctx, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return db.User{}, ErrUserNotFound

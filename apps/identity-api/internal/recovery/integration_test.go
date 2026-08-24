@@ -1,3 +1,5 @@
+//go:build integration
+
 // Integration tests for Task 4.6, exercising the recovery-code service against
 // real PostgreSQL.
 //
@@ -8,9 +10,8 @@
 // pgxpool and a migrated schema.
 //
 // They require a reachable PostgreSQL instance addressed by DATABASE_URL (see
-// .env.example / docker-compose.dev.yml). When DATABASE_URL is unset or the
-// database is unreachable they skip cleanly, so plain `go test ./...` stays green
-// without Docker — mirroring internal/migrate and internal/db.
+// .env.example / docker-compose.dev.yml). The mandatory Nx security-DB target
+// checks the variable before invoking this integration-tagged package.
 //
 // With DATABASE_URL set, run the DB-backed packages serially:
 //
@@ -61,12 +62,12 @@ func openTestPool(ctx context.Context, t *testing.T) *pgxpool.Pool {
 
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
-		t.Skip("DATABASE_URL not set; skipping recovery integration test")
+		t.Fatal("DATABASE_URL is required for integration-tag recovery tests")
 	}
 
 	sqldb, err := migrate.Open(ctx, url)
 	if err != nil {
-		t.Skipf("database unreachable; skipping recovery integration test: %v", err)
+		t.Fatalf("open recovery integration database: %v", err)
 	}
 	if err := migrate.Up(ctx, sqldb); err != nil {
 		_ = sqldb.Close()
@@ -85,11 +86,11 @@ func openTestPool(ctx context.Context, t *testing.T) *pgxpool.Pool {
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		t.Skipf("database unreachable; skipping recovery integration test: %v", err)
+		t.Fatalf("open recovery integration pool: %v", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		t.Skipf("database unreachable; skipping recovery integration test: %v", err)
+		t.Fatalf("ping recovery integration database: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool
@@ -289,6 +290,127 @@ func TestIntegrationRegenerateInvalidatesPreviousBatch(t *testing.T) {
 	}
 	if err := svc.Verify(ctx, userID, second.Codes[0], ""); err != nil {
 		t.Errorf("new-batch code = %v, want nil", err)
+	}
+}
+
+// TestIntegrationConcurrentGenerateLeavesOneWholeBatch exercises the stable
+// users-row mutex rather than relying on recovery-code rows to serialize the
+// replacement. The user intentionally starts with no codes: without the mutex,
+// every DELETE can observe an empty table and concurrent inserts may leave a
+// union of independently returned batches live.
+func TestIntegrationConcurrentGenerateLeavesOneWholeBatch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	pool := openTestPool(ctx, t)
+	svc := newIntegrationService(t, pool)
+	userID := createTestUser(ctx, t, pool, "recovery-concurrent-regen@test.local")
+
+	const racers = 8
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	start.Add(1)
+	done.Add(racers)
+
+	results := make([]*GenerateResult, racers)
+	errs := make([]error, racers)
+	for i := 0; i < racers; i++ {
+		go func(idx int) {
+			defer done.Done()
+			start.Wait()
+			results[idx], errs[idx] = svc.Generate(ctx, userID, "")
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Generate racer %d: %v", i, err)
+		}
+	}
+	if got := countRows(ctx, t, pool, userID); got != defaultCount {
+		t.Fatalf("rows after concurrent Generate = %d, want one batch of %d", got, defaultCount)
+	}
+
+	rows, err := pool.Query(ctx, `SELECT code_hash FROM recovery_codes WHERE user_id = $1`, userID)
+	if err != nil {
+		t.Fatalf("query surviving hashes: %v", err)
+	}
+	defer rows.Close()
+	surviving := make(map[string]struct{}, defaultCount)
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			t.Fatalf("scan surviving hash: %v", err)
+		}
+		surviving[hash] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate surviving hashes: %v", err)
+	}
+
+	matchingBatches := 0
+	for i, result := range results {
+		matches := 0
+		for _, code := range result.Codes {
+			if _, ok := surviving[hashCode(nil, Normalize(code))]; ok {
+				matches++
+			}
+		}
+		switch matches {
+		case 0:
+			// This complete batch was superseded by a later regeneration.
+		case result.Count:
+			matchingBatches++
+		default:
+			t.Errorf("returned batch %d partially survived: %d/%d hashes", i, matches, result.Count)
+		}
+	}
+	if matchingBatches != 1 {
+		t.Errorf("surviving rows match %d complete returned batches, want exactly 1", matchingBatches)
+	}
+}
+
+// TestIntegrationGenerateContendsOnUserRow proves Generate actually takes the
+// stable account mutex. A transaction holding that row forces Generate to time
+// out before it can delete or insert recovery-code rows; after release, an
+// ordinary call succeeds.
+func TestIntegrationGenerateContendsOnUserRow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	pool := openTestPool(ctx, t)
+	svc := newIntegrationService(t, pool)
+	userID := createTestUser(ctx, t, pool, "recovery-user-lock@test.local")
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocker: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	if _, err := db.New(blocker).GetUserByIDForUpdate(ctx, userID); err != nil {
+		t.Fatalf("lock user row: %v", err)
+	}
+
+	blockedCtx, blockedCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err = svc.Generate(blockedCtx, userID, "")
+	blockedCancel()
+	if err == nil {
+		t.Fatal("Generate completed while another transaction held the user row lock")
+	}
+	if got := countRows(ctx, t, pool, userID); got != 0 {
+		t.Fatalf("blocked Generate changed %d recovery rows, want 0", got)
+	}
+
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("release user row lock: %v", err)
+	}
+	if _, err := svc.Generate(ctx, userID, ""); err != nil {
+		t.Fatalf("Generate after releasing user row lock: %v", err)
+	}
+	if got := countRows(ctx, t, pool, userID); got != defaultCount {
+		t.Fatalf("rows after unblocked Generate = %d, want %d", got, defaultCount)
 	}
 }
 

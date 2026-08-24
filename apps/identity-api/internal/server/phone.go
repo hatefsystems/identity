@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 )
@@ -21,8 +22,13 @@ type phoneSendCodeRequest struct {
 }
 
 type phoneVerifyRequest struct {
-	Phone string `json:"phone"`
-	Code  string `json:"code"`
+	VerificationID string `json:"verification_id"`
+	Code           string `json:"code"`
+}
+
+type phoneSendCodeResponse struct {
+	Status         string `json:"status"`
+	VerificationID string `json:"verification_id"`
 }
 
 type phoneStatusResponse struct {
@@ -34,26 +40,32 @@ type phoneStatusResponse struct {
 // surface (/api/v1/users/me/phone), so a valid session is required: a phone can
 // only be attached to the account the caller already holds a live session for.
 //
-// DELETE /api/v1/users/me/phone is intentionally NOT mounted here: removing a
-// verified phone requires Step-up authentication (X-Step-Up-Auth), which lands
-// with the Step-up framework in Task 4.7.
+// Sending a code and deleting the verified phone additionally require a
+// single-use Step-up grant. The grant middleware runs before the handler, so it
+// is consumed before parsing input, touching rate limits, or dispatching SMS.
+// Sensitive routes are left unmounted when no step-up service is configured
+// rather than served ungated; verification remains session-only because the
+// pending challenge is itself bound to the exact initiating session.
 func (s *Server) registerPhoneRoutes() {
-	if s.deps.SessionManager == nil {
-		s.logger.Warn("smsotp: no session manager configured; phone routes not mounted")
+	guard, ok := s.sessionGuard("smsotp")
+	if !ok {
 		return
 	}
-
-	guard, err := session.NewRequireSession(s.deps.SessionManager)
-	if err != nil {
-		s.logger.Error("smsotp: failed to build RequireSession middleware", "error", err.Error())
-		return
-	}
+	stepGuard, hasStepUp := s.stepUpGuard("smsotp")
 
 	s.router.Route("/api/v1/users/me/phone", func(r chi.Router) {
 		r.Use(guard.Handler)
 
-		r.Post("/send-code", s.handlePhoneSendCode())
 		r.Post("/verify", s.handlePhoneVerify())
+
+		if !hasStepUp {
+			return
+		}
+		r.Group(func(pr chi.Router) {
+			pr.Use(stepGuard.Handler)
+			pr.Post("/send-code", s.handlePhoneSendCode())
+			pr.Delete("/", s.handlePhoneRemove())
+		})
 	})
 }
 
@@ -65,6 +77,12 @@ func (s *Server) handlePhoneSendCode() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.webauthnSessionUser(w, r)
 		if !ok {
+			return
+		}
+		current, ok := session.FromContext(r.Context())
+		if !ok {
+			s.logger.Error("smsotp: send-code handler reached without a session in context")
+			writeJSON(w, http.StatusInternalServerError, phoneErrorResponse{Error: "server_error"})
 			return
 		}
 
@@ -81,15 +99,20 @@ func (s *Server) handlePhoneSendCode() http.HandlerFunc {
 			}
 		}
 
-		// r.RemoteAddr is the real client IP: middleware.RealIP has already
-		// resolved it from the proxy headers, so the per-subnet limit groups by
-		// the genuine source rather than the ingress address.
-		if err := s.deps.SMSOTP.SendCode(r.Context(), userID, req.Phone, r.RemoteAddr); err != nil {
+		verificationID, err := s.deps.SMSOTP.SendCode(
+			r.Context(), userID, current.ID, req.Phone, clientip.FromRequest(r),
+		)
+		if err != nil {
 			s.writePhoneError(w, "send phone code", err)
 			return
 		}
 
-		writeJSON(w, http.StatusOK, phoneStatusResponse{Status: "sent"})
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		writeJSON(w, http.StatusOK, phoneSendCodeResponse{
+			Status:         "sent",
+			VerificationID: verificationID,
+		})
 	}
 }
 
@@ -100,6 +123,12 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.webauthnSessionUser(w, r)
 		if !ok {
+			return
+		}
+		current, ok := session.FromContext(r.Context())
+		if !ok {
+			s.logger.Error("smsotp: verify handler reached without a session in context")
+			writeJSON(w, http.StatusInternalServerError, phoneErrorResponse{Error: "server_error"})
 			return
 		}
 
@@ -116,7 +145,7 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 			}
 		}
 
-		if err := s.deps.SMSOTP.Verify(r.Context(), userID, req.Phone, req.Code); err != nil {
+		if err := s.deps.SMSOTP.Verify(r.Context(), userID, current.ID, req.VerificationID, req.Code); err != nil {
 			s.writePhoneError(w, "verify phone code", err)
 			return
 		}
@@ -125,12 +154,34 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 	}
 }
 
+// handlePhoneRemove serves DELETE /api/v1/users/me/phone. It clears the verified
+// phone and its blind index together. Step-up gated: see registerPhoneRoutes.
+//
+// Removing a phone that is not set is a no-op success, so the endpoint is
+// idempotent and a client retrying after a dropped response does not see a
+// spurious failure.
+func (s *Server) handlePhoneRemove() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.webauthnSessionUser(w, r)
+		if !ok {
+			return
+		}
+
+		if err := s.deps.SMSOTP.RemovePhone(r.Context(), userID); err != nil {
+			s.writePhoneError(w, "remove phone", err)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // writePhoneError maps domain SMS OTP errors to HTTP responses. Rate-limit and
 // lockout conditions return 429 so a client can back off; validation problems
 // return 400; a missing account maps to 401.
 func (s *Server) writePhoneError(w http.ResponseWriter, op string, err error) {
 	switch {
-	case errors.Is(err, smsotp.ErrUserNotFound):
+	case errors.Is(err, smsotp.ErrUserNotFound), errors.Is(err, smsotp.ErrAccountNotActive):
 		writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
 	case errors.Is(err, smsotp.ErrInvalidPhone):
 		writeJSON(w, http.StatusBadRequest, phoneErrorResponse{Error: "invalid_phone"})

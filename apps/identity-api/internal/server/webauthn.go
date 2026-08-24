@@ -14,6 +14,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/uuid"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
@@ -30,6 +31,10 @@ const maxWebAuthnBodyBytes = 64 << 10
 // which specific check failed.
 type webauthnErrorResponse struct {
 	Error string `json:"error"`
+}
+
+type recoveryEnrollmentResponse struct {
+	Next string `json:"next"`
 }
 
 // webauthnLoginOptionsRequest is the body of the login options request.
@@ -82,42 +87,60 @@ type webauthnCredentialResponse struct {
 // account, so they are gated behind RequireSession: a passkey may only be
 // enrolled onto the account the caller already holds a live session for, which
 // is what stops an attacker from grafting their own authenticator onto someone
-// else's account. Step-up verification for key deletion follows in Task 4.7.
+// else's account.
+//
+// Key *deletion* is gated further, behind RequireStepUp: unenrolling an
+// authenticator is how an attacker with a hijacked session locks the legitimate
+// owner out, so it must cost a freshly re-asserted strong factor. It is left
+// unmounted when no step-up service is configured rather than served ungated.
 func (s *Server) registerWebAuthnRoutes() {
-	// The guard is built once, before routing, because the account-scoped
-	// routes must not be mounted at all if it cannot be constructed.
-	var guard *session.RequireSession
-	if s.deps.SessionManager != nil {
-		g, err := session.NewRequireSession(s.deps.SessionManager)
-		if err != nil {
-			// Unreachable given the non-nil manager, but surface it rather than
-			// mounting unguarded routes.
-			s.logger.Error("webauthn: failed to build RequireSession middleware", "error", err.Error())
-			return
-		}
-		guard = g
-	} else {
-		// Without a session manager there is no way to authenticate the caller,
-		// so the account-scoped routes are left unmounted rather than exposed
-		// unguarded.
-		s.logger.Warn("webauthn: no session manager configured; registration routes not mounted")
-	}
+	// The guards are built once, before routing, because the account-scoped
+	// routes must not be mounted at all if they cannot be constructed.
+	guard, hasSession := s.sessionGuard("webauthn")
+	stepGuard, hasStepUp := s.stepUpGuard("webauthn")
 
 	s.router.Route("/api/v1/auth/webauthn", func(r chi.Router) {
 		r.Post("/login/generate-options", s.handleWebAuthnLoginOptions())
 		r.Post("/login/verify", s.handleWebAuthnLoginVerify())
 
-		if guard == nil {
+		if !hasSession {
 			return
 		}
 		// A nested group scopes RequireSession to the enrolment routes only,
 		// leaving the login routes above reachable without a session.
 		r.Group(func(pr chi.Router) {
 			pr.Use(guard.Handler)
-			pr.Post("/register/generate-options", s.handleWebAuthnRegisterOptions())
-			pr.Post("/register/verify", s.handleWebAuthnRegisterVerify())
 			pr.Get("/keys", s.handleWebAuthnListKeys())
+
+			if !hasStepUp {
+				return
+			}
+			// The single-use grant is consumed at ceremony start. Finish relies on
+			// the pending challenge's exact session binding, so a second grant is
+			// neither needed nor accepted.
+			pr.With(stepGuard.Handler).Post("/register/generate-options", s.handleWebAuthnRegisterOptions())
+			pr.Post("/register/verify", s.handleWebAuthnRegisterVerify())
+			// Nested inside the session group so deletion requires both a live
+			// session and a fresh step-up grant.
+			pr.Group(func(sr chi.Router) {
+				sr.Use(stepGuard.Handler)
+				sr.Delete("/keys/{id}", s.handleWebAuthnDeleteKey())
+			})
 		})
+	})
+
+	if !hasSession {
+		return
+	}
+	recoveryGuard, err := session.NewRequireRecoveryEnrollment(s.deps.SessionManager)
+	if err != nil {
+		s.logger.Error("webauthn: failed to build recovery enrollment guard", "error", err.Error())
+		return
+	}
+	s.router.Route("/api/v1/auth/enrollment/webauthn/register", func(r chi.Router) {
+		r.Use(recoveryGuard.Handler)
+		r.Post("/generate-options", s.handleRecoveryWebAuthnRegisterOptions())
+		r.Post("/verify", s.handleRecoveryWebAuthnRegisterVerify())
 	})
 }
 
@@ -133,7 +156,8 @@ func (s *Server) handleWebAuthnRegisterOptions() http.HandlerFunc {
 			return
 		}
 
-		options, err := s.deps.WebAuthn.BeginRegistration(r.Context(), userID)
+		current, _ := session.FromContext(r.Context())
+		options, err := s.deps.WebAuthn.BeginRegistration(r.Context(), userID, current.ID)
 		if err != nil {
 			s.writeWebAuthnRegistrationError(w, "begin registration", err)
 			return
@@ -158,13 +182,82 @@ func (s *Server) handleWebAuthnRegisterVerify() http.HandlerFunc {
 			return
 		}
 
-		row, err := s.deps.WebAuthn.FinishRegistration(r.Context(), userID, body)
+		current, _ := session.FromContext(r.Context())
+		row, err := s.deps.WebAuthn.FinishRegistration(r.Context(), userID, current.ID, body)
 		if err != nil {
 			s.writeWebAuthnRegistrationError(w, "finish registration", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, toWebAuthnCredentialResponse(row))
 	}
+}
+
+func (s *Server) handleRecoveryWebAuthnRegisterOptions() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.webauthnSessionUser(w, r)
+		if !ok {
+			return
+		}
+		current, _ := session.FromContext(r.Context())
+		options, err := s.deps.WebAuthn.BeginRecoveryRegistration(r.Context(), userID, current.ID)
+		if err != nil {
+			s.writeWebAuthnRegistrationError(w, "begin recovery registration", err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, options)
+	}
+}
+
+func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.webauthnSessionUser(w, r)
+		if !ok {
+			return
+		}
+		current, _ := session.FromContext(r.Context())
+		body, ok := s.readWebAuthnBody(w, r)
+		if !ok {
+			return
+		}
+
+		claimed, err := s.deps.SessionManager.ClaimRecoveryEnrollment(current.UserID, current.ID)
+		if err != nil {
+			s.logger.Error("webauthn: claim recovery enrollment failed", "error", err.Error())
+			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+			return
+		}
+		if !claimed {
+			writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "enrollment_already_used"})
+			return
+		}
+
+		_, err = s.deps.WebAuthn.FinishRecoveryRegistration(r.Context(), userID, current.ID, body)
+		if err != nil {
+			if isConclusiveWebAuthnCeremonyFailure(err) {
+				_ = s.deps.SessionManager.ReleaseRecoveryEnrollment(current.UserID, current.ID)
+			}
+			s.writeWebAuthnRegistrationError(w, "finish recovery registration", err)
+			return
+		}
+
+		if err := s.deps.SessionManager.Revoke(w, r); err != nil {
+			s.logger.Error("webauthn: clear completed recovery session failed", "error", err.Error())
+			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, recoveryEnrollmentResponse{Next: "login"})
+	}
+}
+
+func isConclusiveWebAuthnCeremonyFailure(err error) bool {
+	return errors.Is(err, webauthn.ErrInvalidResponse) ||
+		errors.Is(err, webauthn.ErrChallengeNotFound) ||
+		errors.Is(err, webauthn.ErrChallengeExpired) ||
+		errors.Is(err, webauthn.ErrChallengeFlowMismatch) ||
+		errors.Is(err, webauthn.ErrVerification) ||
+		errors.Is(err, webauthn.ErrUserVerificationRequired)
 }
 
 // handleWebAuthnListKeys serves GET /api/v1/auth/webauthn/keys, returning the
@@ -272,11 +365,44 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 
 		if _, err := s.deps.SessionManager.Issue(w, session.IssueParams{
 			UserID:    userID.String(),
-			IP:        r.RemoteAddr,
+			IP:        clientip.FromRequest(r),
 			UserAgent: r.UserAgent(),
 		}); err != nil {
 			s.logger.Error("webauthn: issue session after login failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleWebAuthnDeleteKey serves DELETE /api/v1/auth/webauthn/keys/{id}, removing
+// one of the authenticated account's registered authenticators. Step-up gated:
+// see registerWebAuthnRoutes.
+//
+// The {id} path parameter is the unpadded base64url credential ID exactly as
+// returned by GET /keys. Deletion is scoped to the caller's account inside the
+// service, and refuses to remove the account's last remaining passkey. WebAuthn
+// is currently the only session-issuing login method, so secondary factors do
+// not satisfy this invariant.
+func (s *Server) handleWebAuthnDeleteKey() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.webauthnSessionUser(w, r)
+		if !ok {
+			return
+		}
+
+		credentialID, err := base64.RawURLEncoding.DecodeString(chi.URLParam(r, "id"))
+		if err != nil || len(credentialID) == 0 {
+			// A malformed ID cannot name any credential, so it is reported the
+			// same way as one that names none: nothing distinguishes "bad
+			// encoding" from "not yours".
+			writeJSON(w, http.StatusNotFound, webauthnErrorResponse{Error: "credential_not_found"})
+			return
+		}
+
+		if err := s.deps.WebAuthn.DeleteCredential(r.Context(), userID, credentialID); err != nil {
+			s.writeWebAuthnDeleteError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -365,6 +491,28 @@ func (s *Server) writeWebAuthnLoginError(w http.ResponseWriter, op string, err e
 
 	default:
 		s.logger.Error("webauthn: "+op+" failed", "error", err.Error())
+		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+	}
+}
+
+// writeWebAuthnDeleteError maps a key-deletion failure to a status code.
+//
+// A credential that does not exist and one owned by another account render
+// identically as 404, so the endpoint cannot be used to probe for credential IDs.
+// The last-factor refusal is a 409 with a distinct code because it is the one
+// outcome the user must understand to act on: enrol another passkey, enable TOTP,
+// or set a password, then retry.
+func (s *Server) writeWebAuthnDeleteError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, webauthn.ErrCredentialNotFound):
+		writeJSON(w, http.StatusNotFound, webauthnErrorResponse{Error: "credential_not_found"})
+	case errors.Is(err, webauthn.ErrLastCredential):
+		writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "last_credential"})
+	case errors.Is(err, webauthn.ErrUserNotFound):
+		// The session outlived its account (deleted mid-session).
+		writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "unauthorized"})
+	default:
+		s.logger.Error("webauthn: delete credential failed", "error", err.Error())
 		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
 	}
 }

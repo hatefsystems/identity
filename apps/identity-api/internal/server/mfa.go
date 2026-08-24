@@ -17,7 +17,8 @@ type mfaErrorResponse struct {
 }
 
 type mfaVerifyRequest struct {
-	Code string `json:"code"`
+	EnrollmentID string `json:"enrollment_id"`
+	Code         string `json:"code"`
 }
 
 type mfaStatusResponse struct {
@@ -26,27 +27,32 @@ type mfaStatusResponse struct {
 
 // registerMFARoutes mounts the TOTP MFA management endpoints from
 // docs/api-design.md §1.3.
+//
+// Starting enrollment and disabling TOTP both require Step-up authentication.
+// Enrollment completion does not consume a second grant: it can only redeem the
+// short-lived pending record bound to the same user and initiating session.
 func (s *Server) registerMFARoutes() {
-	var guard *session.RequireSession
-	if s.deps.SessionManager != nil {
-		g, err := session.NewRequireSession(s.deps.SessionManager)
-		if err != nil {
-			s.logger.Error("mfa: failed to build RequireSession middleware", "error", err.Error())
-			return
-		}
-		guard = g
-	} else {
-		s.logger.Warn("mfa: no session manager configured; MFA routes not mounted")
+	guard, ok := s.sessionGuard("mfa")
+	if !ok {
 		return
 	}
+	stepGuard, hasStepUp := s.stepUpGuard("mfa")
 
 	s.router.Route("/api/v1/auth/mfa", func(r chi.Router) {
 		r.Use(guard.Handler)
 
-		r.Post("/generate", s.handleMFAGenerate())
 		r.Post("/verify", s.handleMFAVerify())
-		r.Delete("/", s.handleMFADisable())
-		r.Post("/verify-code", s.handleMFAVerifyCode())
+
+		if !hasStepUp {
+			return
+		}
+		// The grant is consumed at enrollment start. Verification relies on the
+		// pending enrollment's exact session binding.
+		r.Group(func(pr chi.Router) {
+			pr.Use(stepGuard.Handler)
+			pr.Post("/generate", s.handleMFAGenerate())
+			pr.Delete("/", s.handleMFADisable())
+		})
 	})
 }
 
@@ -60,12 +66,15 @@ func (s *Server) handleMFAGenerate() http.HandlerFunc {
 			return
 		}
 
-		resp, err := s.deps.MFA.GenerateSetup(r.Context(), userID)
+		current, _ := session.FromContext(r.Context())
+		resp, err := s.deps.MFA.GenerateSetup(r.Context(), userID, current.ID)
 		if err != nil {
 			s.writeMFAError(w, "generate mfa setup", err)
 			return
 		}
 
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
@@ -92,7 +101,8 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 			}
 		}
 
-		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, req.Code); err != nil {
+		current, _ := session.FromContext(r.Context())
+		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, current.ID, req.EnrollmentID, req.Code); err != nil {
 			s.writeMFAError(w, "verify and enable mfa", err)
 			return
 		}
@@ -119,46 +129,21 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 	}
 }
 
-// handleMFAVerifyCode serves POST /api/v1/auth/mfa/verify-code.
-// Verifies a TOTP passcode for an enabled user (e.g. during step-up or login).
-func (s *Server) handleMFAVerifyCode() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := s.webauthnSessionUser(w, r)
-		if !ok {
-			return
-		}
-
-		body, ok := s.readWebAuthnBody(w, r)
-		if !ok {
-			return
-		}
-
-		var req mfaVerifyRequest
-		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
-				writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
-				return
-			}
-		}
-
-		if err := s.deps.MFA.VerifyCode(r.Context(), userID, req.Code); err != nil {
-			s.writeMFAError(w, "verify mfa code", err)
-			return
-		}
-
-		writeJSON(w, http.StatusOK, mfaStatusResponse{Status: "verified"})
-	}
-}
-
 // writeMFAError maps domain MFA errors into standard HTTP responses.
 func (s *Server) writeMFAError(w http.ResponseWriter, op string, err error) {
 	switch {
 	case errors.Is(err, mfa.ErrUserNotFound):
 		writeJSON(w, http.StatusUnauthorized, mfaErrorResponse{Error: "unauthorized"})
+	case errors.Is(err, mfa.ErrAccountNotActive):
+		writeJSON(w, http.StatusUnauthorized, mfaErrorResponse{Error: "unauthorized"})
+	case errors.Is(err, mfa.ErrLastFactor):
+		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "last_factor"})
 	case errors.Is(err, mfa.ErrMfaAlreadyEnabled):
 		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "mfa_already_enabled"})
 	case errors.Is(err, mfa.ErrMfaNotSetup):
 		writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "mfa_not_setup"})
+	case errors.Is(err, mfa.ErrEnrollmentExpired):
+		writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "enrollment_expired"})
 	case errors.Is(err, mfa.ErrInvalidCode):
 		writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_code"})
 	default:

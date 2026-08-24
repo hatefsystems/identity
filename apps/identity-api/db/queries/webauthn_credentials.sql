@@ -43,6 +43,16 @@ SET sign_count = $2,
     last_used_at = NOW()
 WHERE id = $1;
 
+-- name: LockWebauthnCredentialsByUser :many
+-- Row-locked read of every credential a user owns, so the "don't remove the
+-- last authenticator" guard cannot be raced by two concurrent deletions of
+-- different credentials. CountWebauthnCredentialsByUser is not lockable (an
+-- aggregate takes no row locks), which is why the guard counts locked rows.
+SELECT id FROM webauthn_credentials
+WHERE user_id = $1
+ORDER BY id
+FOR UPDATE;
+
 -- name: DeleteWebauthnCredential :execrows
 -- Step-up gated (DELETE /api/v1/auth/webauthn/keys/{id}). Scoped to user_id
 -- so one user can never remove another user's authenticator.

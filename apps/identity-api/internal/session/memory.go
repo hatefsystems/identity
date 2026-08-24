@@ -148,6 +148,49 @@ func (m *MemoryStore) DeleteAllForUser(userID string) error {
 	return nil
 }
 
+// ClaimRecoveryEnrollment implements Store with a single mutex-protected
+// compare-and-set over the restricted session state.
+func (m *MemoryStore) ClaimRecoveryEnrollment(userID, sessionID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	for hash := range m.byUser[userID] {
+		s, ok := m.byHash[hash]
+		if !ok || s.ID != sessionID {
+			continue
+		}
+		if expired(s, now) {
+			m.deleteLocked(hash, userID)
+			return false, nil
+		}
+		if s.Kind != KindRecoveryEnrollment || s.EnrollmentClaimed {
+			return false, nil
+		}
+		s.EnrollmentClaimed = true
+		m.byHash[hash] = s
+		return true, nil
+	}
+	return false, nil
+}
+
+// ReleaseRecoveryEnrollment implements Store.
+func (m *MemoryStore) ReleaseRecoveryEnrollment(userID, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for hash := range m.byUser[userID] {
+		s, ok := m.byHash[hash]
+		if !ok || s.ID != sessionID {
+			continue
+		}
+		if s.Kind == KindRecoveryEnrollment {
+			s.EnrollmentClaimed = false
+			m.byHash[hash] = s
+		}
+		return nil
+	}
+	return nil
+}
+
 // deleteLocked removes a token hash from both indexes. The caller must hold the
 // mutex.
 func (m *MemoryStore) deleteLocked(tokenHash, userID string) {

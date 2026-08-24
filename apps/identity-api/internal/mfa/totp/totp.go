@@ -6,7 +6,7 @@ package totp
 import (
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: RFC 6238 uses HMAC-SHA1; this is not collision-resistance use.
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
@@ -34,8 +34,10 @@ const (
 var (
 	// ErrInvalidSecret indicates the secret string is empty or invalid Base32.
 	ErrInvalidSecret = errors.New("totp: invalid base32 secret")
-	// ErrInvalidCode indicates the passcode is not a 6-digit numeric string.
+	// ErrInvalidCode indicates the passcode is not exactly six ASCII digits.
 	ErrInvalidCode = errors.New("totp: invalid code format")
+	// ErrInvalidTime indicates TOTP was requested before the Unix epoch.
+	ErrInvalidTime = errors.New("totp: time is before Unix epoch")
 )
 
 // GenerateSecret creates a fresh CSPRNG 160-bit (20-byte) TOTP secret, returned
@@ -88,22 +90,39 @@ func GenerateCode(secret string, t time.Time) (string, error) {
 		return "", err
 	}
 
-	counter := uint64(t.Unix() / periodSeconds)
+	unixSeconds := t.Unix()
+	if unixSeconds < 0 {
+		return "", ErrInvalidTime
+	}
+	counter := uint64(unixSeconds / periodSeconds) //nolint:gosec // G115: non-negative value checked above.
 	return calculateHOTP(secretBytes, counter)
+}
+
+// CanonicalizeCode accepts only the single wire representation supported for
+// TOTP passcodes: exactly six ASCII decimal digits. It deliberately performs
+// no trimming or Unicode digit conversion. That makes every accepted passcode
+// its own canonical representation, so verification and replay protection
+// cannot disagree about whether two differently encoded inputs are the same
+// code.
+func CanonicalizeCode(passcode string) (string, error) {
+	if len(passcode) != digits {
+		return "", ErrInvalidCode
+	}
+	for i := 0; i < len(passcode); i++ {
+		if passcode[i] < '0' || passcode[i] > '9' {
+			return "", ErrInvalidCode
+		}
+	}
+	return passcode, nil
 }
 
 // ValidateCode checks if passcode is a valid 6-digit TOTP code for secret at
 // time t within ±windowSteps time steps (e.g. windowSteps = 1 checks t-30s,
 // t, t+30s). Verification uses constant-time string comparison.
 func ValidateCode(secret, passcode string, t time.Time, windowSteps int) bool {
-	cleanPasscode := strings.TrimSpace(passcode)
-	if len(cleanPasscode) != digits {
+	canonicalPasscode, err := CanonicalizeCode(passcode)
+	if err != nil {
 		return false
-	}
-	for _, ch := range cleanPasscode {
-		if ch < '0' || ch > '9' {
-			return false
-		}
 	}
 
 	secretBytes, err := parseSecret(secret)
@@ -111,7 +130,11 @@ func ValidateCode(secret, passcode string, t time.Time, windowSteps int) bool {
 		return false
 	}
 
-	currentCounter := uint64(t.Unix() / periodSeconds)
+	unixSeconds := t.Unix()
+	if unixSeconds < 0 {
+		return false
+	}
+	currentCounter := uint64(unixSeconds / periodSeconds) //nolint:gosec // G115: non-negative value checked above.
 
 	if windowSteps < 0 {
 		windowSteps = 0
@@ -135,7 +158,7 @@ func ValidateCode(secret, passcode string, t time.Time, windowSteps int) bool {
 			continue
 		}
 
-		if subtle.ConstantTimeCompare([]byte(expected), []byte(cleanPasscode)) == 1 {
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(canonicalPasscode)) == 1 {
 			valid = true
 		}
 	}

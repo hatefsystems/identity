@@ -27,13 +27,29 @@ import (
 // user already enrolled refuses to create a duplicate. The generated challenge
 // and its SessionData are held server-side under a short TTL; the response is
 // only accepted if it echoes that exact challenge back.
-func (s *Service) BeginRegistration(ctx context.Context, userID uuid.UUID) (*protocol.CredentialCreation, error) {
+func (s *Service) BeginRegistration(ctx context.Context, userID uuid.UUID, sessionID string) (*protocol.CredentialCreation, error) {
+	return s.beginRegistration(ctx, userID, sessionID, FlowRegistration, false)
+}
+
+// BeginRecoveryRegistration starts the sole ceremony permitted to a restricted
+// recovery session. The resulting credential must perform user verification.
+func (s *Service) BeginRecoveryRegistration(ctx context.Context, userID uuid.UUID, sessionID string) (*protocol.CredentialCreation, error) {
+	return s.beginRegistration(ctx, userID, sessionID, FlowRecoveryRegistration, true)
+}
+
+func (s *Service) beginRegistration(ctx context.Context, userID uuid.UUID, sessionID string, flow Flow, requireUV bool) (*protocol.CredentialCreation, error) {
+	if sessionID == "" {
+		return nil, errors.New("webauthn: initiating session id is required")
+	}
 	user, err := s.users.GetUserByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
 		return nil, fmt.Errorf("webauthn: load user: %w", err)
+	}
+	if !isLoginEligible(user.Status) {
+		return nil, ErrAccountNotActive
 	}
 
 	// Reuse the persisted handle so every credential of an account signs over
@@ -51,24 +67,31 @@ func (s *Service) BeginRegistration(ctx context.Context, userID uuid.UUID) (*pro
 	}
 	existing := dbToCredentials(rows)
 
+	registrationOptions := []gowebauthn.RegistrationOption{
+		gowebauthn.WithExclusions(gowebauthn.Credentials(existing).CredentialDescriptors()),
+		gowebauthn.WithResidentKeyRequirement(s.residentKey),
+	}
+	if requireUV {
+		registrationOptions = append(registrationOptions, gowebauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+			RequireResidentKey: protocol.ResidentKeyRequired(),
+			ResidentKey:        s.residentKey,
+			UserVerification:   protocol.VerificationRequired,
+		}))
+	}
 	creation, session, err := s.wa.BeginRegistration(
 		newUserAdapter(user, handle, existing),
-		gowebauthn.WithExclusions(gowebauthn.Credentials(existing).CredentialDescriptors()),
-		// Ask for a discoverable (resident) credential so the authenticator
-		// stores the user handle itself. Without this the key cannot be offered
-		// in a usernameless ceremony, and the account would be permanently
-		// stuck on the user-named fallback (Task 4.3).
-		gowebauthn.WithResidentKeyRequirement(s.residentKey),
+		registrationOptions...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: begin registration: %w", err)
 	}
 
 	if err := s.challenges.Save(session.Challenge, PendingChallenge{
-		Session: *session,
-		UserRef: user.ID,
-		Flow:    FlowRegistration,
-		Expires: s.now().Add(s.challengeTTL),
+		Session:   *session,
+		UserRef:   user.ID,
+		SessionID: sessionID,
+		Flow:      flow,
+		Expires:   s.now().Add(s.challengeTTL),
 	}); err != nil {
 		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
 	}
@@ -86,20 +109,25 @@ func (s *Service) BeginRegistration(ctx context.Context, userID uuid.UUID) (*pro
 // read (single-use) and must belong to the caller, then the library verifies
 // origin, RP ID hash, client-data type, and attestation before the credential
 // is persisted together with its initial signature counter.
-func (s *Service) FinishRegistration(ctx context.Context, userID uuid.UUID, body []byte) (db.WebauthnCredential, error) {
+func (s *Service) FinishRegistration(ctx context.Context, userID uuid.UUID, sessionID string, body []byte) (db.WebauthnCredential, error) {
+	return s.finishRegistration(ctx, userID, sessionID, FlowRegistration, false, body)
+}
+
+// FinishRecoveryRegistration completes a session-bound, UV-required recovery
+// ceremony and persists the replacement passkey.
+func (s *Service) FinishRecoveryRegistration(ctx context.Context, userID uuid.UUID, sessionID string, body []byte) (db.WebauthnCredential, error) {
+	return s.finishRegistration(ctx, userID, sessionID, FlowRecoveryRegistration, true, body)
+}
+
+func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sessionID string, flow Flow, requireUV bool, body []byte) (db.WebauthnCredential, error) {
 	parsed, err := protocol.ParseCredentialCreationResponseBytes(body)
 	if err != nil {
 		return db.WebauthnCredential{}, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
 
-	pending, err := s.challenges.Take(parsed.Response.CollectedClientData.Challenge)
+	pending, err := s.challenges.TakeBound(parsed.Response.CollectedClientData.Challenge, flow, userID, sessionID)
 	if err != nil {
 		return db.WebauthnCredential{}, err
-	}
-	// A challenge issued for another account is treated as unknown: the caller
-	// learns nothing beyond "this challenge is not yours to complete".
-	if pending.UserRef != userID {
-		return db.WebauthnCredential{}, ErrChallengeNotFound
 	}
 
 	user, err := s.users.GetUserByID(ctx, userID)
@@ -108,6 +136,9 @@ func (s *Service) FinishRegistration(ctx context.Context, userID uuid.UUID, body
 			return db.WebauthnCredential{}, ErrUserNotFound
 		}
 		return db.WebauthnCredential{}, fmt.Errorf("webauthn: load user: %w", err)
+	}
+	if !isLoginEligible(user.Status) {
+		return db.WebauthnCredential{}, ErrAccountNotActive
 	}
 
 	rows, err := s.creds.ListWebauthnCredentialsByUser(ctx, user.ID)
@@ -123,6 +154,9 @@ func (s *Service) FinishRegistration(ctx context.Context, userID uuid.UUID, body
 	cred, err := s.wa.CreateCredential(adapter, pending.Session, parsed)
 	if err != nil {
 		return db.WebauthnCredential{}, fmt.Errorf("%w: %v", ErrVerification, err)
+	}
+	if requireUV && !cred.Flags.UserVerified {
+		return db.WebauthnCredential{}, ErrUserVerificationRequired
 	}
 
 	var row db.WebauthnCredential
@@ -583,4 +617,210 @@ func (s *Service) ListCredentials(ctx context.Context, userID uuid.UUID) ([]db.W
 		return nil, fmt.Errorf("webauthn: list credentials: %w", err)
 	}
 	return rows, nil
+}
+
+// BeginStepUp starts a re-authentication assertion ceremony for an account the
+// caller already holds a session for (Task 4.7), returning the
+// PublicKeyCredentialRequestOptions for navigator.credentials.get().
+//
+// It differs from BeginLogin in three ways, all deliberate:
+//
+//   - userVerification is forced to "required" rather than taking the configured
+//     default (which ships as "preferred"). A step-up grant asserts that the
+//     account *holder* re-authenticated, so a bare presence test — a security key
+//     tapped by whoever is at the keyboard — is not sufficient.
+//   - There is no mock/decoy branch. The caller is already authenticated as this
+//     account, so there is no identity to enumerate and nothing to pad; an
+//     account with no passkey gets an honest ErrNoCredentials, which the step-up
+//     service turns into "offer TOTP instead".
+//   - The challenge is tagged FlowStepUp, so it can never be redeemed at the
+//     login verifier to mint a session.
+func (s *Service) BeginStepUp(ctx context.Context, userID uuid.UUID, sessionID string) (*protocol.CredentialAssertion, error) {
+	if sessionID == "" {
+		return nil, errors.New("webauthn: initiating session id is required")
+	}
+	user, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("webauthn: load user: %w", err)
+	}
+	if !isLoginEligible(user.Status) {
+		return nil, ErrAccountNotActive
+	}
+	if len(user.WebauthnUserHandle) == 0 {
+		return nil, ErrNoCredentials
+	}
+
+	rows, err := s.creds.ListWebauthnCredentialsByUser(ctx, user.ID)
+	if err != nil {
+		return nil, fmt.Errorf("webauthn: list credentials: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, ErrNoCredentials
+	}
+
+	assertion, session, err := s.wa.BeginLogin(
+		newUserAdapter(user, user.WebauthnUserHandle, dbToCredentials(rows)),
+		gowebauthn.WithUserVerification(protocol.VerificationRequired),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("webauthn: begin step-up: %w", err)
+	}
+
+	if err := s.challenges.Save(session.Challenge, PendingChallenge{
+		Session:   *session,
+		UserRef:   user.ID,
+		SessionID: sessionID,
+		Flow:      FlowStepUp,
+		Expires:   s.now().Add(s.challengeTTL),
+	}); err != nil {
+		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
+	}
+
+	return assertion, nil
+}
+
+// FinishStepUp verifies a step-up assertion for userID. A nil return is the proof
+// that a user-verified assertion from one of the account's own credentials was
+// presented; the caller (internal/stepup) mints the ACR grant from it.
+//
+// User verification is checked twice, before and after the library's validation,
+// and the reason for each is different:
+//
+//   - The early check exists to give an actionable answer. The stored SessionData
+//     carries UserVerification: "required", so the library also rejects a UV-less
+//     assertion — but it does so as a generic validation failure, indistinguishable
+//     from a bad signature. Since the user's only remedy ("use a PIN-capable
+//     authenticator, or TOTP") depends on knowing which it was, the flag is read
+//     first and reported precisely. This is safe to trust for *routing* the error
+//     because the flag lives inside the signed authenticator data: an attacker who
+//     flips it to claim verification simply fails the signature check below and
+//     gets the generic rejection instead.
+//   - The late check is defence in depth, so the guarantee does not rest solely on
+//     the SessionData field being carried through the library correctly. It mirrors
+//     how completeLogin re-checks the clone warning explicitly.
+func (s *Service) FinishStepUp(ctx context.Context, userID uuid.UUID, sessionID string, body []byte) error {
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(body)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+
+	pending, err := s.challenges.TakeBound(parsed.Response.CollectedClientData.Challenge, FlowStepUp, userID, sessionID)
+	if err != nil {
+		return err
+	}
+
+	if !parsed.Response.AuthenticatorData.Flags.HasUserVerified() {
+		return ErrUserVerificationRequired
+	}
+
+	user, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("webauthn: load user: %w", err)
+	}
+	if !bytes.Equal(user.WebauthnUserHandle, pending.Session.UserID) {
+		return ErrVerification
+	}
+
+	rows, err := s.creds.ListWebauthnCredentialsByUser(ctx, user.ID)
+	if err != nil {
+		return fmt.Errorf("webauthn: list credentials: %w", err)
+	}
+	if len(rows) == 0 {
+		return ErrNoCredentials
+	}
+
+	cred, err := s.wa.ValidateLogin(
+		newUserAdapter(user, pending.Session.UserID, dbToCredentials(rows)),
+		pending.Session,
+		parsed,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrVerification, err)
+	}
+
+	if !cred.Flags.UserVerified {
+		return ErrUserVerificationRequired
+	}
+	if cred.Authenticator.CloneWarning {
+		return ErrCredentialCloned
+	}
+	// Re-checked after verification: the account may have been suspended while
+	// the ceremony was in flight.
+	if !isLoginEligible(user.Status) {
+		return ErrAccountNotActive
+	}
+
+	// A step-up assertion advances the authenticator's counter exactly like a
+	// login, so it must be persisted or the next authentication would compare
+	// against a stale value — either failing a legitimate user or masking a
+	// genuine cloned authenticator.
+	return s.commitSignCount(ctx, cred)
+}
+
+// DeleteCredential removes one of an account's registered credentials
+// (DELETE /api/v1/auth/webauthn/keys/{id}, step-up gated).
+//
+// It always refuses to remove the account's last passkey. WebAuthn is currently
+// the only flow that can issue a full login session; TOTP, phone, password data,
+// and recovery codes therefore do not make final-passkey deletion safe.
+//
+// The count and the delete run in one transaction over row-locked credential IDs
+// so two concurrent deletions of different credentials cannot both observe "two
+// remain" and leave the account with none.
+func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, credentialID []byte) error {
+	if len(credentialID) == 0 {
+		return ErrCredentialNotFound
+	}
+
+	return s.runInTx(ctx, func(users UserStore, creds CredentialStore) error {
+		user, err := users.GetUserByIDForUpdate(ctx, userID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("webauthn: load user: %w", err)
+		}
+		if !isLoginEligible(user.Status) {
+			return ErrAccountNotActive
+		}
+
+		locked, err := creds.LockWebauthnCredentialsByUser(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("webauthn: lock credentials: %w", err)
+		}
+		if !containsCredentialID(locked, credentialID) {
+			return ErrCredentialNotFound
+		}
+		if len(locked) == 1 {
+			return ErrLastCredential
+		}
+
+		affected, err := creds.DeleteWebauthnCredential(ctx, db.DeleteWebauthnCredentialParams{
+			ID:     credentialID,
+			UserID: userID,
+		})
+		if err != nil {
+			return fmt.Errorf("webauthn: delete credential: %w", err)
+		}
+		if affected == 0 {
+			return ErrCredentialNotFound
+		}
+		return nil
+	})
+}
+
+// containsCredentialID reports whether id appears in the locked credential set.
+func containsCredentialID(ids [][]byte, id []byte) bool {
+	for _, candidate := range ids {
+		if bytes.Equal(candidate, id) {
+			return true
+		}
+	}
+	return false
 }

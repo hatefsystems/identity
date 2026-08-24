@@ -32,6 +32,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -122,7 +123,18 @@ func run(logger *slog.Logger) error {
 	// present, the Redis client for its optional rate limits. When no database
 	// is configured (development only) it is skipped and its routes are left
 	// unmounted.
-	recoveryService, err := buildRecoveryService(pool, redisClient, logger)
+	recoveryService, recoveryFlow, err := buildRecoveryService(cfg.Environment, pool, redisClient, logger)
+	if err != nil {
+		return err
+	}
+
+	// The step-up service reuses the WebAuthn database pool, the OIDC keystore
+	// (grants are signed by the same rotating keys as access tokens), and both
+	// factor verifiers built above. When no database is configured (development
+	// only) it is skipped, which also leaves every step-up-gated route
+	// unmounted — the fail-closed behaviour documented on server.Deps.StepUp.
+	stepupService, err := buildStepUpService(
+		cfg.Environment, pool, redisClient, keyManager, oidcCfg, webauthnService, mfaService, logger)
 	if err != nil {
 		return err
 	}
@@ -138,6 +150,8 @@ func run(logger *slog.Logger) error {
 		MFA:            mfaService,
 		SMSOTP:         smsotpService,
 		Recovery:       recoveryService,
+		RecoveryFlow:   recoveryFlow,
+		StepUp:         stepupService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -506,7 +520,7 @@ func buildMFAService(pool *pgxpool.Pool, logger *slog.Logger) (*mfa.Service, err
 		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
 	}
 
-	svc, err := mfa.New(mfa.Config{}, db.New(pool), encryptor)
+	svc, err := mfa.New(mfa.Config{}, db.New(pool), encryptor, mfa.WithTransacter(pool))
 	if err != nil {
 		return nil, fmt.Errorf("main: build MFA service: %w", err)
 	}
@@ -524,15 +538,15 @@ func buildMFAService(pool *pgxpool.Pool, logger *slog.Logger) (*mfa.Service, err
 // When no database is configured — development only, since buildWebAuthnService
 // already makes it mandatory elsewhere — the service is skipped (nil return)
 // and its routes are left unmounted, matching the WebAuthn precedent.
-func buildRecoveryService(pool *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) (*recovery.Service, error) {
+func buildRecoveryService(environment string, pool *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) (*recovery.Service, *recovery.FlowService, error) {
 	if pool == nil {
 		logger.Warn("recovery-code service disabled (requires DATABASE_URL)")
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	rc, err := config.LoadRecovery()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	opts := []recovery.Option{recovery.WithTransacter(pool)}
@@ -543,7 +557,7 @@ func buildRecoveryService(pool *pgxpool.Pool, redisClient *redis.Client, logger 
 	if redisClient != nil {
 		limiter, err := ratelimit.NewRedisLimiter(redisClient)
 		if err != nil {
-			return nil, fmt.Errorf("main: build rate limiter: %w", err)
+			return nil, nil, fmt.Errorf("main: build rate limiter: %w", err)
 		}
 		opts = append(opts, recovery.WithRateLimiter(limiter))
 	}
@@ -557,7 +571,26 @@ func buildRecoveryService(pool *pgxpool.Pool, redisClient *redis.Client, logger 
 		PerSubnetPerHour:  rc.PerSubnetPerHour,
 	}, db.New(pool), opts...)
 	if err != nil {
-		return nil, fmt.Errorf("main: build recovery service: %w", err)
+		return nil, nil, fmt.Errorf("main: build recovery service: %w", err)
+	}
+
+	var transactionStore recovery.TransactionStore
+	if redisClient != nil {
+		transactionStore, err = recovery.NewRedisTransactionStore(redisClient)
+		if err != nil {
+			return nil, nil, fmt.Errorf("main: build recovery transaction store: %w", err)
+		}
+	} else {
+		transactionStore = recovery.NewMemoryTransactionStore()
+		logger.Warn("recovery transactions use development-only in-memory storage")
+	}
+	webAuthnCfg, err := config.LoadWebAuthn(environment)
+	if err != nil {
+		return nil, nil, err
+	}
+	flow, err := recovery.NewFlowService(svc, db.New(pool), transactionStore, webAuthnCfg.NamedLoginFloor)
+	if err != nil {
+		return nil, nil, fmt.Errorf("main: build recovery flow: %w", err)
 	}
 
 	logger.Info("recovery code service configured",
@@ -566,6 +599,104 @@ func buildRecoveryService(pool *pgxpool.Pool, redisClient *redis.Client, logger 
 		slog.Int("low_threshold", rc.LowThreshold),
 		slog.Bool("rate_limited", redisClient != nil),
 		slog.Bool("peppered", len(rc.HashPepper) > 0),
+	)
+	return svc, flow, nil
+}
+
+// buildStepUpService assembles the Step-up Authentication service (Task 4.7). It
+// reuses the WebAuthn database pool for the user lookup, the OIDC keystore to
+// sign and verify grants (so they follow the same active/next/previous rotation
+// as access and ID tokens), and the WebAuthn and TOTP services as the two factor
+// verifiers.
+//
+// When no database is configured — development only, since buildWebAuthnService
+// already makes it mandatory elsewhere — the service is skipped (nil return).
+// That leaves not only the step-up routes unmounted but every step-up-gated route
+// as well: an endpoint documented as requiring X-Step-Up-Auth must never become
+// reachable without it, so an absent service fails closed. See server.Deps.StepUp.
+//
+// Production replay claims are stored cluster-wide in Redis as HMAC-derived
+// opaque keys. The in-memory guard is retained only for explicit development
+// when no replay HMAC key or Redis connection is configured.
+//
+// Unlike the recovery-code limiter, throttling here is not merely best-effort
+// hardening: the per-minute account window is what keeps a 6-digit TOTP passcode
+// out of brute-force reach. Redis is already mandatory outside development (see
+// buildRedisClient), so the limiter is always present in production.
+func buildStepUpService(
+	environment string,
+	pool *pgxpool.Pool,
+	redisClient *redis.Client,
+	keyManager *keys.Manager,
+	oidcCfg config.OIDCConfig,
+	webauthnSvc *webauthn.Service,
+	mfaSvc *mfa.Service,
+	logger *slog.Logger,
+) (*stepup.Service, error) {
+	if pool == nil {
+		logger.Warn("step-up service disabled (requires DATABASE_URL); step-up gated routes will not be mounted")
+		return nil, nil
+	}
+
+	sc, err := config.LoadStepUp(environment)
+	if err != nil {
+		return nil, err
+	}
+
+	// Only pass a verifier that actually exists; stepup.New requires at least
+	// one, so a process with neither fails at startup rather than mounting gated
+	// routes no caller could ever satisfy.
+	var passkeys stepup.PasskeyVerifier
+	if webauthnSvc != nil {
+		passkeys = webauthnSvc
+	}
+	var totp stepup.TOTPVerifier
+	if mfaSvc != nil {
+		totp = mfaSvc
+	}
+
+	opts := []stepup.Option{}
+	var replayGuard stepup.ReplayGuard
+	distributedReplay := redisClient != nil && len(sc.ReplayHMACKey) > 0
+	if redisClient != nil {
+		limiter, err := ratelimit.NewRedisLimiter(redisClient)
+		if err != nil {
+			return nil, fmt.Errorf("main: build rate limiter: %w", err)
+		}
+		opts = append(opts, stepup.WithRateLimiter(limiter))
+	}
+	if distributedReplay {
+		var err error
+		replayGuard, err = stepup.NewRedisReplayGuard(redisClient, sc.ReplayHMACKey)
+		if err != nil {
+			return nil, fmt.Errorf("main: build distributed replay guard: %w", err)
+		}
+	} else {
+		if redisClient == nil {
+			logger.Warn("step-up verification is not rate limited (requires REDIS_URL)")
+		}
+		replayGuard = stepup.NewMemoryReplayGuard()
+		logger.Warn("step-up replay protection uses development-only in-memory storage")
+	}
+
+	svc, err := stepup.New(stepup.Config{
+		Issuer:              oidcCfg.Issuer,
+		TokenTTL:            sc.TokenTTL,
+		PerAccountPerMinute: sc.PerAccountPerMinute,
+		PerAccountPerHour:   sc.PerAccountPerHour,
+		PerSubnetPerHour:    sc.PerSubnetPerHour,
+	}, keyManager, db.New(pool), passkeys, totp, replayGuard, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("main: build step-up service: %w", err)
+	}
+
+	logger.Info("step-up service configured",
+		slog.Duration("token_ttl", sc.TokenTTL),
+		slog.String("acr", stepup.ACRStepUp),
+		slog.Bool("webauthn_factor", passkeys != nil),
+		slog.Bool("totp_factor", totp != nil),
+		slog.Bool("rate_limited", redisClient != nil),
+		slog.Bool("distributed_replay", distributedReplay),
 	)
 	return svc, nil
 }

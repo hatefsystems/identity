@@ -7,8 +7,10 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,6 +34,10 @@ const (
 	defaultSessionIdleTTL      = 2 * time.Hour
 )
 
+// EnvTrustedProxyCIDRs names the comma-separated CIDR allow-list of immediate
+// reverse-proxy peers whose X-Forwarded-For chains the server may trust.
+const EnvTrustedProxyCIDRs = "TRUSTED_PROXY_CIDRS"
+
 // Config holds the runtime configuration for the HTTP server.
 type Config struct {
 	// Host is the network interface the server binds to.
@@ -41,6 +47,10 @@ type Config struct {
 	// Environment identifies the deployment environment (e.g. "development",
 	// "production"). It is informational and used for readiness reporting.
 	Environment string
+	// TrustedProxyCIDRs contains the immediate reverse-proxy networks allowed to
+	// assert X-Forwarded-For. An empty slice is the secure default: all forwarding
+	// headers are ignored and the socket peer is treated as the client.
+	TrustedProxyCIDRs []netip.Prefix
 	// ReadTimeout is the maximum duration for reading the entire request.
 	ReadTimeout time.Duration
 	// WriteTimeout is the maximum duration before timing out writes of the response.
@@ -135,7 +145,50 @@ func Load() (Config, error) {
 		cfg.Port = port
 	}
 
+	trustedProxyCIDRs, err := parseTrustedProxyCIDRs(os.Getenv(EnvTrustedProxyCIDRs))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.TrustedProxyCIDRs = trustedProxyCIDRs
+
 	return cfg, nil
+}
+
+// parseTrustedProxyCIDRs parses the explicit trust boundary for forwarded
+// client addresses. Host addresses without a prefix and empty list entries are
+// rejected rather than guessed. Universal /0 prefixes are also rejected: they
+// would make every direct Internet client a trusted proxy and allow trivial IP
+// spoofing of rate limits and audit records.
+func parseTrustedProxyCIDRs(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	seen := make(map[netip.Prefix]struct{}, len(parts))
+	for i, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("config: invalid %s entry %d: empty CIDR", EnvTrustedProxyCIDRs, i+1)
+		}
+
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("config: invalid %s entry %q: %w", EnvTrustedProxyCIDRs, value, err)
+		}
+		if prefix.Bits() == 0 {
+			return nil, fmt.Errorf("config: invalid %s entry %q: universal /0 prefixes are not allowed", EnvTrustedProxyCIDRs, value)
+		}
+
+		prefix = prefix.Masked()
+		if _, duplicate := seen[prefix]; duplicate {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
 }
 
 // getEnv returns the value of the environment variable named by key, or

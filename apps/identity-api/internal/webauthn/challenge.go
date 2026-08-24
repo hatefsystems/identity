@@ -34,6 +34,19 @@ const (
 	// only purpose is to be byte-indistinguishable from FlowLoginNamed so the
 	// endpoint cannot be used to enumerate accounts.
 	FlowLoginMock
+	// FlowStepUp is a re-authentication ceremony for an account the caller
+	// already holds a live session for (Task 4.7). It differs from every login
+	// flow in two ways: userVerification is "required" rather than the
+	// configured default, and completing it grants no session — it only proves a
+	// strong factor was re-presented, which internal/stepup turns into a
+	// short-lived ACR grant. Tagging it separately is what stops a step-up
+	// challenge being redeemed at the login verifier (where it would mint a
+	// session) or a login challenge being redeemed for a step-up grant (where it
+	// would bypass the UV requirement).
+	FlowStepUp
+	// FlowRecoveryRegistration is a UV-required passkey registration started
+	// from a restricted recovery-enrollment session.
+	FlowRecoveryRegistration
 )
 
 // String implements fmt.Stringer for log and error messages.
@@ -47,6 +60,10 @@ func (f Flow) String() string {
 		return "login_discoverable"
 	case FlowLoginMock:
 		return "login_mock"
+	case FlowStepUp:
+		return "step_up"
+	case FlowRecoveryRegistration:
+		return "recovery_registration"
 	default:
 		return "unknown"
 	}
@@ -70,6 +87,9 @@ type PendingChallenge struct {
 	// FlowLoginDiscoverable (the identity is unknown until the assertion
 	// arrives) and for FlowLoginMock (there is no identity at all).
 	UserRef uuid.UUID
+	// SessionID binds authenticated ceremonies to the exact server-side
+	// session that started them. Login ceremonies leave it empty.
+	SessionID string
 	// Flow records which ceremony issued this challenge; the matching Finish
 	// step rejects any other value.
 	Flow Flow
@@ -97,6 +117,11 @@ type ChallengeStore interface {
 	// unknown or already consumed, and ErrChallengeExpired when it existed but
 	// its TTL had lapsed (the entry is reclaimed either way).
 	Take(challenge string) (PendingChallenge, error)
+	// TakeBound checks the expected flow, user, and initiating session while
+	// holding the store lock, and consumes the challenge only on an exact
+	// match. A foreign-session probe therefore cannot burn the legitimate
+	// caller's pending ceremony.
+	TakeBound(challenge string, flow Flow, userID uuid.UUID, sessionID string) (PendingChallenge, error)
 }
 
 // defaultMaxPendingChallenges bounds how many ceremonies the in-memory store
@@ -199,5 +224,28 @@ func (m *MemoryChallengeStore) Take(challenge string) (PendingChallenge, error) 
 	if m.now().After(pc.Expires) {
 		return PendingChallenge{}, ErrChallengeExpired
 	}
+	return pc, nil
+}
+
+// TakeBound implements ChallengeStore. Binding mismatches intentionally leave
+// the challenge live; expiry is still terminal and reclaims the entry.
+func (m *MemoryChallengeStore) TakeBound(challenge string, flow Flow, userID uuid.UUID, sessionID string) (PendingChallenge, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pc, ok := m.byChallenge[challenge]
+	if !ok {
+		return PendingChallenge{}, ErrChallengeNotFound
+	}
+	if m.now().After(pc.Expires) {
+		delete(m.byChallenge, challenge)
+		return PendingChallenge{}, ErrChallengeExpired
+	}
+	if pc.Flow != flow {
+		return PendingChallenge{}, ErrChallengeFlowMismatch
+	}
+	if pc.UserRef != userID || sessionID == "" || pc.SessionID == "" || pc.SessionID != sessionID {
+		return PendingChallenge{}, ErrChallengeNotFound
+	}
+	delete(m.byChallenge, challenge)
 	return pc, nil
 }
