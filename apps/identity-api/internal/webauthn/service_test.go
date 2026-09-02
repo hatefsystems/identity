@@ -106,6 +106,14 @@ func (f *fakeUserStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) 
 	return f.GetUserByID(ctx, id)
 }
 
+// GetUserByIDForAdmin is the soft-delete-blind lookup the reclaim ceremony uses.
+// The fake keeps one map keyed by id regardless of deleted_at, so it delegates; the
+// property the reclaim tests exercise is the pending_deletion status gate, which is
+// checked on the returned row.
+func (f *fakeUserStore) GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error) {
+	return f.GetUserByID(ctx, id)
+}
+
 func (f *fakeUserStore) SetWebauthnUserHandle(_ context.Context, arg db.SetWebauthnUserHandleParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

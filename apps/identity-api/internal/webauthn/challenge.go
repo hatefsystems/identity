@@ -47,6 +47,15 @@ const (
 	// FlowRecoveryRegistration is a UV-required passkey registration started
 	// from a restricted recovery-enrollment session.
 	FlowRecoveryRegistration
+	// FlowReclaim is a UV-required assertion presented to cancel a pending
+	// account deletion (Task 5.1). It is the one ceremony that operates on an
+	// account webauthn.isLoginEligible refuses — a pending_deletion account —
+	// which is exactly why it must be tagged separately: a reclaim challenge
+	// redeemed at the login verifier would mint a session for an account that is
+	// suspended from every service, and a login challenge redeemed here would
+	// bypass the UV requirement the reclaim ceremony rests on. Completing it
+	// grants no session at all; internal/privacy turns it into a status change.
+	FlowReclaim
 )
 
 // String implements fmt.Stringer for log and error messages.
@@ -64,6 +73,8 @@ func (f Flow) String() string {
 		return "step_up"
 	case FlowRecoveryRegistration:
 		return "recovery_registration"
+	case FlowReclaim:
+		return "reclaim"
 	default:
 		return "unknown"
 	}

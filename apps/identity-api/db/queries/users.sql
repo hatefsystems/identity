@@ -62,6 +62,18 @@ WHERE email = $1
 SELECT * FROM users
 WHERE id = $1;
 
+-- name: GetUserForUpdateIncludingDeleted :one
+-- Task 5.1: the per-account mutex for the GDPR deletion lifecycle. Unlike
+-- GetUserByIDForUpdate it does NOT filter deleted_at, because both callers
+-- operate exclusively on soft-deleted rows: the reclaim ceremony (which clears
+-- deleted_at) and the hard-delete purge worker (which removes the row). Using the
+-- filtered variant there would find nothing and silently no-op.
+--
+-- Honours the documented lock order: users first, then children ordered by id.
+SELECT * FROM users
+WHERE id = $1
+FOR UPDATE;
+
 -- name: GetUserByPhoneBlindIndex :one
 -- O(1) exact-match lookup via idx_users_phone_blind (data-architecture §2.2).
 SELECT * FROM users
@@ -186,13 +198,25 @@ LIMIT $2;
 
 -- name: HardDeleteUser :execrows
 -- Physical purge after the grace window. FK cascades wipe webauthn
--- credentials, recovery codes, and role assignments; mvp_audit_logs rows are
--- retained with user_id nulled (ON DELETE SET NULL). The status/cutoff guards
--- make it impossible to hard-delete an active account.
-DELETE FROM users
-WHERE id = $1
-  AND status = 'pending_deletion'
-  AND deleted_at < $2;
+-- credentials, recovery codes, role assignments, pending TOTP enrollments, and
+-- the deletion request itself; mvp_audit_logs rows are retained with user_id
+-- nulled (ON DELETE SET NULL). The status/cutoff guards make it impossible to
+-- hard-delete an active account.
+--
+-- The NOT EXISTS legal-hold predicate (Task 5.1) closes the TOCTOU window between
+-- the worker's HasActiveLegalHold check and this DELETE: a hold applied in between
+-- would otherwise be ignored, and holds outrank every retention timer
+-- (compliance-and-data-governance.md §6). The Go-side check is retained purely to
+-- produce the audit *reason* for a skip. Mirrors the predicate already used by
+-- PurgeExpiredSecurityEvents (legal.sql).
+DELETE FROM users u
+WHERE u.id = $1
+  AND u.status = 'pending_deletion'
+  AND u.deleted_at < $2
+  AND NOT EXISTS (
+      SELECT 1 FROM legal_holds lh
+      WHERE lh.account_ref = u.id AND lh.is_active = TRUE
+  );
 
 -- name: ListUsers :many
 -- Admin pagination (api-design §1.7). Includes pending_deletion accounts.

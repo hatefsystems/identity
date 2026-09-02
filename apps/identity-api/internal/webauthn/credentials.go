@@ -22,6 +22,10 @@ type UserStore interface {
 	GetUserByEmail(ctx context.Context, email string) (db.User, error)
 	// GetUserByID resolves an active account by its UUID primary key.
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
+	// GetUserByIDForAdmin resolves an account *including* soft-deleted ones. It is
+	// used only by the reclaim ceremony (Task 5.1), which by definition operates
+	// on a pending_deletion account that every other lookup here filters out.
+	GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error)
 	// GetUserByIDForUpdate is the common account mutex for cross-factor
 	// security mutations. It must be acquired before credential-row locks.
 	GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error)

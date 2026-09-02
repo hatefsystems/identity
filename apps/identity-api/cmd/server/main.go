@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
@@ -27,6 +28,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
@@ -71,7 +73,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	tokenService, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger)
+	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger)
 	if err != nil {
 		return err
 	}
@@ -139,6 +141,19 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// The GDPR privacy service reuses the WebAuthn database pool, the session
+	// manager and refresh-token store (both revoked at soft-delete), the two factor
+	// verifiers (as the reclaim ceremony's factors), and Redis for rate limiting and
+	// passcode replay protection. It additionally requires a notifier that can
+	// actually deliver the reclaim token; outside development, when none is
+	// configured it returns nil so the deletion routes stay unmounted.
+	privacyService, err := buildPrivacyService(
+		cfg.Environment, pool, redisClient, sessionManager, refreshTokenStore,
+		webauthnService, mfaService, logger)
+	if err != nil {
+		return err
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
 		OIDC:           oidcCfg,
 		Keys:           keyManager,
@@ -152,6 +167,7 @@ func run(logger *slog.Logger) error {
 		Recovery:       recoveryService,
 		RecoveryFlow:   recoveryFlow,
 		StepUp:         stepupService,
+		Privacy:        privacyService,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -227,32 +243,39 @@ func buildKeyManager(cfg config.OIDCConfig, environment string, logger *slog.Log
 // authenticator for the client_credentials grant. The authenticator's expected
 // audience is the fully-qualified token endpoint URL so an assertion minted for
 // a different endpoint is rejected (audience-confusion defence).
+//
+// The refresh-token store is returned alongside the service because the GDPR
+// deletion flow must revoke every refresh-token family for a subject
+// (docs/architecture.md "The 30-Day Recovery Window"). Constructing it here and
+// handing out the same instance is what keeps that revocation effective; building a
+// second store for the privacy service would revoke tokens nobody holds.
 func buildTokenService(
 	oidcCfg config.OIDCConfig,
 	keyManager *keys.Manager,
 	clientRegistry *clients.StaticRegistry,
 	logger *slog.Logger,
-) (*token.Service, error) {
+) (*token.Service, token.RefreshTokenStore, error) {
 	tokenEndpoint := oidcCfg.Issuer + "/oauth2/token"
 	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, clientauth.NewMemoryJTIGuard())
 	if err != nil {
-		return nil, fmt.Errorf("main: build client authenticator: %w", err)
+		return nil, nil, fmt.Errorf("main: build client authenticator: %w", err)
 	}
 
+	refreshTokens := token.NewMemoryRefreshTokenStore()
 	svc, err := token.NewService(
 		token.Config{Issuer: oidcCfg.Issuer},
 		keyManager,
 		clientRegistry,
 		token.NewMemoryCodeStore(),
-		token.NewMemoryRefreshTokenStore(),
+		refreshTokens,
 		authenticator,
 		nil,
 		logger,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("main: build token service: %w", err)
+		return nil, nil, fmt.Errorf("main: build token service: %w", err)
 	}
-	return svc, nil
+	return svc, refreshTokens, nil
 }
 
 // buildDPoPValidator assembles the RFC 9449 DPoP validator used to
@@ -697,6 +720,145 @@ func buildStepUpService(
 		slog.Bool("totp_factor", totp != nil),
 		slog.Bool("rate_limited", redisClient != nil),
 		slog.Bool("distributed_replay", distributedReplay),
+	)
+	return svc, nil
+}
+
+// buildPrivacyService assembles the GDPR "Right to be Forgotten" service (Task
+// 5.1). It reuses the WebAuthn database pool, the session manager and the
+// refresh-token store (both revoked synchronously at soft-delete), the WebAuthn and
+// TOTP services as the reclaim ceremony's two factors, and Redis for the rate limits
+// and reclaim-passcode replay guard.
+//
+// Notifier selection is the fail-closed decision this function exists to make. A
+// deletion whose reclaim token cannot be delivered has no 30-day recovery window at
+// all, so:
+//
+//   - development gets the log-only notifier, which keeps the flow runnable locally
+//     with no mail provider;
+//   - any other environment with no real notifier gets a warning and a nil service,
+//     which leaves DELETE /api/v1/users/me and the reclaim endpoints unmounted (404).
+//
+// It is deliberately not a boot failure. Refusing to start would take down login,
+// token issuance, and every other endpoint over a feature that is not yet
+// deliverable; withholding just the deletion routes is the proportionate response,
+// and their absence is visible in the startup log and in the route table.
+//
+// A missing database has the same effect for the same reason as everywhere else in
+// this file (development only, since buildWebAuthnService already makes it mandatory
+// elsewhere).
+func buildPrivacyService(
+	environment string,
+	pool *pgxpool.Pool,
+	redisClient *redis.Client,
+	sessionManager *session.Manager,
+	refreshTokens token.RefreshTokenStore,
+	webauthnSvc *webauthn.Service,
+	mfaSvc *mfa.Service,
+	logger *slog.Logger,
+) (*privacy.Service, error) {
+	if pool == nil {
+		logger.Warn("privacy service disabled (requires DATABASE_URL); deletion routes not mounted")
+		return nil, nil
+	}
+
+	pc, err := config.LoadPrivacy(environment)
+	if err != nil {
+		return nil, err
+	}
+
+	// There is no production email notifier yet (see internal/privacy's known
+	// follow-ups). Until one is wired here, only development can mount the routes.
+	var notifier privacy.Notifier
+	if environment == "development" {
+		notifier = privacy.NewLogNotifier(logger)
+		logger.Warn("privacy deletion notices use the development-only log notifier")
+	} else {
+		logger.Warn("privacy: no production notifier configured; deletion routes not mounted")
+		return nil, nil
+	}
+
+	opts := []privacy.Option{
+		privacy.WithTransacter(pool),
+		privacy.WithLogger(logger),
+	}
+	if sessionManager != nil {
+		opts = append(opts, privacy.WithSessionRevoker(sessionManager))
+	}
+	if refreshTokens != nil {
+		opts = append(opts, privacy.WithTokenRevoker(refreshTokens))
+	}
+	if webauthnSvc != nil {
+		opts = append(opts, privacy.WithPasskeyReclaimer(webauthnSvc))
+	}
+	if mfaSvc != nil {
+		opts = append(opts, privacy.WithTOTPReclaimer(mfaSvc))
+	}
+
+	if redisClient != nil {
+		limiter, err := ratelimit.NewRedisLimiter(redisClient)
+		if err != nil {
+			return nil, fmt.Errorf("main: build rate limiter: %w", err)
+		}
+		opts = append(opts, privacy.WithRateLimiter(limiter))
+	}
+
+	// The reclaim passcode reuses the step-up replay guard so a code cannot be
+	// replayed across its ±1-step acceptance window. Distributed claims need both
+	// Redis and the shared HMAC key; without them the in-memory guard is
+	// process-local, which is only acceptable in development.
+	sc, err := config.LoadStepUp(environment)
+	if err != nil {
+		return nil, err
+	}
+	if redisClient != nil && len(sc.ReplayHMACKey) > 0 {
+		guard, err := stepup.NewRedisReplayGuard(redisClient, sc.ReplayHMACKey)
+		if err != nil {
+			return nil, fmt.Errorf("main: build privacy replay guard: %w", err)
+		}
+		opts = append(opts, privacy.WithReplayGuard(guard))
+	} else {
+		opts = append(opts, privacy.WithReplayGuard(stepup.NewMemoryReplayGuard()))
+		logger.Warn("privacy reclaim replay protection uses development-only in-memory storage")
+	}
+
+	// The backup email is envelope-encrypted at rest, so a decryptor is required to
+	// notify the second mailbox — which is what protects a user whose primary
+	// mailbox was taken over as part of the takeover that triggered the deletion.
+	cryptoCfg, err := config.LoadCrypto()
+	if err != nil {
+		return nil, err
+	}
+	provider, err := kms.NewMockProvider(cryptoCfg.MasterKEK, cryptoCfg.MasterKEKVersion)
+	if err != nil {
+		return nil, fmt.Errorf("main: build KMS provider: %w", err)
+	}
+	encryptor, err := envelope.New(provider)
+	if err != nil {
+		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
+	}
+	opts = append(opts, privacy.WithDecryptor(encryptor))
+
+	svc, err := privacy.New(privacy.Config{
+		GracePeriod:              pc.GracePeriod,
+		ReclaimMaxAttempts:       pc.ReclaimMaxAttempts,
+		ReclaimPerAccountPerHour: pc.ReclaimPerAccountPerHour,
+		ReclaimPerSubnetPerHour:  pc.ReclaimPerSubnetPerHour,
+		DeletePerAccountPerDay:   pc.DeletePerAccountPerDay,
+		DeleteResendCooldown:     pc.DeleteResendCooldown,
+	}, db.New(pool), notifier, audit.NewLogRecorder(logger), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("main: build privacy service: %w", err)
+	}
+
+	logger.Info("privacy configured",
+		slog.Duration("grace_period", pc.GracePeriod),
+		slog.Duration("resend_cooldown", pc.DeleteResendCooldown),
+		slog.Int("reclaim_max_attempts", pc.ReclaimMaxAttempts),
+		slog.Bool("webauthn_factor", webauthnSvc != nil),
+		slog.Bool("totp_factor", mfaSvc != nil),
+		slog.Bool("rate_limited", redisClient != nil),
+		slog.Bool("development_notifier", notifier.IsDevelopmentOnly()),
 	)
 	return svc, nil
 }

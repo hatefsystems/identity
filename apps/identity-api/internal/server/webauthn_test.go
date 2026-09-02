@@ -55,6 +55,12 @@ func (f *fakeWebAuthnUserStore) GetUserByIDForUpdate(ctx context.Context, id uui
 	return f.GetUserByID(ctx, id)
 }
 
+// GetUserByIDForAdmin satisfies the soft-delete-blind lookup the reclaim ceremony
+// requires. These handler tests do not drive reclaim, so it delegates.
+func (f *fakeWebAuthnUserStore) GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error) {
+	return f.GetUserByID(ctx, id)
+}
+
 func (f *fakeWebAuthnUserStore) SetWebauthnUserHandle(_ context.Context, arg db.SetWebauthnUserHandleParams) (int64, error) {
 	u, ok := f.byID[arg.ID]
 	if !ok || len(u.WebauthnUserHandle) != 0 {

@@ -51,6 +51,13 @@ func (f *mfaFakeStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (
 	return f.GetUserByID(ctx, id)
 }
 
+// GetUserByIDForAdmin satisfies the soft-delete-blind lookup mfa.UserStore now
+// requires for VerifyTOTPForReclaim. These handler tests never exercise the reclaim
+// path, so it simply delegates.
+func (f *mfaFakeStore) GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error) {
+	return f.GetUserByID(ctx, id)
+}
+
 func (f *mfaFakeStore) CountWebauthnCredentialsByUser(context.Context, uuid.UUID) (int64, error) {
 	return 1, nil
 }

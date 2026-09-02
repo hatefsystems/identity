@@ -19,6 +19,10 @@ const defaultIssuer = "Hatef Identity"
 // UserStore defines the database query subset required by the MFA service.
 type UserStore interface {
 	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
+	// GetUserByIDForAdmin resolves an account including soft-deleted ones. It is
+	// used only by VerifyTOTPForReclaim, whose subject is by definition a
+	// pending_deletion account that every other lookup here filters out.
+	GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error)
 	GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error)
 	DisableMfa(ctx context.Context, id uuid.UUID) (int64, error)
 	CountWebauthnCredentialsByUser(ctx context.Context, userID uuid.UUID) (int64, error)
@@ -339,6 +343,54 @@ func (s *Service) VerifyEnabledCode(ctx context.Context, userID uuid.UUID, code 
 
 	return nil
 }
+
+// VerifyTOTPForReclaim verifies a passcode against an account that is inside the
+// 30-day deletion grace window (Task 5.1).
+//
+// It is a separate method rather than a flag on VerifyEnabledCode for the same
+// reason there is no general-purpose /api/v1/auth/mfa/verify-code endpoint
+// (docs/api-design.md §1.3): an enabled TOTP secret may only ever be checked
+// inside a named, purpose-specific flow, so that no caller can turn code validity
+// into an oracle. The purpose here is "cancel a pending deletion" and nothing else.
+//
+// The status gate is the inverse of every other method in this package: only
+// pending_deletion is accepted. An active account has no deletion to cancel, and
+// accepting a suspended one would let moderation be undone through the privacy
+// flow. GetUserByIDForAdmin is required because GetUserByID cannot see a
+// soft-deleted row at all.
+//
+// Replay protection is the caller's responsibility and lives in internal/privacy,
+// which claims the canonical code in the shared single-use guard *before* calling
+// this method — the same ordering internal/stepup uses, and the only one that
+// stops two concurrent submissions of one code from both succeeding.
+func (s *Service) VerifyTOTPForReclaim(ctx context.Context, userID uuid.UUID, code string) error {
+	user, err := s.users.GetUserByIDForAdmin(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("mfa: load user: %w", err)
+	}
+	if user.Status != statusPendingDeletion {
+		return ErrAccountNotActive
+	}
+	if !user.IsMfaEnabled || len(user.MfaTotpSecretEncrypted) == 0 {
+		return ErrMfaNotSetup
+	}
+
+	rawSecret, err := s.encryptor.Decrypt(ctx, user.MfaTotpSecretEncrypted)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDecryptFailed, err)
+	}
+	if !totp.ValidateCode(string(rawSecret), code, s.now(), s.windowSteps) {
+		return ErrInvalidCode
+	}
+	return nil
+}
+
+// statusPendingDeletion is the only users.status value VerifyTOTPForReclaim
+// accepts.
+const statusPendingDeletion = "pending_deletion"
 
 func (s *Service) runInTx(ctx context.Context, fn func(UserStore) error) error {
 	if s.tx == nil {

@@ -106,6 +106,18 @@ func (f *fakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, e
 	return u, nil
 }
 
+// GetUserByIDForAdmin mirrors the soft-delete-blind query used by
+// VerifyTOTPForReclaim. The fake stores rows in one map regardless of deleted_at,
+// so it behaves the same as GetUserByID here; the distinction that matters for the
+// reclaim tests is the status gate, not the deleted_at filter.
+func (f *fakeUserStore) GetUserByIDForAdmin(_ context.Context, id uuid.UUID) (db.User, error) {
+	u, ok := f.users[id]
+	if !ok {
+		return db.User{}, pgx.ErrNoRows
+	}
+	return u, nil
+}
+
 func (f *fakeUserStore) SetMfaTotpSecret(_ context.Context, arg db.SetMfaTotpSecretParams) (int64, error) {
 	u, ok := f.users[arg.ID]
 	if !ok {

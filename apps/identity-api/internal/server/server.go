@@ -19,6 +19,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
@@ -83,6 +84,18 @@ type Deps struct {
 	// be reachable without the gate, so an absent service fails closed
 	// (404/route-absent) rather than open.
 	StepUp *stepup.Service
+	// Privacy drives the GDPR "Right to be Forgotten" routes: the step-up-gated
+	// DELETE /api/v1/users/me and the anonymous reclaim ceremony at
+	// /api/v1/auth/deletion/reclaim. It requires a database and, crucially, a
+	// notifier that can actually deliver the reclaim token.
+	//
+	// When nil, those routes are not mounted. That is the fail-closed half of the
+	// notification contract: accepting a deletion whose reclaim token cannot be
+	// delivered would leave the user with no 30-day recovery window at all, which
+	// is strictly worse than refusing the request. Wiring therefore leaves this
+	// nil (and warns) rather than substituting a stand-in notifier outside
+	// development. See internal/privacy's package doc.
+	Privacy *privacy.Service
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -181,6 +194,12 @@ func (s *Server) registerRoutes() {
 	// provisioned (it requires a database and at least one verifiable factor).
 	if s.deps.StepUp != nil {
 		s.registerStepUpRoutes()
+	}
+
+	// GDPR privacy routes are mounted when the service is provisioned, which
+	// additionally requires a notifier that can deliver the reclaim token.
+	if s.deps.Privacy != nil {
+		s.registerPrivacyRoutes()
 	}
 }
 
