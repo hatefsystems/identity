@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
@@ -68,12 +70,37 @@ func (s *Server) registerSessionRoutes() {
 // logout is safe to retry and never leaks whether a session existed.
 func (s *Server) handleLogout() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := s.deps.SessionManager.Revoke(w, r); err != nil {
+		revoked, ok, err := s.deps.SessionManager.Revoke(w, r)
+		if err != nil {
 			s.logger.Error("session: logout failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{
 				Error: "logout_failed",
 			})
 			return
+		}
+
+		// Audited only when a live session was actually revoked. This route is
+		// unauthenticated, so recording every call would let any client append
+		// rows to the audit chain with no account to attribute them to —
+		// mvp_audit_logs.actor_id is NOT NULL, and uuid.Nil would be a fabrication.
+		// A no-cookie or already-expired logout is a no-op and stays out of the log.
+		if ok {
+			if userID, parseErr := uuid.Parse(revoked.UserID); parseErr == nil {
+				s.record(r, audit.Event{
+					EventType:    audit.EventSessionLoggedOut,
+					ActionStatus: audit.StatusSuccess,
+					ActorID:      userID,
+					SubjectID:    &userID,
+					// The session's public ID, never its token or storage hash.
+					Payload: map[string]any{"session_id": revoked.ID},
+				})
+			} else {
+				// The store held a session whose user id is not a UUID. That is a
+				// data-integrity fault, not a client error: the logout itself
+				// succeeded, so it must not fail, but it cannot be attributed.
+				s.logger.Error("session: revoked session carries a non-UUID user id",
+					"error", parseErr.Error())
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -145,6 +172,27 @@ func (s *Server) handleRevokeSession() http.HandlerFunc {
 		if !revoked {
 			writeJSON(w, http.StatusNotFound, sessionErrorResponse{Error: "not_found"})
 			return
+		}
+
+		// RevokeByID already scopes to the caller's own account and reports whether
+		// a session was really removed, so no state-change guard is needed here: an
+		// unknown, already-revoked, or foreign-owned ID took the 404 path above.
+		if userID, parseErr := uuid.Parse(current.UserID); parseErr == nil {
+			s.record(r, audit.Event{
+				EventType:    audit.EventSessionRevoked,
+				ActionStatus: audit.StatusSuccess,
+				ActorID:      userID,
+				SubjectID:    &userID,
+				Payload: map[string]any{
+					"session_id": id,
+					// Distinguishes killing another device from ending this one,
+					// which matters when reconstructing a takeover response.
+					"self": id == current.ID,
+				},
+			})
+		} else {
+			s.logger.Error("session: revoke handler session carries a non-UUID user id",
+				"error", parseErr.Error())
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}

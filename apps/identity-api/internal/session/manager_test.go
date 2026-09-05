@@ -228,8 +228,18 @@ func TestManagerRevokeIdempotent(t *testing.T) {
 	// Revoking with no cookie still succeeds and clears the client cookie.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
-	if err := m.Revoke(rec, req); err != nil {
+	revoked, ok, err := m.Revoke(rec, req)
+	if err != nil {
 		t.Fatalf("Revoke(no cookie): %v", err)
+	}
+	// Nothing was revoked, so there is no account to attribute a logout to. The
+	// audit trail relies on this to keep an unauthenticated endpoint from
+	// appending unattributable rows.
+	if ok {
+		t.Error("Revoke(no cookie) reported a revoked session")
+	}
+	if revoked != (Session{}) {
+		t.Errorf("Revoke(no cookie) returned a session: %+v", revoked)
 	}
 	if len(rec.Result().Cookies()) != 1 {
 		t.Fatal("Revoke(no cookie) did not clear the cookie")
@@ -237,15 +247,40 @@ func TestManagerRevokeIdempotent(t *testing.T) {
 
 	// Issue, then revoke; the session must no longer authenticate.
 	issueRec := httptest.NewRecorder()
-	if _, err := m.Issue(issueRec, IssueParams{UserID: "user-1"}); err != nil {
+	issued, err := m.Issue(issueRec, IssueParams{UserID: "user-1"})
+	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 	revokeRec := httptest.NewRecorder()
-	if err := m.Revoke(revokeRec, requestWithCookies(issueRec)); err != nil {
+	revoked, ok, err = m.Revoke(revokeRec, requestWithCookies(issueRec))
+	if err != nil {
 		t.Fatalf("Revoke: %v", err)
+	}
+	if !ok {
+		t.Fatal("Revoke did not report the revoked session")
+	}
+	// The returned session identifies who logged out, which the caller cannot
+	// learn any other way: logout is unauthenticated and the store is keyed by
+	// token hash.
+	if revoked.UserID != "user-1" {
+		t.Errorf("revoked.UserID = %q, want %q", revoked.UserID, "user-1")
+	}
+	if revoked.ID != issued.ID {
+		t.Errorf("revoked.ID = %q, want %q", revoked.ID, issued.ID)
 	}
 	if _, err := m.Authenticate(requestWithCookies(issueRec)); err != ErrSessionNotFound {
 		t.Fatalf("Authenticate after revoke error = %v, want ErrSessionNotFound", err)
+	}
+
+	// A second revoke of the same cookie is a no-op: the session is already gone,
+	// so it reports no state change rather than a second logout.
+	secondRec := httptest.NewRecorder()
+	_, ok, err = m.Revoke(secondRec, requestWithCookies(issueRec))
+	if err != nil {
+		t.Fatalf("Revoke(already revoked): %v", err)
+	}
+	if ok {
+		t.Error("revoking an already-revoked session reported a state change")
 	}
 }
 

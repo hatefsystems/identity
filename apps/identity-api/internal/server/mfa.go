@@ -8,9 +8,16 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
+
+// mfaFactorTOTP labels the factor in audit payloads. The MFA package currently
+// implements only TOTP, but WebAuthn is already a second factor elsewhere in the
+// system, so every MFA event names its factor rather than leaving readers to infer
+// it from the event type.
+const mfaFactorTOTP = "totp"
 
 type mfaErrorResponse struct {
 	Error string `json:"error"`
@@ -103,10 +110,32 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 
 		current, _ := session.FromContext(r.Context())
 		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, current.ID, req.EnrollmentID, req.Code); err != nil {
+			s.record(r, audit.Event{
+				EventType:    audit.EventMFAVerifyFailed,
+				ActionStatus: audit.StatusFailure,
+				ActorID:      userID,
+				SubjectID:    &userID,
+				Payload: map[string]any{
+					"factor": mfaFactorTOTP,
+					"reason": mfaFailureReason(err),
+				},
+			})
 			s.writeMFAError(w, "verify and enable mfa", err)
 			return
 		}
 
+		// This endpoint is enrolment-completing: reaching here means TOTP went from
+		// "pending secret" to "required at login", which is the state change worth
+		// ledgering. A repeat call cannot re-record it — ErrMfaAlreadyEnabled sends it
+		// down the failure path above.
+		s.record(r, audit.Event{
+			EventType:    audit.EventMFATOTPEnabled,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"factor": mfaFactorTOTP},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 		writeJSON(w, http.StatusOK, mfaStatusResponse{Status: "enabled"})
 	}
 }
@@ -125,6 +154,18 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 			return
 		}
 
+		// Removing a factor weakens the account, so this is ledgered (Class B) the
+		// same way enabling one is. ErrLastFactor keeps this from being an
+		// account-takeover lockout path, but a successful disable is exactly what an
+		// attacker who already holds a session would do next.
+		s.record(r, audit.Event{
+			EventType:    audit.EventMFATOTPDisabled,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"factor": mfaFactorTOTP},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -149,5 +190,32 @@ func (s *Server) writeMFAError(w http.ResponseWriter, op string, err error) {
 	default:
 		s.logger.Error("mfa: "+op+" failed", "error", err.Error())
 		writeJSON(w, http.StatusInternalServerError, mfaErrorResponse{Error: "server_error"})
+	}
+}
+
+// mfaFailureReason maps an enrollment-verification error to a stable, bounded audit
+// label.
+//
+// The labels are deliberately the same vocabulary as the wire-level error codes in
+// writeMFAError: a DPO correlating an audit record with a client-reported failure
+// should not have to translate between two naming schemes. They stay a separate
+// switch because the wire contract and the audit contract are versioned
+// independently — an HTTP code may be broadened for privacy without collapsing the
+// forensic distinction, and the internal_error bucket must never carry err.Error()
+// into a Class C row.
+func mfaFailureReason(err error) string {
+	switch {
+	case errors.Is(err, mfa.ErrInvalidCode):
+		return "invalid_code"
+	case errors.Is(err, mfa.ErrEnrollmentExpired):
+		return "enrollment_expired"
+	case errors.Is(err, mfa.ErrMfaNotSetup):
+		return "mfa_not_setup"
+	case errors.Is(err, mfa.ErrMfaAlreadyEnabled):
+		return "mfa_already_enabled"
+	case errors.Is(err, mfa.ErrUserNotFound), errors.Is(err, mfa.ErrAccountNotActive):
+		return "unauthorized"
+	default:
+		return "internal_error"
 	}
 }

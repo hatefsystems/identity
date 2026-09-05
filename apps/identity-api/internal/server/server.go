@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
@@ -96,6 +97,22 @@ type Deps struct {
 	// nil (and warns) rather than substituting a stand-in notifier outside
 	// development. See internal/privacy's package doc.
 	Privacy *privacy.Service
+	// AuditRecorder receives the security-relevant events raised by the handlers
+	// (Task 5.2). It is the publishing half of the audit pipeline: a handler hands
+	// off an unchained Event and returns, while a separate signing worker owns the
+	// hash chain and both tables.
+	//
+	// When nil, recording degrades to a no-op rather than disabling any route. That
+	// asymmetry with every other field above is deliberate. The others are
+	// capabilities a route cannot function without, so their absence must close the
+	// route; auditing is an observation of a route that is already functioning.
+	// Refusing to authenticate because the audit transport is unset would turn a
+	// monitoring gap into an outage, and audit.Recorder's own contract already says
+	// a transport failure must not fail the caller.
+	//
+	// The no-op default is also what keeps existing handler tests free of audit
+	// wiring: a test asserting an HTTP status has no business building a message bus.
+	AuditRecorder audit.Recorder
 }
 
 // Server encapsulates the HTTP server, its configuration, and dependencies.
@@ -139,6 +156,48 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) *Server {
 // Handler exposes the underlying router, primarily for testing with httptest.
 func (s *Server) Handler() http.Handler {
 	return s.router
+}
+
+// record emits one audit Event for the request being served (Task 5.2).
+//
+// It takes the *http.Request rather than a context so the request-scoped fields
+// every handler would otherwise have to repeat — client IP and user agent — are
+// filled in one place. Thirteen call sites each spelling out
+// clientip.FromRequest(r) and r.UserAgent() is thirteen chances to omit one, and an
+// audit row missing the caller's address is materially less useful for the incident
+// response it exists to serve.
+//
+// It never returns an error, and callers must not treat auditing as part of their
+// success path: a failure to record is logged at Warn and the request proceeds. The
+// alternative — failing a successful login because a message bus is unreachable —
+// would make the audit system an availability liability.
+func (s *Server) record(r *http.Request, e audit.Event) {
+	if s.deps.AuditRecorder == nil {
+		return
+	}
+
+	// Defaults, not overrides: a call site that has better information (a worker
+	// identity, an IP resolved before the request context existed) keeps it.
+	if e.ActorSPIFFEID == "" {
+		e.ActorSPIFFEID = audit.APIActorSPIFFEID
+	}
+	if e.ClientIP == "" {
+		e.ClientIP = clientip.FromRequest(r)
+	}
+	if e.UserAgent == "" && r != nil {
+		e.UserAgent = r.UserAgent()
+	}
+
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	if err := s.deps.AuditRecorder.Record(ctx, e); err != nil {
+		s.logger.Warn("record audit event",
+			slog.String("event_type", e.EventType),
+			slog.String("action_status", e.ActionStatus),
+			slog.String("error", err.Error()))
+	}
 }
 
 // registerMiddleware installs the base middleware chain. Security-specific

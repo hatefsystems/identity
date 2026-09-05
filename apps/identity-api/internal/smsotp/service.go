@@ -381,19 +381,32 @@ func (s *Service) persistPhone(ctx context.Context, userID uuid.UUID, phone stri
 // a no-op success) but not with respect to the account: a missing or soft-deleted
 // account still reports ErrUserNotFound, because the caller's session should not
 // outlive its account.
-func (s *Service) RemovePhone(ctx context.Context, userID uuid.UUID) error {
-	if _, err := s.loadUser(ctx, userID); err != nil {
-		return err
+//
+// The bool reports whether a phone was actually present and is now gone, which
+// the row count cannot answer: RemoveUserPhone matches on id alone, so it affects
+// one row whether or not phone_encrypted held anything. Callers that audit the
+// factor teardown (Task 5.2) need the real state change, because
+// auth.phone.removed is a Class B ledger event and a retried DELETE must not
+// produce a second row claiming a factor was torn down twice.
+func (s *Service) RemovePhone(ctx context.Context, userID uuid.UUID) (bool, error) {
+	user, err := s.loadUser(ctx, userID)
+	if err != nil {
+		return false, err
 	}
+	// Read before the write: loadUser already fetched the row, so the presence
+	// check costs nothing extra. It is not serialized against a concurrent
+	// removal, which is acceptable — two racing DELETEs converge on the same
+	// final state and the loser simply reports no state change.
+	hadPhone := len(user.PhoneEncrypted) > 0
 
 	affected, err := s.users.RemoveUserPhone(ctx, userID)
 	if err != nil {
-		return fmt.Errorf("smsotp: remove phone: %w", err)
+		return false, fmt.Errorf("smsotp: remove phone: %w", err)
 	}
 	if affected == 0 {
-		return ErrUserNotFound
+		return false, ErrUserNotFound
 	}
-	return nil
+	return hadPhone, nil
 }
 
 // loadUser confirms the account exists and is active, mapping a missing row to

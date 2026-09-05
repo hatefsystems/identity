@@ -1,0 +1,31 @@
+# Build context is the identity-api Go module root (see Dockerfile).
+#
+# Two entries here are correctness requirements, not size optimisations:
+#
+#   internal/db  is sqlc-generated and untracked. Excluding it forces the image to
+#                use the code generated inside the build from db/queries and
+#                db/migrations, instead of whatever a developer happens to have on
+#                disk. A stale local copy would compile cleanly against a schema the
+#                image does not ship.
+#   .env         holds real local secrets. A COPY . . would bake them into a layer
+#                that survives every later instruction, including one that deletes
+#                the file.
+
+internal/db/
+
+.env
+.env.local
+*.pem
+*.key
+
+# Host-built artifacts: wrong GOOS, and they would shadow nothing but waste context.
+bin/
+*.exe
+*.out
+*.test
+coverage.out
+coverage.html
+
+# Build definition itself.
+Dockerfile
+.dockerignore

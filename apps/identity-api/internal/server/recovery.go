@@ -9,7 +9,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -147,6 +149,19 @@ func (s *Server) handleRecoveryGenerate() http.HandlerFunc {
 			return
 		}
 
+		// Ledgered (Class B): generating a batch atomically destroys the previous
+		// one, so this single event both grants new recovery credentials and
+		// invalidates the old set. Only the count is recorded — the codes
+		// themselves are one-time secrets returned exactly once.
+		s.record(r, audit.Event{
+			EventType:    audit.EventRecoveryCodeGenerated,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"count": result.Count},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
+
 		// These are one-time secrets: keep them out of any intermediary or
 		// browser cache so a shared cache or back-button cannot resurface them.
 		w.Header().Set("Cache-Control", "no-store")
@@ -202,9 +217,31 @@ func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 
 		userID, err := s.deps.RecoveryFlow.Verify(r.Context(), req.TransactionID, req.Code, clientip.FromRequest(r))
 		if err != nil {
+			// auth.recovery_code.verify_failed is deliberately not recorded here.
+			// FlowService.Verify returns uuid.Nil for every failure, and Start binds
+			// unknown or non-active accounts to a *decoy* subject, so this handler
+			// has no truthful account to attribute a failure to. Recording it would
+			// either fabricate an actor or leak the real/decoy distinction into the
+			// audit store, defeating the enumeration resistance the decoy exists for.
+			// Brute-force detection for this route stays with the rate limiter until
+			// the flow can report attribution without weakening that property.
 			s.writeRecoveryFlowError(w, err)
 			return
 		}
+
+		// Ledgered (Class B) before the session is issued: the code has already been
+		// physically deleted and cannot be replayed, so the consumption is a fact
+		// even if the session issue below fails.
+		s.record(r, audit.Event{
+			EventType:    audit.EventRecoveryCodeConsumed,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload: map[string]any{
+				"ip_subnet": ratelimit.Subnet(clientip.FromRequest(r)),
+			},
+			Security: &audit.SecurityContext{AccountRef: userID},
+		})
 
 		if _, err := s.deps.SessionManager.Issue(w, session.IssueParams{
 			UserID:    userID.String(),

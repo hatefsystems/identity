@@ -9,7 +9,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-webauthn/webauthn/protocol"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 )
@@ -140,9 +142,32 @@ func (s *Server) handleStepUpVerify() http.HandlerFunc {
 			DPoPJKT:   current.DPoPJKT,
 		})
 		if err != nil {
+			s.record(r, audit.Event{
+				EventType:    audit.EventStepUpDenied,
+				ActionStatus: audit.StatusFailure,
+				ActorID:      userID,
+				SubjectID:    &userID,
+				Payload: map[string]any{
+					"method":    stepUpAuditMethod(req.Method),
+					"reason":    stepUpFailureReason(err),
+					"ip_subnet": ratelimit.Subnet(clientip.FromRequest(r)),
+				},
+			})
 			s.writeStepUpError(w, "step-up verify", err)
 			return
 		}
+
+		// Ledgered (Class B): a grant unlocks MFA teardown, phone removal, and
+		// recovery-code regeneration, so it is the pivot an account-takeover
+		// investigation starts from.
+		s.record(r, audit.Event{
+			EventType:    audit.EventStepUpGranted,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"method": stepUpAuditMethod(req.Method)},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 
 		// The grant is a short-lived credential: keep it out of any intermediary
 		// or browser cache, matching the recovery-code batch response.
@@ -193,5 +218,58 @@ func (s *Server) writeStepUpError(w http.ResponseWriter, op string, err error) {
 	default:
 		s.logger.Error("stepup: "+op+" failed", "error", err.Error())
 		writeJSON(w, http.StatusInternalServerError, stepUpErrorResponse{Error: "server_error"})
+	}
+}
+
+// stepUpAuditMethod clamps the client-supplied method to the values the service
+// actually implements.
+//
+// req.Method is arbitrary request data. Copying it verbatim would let any
+// authenticated caller choose the contents of an audit payload — and, on the
+// granted path, of an append-only Class B ledger row. Length is already capped by
+// readWebAuthnBody, but a bounded vocabulary is what makes the field aggregatable
+// and keeps injected text out of DPO exports.
+func stepUpAuditMethod(method string) string {
+	switch method {
+	case stepup.MethodWebAuthn:
+		return stepup.MethodWebAuthn
+	case stepup.MethodTOTP:
+		return stepup.MethodTOTP
+	case "":
+		// The service treats an absent method as "pick the strongest available",
+		// so this is a legitimate request shape, not a malformed one.
+		return "unspecified"
+	default:
+		return "unsupported"
+	}
+}
+
+// stepUpFailureReason maps a step-up failure to a stable audit label.
+//
+// Unlike writeStepUpError, which deliberately collapses every credential failure
+// into one opaque 401 so a caller learns nothing, the audit trail keeps them
+// distinct: the whole point of recording a denial is that an investigator can tell
+// a replayed passcode from a bad signature from a stale challenge. The response
+// stays opaque; only the internal record is precise.
+func stepUpFailureReason(err error) string {
+	switch {
+	case errors.Is(err, stepup.ErrInvalidCredentials):
+		return "invalid_credentials"
+	case errors.Is(err, stepup.ErrCodeReplayed):
+		return "code_replayed"
+	case errors.Is(err, stepup.ErrUserVerificationRequired):
+		return "user_verification_required"
+	case errors.Is(err, stepup.ErrNoFactorAvailable):
+		return "no_factor_available"
+	case errors.Is(err, stepup.ErrUnsupportedMethod):
+		return "unsupported_method"
+	case errors.Is(err, stepup.ErrMethodUnavailable):
+		return "method_unavailable"
+	case errors.Is(err, stepup.ErrRateLimited):
+		return "rate_limited"
+	case errors.Is(err, stepup.ErrUserNotFound), errors.Is(err, stepup.ErrAccountNotActive):
+		return "unauthorized"
+	default:
+		return "internal_error"
 	}
 }

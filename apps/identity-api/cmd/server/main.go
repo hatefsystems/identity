@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/natsjs"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
@@ -141,6 +143,14 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// The audit transport is built before the services that record through it so a
+	// single recorder — one bounded buffer, one publishing goroutine, one drop
+	// counter — is shared by the HTTP handlers and the privacy service.
+	auditRecorder, closeAudit, err := buildAuditRecorder(context.Background(), cfg.Environment, logger)
+	if err != nil {
+		return err
+	}
+
 	// The GDPR privacy service reuses the WebAuthn database pool, the session
 	// manager and refresh-token store (both revoked at soft-delete), the two factor
 	// verifiers (as the reclaim ceremony's factors), and Redis for rate limiting and
@@ -149,7 +159,7 @@ func run(logger *slog.Logger) error {
 	// configured it returns nil so the deletion routes stay unmounted.
 	privacyService, err := buildPrivacyService(
 		cfg.Environment, pool, redisClient, sessionManager, refreshTokenStore,
-		webauthnService, mfaService, logger)
+		webauthnService, mfaService, auditRecorder, logger)
 	if err != nil {
 		return err
 	}
@@ -168,6 +178,7 @@ func run(logger *slog.Logger) error {
 		RecoveryFlow:   recoveryFlow,
 		StepUp:         stepupService,
 		Privacy:        privacyService,
+		AuditRecorder:  auditRecorder,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -183,14 +194,41 @@ func run(logger *slog.Logger) error {
 	select {
 	case err := <-serverErr:
 		// Server stopped on its own (e.g. failed to bind the port).
-		return err
+		// The recorder is still drained: handlers may have recorded events before
+		// the failure, and they are only in the buffer until it is.
+		return errors.Join(err, drainAuditRecorder(closeAudit, cfg.ShutdownTimeout, logger))
 	case <-ctx.Done():
 		// Signal received; begin graceful shutdown.
 		stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		// Strictly ordered: the audit buffer is drained only after the HTTP server has
+		// stopped accepting and finished its in-flight requests. Draining first would
+		// discard the audit events of the requests still being served — exactly the
+		// records a shutdown-time investigation would need.
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		return errors.Join(shutdownErr, drainAuditRecorder(closeAudit, cfg.ShutdownTimeout, logger))
 	}
+}
+
+// drainAuditRecorder flushes the audit transport during shutdown.
+//
+// It builds its own deadline rather than reusing the HTTP shutdown context: that one
+// may already be spent by a slow in-flight request, and the buffered events must
+// still get a full, predictable window to reach the stream. A failure here is
+// returned, not swallowed — the undrained remainder is precisely the set of audit
+// events this process lost.
+func drainAuditRecorder(closeAudit func(context.Context) error, timeout time.Duration, logger *slog.Logger) error {
+	drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := closeAudit(drainCtx); err != nil {
+		logger.Error("audit transport did not drain cleanly; some audit events were not published",
+			slog.String("marker", audit.AuditTransportFailureMarker),
+			slog.String("error", err.Error()))
+		return err
+	}
+	return nil
 }
 
 // buildKeyManager assembles the OIDC signing keystore. In production it parses
@@ -755,6 +793,7 @@ func buildPrivacyService(
 	refreshTokens token.RefreshTokenStore,
 	webauthnSvc *webauthn.Service,
 	mfaSvc *mfa.Service,
+	auditRecorder audit.Recorder,
 	logger *slog.Logger,
 ) (*privacy.Service, error) {
 	if pool == nil {
@@ -846,7 +885,7 @@ func buildPrivacyService(
 		ReclaimPerSubnetPerHour:  pc.ReclaimPerSubnetPerHour,
 		DeletePerAccountPerDay:   pc.DeletePerAccountPerDay,
 		DeleteResendCooldown:     pc.DeleteResendCooldown,
-	}, db.New(pool), notifier, audit.NewLogRecorder(logger), opts...)
+	}, db.New(pool), notifier, auditRecorder, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("main: build privacy service: %w", err)
 	}
@@ -861,4 +900,73 @@ func buildPrivacyService(
 		slog.Bool("development_notifier", notifier.IsDevelopmentOnly()),
 	)
 	return svc, nil
+}
+
+// buildAuditRecorder assembles the audit transport shared by the HTTP handlers and
+// the privacy service (Task 5.2).
+//
+// It never declares JetStream topology. internal/natsjs documents why:
+// CreateOrUpdateStream is authoritative, so an API replica rolled out with a stale
+// value would silently rewrite the stream's limits underneath the signing worker.
+// The signer owns the definition; every API instance is only a publisher. The
+// visible consequence is that publishing before the signer has ever run finds no
+// stream and takes the publisher's log-fallback path, which is loud and recoverable
+// rather than silent.
+//
+// Without NATS_URL it degrades to the Task 5.1 LogRecorder. LoadAudit already
+// refuses that outside development, so this fallback cannot reach production: there,
+// a missing audit transport is a startup failure, not a downgrade to unchained logs.
+//
+// The returned closer is safe to call even when nothing was started.
+func buildAuditRecorder(
+	ctx context.Context,
+	environment string,
+	logger *slog.Logger,
+) (audit.Recorder, func(context.Context) error, error) {
+	ac, err := config.LoadAudit(environment)
+	if err != nil {
+		return nil, func(context.Context) error { return nil }, err
+	}
+
+	if !ac.HasNATS() {
+		logger.Warn("audit pipeline disabled (requires NATS_URL); events are logged unchained and are not written to either ledger",
+			slog.String("environment", environment))
+		return audit.NewLogRecorder(logger), func(context.Context) error { return nil }, nil
+	}
+
+	nc, js, err := natsjs.Connect(ctx, ac.NATSURL, "identity-api", logger)
+	if err != nil {
+		return nil, func(context.Context) error { return nil }, err
+	}
+
+	recorder, err := audit.NewJetStreamRecorder(js, ac.Subject, ac.PublishBuffer, logger)
+	if err != nil {
+		nc.Close()
+		return nil, func(context.Context) error { return nil }, fmt.Errorf("main: build audit recorder: %w", err)
+	}
+
+	logger.Info("audit pipeline configured",
+		slog.String("subject", ac.Subject),
+		slog.Int("publish_buffer", ac.PublishBuffer),
+	)
+
+	closer := func(shutdownCtx context.Context) error {
+		// Order matters: drain the recorder's buffer and wait for its acks before the
+		// connection goes away, or the tail of the buffer is published into a closed
+		// connection and lands in the fallback log instead of the ledger.
+		closeErr := recorder.Close(shutdownCtx)
+
+		// Drain rather than Close: it flushes what the client still holds and waits
+		// for the server to process it. A drain failure is reported but does not mask
+		// the recorder's own error, which is the one that says whether audit events
+		// were lost.
+		if drainErr := nc.Drain(); drainErr != nil {
+			if closeErr != nil {
+				return closeErr
+			}
+			return fmt.Errorf("main: drain NATS connection: %w", drainErr)
+		}
+		return closeErr
+	}
+	return recorder, closer, nil
 }

@@ -8,10 +8,19 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 )
+
+// phoneFactorSMS labels the factor in phone audit payloads, matching mfaFactorTOTP.
+//
+// No phone number, verification id, or code ever enters a payload: the number is
+// PII held envelope-encrypted with only a blind index for lookup, so copying it
+// into a Class C audit row (retained far longer, and readable by the DPO tooling)
+// would defeat that. The account is already identified by actor_id.
+const phoneFactorSMS = "sms"
 
 type phoneErrorResponse struct {
 	Error string `json:"error"`
@@ -150,6 +159,17 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 			return
 		}
 
+		// Binding a phone adds a recovery/second factor, so it is ledgered (Class B)
+		// like the MFA and passkey enrolments. Verify enables it exactly once per
+		// verification record, so this cannot double-record on retry.
+		s.record(r, audit.Event{
+			EventType:    audit.EventPhoneVerified,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"factor": phoneFactorSMS},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 		writeJSON(w, http.StatusOK, phoneStatusResponse{Status: "verified"})
 	}
 }
@@ -167,11 +187,26 @@ func (s *Server) handlePhoneRemove() http.HandlerFunc {
 			return
 		}
 
-		if err := s.deps.SMSOTP.RemovePhone(r.Context(), userID); err != nil {
+		removed, err := s.deps.SMSOTP.RemovePhone(r.Context(), userID)
+		if err != nil {
 			s.writePhoneError(w, "remove phone", err)
 			return
 		}
 
+		// Only a real state change is ledgered. The endpoint is idempotent, so a
+		// retry after a dropped response still returns 204 with removed == false;
+		// recording that would put a second Class B row in the chain asserting a
+		// factor was torn down that was already gone.
+		if removed {
+			s.record(r, audit.Event{
+				EventType:    audit.EventPhoneRemoved,
+				ActionStatus: audit.StatusSuccess,
+				ActorID:      userID,
+				SubjectID:    &userID,
+				Payload:      map[string]any{"factor": phoneFactorSMS},
+				Security:     &audit.SecurityContext{AccountRef: userID},
+			})
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

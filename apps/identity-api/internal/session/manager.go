@@ -199,15 +199,38 @@ func (m *Manager) ReleaseRecoveryEnrollment(userID, sessionID string) error {
 // Revoke deletes the session bound to the request cookie and clears the cookie
 // on the response. It is idempotent: a missing cookie or unknown session still
 // clears the client cookie and returns nil, so logout always succeeds.
-func (m *Manager) Revoke(w http.ResponseWriter, r *http.Request) error {
+//
+// The returned Session is the one that was revoked, and the bool reports whether
+// anything actually was. Logout is an unauthenticated endpoint, so this is the
+// only place the caller can learn who logged out: there is no session in the
+// request context, and the store is keyed by token hash. Task 5.2 needs the
+// account to attribute auth.session.logged_out (mvp_audit_logs.actor_id is NOT
+// NULL), and needs the false case so an anonymous or already-expired POST cannot
+// append an unattributable row to the audit chain.
+//
+// The lookup is not atomic with the delete. A concurrent expiry between the two
+// only causes a revoked-but-already-gone session to be reported as revoked, which
+// is the harmless direction: the cookie is cleared either way, and the audit
+// record still names the account that held the token.
+func (m *Manager) Revoke(w http.ResponseWriter, r *http.Request) (Session, bool, error) {
+	var (
+		revoked Session
+		ok      bool
+	)
 	token, err := m.cookie.Read(r)
 	if err == nil {
-		if delErr := m.store.Delete(HashToken(token)); delErr != nil {
-			return fmt.Errorf("session: revoke: %w", delErr)
+		hash := HashToken(token)
+		// A failed lookup is not fatal: the delete below must still run so a
+		// session the reader could not decode cannot survive a logout.
+		if s, getErr := m.store.Get(hash); getErr == nil {
+			revoked, ok = s, true
+		}
+		if delErr := m.store.Delete(hash); delErr != nil {
+			return Session{}, false, fmt.Errorf("session: revoke: %w", delErr)
 		}
 	}
 	m.cookie.Clear(w)
-	return nil
+	return revoked, ok, nil
 }
 
 // List returns every live session for userID, newest-first, for the

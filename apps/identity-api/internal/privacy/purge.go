@@ -15,6 +15,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 // SubjectDeletedEvent is the NATS subject the outbox row carries
@@ -27,11 +28,9 @@ const SubjectDeletedEvent = "identity.user.deleted"
 // plus the next schedule tick, or a manual run alongside the schedule) cannot both
 // walk the same batch.
 //
-// The value is arbitrary but must be stable and unique across every advisory lock
-// this platform takes; it is written as a decimal literal rather than a hash so it
-// is greppable and can be inspected directly in pg_locks (objid). Reserve a new
-// literal for each future worker instead of reusing this one.
-const PurgeAdvisoryLockKey int64 = 5100001
+// The key registry now lives in internal/pglock so every worker's literal is
+// visible in one place; this remains as the name the purge worker reads.
+const PurgeAdvisoryLockKey int64 = pglock.PurgeKey
 
 // PurgeStore is the database query subset the purge worker needs. It is satisfied
 // by *db.Queries, both pool-bound (for the batch listing) and transaction-bound
@@ -68,14 +67,11 @@ type SubjectTxOpener interface {
 }
 
 // AdvisoryLocker serialises worker runs across processes.
-type AdvisoryLocker interface {
-	// TryLock reports whether the lock was acquired without waiting. When it
-	// returns true the caller must invoke release exactly once. When it returns
-	// false the caller must exit successfully: another run holds the lock, and
-	// treating contention as an error would make a normal schedule overlap page
-	// somebody.
-	TryLock(ctx context.Context) (acquired bool, release func(), err error)
-}
+//
+// Aliased to pglock.AdvisoryLocker: the purge worker's contract is that
+// contention is *not* an error (a schedule overlap is normal), which is why the
+// shared interface reports acquisition rather than returning an error.
+type AdvisoryLocker = pglock.AdvisoryLocker
 
 // PurgeStats summarises one run. Considered is the batch size actually examined,
 // so Considered == BatchSize is the signal that more subjects are waiting and the
@@ -485,63 +481,12 @@ func (t *pgSubjectTx) Rollback(ctx context.Context) error {
 	return nil
 }
 
-// PgAdvisoryLocker holds pg_try_advisory_lock on a dedicated pooled connection for
-// the whole run.
-//
-// The connection is dedicated because a session-scoped advisory lock lives on the
-// connection that took it: taking it on a pooled connection that is then returned
-// and handed to another query would release the lock (or, worse, leak it onto an
-// unrelated caller). Holding one connection out of the pool for the run's duration
-// is the cost of that guarantee.
-type PgAdvisoryLocker struct {
-	pool *pgxpool.Pool
-	key  int64
-}
+// PgAdvisoryLocker is the pgx-backed advisory locker, kept as an alias so the
+// worker wiring and tests written against this package keep compiling after the
+// implementation moved to internal/pglock (shared with the audit signer).
+type PgAdvisoryLocker = pglock.PgAdvisoryLocker
 
 // NewPgAdvisoryLocker constructs an AdvisoryLocker over a pgx pool.
 func NewPgAdvisoryLocker(pool *pgxpool.Pool, key int64) (*PgAdvisoryLocker, error) {
-	if pool == nil {
-		return nil, errors.New("privacy: pool is required for the advisory lock")
-	}
-	return &PgAdvisoryLocker{pool: pool, key: key}, nil
+	return pglock.NewPgAdvisoryLocker(pool, key)
 }
-
-// TryLock implements AdvisoryLocker with pg_try_advisory_lock, which returns
-// immediately rather than queueing behind the holder.
-func (l *PgAdvisoryLocker) TryLock(ctx context.Context) (bool, func(), error) {
-	conn, err := l.pool.Acquire(ctx)
-	if err != nil {
-		return false, nil, fmt.Errorf("privacy: acquire advisory lock connection: %w", err)
-	}
-
-	var acquired bool
-	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", l.key).Scan(&acquired); err != nil {
-		conn.Release()
-		return false, nil, fmt.Errorf("privacy: pg_try_advisory_lock: %w", err)
-	}
-	if !acquired {
-		conn.Release()
-		return false, nil, nil
-	}
-
-	release := func() {
-		// Unlock explicitly rather than relying on the connection closing: the
-		// connection goes back to the pool, where a session-scoped lock would
-		// otherwise persist. A background context is used so a cancelled run
-		// (SIGTERM) still releases.
-		unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
-		defer cancel()
-		if _, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", l.key); err != nil {
-			// Losing the connection also drops the lock, so this is reportable but
-			// not corrupting.
-			slog.Default().Error("privacy: release purge advisory lock",
-				slog.String("error", err.Error()))
-		}
-		conn.Release()
-	}
-	return true, release, nil
-}
-
-// advisoryUnlockTimeout bounds the explicit unlock so a wedged connection cannot
-// hang process shutdown.
-const advisoryUnlockTimeout = 5 * time.Second

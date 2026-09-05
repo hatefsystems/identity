@@ -928,12 +928,15 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 			t.Fatalf("InsertAuditLog b: %v", err)
 		}
 
-		// Ascending keyset scan from the epoch must return records in
-		// insertion order (timestamp, id ascending).
+		// Ascending keyset scan from genesis must return records in insertion
+		// order. Ordering is by seq, not (timestamp, id): timestamp is the event's
+		// true occurrence time and is supplied by the publisher, so two events can
+		// share one — or arrive out of order — without that being tampering. seq is
+		// assigned by the database at insert and is the only total order the chain
+		// can be verified against.
 		page, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
-			AfterTimestamp: ts(time.Unix(0, 0)),
-			AfterID:        uuid.Nil,
-			PageLimit:      1000,
+			AfterSeq:  0,
+			PageLimit: 1000,
 		})
 		if err != nil {
 			t.Fatalf("ListAuditLogsForChainVerification: %v", err)
@@ -943,15 +946,52 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		}
 		for i := 1; i < len(page); i++ {
 			prev, cur := page[i-1], page[i]
-			if cur.Timestamp.Time.Before(prev.Timestamp.Time) {
-				t.Errorf("records out of ascending timestamp order at index %d", i)
+			if cur.Seq <= prev.Seq {
+				t.Errorf("records out of ascending seq order at index %d: %d then %d",
+					i, prev.Seq, cur.Seq)
 			}
 		}
 
+		// The keyset boundary is exclusive: resuming from the first page's last seq
+		// must not repeat it. An off-by-one here would make a verifier hash one
+		// record twice and report a break in an intact chain.
+		firstOnly, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
+			AfterSeq:  0,
+			PageLimit: 1,
+		})
+		if err != nil {
+			t.Fatalf("ListAuditLogsForChainVerification (page 1): %v", err)
+		}
+		if len(firstOnly) != 1 {
+			t.Fatalf("expected exactly 1 record with PageLimit=1, got %d", len(firstOnly))
+		}
+		next, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
+			AfterSeq:  firstOnly[0].Seq,
+			PageLimit: 1,
+		})
+		if err != nil {
+			t.Fatalf("ListAuditLogsForChainVerification (page 2): %v", err)
+		}
+		if len(next) != 1 {
+			t.Fatalf("expected exactly 1 record on page 2, got %d", len(next))
+		}
+		if next[0].Seq <= firstOnly[0].Seq {
+			t.Errorf("keyset is inclusive: page 2 seq %d must exceed page 1 seq %d",
+				next[0].Seq, firstOnly[0].Seq)
+		}
+
 		// InsertAuditLogs (copyfrom batch used by the Task 5.2 signing consumer).
+		//
+		// id is supplied by the caller rather than defaulted by the database. That is
+		// what makes the pipeline idempotent: the publisher mints the id, ships it as
+		// the JetStream Nats-Msg-Id, and the signer filters ids that already exist
+		// before this COPY. A server-generated id would make a redelivered message a
+		// brand-new row, silently duplicating events inside the hash chain.
 		now := time.Now().UTC()
+		batchIDs := []uuid.UUID{uuid.New(), uuid.New()}
 		batch := []InsertAuditLogsParams{
 			{
+				ID:            batchIDs[0],
 				ActorID:       uuid.New(),
 				ActorSpiffeID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
 				EventType:     "test.batch.insert",
@@ -963,6 +1003,7 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 				ChainHash:     strings.Repeat("6", 64),
 			},
 			{
+				ID:            batchIDs[1],
 				ActorID:       uuid.New(),
 				ActorSpiffeID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
 				EventType:     "test.batch.insert",
@@ -980,6 +1021,29 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		}
 		if n != 2 {
 			t.Errorf("expected 2 batch rows inserted, got %d", n)
+		}
+
+		// FilterExistingAuditLogIDs is the signer's pre-COPY duplicate guard. It must
+		// report exactly the ids already stored, so a mixed set of one known and one
+		// unknown id is the case that matters: returning both would drop a real event,
+		// returning neither would duplicate one.
+		unknown := uuid.New()
+		existing, err := q.FilterExistingAuditLogIDs(ctx, []uuid.UUID{batchIDs[0], unknown})
+		if err != nil {
+			t.Fatalf("FilterExistingAuditLogIDs: %v", err)
+		}
+		if len(existing) != 1 || existing[0] != batchIDs[0] {
+			t.Errorf("FilterExistingAuditLogIDs = %v, want exactly [%v]", existing, batchIDs[0])
+		}
+
+		// The chain tip must be the most recent row by seq, which is the value the
+		// signer seeds its in-memory chain from on startup.
+		tip, err := q.GetLatestAuditLogChainHash(ctx)
+		if err != nil {
+			t.Fatalf("GetLatestAuditLogChainHash: %v", err)
+		}
+		if tip != strings.Repeat("7", 64) {
+			t.Errorf("GetLatestAuditLogChainHash = %q, want the last batch row's hash", tip)
 		}
 	}
 }

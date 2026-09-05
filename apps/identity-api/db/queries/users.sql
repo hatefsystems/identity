@@ -78,13 +78,26 @@ FOR UPDATE;
 -- O(1) exact-match lookup via idx_users_phone_blind (data-architecture §2.2).
 SELECT * FROM users
 WHERE phone_blind_index = $1
-  AND deleted_at IS NULL;
-
--- name: GetUserByBackupEmailBlindIndex :one
+  AND deleted_at IS NULL;-- name: GetUserByBackupEmailBlindIndex :one
 -- O(1) exact-match lookup via idx_users_backup_email_blind.
 SELECT * FROM users
 WHERE backup_email_blind_index = $1
   AND deleted_at IS NULL;
+
+-- name: GetUserEmailForBlindIndex :one
+-- Task 5.2: the signing consumer resolves security_event_ledger.
+-- identity_blind_index from account_ref by computing SHA-256(email + pepper)
+-- itself, which keeps the pepper in one process and needs no call-site changes.
+--
+-- Deliberately does NOT filter deleted_at: a soft-deleted account is still
+-- attributable throughout its 30-day grace window, and filtering it out would
+-- silently drop the blind index for exactly the subjects a lawful inquiry is
+-- most likely to ask about (threat-modeling.md R2).
+--
+-- Returns only the column needed. The email is Class A PII: it is hashed
+-- immediately and MUST NOT be logged or persisted by the consumer.
+SELECT email FROM users
+WHERE id = $1;
 
 -- name: UpdateUserPassword :execrows
 -- Argon2id hash computed in the application layer (Task 2.4).

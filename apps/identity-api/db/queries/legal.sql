@@ -8,6 +8,11 @@
 -- only inserts, reads, and a maintenance-role purge are defined here. Rows are
 -- chained like mvp_audit_logs:
 --   chain_hash(N) = SHA-256(chain_hash(N-1) || serialize(record(N)))
+--
+-- This is a SECOND, INDEPENDENT chain: it shares the formula with mvp_audit_logs
+-- but not the sequence, and the two serializations carry distinct domain
+-- prefixes so a record can never be replayed across ledgers. Chain position is
+-- `seq` (migration 00006), never (timestamp, id).
 
 -- ---------------------------------------------------------------------------
 -- Security Event Ledger
@@ -23,16 +28,36 @@ RETURNING *;
 -- name: InsertSecurityEvents :copyfrom
 -- Batched writes for the single-threaded signing consumer (Task 5.2). Timestamp
 -- is supplied explicitly so the chain hash covers the exact persisted value.
+--
+-- `id` is the publisher-assigned event id from the JetStream message; the
+-- consumer filters already-present ids (FilterExistingSecurityEventIDs) so an
+-- at-least-once redelivery cannot append a permanent duplicate to a table whose
+-- UPDATE/DELETE rights are revoked.
 INSERT INTO security_event_ledger (
-    account_ref, identity_blind_index, event_type, client_ip, ip_subnet,
+    id, account_ref, identity_blind_index, event_type, client_ip, ip_subnet,
     user_agent, device_fingerprint, client_id, scope, timestamp, retain_until, chain_hash
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
 
 -- name: GetLatestSecurityEventChainHash :one
 -- Seeds the next chain computation; returns no rows before the genesis record.
 SELECT chain_hash FROM security_event_ledger
-ORDER BY timestamp DESC, id DESC
+ORDER BY seq DESC
 LIMIT 1;
+
+-- name: FilterExistingSecurityEventIDs :many
+-- Deduplication probe for the signing consumer (see InsertSecurityEvents).
+SELECT id FROM security_event_ledger
+WHERE id = ANY(sqlc.arg('ids')::uuid[]);
+
+-- name: ListSecurityEventsForChainVerification :many
+-- Ordered ascending scan for the ledger integrity audit (disaster-recovery
+-- §3.2), mirroring ListAuditLogsForChainVerification. Keyset pagination over seq
+-- keeps memory bounded; pass after_seq = 0 to start at genesis. See that query
+-- for why the ::bigint cast matters.
+SELECT * FROM security_event_ledger
+WHERE seq > sqlc.arg('after_seq')::bigint
+ORDER BY seq
+LIMIT sqlc.arg('page_limit');
 
 -- name: FindSecurityEventsByBlindIndex :many
 -- Attribution lookup (api-design §1.7 legal-inquiry/lookup): an authority

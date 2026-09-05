@@ -22,6 +22,11 @@ import (
 type fakeUserStore struct {
 	users  map[uuid.UUID]bool
 	status string
+	// phoneEncrypted is what GetUserByID reports for phone_encrypted, which is
+	// how the service decides whether a removal was a real state change. It
+	// defaults to nil (no phone bound); tests that exercise a removal of a
+	// present phone set it explicitly.
+	phoneEncrypted []byte
 
 	setCalled       bool
 	setEncrypted    []byte
@@ -51,7 +56,7 @@ func (f *fakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, e
 	if status == "" {
 		status = "active"
 	}
-	return db.User{ID: id, Status: status}, nil
+	return db.User{ID: id, Status: status, PhoneEncrypted: f.phoneEncrypted}, nil
 }
 
 func (f *fakeUserStore) SetUserPhone(_ context.Context, arg db.SetUserPhoneParams) (int64, error) {
@@ -392,7 +397,7 @@ func TestPhoneOperationsRejectNonActiveAccount(t *testing.T) {
 	if err := fx.svc.Verify(context.Background(), fx.userID, fx.sessionID, verificationID, "123456"); !errors.Is(err, ErrAccountNotActive) {
 		t.Fatalf("Verify = %v, want ErrAccountNotActive", err)
 	}
-	if err := fx.svc.RemovePhone(context.Background(), fx.userID); !errors.Is(err, ErrAccountNotActive) {
+	if _, err := fx.svc.RemovePhone(context.Background(), fx.userID); !errors.Is(err, ErrAccountNotActive) {
 		t.Fatalf("RemovePhone = %v, want ErrAccountNotActive", err)
 	}
 	if fx.sender.calls != 0 || fx.users.setCalled || fx.users.removeCalled {
@@ -642,15 +647,45 @@ func TestHashCodeBindsPhone(t *testing.T) {
 // apart — the same invariant persistPhone maintains on the way in.
 func TestRemovePhoneClearsTheAccount(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
+	fx.users.phoneEncrypted = []byte("envelope")
 
-	if err := fx.svc.RemovePhone(context.Background(), fx.userID); err != nil {
+	removed, err := fx.svc.RemovePhone(context.Background(), fx.userID)
+	if err != nil {
 		t.Fatalf("RemovePhone: %v", err)
+	}
+	if !removed {
+		t.Error("clearing a bound phone did not report a state change")
 	}
 	if !fx.users.removeCalled {
 		t.Fatal("expected the phone to be cleared")
 	}
 	if fx.users.removeUserID != fx.userID {
 		t.Fatalf("cleared %s, want %s", fx.users.removeUserID, fx.userID)
+	}
+}
+
+// TestRemovePhoneReportsNoChangeWhenNoPhoneIsBound pins the idempotency contract
+// the audit trail depends on. The endpoint still succeeds — a client retrying
+// after a dropped response must not see a spurious failure — but the caller is
+// told nothing changed, so Task 5.2 does not append a second Class B ledger row
+// claiming a factor was torn down that was already gone.
+//
+// This is deliberately not inferred from the affected row count: RemoveUserPhone
+// matches on id alone, so it reports one row either way.
+func TestRemovePhoneReportsNoChangeWhenNoPhoneIsBound(t *testing.T) {
+	fx := newServiceFixture(t, Config{})
+
+	removed, err := fx.svc.RemovePhone(context.Background(), fx.userID)
+	if err != nil {
+		t.Fatalf("RemovePhone on an account with no phone: %v", err)
+	}
+	if removed {
+		t.Error("removing an absent phone reported a state change")
+	}
+	// The write still runs: it is the statement that guarantees the payload and
+	// the blind index cannot survive independently of each other.
+	if !fx.users.removeCalled {
+		t.Error("expected the clearing statement to run regardless")
 	}
 }
 
@@ -662,7 +697,7 @@ func TestRemovePhoneIsNotRateLimited(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 	fx.limiter.denyAll()
 
-	if err := fx.svc.RemovePhone(context.Background(), fx.userID); err != nil {
+	if _, err := fx.svc.RemovePhone(context.Background(), fx.userID); err != nil {
 		t.Fatalf("RemovePhone with a saturated limiter: %v", err)
 	}
 }
@@ -670,7 +705,7 @@ func TestRemovePhoneIsNotRateLimited(t *testing.T) {
 func TestRemovePhoneRejectsAnUnknownAccount(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 
-	if err := fx.svc.RemovePhone(context.Background(), uuid.New()); !errors.Is(err, ErrUserNotFound) {
+	if _, err := fx.svc.RemovePhone(context.Background(), uuid.New()); !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("expected ErrUserNotFound, got %v", err)
 	}
 	if fx.users.removeCalled {
@@ -683,21 +718,33 @@ func TestRemovePhoneRejectsAnUnknownAccount(t *testing.T) {
 // outlived its account.
 func TestRemovePhoneReportsAVanishedAccount(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
+	// A phone was present at lookup time, so a caller that ignored the error
+	// would see the state change reported as true. It must not be: the update
+	// matched nothing, so nothing was cleared.
+	fx.users.phoneEncrypted = []byte("envelope")
 	zero := int64(0)
 	fx.users.removeAffected = &zero
 
-	if err := fx.svc.RemovePhone(context.Background(), fx.userID); !errors.Is(err, ErrUserNotFound) {
+	removed, err := fx.svc.RemovePhone(context.Background(), fx.userID)
+	if !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("expected ErrUserNotFound, got %v", err)
+	}
+	if removed {
+		t.Error("a failed removal reported a state change")
 	}
 }
 
 func TestRemovePhonePropagatesStoreFailures(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
+	fx.users.phoneEncrypted = []byte("envelope")
 	fx.users.removeUserPhoneErr = errors.New("database on fire")
 
-	err := fx.svc.RemovePhone(context.Background(), fx.userID)
+	removed, err := fx.svc.RemovePhone(context.Background(), fx.userID)
 	if err == nil {
 		t.Fatal("expected the store failure to propagate")
+	}
+	if removed {
+		t.Error("a failed removal reported a state change")
 	}
 	// An infrastructure fault must not be flattened into a domain sentinel, or a
 	// database outage would surface to the user as "no such account".

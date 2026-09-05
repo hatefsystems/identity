@@ -5,6 +5,9 @@ import (
 	"mime"
 	"net/http"
 
+	"github.com/google/uuid"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 )
@@ -61,6 +64,7 @@ func (s *Server) handleToken() http.HandlerFunc {
 
 		resp, err := s.deps.TokenService.Exchange(ctx, r.PostForm)
 		if err != nil {
+			s.recordTokenDenied(r, err)
 			var tokenErr *token.Error
 			if errors.As(err, &tokenErr) {
 				writeJSON(w, tokenErr.Status, tokenErrorResponse{
@@ -76,8 +80,112 @@ func (s *Server) handleToken() http.HandlerFunc {
 			return
 		}
 
+		s.recordTokenIssued(r, resp)
 		writeJSON(w, http.StatusOK, resp)
 	}
+}
+
+// recordTokenIssued records a successful grant.
+//
+// It is ledgered (Class B) only when the grant resolved a user account. The
+// client_credentials grant has no subject — the client acts on its own behalf —
+// so it produces an audit row with no subject and no security_event_ledger row,
+// because account_ref is NOT NULL and there is no account to attribute. Inventing
+// one would put a non-existent subject into the tamper-evident chain.
+func (s *Server) recordTokenIssued(r *http.Request, resp *token.Response) {
+	if resp == nil {
+		return
+	}
+	e := audit.Event{
+		EventType:    audit.EventTokenIssued,
+		ActionStatus: audit.StatusSuccess,
+		Payload: map[string]any{
+			"grant_type": tokenAuditGrantType(r.PostForm.Get("grant_type")),
+			"client_id":  resp.ClientID,
+			"scope":      resp.Scope,
+			// Records whether the issued token is sender-constrained, which is the
+			// difference between a stolen token being replayable and not.
+			"dpop_bound": r.Header.Get(dpop.HeaderProof) != "",
+		},
+	}
+	// A malformed subject is treated as no subject rather than dropping the event:
+	// the grant did happen, and the client/scope context is still worth recording.
+	if subject, parseErr := uuid.Parse(resp.Subject); parseErr == nil {
+		e.ActorID = subject
+		e.SubjectID = &subject
+		e.Security = &audit.SecurityContext{
+			AccountRef: subject,
+			ClientID:   resp.ClientID,
+			Scope:      resp.Scope,
+		}
+	} else if resp.Subject != "" {
+		s.logger.Error("token endpoint: issued response carries a non-UUID subject",
+			"error", parseErr.Error())
+	}
+	s.record(r, e)
+}
+
+// recordTokenDenied records a refused grant.
+//
+// Audit-only, and with ActorID left as uuid.Nil: a denial usually has no resolved
+// account (bad code, unknown client, failed client authentication), and the actor
+// is the OAuth client rather than a user. ActorSPIFFEID, filled in by record,
+// states which workload refused it, so a nil actor here is not confusable with the
+// purge worker's nil actor.
+//
+// client_id comes from the raw form and may be unregistered or absent — that is
+// precisely what makes it worth recording — so it is length-clamped rather than
+// trusted. No token, code, assertion, or client secret from the form is recorded.
+func (s *Server) recordTokenDenied(r *http.Request, err error) {
+	reason := token.ErrCodeServerError
+	var tokenErr *token.Error
+	if errors.As(err, &tokenErr) {
+		reason = tokenErr.Code
+	}
+	s.record(r, audit.Event{
+		EventType:    audit.EventTokenDenied,
+		ActionStatus: audit.StatusFailure,
+		Payload: map[string]any{
+			"grant_type": tokenAuditGrantType(r.PostForm.Get("grant_type")),
+			"client_id":  clampAuditValue(r.PostForm.Get("client_id")),
+			// tokenErr.Code is a server-defined RFC 6749 constant, never client
+			// input, so it is safe to record verbatim. Description is not: it can
+			// quote request detail.
+			"reason": reason,
+		},
+	})
+}
+
+// tokenAuditGrantType clamps the client-supplied grant_type to the values the
+// service implements, so an unbounded request field cannot choose the contents of
+// an audit payload. Anything else is recorded as unsupported, which is the same
+// distinction the endpoint itself makes.
+func tokenAuditGrantType(grant string) string {
+	switch grant {
+	case token.GrantAuthorizationCode:
+		return token.GrantAuthorizationCode
+	case token.GrantRefreshToken:
+		return token.GrantRefreshToken
+	case token.GrantClientCredentials:
+		return token.GrantClientCredentials
+	case "":
+		return "missing"
+	default:
+		return "unsupported"
+	}
+}
+
+// clampAuditValue bounds a request-supplied string recorded in an audit payload.
+//
+// Some fields (an unregistered client_id) are only useful verbatim, so they cannot
+// be mapped to a fixed vocabulary the way grant_type is. Truncating instead keeps a
+// caller from choosing the size of a row in an append-only table.
+func clampAuditValue(v string) string {
+	const maxAuditValueLen = 128
+	if len(v) <= maxAuditValueLen {
+		return v
+	}
+	return v[:maxAuditValueLen] + "…"
 }
 
 // validateTokenDPoP validates a DPoP proof for the token endpoint. The htu is

@@ -14,8 +14,10 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/uuid"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
@@ -188,6 +190,7 @@ func (s *Server) handleWebAuthnRegisterVerify() http.HandlerFunc {
 			s.writeWebAuthnRegistrationError(w, "finish registration", err)
 			return
 		}
+		s.recordCredentialRegistered(r, userID, row, webauthnFlowSelfService)
 		writeJSON(w, http.StatusCreated, toWebAuthnCredentialResponse(row))
 	}
 }
@@ -232,7 +235,7 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 			return
 		}
 
-		_, err = s.deps.WebAuthn.FinishRecoveryRegistration(r.Context(), userID, current.ID, body)
+		row, err := s.deps.WebAuthn.FinishRecoveryRegistration(r.Context(), userID, current.ID, body)
 		if err != nil {
 			if isConclusiveWebAuthnCeremonyFailure(err) {
 				_ = s.deps.SessionManager.ReleaseRecoveryEnrollment(current.UserID, current.ID)
@@ -241,7 +244,15 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 			return
 		}
 
-		if err := s.deps.SessionManager.Revoke(w, r); err != nil {
+		// Recorded before the session teardown below: the credential now exists and
+		// is usable, so a failure to clear the enrollment session must not cost the
+		// ledger its record of a new authenticator being bound to the account.
+		s.recordCredentialRegistered(r, userID, row, webauthnFlowRecoveryEnrollment)
+
+		// The revoked session is not audited here. This teardown is a step inside
+		// recovery enrollment, not a user-initiated logout, and the account-level
+		// state change was already recorded above.
+		if _, _, err := s.deps.SessionManager.Revoke(w, r); err != nil {
 			s.logger.Error("webauthn: clear completed recovery session failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
 			return
@@ -359,6 +370,7 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 
 		userID, err := s.deps.WebAuthn.FinishLogin(r.Context(), body)
 		if err != nil {
+			s.recordLoginFailed(r, err)
 			s.writeWebAuthnLoginError(w, "finish login", err)
 			return
 		}
@@ -372,6 +384,18 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
 			return
 		}
+
+		// After Issue, not before: the assertion alone is not a login until the
+		// caller actually holds a session. Recording earlier would put successful
+		// logins in the ledger for requests that ended in a 500 with no session.
+		s.record(r, audit.Event{
+			EventType:    audit.EventLoginSucceeded,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"method": webauthnLoginMethod},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -405,6 +429,14 @@ func (s *Server) handleWebAuthnDeleteKey() http.HandlerFunc {
 			s.writeWebAuthnDeleteError(w, err)
 			return
 		}
+		s.record(r, audit.Event{
+			EventType:    audit.EventWebAuthnCredentialDeleted,
+			ActionStatus: audit.StatusSuccess,
+			ActorID:      userID,
+			SubjectID:    &userID,
+			Payload:      map[string]any{"method": webauthnLoginMethod},
+			Security:     &audit.SecurityContext{AccountRef: userID},
+		})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -538,4 +570,123 @@ func toWebAuthnCredentialResponse(row db.WebauthnCredential) webauthnCredentialR
 		out.LastUsedAt = &lastUsed
 	}
 	return out
+}
+
+// Audit payload constants for the passkey routes (Task 5.2).
+const (
+	// webauthnLoginMethod names the factor in the audit payload. It exists so a
+	// future second session-issuing method is distinguishable in the ledger rather
+	// than being retroactively indistinguishable from a passkey login.
+	webauthnLoginMethod = "webauthn"
+
+	// webauthnFlowSelfService is an enrolment performed inside an ordinary
+	// authenticated session.
+	webauthnFlowSelfService = "self_service"
+	// webauthnFlowRecoveryEnrollment is an enrolment performed with a restricted
+	// session minted by spending a recovery code. It is the higher-risk of the two —
+	// it is the path an attacker with a stolen recovery code would take — so the two
+	// are never collapsed into one event.
+	webauthnFlowRecoveryEnrollment = "recovery_enrollment"
+)
+
+// recordCredentialRegistered audits a newly bound authenticator. Both enrolment
+// routes funnel through it so the two flows cannot drift into recording different
+// shapes for the same security event.
+//
+// The credential ID is deliberately absent from the payload (Event.Payload's
+// contract): it is a stable, per-account identifier that would outlive the erasure
+// of the account it belongs to. The AAGUID is included instead — it names the
+// authenticator *model*, which is what an investigator actually needs ("a new
+// YubiKey was enrolled at 03:00") and carries no per-user information.
+func (s *Server) recordCredentialRegistered(
+	r *http.Request, userID uuid.UUID, row db.WebauthnCredential, flow string,
+) {
+	payload := map[string]any{
+		"method": webauthnLoginMethod,
+		"flow":   flow,
+	}
+	if row.Aaguid != uuid.Nil {
+		payload["aaguid"] = row.Aaguid.String()
+	}
+	if row.AttestationType != "" {
+		payload["attestation_type"] = row.AttestationType
+	}
+	payload["user_verified"] = row.UserVerified
+	// Backup eligibility distinguishes a synced passkey (recoverable, present on
+	// every device in the user's cloud account) from a device-bound one. That
+	// materially changes the blast radius of a compromised platform account, so it
+	// belongs in the record of the credential's creation.
+	payload["backup_eligible"] = row.BackupEligible
+
+	s.record(r, audit.Event{
+		EventType:    audit.EventWebAuthnCredentialRegistered,
+		ActionStatus: audit.StatusSuccess,
+		ActorID:      userID,
+		SubjectID:    &userID,
+		Payload:      payload,
+		Security:     &audit.SecurityContext{AccountRef: userID},
+	})
+}
+
+// recordLoginFailed audits a rejected assertion.
+//
+// It is audit-only, with no SecurityContext, because a failed login usually has no
+// resolvable account: FinishLogin returns an opaque error for an unknown handle, a
+// decoy ceremony, and a bad signature alike, and security_event_ledger.account_ref
+// is NOT NULL. Attributing these would require guessing, and a ledger row
+// attributed to the wrong account is worse than no row.
+//
+// The payload carries a precise reason even though the HTTP response is
+// deliberately opaque. That is not a contradiction: the opacity exists to deny an
+// *external* caller an enumeration oracle, while the audit trail is internal and is
+// useless for incident response if every failure reads "invalid_credentials". The
+// subnet is recorded because it is the only correlation key available when there is
+// no account to group by.
+func (s *Server) recordLoginFailed(r *http.Request, err error) {
+	clientIP := clientip.FromRequest(r)
+	s.record(r, audit.Event{
+		EventType:     audit.EventLoginFailed,
+		ActionStatus:  audit.StatusFailure,
+		ActorSPIFFEID: audit.APIActorSPIFFEID,
+		ClientIP:      clientIP,
+		Payload: map[string]any{
+			"method":    webauthnLoginMethod,
+			"reason":    webauthnLoginFailureReason(err),
+			"ip_subnet": ratelimit.Subnet(clientIP),
+		},
+	})
+}
+
+// webauthnLoginFailureReason maps a login failure to a coarse, stable label for the
+// audit payload. The labels are grouped by what an operator would do about them,
+// not by Go error identity:
+//
+//   - credential_cloned is the only one that indicates a compromised authenticator
+//     and should page someone;
+//   - challenge_invalid means a stale or replayed ceremony, which is usually a slow
+//     user or a broken client;
+//   - rejected covers every outcome that is indistinguishable to the caller
+//     (unknown account, no credentials, decoy ceremony, inactive account, failed
+//     signature). Splitting these apart in the audit trail would reconstruct the
+//     enumeration oracle the response format exists to prevent, because audit
+//     records are exportable.
+func webauthnLoginFailureReason(err error) string {
+	switch {
+	case errors.Is(err, webauthn.ErrCredentialCloned):
+		return "credential_cloned"
+	case errors.Is(err, webauthn.ErrInvalidResponse):
+		return "malformed_response"
+	case errors.Is(err, webauthn.ErrChallengeNotFound),
+		errors.Is(err, webauthn.ErrChallengeExpired),
+		errors.Is(err, webauthn.ErrChallengeFlowMismatch):
+		return "challenge_invalid"
+	case errors.Is(err, webauthn.ErrUserNotFound),
+		errors.Is(err, webauthn.ErrNoCredentials),
+		errors.Is(err, webauthn.ErrMockChallenge),
+		errors.Is(err, webauthn.ErrAccountNotActive),
+		errors.Is(err, webauthn.ErrVerification):
+		return "rejected"
+	default:
+		return "internal_error"
+	}
 }

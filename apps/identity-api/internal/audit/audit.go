@@ -62,6 +62,118 @@ const (
 	EventDeletionPurgeFailed = "privacy.deletion.purge_failed"
 )
 
+// Event types emitted by the authentication and OAuth surfaces (Task 5.2). Every
+// one of these is a security-relevant state change or a failed attempt at one, so
+// each has an instrumented call site in internal/server.
+//
+// The ones listed in LedgerEventTypes must additionally carry Event.Security.
+const (
+	// EventLoginSucceeded records a completed WebAuthn assertion.
+	EventLoginSucceeded = "auth.login.succeeded"
+	// EventLoginFailed records a rejected authentication attempt. It frequently
+	// has no resolvable account (unknown handle, malformed assertion), which is
+	// why it is audit-only — see the LedgerEventTypes doc.
+	EventLoginFailed = "auth.login.failed"
+
+	// EventWebAuthnCredentialRegistered records a new passkey bound to an account.
+	// Adding an authenticator is a permanent expansion of who can log in, so it is
+	// ledgered.
+	EventWebAuthnCredentialRegistered = "auth.webauthn.credential.registered"
+	// EventWebAuthnCredentialDeleted records a passkey removal.
+	EventWebAuthnCredentialDeleted = "auth.webauthn.credential.deleted"
+
+	// EventMFATOTPEnabled records enrolment completion: TOTP is now required.
+	EventMFATOTPEnabled = "auth.mfa.totp.enabled"
+	// EventMFATOTPDisabled records MFA teardown, a security *downgrade* and one of
+	// the highest-value events in the ledger.
+	EventMFATOTPDisabled = "auth.mfa.totp.disabled"
+	// EventMFAVerifyFailed records a rejected TOTP code.
+	EventMFAVerifyFailed = "auth.mfa.verify_failed"
+
+	// EventRecoveryCodeGenerated records a freshly minted recovery-code batch,
+	// which invalidates every previously issued code.
+	EventRecoveryCodeGenerated = "auth.recovery_code.generated"
+	// EventRecoveryCodeConsumed records a single-use recovery code being spent.
+	EventRecoveryCodeConsumed = "auth.recovery_code.consumed"
+	// EventRecoveryCodeVerifyFailed records a rejected recovery code.
+	EventRecoveryCodeVerifyFailed = "auth.recovery_code.verify_failed"
+
+	// EventPhoneVerified records a phone number bound to the account as a factor.
+	EventPhoneVerified = "auth.phone.verified"
+	// EventPhoneRemoved records that binding being torn down.
+	EventPhoneRemoved = "auth.phone.removed"
+
+	// EventStepUpGranted records a successful step-up, which unlocks the
+	// sensitive-operation endpoints for a bounded window.
+	EventStepUpGranted = "auth.stepup.granted"
+	// EventStepUpDenied records a refused step-up attempt.
+	EventStepUpDenied = "auth.stepup.denied"
+
+	// EventSessionLoggedOut records a user-initiated logout. Audit-only: ending
+	// one's own session grants nothing and is not attribution evidence.
+	EventSessionLoggedOut = "auth.session.logged_out"
+	// EventSessionRevoked records a specific session being revoked.
+	EventSessionRevoked = "auth.session.revoked"
+
+	// EventTokenIssued records a successful token grant. Ledgered because
+	// "which client held which scopes for this account, and when" is exactly the
+	// question a lawful inquiry asks (threat-modeling.md R2).
+	EventTokenIssued = "oauth.token.issued"
+	// EventTokenDenied records a rejected token request.
+	EventTokenDenied = "oauth.token.denied"
+
+	// EventRTRBreach records a refresh-token-rotation replay: a used refresh token
+	// was presented again, which means it leaked. The whole family is revoked.
+	EventRTRBreach = "security.rtr_breach"
+)
+
+// Event types emitted by the audit pipeline about itself (Task 5.2).
+const (
+	// EventPipelineUndecodable records a stream message the signing consumer could
+	// not decode. The signer synthesizes this record, chains it normally, and only
+	// then discards the original, so the loss is itself in the tamper-evident log
+	// rather than being a silent gap.
+	EventPipelineUndecodable = "audit.pipeline.undecodable"
+)
+
+// LedgerEventTypes is the declared set of event types that MUST carry
+// Event.Security, i.e. that must produce a security_event_ledger row in addition
+// to the mvp_audit_logs row. Membership is what makes an event survive account
+// deletion, so it is a compliance statement, not a convenience.
+//
+// Failures are deliberately absent even when their success counterpart is present.
+// security_event_ledger.account_ref is NOT NULL and must always be users.id, and a
+// failed attempt frequently has no resolvable account: an unknown WebAuthn handle,
+// a bad client_id, a malformed assertion. Inventing an account_ref to satisfy the
+// column would fabricate attribution evidence, and skipping only the unresolvable
+// subset would make ledger coverage depend on how the attempt happened to fail.
+// Failures are therefore recorded as audit rows whose payload carries the
+// non-identifying facts (identifier_present, ip_subnet, reason) instead.
+//
+// The signer treats a mismatch in either direction as an error worth logging: a
+// member arriving without Security, or Security arriving with a nil AccountRef.
+// Neither is silently dropped — see internal/audit/signer.
+var LedgerEventTypes = map[string]struct{}{
+	EventLoginSucceeded:               {},
+	EventWebAuthnCredentialRegistered: {},
+	EventWebAuthnCredentialDeleted:    {},
+	EventMFATOTPEnabled:               {},
+	EventMFATOTPDisabled:              {},
+	EventRecoveryCodeGenerated:        {},
+	EventRecoveryCodeConsumed:         {},
+	EventPhoneVerified:                {},
+	EventPhoneRemoved:                 {},
+	EventStepUpGranted:                {},
+	EventTokenIssued:                  {},
+	EventRTRBreach:                    {},
+}
+
+// IsLedgerEventType reports whether an event type must carry Security.
+func IsLedgerEventType(eventType string) bool {
+	_, ok := LedgerEventTypes[eventType]
+	return ok
+}
+
 // Action statuses. They mirror mvp_audit_logs.action_status, which is a free-text
 // VARCHAR, so pinning the vocabulary here keeps queries over it meaningful.
 const (
@@ -77,6 +189,43 @@ const (
 // itself explicitly instead of leaving actor_spiffe_id empty and indistinguishable
 // from a missing value.
 const SystemActorSPIFFEID = "system://identity/purge-worker"
+
+// SignerActorSPIFFEID identifies records the audit signing worker raises about the
+// pipeline itself (EventPipelineUndecodable). It is distinct from
+// SystemActorSPIFFEID so a self-report by the signer can never be confused with a
+// purge decision when reading the ledger.
+const SignerActorSPIFFEID = "system://identity/audit-signer"
+
+// APIActorSPIFFEID identifies events raised by the identity API process while
+// serving a request. ActorID carries the authenticated user; this states which
+// workload asserted it.
+const APIActorSPIFFEID = "system://identity/identity-api"
+
+// SecurityContext marks an Event as a Class B security event and carries the
+// attributes that exist only on security_event_ledger.
+//
+// A non-nil value is the call site's explicit declaration that this action must
+// remain attributable after the account is erased (threat-modeling.md R2). That is
+// a deliberate, auditable choice, which is why it is a typed struct rather than
+// well-known Payload keys: a typo in a map key would silently destroy attribution
+// evidence with no compile-time signal.
+//
+// It must never carry raw PII. identity_blind_index is derived by the signing
+// consumer from AccountRef, so the blind-index pepper stays in one process and no
+// email or phone number ever crosses the message bus.
+type SecurityContext struct {
+	// AccountRef is the subject of the event and is always users.id (tasks.md:54).
+	// It is required: security_event_ledger.account_ref is NOT NULL, and it is the
+	// join key legal holds and lawful-inquiry lookups use, so any other derivation
+	// would decouple holds from the rows they are meant to freeze.
+	AccountRef uuid.UUID
+	// ClientID is the OAuth client involved, when the event happened through one.
+	ClientID string
+	// Scope is the granted scope string, for token events.
+	Scope string
+	// DeviceFingerprint is the caller-supplied device identifier, when present.
+	DeviceFingerprint string
+}
 
 // Event is one security-relevant occurrence, shaped to match the columns of
 // mvp_audit_logs so the Task 5.2 consumer can persist it without a translation
@@ -105,7 +254,15 @@ type Event struct {
 	// token, a passcode, an email address, a phone number, or any other Class A
 	// value: these records outlive the account (see the package doc), so anything
 	// put here escapes the "Right to be Forgotten" erasure entirely.
+	//
+	// Task 5.2 makes this load-bearing rather than belt-and-braces: the JetStream
+	// publisher forwards payload *values* verbatim, and its transport-failure
+	// fallback writes them to the process log.
 	Payload map[string]any
+	// Security, when non-nil, declares this a Class B security event that must also
+	// be written to security_event_ledger and must survive account deletion. Nil
+	// means audit-only. See SecurityContext and LedgerEventTypes.
+	Security *SecurityContext
 }
 
 // Recorder persists an audit Event.

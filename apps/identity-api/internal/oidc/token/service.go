@@ -131,6 +131,11 @@ func (c Config) withDefaults() Config {
 }
 
 // Response is the successful token endpoint JSON payload (RFC 6749 §5.1).
+//
+// Subject and ClientID are transport-only: they are how the HTTP layer learns who
+// the grant was for so it can emit the audit/ledger event, and they carry `json:"-"`
+// so they never reach the wire. Returning them beats re-parsing the issued JWT,
+// which would mean verifying our own signature to recover a value we just had.
 type Response struct {
 	AccessToken  string `json:"access_token"`
 	TokenType    string `json:"token_type"`
@@ -138,6 +143,15 @@ type Response struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	IDToken      string `json:"id_token,omitempty"`
 	Scope        string `json:"scope,omitempty"`
+
+	// Subject is the users.id the tokens were issued for. It is empty for the
+	// client_credentials grant, where the token's sub is the client acting on its
+	// own behalf and no user account exists — so that grant produces an audit row
+	// with no subject and no security_event_ledger row, because there is nothing
+	// attributable to an account.
+	Subject string `json:"-"`
+	// ClientID is the OAuth client that received the grant.
+	ClientID string `json:"-"`
 }
 
 // Service implements the three grants against the pluggable stores.
@@ -296,6 +310,8 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 		RefreshToken: refreshToken,
 		IDToken:      idToken,
 		Scope:        data.Scope,
+		Subject:      data.UserID,
+		ClientID:     clientID,
 	}, nil
 }
 
@@ -371,6 +387,8 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 		ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
 		RefreshToken: newRefreshToken,
 		Scope:        data.Scope,
+		Subject:      data.UserID,
+		ClientID:     data.ClientID,
 	}, nil
 }
 
@@ -411,6 +429,8 @@ func (s *Service) exchangeClientCredentials(ctx context.Context, form url.Values
 		TokenType:   tokenType,
 		ExpiresIn:   int64(s.cfg.AccessTokenTTL.Seconds()),
 		Scope:       scope,
+		// Subject stays empty on purpose: see Response.Subject.
+		ClientID: client.ID,
 	}, nil
 }
 
