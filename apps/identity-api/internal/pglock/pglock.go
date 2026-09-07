@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -93,21 +94,24 @@ func (l *PgAdvisoryLocker) TryLock(ctx context.Context) (bool, func(), error) {
 		return false, nil, nil
 	}
 
+	var once sync.Once
 	release := func() {
-		// Unlock explicitly rather than relying on the connection closing: the
-		// connection goes back to the pool, where a session-scoped lock would
-		// otherwise persist. A background context is used so a cancelled run
-		// (SIGTERM) still releases.
-		unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
-		defer cancel()
-		if _, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", l.key); err != nil {
-			// Losing the connection also drops the lock, so this is reportable but
-			// not corrupting.
-			slog.Default().Error("pglock: release advisory lock",
-				slog.Int64("lock_key", l.key),
-				slog.String("error", err.Error()))
-		}
-		conn.Release()
+		once.Do(func() {
+			// Unlock explicitly rather than relying on the connection closing: the
+			// connection goes back to the pool, where a session-scoped lock would
+			// otherwise persist. A background context is used so a cancelled run
+			// (SIGTERM) still releases.
+			unlockCtx, cancel := context.WithTimeout(context.Background(), advisoryUnlockTimeout)
+			defer cancel()
+			if _, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", l.key); err != nil {
+				// Losing the connection also drops the lock, so this is reportable but
+				// not corrupting.
+				slog.Default().Error("pglock: release advisory lock",
+					slog.Int64("lock_key", l.key),
+					slog.String("error", err.Error()))
+			}
+			conn.Release()
+		})
 	}
 	return true, release, nil
 }
