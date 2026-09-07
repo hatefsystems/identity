@@ -204,7 +204,7 @@ type fakeMessageBatch struct {
 }
 
 func (b *fakeMessageBatch) Messages() <-chan jetstream.Msg { return b.msgs }
-func (b *fakeMessageBatch) Error() error                 { return b.err }
+func (b *fakeMessageBatch) Error() error                   { return b.err }
 
 type fakeFetcher struct {
 	batches []jetstream.MessageBatch
