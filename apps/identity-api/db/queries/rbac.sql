@@ -52,8 +52,8 @@ WHERE rp.role_id = $1
 ORDER BY p.id;
 
 -- name: AssignRoleToUser :exec
--- Super Admin only endpoint (api-design §1.7). Idempotent by design; every
--- assignment is additionally recorded in the immutable audit ledger.
+-- Controlled operator procedure only. Lock the affected account before changes
+-- and commit the role change and durable audit intent in the same transaction.
 INSERT INTO user_roles (user_id, role_id)
 VALUES ($1, $2)
 ON CONFLICT DO NOTHING;
@@ -88,7 +88,12 @@ SELECT EXISTS (
 -- Single-roundtrip RBAC evaluation for the gRPC CheckPermission RPC.
 SELECT EXISTS (
     SELECT 1 FROM user_roles ur
+    JOIN users u ON u.id = ur.user_id AND u.status = 'active' AND u.deleted_at IS NULL
     JOIN role_permissions rp ON rp.role_id = ur.role_id
     WHERE ur.user_id = $1
       AND rp.permission_id = $2
 ) AS has_permission;
+
+-- name: UserHasPrivilegedRole :one
+-- Any role membership protects the account, including operator-defined roles.
+SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1) AS has_role;

@@ -27,6 +27,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // Token type values (RFC 6749 §7.1 / RFC 9449 §5). A token confirmed to a DPoP
@@ -106,6 +107,7 @@ type Signer interface {
 
 // Config carries the tunable lifetimes for issued artifacts.
 type Config struct {
+	AccountState    session.AccountState
 	Issuer          string
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
@@ -187,6 +189,9 @@ func NewService(
 	if cfg.Issuer == "" {
 		return nil, errors.New("token: issuer is required")
 	}
+	if cfg.AccessTokenTTL > DefaultAccessTokenTTL || cfg.IDTokenTTL > DefaultIDTokenTTL {
+		return nil, errors.New("token: downstream JWT lifetime must not exceed ten minutes")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -208,6 +213,11 @@ func NewService(
 // authenticates and approves; integration tests call it directly. The raw
 // code is returned for delivery via redirect; only its hash is stored.
 func (s *Service) IssueCode(data AuthorizationCodeData) (string, error) {
+	return s.IssueCodeContext(context.Background(), data)
+}
+
+// IssueCodeContext requires the version captured by the authenticated session.
+func (s *Service) IssueCodeContext(ctx context.Context, data AuthorizationCodeData) (string, error) {
 	code, hash, err := NewSecret()
 	if err != nil {
 		return "", err
@@ -215,7 +225,16 @@ func (s *Service) IssueCode(data AuthorizationCodeData) (string, error) {
 	if data.ExpiresAt.IsZero() {
 		data.ExpiresAt = s.now().Add(s.cfg.CodeTTL)
 	}
-	if err := s.codes.Save(hash, data); err != nil {
+	persist := func() error { return s.codes.Save(hash, data) }
+	if s.cfg.AccountState != nil {
+		if !data.AuthVersionSet {
+			return "", session.ErrAccountIneligible
+		}
+		err = s.cfg.AccountState.WithActive(ctx, data.UserID, data.AuthVersion, persist)
+	} else {
+		err = persist()
+	}
+	if err != nil {
 		return "", fmt.Errorf("token: save authorization code: %w", err)
 	}
 	return code, nil
@@ -284,35 +303,37 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 		return nil, newError(ErrCodeInvalidGrant, "PKCE verification failed", 400)
 	}
 
-	now := s.now()
-	// Sender-constrain the access token to the client's DPoP key when the
-	// request carried a validated proof (RFC 9449 §5); otherwise Bearer.
-	jkt, tokenType := s.tokenBinding(ctx)
-	accessToken, err := s.signAccessToken(data.UserID, clientID, data.Scope, jkt, now)
-	if err != nil {
-		return nil, s.serverError("sign access token", err)
-	}
-	idToken, err := s.signIDToken(data.UserID, clientID, data.Nonce, now)
-	if err != nil {
-		return nil, s.serverError("sign id token", err)
-	}
+	return s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+		now := s.now()
+		// Sender-constrain the access token to the client's DPoP key when the
+		// request carried a validated proof (RFC 9449 §5); otherwise Bearer.
+		jkt, tokenType := s.tokenBinding(ctx)
+		accessToken, err := s.signAccessToken(data.UserID, clientID, data.Scope, jkt, now)
+		if err != nil {
+			return nil, s.serverError("sign access token", err)
+		}
+		idToken, err := s.signIDToken(data.UserID, clientID, data.Nonce, now)
+		if err != nil {
+			return nil, s.serverError("sign id token", err)
+		}
 
-	// Start a fresh refresh-token family for this grant/session.
-	refreshToken, err := s.issueRefreshToken(uuid.NewString(), data.UserID, clientID, data.Scope, now)
-	if err != nil {
-		return nil, s.serverError("issue refresh token", err)
-	}
+		// Start a fresh refresh-token family for this grant/session.
+		refreshToken, err := s.issueRefreshToken(uuid.NewString(), data.UserID, clientID, data.Scope, now, data.AuthVersion, data.AuthVersionSet)
+		if err != nil {
+			return nil, s.serverError("issue refresh token", err)
+		}
 
-	return &Response{
-		AccessToken:  accessToken,
-		TokenType:    tokenType,
-		ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
-		RefreshToken: refreshToken,
-		IDToken:      idToken,
-		Scope:        data.Scope,
-		Subject:      data.UserID,
-		ClientID:     clientID,
-	}, nil
+		return &Response{
+			AccessToken:  accessToken,
+			TokenType:    tokenType,
+			ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
+			RefreshToken: refreshToken,
+			IDToken:      idToken,
+			Scope:        data.Scope,
+			Subject:      data.UserID,
+			ClientID:     clientID,
+		}, nil
+	})
 }
 
 // exchangeRefreshToken implements Refresh Token Rotation with breach
@@ -364,32 +385,64 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 		return nil, s.serverError("refresh token state", fmt.Errorf("unknown status %q", data.Status))
 	}
 
-	// Rotate: retire the presented token first so a crash between the two
-	// writes can never leave two active tokens in the family.
-	if err := s.refresh.MarkRotated(hash); err != nil {
-		return nil, s.serverError("rotate refresh token", err)
-	}
+	return s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+		// Rotate: retire the presented token first so a crash between the two
+		// writes can never leave two active tokens in the family.
+		if err := s.refresh.MarkRotated(hash); err != nil {
+			if errors.Is(err, ErrRefreshTokenNotFound) {
+				s.triggerBreach(ctx, data)
+				return nil, newError(ErrCodeInvalidGrant, "invalid or consumed refresh token", 400)
+			}
+			return nil, s.serverError("rotate refresh token", err)
+		}
 
-	now := s.now()
-	newRefreshToken, err := s.issueRefreshToken(data.FamilyID, data.UserID, data.ClientID, data.Scope, now)
-	if err != nil {
-		return nil, s.serverError("issue rotated refresh token", err)
-	}
-	jkt, tokenType := s.tokenBinding(ctx)
-	accessToken, err := s.signAccessToken(data.UserID, data.ClientID, data.Scope, jkt, now)
-	if err != nil {
-		return nil, s.serverError("sign access token", err)
-	}
+		now := s.now()
+		newRefreshToken, err := s.issueRefreshToken(data.FamilyID, data.UserID, data.ClientID, data.Scope, now, data.AuthVersion, data.AuthVersionSet)
+		if err != nil {
+			return nil, s.serverError("issue rotated refresh token", err)
+		}
+		jkt, tokenType := s.tokenBinding(ctx)
+		accessToken, err := s.signAccessToken(data.UserID, data.ClientID, data.Scope, jkt, now)
+		if err != nil {
+			return nil, s.serverError("sign access token", err)
+		}
 
-	return &Response{
-		AccessToken:  accessToken,
-		TokenType:    tokenType,
-		ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
-		RefreshToken: newRefreshToken,
-		Scope:        data.Scope,
-		Subject:      data.UserID,
-		ClientID:     data.ClientID,
-	}, nil
+		return &Response{
+			AccessToken:  accessToken,
+			TokenType:    tokenType,
+			ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
+			RefreshToken: newRefreshToken,
+			Scope:        data.Scope,
+			Subject:      data.UserID,
+			ClientID:     data.ClientID,
+		}, nil
+	})
+}
+
+func (s *Service) withAccount(ctx context.Context, userID string, version int64, captured bool, issue func() (*Response, error)) (*Response, error) {
+	if s.cfg.AccountState == nil {
+		return issue()
+	}
+	if !captured {
+		return nil, newError(ErrCodeInvalidGrant, "account authentication is no longer valid", 400)
+	}
+	var response *Response
+	err := s.cfg.AccountState.WithActive(ctx, userID, version, func() error {
+		var err error
+		response, err = issue()
+		return err
+	})
+	if errors.Is(err, session.ErrAccountIneligible) {
+		return nil, newError(ErrCodeInvalidGrant, "account authentication is no longer valid", 400)
+	}
+	if err != nil {
+		var oauthErr *Error
+		if errors.As(err, &oauthErr) {
+			return nil, err
+		}
+		return nil, s.serverError("account state", err)
+	}
+	return response, nil
 }
 
 // exchangeClientCredentials implements the client_credentials grant for
@@ -453,18 +506,20 @@ func (s *Service) triggerBreach(ctx context.Context, data RefreshTokenData) {
 }
 
 // issueRefreshToken mints and stores a new active refresh token in familyID.
-func (s *Service) issueRefreshToken(familyID, userID, clientID, scope string, now time.Time) (string, error) {
+func (s *Service) issueRefreshToken(familyID, userID, clientID, scope string, now time.Time, version int64, captured bool) (string, error) {
 	tokenValue, hash, err := NewSecret()
 	if err != nil {
 		return "", err
 	}
 	err = s.refresh.Save(hash, RefreshTokenData{
-		FamilyID:  familyID,
-		UserID:    userID,
-		ClientID:  clientID,
-		Scope:     scope,
-		Status:    StatusActive,
-		ExpiresAt: now.Add(s.cfg.RefreshTokenTTL),
+		AuthVersion:    version,
+		AuthVersionSet: captured,
+		FamilyID:       familyID,
+		UserID:         userID,
+		ClientID:       clientID,
+		Scope:          scope,
+		Status:         StatusActive,
+		ExpiresAt:      now.Add(s.cfg.RefreshTokenTTL),
 	})
 	if err != nil {
 		return "", fmt.Errorf("token: save refresh token: %w", err)

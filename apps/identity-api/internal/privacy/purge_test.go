@@ -34,13 +34,14 @@ type fakePurgeWorld struct {
 	outbox []db.EnqueueOutboxEventParams
 
 	// Injectable faults.
-	listErr    error
-	lockErr    error
-	holdErr    error
-	deleteErr  error
-	enqueueErr error
-	beginErr   error
-	commitErr  error
+	listErr        error
+	lockErr        error
+	holdErr        error
+	deleteErr      error
+	enqueueErr     error
+	beginErr       error
+	commitErr      error
+	accountLockErr error
 	// failFor scopes lockErr/holdErr/deleteErr/commitErr to one subject, so batch
 	// isolation can be asserted.
 	failFor *uuid.UUID
@@ -126,11 +127,12 @@ func (w *fakePurgeWorld) ListUsersDueForHardDelete(_ context.Context, arg db.Lis
 			due = append(due, row{id: id, deletedAt: u.DeletedAt.Time})
 		}
 	}
-	// ORDER BY deleted_at, with the id as a tiebreak so the batch is deterministic.
+	// Unheld candidates first so held oldest rows cannot monopolize the batch.
 	for i := 1; i < len(due); i++ {
 		for j := i; j > 0; j-- {
-			if due[j].deletedAt.Before(due[j-1].deletedAt) ||
-				(due[j].deletedAt.Equal(due[j-1].deletedAt) && due[j].id.String() < due[j-1].id.String()) {
+			leftHeld, rightHeld := w.holds[due[j].id], w.holds[due[j-1].id]
+			if (!leftHeld && rightHeld) || (leftHeld == rightHeld && (due[j].deletedAt.Before(due[j-1].deletedAt) ||
+				(due[j].deletedAt.Equal(due[j-1].deletedAt) && due[j].id.String() < due[j-1].id.String()))) {
 				due[j], due[j-1] = due[j-1], due[j]
 				continue
 			}
@@ -180,19 +182,31 @@ func (w *fakePurgeWorld) BeginSubject(context.Context) (SubjectTx, error) {
 
 // fakePurgeTx buffers one subject's mutations until Commit.
 type fakePurgeTx struct {
-	w       *fakePurgeWorld
-	deletes []uuid.UUID
-	events  []db.EnqueueOutboxEventParams
-	closed  bool
+	w             *fakePurgeWorld
+	deletes       []uuid.UUID
+	events        []db.EnqueueOutboxEventParams
+	closed        bool
+	accountLocked uuid.UUID
 }
 
 func (t *fakePurgeTx) Store() PurgeStore { return t }
+
+func (t *fakePurgeTx) LockAccount(_ context.Context, account uuid.UUID) error {
+	if t.w.accountLockErr != nil {
+		return t.w.accountLockErr
+	}
+	t.accountLocked = account
+	return nil
+}
 
 func (t *fakePurgeTx) ListUsersDueForHardDelete(ctx context.Context, arg db.ListUsersDueForHardDeleteParams) ([]uuid.UUID, error) {
 	return t.w.ListUsersDueForHardDelete(ctx, arg)
 }
 
 func (t *fakePurgeTx) GetUserForUpdateIncludingDeleted(_ context.Context, id uuid.UUID) (db.User, error) {
+	if t.accountLocked != id {
+		return db.User{}, errors.New("account lock must precede user read")
+	}
 	t.w.mu.Lock()
 	defer t.w.mu.Unlock()
 	if t.w.lockErr != nil && t.w.shouldFail(id) {

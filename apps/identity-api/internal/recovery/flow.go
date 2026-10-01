@@ -117,26 +117,33 @@ func (s *FlowService) Start(ctx context.Context, email string) (*StartResult, er
 // A wrong code therefore cannot be retried under the same transaction, and
 // concurrent submissions have exactly one database candidate.
 func (s *FlowService) Verify(ctx context.Context, transactionID, code, clientIP string) (uuid.UUID, error) {
+	id, _, err := s.VerifyWithVersion(ctx, transactionID, code, clientIP)
+	return id, err
+}
+
+// VerifyWithVersion binds the restricted session to the consumed proof's state.
+func (s *FlowService) VerifyWithVersion(ctx context.Context, transactionID, code, clientIP string) (uuid.UUID, int64, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(transactionID)
 	if err != nil || len(raw) != recoveryTransactionBytes {
-		return uuid.Nil, ErrInvalidCode
+		return uuid.Nil, 0, ErrInvalidCode
 	}
 	userID, err := s.transactions.Take(ctx, hashTransactionToken(transactionID))
 	if err != nil {
 		if errors.Is(err, errTransactionNotFound) {
-			return uuid.Nil, ErrInvalidCode
+			return uuid.Nil, 0, ErrInvalidCode
 		}
-		return uuid.Nil, fmt.Errorf("recovery: consume transaction: %w", err)
+		return uuid.Nil, 0, fmt.Errorf("recovery: consume transaction: %w", err)
 	}
-	if err := s.codes.Verify(ctx, userID, code, clientIP); err != nil {
+	version, err := s.codes.VerifyWithVersion(ctx, userID, code, clientIP)
+	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidCode), errors.Is(err, ErrUserNotFound), errors.Is(err, ErrAccountNotActive):
-			return uuid.Nil, ErrInvalidCode
+			return uuid.Nil, 0, ErrInvalidCode
 		default:
-			return uuid.Nil, err
+			return uuid.Nil, 0, err
 		}
 	}
-	return userID, nil
+	return userID, version, nil
 }
 
 func hashTransactionToken(token string) string {

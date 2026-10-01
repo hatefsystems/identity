@@ -48,6 +48,14 @@ LIMIT 1;
 SELECT id FROM mvp_audit_logs
 WHERE id = ANY(sqlc.arg('ids')::uuid[]);
 
+-- name: LockAuditSubjects :many
+-- Hold live subjects against deletion until COPY commits. Missing subjects are
+-- intentionally absent from the result and must be inserted with a NULL user_id.
+SELECT id FROM users
+WHERE id = ANY(sqlc.arg('ids')::uuid[])
+ORDER BY id
+FOR KEY SHARE;
+
 -- name: ListAuditLogs :many
 -- DPO/Admin query (api-design §1.7): start/end time bounds are mandatory to
 -- prevent unbounded DoS scans; results include chain_hash for client-side
@@ -74,5 +82,43 @@ WHERE timestamp >= sqlc.arg('start_time')
 -- reporting an intact chain for a table it never read.
 SELECT * FROM mvp_audit_logs
 WHERE seq > sqlc.arg('after_seq')::bigint
+  AND seq <= sqlc.arg('through_seq')::bigint
 ORDER BY seq
 LIMIT sqlc.arg('page_limit');
+
+-- name: GetAuditLogHighWaterSeq :one
+SELECT COALESCE(MAX(seq), 0)::bigint FROM mvp_audit_logs;
+
+-- name: GetAuditLogChainHashBySeq :one
+-- Task 5.3: seeds a *resumed* chain verification (GET /admin/audit-logs/verify
+-- with after_seq > 0) by returning the predecessor digest at exactly that seq.
+--
+-- The equality match is load-bearing. seq gaps are legal and meaningless (see
+-- the header comment): a rolled-back batch consumes sequence values without
+-- leaving rows. Approximating this with "the first row at or after N" would, on
+-- a gap, silently return a *later* row and hand verification the wrong
+-- predecessor — reporting tampering across an intact chain. No rows means the
+-- caller named a seq that does not exist, which is a bad request, not a break.
+SELECT chain_hash FROM mvp_audit_logs
+WHERE seq = sqlc.arg('seq')::bigint;
+
+-- name: ListAuditLogsPage :one
+-- Count and page share one statement snapshot, including an empty late page.
+WITH matching AS MATERIALIZED (
+    SELECT * FROM mvp_audit_logs
+    WHERE timestamp >= sqlc.arg('start_time')
+      AND timestamp <= sqlc.arg('end_time')
+      AND (sqlc.narg('event_type')::varchar IS NULL OR event_type = sqlc.narg('event_type')::varchar)
+), page AS (
+    SELECT * FROM matching
+    ORDER BY timestamp DESC, id DESC
+    LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset')
+)
+SELECT (SELECT COUNT(*) FROM matching)::bigint AS total,
+       COALESCE((SELECT jsonb_agg(jsonb_build_object(
+           'id', id, 'user_id', user_id, 'actor_id', actor_id,
+           'actor_spiffe_id', actor_spiffe_id, 'event_type', event_type,
+           'action_status', action_status, 'client_ip', client_ip,
+           'user_agent', user_agent, 'payload', payload, 'timestamp', timestamp,
+           'sha256_chain_hash', chain_hash, 'seq', seq
+       ) ORDER BY timestamp DESC, id DESC) FROM page), '[]'::jsonb)::jsonb AS items;

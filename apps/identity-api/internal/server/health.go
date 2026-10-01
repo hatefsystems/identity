@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -30,11 +31,22 @@ func (s *Server) handleLiveness() http.HandlerFunc {
 }
 
 // handleReadiness reports whether the service is ready to accept requests.
-// At this scaffolding stage there are no backing dependencies (PostgreSQL,
-// Redis, NATS) wired in yet, so it mirrors the liveness result. Dependency
-// checks will be added here as those integrations land in later tasks.
+// Enabled admin capabilities require their gates and live dependency probe.
 func (s *Server) handleReadiness() http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.Admin.Enabled {
+			ready := s.deps.AdminActions != nil && s.deps.AdminStore != nil && s.deps.RBAC != nil &&
+				s.deps.AdminLimiter != nil && s.deps.SessionManager != nil && s.deps.LegalHold != nil && s.deps.AdminReady != nil
+			if ready {
+				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+				ready = s.deps.AdminReady(ctx) == nil
+				cancel()
+			}
+			if !ready {
+				writeJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "not_ready", Service: serviceName, Time: time.Now().UTC().Format(time.RFC3339)})
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, healthResponse{
 			Status:  "ready",
 			Service: serviceName,

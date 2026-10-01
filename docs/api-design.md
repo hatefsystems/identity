@@ -108,23 +108,31 @@ To prevent fake account creation (e.g., for the Email Service), the platform use
 - `POST /api/v1/auth/password-reset/confirm`: Confirms the new password securely.
 
 ### 1.7 Admin & Moderation API
-Protected by strict RBAC. Accessed only by authorized Admin/Moderator roles.
-- `GET /api/v1/admin/users`: List users (with pagination and filtering).
-- `GET /api/v1/admin/users/{user_id}`: View detailed account status.
-- `POST /api/v1/admin/users/{user_id}/trigger-reset`: Send a password reset email to the user (Helpdesk/Support capability).
-- `PATCH /api/v1/admin/users/{user_id}/status`: Change account status (Active, Suspended, Banned). *Note: Hard delete is not available.*
-- `POST /api/v1/admin/roles/assign`: Assign a role (e.g., Moderator, DPO) to a user (Super Admin only).
-- `GET /api/v1/admin/audit-logs`: Query system audit logs. **(MVP Fallback: During the MVP phase, queries are executed against the `mvp_audit_logs` table in PostgreSQL. Post-MVP, this is migrated to ClickHouse without API changes).** Requires mandatory query parameters `start_time` and `end_time` (Unix timestamp or RFC 3339) to restrict query limits and prevent Denial of Service (DoS) overhead. Returns a JSON list of immutable audit events, including the cryptographic chaining hash (`sha256_chain_hash`) of each row to allow client-side validation of the integrity and ordering of the logs.
 
-#### Legal Hold & Preservation (DPO / Legal role only)
-Endpoints supporting lawful-request handling. A Legal Hold is a **precedence lock** over all retention timers (holds > retention): while active, it prevents both the 30-day hard-delete Cron and the `security_event_ledger` purge from removing the subject's data. See `compliance-and-data-governance.md` and the `legal_holds` / `security_event_ledger` schemas in `data-architecture.md`.
-- `POST /api/v1/admin/legal-holds`: Apply a Legal Hold on a subject (`account_ref`). Body requires `reason`, `requesting_authority` (court/agency/case reference), and `legal_basis`. Every application is audit-logged. A hold has no time cap and stays until explicitly released.
-- `GET /api/v1/admin/legal-holds`: List active/historical holds (with pagination and filtering by `account_ref` or status).
-- `DELETE /api/v1/admin/legal-holds/{hold_id}`: Release a Legal Hold. Sets `is_active = false` and records `released_by`/`released_at`. Released data returns to normal retention timers and is purged on the next cycle if already past its window.
-- `POST /api/v1/admin/preservation-requests`: Record a preservation ("freeze-before-order") request and immediately apply a Legal Hold on the target `account_ref`, freezing the subject's data before a full order arrives. Body requires `requesting_authority`, `reason`, and optional `expires_at` (advisory review date). *Note: preservation cannot resurrect data already hard-deleted; it only prevents future purge of data still present.*
-- `GET /api/v1/admin/legal-inquiry/lookup`: Attribution lookup. Given an identity value provided by an authority, the server computes the blind index and returns matching `security_event_ledger` rows (non-PII metadata) within the retention window. Read-only; the lookup itself is audit-logged.
+Admin routes require an active, non-deleted account, an authenticated cookie session, and live database permissions. Recovery-enrollment sessions cannot access them. Unsafe methods require an exact configured `Origin`; mutations and legal attribution additionally consume a single-use, session-bound step-up grant **after** permission checks. All responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
 
----
+| Route under `/api/v1/admin` | Seeded role | Contract |
+|---|---|---|
+| `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
+| `POST /users/lookup` | Moderator | Exact normalized email in JSON `{email}`. Legacy `GET /users?email=...` is rejected. |
+| `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason}`; active/suspended/banned only, no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. |
+| `GET /audit-logs` | DPO | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes. |
+| `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin | Content-free verification; no actors, network data, payloads or account data. |
+| `POST /legal-holds` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional advisory `review_at`; UUID `Idempotency-Key` header. |
+| `GET /legal-holds` | DPO | Optional `account_ref`; `status=active|released|all`; true snapshot total. |
+| `DELETE /legal-holds/{hold_id}` | DPO + step-up | Releases only that request; 204 for release or already released, 404 for unknown ID. |
+| `POST /preservation-requests` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`; optional advisory `expires_at`; UUID `Idempotency-Key`. Atomically records a hold and observed evidence presence even without a live account. |
+| `POST /legal-inquiry/lookup` | DPO + step-up | JSON identifier/type (`email` only), authority/case context, time bounds, optional fields and cursor. Requires a verified signer fixture before mounting. No GET alias. |
+
+Offset lists use `{items,total,limit,offset}` with default 50 and maximum 200. Lists and counts share a statement snapshot; empty items are `[]`. Attribution uses `{items,next_cursor,coverage}`, a fixed high-water bound, and a fresh retention/hold check on every page. Empty results mean no matching **indexed, eligible records in that scope**, not proof of no activity. Default fields are record/account references, event type, timestamps and hash; network/client/device fields require explicit selection and case purpose. Phone attribution returns `400 unsupported_identifier_type`.
+
+Independent requests may protect the same account. New requests return 201; matching retries return 200 with `replayed=true` and current state. Reusing a key with different inputs returns 409. Replaying a released request cannot reactivate it. Advisory dates never release a hold. Release resumes original retention clocks; preservation neither restores purged data nor creates an immutable snapshot.
+
+Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together. Audit storage failure returns `503 audit_unavailable`; an unavailable store cannot guarantee durable recording of that rejected attempt. An acknowledged outbox worker delivers Class C intent to the signer. Ordinary security-event recording retains its existing best-effort transport.
+
+Verification defaults to 1,000 records (maximum 5,000), captures `through_seq`, and resumes with `after_seq`, that fixed bound, and optional `predecessor_hash`. It reports the seed, checked range, completion, next cursor and first mismatch. Valid sequence allocation gaps are allowed. It proves only the stored segment relative to its seed; it does not prove complete ingestion, absence of tail truncation, or authenticity without an external anchor. Hashes in a filtered audit list do not form a contiguous-chain proof.
+
+HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate stateful credentials across instances; previously issued downstream JWTs retain at most their configured 10-minute lifetime. Reactivation does not revive old credentials or prevent re-registration.
 
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.

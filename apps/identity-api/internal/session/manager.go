@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,8 +20,9 @@ import (
 // invariants (see NewCookieCodec) and the TTL policy are validated once at
 // startup.
 type Manager struct {
-	store  Store
-	cookie *CookieCodec
+	store    Store
+	accounts AccountState
+	cookie   *CookieCodec
 	// absoluteTTL is the hard ceiling on a session's lifetime; it is fixed at
 	// creation and never extended.
 	absoluteTTL time.Duration
@@ -34,6 +36,8 @@ type Manager struct {
 
 // ManagerConfig configures a Manager's lifetime policy.
 type ManagerConfig struct {
+	// AccountState is mandatory in a DB-backed runtime; nil is for isolated tests.
+	AccountState AccountState
 	// AbsoluteTTL is the maximum lifetime of a session regardless of activity.
 	AbsoluteTTL time.Duration
 	// IdleTTL is the inactivity window after which a session lapses. It must
@@ -45,6 +49,8 @@ type ManagerConfig struct {
 // into a new session. UserID is required; the rest are best-effort audit
 // context sourced from the request.
 type IssueParams struct {
+	AuthVersion    int64
+	AuthVersionSet bool
 	// UserID is the authenticated subject the session belongs to (required).
 	UserID string
 	// IP is the client source address at authentication time.
@@ -88,6 +94,7 @@ func NewManager(store Store, cookie *CookieCodec, cfg ManagerConfig) (*Manager, 
 	}
 	return &Manager{
 		store:       store,
+		accounts:    cfg.AccountState,
 		cookie:      cookie,
 		absoluteTTL: cfg.AbsoluteTTL,
 		idleTTL:     cfg.IdleTTL,
@@ -100,6 +107,12 @@ func NewManager(store Store, cookie *CookieCodec, cfg ManagerConfig) (*Manager, 
 // the caller can surface its public ID. The raw token exists only long enough
 // to be written into the cookie; it is never returned or logged.
 func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
+	return m.IssueContext(context.Background(), w, p)
+}
+
+// IssueContext preserves the version earned by authentication and serializes
+// final issuance with account transitions. No cookie is sent on DB failure.
+func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p IssueParams) (Session, error) {
 	if p.UserID == "" {
 		return Session{}, ErrMissingUserID
 	}
@@ -133,6 +146,8 @@ func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
 	}
 
 	s := Session{
+		AuthVersion:    p.AuthVersion,
+		AuthVersionSet: p.AuthVersionSet,
 		ID:             uuid.NewString(),
 		Kind:           kind,
 		UserID:         p.UserID,
@@ -145,7 +160,16 @@ func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
 		IdleExpiry:     idleExpiry,
 	}
 
-	if err := m.store.Create(hash, s); err != nil {
+	persist := func() error { return m.store.Create(hash, s) }
+	if m.accounts != nil {
+		if !p.AuthVersionSet {
+			return Session{}, ErrAccountIneligible
+		}
+		err = m.accounts.WithActive(ctx, p.UserID, p.AuthVersion, persist)
+	} else {
+		err = persist()
+	}
+	if err != nil {
 		return Session{}, fmt.Errorf("session: persist: %w", err)
 	}
 
@@ -168,6 +192,17 @@ func (m *Manager) Authenticate(r *http.Request) (Session, error) {
 	s, err := m.store.Get(hash)
 	if err != nil {
 		return Session{}, err
+	}
+	if s.Kind != KindAuthenticated && s.Kind != KindRecoveryEnrollment {
+		return Session{}, ErrSessionNotFound
+	}
+	if m.accounts != nil {
+		if !s.AuthVersionSet {
+			return Session{}, ErrAccountIneligible
+		}
+		if err := m.accounts.Validate(r.Context(), s.UserID, s.AuthVersion); err != nil {
+			return Session{}, err
+		}
 	}
 
 	// Slide the idle window forward, clamped to the absolute ceiling.

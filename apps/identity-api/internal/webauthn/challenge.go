@@ -91,6 +91,10 @@ func (f Flow) String() string {
 // Finish step can load the account and issue a session without re-deriving it
 // from the anonymised handle.
 type PendingChallenge struct {
+	// Named ceremonies pin a version; usernameless ceremonies pin a global
+	// epoch so a ban/reactivation during the challenge cannot be overlooked.
+	AuthVersion int64
+	AuthEpoch   int64
 	// Session is the go-webauthn SessionData produced by BeginRegistration /
 	// BeginLogin and required verbatim by CreateCredential / ValidateLogin.
 	Session gowebauthn.SessionData

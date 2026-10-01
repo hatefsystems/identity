@@ -59,6 +59,8 @@ const integrationTimeout = 2 * time.Minute
 // the cutoff by choosing deleted_at, without waiting.
 const testGracePeriod = time.Hour
 
+func legalFixtureString(value string) *string { return &value }
+
 // openTestPool applies the embedded migrations and returns a connection pool.
 //
 // MaxConns is raised because the concurrency test needs several simultaneous
@@ -462,9 +464,9 @@ func TestIntegrationLegalHoldBlocksPurge(t *testing.T) {
 
 	hold, err := env.queries.ApplyLegalHold(ctx, db.ApplyLegalHoldParams{
 		AccountRef:          user.ID,
-		Reason:              "integration test",
-		RequestingAuthority: "test-court",
-		LegalBasis:          "legal obligation",
+		Reason:              legalFixtureString("integration test"),
+		RequestingAuthority: legalFixtureString("test-court"),
+		LegalBasis:          legalFixtureString("legal obligation"),
 		AppliedBy:           uuid.New(),
 	})
 	if err != nil {
@@ -532,9 +534,9 @@ func TestIntegrationHardDeleteQueryRefusesHeldSubject(t *testing.T) {
 
 	hold, err := q.ApplyLegalHold(ctx, db.ApplyLegalHoldParams{
 		AccountRef:          user.ID,
-		Reason:              "toctou test",
-		RequestingAuthority: "test-court",
-		LegalBasis:          "legal obligation",
+		Reason:              legalFixtureString("toctou test"),
+		RequestingAuthority: legalFixtureString("test-court"),
+		LegalBasis:          legalFixtureString("legal obligation"),
 		AppliedBy:           uuid.New(),
 	})
 	if err != nil {

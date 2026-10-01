@@ -26,6 +26,8 @@ The API trusts `X-Forwarded-For` only when its immediate socket peer is listed i
 Below is the production-ready Nginx configuration file (`/etc/nginx/sites-available/identity.hatef.ir`) for the MVP:
 
 ```nginx
+# http{} scope: constant route template, never request URI/query/referrer/headers.
+log_format admin_safe '$request_method /api/v1/admin/* $status $request_time';
 server {
     listen 443 ssl http2;
     server_name identity.hatef.ir;
@@ -69,6 +71,18 @@ server {
 
     location = /oauth2/error {
         proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Admin prefix wins over the general API regex, including rejected legacy GETs.
+    location ^~ /api/v1/admin {
+        access_log /var/log/nginx/admin-access.log admin_safe;
+        # Nginx error records can embed raw URLs; use sanitized API diagnostics.
+        error_log /dev/null crit;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -347,3 +361,7 @@ groups:
           summary: "Database connection pool utilization is critically high"
           description: "Active database connections are over 90% of pool limits, risking query queuing and increased request latencies."
 ```
+
+### Admin deployment gate
+
+Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including role separation, approved retention, encrypted backfill, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.

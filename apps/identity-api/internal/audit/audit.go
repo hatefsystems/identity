@@ -78,9 +78,9 @@ const (
 	// EventWebAuthnCredentialRegistered records a new passkey bound to an account.
 	// Adding an authenticator is a permanent expansion of who can log in, so it is
 	// ledgered.
-	EventWebAuthnCredentialRegistered = "auth.webauthn.credential.registered"
+	EventWebAuthnCredentialRegistered = "auth.webauthn.credential.registered" // #nosec G101 -- Public event name, not a credential.
 	// EventWebAuthnCredentialDeleted records a passkey removal.
-	EventWebAuthnCredentialDeleted = "auth.webauthn.credential.deleted"
+	EventWebAuthnCredentialDeleted = "auth.webauthn.credential.deleted" // #nosec G101 -- Public event name, not a credential.
 
 	// EventMFATOTPEnabled records enrolment completion: TOTP is now required.
 	EventMFATOTPEnabled = "auth.mfa.totp.enabled"
@@ -118,9 +118,9 @@ const (
 	// EventTokenIssued records a successful token grant. Ledgered because
 	// "which client held which scopes for this account, and when" is exactly the
 	// question a lawful inquiry asks (threat-modeling.md R2).
-	EventTokenIssued = "oauth.token.issued"
+	EventTokenIssued = "oauth.token.issued" // #nosec G101 -- Public event name, not a credential.
 	// EventTokenDenied records a rejected token request.
-	EventTokenDenied = "oauth.token.denied"
+	EventTokenDenied = "oauth.token.denied" // #nosec G101 -- Public event name, not a credential.
 
 	// EventRTRBreach records a refresh-token-rotation replay: a used refresh token
 	// was presented again, which means it leaked. The whole family is revoked.
@@ -134,6 +134,58 @@ const (
 	// then discards the original, so the loss is itself in the tamper-evident log
 	// rather than being a silent gap.
 	EventPipelineUndecodable = "audit.pipeline.undecodable"
+)
+
+// Event types emitted by the administrative and lawful-request surfaces
+// (Task 5.3, docs/api-design.md §1.7).
+//
+// Every one of these is Class C — administrative and lawful-request handling
+// (docs/compliance-and-data-governance.md §8). None of them may ever be added
+// to LedgerEventTypes, and TestAdminAndLegalEventsAreNeverLedgered enforces
+// that. The reason is structural rather than stylistic:
+// security_event_ledger.account_ref is the *subject* of an event, but for these
+// events the account that matters is the *actor* — the administrator. Ledgering
+// one would file an admin's action under the subject's attribution history and
+// let it survive that subject's erasure, which is precisely backwards.
+//
+// Payloads carry only opaque action/hold references, outcomes, status changes,
+// and bounded disclosure scope. Legal narratives belong in restricted encrypted
+// context, not here. Raw identities and reusable identity blind indexes must
+// never enter these long-lived Class C payloads.
+const (
+	// EventAdminUserStatusChanged records a moderator moving an account between
+	// active, suspended, and banned.
+	EventAdminUserStatusChanged = "admin.user.status_changed"
+	// EventAdminRoleAssigned records a role grant. This is privilege escalation
+	// by definition and is the event most worth alerting on.
+	EventAdminRoleAssigned = "admin.role.assigned"
+	// EventAdminAuditLogsQueried records a DPO reading the audit
+	// log. Reading the tamper-evident log is itself an auditable act; without
+	// this, the one surface that observes everything would observe nothing about
+	// its own use.
+	EventAdminAuditLogsQueried = "admin.audit_logs.queried"
+	// EventAdminChainVerified records a chain-verification run. It must carry
+	// verified, checked, and broken_at_seq: a detected break is the single
+	// highest-severity signal this system produces, and it belongs in the
+	// tamper-evident log itself rather than only in an HTTP response the caller
+	// is free to discard.
+	EventAdminChainVerified = "admin.chain.verified"
+	// EventAdminAccessDenied records a rejected authorization check on an admin
+	// route. Raised by rbac.RequirePermission on every 403; it is the tripwire
+	// for a compromised or over-curious admin account.
+	EventAdminAccessDenied = "admin.access.denied"
+
+	// EventLegalHoldApplied records a Legal Hold being placed on an account_ref.
+	EventLegalHoldApplied = "legal.hold.applied"
+	// EventLegalHoldReleased records a hold being lifted, which re-exposes the
+	// subject to every retention timer the hold was suspending.
+	EventLegalHoldReleased = "legal.hold.released"
+	// EventLegalPreservationRecorded records a freeze-before-order preservation
+	// request (compliance §8), implemented as an immediate hold.
+	EventLegalPreservationRecorded = "legal.preservation.recorded"
+	// EventLegalInquiryLookup records a blind-index attribution lookup. The
+	// payload carries bounded disclosure scope, never the identifier or index.
+	EventLegalInquiryLookup = "legal.inquiry.lookup"
 )
 
 // LedgerEventTypes is the declared set of event types that MUST carry
@@ -210,9 +262,9 @@ const APIActorSPIFFEID = "system://identity/identity-api"
 // well-known Payload keys: a typo in a map key would silently destroy attribution
 // evidence with no compile-time signal.
 //
-// It must never carry raw PII. identity_blind_index is derived by the signing
-// consumer from AccountRef, so the blind-index pepper stays in one process and no
-// email or phone number ever crosses the message bus.
+// It must never carry raw PII. The producer captures identity_blind_index before
+// asynchronous publication while attribution material is available. The signer
+// retains live-account lookup only for older queued envelopes and degraded capture.
 type SecurityContext struct {
 	// AccountRef is the subject of the event and is always users.id (tasks.md:54).
 	// It is required: security_event_ledger.account_ref is NOT NULL, and it is the
@@ -225,6 +277,8 @@ type SecurityContext struct {
 	Scope string
 	// DeviceFingerprint is the caller-supplied device identifier, when present.
 	DeviceFingerprint string
+	// IdentityBlindIndex is captured synchronously, never copied to Payload.
+	IdentityBlindIndex *string
 }
 
 // Event is one security-relevant occurrence, shaped to match the columns of

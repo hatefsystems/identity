@@ -16,6 +16,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -66,6 +67,9 @@ func (s *Service) Challenge(ctx context.Context, userID uuid.UUID, sessionID str
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkSessionVersion(ctx, user, sessionID); err != nil {
+		return nil, err
+	}
 
 	result := &ChallengeResult{Methods: make([]string, 0, 2)}
 
@@ -75,11 +79,13 @@ func (s *Service) Challenge(ctx context.Context, userID uuid.UUID, sessionID str
 		case err == nil:
 			result.Methods = append(result.Methods, MethodWebAuthn)
 			result.WebAuthn = options
-		case errors.Is(err, webauthn.ErrNoCredentials),
-			errors.Is(err, webauthn.ErrUserNotFound),
-			errors.Is(err, webauthn.ErrAccountNotActive):
+		case errors.Is(err, webauthn.ErrNoCredentials):
 			// The account simply has no passkey to assert; fall through to the
 			// TOTP option rather than failing the whole challenge.
+		case errors.Is(err, webauthn.ErrUserNotFound):
+			return nil, ErrUserNotFound
+		case errors.Is(err, webauthn.ErrAccountNotActive):
+			return nil, ErrAccountNotActive
 		default:
 			return nil, fmt.Errorf("stepup: begin passkey challenge: %w", err)
 		}
@@ -101,7 +107,11 @@ func (s *Service) Verify(ctx context.Context, p VerifyParams) (string, time.Time
 	if p.SessionID == "" {
 		return "", time.Time{}, errors.New("stepup: session id is required")
 	}
-	if _, err := s.loadActiveUser(ctx, p.UserID); err != nil {
+	user, err := s.loadActiveUser(ctx, p.UserID)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if err := s.checkSessionVersion(ctx, user, p.SessionID); err != nil {
 		return "", time.Time{}, err
 	}
 
@@ -134,11 +144,13 @@ func (s *Service) Verify(ctx context.Context, p VerifyParams) (string, time.Time
 		return "", time.Time{}, fmt.Errorf("%w: %q", ErrUnsupportedMethod, p.Method)
 	}
 
-	return s.Mint(MintParams{
-		UserID:    p.UserID.String(),
-		SessionID: p.SessionID,
-		AMR:       amr,
-		DPoPJKT:   p.DPoPJKT,
+	return s.MintContext(ctx, MintParams{
+		AuthVersion:    user.AuthVersion,
+		AuthVersionSet: true,
+		UserID:         p.UserID.String(),
+		SessionID:      p.SessionID,
+		AMR:            amr,
+		DPoPJKT:        p.DPoPJKT,
 	})
 }
 
@@ -234,6 +246,17 @@ func (s *Service) loadActiveUser(ctx context.Context, userID uuid.UUID) (db.User
 		return db.User{}, ErrAccountNotActive
 	}
 	return user, nil
+}
+
+func (s *Service) checkSessionVersion(ctx context.Context, user db.User, sessionID string) error {
+	if s.accounts == nil {
+		return nil
+	}
+	current, ok := session.FromContext(ctx)
+	if !ok || current.Kind != session.KindAuthenticated || !current.AuthVersionSet || current.UserID != user.ID.String() || current.ID != sessionID || current.AuthVersion != user.AuthVersion {
+		return ErrAccountNotActive
+	}
+	return nil
 }
 
 // statusActive is the only users.status value permitted to raise its

@@ -15,6 +15,7 @@ import (
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // BeginRegistration starts an attestation ceremony for an already-authenticated
@@ -50,6 +51,9 @@ func (s *Service) beginRegistration(ctx context.Context, userID uuid.UUID, sessi
 	}
 	if !isLoginEligible(user.Status) {
 		return nil, ErrAccountNotActive
+	}
+	if err := s.checkSessionVersion(ctx, user); err != nil {
+		return nil, err
 	}
 
 	// Reuse the persisted handle so every credential of an account signs over
@@ -87,11 +91,12 @@ func (s *Service) beginRegistration(ctx context.Context, userID uuid.UUID, sessi
 	}
 
 	if err := s.challenges.Save(session.Challenge, PendingChallenge{
-		Session:   *session,
-		UserRef:   user.ID,
-		SessionID: sessionID,
-		Flow:      flow,
-		Expires:   s.now().Add(s.challengeTTL),
+		AuthVersion: user.AuthVersion,
+		Session:     *session,
+		UserRef:     user.ID,
+		SessionID:   sessionID,
+		Flow:        flow,
+		Expires:     s.now().Add(s.challengeTTL),
 	}); err != nil {
 		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
 	}
@@ -137,7 +142,7 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 		}
 		return db.WebauthnCredential{}, fmt.Errorf("webauthn: load user: %w", err)
 	}
-	if !isLoginEligible(user.Status) {
+	if !isLoginEligible(user.Status) || user.AuthVersion != pending.AuthVersion {
 		return db.WebauthnCredential{}, ErrAccountNotActive
 	}
 
@@ -161,6 +166,17 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 
 	var row db.WebauthnCredential
 	err = s.runInTx(ctx, func(users UserStore, creds CredentialStore) error {
+		locked, err := users.GetUserByIDForUpdate(ctx, user.ID)
+		if err != nil {
+			return err
+		}
+		if !isLoginEligible(locked.Status) || locked.AuthVersion != pending.AuthVersion {
+			return ErrAccountNotActive
+		}
+		if err := s.checkSessionVersion(ctx, locked); err != nil {
+			return err
+		}
+		user = locked
 		// Persist the handle only after a successful ceremony, so a failed or
 		// abandoned registration never pins a handle to the account.
 		if len(user.WebauthnUserHandle) == 0 {
@@ -207,7 +223,15 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 // server never looks anything up before answering, there is simply no account
 // to enumerate — the timing and content of this response carry no information
 // about who does or does not have an account.
-func (s *Service) BeginDiscoverableLogin(_ context.Context) (*protocol.CredentialAssertion, error) {
+func (s *Service) BeginDiscoverableLogin(ctx context.Context) (*protocol.CredentialAssertion, error) {
+	var epoch int64
+	if s.accounts != nil {
+		var err error
+		epoch, err = s.accounts.Epoch(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	assertion, session, err := s.wa.BeginDiscoverableLogin()
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: begin discoverable login: %w", err)
@@ -216,9 +240,10 @@ func (s *Service) BeginDiscoverableLogin(_ context.Context) (*protocol.Credentia
 	// UserRef stays uuid.Nil: the identity is unknown until the assertion
 	// arrives and is resolved from the authenticator-reported user handle.
 	if err := s.challenges.Save(session.Challenge, PendingChallenge{
-		Session: *session,
-		Flow:    FlowLoginDiscoverable,
-		Expires: s.now().Add(s.challengeTTL),
+		AuthEpoch: epoch,
+		Session:   *session,
+		Flow:      FlowLoginDiscoverable,
+		Expires:   s.now().Add(s.challengeTTL),
 	}); err != nil {
 		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
 	}
@@ -278,10 +303,11 @@ func (s *Service) BeginLogin(ctx context.Context, email string) (*protocol.Crede
 	}
 
 	if err := s.challenges.Save(session.Challenge, PendingChallenge{
-		Session: *session,
-		UserRef: user.ID,
-		Flow:    FlowLoginNamed,
-		Expires: s.now().Add(s.challengeTTL),
+		AuthVersion: user.AuthVersion,
+		Session:     *session,
+		UserRef:     user.ID,
+		Flow:        FlowLoginNamed,
+		Expires:     s.now().Add(s.challengeTTL),
 	}); err != nil {
 		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
 	}
@@ -352,14 +378,27 @@ func isLoginEligible(status string) bool {
 // authenticator does not implement a counter and reports zero), otherwise the
 // credential is treated as cloned and the login is rejected.
 func (s *Service) FinishLogin(ctx context.Context, body []byte) (uuid.UUID, error) {
+	user, err := s.FinishLoginVersioned(ctx, body)
+	return user.ID, err
+}
+
+// LoginResult contains only the account identity and the version earned by the
+// challenge. The session issuer must use this version, never reload it.
+type LoginResult struct {
+	ID          uuid.UUID
+	AuthVersion int64
+}
+
+// FinishLoginVersioned returns the account version validated by the ceremony.
+func (s *Service) FinishLoginVersioned(ctx context.Context, body []byte) (LoginResult, error) {
 	parsed, err := protocol.ParseCredentialRequestResponseBytes(body)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return LoginResult{}, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
 
 	pending, err := s.challenges.Take(parsed.Response.CollectedClientData.Challenge)
 	if err != nil {
-		return uuid.Nil, err
+		return LoginResult{}, err
 	}
 
 	switch pending.Flow {
@@ -372,10 +411,10 @@ func (s *Service) FinishLogin(ctx context.Context, body []byte) (uuid.UUID, erro
 		// does not exist can verify, so this is simply "invalid credentials",
 		// and the handler renders it as the same opaque 401 as a genuinely
 		// failed assertion.
-		return uuid.Nil, ErrMockChallenge
+		return LoginResult{}, ErrMockChallenge
 	default:
 		// A registration challenge submitted to the login verifier.
-		return uuid.Nil, ErrChallengeFlowMismatch
+		return LoginResult{}, ErrChallengeFlowMismatch
 	}
 }
 
@@ -385,34 +424,37 @@ func (s *Service) finishNamedLogin(
 	ctx context.Context,
 	pending PendingChallenge,
 	parsed *protocol.ParsedCredentialAssertionData,
-) (uuid.UUID, error) {
+) (LoginResult, error) {
 	user, err := s.users.GetUserByID(ctx, pending.UserRef)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return uuid.Nil, ErrUserNotFound
+			return LoginResult{}, ErrUserNotFound
 		}
-		return uuid.Nil, fmt.Errorf("webauthn: load user: %w", err)
+		return LoginResult{}, fmt.Errorf("webauthn: load user: %w", err)
+	}
+	if user.AuthVersion != pending.AuthVersion {
+		return LoginResult{}, ErrAccountNotActive
 	}
 	// Defensive: the account's handle must still be the one the challenge was
 	// issued for, otherwise the assertion is validated against a different
 	// identity than the browser was told about.
 	if !bytes.Equal(user.WebauthnUserHandle, pending.Session.UserID) {
-		return uuid.Nil, ErrVerification
+		return LoginResult{}, ErrVerification
 	}
 
 	rows, err := s.creds.ListWebauthnCredentialsByUser(ctx, user.ID)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("webauthn: list credentials: %w", err)
+		return LoginResult{}, fmt.Errorf("webauthn: list credentials: %w", err)
 	}
 	if len(rows) == 0 {
-		return uuid.Nil, ErrNoCredentials
+		return LoginResult{}, ErrNoCredentials
 	}
 
 	adapter := newUserAdapter(user, pending.Session.UserID, dbToCredentials(rows))
 
 	cred, err := s.wa.ValidateLogin(adapter, pending.Session, parsed)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("%w: %v", ErrVerification, err)
+		return LoginResult{}, fmt.Errorf("%w: %v", ErrVerification, err)
 	}
 	return s.completeLogin(ctx, user, cred)
 }
@@ -431,7 +473,7 @@ func (s *Service) finishDiscoverableLogin(
 	ctx context.Context,
 	pending PendingChallenge,
 	parsed *protocol.ParsedCredentialAssertionData,
-) (uuid.UUID, error) {
+) (LoginResult, error) {
 	var (
 		resolved db.User
 		// internalErr carries an infrastructure failure back out of the
@@ -450,6 +492,9 @@ func (s *Service) finishDiscoverableLogin(
 				internalErr = err
 			}
 			return nil, err
+		}
+		if s.accounts != nil && (pending.AuthEpoch == 0 || user.AuthEpoch >= pending.AuthEpoch) {
+			return nil, ErrAccountNotActive
 		}
 
 		rows, err := s.creds.ListWebauthnCredentialsByUser(ctx, user.ID)
@@ -471,15 +516,15 @@ func (s *Service) finishDiscoverableLogin(
 	if err != nil {
 		// An infrastructure fault must not be reported as a failed assertion.
 		if internalErr != nil {
-			return uuid.Nil, internalErr
+			return LoginResult{}, internalErr
 		}
-		return uuid.Nil, fmt.Errorf("%w: %v", ErrVerification, err)
+		return LoginResult{}, fmt.Errorf("%w: %v", ErrVerification, err)
 	}
 
 	// Unreachable when err is nil, but asserted rather than assumed: the rest of
 	// this function dereferences the resolved account.
 	if resolved.ID == uuid.Nil {
-		return uuid.Nil, ErrVerification
+		return LoginResult{}, ErrVerification
 	}
 	return s.completeLogin(ctx, resolved, cred)
 }
@@ -520,22 +565,22 @@ func (s *Service) completeLogin(
 	ctx context.Context,
 	user db.User,
 	cred *gowebauthn.Credential,
-) (uuid.UUID, error) {
+) (LoginResult, error) {
 	// The library reports a non-increasing counter as a warning flag on the
 	// credential rather than an error, so it must be inspected explicitly.
 	if cred.Authenticator.CloneWarning {
-		return uuid.Nil, ErrCredentialCloned
+		return LoginResult{}, ErrCredentialCloned
 	}
 	// Re-checked after verification: the named flow validated status at Begin,
 	// but the account may have been suspended while the ceremony was in flight.
 	if !isLoginEligible(user.Status) {
-		return uuid.Nil, ErrAccountNotActive
+		return LoginResult{}, ErrAccountNotActive
 	}
 
-	if err := s.commitSignCount(ctx, cred); err != nil {
-		return uuid.Nil, err
+	if err := s.commitSignCountChecked(ctx, cred, &user); err != nil {
+		return LoginResult{}, err
 	}
-	return user.ID, nil
+	return LoginResult{ID: user.ID, AuthVersion: user.AuthVersion}, nil
 }
 
 // commitSignCount re-reads the credential with SELECT ... FOR UPDATE and
@@ -546,7 +591,24 @@ func (s *Service) completeLogin(
 // closes that window (and serialises competing assertions for the same
 // credential once the store is a transaction-scoped *db.Queries).
 func (s *Service) commitSignCount(ctx context.Context, cred *gowebauthn.Credential) error {
-	return s.runInTx(ctx, func(_ UserStore, creds CredentialStore) error {
+	// Reclaim has its own pending-deletion eligibility policy, not active login.
+	return s.commitSignCountChecked(ctx, cred, nil)
+}
+
+func (s *Service) commitSignCountChecked(ctx context.Context, cred *gowebauthn.Credential, authenticated *db.User) error {
+	return s.runInTx(ctx, func(users UserStore, creds CredentialStore) error {
+		if authenticated != nil {
+			current, err := users.GetUserByIDForUpdate(ctx, authenticated.ID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAccountNotActive
+			}
+			if err != nil {
+				return err
+			}
+			if !isLoginEligible(current.Status) || current.AuthVersion != authenticated.AuthVersion {
+				return ErrAccountNotActive
+			}
+		}
 		row, err := creds.GetWebauthnCredentialForUpdate(ctx, cred.ID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -649,6 +711,9 @@ func (s *Service) BeginStepUp(ctx context.Context, userID uuid.UUID, sessionID s
 	if !isLoginEligible(user.Status) {
 		return nil, ErrAccountNotActive
 	}
+	if err := s.checkSessionVersion(ctx, user); err != nil {
+		return nil, err
+	}
 	if len(user.WebauthnUserHandle) == 0 {
 		return nil, ErrNoCredentials
 	}
@@ -670,11 +735,12 @@ func (s *Service) BeginStepUp(ctx context.Context, userID uuid.UUID, sessionID s
 	}
 
 	if err := s.challenges.Save(session.Challenge, PendingChallenge{
-		Session:   *session,
-		UserRef:   user.ID,
-		SessionID: sessionID,
-		Flow:      FlowStepUp,
-		Expires:   s.now().Add(s.challengeTTL),
+		AuthVersion: user.AuthVersion,
+		Session:     *session,
+		UserRef:     user.ID,
+		SessionID:   sessionID,
+		Flow:        FlowStepUp,
+		Expires:     s.now().Add(s.challengeTTL),
 	}); err != nil {
 		return nil, fmt.Errorf("webauthn: save challenge: %w", err)
 	}
@@ -752,7 +818,7 @@ func (s *Service) FinishStepUp(ctx context.Context, userID uuid.UUID, sessionID 
 	}
 	// Re-checked after verification: the account may have been suspended while
 	// the ceremony was in flight.
-	if !isLoginEligible(user.Status) {
+	if !isLoginEligible(user.Status) || user.AuthVersion != pending.AuthVersion {
 		return ErrAccountNotActive
 	}
 
@@ -760,7 +826,7 @@ func (s *Service) FinishStepUp(ctx context.Context, userID uuid.UUID, sessionID 
 	// login, so it must be persisted or the next authentication would compare
 	// against a stale value — either failing a legitimate user or masking a
 	// genuine cloned authenticator.
-	return s.commitSignCount(ctx, cred)
+	return s.commitSignCountChecked(ctx, cred, &user)
 }
 
 // DeleteCredential removes one of an account's registered credentials
@@ -789,6 +855,9 @@ func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, creden
 		if !isLoginEligible(user.Status) {
 			return ErrAccountNotActive
 		}
+		if err := s.checkSessionVersion(ctx, user); err != nil {
+			return err
+		}
 
 		locked, err := creds.LockWebauthnCredentialsByUser(ctx, userID)
 		if err != nil {
@@ -813,6 +882,17 @@ func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, creden
 		}
 		return nil
 	})
+}
+
+func (s *Service) checkSessionVersion(ctx context.Context, user db.User) error {
+	if s.accounts == nil {
+		return nil
+	}
+	current, ok := session.FromContext(ctx)
+	if !ok || !current.AuthVersionSet || current.UserID != user.ID.String() || current.AuthVersion != user.AuthVersion {
+		return ErrAccountNotActive
+	}
+	return nil
 }
 
 // containsCredentialID reports whether id appears in the locked credential set.

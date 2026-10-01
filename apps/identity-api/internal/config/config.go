@@ -59,6 +59,11 @@ type Config struct {
 	IdleTimeout time.Duration
 	// ShutdownTimeout bounds how long graceful shutdown waits for in-flight requests.
 	ShutdownTimeout time.Duration
+	// Admin bounds the administrative REST surface at /api/v1/admin/*. It
+	// lives on the base Config rather than being handed to a service because
+	// the values are consumed by the HTTP handlers themselves (page sizes,
+	// time windows), not by any domain package.
+	Admin AdminConfig
 }
 
 // Addr returns the host:port address string the server should listen on.
@@ -150,6 +155,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.TrustedProxyCIDRs = trustedProxyCIDRs
+	cfg.Admin, err = LoadAdmin()
+	if err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
 }

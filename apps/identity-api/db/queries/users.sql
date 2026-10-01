@@ -41,6 +41,22 @@ SELECT * FROM users
 WHERE id = $1
   AND deleted_at IS NULL;
 
+-- name: GetAccountAuthState :one
+SELECT status, deleted_at, auth_version, auth_epoch FROM users WHERE id = $1;
+
+-- name: GetAccountAuthStateForUpdate :one
+SELECT status, deleted_at, auth_version, auth_epoch FROM users WHERE id = $1 FOR UPDATE;
+
+-- name: NextAccountAuthEpoch :one
+SELECT nextval('account_auth_epoch_seq')::bigint AS epoch;
+
+-- name: ModerateUserStatus :one
+-- Caller holds actor/target account locks and has checked live permission and
+-- privileged-role protection. Every accepted action invalidates prior state.
+UPDATE users SET status = $2, auth_version = auth_version + 1, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL AND status IN ('active', 'suspended', 'banned')
+RETURNING *;
+
 -- name: GetUserByIDForUpdate :one
 -- Stable per-account mutex for security-sensitive mutations that span child
 -- tables. Permanent lock order is users first, then WebAuthn credentials ordered
@@ -61,6 +77,29 @@ WHERE email = $1
 -- Admin/reclaim path: also returns soft-deleted (pending_deletion) accounts.
 SELECT * FROM users
 WHERE id = $1;
+
+-- name: GetUserByEmailForAdmin :one
+-- Task 5.3: exact-match account lookup for POST /api/v1/admin/users/lookup.
+-- (api-design.md §1.7). Gated behind the admin.users.read.pii permission
+-- because the caller must already know the address to use it.
+--
+-- Deliberately does NOT filter deleted_at, matching GetUserByIDForAdmin: an
+-- account in its 30-day grace window is exactly the one a moderator or DPO
+-- needs to find, and filtering it out would report "not found" for a row that
+-- demonstrably exists.
+--
+-- Consequence: idx_users_email is partial (WHERE deleted_at IS NULL), so
+-- uniqueness holds only across live accounts. Dropping the filter can therefore
+-- match several rows — one live account plus any number of soft-deleted
+-- predecessors that reused the address. That is legal by design
+-- (partial_unique_index_on_soft_delete_email), so this query MUST NOT be left
+-- to pick an arbitrary row: the ORDER BY makes it total. The live account wins;
+-- among soft-deleted rows the most recent wins. LIMIT 1 is redundant given
+-- :one/QueryRow but states the intent at the SQL layer.
+SELECT * FROM users
+WHERE email = $1
+ORDER BY (deleted_at IS NULL) DESC, created_at DESC, id
+LIMIT 1;
 
 -- name: GetUserForUpdateIncludingDeleted :one
 -- Task 5.1: the per-account mutex for the GDPR deletion lifecycle. Unlike
@@ -182,6 +221,7 @@ WHERE id = $1
 -- "Grace Period & Soft Deletes"). Session/token revocation happens in Redis.
 UPDATE users
 SET status = 'pending_deletion',
+    auth_version = auth_version + 1,
     deleted_at = NOW(),
     updated_at = NOW()
 WHERE id = $1
@@ -203,10 +243,11 @@ WHERE id = $1
 -- name: ListUsersDueForHardDelete :many
 -- Feeds the GDPR hard-delete cron worker (Task 5.1). cutoff is
 -- NOW() - INTERVAL '30 days' computed by the worker; limit bounds each batch.
-SELECT id FROM users
-WHERE status = 'pending_deletion'
-  AND deleted_at < $1
-ORDER BY deleted_at
+SELECT u.id FROM users u
+WHERE u.status = 'pending_deletion'
+  AND u.deleted_at < $1
+ORDER BY EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.account_ref = u.id AND lh.is_active),
+         u.deleted_at, u.id
 LIMIT $2;
 
 -- name: HardDeleteUser :execrows
@@ -216,12 +257,9 @@ LIMIT $2;
 -- nulled (ON DELETE SET NULL). The status/cutoff guards make it impossible to
 -- hard-delete an active account.
 --
--- The NOT EXISTS legal-hold predicate (Task 5.1) closes the TOCTOU window between
--- the worker's HasActiveLegalHold check and this DELETE: a hold applied in between
--- would otherwise be ignored, and holds outrank every retention timer
--- (compliance-and-data-governance.md §6). The Go-side check is retained purely to
--- produce the audit *reason* for a skip. Mirrors the predicate already used by
--- PurgeExpiredSecurityEvents (legal.sql).
+-- Defense in depth only: callers must acquire the shared subject advisory lock
+-- in a separate statement before eligibility reads, then the user row lock.
+-- A NOT EXISTS predicate alone cannot serialize concurrent hold insertion.
 DELETE FROM users u
 WHERE u.id = $1
   AND u.status = 'pending_deletion'
@@ -242,3 +280,17 @@ LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
 -- name: CountUsers :one
 SELECT COUNT(*) FROM users
 WHERE (sqlc.narg('status')::varchar IS NULL OR status = sqlc.narg('status')::varchar);
+
+-- name: ListAdminUsersPage :one
+-- A single statement gives the bounded safe projection and count one snapshot,
+-- including requests whose offset is beyond the last result.
+WITH matching AS MATERIALIZED (
+    SELECT id, email, status, is_mfa_enabled, created_at, updated_at, deleted_at
+    FROM users
+    WHERE (sqlc.narg('status')::varchar IS NULL OR status = sqlc.narg('status')::varchar)
+), page AS (
+    SELECT * FROM matching ORDER BY created_at DESC, id
+    LIMIT sqlc.arg('page_limit')::integer OFFSET sqlc.arg('page_offset')::integer
+)
+SELECT (SELECT COUNT(*) FROM matching)::bigint AS total,
+       COALESCE((SELECT jsonb_agg(page ORDER BY created_at DESC, id) FROM page), '[]'::jsonb)::jsonb AS items;

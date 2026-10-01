@@ -29,6 +29,9 @@ import (
 // the only safe response.
 var ErrLockUnavailable = errors.New("signer: another audit signer holds the advisory lock")
 
+// ErrChainTipsUnknown is fatal: no further batch may use uncertain cached tips.
+var ErrChainTipsUnknown = errors.New("signer: chain tips unknown after commit failure")
+
 // quarantineNamespace derives the event id of a synthesized
 // audit.pipeline.undecodable record from the offending message's stream position.
 //
@@ -94,8 +97,9 @@ type Signer struct {
 	// auditTip and ledgerTip are the raw predecessor digests for the next record in
 	// each chain. They are a cache of the database: any commit failure invalidates
 	// them and they are re-read before the retry.
-	auditTip  [sha256.Size]byte
-	ledgerTip [sha256.Size]byte
+	auditTip    [sha256.Size]byte
+	ledgerTip   [sha256.Size]byte
+	tipsUnknown bool
 }
 
 // Option configures optional behaviour on a Signer.
@@ -226,6 +230,9 @@ func (s *Signer) RunUntilDone(ctx context.Context) error {
 		}
 
 		if err := s.processBatch(ctx, msgs); err != nil {
+			if errors.Is(err, ErrChainTipsUnknown) {
+				return err
+			}
 			s.logger.Error("signer: batch failed; messages will be redelivered",
 				slog.Int("messages", len(msgs)),
 				slog.String("error", err.Error()))
@@ -248,6 +255,7 @@ func (s *Signer) seedChainTips(ctx context.Context) error {
 	}
 	s.auditTip = auditTip
 	s.ledgerTip = ledgerTip
+	s.tipsUnknown = false
 	return nil
 }
 
@@ -283,6 +291,10 @@ type batchStats struct {
 // already dropped it and both tables refuse the retro-active insert an operator would
 // need to repair the chain.
 func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
+	if s.tipsUnknown {
+		s.nakAll(msgs)
+		return ErrChainTipsUnknown
+	}
 	started := s.now()
 	stats := batchStats{messages: len(msgs)}
 
@@ -330,12 +342,32 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 	}
 	stats.duplicatesSkipped = skipped
 
+	subjectIDs := make([]uuid.UUID, 0, len(kept))
+	for _, rec := range kept {
+		if id, err := uuid.Parse(rec.envelope.SubjectID); err == nil && id != uuid.Nil {
+			subjectIDs = append(subjectIDs, id)
+		}
+	}
+	liveSubjects := make(map[uuid.UUID]bool, len(subjectIDs))
+	if len(subjectIDs) > 0 {
+		ids, err := store.LockAuditSubjects(batchCtx, subjectIDs)
+		if err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: lock audit subjects: %w", err)
+		}
+		for _, id := range ids {
+			liveSubjects[id] = true
+		}
+	}
+
 	auditRows := make([]db.InsertAuditLogsParams, 0, len(kept))
 	ledgerRows := make([]db.InsertSecurityEventsParams, 0, len(kept))
 	blindIndexes := make(map[uuid.UUID]*string, len(kept))
 
 	for _, rec := range kept {
 		env := rec.envelope
+		// Covers old queued envelopes and synthetic events as well as new producers.
+		env.OccurredAt = audit.NormalizeChainTime(env.OccurredAt)
 
 		auditRec := env.AuditRecord()
 		auditHash := audit.ChainHash(auditTip, audit.SerializeAudit(auditRec))
@@ -347,17 +379,24 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 			return fmt.Errorf("signer: decode computed audit chain hash: %w", err)
 		}
 		auditTip = nextAuditTip
-		auditRows = append(auditRows, buildAuditRow(env, auditHash))
+		row := buildAuditRow(env, auditHash)
+		if !liveSubjects[row.UserID.UUID] {
+			row.UserID = uuid.NullUUID{}
+		}
+		auditRows = append(auditRows, row)
 
 		ledgerCtx, ok := s.resolveLedgerContext(env)
 		if !ok {
 			continue
 		}
 
-		blindIndex, err := s.blindIndexFor(batchCtx, store, blindIndexes, ledgerCtx.accountRef)
-		if err != nil {
-			s.nakAll(msgs)
-			return err
+		blindIndex := ledgerCtx.identityBlindIndex
+		if blindIndex == nil {
+			blindIndex, err = s.blindIndexFor(batchCtx, store, blindIndexes, ledgerCtx.accountRef)
+			if err != nil {
+				s.nakAll(msgs)
+				return err
+			}
 		}
 
 		ledgerRec := s.buildLedgerRecord(env, ledgerCtx, blindIndex)
@@ -390,8 +429,9 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		// longer be trusted: re-read them from the database before the redelivered
 		// batch is chained again.
 		s.nakAll(msgs)
+		s.tipsUnknown = true
 		if seedErr := s.seedChainTips(batchCtx); seedErr != nil {
-			return fmt.Errorf("signer: commit batch: %w (and re-seeding chain tips failed: %v)", err, seedErr)
+			return fmt.Errorf("%w: commit: %v; reseed: %v", ErrChainTipsUnknown, err, seedErr)
 		}
 		return fmt.Errorf("signer: commit batch: %w", err)
 	}
@@ -508,7 +548,7 @@ func (s *Signer) quarantineRecord(msg jetstream.Msg, cause error) pendingRecord 
 	env := audit.Envelope{
 		EventID:       eventID,
 		SchemaVersion: audit.EnvelopeSchemaVersion,
-		OccurredAt:    s.now().UTC(),
+		OccurredAt:    audit.NormalizeChainTime(s.now()),
 		EventType:     audit.EventPipelineUndecodable,
 		ActionStatus:  audit.StatusFailure,
 		ActorID:       uuid.Nil.String(),
@@ -581,10 +621,11 @@ func (s *Signer) filterDuplicates(ctx context.Context, store Store, records []pe
 
 // ledgerContext is the resolved ledger attribution for one envelope.
 type ledgerContext struct {
-	accountRef        uuid.UUID
-	clientID          string
-	scope             string
-	deviceFingerprint string
+	accountRef         uuid.UUID
+	clientID           string
+	scope              string
+	deviceFingerprint  string
+	identityBlindIndex *string
 }
 
 // resolveLedgerContext decides whether an envelope produces a ledger row.
@@ -594,6 +635,10 @@ type ledgerContext struct {
 // account loses attribution evidence, and a ledger event type published without
 // SecurityContext means a call site forgot the declaration.
 func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool) {
+	// The type allowlist, not producer-controlled Security, defines Class B.
+	if !audit.IsLedgerEventType(env.EventType) {
+		return ledgerContext{}, false
+	}
 	if env.Security == nil {
 		if !audit.IsLedgerEventType(env.EventType) {
 			// Audit-only event: nothing to resolve.
@@ -626,18 +671,18 @@ func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool) 
 	}
 
 	return ledgerContext{
-		accountRef:        accountRef,
-		clientID:          env.Security.ClientID,
-		scope:             env.Security.Scope,
-		deviceFingerprint: env.Security.DeviceFingerprint,
+		accountRef:         accountRef,
+		clientID:           env.Security.ClientID,
+		scope:              env.Security.Scope,
+		deviceFingerprint:  env.Security.DeviceFingerprint,
+		identityBlindIndex: env.Security.IdentityBlindIndex,
 	}, true
 }
 
 // blindIndexFor resolves and caches identity_blind_index for one account.
 //
-// The signer derives it here, rather than accepting it from the publisher, so the
-// pepper lives in exactly one process and no email address ever crosses the message
-// bus. The email is read, hashed, and discarded; it is never logged.
+// This is the fallback for legacy queued envelopes or failed producer capture.
+// The email is read, hashed, and discarded; it is never logged.
 //
 // A purged subject yields NULL, which is the column's designed state for
 // "attribution material no longer exists".
@@ -659,6 +704,8 @@ func (s *Signer) blindIndexFor(ctx context.Context, store Store, cache map[uuid.
 		// row still gets written — surviving deletion is the point — just without a
 		// blind index to look it up by.
 		cache[accountRef] = nil
+		s.logger.Warn("signer: attribution unavailable; ledger index missing",
+			slog.String("marker", "audit_index_missing"))
 		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("signer: resolve email for blind index: %w", err)
@@ -681,8 +728,8 @@ func (s *Signer) buildLedgerRecord(env audit.Envelope, lc ledgerContext, blindIn
 		DeviceFingerprint:  optional(lc.deviceFingerprint),
 		ClientID:           optional(lc.clientID),
 		Scope:              optional(lc.scope),
-		Timestamp:          env.OccurredAt,
-		RetainUntil:        env.OccurredAt.Add(s.cfg.LedgerRetention),
+		Timestamp:          audit.NormalizeChainTime(env.OccurredAt),
+		RetainUntil:        audit.NormalizeChainTime(env.OccurredAt.Add(s.cfg.LedgerRetention)),
 	}
 	if env.ClientIP != "" {
 		subnet := ratelimit.Subnet(env.ClientIP)

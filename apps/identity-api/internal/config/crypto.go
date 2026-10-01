@@ -50,6 +50,21 @@ const minPepperBytes = 32
 // (rather than applying defaults) whenever a required secret is missing or
 // malformed, so misconfiguration fails fast at startup.
 func LoadCrypto() (CryptoConfig, error) {
+	cfg, err := LoadEnvelopeCrypto()
+	if err != nil {
+		return CryptoConfig{}, err
+	}
+	pepper, err := LoadBlindIndexPepper()
+	if err != nil {
+		return CryptoConfig{}, err
+	}
+	cfg.BlindIndexPepper = pepper
+	return cfg, nil
+}
+
+// LoadEnvelopeCrypto loads only the keys needed to encrypt records. Retention
+// holds and moderation must not depend on the independent lookup pepper.
+func LoadEnvelopeCrypto() (CryptoConfig, error) {
 	var cfg CryptoConfig
 
 	rawKEK, ok := os.LookupEnv(EnvMasterKEK)
@@ -78,18 +93,21 @@ func LoadCrypto() (CryptoConfig, error) {
 		cfg.MasterKEKVersion = byte(v)
 	}
 
+	return cfg, nil
+}
+
+// LoadBlindIndexPepper never invents replacement key material.
+func LoadBlindIndexPepper() ([]byte, error) {
 	rawPepper, ok := os.LookupEnv(EnvBlindIndexPepper)
 	if !ok || rawPepper == "" {
-		return CryptoConfig{}, fmt.Errorf("config: %s is required", EnvBlindIndexPepper)
+		return nil, fmt.Errorf("config: %s is required", EnvBlindIndexPepper)
 	}
 	pepper, err := base64.StdEncoding.DecodeString(rawPepper)
 	if err != nil {
-		return CryptoConfig{}, fmt.Errorf("config: %s must be valid base64: %w", EnvBlindIndexPepper, err)
+		return nil, fmt.Errorf("config: %s must be valid base64: %w", EnvBlindIndexPepper, err)
 	}
 	if len(pepper) < minPepperBytes {
-		return CryptoConfig{}, fmt.Errorf("config: %s must decode to at least %d bytes, got %d", EnvBlindIndexPepper, minPepperBytes, len(pepper))
+		return nil, fmt.Errorf("config: %s must decode to at least %d bytes, got %d", EnvBlindIndexPepper, minPepperBytes, len(pepper))
 	}
-	cfg.BlindIndexPepper = pepper
-
-	return cfg, nil
+	return pepper, nil
 }

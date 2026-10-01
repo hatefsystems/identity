@@ -12,15 +12,19 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
@@ -32,6 +36,13 @@ import (
 // Fields left zero-valued disable the routes that need them, which keeps
 // handler tests lightweight and startup order explicit.
 type Deps struct {
+	AdminReady   func(context.Context) error
+	AdminRevoke  func(string) error
+	AdminActions *adminaction.Service
+	AdminStore   AdminStore
+	RBAC         rbac.PermissionChecker
+	LegalHold    *legalhold.Service
+	AdminLimiter ratelimit.Limiter
 	// OIDC provides the issuer identity used to build the discovery document.
 	OIDC config.OIDCConfig
 	// Keys is the signing keystore backing /oauth2/jwks; when nil, the OIDC
@@ -259,6 +270,9 @@ func (s *Server) registerRoutes() {
 	// additionally requires a notifier that can deliver the reclaim token.
 	if s.deps.Privacy != nil {
 		s.registerPrivacyRoutes()
+	}
+	if s.cfg.Admin.Enabled && s.deps.AdminActions != nil && s.deps.AdminStore != nil && s.deps.RBAC != nil && s.deps.AdminLimiter != nil {
+		s.registerAdminRoutes()
 	}
 }
 

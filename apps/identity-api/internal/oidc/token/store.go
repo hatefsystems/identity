@@ -45,7 +45,9 @@ var (
 // authorization code, captured at the consent stage and consumed exactly once
 // at the token endpoint.
 type AuthorizationCodeData struct {
-	ClientID string
+	AuthVersion    int64
+	AuthVersionSet bool
+	ClientID       string
 	// RedirectURI is the canonical redirect URI the code was issued for; the
 	// token request must present the identical value (RFC 6749 §4.1.3).
 	RedirectURI string
@@ -71,6 +73,8 @@ type AuthorizationCodeStore interface {
 // RefreshTokenData is the server-side record of a refresh token under
 // Refresh Token Rotation.
 type RefreshTokenData struct {
+	AuthVersion    int64
+	AuthVersionSet bool
 	// FamilyID groups all rotations of one grant/session. Breach detection
 	// revokes entire families.
 	FamilyID  string
@@ -208,18 +212,13 @@ func (s *MemoryRefreshTokenStore) Get(tokenHash string) (RefreshTokenData, error
 
 // MarkRotated implements RefreshTokenStore.
 func (s *MemoryRefreshTokenStore) MarkRotated(tokenHash string) error {
-	return s.setStatus(tokenHash, StatusRotated)
-}
-
-// setStatus transitions a single token's status under the lock.
-func (s *MemoryRefreshTokenStore) setStatus(tokenHash, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	data, ok := s.tokens[tokenHash]
-	if !ok {
+	if !ok || data.Status != StatusActive || !s.now().Before(data.ExpiresAt) {
 		return ErrRefreshTokenNotFound
 	}
-	data.Status = status
+	data.Status = StatusRotated
 	s.tokens[tokenHash] = data
 	return nil
 }

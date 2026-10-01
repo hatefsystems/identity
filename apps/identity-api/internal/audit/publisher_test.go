@@ -136,7 +136,7 @@ func TestNewJetStreamRecorderValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error with nil logger: %v", err)
 	}
-	defer rec.Close(context.Background())
+	defer func() { _ = rec.Close(context.Background()) }()
 	if rec.logger == nil {
 		t.Error("expected default logger when nil provided")
 	}
@@ -293,7 +293,7 @@ func TestJetStreamRecorderUnserializablePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewJetStreamRecorder: %v", err)
 	}
-	defer rec.Close(context.Background())
+	defer func() { _ = rec.Close(context.Background()) }()
 
 	unserializable := map[string]any{
 		"ch": make(chan int),

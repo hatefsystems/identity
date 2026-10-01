@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,8 @@ type Grant struct {
 
 // MintParams describes the authentication event a grant attests to.
 type MintParams struct {
+	AuthVersion    int64
+	AuthVersionSet bool
 	// UserID is the authenticated subject (required).
 	UserID string
 	// SessionID is the session that completed the challenge (required); it
@@ -63,6 +66,34 @@ type grantHeader struct {
 // Mint signs a step-up grant for a completed challenge and returns the compact
 // JWS together with its expiry.
 func (s *Service) Mint(p MintParams) (string, time.Time, error) {
+	return s.MintContext(context.Background(), p)
+}
+
+// MintContext binds a grant to the version earned by authentication.
+func (s *Service) MintContext(ctx context.Context, p MintParams) (string, time.Time, error) {
+	if s.accounts == nil {
+		return s.mint(p)
+	}
+	if !p.AuthVersionSet {
+		return "", time.Time{}, ErrAccountNotActive
+	}
+	var compact string
+	var expires time.Time
+	err := s.accounts.WithActive(ctx, p.UserID, p.AuthVersion, func() error {
+		var err error
+		compact, expires, err = s.mint(p)
+		return err
+	})
+	if errors.Is(err, session.ErrAccountIneligible) {
+		return "", time.Time{}, ErrAccountNotActive
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return compact, expires, nil
+}
+
+func (s *Service) mint(p MintParams) (string, time.Time, error) {
 	if p.UserID == "" {
 		return "", time.Time{}, errors.New("stepup: user id is required")
 	}
@@ -89,6 +120,9 @@ func (s *Service) Mint(p MintParams) (string, time.Time, error) {
 		"jti":       uuid.NewString(),
 		"iat":       now.Unix(),
 		"exp":       expiresAt.Unix(),
+	}
+	if p.AuthVersionSet {
+		claims["auth_version"] = strconv.FormatInt(p.AuthVersion, 10)
 	}
 	// RFC 9449 §6 confirmation claim, populated only when the earning session is
 	// sender-constrained.
@@ -192,6 +226,17 @@ func (s *Service) Validate(ctx context.Context, compact string, sess session.Ses
 	// or a second device), which defeats the per-operation nature of the grant.
 	if sub != sess.UserID || sid != sess.ID {
 		return nil, ErrGrantNotForSession
+	}
+	if s.accounts != nil {
+		if sess.Kind != session.KindAuthenticated || !sess.AuthVersionSet || stringClaim(claims, "auth_version") != strconv.FormatInt(sess.AuthVersion, 10) {
+			return nil, ErrGrantNotForSession
+		}
+		if err := s.accounts.Validate(ctx, sess.UserID, sess.AuthVersion); err != nil {
+			if errors.Is(err, session.ErrAccountIneligible) {
+				return nil, ErrGrantNotForSession
+			}
+			return nil, err
+		}
 	}
 
 	fresh, err := s.guard.Remember(ctx, jtiGuardKey(jti), exp)

@@ -64,12 +64,13 @@ type Session struct {
 	// cannot be used to authenticate a request.
 	ID string
 	// Kind separates full authenticated sessions from deliberately restricted
-	// recovery-enrollment sessions. The zero value is treated as authenticated
-	// only while reading legacy in-memory records created before this field was
-	// introduced.
+	// recovery-enrollment sessions. Unknown and zero kinds are rejected.
 	Kind Kind
 	// UserID is the authenticated subject the session belongs to.
 	UserID string
+	// AuthVersion is captured by the authentication ceremony, never restamped.
+	AuthVersion    int64
+	AuthVersionSet bool
 	// IP is the client source address captured at session creation.
 	IP string
 	// UserAgent identifies the client device/browser (data-architecture §3.1

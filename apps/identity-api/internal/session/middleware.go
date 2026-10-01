@@ -43,7 +43,7 @@ func (rs *RequireSession) Handler(next http.Handler) http.Handler {
 			rs.writeUnauthorized(w)
 			return
 		}
-		if sess.Kind != "" && sess.Kind != KindAuthenticated {
+		if sess.Kind != KindAuthenticated {
 			rs.writeUnauthorized(w)
 			return
 		}

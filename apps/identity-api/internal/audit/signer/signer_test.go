@@ -47,6 +47,7 @@ type fakeStore struct {
 	existingLedgerIDs      []uuid.UUID
 	userEmails             map[uuid.UUID]string
 	userEmailErrs          map[uuid.UUID]error
+	subjectLockErr         error
 	insertedAuditLogs      []db.InsertAuditLogsParams
 	insertedSecurityEvents []db.InsertSecurityEventsParams
 }
@@ -113,6 +114,19 @@ func (s *fakeStore) GetUserEmailForBlindIndex(_ context.Context, id uuid.UUID) (
 	return "", pgx.ErrNoRows
 }
 
+func (s *fakeStore) LockAuditSubjects(_ context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	if s.subjectLockErr != nil {
+		return nil, s.subjectLockErr
+	}
+	var live []uuid.UUID
+	for _, id := range ids {
+		if _, ok := s.userEmails[id]; ok {
+			live = append(live, id)
+		}
+	}
+	return live, nil
+}
+
 func (s *fakeStore) InsertAuditLogs(_ context.Context, arg []db.InsertAuditLogsParams) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,11 +146,15 @@ type fakeBatchTx struct {
 	committed  bool
 	rolledBack bool
 	commitErr  error
+	onCommit   func()
 }
 
 func (t *fakeBatchTx) Store() Store { return t.store }
 
 func (t *fakeBatchTx) Commit(_ context.Context) error {
+	if t.onCommit != nil {
+		t.onCommit()
+	}
 	if t.commitErr != nil {
 		return t.commitErr
 	}
@@ -209,9 +227,11 @@ func (b *fakeMessageBatch) Error() error                   { return b.err }
 type fakeFetcher struct {
 	batches []jetstream.MessageBatch
 	err     error
+	calls   int
 }
 
 func (f *fakeFetcher) Fetch(_ int, _ ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
+	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}

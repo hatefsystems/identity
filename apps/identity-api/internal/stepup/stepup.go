@@ -44,6 +44,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // ACRStepUp is the Authentication Context Class Reference a step-up grant
@@ -159,6 +160,7 @@ type TOTPVerifier interface {
 // Config carries the step-up policy. Every field has a production-safe default
 // (see New); nothing here is secret.
 type Config struct {
+	AccountState session.AccountState
 	// Issuer is the OIDC issuer URL stamped into a grant's iss and aud claims
 	// and required to match on validation. It is mandatory.
 	Issuer string
@@ -184,6 +186,7 @@ const (
 // Service mints and validates step-up grants and runs the challenge ceremony.
 // Construct it with New; the zero value is not usable.
 type Service struct {
+	accounts session.AccountState
 	keys     KeyStore
 	users    UserStore
 	passkeys PasskeyVerifier
@@ -271,6 +274,7 @@ func New(
 	}
 
 	svc := &Service{
+		accounts:            cfg.AccountState,
 		keys:                keyStore,
 		users:               users,
 		passkeys:            passkeys,

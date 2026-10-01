@@ -60,8 +60,8 @@ Protected by strict RBAC. Accessible only to users with `Support`, `Moderator`, 
   - Action: Suspend Account.
   - Action: Ban Account.
   - *Note: "Delete User" button does not exist by design (Zero Trust philosophy).*
-- `/admin/roles` : (Super Admin Only) Assign platform roles to specific users.
-- `/admin/audit-logs` : (DPO / Super Admin) View system audit logs (fetched from ClickHouse) showing which admin performed what action. Enforces default date range selection (defaulting to the past 24–48 hours) and paginated loading controls to protect client and network performance.
+- `/admin/roles` : Future delegated-role workflow; no HTTP assignment endpoint in Task 5.3. Use the controlled operator procedure.
+- `/admin/audit-logs` : (DPO only) View system audit logs (PostgreSQL in the MVP) showing which admin performed what action. Enforces default date range selection (defaulting to the past 24–48 hours) and paginated loading controls to protect client and network performance.
 
 ---
 
@@ -109,3 +109,5 @@ To protect highly critical administrative or identity operations (such as Passwo
 To completely prevent user-enumeration (account harvesting) through timing side-channels, the platform implements two distinct defenses:
 - **Discoverable Credentials (Usernameless Passkeys) as Primary:** The primary login route relies on discoverable credentials. The user is prompted for biometrics directly without inputting an email first (`navigator.credentials.get` is called with an empty `allowCredentials` list). The authenticator resolves the user's registered identity locally and securely transfers the associated username/ID within the signed cryptographic assertion, completely eliminating the possibility of account harvesting.
 - **Mock Challenges for User-Named Fallbacks:** For legacy user-named credential flows, if an unregistered username/email is entered, the server returns a fully formed mock challenge. The frontend initiates `navigator.credentials.get` using this dummy credential ID, prompting the standard OS biometric dialog to preserve UX consistency. The backend introduces exact timing delays to match a successful credentials lookup, though discoverable credentials remain the recommended path due to browser-level key-lookup speed variances on local devices. (Note: Because modern browsers throw instant client-side exceptions when an `allowCredentials` list contains only dummy IDs, a client-side behavioral side-channel remains on user-named credentials. Therefore, discoverable credentials are the only fully secure WebAuthn authentication route).
+
+The Admin UI remains future work. Follow [API section 1.7](api-design.md#17-admin--moderation-api): body-based exact-email search and legal attribution; no identity query strings. Super Admin receives content-free verification only; Support never receives email, roles or hold details.

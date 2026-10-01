@@ -49,7 +49,7 @@ type Envelope struct {
 	SubjectID string `json:"subject_id,omitempty"`
 	ClientIP  string `json:"client_ip"`
 	UserAgent string `json:"user_agent"`
-	// Payload is the pre-serialized JSONB text. The publisher marshals the caller's
+	// Payload is pre-serialized JSON stored as TEXT. The publisher marshals the caller's
 	// map exactly once, here, so the bytes that get hashed are the bytes that get
 	// stored; a consumer-side re-marshal could reorder keys and break verification.
 	Payload string `json:"payload"`
@@ -67,9 +67,12 @@ type EnvelopeSecurity struct {
 	ClientID          string `json:"client_id,omitempty"`
 	Scope             string `json:"scope,omitempty"`
 	DeviceFingerprint string `json:"device_fingerprint,omitempty"`
+	// Optional additive v1 field: old queued envelopes omit it and the signer
+	// attempts the legacy live-account lookup instead.
+	IdentityBlindIndex *string `json:"identity_blind_index,omitempty"`
 }
 
-// emptyPayload is the JSONB text used when an event carries no context. The column
+// emptyPayload is the JSON text used when an event carries no context. The column
 // is NOT NULL, and "{}" keeps it a valid JSON object so payload-key queries do not
 // need a null guard.
 const emptyPayload = "{}"
@@ -94,7 +97,7 @@ func NewEnvelope(e Event, eventID uuid.UUID, occurredAt time.Time) (Envelope, er
 	env := Envelope{
 		EventID:       eventID,
 		SchemaVersion: EnvelopeSchemaVersion,
-		OccurredAt:    occurredAt.UTC(),
+		OccurredAt:    NormalizeChainTime(occurredAt),
 		EventType:     e.EventType,
 		ActionStatus:  e.ActionStatus,
 		ActorID:       e.ActorID.String(),
@@ -106,12 +109,16 @@ func NewEnvelope(e Event, eventID uuid.UUID, occurredAt time.Time) (Envelope, er
 	if e.SubjectID != nil {
 		env.SubjectID = e.SubjectID.String()
 	}
-	if e.Security != nil {
+	if e.Security != nil && IsLedgerEventType(e.EventType) {
 		env.Security = &EnvelopeSecurity{
 			AccountRef:        e.Security.AccountRef.String(),
 			ClientID:          e.Security.ClientID,
 			Scope:             e.Security.Scope,
 			DeviceFingerprint: e.Security.DeviceFingerprint,
+		}
+		if e.Security.IdentityBlindIndex != nil {
+			index := *e.Security.IdentityBlindIndex
+			env.Security.IdentityBlindIndex = &index
 		}
 	}
 	return env, nil

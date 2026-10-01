@@ -367,3 +367,9 @@ To prevent parallel write bottlenecks and lock contention inherent to multi-writ
 Where:
 * `audit_log_record(N)` is a deterministic canonical serialization of the record attributes (IDs, event types, payloads, timestamps).
 * The ledger's integrity is verified periodically by recalculating the chains. Any break in the sequence alerts the security operations team instantly.
+
+### Task 5.3 implementation boundary
+
+Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+
+Automatic security-ledger deletion, retained-island/checkpoint verification, external trust anchors, phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE or trigger-bypass privileges.

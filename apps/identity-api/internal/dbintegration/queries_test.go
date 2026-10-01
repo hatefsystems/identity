@@ -39,8 +39,9 @@ const testTimeout = 2 * time.Minute
 
 // openTestPool connects via pgx and fails when DATABASE_URL is absent/down.
 // It first applies the embedded goose migrations so the sqlc-generated schema
-// is guaranteed to exist even if another test suite rolled it back.
-func openTestPool(ctx context.Context, t *testing.T) *pgx.Conn {
+// exists, then isolates fixtures in a transaction. Soft deletion deliberately
+// retains email reservations, so it cannot serve as repeatable test cleanup.
+func openTestPool(ctx context.Context, t *testing.T) pgx.Tx {
 	t.Helper()
 
 	url := os.Getenv("DATABASE_URL")
@@ -63,7 +64,18 @@ func openTestPool(ctx context.Context, t *testing.T) *pgx.Conn {
 		t.Fatalf("connect query integration database: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close(context.Background()) })
-	return conn
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin query fixture transaction: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanup); err != nil && err != pgx.ErrTxClosed {
+			t.Errorf("roll back query fixtures: %v", err)
+		}
+	})
+	return tx
 }
 
 // ts wraps a time.Time as pgtype.Timestamptz (valid).
@@ -685,7 +697,7 @@ func TestRecoveryCodesQueries(t *testing.T) {
 	t.Run("BatchCreateAndCount", testRecoveryCodesBatchCreateCount(ctx, q))
 }
 
-func testRecoveryCodesAtomicVerifyDelete(ctx context.Context, conn *pgx.Conn, q *Queries) func(*testing.T) {
+func testRecoveryCodesAtomicVerifyDelete(ctx context.Context, conn pgx.Tx, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{Email: "codes-atomic@test.local", Status: "active"})
 		if err != nil {
@@ -934,9 +946,14 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		// share one — or arrive out of order — without that being tampering. seq is
 		// assigned by the database at insert and is the only total order the chain
 		// can be verified against.
+		head, err := q.GetAuditLogHighWaterSeq(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		page, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
-			AfterSeq:  0,
-			PageLimit: 1000,
+			ThroughSeq: head,
+			AfterSeq:   0,
+			PageLimit:  1000,
 		})
 		if err != nil {
 			t.Fatalf("ListAuditLogsForChainVerification: %v", err)
@@ -956,8 +973,9 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		// must not repeat it. An off-by-one here would make a verifier hash one
 		// record twice and report a break in an intact chain.
 		firstOnly, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
-			AfterSeq:  0,
-			PageLimit: 1,
+			ThroughSeq: head,
+			AfterSeq:   0,
+			PageLimit:  1,
 		})
 		if err != nil {
 			t.Fatalf("ListAuditLogsForChainVerification (page 1): %v", err)
@@ -966,8 +984,9 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 			t.Fatalf("expected exactly 1 record with PageLimit=1, got %d", len(firstOnly))
 		}
 		next, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
-			AfterSeq:  firstOnly[0].Seq,
-			PageLimit: 1,
+			ThroughSeq: head,
+			AfterSeq:   firstOnly[0].Seq,
+			PageLimit:  1,
 		})
 		if err != nil {
 			t.Fatalf("ListAuditLogsForChainVerification (page 2): %v", err)

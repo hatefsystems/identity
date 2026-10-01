@@ -93,13 +93,13 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 #### Admin Roles & Scopes
 1. **System Administrator (Super Admin):**
    - **Scope:** Infrastructure and Role Management.
-   - **Capabilities:** Can assign/revoke roles to other admins, modify system-wide configurations (e.g., rate limits).
+   - **Capabilities:** Can request content-free audit/ledger verification. Role provisioning uses a separately controlled, audited operator command; no HTTP role assignment is exposed.
    - **Restrictions:** Does NOT have access to read individual user raw data or private telemetry.
 
 2. **Trust & Safety / Content Moderator:**
    - **Scope:** Account Abuse Prevention.
    - **Capabilities:** Can **Suspend** or **Ban** abusive user accounts across the ecosystem to prevent platform-wide spam.
-   - **Restrictions:** Cannot Hard Delete users, and has no capabilities regarding client-specific data moderation (which are delegated to downstream clients like the Search Engine or Email Service). Banning a user deactivates the account and retains a hashed fingerprint to prevent re-registration, but does not wipe the soft-deleted data manually.
+   - **Restrictions:** Cannot Hard Delete users, and has no capabilities regarding client-specific data moderation (which are delegated to downstream clients like the Search Engine or Email Service). Banning restricts authentication indefinitely until explicit reactivation. It does not retain a re-registration fingerprint or erase account data. Persistent auth versions prevent old stateful credentials from reviving; downstream JWT authority is bounded by the existing maximum 10-minute lifetime.
 
 3. **Data Protection Officer (DPO):**
    - **Scope:** Compliance and Audit.
@@ -107,7 +107,7 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 
 4. **Support / Helpdesk:**
    - **Scope:** Basic User Assistance.
-   - **Capabilities:** Can view high-level account status (active/suspended) and trigger password reset flows.
+   - **Capabilities:** Can view account ID, status, MFA-enabled flag and lifecycle timestamps. Trigger-reset is outside Task 5.3.
    - **Restrictions:** No access to personal data, IPs, or behavioral history.
 
 #### The "Zero Trust" Admin Philosophy
@@ -185,3 +185,5 @@ The Identity Platform is isolated in its own repository (`hatefsystems/identity`
 ### Security First
 - **Never commit secrets:** Use environment variables and secret management tools.
 - **Review for Privacy:** Always consider the privacy implications of new features. Ensure data minimization and proper masking of PII in logs.
+
+Task 5.3 runtime and release boundaries: [Admin operations](admin-operations.md). DPO alone reads raw audit records and manages independent encrypted legal requests. Super Admin has no implicit legal or personal-data bypass. Holds are retention locks, not immutable snapshots; review dates are advisory.

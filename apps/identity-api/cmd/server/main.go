@@ -75,27 +75,28 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger)
-	if err != nil {
-		return err
-	}
-
-	dpopValidator, err := buildDPoPValidator()
-	if err != nil {
-		return err
-	}
-
-	sessionManager, err := buildSessionManager()
-	if err != nil {
-		return err
-	}
-
 	webauthnService, pool, err := buildWebAuthnService(cfg.Environment, logger)
 	if err != nil {
 		return err
 	}
 	if pool != nil {
 		defer pool.Close()
+	}
+	var accounts session.AccountState
+	if pool != nil {
+		accounts = session.NewDBAccountState(pool)
+	}
+	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger, accounts)
+	if err != nil {
+		return err
+	}
+	dpopValidator, err := buildDPoPValidator()
+	if err != nil {
+		return err
+	}
+	sessionManager, err := buildSessionManager(accounts)
+	if err != nil {
+		return err
 	}
 
 	redisClient, err := buildRedisClient(cfg.Environment, logger)
@@ -151,6 +152,26 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// Capture attribution before ordinary security events cross the async boundary.
+	if pool != nil && os.Getenv(config.EnvBlindIndexPepper) != "" {
+		pepper, err := config.LoadBlindIndexPepper()
+		if err != nil {
+			return err
+		}
+		indexer, err := blindindex.New(pepper)
+		if err != nil {
+			return err
+		}
+		auditRecorder, err = audit.NewIndexingRecorder(auditRecorder, db.New(pool), indexer, logger)
+		if err != nil {
+			return err
+		}
+	}
+	adminDeps, err := buildAdminServices(cfg.Admin, cfg.Environment, pool, redisClient)
+	if err != nil {
+		return err
+	}
+
 	// The GDPR privacy service reuses the WebAuthn database pool, the session
 	// manager and refresh-token store (both revoked at soft-delete), the two factor
 	// verifiers (as the reclaim ceremony's factors), and Redis for rate limiting and
@@ -165,6 +186,15 @@ func run(logger *slog.Logger) error {
 	}
 
 	srv := server.New(cfg, logger, server.Deps{
+		AdminActions: adminDeps.AdminActions,
+		AdminReady:   adminDeps.AdminReady,
+		AdminRevoke: func(userID string) error {
+			return errors.Join(sessionManager.RevokeAllForUser(userID), refreshTokenStore.RevokeAllForUser(userID))
+		},
+		AdminStore:     adminDeps.AdminStore,
+		RBAC:           adminDeps.RBAC,
+		LegalHold:      adminDeps.LegalHold,
+		AdminLimiter:   adminDeps.AdminLimiter,
 		OIDC:           oidcCfg,
 		Keys:           keyManager,
 		Clients:        clientRegistry,
@@ -292,6 +322,7 @@ func buildTokenService(
 	keyManager *keys.Manager,
 	clientRegistry *clients.StaticRegistry,
 	logger *slog.Logger,
+	accounts session.AccountState,
 ) (*token.Service, token.RefreshTokenStore, error) {
 	tokenEndpoint := oidcCfg.Issuer + "/oauth2/token"
 	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, clientauth.NewMemoryJTIGuard())
@@ -301,7 +332,7 @@ func buildTokenService(
 
 	refreshTokens := token.NewMemoryRefreshTokenStore()
 	svc, err := token.NewService(
-		token.Config{Issuer: oidcCfg.Issuer},
+		token.Config{Issuer: oidcCfg.Issuer, AccountState: accounts},
 		keyManager,
 		clientRegistry,
 		token.NewMemoryCodeStore(),
@@ -339,7 +370,7 @@ func buildDPoPValidator() (*dpop.Validator, error) {
 // name/Secure and the two TTLs) is loaded from the environment; the
 // __Host-/Secure invariant is enforced inside NewCookieCodec so a misconfigured
 // dev override fails fast at startup.
-func buildSessionManager() (*session.Manager, error) {
+func buildSessionManager(accounts session.AccountState) (*session.Manager, error) {
 	sc, err := config.LoadSession()
 	if err != nil {
 		return nil, err
@@ -355,8 +386,9 @@ func buildSessionManager() (*session.Manager, error) {
 	}
 
 	manager, err := session.NewManager(session.NewMemoryStore(), codec, session.ManagerConfig{
-		AbsoluteTTL: sc.AbsoluteTTL,
-		IdleTTL:     sc.IdleTTL,
+		AccountState: accounts,
+		AbsoluteTTL:  sc.AbsoluteTTL,
+		IdleTTL:      sc.IdleTTL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("main: build session manager: %w", err)
@@ -417,6 +449,7 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 
 	queries := db.New(pool)
 	svc, err := webauthn.New(webauthn.Config{
+		AccountState:     session.NewDBAccountState(pool),
 		RPID:             wc.RPID,
 		RPDisplayName:    wc.RPDisplayName,
 		RPOrigins:        wc.RPOrigins,
@@ -501,6 +534,11 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		return nil, err
 	}
 
+	if os.Getenv(config.EnvBlindIndexPepper) == "" {
+		logger.Warn("SMS OTP service disabled (requires ENVELOPE_BLIND_INDEX_PEPPER)")
+		return nil, nil
+	}
+
 	cryptoCfg, err := config.LoadCrypto()
 	if err != nil {
 		return nil, err
@@ -567,7 +605,7 @@ func buildMFAService(pool *pgxpool.Pool, logger *slog.Logger) (*mfa.Service, err
 		return nil, nil
 	}
 
-	cryptoCfg, err := config.LoadCrypto()
+	cryptoCfg, err := config.LoadEnvelopeCrypto()
 	if err != nil {
 		return nil, err
 	}
@@ -741,6 +779,7 @@ func buildStepUpService(
 	}
 
 	svc, err := stepup.New(stepup.Config{
+		AccountState:        session.NewDBAccountState(pool),
 		Issuer:              oidcCfg.Issuer,
 		TokenTTL:            sc.TokenTTL,
 		PerAccountPerMinute: sc.PerAccountPerMinute,
@@ -864,7 +903,7 @@ func buildPrivacyService(
 	// The backup email is envelope-encrypted at rest, so a decryptor is required to
 	// notify the second mailbox — which is what protects a user whose primary
 	// mailbox was taken over as part of the takeover that triggered the deletion.
-	cryptoCfg, err := config.LoadCrypto()
+	cryptoCfg, err := config.LoadEnvelopeCrypto()
 	if err != nil {
 		return nil, err
 	}

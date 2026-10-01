@@ -49,6 +49,9 @@ type Store interface {
 	// GetUserEmailForBlindIndex returns the account's email so the signer can derive
 	// identity_blind_index. It returns pgx.ErrNoRows once the subject is purged.
 	GetUserEmailForBlindIndex(ctx context.Context, id uuid.UUID) (string, error)
+	// LockAuditSubjects returns and locks surviving optional FK attachments in
+	// UUID order until the batch transaction commits.
+	LockAuditSubjects(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error)
 	// InsertAuditLogs batch-writes audit rows via COPY.
 	InsertAuditLogs(ctx context.Context, arg []db.InsertAuditLogsParams) (int64, error)
 	// InsertSecurityEvents batch-writes ledger rows via COPY.

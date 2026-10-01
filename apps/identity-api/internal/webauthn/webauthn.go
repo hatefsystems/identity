@@ -33,6 +33,8 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // userHandleByteLen is the size of the WebAuthn user handle: a random 64-bit
@@ -45,6 +47,7 @@ const userHandleByteLen = 8
 // WebAuthn service. Values originate from the environment (see
 // config.LoadWebAuthn); nothing here is secret.
 type Config struct {
+	AccountState session.AccountState
 	// RPID is the Relying Party ID: the effective domain of the IdP with no
 	// scheme, port, or path (e.g. "identity.hatef.ir"). The authenticator binds
 	// credentials to this value and it must be a registrable suffix of every
@@ -112,6 +115,7 @@ type Service struct {
 	creds      CredentialStore
 	challenges ChallengeStore
 	tx         Transacter
+	accounts   session.AccountState
 	// challengeTTL is the validity window stamped onto each pending ceremony.
 	challengeTTL time.Duration
 	// residentKey is the residentKey requirement applied to registration.
@@ -205,6 +209,7 @@ func New(cfg Config, users UserStore, creds CredentialStore, challenges Challeng
 
 	svc := &Service{
 		wa:              wa,
+		accounts:        cfg.AccountState,
 		users:           users,
 		creds:           creds,
 		challenges:      challenges,

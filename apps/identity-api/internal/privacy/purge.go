@@ -51,6 +51,9 @@ type PurgeStore interface {
 // fail-closed legal-hold behaviour and of dry-run mode, and is otherwise
 // unobservable without a live database.
 type SubjectTx interface {
+	// LockAccount must precede every deciding user/hold read. It shares the
+	// stable account advisory lock with legalhold, even without a users row.
+	LockAccount(ctx context.Context, account uuid.UUID) error
 	// Store returns the transaction-bound query set.
 	Store() PurgeStore
 	// Commit makes the subject's delete and its outbox event durable together.
@@ -293,8 +296,13 @@ func (p *Purger) purgeSubject(ctx context.Context, userID uuid.UUID, cutoff time
 	}()
 	store := tx.Store()
 
-	// Lock order: users first, then children. The soft-delete-blind variant is
-	// mandatory here — the filtered lock cannot see a pending_deletion row.
+	if err := tx.LockAccount(ctx, userID); err != nil {
+		p.failSubject(ctx, userID, "lock_account", err)
+		return outcomeFailed
+	}
+	// Lock order: subject advisory lock, then user, then children. This read is
+	// a separate READ COMMITTED statement after any wait on the subject lock.
+	// The soft-delete-blind variant must see pending_deletion rows.
 	user, err := store.GetUserForUpdateIncludingDeleted(ctx, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -354,9 +362,9 @@ func (p *Purger) purgeSubject(ctx context.Context, userID uuid.UUID, cutoff time
 		return outcomeFailed
 	}
 	if affected != 1 {
-		// Either a reclaim won the row, or the query's own NOT EXISTS legal-hold
-		// predicate caught a hold applied since the check above (the TOCTOU this
-		// predicate exists to close). Roll back without enqueuing an event: an
+		// The query predicates are defense in depth; the shared subject lock,
+		// not a statement snapshot, prevents concurrent hold insertion. Roll
+		// back without enqueuing an event: an
 		// identity.user.deleted for a subject that still exists would have
 		// downstream services scrub live data.
 		p.record(ctx, audit.Event{
@@ -460,6 +468,10 @@ func (o *PgSubjectTxOpener) BeginSubject(ctx context.Context) (SubjectTx, error)
 	if err != nil {
 		return nil, fmt.Errorf("privacy: begin subject transaction: %w", err)
 	}
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, fmt.Errorf("privacy: subject transaction isolation: %w", err)
+	}
 	return &pgSubjectTx{tx: tx, store: db.New(tx)}, nil
 }
 
@@ -471,6 +483,9 @@ type pgSubjectTx struct {
 
 func (t *pgSubjectTx) Store() PurgeStore                { return t.store }
 func (t *pgSubjectTx) Commit(ctx context.Context) error { return t.tx.Commit(ctx) }
+func (t *pgSubjectTx) LockAccount(ctx context.Context, account uuid.UUID) error {
+	return pglock.LockAccount(ctx, t.tx, account)
+}
 
 // Rollback discards the transaction. pgx.ErrTxClosed is swallowed so the deferred
 // rollback after a successful commit is a no-op rather than a spurious error.

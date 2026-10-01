@@ -215,7 +215,7 @@ func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 			}
 		}
 
-		userID, err := s.deps.RecoveryFlow.Verify(r.Context(), req.TransactionID, req.Code, clientip.FromRequest(r))
+		userID, authVersion, err := s.deps.RecoveryFlow.VerifyWithVersion(r.Context(), req.TransactionID, req.Code, clientip.FromRequest(r))
 		if err != nil {
 			// auth.recovery_code.verify_failed is deliberately not recorded here.
 			// FlowService.Verify returns uuid.Nil for every failure, and Start binds
@@ -243,11 +243,13 @@ func (s *Server) handleRecoveryVerify() http.HandlerFunc {
 			Security: &audit.SecurityContext{AccountRef: userID},
 		})
 
-		if _, err := s.deps.SessionManager.Issue(w, session.IssueParams{
-			UserID:    userID.String(),
-			IP:        clientip.FromRequest(r),
-			UserAgent: r.UserAgent(),
-			Kind:      session.KindRecoveryEnrollment,
+		if _, err := s.deps.SessionManager.IssueContext(r.Context(), w, session.IssueParams{
+			UserID:         userID.String(),
+			AuthVersion:    authVersion,
+			AuthVersionSet: true,
+			IP:             clientip.FromRequest(r),
+			UserAgent:      r.UserAgent(),
+			Kind:           session.KindRecoveryEnrollment,
 		}); err != nil {
 			// The code has already been physically deleted. Fail closed rather
 			// than attempting to resurrect a credential after session failure.

@@ -55,8 +55,8 @@ func TestNewEnvelopeStampsSchemaVersionAndUTC(t *testing.T) {
 	if env.OccurredAt.Location() != time.UTC {
 		t.Errorf("OccurredAt location = %s, want UTC", env.OccurredAt.Location())
 	}
-	if !env.OccurredAt.Equal(fixedTime) {
-		t.Errorf("OccurredAt = %s, want the same instant as %s", env.OccurredAt, fixedTime)
+	if !env.OccurredAt.Equal(NormalizeChainTime(fixedTime)) {
+		t.Errorf("OccurredAt = %s, want PostgreSQL precision %s", env.OccurredAt, NormalizeChainTime(fixedTime))
 	}
 }
 

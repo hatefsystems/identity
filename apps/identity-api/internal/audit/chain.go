@@ -62,6 +62,8 @@ var ErrInvalidChainHash = errors.New("audit: stored chain_hash is not a 64-chara
 // rest of the row byte-identical. Hashing it would make every purged subject's rows
 // fail verification forever — a correct erasure presenting as permanent tampering.
 // Post-deletion attribution is security_event_ledger's job. See the package doc.
+//
+//revive:disable-next-line:exported -- Paired with LedgerRecord in the public chain format.
 type AuditRecord struct {
 	ID            string
 	ActorID       string
@@ -70,7 +72,7 @@ type AuditRecord struct {
 	ActionStatus  string
 	ClientIP      string
 	UserAgent     string
-	// Payload is the persisted JSONB text exactly as stored. The publisher
+	// Payload is the persisted TEXT exactly as stored. The publisher
 	// serializes the payload once and ships the string so the hashed bytes and the
 	// stored bytes cannot diverge through a re-marshal.
 	Payload   string
@@ -160,20 +162,26 @@ func DecodeChainHash(stored string) ([sha256.Size]byte, error) {
 	return out, nil
 }
 
-// FormatChainTime renders a timestamp for hashing: UTC, RFC 3339 with nanoseconds.
-//
-// Normalizing to UTC matters because timestamptz carries no zone through
-// PostgreSQL — a value written as +03:30 comes back as UTC, so hashing the
-// publisher's local rendering would never verify. Nanosecond precision is used
-// because PostgreSQL stores microseconds; truncating further would make two
-// distinct rows hash the same field value.
+// NormalizeChainTime prepares new timestamps for PostgreSQL's microsecond
+// precision before hashing AND insertion. Do not apply it as a historical repair:
+// existing hashes must be verified against exactly the values that survived.
+func NormalizeChainTime(t time.Time) time.Time {
+	return t.UTC().Truncate(time.Microsecond)
+}
+
+// FormatChainTime renders the exact supplied timestamp in UTC. RFC3339Nano
+// preserves microseconds without changing the existing serialization contract.
 func FormatChainTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // appendField writes uint32be(len(s)) || s.
 func appendField(dst []byte, s string) []byte {
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(s)))
+	length := len(s)
+	if length < 0 || length > 1<<32-1 {
+		panic("audit: field exceeds serialization limit")
+	}
+	dst = binary.BigEndian.AppendUint32(dst, uint32(length))
 	return append(dst, s...)
 }
 

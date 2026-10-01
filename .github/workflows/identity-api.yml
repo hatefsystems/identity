@@ -75,6 +75,9 @@ jobs:
       - name: Build identity API
         run: npm exec -- nx run identity-api:build --skipNxCache
 
+      - name: Build admin operational commands
+        run: npm exec -- nx run-many -t build-admin-audit-publisher,build-admin-roles,build-admin-legal -p identity-api --skipNxCache
+
   security-db:
     name: PostgreSQL security integration tests
     runs-on: ubuntu-latest
@@ -95,8 +98,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     env:
       DATABASE_URL: postgres://identity:identity_test_password@127.0.0.1:5432/identity?sslmode=disable
+      REDIS_URL: redis://127.0.0.1:6379/0
+      NATS_URL: nats://127.0.0.1:4222
 
     steps:
       - name: Check out repository
@@ -120,5 +135,11 @@ jobs:
           npm --version
           npm ci
 
+      - name: Start disposable NATS JetStream
+        run: docker run --detach --name admin-test-nats --publish 127.0.0.1:4222:4222 nats:2.10-alpine -js
+
       - name: Run serial database security tests
         run: npm exec -- nx run identity-api:test-security-db --skipNxCache
+
+      - name: Run mandatory admin and audit integration tests
+        run: npm exec -- nx run identity-api:test-admin-integration --skipNxCache

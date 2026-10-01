@@ -44,7 +44,7 @@
 //	AUDIT_ACK_WAIT              redelivery timeout (default 60s)
 //	AUDIT_MAX_DELIVER           redelivery attempts (default 5)
 //	SECURITY_LEDGER_RETENTION   ledger retain_until offset (default 8760h)
-//	BLIND_INDEX_PEPPER          required to populate identity_blind_index
+//	ENVELOPE_BLIND_INDEX_PEPPER shared producer/lookup key for legacy index capture
 //
 // Credentials are never hardcoded (DoD #3).
 //
@@ -255,17 +255,17 @@ func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // The degradation is logged loudly because it is silent in the data: a NULL index is
 // indistinguishable from a purged subject's NULL.
 //
-// LoadCrypto's own rules still apply, so this can only be reached in development;
-// outside it, a missing pepper is a configuration error that fails here.
+// The signer only needs the shared pepper, not legal narrative encryption keys.
+// The caller enforces the non-development failure policy.
 func buildBlindIndexer(environment string, logger *slog.Logger) (*blindindex.Indexer, bool) {
-	cryptoCfg, err := config.LoadCrypto()
+	pepper, err := config.LoadBlindIndexPepper()
 	if err != nil {
 		logger.Error("audit-signer: crypto config unavailable; ledger rows will have a NULL identity_blind_index",
 			slog.String("environment", environment),
 			slog.String("error", err.Error()))
 		return nil, false
 	}
-	indexer, err := blindindex.New(cryptoCfg.BlindIndexPepper)
+	indexer, err := blindindex.New(pepper)
 	if err != nil {
 		logger.Error("audit-signer: blind indexer unavailable; ledger rows will have a NULL identity_blind_index",
 			slog.String("environment", environment),

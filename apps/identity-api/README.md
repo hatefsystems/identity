@@ -226,3 +226,7 @@ Then verify:
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
 ```
+
+## Admin runtime and operator commands
+
+Task 5.3 is opt-in (`ADMIN_ENABLED=false` by default). See [admin operations](../../docs/admin-operations.md) and [API contract](../../docs/api-design.md#17-admin--moderation-api). `admin-roles` performs audited operator provisioning; `admin-legal` handles bounded encryption backfill, released metadata cleanup and the deployed signer lookup probe. `admin-audit-publisher` drains durable intent with JetStream acknowledgement. All commands have Nx run/build targets. No HTTP role assignment or trigger-reset endpoint is mounted.

@@ -368,17 +368,20 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 			return
 		}
 
-		userID, err := s.deps.WebAuthn.FinishLogin(r.Context(), body)
+		login, err := s.deps.WebAuthn.FinishLoginVersioned(r.Context(), body)
 		if err != nil {
 			s.recordLoginFailed(r, err)
 			s.writeWebAuthnLoginError(w, "finish login", err)
 			return
 		}
 
-		if _, err := s.deps.SessionManager.Issue(w, session.IssueParams{
-			UserID:    userID.String(),
-			IP:        clientip.FromRequest(r),
-			UserAgent: r.UserAgent(),
+		userID := login.ID
+		if _, err := s.deps.SessionManager.IssueContext(r.Context(), w, session.IssueParams{
+			AuthVersion:    login.AuthVersion,
+			AuthVersionSet: true,
+			UserID:         userID.String(),
+			IP:             clientip.FromRequest(r),
+			UserAgent:      r.UserAgent(),
 		}); err != nil {
 			s.logger.Error("webauthn: issue session after login failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})

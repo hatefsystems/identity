@@ -55,7 +55,7 @@ func (rs *RequireStepUp) Handler(next http.Handler) http.Handler {
 			// error rather than an authentication failure. Treated the same way
 			// server.webauthnSessionUser treats the identical condition.
 			rs.logger.Error("stepup: middleware reached without a session in context",
-				slog.String("path", r.URL.Path))
+				slog.String("method", r.Method))
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -95,7 +95,7 @@ func (rs *RequireStepUp) writeChallenge(w http.ResponseWriter, r *http.Request, 
 		// with a session it was not minted for.
 		if errors.Is(err, ErrGrantConsumed) || errors.Is(err, ErrGrantNotForSession) {
 			rs.logger.Warn("stepup: grant rejected",
-				slog.String("path", r.URL.Path),
+				slog.String("method", r.Method),
 				slog.String("reason", err.Error()))
 		}
 		rs.writeJSON(w, http.StatusForbidden, challengeResponse{
@@ -104,7 +104,7 @@ func (rs *RequireStepUp) writeChallenge(w http.ResponseWriter, r *http.Request, 
 		})
 	default:
 		rs.logger.Error("stepup: grant validation failed",
-			slog.String("path", r.URL.Path),
+			slog.String("method", r.Method),
 			slog.String("error", err.Error()))
 		rs.writeJSON(w, http.StatusInternalServerError, challengeResponse{Error: "server_error"})
 	}

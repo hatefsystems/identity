@@ -271,23 +271,36 @@ func (s *Service) Status(ctx context.Context, userID uuid.UUID) (*StatusResult, 
 // ErrInvalidCode so nothing distinguishes them to the caller. clientIP feeds the
 // optional per-subnet rate limit.
 func (s *Service) Verify(ctx context.Context, userID uuid.UUID, code, clientIP string) error {
+	_, err := s.VerifyWithVersion(ctx, userID, code, clientIP)
+	return err
+}
+
+// VerifyWithVersion returns the authorization version captured while the user
+// and recovery code are locked, never a later version observed after a ban.
+func (s *Service) VerifyWithVersion(ctx context.Context, userID uuid.UUID, code, clientIP string) (int64, error) {
 	if err := s.checkRateLimits(ctx, userID, clientIP, "verify"); err != nil {
-		return err
+		return 0, err
 	}
 	// Apply limits before resolving the account. Anonymous recovery uses a
 	// deterministic decoy subject for unknown identities, so real and decoy
 	// attempts consume the same account/subnet budgets and follow the same path.
 	if _, err := s.loadUser(ctx, userID); err != nil {
-		return err
+		return 0, err
 	}
 
 	normalized := Normalize(code)
 	if normalized == "" {
-		return ErrInvalidCode
+		return 0, ErrInvalidCode
 	}
 	hash := hashCode(s.hashPepper, normalized)
 
-	return s.runInTx(ctx, func(store Store) error {
+	var version int64
+	err := s.runInTx(ctx, func(store Store) error {
+		user, err := s.lockUserForRegeneration(ctx, store, userID)
+		if err != nil {
+			return err
+		}
+		version = user.AuthVersion
 		row, err := store.GetActiveRecoveryCodeForUpdate(ctx, db.GetActiveRecoveryCodeForUpdateParams{
 			CodeHash: hash,
 			UserID:   userID,
@@ -318,6 +331,10 @@ func (s *Service) Verify(ctx context.Context, userID uuid.UUID, code, clientIP s
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 // buildBatch generates s.count distinct codes, returning the formatted plaintext
