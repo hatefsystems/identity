@@ -41,8 +41,12 @@ type fakeStore struct {
 	mu                     sync.Mutex
 	latestAuditHash        string
 	latestAuditErr         error
-	latestLedgerHash       string
-	latestLedgerErr        error
+	head                   db.GetSignerLedgerHeadRow
+	headErr                error
+	advanceErr             error
+	advancedHeads          []db.AdvanceSecurityLedgerHeadParams
+	onHeadRead             func()
+	onSubjectLock          func()
 	existingAuditIDs       []uuid.UUID
 	existingLedgerIDs      []uuid.UUID
 	userEmails             map[uuid.UUID]string
@@ -61,13 +65,24 @@ func (s *fakeStore) GetLatestAuditLogChainHash(_ context.Context) (string, error
 	return s.latestAuditHash, nil
 }
 
-func (s *fakeStore) GetLatestSecurityEventChainHash(_ context.Context) (string, error) {
+func genesisLedgerHead() db.GetSignerLedgerHeadRow {
+	return db.GetSignerLedgerHeadRow{Seq: 0, ChainHash: strings.Repeat("0", 64), StateValid: true}
+}
+
+func (s *fakeStore) GetSignerLedgerHead(_ context.Context) (db.GetSignerLedgerHeadRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.latestLedgerErr != nil {
-		return "", s.latestLedgerErr
+	if s.onHeadRead != nil {
+		s.onHeadRead()
 	}
-	return s.latestLedgerHash, nil
+	return s.head, s.headErr
+}
+
+func (s *fakeStore) AdvanceSecurityLedgerHead(_ context.Context, arg db.AdvanceSecurityLedgerHeadParams) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.advancedHeads = append(s.advancedHeads, arg)
+	return s.advanceErr
 }
 
 func (s *fakeStore) FilterExistingAuditLogIDs(_ context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
@@ -115,6 +130,9 @@ func (s *fakeStore) GetUserEmailForBlindIndex(_ context.Context, id uuid.UUID) (
 }
 
 func (s *fakeStore) LockAuditSubjects(_ context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	if s.onSubjectLock != nil {
+		s.onSubjectLock()
+	}
 	if s.subjectLockErr != nil {
 		return nil, s.subjectLockErr
 	}
@@ -142,14 +160,30 @@ func (s *fakeStore) InsertSecurityEvents(_ context.Context, arg []db.InsertSecur
 }
 
 type fakeBatchTx struct {
-	store      *fakeStore
-	committed  bool
-	rolledBack bool
-	commitErr  error
-	onCommit   func()
+	store            *fakeStore
+	committed        bool
+	rolledBack       bool
+	commitErr        error
+	onCommit         func()
+	onAccounts       func([]uuid.UUID) error
+	onRollback       func(context.Context)
+	validationErr    error
+	validatedThrough []int64
 }
 
 func (t *fakeBatchTx) Store() Store { return t.store }
+
+func (t *fakeBatchTx) LockAccounts(_ context.Context, ids []uuid.UUID) error {
+	if t.onAccounts != nil {
+		return t.onAccounts(ids)
+	}
+	return nil
+}
+
+func (t *fakeBatchTx) ValidateLedgerState(_ context.Context, through int64) error {
+	t.validatedThrough = append(t.validatedThrough, through)
+	return t.validationErr
+}
 
 func (t *fakeBatchTx) Commit(_ context.Context) error {
 	if t.onCommit != nil {
@@ -162,8 +196,11 @@ func (t *fakeBatchTx) Commit(_ context.Context) error {
 	return nil
 }
 
-func (t *fakeBatchTx) Rollback(_ context.Context) error {
+func (t *fakeBatchTx) Rollback(ctx context.Context) error {
 	t.rolledBack = true
+	if t.onRollback != nil {
+		t.onRollback(ctx)
+	}
 	return nil
 }
 
@@ -355,8 +392,8 @@ func TestSignerFailsClosedOnLockContention(t *testing.T) {
 func TestSignerGenesisChainTips(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditErr:  pgx.ErrNoRows,
-		latestLedgerErr: pgx.ErrNoRows,
+		latestAuditErr: pgx.ErrNoRows,
+		head:           genesisLedgerHead(),
 	}
 	opener := &fakeBatchTxOpener{tx: &fakeBatchTx{store: store}}
 	fetcher := &fakeFetcher{}
@@ -395,9 +432,9 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 	userEmail := "alice@example.test"
 
 	store := &fakeStore{
-		latestAuditErr:  pgx.ErrNoRows,
-		latestLedgerErr: pgx.ErrNoRows,
-		userEmails:      map[uuid.UUID]string{accountRef: userEmail},
+		latestAuditErr: pgx.ErrNoRows,
+		head:           genesisLedgerHead(),
+		userEmails:     map[uuid.UUID]string{accountRef: userEmail},
 	}
 	batchTx := &fakeBatchTx{store: store}
 	opener := &fakeBatchTxOpener{tx: batchTx}
@@ -599,7 +636,7 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 
 	store := &fakeStore{
 		latestAuditErr:   pgx.ErrNoRows,
-		latestLedgerErr:  pgx.ErrNoRows,
+		head:             genesisLedgerHead(),
 		existingAuditIDs: []uuid.UUID{dupID},
 	}
 	batchTx := &fakeBatchTx{store: store}
@@ -652,8 +689,8 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 func TestSignerCommitFailureRollsBackAndNaks(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditHash:  strings.Repeat("a", 64),
-		latestLedgerHash: strings.Repeat("b", 64),
+		latestAuditHash: strings.Repeat("a", 64),
+		head:            db.GetSignerLedgerHeadRow{Seq: 8, ChainHash: strings.Repeat("b", 64), StateValid: true},
 	}
 	batchTx := &fakeBatchTx{
 		store:     store,
@@ -701,8 +738,8 @@ func TestSignerCommitFailureRollsBackAndNaks(t *testing.T) {
 func TestSignerGracefulShutdown(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditErr:  pgx.ErrNoRows,
-		latestLedgerErr: pgx.ErrNoRows,
+		latestAuditErr: pgx.ErrNoRows,
+		head:           genesisLedgerHead(),
 	}
 	batchTx := &fakeBatchTx{store: store}
 	opener := &fakeBatchTxOpener{tx: batchTx}

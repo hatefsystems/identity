@@ -14,6 +14,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/ledgerproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
@@ -40,9 +41,11 @@ type Deps struct {
 	AdminRevoke  func(string) error
 	AdminActions *adminaction.Service
 	AdminStore   AdminStore
-	RBAC         rbac.PermissionChecker
-	LegalHold    *legalhold.Service
-	AdminLimiter ratelimit.Limiter
+	// LedgerProofDB opens a snapshot separate from the admin audit transaction.
+	LedgerProofDB ledgerproof.Beginner
+	RBAC          rbac.PermissionChecker
+	LegalHold     *legalhold.Service
+	AdminLimiter  ratelimit.Limiter
 	// OIDC provides the issuer identity used to build the discovery document.
 	OIDC config.OIDCConfig
 	// Keys is the signing keystore backing /oauth2/jwks; when nil, the OIDC

@@ -32,6 +32,9 @@ var ErrLockUnavailable = errors.New("signer: another audit signer holds the advi
 // ErrChainTipsUnknown is fatal: no further batch may use uncertain cached tips.
 var ErrChainTipsUnknown = errors.New("signer: chain tips unknown after commit failure")
 
+// ErrLedgerStateInvalid prevents appends to an uninitialized or inconsistent ledger.
+var ErrLedgerStateInvalid = errors.New("signer: invalid durable ledger state")
+
 // quarantineNamespace derives the event id of a synthesized
 // audit.pipeline.undecodable record from the offending message's stream position.
 //
@@ -94,9 +97,9 @@ type Signer struct {
 	logger   *slog.Logger
 	now      func() time.Time
 
-	// auditTip and ledgerTip are the raw predecessor digests for the next record in
-	// each chain. They are a cache of the database: any commit failure invalidates
-	// them and they are re-read before the retry.
+	// auditTip is cached while the daemon holds the single-writer lock. ledgerTip
+	// records the last observed logical head; every batch re-reads it under the
+	// ledger coordination lock rather than trusting surviving payload rows.
 	auditTip    [sha256.Size]byte
 	ledgerTip   [sha256.Size]byte
 	tipsUnknown bool
@@ -230,7 +233,7 @@ func (s *Signer) RunUntilDone(ctx context.Context) error {
 		}
 
 		if err := s.processBatch(ctx, msgs); err != nil {
-			if errors.Is(err, ErrChainTipsUnknown) {
+			if errors.Is(err, ErrChainTipsUnknown) || errors.Is(err, ErrLedgerStateInvalid) {
 				return err
 			}
 			s.logger.Error("signer: batch failed; messages will be redelivered",
@@ -245,18 +248,50 @@ func (s *Signer) RunUntilDone(ctx context.Context) error {
 
 // seedChainTips reads both chain tips from the database.
 func (s *Signer) seedChainTips(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, BatchTimeout)
+	defer cancel()
+	// Class C cannot be purged and the daemon lock excludes another signer.
+	// Read it before opening a transaction so even a one-connection pool works.
 	auditTip, err := s.readTip(ctx, s.store.GetLatestAuditLogChainHash)
 	if err != nil {
 		return fmt.Errorf("signer: read audit chain tip: %w", err)
 	}
-	ledgerTip, err := s.readTip(ctx, s.store.GetLatestSecurityEventChainHash)
+	tx, err := s.opener.BeginBatch(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.rollbackBatch(ctx, tx)
+	ledgerSeq, ledgerTip, err := readLedgerHead(ctx, tx.Store())
 	if err != nil {
 		return fmt.Errorf("signer: read ledger chain tip: %w", err)
+	}
+	if err := tx.ValidateLedgerState(ctx, ledgerSeq); err != nil {
+		return fmt.Errorf("signer: verify ledger state: %w", err)
 	}
 	s.auditTip = auditTip
 	s.ledgerTip = ledgerTip
 	s.tipsUnknown = false
 	return nil
+}
+
+func readLedgerHead(ctx context.Context, store Store) (int64, [sha256.Size]byte, error) {
+	head, err := store.GetSignerLedgerHead(ctx)
+	if err != nil {
+		return 0, [sha256.Size]byte{}, fmt.Errorf("%w: read head: %w", ErrLedgerStateInvalid, err)
+	}
+	tip, err := audit.DecodeChainHash(head.ChainHash)
+	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.GenesisChainHash) {
+		return 0, [sha256.Size]byte{}, ErrLedgerStateInvalid
+	}
+	return head.Seq, tip, nil
+}
+
+func (s *Signer) rollbackBatch(ctx context.Context, tx BatchTx) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+	if err := tx.Rollback(cleanupCtx); err != nil {
+		s.logger.Error("signer: rollback batch transaction", slog.String("error", err.Error()))
+	}
 }
 
 // readTip fetches one chain tip, treating an empty table as genesis.
@@ -315,19 +350,18 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		s.nakAll(msgs)
 		return err
 	}
-	defer func() {
-		if rbErr := tx.Rollback(batchCtx); rbErr != nil {
-			s.logger.Error("signer: rollback batch transaction", slog.String("error", rbErr.Error()))
-		}
-	}()
+	defer s.rollbackBatch(batchCtx, tx)
 
 	store := tx.Store()
 
-	// Both chains advance from the in-memory tips. They are only committed back to
-	// the Signer once the transaction commits, so a rollback leaves the cached tips
-	// exactly where the database still is.
+	// BeginBatch holds the ledger lock before any account/subject lock. A separate
+	// READ COMMITTED statement sees the latest committed head after a lock wait.
 	auditTip := s.auditTip
-	ledgerTip := s.ledgerTip
+	ledgerSeq, ledgerTip, err := readLedgerHead(batchCtx, store)
+	if err != nil {
+		s.nakAll(msgs)
+		return err
+	}
 
 	// Quarantine records are chained first, and before the real events, so the
 	// incident is ordered ahead of everything that followed it in the same batch.
@@ -343,10 +377,21 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 	stats.duplicatesSkipped = skipped
 
 	subjectIDs := make([]uuid.UUID, 0, len(kept))
+	accountIDs := make([]uuid.UUID, 0, 2*len(kept))
 	for _, rec := range kept {
 		if id, err := uuid.Parse(rec.envelope.SubjectID); err == nil && id != uuid.Nil {
 			subjectIDs = append(subjectIDs, id)
+			accountIDs = append(accountIDs, id)
 		}
+		if security := rec.envelope.Security; security != nil {
+			if id, err := uuid.Parse(security.AccountRef); err == nil && id != uuid.Nil {
+				accountIDs = append(accountIDs, id)
+			}
+		}
+	}
+	if err := tx.LockAccounts(batchCtx, accountIDs); err != nil {
+		s.nakAll(msgs)
+		return fmt.Errorf("signer: lock accounts: %w", err)
 	}
 	liveSubjects := make(map[uuid.UUID]bool, len(subjectIDs))
 	if len(subjectIDs) > 0 {
@@ -422,6 +467,13 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 			s.nakAll(msgs)
 			return fmt.Errorf("signer: copy ledger rows: %w", err)
 		}
+		if err := store.AdvanceSecurityLedgerHead(batchCtx, db.AdvanceSecurityLedgerHeadParams{
+			ExpectedSeq: ledgerSeq,
+			TerminalID:  ledgerRows[len(ledgerRows)-1].ID,
+		}); err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: advance ledger head: %w", err)
+		}
 	}
 
 	if err := tx.Commit(batchCtx); err != nil {
@@ -430,7 +482,11 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		// batch is chained again.
 		s.nakAll(msgs)
 		s.tipsUnknown = true
-		if seedErr := s.seedChainTips(batchCtx); seedErr != nil {
+		// End the uncertain transaction before taking a fresh coordination lock.
+		s.rollbackBatch(batchCtx, tx)
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.WithoutCancel(ctx), BatchTimeout)
+		defer recoveryCancel()
+		if seedErr := s.seedChainTips(recoveryCtx); seedErr != nil {
 			return fmt.Errorf("%w: commit: %v; reseed: %v", ErrChainTipsUnknown, err, seedErr)
 		}
 		return fmt.Errorf("signer: commit batch: %w", err)

@@ -494,8 +494,8 @@ func TestLegalMaintenanceHoldPrecedenceAndTombstoneIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		// Exercise the future maintenance predicate only in a rolled-back,
-		// table-locked transaction. No API trigger bypass or deletion is committed.
+		// Hold release changes eligibility, never the signed expiration. Actual
+		// erasure and real-role enforcement are covered by retentiondbintegration.
 		tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			t.Fatal(err)
@@ -504,18 +504,14 @@ func TestLegalMaintenanceHoldPrecedenceAndTombstoneIntegration(t *testing.T) {
 		if err := pglock.LockAccount(f.ctx, tx, account); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(f.ctx, "ALTER TABLE security_event_ledger DISABLE TRIGGER trg_security_event_ledger_append_only"); err != nil {
+		var eligible bool
+		if err := tx.QueryRow(f.ctx, `SELECT EXISTS (SELECT 1 FROM security_event_ledger l
+WHERE l.account_ref=$1 AND l.retain_until < now()
+AND NOT EXISTS (SELECT 1 FROM legal_holds h WHERE h.account_ref=l.account_ref AND h.is_active))`, account).Scan(&eligible); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.New(tx).PurgeExpiredSecurityEvents(f.ctx); err != nil {
-			t.Fatal(err)
-		}
-		var remains bool
-		if err := tx.QueryRow(f.ctx, "SELECT EXISTS (SELECT 1 FROM security_event_ledger WHERE account_ref=$1)", account).Scan(&remains); err != nil {
-			t.Fatal(err)
-		}
-		if remains == released {
-			t.Fatal("ledger purge ignored active hold or restarted retention after release")
+		if eligible != released {
+			t.Fatal("ledger eligibility ignored active hold or restarted retention after release")
 		}
 		if err := tx.Rollback(f.ctx); err != nil {
 			t.Fatal(err)

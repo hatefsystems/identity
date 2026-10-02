@@ -186,6 +186,10 @@ const (
 	// EventLegalInquiryLookup records a blind-index attribution lookup. The
 	// payload carries bounded disclosure scope, never the identifier or index.
 	EventLegalInquiryLookup = "legal.inquiry.lookup"
+	// EventLegalLedgerPurged records a bounded Class B maintenance commit.
+	EventLegalLedgerPurged = "legal.ledger.purged"
+	// EventLegalLedgerPurgeSkipped records an aggregate held/ineligible outcome.
+	EventLegalLedgerPurgeSkipped = "legal.ledger.purge_skipped"
 )
 
 // LedgerEventTypes is the declared set of event types that MUST carry
@@ -247,6 +251,9 @@ const SystemActorSPIFFEID = "system://identity/purge-worker"
 // SystemActorSPIFFEID so a self-report by the signer can never be confused with a
 // purge decision when reading the ledger.
 const SignerActorSPIFFEID = "system://identity/audit-signer"
+
+// LedgerRetentionActorSPIFFEID separates Class B expiry from account deletion.
+const LedgerRetentionActorSPIFFEID = "system://identity/security-ledger-purge"
 
 // APIActorSPIFFEID identifies events raised by the identity API process while
 // serving a request. ActorID carries the authenticated user; this states which

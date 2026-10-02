@@ -105,7 +105,7 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 		Enabled: true, AllowedOrigins: []string{"https://identity.example"}, RequestTimeout: 5 * time.Second,
 		PerActorPerMinute: 10000, PerSubnetPerMinute: 10000, PageSizeDefault: 50, PageSizeMax: 200,
 		ChainVerifyMaxLimit: 5000, AuditMaxWindow: 31 * 24 * time.Hour,
-	}}, nil, Deps{SessionManager: sessions, StepUp: step, AdminStore: q, AdminActions: actions, RBAC: q, LegalHold: holds, AdminLimiter: limiter})
+	}}, nil, Deps{SessionManager: sessions, StepUp: step, AdminStore: q, AdminActions: actions, RBAC: q, LegalHold: holds, AdminLimiter: limiter, LedgerProofDB: pool})
 	for _, role := range []string{"support", "moderator", "super_admin", "dpo", "ordinary"} {
 		user := f.user(t)
 		if role != "ordinary" {
@@ -249,6 +249,12 @@ func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testin
 		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), f.target.Email) {
 			t.Fatalf("audit failure disclosed/succeeded: %d %s", w.Code, w.Body.String())
 		}
+	}
+	// The ledger's independent read-only snapshot must not bypass the outer
+	// durable disclosure receipt, even for a no-content/uninitialized response.
+	w := f.request("dpo", "GET", "/ledger/verify", "", "")
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), "through_seq") {
+		t.Fatalf("ledger proof escaped failed audit: %d %s", w.Code, w.Body.String())
 	}
 	u, err := db.New(f.pool).GetUserByIDForAdmin(context.Background(), f.target.ID)
 	if err != nil {

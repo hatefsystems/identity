@@ -13,22 +13,27 @@
 //
 // # Why the database is the only source of truth for the tip
 //
-// The tip is cached in memory for the duration of a run purely to avoid a query per
-// batch. Any commit failure invalidates that cache — the transaction may have
-// partially applied from the connection's point of view, and a retry must not build
-// on a guess — so the tip is re-read from the database before the batch is retried.
+// The audit tip is cached while the daemon holds the single-writer lock. Ledger
+// batches instead read the protected logical head under a short coordination lock,
+// because retention can remove even the last surviving payload row. Any uncertain
+// commit requires re-reading both tips before processing another batch.
 package signer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/ledgerproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 // Store is the database surface the signer needs. It is narrow and hand-declared
@@ -39,9 +44,11 @@ type Store interface {
 	// GetLatestAuditLogChainHash returns the current audit chain tip, or
 	// pgx.ErrNoRows before the genesis record.
 	GetLatestAuditLogChainHash(ctx context.Context) (string, error)
-	// GetLatestSecurityEventChainHash returns the current ledger chain tip, or
-	// pgx.ErrNoRows before the genesis record.
-	GetLatestSecurityEventChainHash(ctx context.Context) (string, error)
+	// GetSignerLedgerHead reads the initialized logical head and proof consistency
+	// from one statement snapshot. A missing row is an error, never genesis.
+	GetSignerLedgerHead(ctx context.Context) (db.GetSignerLedgerHeadRow, error)
+	// AdvanceSecurityLedgerHead validates the actual newly inserted terminal row.
+	AdvanceSecurityLedgerHead(ctx context.Context, arg db.AdvanceSecurityLedgerHeadParams) error
 	// FilterExistingAuditLogIDs returns the subset of ids already persisted.
 	FilterExistingAuditLogIDs(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error)
 	// FilterExistingSecurityEventIDs returns the subset of ids already persisted.
@@ -72,6 +79,11 @@ type Store interface {
 type BatchTx interface {
 	// Store returns the transaction-bound query set.
 	Store() Store
+	// LockAccounts takes UUID-ordered advisory locks before any subject row locks.
+	LockAccounts(ctx context.Context, ids []uuid.UUID) error
+	// ValidateLedgerState checks all live bodies and checkpoint transitions on
+	// startup/recovery, in bounded pages while the coordination lock is held.
+	ValidateLedgerState(ctx context.Context, through int64) error
 	// Commit makes both COPYs durable together.
 	Commit(ctx context.Context) error
 	// Rollback discards both. It must be safe to call after Commit.
@@ -85,7 +97,7 @@ type BatchTxOpener interface {
 
 // Transacter is the subset of *pgxpool.Pool the opener needs.
 type Transacter interface {
-	Begin(ctx context.Context) (pgx.Tx, error)
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
 // PgBatchTxOpener opens pgx transactions for batches.
@@ -103,11 +115,22 @@ func NewPgBatchTxOpener(tx Transacter) (*PgBatchTxOpener, error) {
 
 // BeginBatch implements BatchTxOpener.
 func (o *PgBatchTxOpener) BeginBatch(ctx context.Context) (BatchTx, error) {
-	tx, err := o.tx.Begin(ctx)
+	tx, err := o.tx.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("signer: begin batch transaction: %w", err)
 	}
-	return &pgBatchTx{tx: tx, store: db.New(tx)}, nil
+	batch := &pgBatchTx{tx: tx, store: db.New(tx)}
+	// Server-side waits remain bounded even if the caller's connection loses its
+	// deadline. Rollback has its own budget because ctx may already be cancelled.
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s'; SET LOCAL idle_in_transaction_session_timeout = '30s'"); err != nil {
+		_ = batch.Rollback(ctx)
+		return nil, fmt.Errorf("signer: set batch timeouts: %w", err)
+	}
+	if err := pglock.LockLedger(ctx, tx); err != nil {
+		_ = batch.Rollback(ctx)
+		return nil, fmt.Errorf("signer: lock ledger: %w", err)
+	}
+	return batch, nil
 }
 
 // pgBatchTx is the pgx-backed BatchTx.
@@ -119,14 +142,56 @@ type pgBatchTx struct {
 func (t *pgBatchTx) Store() Store                     { return t.store }
 func (t *pgBatchTx) Commit(ctx context.Context) error { return t.tx.Commit(ctx) }
 
+func (t *pgBatchTx) LockAccounts(ctx context.Context, ids []uuid.UUID) error {
+	ids = slices.Clone(ids)
+	slices.SortFunc(ids, func(a, b uuid.UUID) int { return bytes.Compare(a[:], b[:]) })
+	for _, id := range slices.Compact(ids) {
+		if err := pglock.LockAccount(ctx, t.tx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *pgBatchTx) ValidateLedgerState(ctx context.Context, through int64) error {
+	source := ledgerproof.NewSource(t.tx)
+	params := ledgerproof.Params{ThroughSeq: through, HasThrough: true, Limit: 1000}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := ledgerproof.Verify(ctx, source, params)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrLedgerStateInvalid, err)
+		}
+		// Erased history is not content verification, but its validated boundary
+		// digests still permit safe future appends. Never invent erased bodies.
+		if result.FailureReason != nil && *result.FailureReason != "no_retained_records" {
+			return fmt.Errorf("%w: %s", ErrLedgerStateInvalid, *result.FailureReason)
+		}
+		if result.Complete {
+			return nil
+		}
+		if result.NextAfterSeq == nil || result.LastHash == nil || *result.NextAfterSeq <= params.AfterSeq {
+			return fmt.Errorf("%w: incomplete proof traversal", ErrLedgerStateInvalid)
+		}
+		params.AfterSeq = *result.NextAfterSeq
+		params.PredecessorHash = *result.LastHash
+	}
+}
+
 // Rollback discards the transaction. pgx.ErrTxClosed is swallowed so the deferred
 // rollback after a successful commit is a no-op rather than a spurious error.
 func (t *pgBatchTx) Rollback(ctx context.Context) error {
-	if err := t.tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+	if err := t.tx.Rollback(cleanupCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 		return err
 	}
 	return nil
 }
+
+const rollbackTimeout = 5 * time.Second
 
 // NewPoolStore returns the pool-bound query set used for the startup chain-tip
 // reads, which happen outside any batch transaction.

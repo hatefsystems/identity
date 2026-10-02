@@ -17,6 +17,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/ledgerproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
@@ -169,5 +170,80 @@ func TestAdminVerificationRejectsMalformedBounds(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("accepted %s: %d", query, w.Code)
 		}
+	}
+}
+
+type ledgerHTTPSource struct {
+	head  ledgerproof.Head
+	steps []ledgerproof.Step
+}
+
+func (s ledgerHTTPSource) Head(context.Context) (ledgerproof.Head, error) { return s.head, nil }
+func (s ledgerHTTPSource) Boundary(_ context.Context, seq int64) ([]ledgerproof.Step, error) {
+	var out []ledgerproof.Step
+	for _, step := range s.steps {
+		if step.FirstSeq <= seq && step.LastSeq >= seq || step.Record == nil && step.PredecessorSeq == seq {
+			out = append(out, step)
+		}
+	}
+	return out, nil
+}
+func (s ledgerHTTPSource) Page(_ context.Context, after, through int64, limit int32) ([]ledgerproof.Step, error) {
+	var out []ledgerproof.Step
+	for _, step := range s.steps {
+		if step.LastSeq > after && step.FirstSeq <= through {
+			out = append(out, step)
+			if len(out) == int(limit) {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func TestAdminLedgerRetentionResponseAndAudit(t *testing.T) {
+	record := audit.LedgerRecord{ID: uuid.NewString(), AccountRef: uuid.NewString(), EventType: "private-event", ClientIP: stringPtr("192.0.2.123"), Timestamp: time.Now().Truncate(time.Microsecond)}
+	hash := audit.ChainHash(audit.GenesisChainHash, audit.SerializeLedger(record))
+	live := ledgerproof.Step{Checkpoint: ledgerproof.Checkpoint{FirstSeq: 4, LastSeq: 4, TerminalHash: hash}, Record: &record}
+	erased := ledgerproof.Step{Checkpoint: ledgerproof.Checkpoint{FirstSeq: 1, LastSeq: 4, PredecessorHash: strings.Repeat("0", 64), TerminalHash: hash, ErasedCount: 2}}
+	for _, tc := range []struct {
+		name, query, reason, status string
+		step                        ledgerproof.Step
+		verified, restart           bool
+	}{
+		{"live", "", "", audit.StatusSuccess, live, true, false},
+		{"all purged", "", "no_retained_records", audit.StatusSuccess, erased, false, false},
+		{"compacted cursor", "?after_seq=1&through_seq=4", "retention_boundary_unavailable", audit.StatusSuccess, erased, false, true},
+		{"supplied mismatch", "?after_seq=4&through_seq=4&predecessor_hash=" + strings.Repeat("a", 64), "predecessor_mismatch", audit.StatusFailure, erased, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{cfg: config.Config{Admin: config.AdminConfig{ChainVerifyMaxLimit: 5000}}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			op := &adminaction.Operation{ID: uuid.New()}
+			r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/ledger/verify"+tc.query, nil)
+			r = r.WithContext(adminaction.WithContext(rbac.WithActor(r.Context(), uuid.New()), op))
+			w := httptest.NewRecorder()
+			source := ledgerHTTPSource{head: ledgerproof.Head{Seq: 4, MaxSeq: 4, Hash: hash}, steps: []ledgerproof.Step{tc.step}}
+			s.runLedgerVerification(w, r, func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
+				return ledgerproof.Verify(ctx, source, p)
+			})
+			var response adminLedgerVerifyResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if w.Code != 200 || response.Verified != tc.verified || response.RestartRequired != tc.restart || (tc.reason != "" && (response.FailureReason == nil || *response.FailureReason != tc.reason)) {
+				t.Fatalf("%d %s", w.Code, w.Body.String())
+			}
+			if op.Event.EventType != audit.EventAdminChainVerified || op.Event.ActionStatus != tc.status || op.Event.Security != nil || op.Event.Payload["verification_scope"] != "database_relative_retained_segment" {
+				t.Fatalf("audit %+v", op.Event)
+			}
+			if tc.name == "all purged" && (response.Checked != 0 || response.PurgedCount != 2 || response.PurgedSpans != 1 || !response.Complete || response.BrokenAtSeq != nil) {
+				t.Fatalf("no-content status %s", w.Body.String())
+			}
+			for _, forbidden := range []string{record.ID, record.AccountRef, "192.0.2.123", "private-event", "account_ref", "payload", "identity_blind_index"} {
+				if strings.Contains(w.Body.String(), forbidden) {
+					t.Fatalf("leaked %s", forbidden)
+				}
+			}
+		})
 	}
 }

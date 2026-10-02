@@ -13,7 +13,7 @@
 //   - recovery_codes hash uniqueness applies only to unused codes.
 //   - mvp_audit_logs is append-only: UPDATE/DELETE/TRUNCATE are rejected,
 //     while the FK ON DELETE SET NULL path (GDPR hard-delete) still works.
-//   - goose Down (reset) rolls everything back cleanly.
+//   - Forward-only retention migrations refuse reset without losing proof state.
 package migrate
 
 import (
@@ -23,6 +23,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // testTimeout bounds the whole migration lifecycle per test run.
@@ -37,21 +41,35 @@ func openTestDB(ctx context.Context, t *testing.T) *sql.DB {
 	if url == "" {
 		t.Skip("DATABASE_URL not set; skipping migration integration test")
 	}
-	sqldb, err := Open(ctx, url)
+	admin, err := Open(ctx, url)
 	if err != nil {
-		t.Skipf("database unreachable; skipping migration integration test: %v", err)
+		t.Fatalf("configured migration database is unreachable: %v", err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	name := "migration_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quoted := pgx.Identifier{name}.Sanitize()
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+quoted); err != nil {
+		t.Fatalf("create disposable migration database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := admin.ExecContext(cleanup, "DROP DATABASE "+quoted+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop disposable migration database: %v", err)
+		}
+	})
+	cfg, err := pgx.ParseConfig(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Database = name
+	sqldb := stdlib.OpenDB(*cfg)
+	if err := sqldb.PingContext(ctx); err != nil {
+		_ = sqldb.Close()
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sqldb.Close() })
 	return sqldb
-}
-
-// resetToClean rolls back all migrations so each test starts from an empty
-// schema regardless of previous runs.
-func resetToClean(ctx context.Context, t *testing.T, sqldb *sql.DB) {
-	t.Helper()
-	if err := Reset(ctx, sqldb); err != nil {
-		t.Fatalf("reset to clean state: %v", err)
-	}
 }
 
 func TestInitialSchemaMigration(t *testing.T) {
@@ -59,24 +77,16 @@ func TestInitialSchemaMigration(t *testing.T) {
 	defer cancel()
 
 	sqldb := openTestDB(ctx, t)
-	resetToClean(ctx, t, sqldb)
 
 	if err := Up(ctx, sqldb); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	// Leave a clean database behind even when subtests fail.
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cleanupCancel()
-		if err := Reset(cleanupCtx, sqldb); err != nil {
-			t.Errorf("cleanup reset: %v", err)
-		}
-	})
 
 	t.Run("AllTablesCreated", func(t *testing.T) {
 		tables := []string{
 			"users", "roles", "permissions", "role_permissions", "user_roles",
 			"webauthn_credentials", "recovery_codes", "mvp_audit_logs",
+			"security_event_ledger", "security_ledger_head", "security_ledger_checkpoints", "security_ledger_retention_settings",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -101,6 +111,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"idx_webauthn_user_id",
 			"idx_recovery_codes_hash", "idx_recovery_codes_user_id",
 			"idx_mvp_audit_logs_event_type", "idx_mvp_audit_logs_timestamp",
+			"idx_security_ledger_retention_seq",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -225,9 +236,12 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("DownLeavesCleanSchema", func(t *testing.T) {
-		if err := Reset(ctx, sqldb); err != nil {
-			t.Fatalf("roll back migrations: %v", err)
+	t.Run("ForwardOnlyRefusalPreservesState", func(t *testing.T) {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO security_ledger_head(singleton,seq,chain_hash) VALUES(true,0,repeat('0',64))`); err != nil {
+			t.Fatal(err)
+		}
+		if err := Reset(ctx, sqldb); err == nil || !strings.Contains(err.Error(), "forward-only") {
+			t.Fatalf("expected forward-only reset refusal, got: %v", err)
 		}
 		var count int
 		err := sqldb.QueryRowContext(ctx,
@@ -238,13 +252,15 @@ func TestInitialSchemaMigration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("count remaining tables: %v", err)
 		}
-		if count != 0 {
-			t.Errorf("expected 0 schema tables after down, found %d", count)
+		if count != 8 {
+			t.Errorf("reset refusal lost schema tables: found %d", count)
 		}
-		// Re-apply so the cleanup Reset in t.Cleanup has state to remove and
-		// the database is usable for subsequent local runs.
+		var seq int64
+		if err := sqldb.QueryRowContext(ctx, `SELECT seq FROM security_ledger_head WHERE singleton`).Scan(&seq); err != nil || seq != 0 {
+			t.Fatalf("reset refusal lost initialized head: %d, %v", seq, err)
+		}
 		if err := Up(ctx, sqldb); err != nil {
-			t.Fatalf("re-apply migrations: %v", err)
+			t.Fatalf("forward recovery after refused reset: %v", err)
 		}
 	})
 }

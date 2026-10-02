@@ -5,19 +5,22 @@
 #   docker build -t identity-api:dev apps/identity-api
 #
 # ONE IMAGE, SEVERAL ENTRYPOINTS
-# Every binary under ./cmd is built into a single image, and the deployment picks
-# one by overriding the command:
+# Every binary under ./cmd is built; the runtime binaries listed below are copied
+# into one image. The deployment selects one with an explicit --entrypoint:
 #
 #   identity-api    the HTTP API      (default entrypoint)
 #   audit-signer    audit chain signer worker
-#   purge-worker    GDPR erasure worker (Kubernetes CronJob)
-#   migrate         goose migration runner (init container / Job)
+#   admin-audit-publisher  acknowledged administrative/maintenance outbox publisher
+#   purge-worker    Class A GDPR erasure worker (host cron/systemd)
+#   security-ledger-purge  Class B retention worker (host cron/systemd)
+#   migrate         goose migration runner (controlled operator invocation)
 #
 # This is deliberate rather than lazy. The API publishes audit envelopes and the
 # signer serializes them into a hash chain; the two must agree byte-for-byte on
 # internal/audit's canonical serializer, or the chain the signer writes will not
 # verify against the records the API produced. Shipping them as one immutable
-# artifact makes that skew impossible to introduce by deploying at different times.
+# artifact makes compatible versions available together. Rollout must still prevent
+# old signer binaries from running after ledger retention is enabled.
 # The same argument applies to migrate: the embedded migrations and the sqlc-generated
 # code are generated from the same files in the same build.
 
@@ -58,7 +61,9 @@ RUN go build -trimpath -ldflags='-s -w' -o /out/ ./cmd/...
 
 # Fail loudly at build time if a command failed to produce a binary, instead of
 # shipping an image whose entrypoint does not exist.
-RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate && test -x /out/audit-signer
+RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
+    && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
+    && test -x /out/security-ledger-purge
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -82,6 +87,8 @@ COPY --from=builder /out/migrate /usr/local/bin/migrate
 # publisher would hash records the publisher did not describe. Deploy it by
 # overriding the entrypoint, with replicas: 1 — see cmd/audit-signer.
 COPY --from=builder /out/audit-signer /usr/local/bin/audit-signer
+COPY --from=builder /out/admin-audit-publisher /usr/local/bin/admin-audit-publisher
+COPY --from=builder /out/security-ledger-purge /usr/local/bin/security-ledger-purge
 
 # The HTTP API's default listen port (config.defaultPort). Informational only.
 EXPOSE 8080

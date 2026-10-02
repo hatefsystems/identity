@@ -34,6 +34,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 		}
 		t.Skip("DATABASE_URL is not set; skipping integration test")
 	}
+	dbURL = isolatedSignerDatabase(t, dbURL)
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		if os.Getenv("REQUIRE_ADMIN_AUDIT_INTEGRATION") == "1" {
@@ -50,7 +51,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate.Open: %v", err)
 	}
-	defer sqldb.Close()
+	defer func() { _ = sqldb.Close() }()
 	if err := migrate.Up(ctx, sqldb); err != nil {
 		t.Fatalf("migrate.Up: %v", err)
 	}
@@ -60,6 +61,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 		t.Fatalf("pgxpool.New: %v", err)
 	}
 	defer pool.Close()
+	provisionSignerFixture(t, ctx, pool)
 
 	// Connect to NATS.
 	nc, js, err := natsjs.Connect(ctx, natsURL, "audit-e2e-test", nil)

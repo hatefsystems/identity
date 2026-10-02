@@ -14,6 +14,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/ledgerproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 )
 
@@ -218,39 +219,75 @@ func (s *Server) handleAdminVerifyAuditChain() http.HandlerFunc {
 // handleAdminVerifyLedgerChain serves GET /api/v1/admin/ledger/verify.
 func (s *Server) handleAdminVerifyLedgerChain() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.runChainVerification(w, r, "ledger", func(ctx context.Context, p chainVerifyParams) ([]chainRow, error) {
-			events, err := s.adminStore(r).ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{
-				AfterSeq:   p.afterSeq,
-				ThroughSeq: p.throughSeq,
-				PageLimit:  p.limit + 1,
-			})
-			if err != nil {
-				return nil, err
+		s.runLedgerVerification(w, r, func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
+			if s.deps.LedgerProofDB == nil {
+				return ledgerproof.Result{}, errors.New("ledger snapshot database unavailable")
 			}
-			rows := make([]chainRow, 0, len(events))
-			for _, e := range events {
-				rows = append(rows, chainRow{
-					seq:        e.Seq,
-					storedHash: e.ChainHash,
-					body: audit.SerializeLedger(audit.LedgerRecord{
-						ID:                 e.ID.String(),
-						AccountRef:         e.AccountRef.String(),
-						IdentityBlindIndex: e.IdentityBlindIndex,
-						EventType:          e.EventType,
-						ClientIP:           e.ClientIp,
-						IPSubnet:           e.IpSubnet,
-						UserAgent:          e.UserAgent,
-						DeviceFingerprint:  e.DeviceFingerprint,
-						ClientID:           e.ClientID,
-						Scope:              e.Scope,
-						Timestamp:          e.Timestamp.Time,
-						RetainUntil:        e.RetainUntil.Time,
-					}),
-				})
-			}
-			return rows, nil
-		}, s.adminStore(r).GetSecurityEventChainHashBySeq, s.adminStore(r).GetSecurityEventHighWaterSeq)
+			return ledgerproof.VerifySnapshot(ctx, s.deps.LedgerProofDB, p)
+		})
 	}
+}
+
+func (s *Server) runLedgerVerification(w http.ResponseWriter, r *http.Request, verify func(context.Context, ledgerproof.Params) (ledgerproof.Result, error)) {
+	actor, ok := s.adminActor(w, r)
+	if !ok {
+		return
+	}
+	p, err := s.parseChainVerifyParams(r)
+	if err != nil {
+		s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := verify(r.Context(), ledgerproof.Params{AfterSeq: p.afterSeq, ThroughSeq: p.throughSeq,
+		HasThrough: p.hasThrough, PredecessorHash: p.predecessorHash, Limit: p.limit})
+	if err != nil {
+		switch err.Error() {
+		case "unknown_after_seq", "unknown_through_seq", "invalid_request":
+			s.writeAdminError(w, http.StatusBadRequest, err.Error())
+		default:
+			s.logger.Error("admin: ledger snapshot verification failed")
+			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
+		}
+		return
+	}
+	resp := adminLedgerVerifyResponse{adminChainVerifyResponse: adminChainVerifyResponse{
+		Chain: "ledger", AfterSeq: result.AfterSeq, ThroughSeq: result.ThroughSeq,
+		SeedHash: result.SeedHash, SeedSource: result.SeedSource, Verified: result.Verified,
+		Complete: result.Complete, Checked: result.Checked, FirstSeq: result.FirstSeq,
+		LastSeq: result.LastSeq, LastHash: result.LastHash, NextAfterSeq: result.NextAfterSeq,
+		BrokenAtSeq: result.BrokenAtSeq, ExpectedHash: result.ExpectedHash, StoredHash: result.StoredHash,
+		FailureReason: result.FailureReason,
+		Scope:         "database_relative_retained_segment; erased bodies not recomputed; not complete ingestion or independent historical authenticity",
+	}, PurgedCount: result.PurgedCount, PurgedSpans: result.PurgedSpans,
+		ProofSteps: result.ProofSteps, RestartRequired: result.RestartRequired}
+	payload := map[string]any{
+		"chain": "ledger", "verified": resp.Verified, "checked": resp.Checked,
+		"after_seq": resp.AfterSeq, "through_seq": resp.ThroughSeq,
+		"verification_scope": "database_relative_retained_segment", "complete": resp.Complete,
+		"purged_count": resp.PurgedCount, "purged_spans": resp.PurgedSpans,
+		"proof_steps": resp.ProofSteps, "restart_required": resp.RestartRequired,
+	}
+	if resp.SeedHash != "" {
+		payload["seed_hash"], payload["seed_source"] = resp.SeedHash, resp.SeedSource
+	}
+	if resp.BrokenAtSeq != nil {
+		payload["broken_at_seq"] = *resp.BrokenAtSeq
+	}
+	if resp.LastHash != nil {
+		payload["last_hash"] = *resp.LastHash
+	}
+	status := audit.StatusSuccess
+	if resp.FailureReason != nil {
+		payload["failure_reason"] = *resp.FailureReason
+		// Retention and unavailable historical boundaries are not tamper alarms.
+		if *resp.FailureReason != "no_retained_records" && !resp.RestartRequired {
+			status = audit.StatusFailure
+		}
+	}
+	adminaction.SetEvent(r.Context(), audit.Event{EventType: audit.EventAdminChainVerified,
+		ActionStatus: status, ActorID: actor, Payload: payload})
+	// adminTransaction withholds this content-free response until audit commits.
+	s.writeAdminJSON(w, http.StatusOK, resp)
 }
 
 // chainRow is one row reduced to what verification needs.
@@ -266,7 +303,7 @@ type chainFetcher func(ctx context.Context, p chainVerifyParams) ([]chainRow, er
 // chainSeeder returns the stored digest at an exact seq.
 type chainSeeder func(ctx context.Context, seq int64) (string, error)
 
-// runChainVerification is the shared engine behind both verify endpoints.
+// runChainVerification verifies the unchanged Class C audit chain.
 //
 // It stops at the first mismatch. Continuing would be misleading: every
 // subsequent row chains off the broken one, so they would all "fail" and bury

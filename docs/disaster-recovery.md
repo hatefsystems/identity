@@ -163,4 +163,54 @@ A backup is only as good as its recovery validation. The operations team execute
 4. **Redis Cache Reconstruction:**
    * Restore the latest RDB file. Validate that the rate limiting sliding window sets are parsed correctly.
 5. **Ledger Integrity Audit (MVP PostgreSQL / Post-MVP ClickHouse):**
-   * Recompute the cryptographic log chains. In the MVP phase, this audit is performed against the `mvp_audit_logs` table in PostgreSQL. Verify that no logs are missing and that the cryptographic signature sequence (`chain_hash`) matches perfectly from the starting genesis block to the latest record. Post-MVP, this is executed against ClickHouse.
+   * Recompute Class C's stored chain in `mvp_audit_logs`. For the Class B security ledger, validate the restored durable head, retained bodies and authorized checkpoint transitions as described below; erased bodies cannot be recomputed. These are database-relative checks, not proof of complete ingestion or detection of a coherently rolled-back backup. Post-MVP ClickHouse still requires its separately approved verification procedure.
+
+### 3.3 Security Ledger Retention Recovery
+
+This procedure applies to the current single-node Compose MVP as well as future
+HA deployments. The independent backup rotations above do not change when a
+live ledger row expires. Deleted payloads may exist in an older backup until it
+rotates out; restoration is not a mechanism to bypass erasure or active holds.
+
+1. Disable the host retention schedule and revoke the purge routine's EXECUTE
+   grant before recovery. Stop/drain signer and ingestion, and stop affected
+   publishers while selecting a recovery point. Preserve the original system
+   and incident evidence; do not delete proof state to make a check pass.
+2. Restore `security_event_ledger`, `security_ledger_head`,
+   `security_ledger_checkpoints`, protected maintenance settings, legal holds,
+   Class C history and `event_outbox` from a consistent backup/WAL point. Never
+   combine payloads from one point with a later or earlier head/checkpoint set.
+   Restore protected ownership/grants through the controlled provisioning
+   procedure, not the runtime worker login.
+3. Keep ingestion and destructive purge closed while verifying canonical
+   retained bodies, checkpoint boundaries/counts/non-overlap, logical terminal
+   head and sequence allocation state. Missing proof, unexplained gaps or
+   historic hash defects require investigation. Never rehash history, reset the
+   sequence, invent checkpoints or infer fresh genesis from an empty ledger.
+   A consistent all-purged result is neither successful content verification
+   nor a tampering alarm.
+4. Reconcile authoritative post-backup holds, releases and deletion obligations
+   through the established recovery/legal process before reopening processing.
+   Restore active holds before evaluating erasure and honor all independent
+   requests, including accounts with no live user row. A review date never
+   authorizes expiry of a hold. Reapply eligible deletions without bypassing
+   holds; preserve original event expiry rather than restarting its clock.
+5. Deploy only compatible signer/API/worker versions. Validate non-owner roles,
+   outbox acknowledgement/redelivery, online append/head/checkpoint consistency
+   and a dry-run against the recovered state. Keep destructive scheduling off
+   until operations and legal owners approve these checks. Then resume eligible
+   expiry on the hourly host schedule and monitor backlog/cutoff/failure totals.
+
+Rollback is forward recovery after initialization/proof state or erasure exists:
+disable schedule/revoke maintenance EXECUTE first, retain head/checkpoints/holds/
+outbox, and repair with compatible code. A pre-retention signer or verifier is
+not a safe downgrade. Exact provisioning, revocation and rollout commands are
+in [admin operations](admin-operations.md#security-ledger-retention-task-54).
+Migration `00011` refuses Down unconditionally; use forward recovery rather than
+an up/down/up drill even when a restored payload table appears empty.
+
+No procedure promises restoration of erased payloads. Database-only checkpoints
+and Class C receipts cannot independently detect a coherent privileged rewrite
+or backup rollback without an external anchor. External anchoring remains
+explicitly deferred; drills and production restore validation are release gates,
+not guarantees supplied by this document.

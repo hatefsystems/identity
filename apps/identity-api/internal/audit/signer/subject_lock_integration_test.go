@@ -31,7 +31,7 @@ func TestAuditSubjectLockAgainstConcurrentDeletionIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer migrationDB.Close()
+	defer func() { _ = migrationDB.Close() }()
 	if err := migrate.Up(ctx, migrationDB); err != nil {
 		t.Fatal(err)
 	}
@@ -50,12 +50,12 @@ func TestAuditSubjectLockAgainstConcurrentDeletionIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer signTx.Rollback(context.Background())
+			defer func() { _ = signTx.Rollback(context.Background()) }()
 			deleteTx, err := pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer deleteTx.Rollback(context.Background())
+			defer func() { _ = deleteTx.Rollback(context.Background()) }()
 			assertBlocked := func(err error) {
 				t.Helper()
 				var pgErr *pgconn.PgError
@@ -102,7 +102,7 @@ func TestAuditSubjectLockAgainstConcurrentDeletionIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer tx.Rollback(context.Background())
+			defer func() { _ = tx.Rollback(context.Background()) }()
 			ids, err := db.New(tx).LockAuditSubjects(ctx, []uuid.UUID{user.ID})
 			if err != nil || len(ids) != 0 {
 				t.Fatalf("deleted subject must become NULL attachment: %v %v", ids, err)

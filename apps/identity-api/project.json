@@ -41,6 +41,28 @@
       ],
       "cache": true
     },
+    "build-security-ledger-purge": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go build -o bin/security-ledger-purge ./cmd/security-ledger-purge"
+      },
+      "dependsOn": [
+        "sqlc-generate"
+      ],
+      "cache": true
+    },
+    "security-ledger-purge": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/security-ledger-purge"
+      },
+      "dependsOn": [
+        "sqlc-generate"
+      ],
+      "cache": false
+    },
     "build-admin-audit-publisher": {
       "executor": "nx:run-commands",
       "options": {
@@ -202,6 +224,17 @@
       "options": {
         "cwd": "apps/identity-api",
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/adminaction','./internal/legalhold','./internal/rbac','./internal/session','./internal/server','./internal/audit/signer','./internal/pglock'], {stdio:'inherit',env:{...process.env,REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+      },
+      "dependsOn": [
+        "sqlc-generate"
+      ],
+      "cache": false
+    },
+    "test-retention-integration": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/audit/retention','./internal/audit/ledgerproof','./internal/retentiondbintegration'], {stdio:'inherit',env:{...process.env,REQUIRE_RETENTION_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": [
         "sqlc-generate"

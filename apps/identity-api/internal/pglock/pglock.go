@@ -44,6 +44,12 @@ const (
 	// PurgeKey this is a correctness lock, not a de-duplication convenience: the
 	// holder is the sole writer of both hash chains.
 	AuditSignerKey int64 = 5200001
+	// LedgerCoordinationKey serializes short signer/purge transactions. Acquire
+	// it before account advisory locks or any user/hold/ledger/proof row locks.
+	LedgerCoordinationKey int64 = 5200002
+	// SecurityLedgerPurgeKey prevents overlapping ledger-retention worker runs.
+	// It is deliberately separate from both signer and transaction locks.
+	SecurityLedgerPurgeKey int64 = 5200003
 )
 
 // AdvisoryLocker serialises worker runs across processes.

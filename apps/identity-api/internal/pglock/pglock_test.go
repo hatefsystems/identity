@@ -9,6 +9,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestReservedWorkerKeysArePositiveAndDistinct(t *testing.T) {
+	seen := make(map[int64]bool)
+	for _, key := range []int64{PurgeKey, AuditSignerKey, LedgerCoordinationKey, SecurityLedgerPurgeKey} {
+		if key <= 0 || seen[key] {
+			t.Fatalf("nonpositive or reused worker key: %d", key)
+		}
+		seen[key] = true
+	}
+	if err := LockLedger(context.Background(), nil); err == nil {
+		t.Fatal("ledger lock accepted nil transaction")
+	}
+}
+
 func TestNewPgAdvisoryLockerRequiresPool(t *testing.T) {
 	t.Parallel()
 

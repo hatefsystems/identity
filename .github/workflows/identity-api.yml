@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'apps/identity-api/**'
+      - '.env.example'
       - 'nx.json'
       - 'package.json'
       - 'package-lock.json'
@@ -11,6 +12,7 @@ on:
   push:
     paths:
       - 'apps/identity-api/**'
+      - '.env.example'
       - 'nx.json'
       - 'package.json'
       - 'package-lock.json'
@@ -60,6 +62,15 @@ jobs:
       - name: Vet sqlc queries
         run: npm exec -- nx run identity-api:sqlc-vet --skipNxCache
 
+      - name: Check generated-code reproducibility
+        shell: bash
+        run: |
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+          snapshot=$(mktemp -d)
+          cp -R apps/identity-api/internal/db "$snapshot/db"
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+          diff -ru "$snapshot/db" apps/identity-api/internal/db
+
       - name: Run fresh tests
         run: npm exec -- nx run identity-api:test --skipNxCache
 
@@ -77,6 +88,25 @@ jobs:
 
       - name: Build admin operational commands
         run: npm exec -- nx run-many -t build-admin-audit-publisher,build-admin-roles,build-admin-legal -p identity-api --skipNxCache
+
+      - name: Build compatible signer and purge workers
+        run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge -p identity-api --skipNxCache
+
+      - name: Build non-root runtime image
+        run: docker build --tag identity-api:ci apps/identity-api
+
+      - name: Smoke-test packaged maintenance entrypoints without credentials
+        shell: bash
+        run: |
+          image=$(docker image inspect --format '{{.Id}}' identity-api:ci)
+          test "$(docker image inspect --format '{{.Config.User}}' "$image")" = 'nonroot:nonroot'
+          for binary in security-ledger-purge admin-audit-publisher; do
+            status=0
+            output=$(docker run --rm --network none --entrypoint "/usr/local/bin/$binary" "$image" 2>&1) || status=$?
+            printf '%s\n' "$output"
+            test "$status" -eq 1
+            printf '%s\n' "$output" | grep -q '"level":"ERROR"'
+          done
 
   security-db:
     name: PostgreSQL security integration tests
@@ -143,3 +173,7 @@ jobs:
 
       - name: Run mandatory admin and audit integration tests
         run: npm exec -- nx run identity-api:test-admin-integration --skipNxCache
+
+      # Serial with the other suites: migration fixtures reset the shared schema.
+      - name: Run mandatory retention and real-role integration tests
+        run: npm exec -- nx run identity-api:test-retention-integration --skipNxCache

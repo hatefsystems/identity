@@ -59,7 +59,7 @@ core tables from `docs/data-architecture.md` §1.1 — `users`, `roles`,
 append-only triggers + `REVOKE` hardening on `mvp_audit_logs` (only the GDPR
 purge's FK `ON DELETE SET NULL` mutation is permitted).
 
-`DATABASE_URL` must be set in the environment (see `.env.example`); it is never
+`DATABASE_URL` must be set in the environment (see the repository-root `.env.example`); it is never
 hardcoded. With the dev stack running (`docker compose -f
 docker-compose.dev.yml up -d`):
 
@@ -71,8 +71,10 @@ pnpm nx run identity-api:migrate-status   # show per-migration applied state
 
 Or directly: `go run ./cmd/migrate <up|down|reset|status>`.
 
-The integration tests in `internal/migrate` apply the full up/down cycle and
-verify schema invariants against the real database; they skip automatically
+The integration tests in `internal/migrate` verify migration invariants against
+the real database, including downgrade refusal for forward-only migrations. Do
+not run a down/reset cycle against retained proof or production history. Optional
+database tests skip automatically
 when `DATABASE_URL` is unset or unreachable so `go test ./...` works offline.
 The same gating applies to `internal/db` (query layer) and `internal/recovery`
 (recovery-code atomicity).
@@ -199,7 +201,7 @@ runtime (via Infisical/KMS or the container environment) and never committed.
 | `RECOVERY_CODES_PER_SUBNET_PER_HOUR`  | `20`          | Per-subnet generate/verify budget per hour (checked before the account). |
 | `RECOVERY_CODES_HASH_PEPPER`          | _unset_       | **Optional secret** (KMS/Infisical): base64, >=16 bytes. Keys the stored hash. |
 
-See `.env.example` for the full set, including the database, Redis, OIDC,
+See the repository-root `.env.example` for the full set, including the database, Redis, OIDC,
 WebAuthn, and SMS OTP variables.
 
 ## Local development
@@ -230,3 +232,55 @@ curl http://localhost:8080/readyz
 ## Admin runtime and operator commands
 
 Task 5.3 is opt-in (`ADMIN_ENABLED=false` by default). See [admin operations](../../docs/admin-operations.md) and [API contract](../../docs/api-design.md#17-admin--moderation-api). `admin-roles` performs audited operator provisioning; `admin-legal` handles bounded encryption backfill, released metadata cleanup and the deployed signer lookup probe. `admin-audit-publisher` drains durable intent with JetStream acknowledgement. All commands have Nx run/build targets. No HTTP role assignment or trigger-reset endpoint is mounted.
+
+## Security ledger retention worker
+
+`cmd/security-ledger-purge` is a separately credentialed, one-shot Class B worker,
+not the Class A `purge-worker` or a Class C cleanup command. It deletes only
+`retain_until < cutoff` rows without any active hold on the original `account_ref`,
+including accounts already hard-deleted. `SECURITY_LEDGER_RETENTION=8760h` remains
+365 days from event occurrence (valid policy range `4320h..13140h`); the worker
+uses stored expiry and never restarts that clock when a hold is released.
+
+| Variable | Default | Contract |
+|---|---|---|
+| `SECURITY_LEDGER_PURGE_DATABASE_URL` | Required | Dedicated `identity_ledger_purge` login; no fallback to API `DATABASE_URL`. |
+| `SECURITY_LEDGER_PURGE_BATCH_SIZE` | `500` | `1..5000` candidate rows per transaction. |
+| `SECURITY_LEDGER_PURGE_MAX_ROWS` | `10000` | Considered rows per run, at least batch size and at most `1000000`. |
+| `SECURITY_LEDGER_PURGE_TIMEOUT` | `2m` | Whole-run bound `1s..30m`; 2-second lock wait and 15-second batch bounds. |
+| `SECURITY_LEDGER_PURGE_DRY_RUN` | `true` | Execute eligibility/proof checks, roll back deletion, checkpoints and outbox; report `would_delete`. |
+| `AUDIT_SUBJECT` | `identity.audit.logs` | Match protected DB settings, signer and publisher. This is the existing convention, not `NATS_AUDIT_SUBJECT`. |
+
+No Redis, NATS connection, API config, blind-index pepper or encryption keys are
+needed by this command. Maintenance Class C intent commits in `event_outbox`
+with the deletion and is delivered separately by `admin-audit-publisher`; it has
+no Security context and cannot recursively create Class B rows. Logging uses
+structured JSON at the existing workers' default info level; this command does
+not currently load `LOG_LEVEL`.
+
+Run workspace-local Nx from the repository root:
+
+```bash
+npm exec -- nx show project identity-api --json
+npm exec -- nx run identity-api:build-security-ledger-purge
+npm exec -- nx run identity-api:security-ledger-purge
+npm exec -- nx run identity-api:test-retention-integration --skipNxCache
+```
+
+The mandatory integration target requires `DATABASE_URL`, `REDIS_URL` and
+`NATS_URL`, forces `REQUIRE_RETENTION_INTEGRATION=1`, and runs the worker,
+retained-proof and real-role database suites serially with `go test -tags=integration -count=1 -p=1`.
+Use only disposable PostgreSQL 16, Redis and NATS JetStream, never production:
+fixtures can reset schemas and create roles. Do not run it concurrently with
+the other database suites. Its test-owner `DATABASE_URL` is not a permitted
+production worker credential.
+
+The non-root Docker image includes `security-ledger-purge`, `audit-signer` and
+`admin-audit-publisher`. Select workers with `--entrypoint`, not a trailing
+command after the API entrypoint. Distroless has no shell or cron; the MVP uses
+host cron/systemd with Compose networking. See the [retention runbook](../../docs/admin-operations.md#security-ledger-retention-task-54)
+for exact provisioning/bootstrap, image launch, monitoring and rollback gates.
+Never enable deletion with an old signer or downgrade a verifier after proof
+state exists. Database-relative checkpoints are not external trust anchors;
+that follow-up, Task 5.3 production sign-off and Task 5.5 narrative-retention
+approval remain open.

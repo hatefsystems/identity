@@ -38,11 +38,16 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 				"GET /api/v1/admin/*", "POST /api/v1/admin/*", "PATCH /api/v1/admin/*", "DELETE /api/v1/admin/*",
 				"PUT /api/v1/admin/*", "HEAD /api/v1/admin/*", "OPTIONS /api/v1/admin/*",
 				"TRACE /api/v1/admin/*", "CONNECT /api/v1/admin/*")
-		case "result_count", "total", "limit", "offset", "checked", "after_seq", "through_seq", "first_seq", "last_seq", "broken_at_seq", "next_after_seq", "http_status", "high_water_seq", "old_auth_version", "new_auth_version":
+		case "result_count", "total", "limit", "offset", "checked", "after_seq", "through_seq", "first_seq", "last_seq", "broken_at_seq", "next_after_seq", "http_status", "high_water_seq", "old_auth_version", "new_auth_version", "purged_count", "purged_spans", "proof_steps":
 			clean, valid = nonnegativeInteger(value)
-		case "verified", "complete", "replayed", "noop", "account_present", "ledger_evidence_present", "identifier_present", "has_more":
+		case "considered_count", "deleted_count", "held_count", "would_delete":
+			var count int64
+			count, valid = nonnegativeInteger(value)
+			valid = valid && count <= 5000
+			clean = count
+		case "verified", "complete", "replayed", "noop", "account_present", "ledger_evidence_present", "identifier_present", "has_more", "restart_required", "dry_run":
 			clean, valid = value.(bool)
-		case "hold_id":
+		case "hold_id", "operation_id":
 			var id uuid.UUID
 			switch v := value.(type) {
 			case uuid.UUID:
@@ -58,7 +63,7 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 			b, err := hex.DecodeString(v)
 			valid = ok && err == nil && len(b) == 32
 			clean = strings.ToLower(v)
-		case "start_time", "end_time", "as_of", "observed_at":
+		case "start_time", "end_time", "as_of", "observed_at", "cutoff":
 			var t time.Time
 			switch v := value.(type) {
 			case time.Time:
@@ -80,13 +85,15 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 		case "role_id":
 			clean, valid = enum(value, "super_admin", "moderator", "support", "dpo")
 		case "seed_source":
-			clean, valid = enum(value, "genesis", "database_predecessor", "supplied_predecessor")
+			clean, valid = enum(value, "genesis", "database_predecessor", "supplied_predecessor", "checkpoint_boundary")
 		case "failure_reason":
-			clean, valid = enum(value, "no_stored_records", "predecessor_mismatch", "hash_mismatch", "missing_upper_boundary")
+			clean, valid = enum(value, "no_stored_records", "predecessor_mismatch", "hash_mismatch", "missing_upper_boundary",
+				"no_retained_records", "retention_boundary_unavailable", "missing_head", "head_mismatch", "invalid_checkpoint",
+				"checkpoint_overlap", "checkpoint_link_mismatch", "missing_proof")
 		case "verification_scope":
-			clean, valid = enum(value, "stored_segment_relative_to_seed")
+			clean, valid = enum(value, "stored_segment_relative_to_seed", "database_relative_retained_segment")
 		case "outcome":
-			clean, valid = enum(value, "success", "failure", "denied", "invalid", "not_found", "conflict", "unavailable", "noop", "replayed")
+			clean, valid = enum(value, "success", "failure", "denied", "invalid", "not_found", "conflict", "unavailable", "noop", "replayed", "purged", "held", "ineligible")
 		case "fields", "selected_fields":
 			var fields []string
 			switch v := value.(type) {

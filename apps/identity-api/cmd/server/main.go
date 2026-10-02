@@ -192,6 +192,7 @@ func run(logger *slog.Logger) error {
 			return errors.Join(sessionManager.RevokeAllForUser(userID), refreshTokenStore.RevokeAllForUser(userID))
 		},
 		AdminStore:     adminDeps.AdminStore,
+		LedgerProofDB:  pool,
 		RBAC:           adminDeps.RBAC,
 		LegalHold:      adminDeps.LegalHold,
 		AdminLimiter:   adminDeps.AdminLimiter,

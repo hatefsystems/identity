@@ -130,7 +130,45 @@ Independent requests may protect the same account. New requests return 201; matc
 
 Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together. Audit storage failure returns `503 audit_unavailable`; an unavailable store cannot guarantee durable recording of that rejected attempt. An acknowledged outbox worker delivers Class C intent to the signer. Ordinary security-event recording retains its existing best-effort transport.
 
-Verification defaults to 1,000 records (maximum 5,000), captures `through_seq`, and resumes with `after_seq`, that fixed bound, and optional `predecessor_hash`. It reports the seed, checked range, completion, next cursor and first mismatch. Valid sequence allocation gaps are allowed. It proves only the stored segment relative to its seed; it does not prove complete ingestion, absence of tail truncation, or authenticity without an external anchor. Hashes in a filtered audit list do not form a contiguous-chain proof.
+Verification defaults to a 1,000-step page (maximum 5,000), captures `through_seq`, and resumes with `after_seq`, that fixed bound, and optional `predecessor_hash`. It reports the seed, checked range, completion, next cursor and first mismatch. Valid sequence allocation gaps are allowed. Class C `/audit-logs/verify` behavior is unchanged. Hashes in a filtered audit list do not form a contiguous-chain proof.
+
+`/ledger/verify` reads the durable head, surviving rows and compact erased-span
+checkpoints in one bounded read-only REPEATABLE READ snapshot per request. That
+snapshot is separate from the administrative audit transaction; the response is
+still withheld until durable disclosure intent commits. Authorization and the
+content-free response boundary are unchanged. No route grants retention DELETE
+or exposes erased metadata.
+
+| Ledger response field | Meaning |
+|---|---|
+| `checked` | Retained records whose canonical bodies were recomputed, not erased rows. |
+| `purged_count`, `purged_spans` | Authorized erased rows and checkpoint spans traversed on this page. |
+| `proof_steps` | Bounded live-record plus checkpoint work; the page limit applies to both kinds. |
+| `seed_source` | May be `checkpoint_boundary` when the exact historical boundary digest remains available. |
+| `restart_required` | The requested exact historical boundary was erased inside a compacted span and is unavailable. |
+| `scope` | Declares database-relative retained-segment verification; erased bodies are not recomputed and ingestion completeness/independent authenticity are not proved. |
+
+A legitimate prefix/interior/tail purge is traversed through authorized
+checkpoint transitions rather than treated as missing evidence corruption. If
+no retained bodies are checked, including a fully purged ledger, the result is
+`verified=false`, `failure_reason=no_retained_records`; proof traversal may still
+be complete or return a next cursor. It is neither successful content verification
+nor a tampering alarm, and is audited as a non-tamper outcome.
+
+Continuation never silently moves `through_seq` or approximates an interior
+digest. Exact retained/checkpoint boundaries remain usable. If compaction makes
+a requested boundary unavailable, the content-free result has
+`failure_reason=retention_boundary_unavailable`, `restart_required=true`,
+`verified=false`, `complete=false` and no next cursor. Restart a fresh verification
+from genesis without the stale boundary/high-water parameters. Unknown supplied
+sequence boundaries that are not explained by retention remain invalid requests.
+
+`missing_head`, `head_mismatch`, `invalid_checkpoint`, `checkpoint_overlap`,
+`checkpoint_link_mismatch` and `missing_proof` indicate invalid proof state;
+`hash_mismatch` and supplied `predecessor_mismatch` remain failures. None yields
+`verified=true`. The durable head detects inconsistent tail/sequence state, but
+checkpoints and Class C receipts do not independently defeat a privileged coherent
+database rewrite or backup rollback. External anchoring is explicitly deferred.
 
 HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate stateful credentials across instances; previously issued downstream JWTs retain at most their configured 10-minute lifetime. Reactivation does not revive old credentials or prevent re-registration.
 

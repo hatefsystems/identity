@@ -113,7 +113,7 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 #### The "Zero Trust" Admin Philosophy
 - **No Manual Deletion:** Admins cannot manually perform a "Hard Delete" on a user account. Hard Deletes are exclusively triggered by the user via the "Right to be Forgotten" self-service flow, which initiates a scheduled Cron Job.
 - **Immutable Audit Logging:** Every state change initiated by an admin (e.g., banning a user, changing a role, triggering password resets) is immutably logged in the database ledger. To minimize resource utilization during the MVP phase, these logs are stored in a dedicated PostgreSQL table; they are migrated to the analytical database (ClickHouse) post-MVP.
-  - **Cryptographic Log Chaining:** To prevent any out-of-band manipulation of logs on the physical disk, each audit log row's cryptographic hash is chained to the hash of the preceding row (forming a secure cryptographic ledger). Any unauthorized deletion or modification instantly breaks the chain, raising high-severity system alerts.
+  - **Cryptographic Log Chaining:** Each audit log row is chained to its predecessor. Verification detects inconsistent stored segments; it is not an independent defense against a privileged coherent database rewrite. Class B authorized retention uses checkpoints and a durable head, while Class C remains unchanged. External trust anchoring is deferred.
 
 ### Privacy & GDPR Compliance
 - **PII Masking:** Personally Identifiable Information is masked at the application layer before logging or analytics processing.
@@ -126,7 +126,7 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
   - **Transactional Outbox for `identity.user.deleted`:** The worker cannot publish to NATS atomically with the `DELETE`, so it writes the event to an `event_outbox` table inside the very same transaction. That makes "no event without a commit, no commit without an event" a database guarantee rather than worker discipline: a `DELETE` affecting anything other than exactly one row (a raced reclaim, or a hold applied mid-flight and caught by the query's own `NOT EXISTS` predicate) rolls the event back with it, so downstream services can never be told to scrub a subject that still exists. Draining the outbox into JetStream is a later task; until then rows accumulate and an unpublished-row-count alert is required.
   - **Legal Hold Precedence (holds > retention):** Before purging any record, the Cron **must** check the `legal_holds` table for an active hold on the subject. If a hold exists, the purge is skipped entirely (regardless of how long the hold lasts) and the skip is recorded in the audit log. A Legal Hold is a precedence lock with no time cap; it only helps if applied **before** the purge and cannot resurrect already-deleted data.
   - **Grace Period vs. Security Retention (distinct concepts):** The 30-day window is strictly a **user-recovery** mechanism, not a legal-retention period. It is independent of both Legal Hold and the security-ledger retention. Hard-delete removes only Class A (deletable PII); it does **not** touch the `security_event_ledger`.
-  - **Persistent Security Event Ledger:** To answer a lawful request that arrives *after* an account is deleted (e.g., a court inquiry at day 60 about an action taken before a day-30 deletion), a minimal, non-PII `security_event_ledger` is retained on its own independent schedule (e.g., 6-18 months). It stores a stable `account_ref` and an identity blind index (never raw PII), so an action stays attributable within a bounded, documented window. Full policy: see `compliance-and-data-governance.md`.
+  - **Persistent Security Event Ledger:** To answer a lawful request that arrives *after* an account is deleted (e.g., a court inquiry at day 60 about an action taken before a day-30 deletion), `security_event_ledger` retains minimized metadata for 365 days from occurrence (`SECURITY_LEDGER_RETENTION=8760h`, validated range `4320h..13140h`). It stores a stable `account_ref` and an identity blind index (never raw email/phone), so an action stays attributable within a bounded window or active hold. Full policy: see `compliance-and-data-governance.md`.
 - **Append-Only Log Management (ClickHouse / PostgreSQL MVP Fallback):** System logs and audit trails are designed to be stored in a high-performance, append-only column-oriented database (**ClickHouse**), rather than the transactional database, preventing database write bottlenecks. However, **during the MVP phase, ClickHouse is completely bypassed to reduce server memory overhead by ~1.2 GB**. Instead, logs are written to PostgreSQL using a dedicated `mvp_audit_logs` table, while strictly maintaining the same cryptographic chaining and append-only access controls (administrative database roles do not possess `UPDATE` or `DELETE` permissions on the audit logs table, guaranteeing that audit trails are permanent and tamper-proof).
 
 ## 3. Observability & Secret Management
@@ -162,7 +162,7 @@ The Identity Platform is isolated in its own repository (`hatefsystems/identity`
 
 ### Deployment Strategy
 - **Containerization:** All services (Next.js, Go) are containerized using Docker.
-- **Orchestration:** Kubernetes (K8s) is used to manage deployments, scaling, and networking (handling the mTLS mesh).
+- **Orchestration:** The current MVP uses Docker Compose and host cron/systemd for one-shot workers. Kubernetes remains a later deployment target, not a prerequisite for ledger retention.
 - **CI/CD:** Automated pipelines handle testing, building, and deploying containers to staging and production environments.
 
 ## 7. Contribution Guidelines
@@ -187,3 +187,31 @@ The Identity Platform is isolated in its own repository (`hatefsystems/identity`
 - **Review for Privacy:** Always consider the privacy implications of new features. Ensure data minimization and proper masking of PII in logs.
 
 Task 5.3 runtime and release boundaries: [Admin operations](admin-operations.md). DPO alone reads raw audit records and manages independent encrypted legal requests. Super Admin has no implicit legal or personal-data bypass. Holds are retention locks, not immutable snapshots; review dates are advisory.
+
+### Security Ledger Retention Boundary (Task 5.4)
+
+`security-ledger-purge` is independent of Class A erasure and Class C history.
+The worker uses a dedicated database login, bounded keyset batches and one
+database cutoff/high-water mark per run. A restricted SECURITY DEFINER routine
+rechecks active holds under the same account-lock protocol as hold changes,
+including absent user rows; only strict expired rows may be deleted. The routine
+atomically compacts content-free erased-span checkpoints and writes durable
+Class C maintenance intent. `admin-audit-publisher` delivers that intent with
+JetStream acknowledgement on `AUDIT_SUBJECT` (default `identity.audit.logs`).
+The retention worker itself has no broker credential or encryption secret.
+
+Signer and purge share short READ COMMITTED transactions with ledger coordination
+before account/row locks. Signer restart and uncertain-commit recovery use the
+durable `security_ledger_head`, never the latest surviving payload. Routine
+operation requires no scheduled signer stop. Initial rollout does require a
+controlled drain, verified-history bootstrap and compatible signer/API/worker
+deployment before destructive enablement. The non-root image ships all three
+plus the existing admin publisher; host jobs use explicit entrypoint overrides.
+
+Retained-segment verification uses a bounded snapshot of live rows, head and
+checkpoints. It distinguishes erased spans from hash failures but cannot
+recompute erased bodies or independently detect a coherent privileged rewrite.
+External anchors are explicitly deferred. Rollback first disables scheduling
+and maintenance EXECUTE; initialized/purged state is forward-only and must not
+be served by old signer/verifier binaries. Task 5.3 operational approval and
+Task 5.5 narrative-retention policy remain separate gates in the runbook.

@@ -28,7 +28,7 @@ func TestSignerNormalizesLegacyAndSyntheticTimestamps(t *testing.T) {
 	now := time.Date(2026, 9, 18, 1, 2, 3, 123456789, time.FixedZone("offset", 12600))
 	id := uuid.New()
 	index := strings.Repeat("a", 64)
-	store := &fakeStore{userEmails: map[uuid.UUID]string{id: "alice@example.test"}}
+	store := &fakeStore{head: genesisLedgerHead(), userEmails: map[uuid.UUID]string{id: "alice@example.test"}}
 	tx := &fakeBatchTx{store: store}
 	s, err := New(Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: time.Hour + 987*time.Nanosecond}, store, &fakeBatchTxOpener{tx: tx}, &fakeFetcher{}, WithClock(func() time.Time { return now }), WithLogger(discardLogger()))
 	if err != nil {
@@ -62,7 +62,7 @@ func TestSignerNormalizesLegacyAndSyntheticTimestamps(t *testing.T) {
 func TestSignerLateSubjectsAndClassC(t *testing.T) {
 	live, deleted := uuid.New(), uuid.New()
 	index := strings.Repeat("a", 64)
-	store := &fakeStore{userEmails: map[uuid.UUID]string{live: "live@example.test"}, userEmailErrs: map[uuid.UUID]error{deleted: errors.New("must not query identity after capture")}}
+	store := &fakeStore{head: genesisLedgerHead(), userEmails: map[uuid.UUID]string{live: "live@example.test"}, userEmailErrs: map[uuid.UUID]error{deleted: errors.New("must not query identity after capture")}}
 	s, err := New(Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: time.Hour}, store, &fakeBatchTxOpener{tx: &fakeBatchTx{store: store}}, &fakeFetcher{}, WithLogger(discardLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestSignerLateSubjectsAndClassC(t *testing.T) {
 }
 
 func TestSignerSubjectLockFailureAbortsBatch(t *testing.T) {
-	store := &fakeStore{subjectLockErr: errors.New("lock unavailable")}
+	store := &fakeStore{head: genesisLedgerHead(), subjectLockErr: errors.New("lock unavailable")}
 	tx := &fakeBatchTx{store: store}
 	s, err := New(Config{BatchSize: 1, FlushInterval: time.Second, LedgerRetention: time.Hour}, store, &fakeBatchTxOpener{tx: tx}, &fakeFetcher{}, WithLogger(discardLogger()))
 	if err != nil {
@@ -113,7 +113,7 @@ func TestSignerSubjectLockFailureAbortsBatch(t *testing.T) {
 }
 
 func TestSignerFailedReseedStopsBeforeNextFetch(t *testing.T) {
-	store := &fakeStore{latestAuditErr: pgx.ErrNoRows, latestLedgerErr: pgx.ErrNoRows}
+	store := &fakeStore{latestAuditErr: pgx.ErrNoRows, head: genesisLedgerHead()}
 	tx := &fakeBatchTx{store: store, commitErr: errors.New("commit outcome uncertain")}
 	tx.onCommit = func() { store.latestAuditErr = errors.New("database unreachable") }
 	ch := make(chan jetstream.Msg, 1)

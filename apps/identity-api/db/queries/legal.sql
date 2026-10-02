@@ -106,20 +106,6 @@ WHERE account_ref = $1
 ORDER BY timestamp DESC, id DESC
 LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
 
--- name: PurgeExpiredSecurityEvents :execrows
--- Retention purge (Task 5.4). Runs under a dedicated maintenance role. Rows are
--- removed ONLY when past retain_until AND the subject has no active Legal Hold
--- (holds > retention, compliance §6). NOT safe as a live worker: before any
--- maintenance deletion, lock every selected account with pglock.LockAccount in
--- UUID order, then re-read in a NEW READ COMMITTED statement. API roles must not
--- bypass the append-only trigger. Task 5.4 owns the maintenance/checkpoint design.
-DELETE FROM security_event_ledger sel
-WHERE sel.retain_until < NOW()
-  AND NOT EXISTS (
-      SELECT 1 FROM legal_holds lh
-      WHERE lh.account_ref = sel.account_ref AND lh.is_active = TRUE
-  );
-
 -- ---------------------------------------------------------------------------
 -- Legal Holds
 -- ---------------------------------------------------------------------------

@@ -47,18 +47,18 @@ Tamper-evident administrative and system audit trail.
 
 ## 3. Data Retention Schedule
 
-Retention is purpose-bound and time-boxed. Every category auto-purges when its window expires, unless a Legal Hold (Section 6) is active.
+Retention is purpose-bound and time-boxed. Expiry-driven purges run after their operational enablement gates pass, unless a Legal Hold (Section 6) is active. Class C audit retention remains a separate policy, not a cleanup performed by the Class B worker.
 
 | Data Category | Class | Default Retention | Basis | Purge Mechanism |
 | :--- | :--- | :--- | :--- | :--- |
 | Active account PII & credentials | A | Life of account | Contract / consent | Hard-delete on erasure |
 | Sessions & refresh tokens | A | Until logout / expiry | Contract | TTL + revocation |
 | Deletion grace record | A | 30 days | Contract / user recovery | Cron after grace window |
-| Security event ledger | B | 6-18 months (configurable) | Legitimate interest / legal obligation | Scheduled purge job |
+| Security event ledger | B | 365 days (`8760h`; validated `4320h..13140h` range) | Legitimate interest / legal obligation | Separately credentialed hourly worker after rollout gates |
 | Admin/system audit logs | C | Long-term (policy-defined) | Legal obligation / accountability | Append-only; no ad-hoc delete |
 | Backups (PostgreSQL) | Mixed | Per backup retention (e.g., 14-30 days) | Operational continuity | Backup rotation |
 
-The exact security-ledger retention value is a configuration decision. A shorter window is more privacy-protective; a longer window reduces the risk of being unable to answer a late-arriving lawful request. It must be a single, documented, enforced value - never "keep everything indefinitely."
+The configured security-ledger policy is `SECURITY_LEDGER_RETENTION=8760h` (365 days). Changes within the validated range require a documented policy decision. The signer derives expiry from event occurrence, not ingestion time. The worker honors persisted `retain_until`; it neither rewrites signed timestamps nor restarts retention after a hold release. A shorter window is more privacy-protective; a longer window reduces the risk of being unable to answer a late-arriving lawful request. There is no "keep everything indefinitely" fallback.
 
 ---
 
@@ -109,6 +109,38 @@ The ledger is the mechanism that answers a lawful request that arrives **after**
 
 This is the load-bearing difference from a design that only masks and nulls audit rows on deletion: the ledger is intentionally kept attributable (via blind index and stable ref) within a bounded, documented window.
 
+### 7.1 Authorized Retention and Proof Minimization
+
+The independent `security-ledger-purge` command removes only rows whose stored
+`retain_until` is strictly before the run's database cutoff and for which no
+independent active hold remains on the original account reference. Account
+hard-delete does not remove that protection. Advisory dates are not releases;
+applying a hold after erasure cannot restore evidence. The Class A deletion
+worker and Class C audit history remain untouched.
+
+Minimal proof metadata can outlive erased events: sequence boundaries, counts
+and digests in compact checkpoints plus a durable logical head. These records
+must contain no erased account reference, source event ID, blind index,
+network/device metadata or body. Adjacent erased spans compact without crossing
+retained records. The purpose is validating surviving segments and future
+appends, not preserving erased evidence under a different name.
+
+Sanitized `legal.ledger.purged` / `legal.ledger.purge_skipped` Class C receipts
+contain a system actor, opaque operation ID, cutoff, aggregate counts and bounded
+outcomes, never identifiers, legal narratives or complete checkpoint histories.
+Receipt intent, proof changes and deletion are one transaction; delivery uses
+the acknowledged admin audit publisher. Receipt retention follows the existing
+Class C policy, which this task does not redesign. Dry-run commits neither
+deletion, checkpoints nor receipts.
+
+Verification is explicitly database-relative. Checkpoints and Class C receipts
+are not external anchors and do not independently defeat a privileged coherent
+rewrite or backup rollback. External anchoring is a deferred follow-up, not a
+completed Task 5.4 control. Enablement requires the [operator gates](admin-operations.md#security-ledger-retention-task-54),
+including history assessment, explicit bootstrap, real-role denial tests and
+successful dry-run/audit delivery. Task 5.3 deployment closure and Task 5.5
+restricted-narrative retention approval/cleanup remain independent and open.
+
 ---
 
 ## 8. Law Enforcement Response & Preservation Requests
@@ -125,6 +157,7 @@ This is the load-bearing difference from a design that only masks and nulls audi
 - Deleted data does not vanish from backups instantly. It persists until the relevant backup rotates out (e.g., 14-30 days per Section 3).
 - Backups are encrypted and access-controlled. They are not used to circumvent erasure; they are a disaster-recovery mechanism only.
 - A restore that would reintroduce erased data must re-apply pending deletions and active holds after recovery.
+- Restore ledger, durable head, checkpoints, holds and outbox from one consistent recovery point. Verify before reopening ingestion or purge, then reconcile authoritative holds/deletions and resume eligible expiry. Backup rotation remains independent of live-ledger retention; no automatic fresh genesis, hold bypass or guarantee of recovering erased payloads is permitted. See [disaster recovery](disaster-recovery.md#33-security-ledger-retention-recovery).
 
 ---
 
@@ -203,4 +236,4 @@ These are stated as posture and targets; formal certification is pursued as the 
 
 Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
 
-Automatic security-ledger deletion, retained-island/checkpoint verification, external trust anchors, phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE or trigger-bypass privileges.
+Task 5.4 owns separately credentialed ledger retention and retained-segment verification, subject to its deployment gates. External trust anchors are explicitly deferred; phone attribution and pepper rotation remain separate work. Task 5.5 narrative-retention approval is not satisfied by this worker. Do not grant the API ledger DELETE, maintenance EXECUTE or trigger-bypass privileges.

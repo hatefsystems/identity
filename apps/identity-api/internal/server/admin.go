@@ -195,6 +195,15 @@ type adminChainVerifyResponse struct {
 	NextAfterSeq *int64 `json:"next_after_seq"`
 }
 
+// adminLedgerVerifyResponse distinguishes recomputed content from erased proof.
+type adminLedgerVerifyResponse struct {
+	adminChainVerifyResponse
+	PurgedCount     int64 `json:"purged_count"`
+	PurgedSpans     int   `json:"purged_spans"`
+	ProofSteps      int   `json:"proof_steps"`
+	RestartRequired bool  `json:"restart_required"`
+}
+
 // writeAdminError writes the uniform admin error envelope with no-store.
 func (s *Server) writeAdminError(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Cache-Control", "no-store")

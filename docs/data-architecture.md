@@ -147,7 +147,7 @@ CREATE TABLE security_event_ledger (
     client_id VARCHAR(100) NULL,             -- OAuth client that received an authorization, if any
     scope TEXT NULL,
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    retain_until TIMESTAMP WITH TIME ZONE NOT NULL, -- Independent retention (e.g., NOW() + 6..18 months)
+    retain_until TIMESTAMP WITH TIME ZONE NOT NULL, -- Event occurrence + SECURITY_LEDGER_RETENTION (default 8760h)
     chain_hash VARCHAR(64) NOT NULL          -- Same cryptographic chaining as audit logs
 );
 
@@ -184,6 +184,60 @@ CREATE INDEX idx_legal_holds_active ON legal_holds(account_ref) WHERE is_active 
 - **Purge of the ledger** is driven solely by `retain_until` (scheduled job), never by account deletion.
 - **Legal Hold precedence:** Before any purge - the 30-day hard-delete Cron on `users`, or the ledger purge job - the worker MUST check `legal_holds` for an active row matching the `account_ref`. If one exists, the purge is skipped and the skip is recorded in the audit log.
 - **No raw PII in the ledger.** Only the blind index is stored; raw email/phone stay in Class A and are erased on hard-delete.
+
+### 1.1.2 Retention Proof and Durable Head (Task 5.4)
+
+Additive migration `00011` protects the logical chain independently of surviving
+payloads. The migration does not initialize genesis or provision deployment
+logins. Operators must inventory and verify history, stop/drain the old signer,
+and explicitly bootstrap the known terminal position as described in
+[admin operations](admin-operations.md#security-ledger-retention-task-54).
+
+| Protected relation | State |
+|---|---|
+| `security_ledger_head` | `singleton boolean` primary key constrained to true, `seq bigint`, `chain_hash text`; latest committed logical position even if its payload has been erased. |
+| `security_ledger_checkpoints` | `first_seq`, `last_seq`, `predecessor_seq`, `predecessor_hash`, `terminal_hash`, `erased_count`; compact maximal erased spans in committed chain order. |
+| `security_ledger_retention_settings` | `singleton boolean` primary key constrained to true, `audit_subject text`; explicitly provisioned subject binding for maintenance receipts, never worker-writable. |
+
+Genesis is an explicit initialized head, not an inference from an empty ledger.
+Missing/malformed state fails closed. Checkpoints retain only sequence boundaries,
+counts and digests, never erased account refs, source event IDs, blind indexes,
+network/device metadata or bodies. Numeric sequence allocation gaps are legal;
+a checkpoint must never cover a surviving row. Only chain-adjacent, hash-linked
+spans can merge. Fully erased history compacts to a bounded prefix proof plus
+the head, not one tombstone per erased event.
+
+The purge candidate index is `(retain_until, seq)`. Bounded keyset traversal uses
+one database cutoff and logical high-water mark per run, never OFFSET over a
+shrinking table. Eligibility is strict `retain_until < cutoff`, and any active
+hold on the original account blocks deletion even without a `users` row. Review
+dates do not expire holds; last-hold release resumes the original expiry.
+
+Signer and purge transactions use READ COMMITTED and the common lock order:
+ledger coordination advisory transaction lock (`5200002`), account locks in UUID
+order, then deterministic row locks. No account-locked path may acquire the
+ledger lock later. Purge overlap uses a separate run lock (`5200003`), not the
+daemon-lifetime signer lock (`5200001`). After account-lock acquisition a fresh
+statement rechecks holds. Routine checks remain authoritative if a run-lock
+connection is lost or the routine is invoked without the Go worker.
+
+The trusted maintenance function, owned by non-login
+`identity_ledger_maintenance_owner`, is the only ledger DELETE/checkpoint
+compaction authority. `identity_ledger_purge` is a non-owner login with narrow
+reads and approved EXECUTE only, never owner membership or direct chain writes.
+Signer head advancement is separately granted and validates the actual newly
+inserted terminal row in the append transaction. UPDATE/TRUNCATE guards stay
+unconditional; there is no trigger disabling or caller-settable bypass. This
+replaces the old broad append-only exemption comment, not the guards on Class C.
+
+Canonical-body verification, exact-row deletion, checkpoint compaction and
+sanitized Class C `admin_action` outbox intent commit atomically. Dry-run rolls
+all of them back. Retained-segment verification uses a bounded read-only
+REPEATABLE READ snapshot of the head, live rows and checkpoints. It recomputes
+only retained bodies, distinguishes authorized erasure from unexplained damage,
+and never invents an erased interior digest. All-purged is not successful content
+verification. This proof is database-relative; external anchoring is deferred,
+so a privileged coherent database rewrite/rollback is not independently detected.
 
 
 ### 1.2 `sqlc` & `pgx` Configurations
@@ -372,4 +426,4 @@ Where:
 
 Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
 
-Automatic security-ledger deletion, retained-island/checkpoint verification, external trust anchors, phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE or trigger-bypass privileges.
+Task 5.4 adds separately credentialed ledger retention and retained-segment proof under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External trust anchors are explicitly deferred; phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE, maintenance EXECUTE or trigger-bypass privileges.
