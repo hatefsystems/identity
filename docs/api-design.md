@@ -221,14 +221,20 @@ this contract. See [operator procedures](admin-operations.md#legal-review-and-tr
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 
+Task 6.1 implements the reusable `internal/grpcauth` security layer and its TLS/gRPC tests. The current API runtime remains HTTP-only; Task 6.2 must activate the private listener and implement the RPCs below. No SPIRE deployment, production identity grants, or public gRPC routing is implied.
+
 ### 2.1 Identity SAN Validation (gRPC RBAC)
-Every internal RPC method call is intercepted by a security middleware that extracts the client's X.509 certificate metadata and verifies the **SPIFFE ID** contained within the **Subject Alternative Name (SAN)** field (e.g., `spiffe://hatef.ir/ns/identity/sa/email-service`). Method-level RBAC is strictly applied, rejecting connection requests if the SPIFFE identity is not pre-authorized for the targeted RPC call.
+`grpcauth` verifies the client's X.509-SVID at each unary call or stream creation, using exactly one URI **Subject Alternative Name (SAN)** containing a valid workload **SPIFFE ID**, for example `spiffe://hatef.ir/ns/identity/sa/email-service`. The identity must belong to the explicitly configured trust domain and its certificate chain must verify against the current injected bundle. CN, DNS SANs, metadata, forwarding headers, OAuth clients, and administrator roles are not workload authentication.
+
+Service RBAC is an immutable exact-full-method-to-SPIFFE-ID allowlist supplied by the composition root. There are no default, wildcard, or prefix grants. Unknown grants are never inferred from service names, and health/reflection methods have no exemption. Authorization denies the RPC, not other independently permitted calls on the same authenticated connection. The helper installs TLS 1.3 mTLS credentials and both guards without opening a listener or owning credential-source lifetime.
+
+RPC-stage authentication failures return `Unauthenticated`, unavailable trust material returns `Unavailable`, and authenticated callers without a matching grant receive `PermissionDenied`. Allowed handlers can read the verified service identity through `grpcauth.IdentityFromContext`. Streaming authorization is admission-only; already-open streams are not revoked automatically. Interceptor denials produce sanitized, best-effort `grpc.access.denied` audit events, without user/security-ledger attribution or request contents. Handshake failures and unregistered-method dispatch can occur before an interceptor. See [client integration](client-integration.md#3-internal-grpc-integration-zero-trust) for wiring, certificate renewal, error, and audit limits.
 
 ### 2.2 `IdentityService`
-Used by microservices to validate user identity and permissions.
+Planned for Task 6.2, using the [canonical protobuf contract](../libs/schemas/proto/hatef/identity/v1/identity_service.proto). Method-level workload permission does not replace these user-level checks.
 - `rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse)`: Parses a JWT, checks if it's revoked in Redis, and returns user claims. Extremely fast, heavily cached.
 - `rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse)`: Evaluates if a specific User ID has a specific role or permission (RBAC evaluation).
-- `rpc GetInternalUserInfo(GetUserInfoRequest) returns (GetUserInfoResponse)`: Fetches basic user info (e.g., email, display name) needed by other services (e.g., Email service needing to address the user).
+- `rpc GetInternalUserInfo(GetInternalUserInfoRequest) returns (GetInternalUserInfoResponse)`: Fetches basic user info (e.g., email, display name) needed by other services (e.g., Email service needing to address the user).
 
 ---
 

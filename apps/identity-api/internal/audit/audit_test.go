@@ -154,3 +154,10 @@ func TestPayloadFieldsSorted(t *testing.T) {
 func TestRecorderInterfaceIsSatisfied(_ *testing.T) {
 	var _ Recorder = NewLogRecorder(nil)
 }
+
+func TestGRPCAccessDeniedIsAuditOnly(t *testing.T) {
+	t.Parallel()
+	if IsLedgerEventType(EventGRPCAccessDenied) {
+		t.Fatal("workload denials must not fabricate account attribution in the security ledger")
+	}
+}

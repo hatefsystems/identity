@@ -127,6 +127,10 @@ const (
 	EventRTRBreach = "security.rtr_breach"
 )
 
+// EventGRPCAccessDenied records a rejected workload authentication or method
+// authorization check. It is audit-only: a service identity is not an account.
+const EventGRPCAccessDenied = "grpc.access.denied"
+
 // Event types emitted by the audit pipeline about itself (Task 5.2).
 const (
 	// EventPipelineUndecodable records a stream message the signing consumer could

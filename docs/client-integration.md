@@ -146,24 +146,29 @@ The Go Identity Server looks up the public key matching `kid` from its database/
 
 ## 3. Internal gRPC Integration (Zero-Trust)
 
-Internal microservices bypass public HTTP routing for token validation, communicating directly with the Identity Platform over **gRPC**.
+Internal microservices must bypass public HTTP routing and authenticate directly to the Identity Platform over **gRPC with mTLS**. Forwarded headers and caller-supplied metadata are not workload credentials.
+
+**Implementation boundary:** Task 6.1 provides `apps/identity-api/internal/grpcauth`, a reusable security layer and self-contained TLS/gRPC tests. The running API is still HTTP-only. Listener activation, Workload API lifecycle, production grants, and the business RPC implementations remain Task 6.2; SPIRE provisioning remains separately approved infrastructure work. The examples below are integration guidance, not a deployed configuration.
 
 ### 3.1 SPIFFE/SPIRE Bootstrapping
 
-All internal containers run a SPIRE Agent sidecar. The agent exposes the local SPIFFE Workload API (via a Unix Domain Socket at `/run/spire/sockets/agent.sock`).
+A future SPIRE deployment must expose an authorized local Workload API to each workload, for example through `unix:///run/spire/sockets/agent.sock`. Agent topology, workload attestation/registration, trust bundles, and socket access controls must be provisioned before enabling the listener. This task neither installs sidecars nor provisions the post-MVP DaemonSet.
 
-When a client application starts, it reads its **SVID** (SPIFFE Verifiable Identity Document) from the Workload API:
+When an application starts, a maintained source obtains its **SVID** (SPIFFE Verifiable Identity Document) and trust bundles. With `go-spiffe/v2` v2.8.2:
 
 ```go
 import "github.com/spiffe/go-spiffe/v2/workloadapi"
 
-// Create a connection source to SPIRE Agent
-source, err := workloadapi.NewX509Source(ctx, workloadapi.WithAddress("unix:///run/spire/sockets/agent.sock"))
+source, err := workloadapi.NewX509Source(ctx,
+    workloadapi.WithClientOptions(workloadapi.WithAddr("unix:///run/spire/sockets/agent.sock")),
+)
 if err != nil {
     log.Fatalf("Unable to connect to SPIRE workload API: %v", err)
 }
 defer source.Close()
 ```
+
+The composition root owns this source. Keep it alive throughout RPC service, and stop RPC activity before closing it or the shared audit recorder. `grpcauth` accepts the source interfaces but does not create a client, acquire credentials, or manage shutdown.
 
 ### 3.2 Dynamic mTLS gRPC Connections
 
@@ -171,51 +176,77 @@ Using the `X509Source`, the client constructs a secure gRPC connection without h
 
 ```go
 import (
-    "github.com/spiffe/go-spiffe/v2/spiffegrpc/grpccredentials"
+    "crypto/tls"
+
+    "github.com/spiffe/go-spiffe/v2/spiffeid"
+    "github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
     "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials"
 )
 
-// Configure gRPC options using dynamically rotated SPIFFE credentials
-creds := grpccredentials.MTLSClientCredentials(source, source, grpccredentials.AuthorizeID(
+// Example server identity. Production must pin its approved exact identity.
+tlsConfig := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(
     spiffeid.RequireFromString("spiffe://hatef.ir/ns/identity/sa/idp-core"),
 ))
+tlsConfig.MinVersion = tls.VersionTLS13
 
-conn, err := grpc.DialContext(ctx, "idp-core.internal:9090", grpc.WithTransportCredentials(creds))
+conn, err := grpc.NewClient("dns:///idp-core.internal:9090",
+    grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+)
 if err != nil {
-    log.Fatalf("gRPC connection failure: %v", err)
+    log.Fatalf("gRPC client configuration failure: %v", err)
 }
 defer conn.Close()
 ```
 
-### 3.3 Passing Metadata & Token Validation API
+The SPIFFE TLS helper verifies the certificate chain and pinned SPIFFE identity instead of a DNS hostname. Do not replace it with a raw `InsecureSkipVerify` configuration. `grpc.NewClient` is lazy: construction is not proof of connectivity or readiness; calls need deadlines and normal error handling.
 
-Once connected via dynamic mTLS, internal services validate incoming API requests against the IdP.
+The server helper requires TLS 1.3 and disables session tickets. New connections perform a fresh handshake, while every new RPC also verifies the peer certificate against the current local trust bundle. Renewing the source does not replace the certificate on an established connection. Define reconnection/connection-age behavior before production so calls do not continue using expired peer credentials.
 
-#### Service Specification (gRPC Interface):
-```protobuf
-syntax = "proto3";
-package hatef.identity.v1;
+### 3.3 Method Grants and IdentityService
 
-service TokenValidationService {
-    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+The canonical contract is [`hatef.identity.v1.IdentityService`](../libs/schemas/proto/hatef/identity/v1/identity_service.proto), not a separate `TokenValidationService`. It defines three unary methods: `ValidateToken`, `CheckPermission`, and `GetInternalUserInfo`. Their business implementations remain Task 6.2. User tokens and DPoP proofs belong to those handlers, not to workload authentication.
+
+The future server composition root can construct the guard as follows, using an existing `audit.Recorder` and maintained source. This example is not a production permission grant:
+
+```go
+import "github.com/hatefsystems/identity/apps/identity-api/internal/grpcauth"
+
+guard, err := grpcauth.New(grpcauth.Config{
+    TrustDomain: "hatef.ir",
+    Grants: map[string][]string{
+        "/hatef.identity.v1.IdentityService/ValidateToken": {
+            "spiffe://hatef.ir/ns/identity/sa/search-core",
+        },
+    },
+    Bundles: source,
+    Recorder: recorder,
+    Logger: logger,
+})
+if err != nil {
+    return err
 }
-
-message ValidateTokenRequest {
-    string access_token = 1;
-    string dpop_proof = 2; // Required if the token is DPoP-bound
+options, err := guard.ServerOptions(source)
+if err != nil {
+    return err
 }
-
-message ValidateTokenResponse {
-    bool active = 1;
-    string user_id = 2;
-    repeated string scopes = 3;
-    string client_id = 4;
-    int64 expires_at = 5;
-}
+server := grpc.NewServer(options...)
+// Task 6.2 must register the service, bind a private listener, and own shutdown.
 ```
 
-#### Validation Interceptor Behaviors on IdP:
-1. **mTLS Handshake:** The IdP verifies the client's X.509 certificate.
-2. **SAN Verification:** The IdP Go interceptor inspects the `Subject Alternative Name` (SAN) of the incoming connection to read the client SPIFFE ID.
-3. **Application AuthZ:** If `spiffe://hatef.ir/ns/identity/sa/search-core` calls `ValidateToken`, the interceptor permits the invocation. If a service without validation clearance calls it, the interceptor immediately rejects it with `codes.PermissionDenied`.
-4. **Token Resolution:** The IdP queries the active token details in Redis/PostgreSQL and returns token metadata.
+Install these options before additional business interceptor chains and never override their transport credentials. The helper registers no services and enables no reflection. Workload policy is immutable and copied on construction: no wildcards, namespace/prefix grants, or defaults. An empty policy denies all methods. The example grants Search Core only `ValidateToken`, not the other two methods. Full method names are limited to 512 characters and SPIFFE IDs to 2048; the configured trust domain must be a bare canonical name.
+
+At each admission the guard requires a completed TLS connection, exactly one URI SAN containing a non-root SPIFFE workload identity in the configured trust domain, a currently valid chain, and valid SVID leaf key usages. Other SAN types do not supply identity. Custom SPIFFE TLS verification can leave `VerifiedChains` empty; the guard verifies the actual peer chain against a snapshot of the current bundle rather than trusting that field or `TLSInfo.SPIFFEID` alone.
+
+| Admission result | gRPC status |
+|---|---|
+| Missing/invalid TLS, certificate, identity, validity period, or trust | `Unauthenticated` |
+| Required trust bundle missing, empty, or unavailable | `Unavailable` |
+| Authenticated workload without the exact method grant | `PermissionDenied` |
+| Authenticated and explicitly granted | Handler receives the verified ID via `grpcauth.IdentityFromContext`; its result is preserved |
+
+Health and reflection methods have no automatic exemption. Unregistered methods may return gRPC's native `Unimplemented`. TLS-handshake failures occur before interceptor invocation and need not appear as an application authentication status.
+
+Streaming support authorizes **stream creation only**. Expiry and trust changes block new RPC admissions but do not terminate or reauthorize already-open streams. Continuous revocation and forced stream expiry are not provided.
+
+The guard emits `grpc.access.denied` through the existing best-effort recorder for interceptor-stage denials only. Events contain bounded method/status/reason metadata and a verified workload actor when available, never tokens, RPC bodies, raw certificates, or asserted metadata. The existing audit actor column is limited to 255 characters: longer verified IDs are omitted in full and marked with `actor_spiffe_id_omitted: true`, never truncated, hashed, or copied into the payload. These events are audit-only, with no fabricated user or security-ledger attribution. Recorder errors do not alter the rejection. Successful business operations and transport-handshake failures are outside this event's coverage.
