@@ -61,6 +61,138 @@ Do not downgrade migrations `00008`–`00010` over durable intent, encrypted req
 
 Task 5.3 stays open until its complete role/route, concurrency, migration, ingress/privacy and operational acceptance matrix is verified. Task 5.4 owns ledger maintenance with subject locks, retained-segment/checkpoint proof and signer-head coordination; external anchoring is explicitly deferred. Task 5.5 owns operational reviews/transparency and restricted-narrative retention approval; phone attribution, historical key rotation, shared credential stores and immediate downstream JWT revocation remain separately scoped.
 
+## Legal Review and Transparency (Task 5.5)
+
+This backend is opt-in and does not confer production approval. `ADMIN_ENABLED`
+now requires `ADMIN_GOVERNANCE_POLICY_ID`, resolving to the immutable baseline
+installed by the controlled operator. The baseline must match both existing
+retention durations exactly. `LEGAL_WORKFLOW_ENABLED=false` remains the default;
+enabling it additionally requires `LEGAL_WORKFLOW_POLICY_ID` with an approved
+workflow extension. A baseline-only deployment can retain Task 5.3 preservation
+without enabling case intake. Backfill and the synthetic lookup probe remain
+available before approval; cleanup loads approved persisted policy independently
+of intake flags.
+
+### Approval Artifact
+
+The operator supplies a bounded JSON file with these fields. No example numeric
+retention values are production defaults:
+
+| Field | Required meaning |
+|---|---|
+| `id`, `approval_reference`, `fixture` | Immutable UUID, opaque external approval reference, explicit boolean. Fixtures are rejected outside development/test. |
+| `context_retention_seconds`, `released_hold_retention_seconds` | Positive approved integer seconds matching configured baseline values. |
+| `context_clock`, `released_hold_clock` | Exactly `created_at` and `released_at`. |
+| `hold_tombstone_fields`, `hold_tombstone_lifetime` | Exact actual retained field inventory and explicit `no_expiry` approval. |
+| `legacy_inventory_reference` | Opaque inventory attestation required when binding existing holds/contexts. Existing context clocks must match; they are never rewritten. |
+| `workflow` | Optional baseline extension; required for case intake/reporting. |
+| `workflow.max_case_age_seconds`, `workflow.closed_case_retention_seconds` | Positive approved case expiry durations. |
+| `workflow.case_clock` | Exactly `created_at_max_closed_at_min`: closure can shorten, never extend the original maximum. |
+| `workflow.replay_fields`, `workflow.replay_lifetime` | Exact minimized replay inventory and explicit `no_expiry` approval. |
+
+The existing hold inventory is `id`, `account_ref`, `applied_by`, `is_active`,
+`applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`,
+`idempotency_key`, `details_purged_at`. These are **linkable pseudonymous records**,
+not anonymous tokens. The new erased workflow replay inventory is `operation`,
+`scope`, `idempotency_key`, `result_id`, `erased`; it contains no subjects, actors,
+narratives or content fingerprints. Neither mechanism implements finite replay
+expiry. If governance does not approve its actual inventory and lifetime, intake
+must stay disabled until a separately reviewed replay protocol exists.
+
+Run with separately provisioned credentials and trusted launcher attribution:
+
+```sh
+npm exec -- nx run identity-api:admin-legal -- --operation=policy-install --policy-file=/approved/legal-policy.json
+npm exec -- nx run identity-api:admin-legal -- --operation=workflow-cleanup --limit=500 --dry-run
+npm exec -- nx run identity-api:admin-legal -- --operation=workflow-cleanup --limit=500
+```
+
+The policy installer records durable audit intent atomically. It does not verify
+the law or authenticate the operator from environment strings. First installation
+binds the baseline; changing that binding/retention requires a separate migration,
+not a new environment value. Schedule cleanup with the existing host scheduler;
+the packaged `admin-legal` command runs without a container shell. Cleanups of
+legacy action contexts and released hold narratives still use their existing
+commands and do not remove ledger evidence.
+
+### Operating Procedure
+
+1. Assign one opaque intake UUID to each actual request and reuse it on retries.
+   Record received time separately from entry time, including rejected/no-match
+   requests. One request can cover zero or multiple original accounts.
+2. Validate authority, legal sufficiency, scope and notification restrictions.
+   Record `accepted`, `rejected` or `needs_information` against the content
+   revision. Store documents in the approved external evidence system; this API
+   stores encrypted references, never uploads or follows their URLs.
+3. Apply any needed preservation through Task 5.3 immediately; no case approval is
+   a prerequisite. Link the existing hold afterward. Review dates are advisory;
+   the separate review queue/history never changes the hold's original replay
+   inputs, automatically releases a hold or implies an immutable evidence copy.
+4. Prepare the exact response scope/artifact manifest. Data-bearing proposals
+   require an accepted current content revision and a different active DPO's
+   approval. Editing content/proposals invalidates old approval. Recheck current
+   permissions and auth versions when approval is used.
+5. Transfer only the approved material through the controlled external channel,
+   then record the delivery receipt/time. This is operator attestation, not
+   verified transport. Reconcile a failed receipt write with the external record
+   and retry its original key; an API failure is never an instruction to resend
+   the material. Delivery time must not precede preparation or required approval.
+   The first release allows one final response and no
+   supplements, reopening or post-delivery correction. Closure never releases a
+   hold. Existing investigative lookup remains single-DPO and distinct from
+   permission to respond externally.
+6. Review exact monthly totals and prepare a completed-year artifact. A second
+   DPO approves the frozen artifact; only then download it for manual publication.
+   Received and answered are separate time cohorts. No historical totals are
+   inferred from hold operations. Late entries invalidate unexported snapshots;
+   downloaded artifacts remain historical and are never silently rewritten.
+
+Annual artifacts suppress nonzero totals below 5 and suppress the whole outcome
+breakdown if any outcome is 1-4. They contain no monthly/country/authority or
+identifier breakdowns. Source data versions stay internal because they can reveal
+suppressed counts. Suppression is not proof of anonymity or differential privacy;
+public-release review must consider previous publications too.
+
+Coverage begins with the first committed counter, not migration installation or
+policy registration. Reports never assert complete real-world collection;
+`partial` and `no_coverage` describe collection limitations and late entries may
+still contribute earlier-year counts. Approved payloads and replay results use
+byte-preserving storage, not JSONB reserialization, so a replay cannot silently
+change the artifact behind its digest.
+
+### Workflow Database Grants
+
+Use separate non-owner, non-superuser deployment logins with no inherited owner,
+DDL, replication or trigger-bypass authority. Migrations revoke public table
+access; they do not create deployment logins or grant production approval.
+
+| Identity | Additional scope |
+|---|---|
+| API | SELECT policy/baseline; required workflow SELECT/INSERT and state-column UPDATE; append-only encrypted history INSERT; transactional replay/counter/report operations. No policy INSERT, narrative/history DELETE, evidence maintenance, or outbox delivery updates. |
+| Policy operator | SELECT/INSERT policy and first baseline binding, legacy inventory reads, outbox INSERT. No workflow cleanup or evidence editing. |
+| Workflow maintenance | Policy and workflow/hold reads, subject locks, restricted-history/association cleanup and erased-state updates, outbox INSERT. No user/role writes, policy writes, audit/ledger mutation or ledger-purge EXECUTE. |
+| Publisher/signer | Existing Task 5.3/5.4 scopes only; no restricted workflow plaintext or keys. |
+
+Restrict mutable columns rather than granting table-wide rewriting where possible.
+Keep report payload/provenance and history immutable. Verify the actual login's
+privileges and membership paths, not only grants shown for a group role. Run the
+mandatory `identity-api:test-legal-workflow-integration` target against disposable
+PostgreSQL, Redis and JetStream; it must not skip missing dependencies.
+
+Validate redaction for these routes at ingress/APM as well as application logs.
+The application deliberately omits whole-response hashes and case correlations
+from their general audit projection. Alert on overdue reviews, policy failures,
+eligible-but-unremoved metadata, key failures and audit backlog, using only
+bounded codes and aggregate counts. Production approval, actual numeric policy,
+real deployment grants and restore/privacy drills remain external release gates.
+
+The inherited `ADMIN_REQUEST_TIMEOUT` bounds the whole administrative operation
+(5 seconds by default, at most 10), including permission/lock waits and audit
+commit. Legal case input is capped at 100 historically associated subjects and a
+32 KiB encrypted-history plaintext envelope. Detail history is bounded to 200
+events and 1 MiB of decrypted input, with `history_truncated` when omitted; it is
+not an unbounded document/archive export.
+
 ## Security Ledger Retention (Task 5.4)
 
 The independent `security-ledger-purge` binary removes Class B rows only. It is

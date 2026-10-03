@@ -150,6 +150,43 @@ restricted-narrative retention approval/cleanup remain independent and open.
 - **Response:** Only the minimum necessary data is disclosed, logged as a Class C audit event (who requested, what was disclosed, under what authority).
 - **Transparency:** Aggregate statistics on requests received and answered are tracked for a future transparency report.
 
+### 8.1 Operational Workflow and Approval Gate
+
+One restricted case represents one actual request, including a rejected/no-match
+request, not one account, lookup or hold. Intake is disabled until governance
+approves a versioned numeric narrative-retention policy and the actual replay
+metadata inventory/lifetime. Positive configuration alone is insufficient.
+Existing hold tombstones retain linkable account/actor/time metadata; they are not
+anonymous. Finite replay-token expiry is separately scoped, and rejection of the
+supported lifetime keeps intake disabled.
+
+Restricted legal narratives and subject associations are purpose-bound legal
+administration records, not immutable Class C narrative archives. They use the
+documented legal-obligation/claims exception to ordinary Class A erasure while
+required, without extending Class B evidence retention. Intake fixes a maximum
+case lifetime; closure may shorten it. Any active hold on any historically linked
+subject takes precedence; release resumes the original clock. An abandoned open
+case is not an indefinite-retention exemption. Exact policy numbers remain
+unapproved until an external governance decision is installed.
+
+Data-bearing response plans require an accepted content revision and approval by
+a different active DPO account. This is distinct from investigative access and
+does not automatically transfer data. Document handling and delivery use the
+approved external system with its own retention/access controls. Case review or
+closure never releases Task 5.3 holds. The first release supports one final
+response, no reopening/supplements, and no automatic publication.
+
+Case-free monthly counters survive narrative erasure for the transparency
+purpose. Received and answered use their own timestamps/cohorts; an uncommunicated
+rejection is not an answer. Annual reviewed artifacts omit identifiers and
+fine-grained dimensions, suppress nonzero counts below 5, and suppress a whole
+outcome breakdown when any cell is small. They are aggregate reporting records,
+not a substitute for retained evidence or an anonymity guarantee. Restricted
+approval provenance remains access-controlled; Class C action receipts retain
+only minimized accountability data under the existing audit policy. No per-case
+archive is reconstructed from statistics. Public publication remains a separate
+manual governance decision.
+
 ---
 
 ## 9. Backup Deletion Policy

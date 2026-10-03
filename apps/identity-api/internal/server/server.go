@@ -18,6 +18,8 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalreport"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalworkflow"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
@@ -45,6 +47,8 @@ type Deps struct {
 	LedgerProofDB ledgerproof.Beginner
 	RBAC          rbac.PermissionChecker
 	LegalHold     *legalhold.Service
+	LegalWorkflow *legalworkflow.Service
+	LegalReports  *legalreport.Service
 	AdminLimiter  ratelimit.Limiter
 	// OIDC provides the issuer identity used to build the discovery document.
 	OIDC config.OIDCConfig

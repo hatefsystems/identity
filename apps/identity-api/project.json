@@ -210,7 +210,7 @@
         "cwd": "apps/identity-api",
         "commands": [
           "node -e \"if (!process.env.DATABASE_URL) { throw new Error('DATABASE_URL is required') }\"",
-          "go test -tags=integration -count=1 -p=1 ./internal/dbintegration ./internal/recovery ./internal/webauthn ./internal/privacy ./internal/server ./internal/audit/signer ./internal/natsjs ./internal/pglock ./internal/rbac ./internal/legalhold ./internal/adminaction ./internal/session"
+          "go test -tags=integration -count=1 -p=1 ./internal/dbintegration ./internal/recovery ./internal/webauthn ./internal/privacy ./internal/server ./internal/audit/signer ./internal/natsjs ./internal/pglock ./internal/rbac ./internal/legalhold ./internal/adminaction ./internal/session ./internal/legalpolicy ./internal/legalworkflow ./internal/legalreport"
         ],
         "parallel": false
       },
@@ -235,6 +235,17 @@
       "options": {
         "cwd": "apps/identity-api",
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/audit/retention','./internal/audit/ledgerproof','./internal/retentiondbintegration'], {stdio:'inherit',env:{...process.env,REQUIRE_RETENTION_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+      },
+      "dependsOn": [
+        "sqlc-generate"
+      ],
+      "cache": false
+    },
+    "test-legal-workflow-integration": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/legalpolicy','./internal/legalworkflow','./internal/legalreport','./internal/server'], {stdio:'inherit',env:{...process.env,REQUIRE_LEGAL_WORKFLOW_INTEGRATION:'1',REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": [
         "sqlc-generate"

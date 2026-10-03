@@ -172,6 +172,52 @@ database rewrite or backup rollback. External anchoring is explicitly deferred.
 
 HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate stateful credentials across instances; previously issued downstream JWTs retain at most their configured 10-minute lifetime. Reactivation does not revive old credentials or prevent re-registration.
 
+### 1.8 Operational Legal Workflow
+
+These routes are under `/api/v1/admin` and require the additional opt-in workflow
+and approved immutable policy. Only explicit DPO permissions are seeded; Super
+Admin has no bypass. All writes and annual artifact downloads require a fresh
+step-up grant, exact Origin and a UUID `Idempotency-Key`. JSON actor/ID/key
+overrides, unknown fields, trailing bodies and query strings on body-based routes
+are rejected. Read responses and mutations are withheld until durable audit
+intent commits. New workflow responses do not create permanent response-body
+fingerprints in audit.
+
+| Method and suffix | Contract |
+|---|---|
+| `POST /legal-cases` | `expected_version=0`, UTC `received_at`, optional advisory `next_review_at`, encrypted `content`, `subject_ids`, `hold_ids`. One request, zero-to-many subjects. |
+| `GET /legal-cases`, `GET /legal-cases/{case_id}` | Bounded `{items,total,limit,offset}` summary list (`status=all|open|closed`) or restricted detail/history; expired unheld/erased detail is unavailable. |
+| `POST /legal-cases/{case_id}/revisions` | Expected state version, replacement content and current subject/hold selection; historical subject protection is retained. |
+| `POST /legal-cases/{case_id}/reviews` | Expected state version, `content_revision`, decision, rationale and optional next review. |
+| `POST /legal-cases/{case_id}/close` | Explicit closure without a response; never releases a hold. |
+| `GET /legal-reviews` | Due review queue requiring both case-read and hold-read permissions. |
+| `POST /legal-holds/{hold_id}/reviews` | Advisory review/history, starting at `expected_version=0`; original hold replay fields are unchanged. |
+| `POST /legal-cases/{case_id}/response` | Exact content revision, outcome, rationale and encrypted manifest (recipient/evidence/legal basis and exact subject/time/field/artifact selection). |
+| `POST /legal-cases/{case_id}/response/approve` | Exact expected state, content and proposal revisions; different DPO for data-bearing outcomes. |
+| `POST /legal-cases/{case_id}/response/delivery` | Same approved revisions, UTC `delivered_at`, external `receipt_reference`; attests one final delivery and closes the case. |
+| `GET /legal-transparency/monthly?start=YYYY-MM&months=N` | Exact audited aggregates for 1-12 months, explicit coverage and late-entry limitations. |
+| `POST /legal-transparency/reports` | Prepare a completed UTC `year`, `expected_version=0`; immutable snapshot. |
+| `GET /legal-transparency/reports/{report_id}` | Internal approval representation including digest, source/policy version and staleness. |
+| `POST /legal-transparency/reports/{report_id}/approve` | Different DPO approves exact `expected_version`, `data_version`, `policy_version`, `digest`. |
+| `POST /legal-transparency/reports/{report_id}/download` | Expected version; returns only the approved aggregate JSON bytes, not the internal report representation. |
+
+Cases distinguish optimistic state version from immutable content revision, so
+review bookkeeping does not invalidate itself. Pending/needs-information/rejected
+reviews cannot authorize data disclosure. Scope edits require a fresh accepted
+review and approval. Delivery timestamps cannot precede preparation or required
+approval. `content.request_type` is `disclosure|preservation|other`;
+`notification_disposition` is `pending|notify|restricted|not_applicable`, with
+restriction text required for `restricted`. Hold review decisions are
+`continue|release_recommended|needs_information`; closure reasons are
+`withdrawn|no_response_required`. At most 100 distinct historical subjects are
+allowed, not 100 new subjects per amendment. Detail history exposes truncation
+explicitly. Replay does not consume a second request/answer counter;
+changed input or stale versions produce 409. Retention-erased cases return 410,
+policy/storage failures 503, and authorization failures 403. Operator delivery
+attestation is not evidence that the API transferred data. Supplements, reopening,
+external messaging, uploads, public publishing and the UI are not implemented by
+this contract. See [operator procedures](admin-operations.md#legal-review-and-transparency-task-55).
+
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 

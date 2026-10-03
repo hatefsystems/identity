@@ -11,6 +11,7 @@
 #   identity-api    the HTTP API      (default entrypoint)
 #   audit-signer    audit chain signer worker
 #   admin-audit-publisher  acknowledged administrative/maintenance outbox publisher
+#   admin-legal     policy installation and restricted legal metadata maintenance
 #   purge-worker    Class A GDPR erasure worker (host cron/systemd)
 #   security-ledger-purge  Class B retention worker (host cron/systemd)
 #   migrate         goose migration runner (controlled operator invocation)
@@ -63,7 +64,7 @@ RUN go build -trimpath -ldflags='-s -w' -o /out/ ./cmd/...
 # shipping an image whose entrypoint does not exist.
 RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
     && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
-    && test -x /out/security-ledger-purge
+    && test -x /out/security-ledger-purge && test -x /out/admin-legal
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -89,6 +90,7 @@ COPY --from=builder /out/migrate /usr/local/bin/migrate
 COPY --from=builder /out/audit-signer /usr/local/bin/audit-signer
 COPY --from=builder /out/admin-audit-publisher /usr/local/bin/admin-audit-publisher
 COPY --from=builder /out/security-ledger-purge /usr/local/bin/security-ledger-purge
+COPY --from=builder /out/admin-legal /usr/local/bin/admin-legal
 
 # The HTTP API's default listen port (config.defaultPort). Informational only.
 EXPOSE 8080

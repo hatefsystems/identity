@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // AdminConfig holds the bounds applied to the administrative REST surface at
@@ -24,6 +26,9 @@ import (
 // audit-logged in the meantime.
 type AdminConfig struct {
 	Enabled                bool
+	GovernancePolicyID     string
+	WorkflowEnabled        bool
+	WorkflowPolicyID       string
 	AllowedOrigins         []string
 	ContextRetention       time.Duration
 	LegalReleasedRetention time.Duration
@@ -53,6 +58,9 @@ type AdminConfig struct {
 // Environment variable names for the admin surface.
 const (
 	EnvAdminEnabled                = "ADMIN_ENABLED"
+	EnvAdminGovernancePolicyID     = "ADMIN_GOVERNANCE_POLICY_ID"
+	EnvLegalWorkflowEnabled        = "LEGAL_WORKFLOW_ENABLED"
+	EnvLegalWorkflowPolicyID       = "LEGAL_WORKFLOW_POLICY_ID"
 	EnvAdminAllowedOrigins         = "ADMIN_ALLOWED_ORIGINS"
 	EnvAdminContextRetention       = "ADMIN_CONTEXT_RETENTION"
 	EnvAdminLegalReleasedRetention = "ADMIN_LEGAL_RELEASED_RETENTION"
@@ -81,6 +89,10 @@ const (
 // only slower).
 func LoadAdmin() (AdminConfig, error) {
 	enabled, err := getEnvBool(EnvAdminEnabled, false)
+	if err != nil {
+		return AdminConfig{}, err
+	}
+	workflowEnabled, err := getEnvBool(EnvLegalWorkflowEnabled, false)
 	if err != nil {
 		return AdminConfig{}, err
 	}
@@ -146,6 +158,9 @@ func LoadAdmin() (AdminConfig, error) {
 
 	cfg := AdminConfig{
 		Enabled:                enabled,
+		GovernancePolicyID:     strings.TrimSpace(os.Getenv(EnvAdminGovernancePolicyID)),
+		WorkflowEnabled:        workflowEnabled,
+		WorkflowPolicyID:       strings.TrimSpace(os.Getenv(EnvLegalWorkflowPolicyID)),
 		AllowedOrigins:         origins,
 		ContextRetention:       contextRetention,
 		LegalReleasedRetention: legalRetention,
@@ -165,6 +180,20 @@ func LoadAdmin() (AdminConfig, error) {
 
 // validate rejects internally inconsistent combinations.
 func (c AdminConfig) validate() error {
+	for key, value := range map[string]string{EnvAdminGovernancePolicyID: c.GovernancePolicyID, EnvLegalWorkflowPolicyID: c.WorkflowPolicyID} {
+		if value != "" {
+			id, err := uuid.Parse(value)
+			if err != nil || id == uuid.Nil {
+				return fmt.Errorf("config: %s requires a nonzero policy UUID", key)
+			}
+		}
+	}
+	if c.Enabled && c.GovernancePolicyID == "" {
+		return fmt.Errorf("config: enabling admin requires %s", EnvAdminGovernancePolicyID)
+	}
+	if c.WorkflowEnabled && (!c.Enabled || c.WorkflowPolicyID == "") {
+		return fmt.Errorf("config: enabling legal workflow requires admin and %s", EnvLegalWorkflowPolicyID)
+	}
 	if c.Enabled && (len(c.AllowedOrigins) == 0 || c.ContextRetention <= 0 || c.LegalReleasedRetention <= 0) {
 		return fmt.Errorf("config: enabling admin requires explicit origins and approved context/legal-record retention durations")
 	}

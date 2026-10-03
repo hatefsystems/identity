@@ -214,3 +214,17 @@ and Class C receipts cannot independently detect a coherent privileged rewrite
 or backup rollback without an external anchor. External anchoring remains
 explicitly deferred; drills and production restore validation are release gates,
 not guarantees supplied by this document.
+
+### 3.4 Legal Workflow Recovery
+
+Restore governance artifacts/baseline, case revisions, original subject/hold
+associations, replay stubs, response approvals/receipts, counters, frozen reports
+and audit intent from one consistent recovery point. Disable case intake,
+downloads and metadata cleanup during recovery. Reconcile authoritative external
+hold/deletion instructions and external delivery receipts before reopening.
+Never resend a response because a restored backup lacks its delivery marker,
+regenerate an artifact under an old approval, reset retention clocks or delete
+replay keys to bypass conflicts. Reapply erasure subject to current holds; deleted
+ciphertext cannot be reconstructed from the aggregate counters. Preserve the
+independent backup-rotation policy. A restored database is not an external trust
+anchor or proof of complete external-response history.

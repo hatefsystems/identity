@@ -195,6 +195,8 @@ func run(logger *slog.Logger) error {
 		LedgerProofDB:  pool,
 		RBAC:           adminDeps.RBAC,
 		LegalHold:      adminDeps.LegalHold,
+		LegalWorkflow:  adminDeps.LegalWorkflow,
+		LegalReports:   adminDeps.LegalReports,
 		AdminLimiter:   adminDeps.AdminLimiter,
 		OIDC:           oidcCfg,
 		Keys:           keyManager,

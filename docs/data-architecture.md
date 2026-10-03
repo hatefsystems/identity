@@ -422,7 +422,28 @@ Where:
 * `audit_log_record(N)` is a deterministic canonical serialization of the record attributes (IDs, event types, payloads, timestamps).
 * The ledger's integrity is verified periodically by recalculating the chains. Any break in the sequence alerts the security operations team instantly.
 
-### Task 5.3 implementation boundary
+### Task 5.5 workflow storage
+
+Migrations `00012`-`00014` add immutable governance artifacts and baseline binding,
+legal cases and encrypted revision/review/response history, historical subject
+associations, existing-hold links, advisory hold-review state, business replay
+records, case-free monthly/year counters and frozen report artifacts. No workflow
+subject reference cascades through `users`; original account identity survives
+hard deletion while its approved legal purpose remains.
+
+Ciphertexts are bound to their record, scope, purpose and revision. General audit
+holds opaque action IDs and bounded outcomes/counts, not case narratives or their
+hashes. Cleanup deletes restricted history/associations after original expiry
+only when no historically associated subject is held; replay stubs remain under
+explicit policy approval. Counters contain no per-case IDs and never derive
+request totals from audit attempts. Coverage starts at the first committed
+counter. Report payloads and replay results preserve exact bytes; JSONB would
+reorder or reformat an approved artifact. Report approvals are revision
+bound; year-version synchronization prevents an unchanged approval from covering
+different counts. See the [operational gate](admin-operations.md#legal-review-and-transparency-task-55)
+for actual tombstone fields and pending retention approval.
+
+### Task 5.3 inherited boundary
 
 Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
 

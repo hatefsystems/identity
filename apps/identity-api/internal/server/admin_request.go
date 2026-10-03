@@ -122,9 +122,19 @@ func (s *Server) adminTransaction(next http.Handler) http.Handler {
 		}
 		op.Event.Payload["operation"] = r.Method + " " + pattern
 		op.Event.Payload["http_status"] = buffer.status
+		restrictedWorkflow := adminaction.IsLegalWorkflowPath(r.URL.Path)
+		if restrictedWorkflow {
+			// This internal marker also survives the separate failure-audit
+			// transaction. The sanitizer consumes it without persisting it.
+			op.Event.Payload["workflow_restricted"] = true
+		}
 		if buffer.status >= 200 && buffer.status < 300 {
-			digest := sha256.Sum256(buffer.body.Bytes())
-			op.Event.Payload["response_digest"] = hex.EncodeToString(digest[:])
+			if !restrictedWorkflow && !adminaction.IsLegalWorkflowOperation(r.Method+" "+pattern) {
+				digest := sha256.Sum256(buffer.body.Bytes())
+				op.Event.Payload["response_digest"] = hex.EncodeToString(digest[:])
+			} else {
+				delete(op.Event.Payload, "response_digest")
+			}
 			err = op.Commit(ctx)
 			if err == nil && op.AfterCommit != nil {
 				if cleanupErr := op.AfterCommit(); cleanupErr != nil {

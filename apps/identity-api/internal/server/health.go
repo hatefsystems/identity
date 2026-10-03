@@ -37,6 +37,9 @@ func (s *Server) handleReadiness() http.HandlerFunc {
 		if s.cfg.Admin.Enabled {
 			ready := s.deps.AdminActions != nil && s.deps.AdminStore != nil && s.deps.RBAC != nil &&
 				s.deps.AdminLimiter != nil && s.deps.SessionManager != nil && s.deps.LegalHold != nil && s.deps.AdminReady != nil
+			if s.cfg.Admin.WorkflowEnabled {
+				ready = ready && s.deps.LegalWorkflow != nil && s.deps.LegalReports != nil && s.deps.StepUp != nil
+			}
 			if ready {
 				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 				ready = s.deps.AdminReady(ctx) == nil

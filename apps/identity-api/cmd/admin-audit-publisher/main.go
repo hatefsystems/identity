@@ -14,10 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/natsjs"
 )
 
@@ -50,6 +52,13 @@ func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
 		return err
 	}
 	if cleanup {
+		environment := os.Getenv("APP_ENV")
+		if environment == "" {
+			environment = "development"
+		}
+		if _, err := legalpolicy.LoadBaseline(startupCtx, pool, uuid.Nil, environment); err != nil {
+			return err
+		}
 		count, err := adminaction.CleanupExpired(ctx, pool, 500)
 		if err == nil {
 			logger.Info("admin action context cleanup complete", "deleted", count)

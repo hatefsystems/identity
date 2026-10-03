@@ -100,7 +100,7 @@ jobs:
         run: |
           image=$(docker image inspect --format '{{.Id}}' identity-api:ci)
           test "$(docker image inspect --format '{{.Config.User}}' "$image")" = 'nonroot:nonroot'
-          for binary in security-ledger-purge admin-audit-publisher; do
+          for binary in security-ledger-purge admin-audit-publisher admin-legal; do
             status=0
             output=$(docker run --rm --network none --entrypoint "/usr/local/bin/$binary" "$image" 2>&1) || status=$?
             printf '%s\n' "$output"
@@ -111,7 +111,9 @@ jobs:
   security-db:
     name: PostgreSQL security integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Includes the serial legal-workflow and real-role suites; local runs of the
+    # complete sequence exceed the former 20-minute budget.
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -177,3 +179,6 @@ jobs:
       # Serial with the other suites: migration fixtures reset the shared schema.
       - name: Run mandatory retention and real-role integration tests
         run: npm exec -- nx run identity-api:test-retention-integration --skipNxCache
+
+      - name: Run mandatory legal workflow and transparency integration tests
+        run: npm exec -- nx run identity-api:test-legal-workflow-integration --skipNxCache

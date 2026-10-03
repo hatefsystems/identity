@@ -17,6 +17,9 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalreport"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalworkflow"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 )
@@ -61,6 +64,45 @@ func buildAdminServices(cfg config.AdminConfig, environment string, pool *pgxpoo
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	baselineID, err := uuid.Parse(cfg.GovernancePolicyID)
+	if err != nil || baselineID == uuid.Nil {
+		return deps, errors.New("admin: approved governance policy ID is required")
+	}
+	checkPolicy := func(ctx context.Context) error {
+		baseline, err := legalpolicy.LoadBaseline(ctx, pool, baselineID, environment)
+		if err != nil {
+			return err
+		}
+		if err := legalpolicy.ValidateBaseline(baseline, cfg.ContextRetention, cfg.LegalReleasedRetention, environment); err != nil {
+			return err
+		}
+		if cfg.WorkflowEnabled {
+			id, err := uuid.Parse(cfg.WorkflowPolicyID)
+			if err != nil || id == uuid.Nil {
+				return errors.New("admin: workflow policy ID required")
+			}
+			policy, err := legalpolicy.Load(ctx, pool, id, environment)
+			if err != nil {
+				return err
+			}
+			return legalpolicy.ValidateWorkflow(policy, environment)
+		}
+		return nil
+	}
+	if err := checkPolicy(ctx); err != nil {
+		return deps, errors.New("admin: governance approval missing or inconsistent")
+	}
+	if cfg.WorkflowEnabled {
+		id, _ := uuid.Parse(cfg.WorkflowPolicyID)
+		deps.LegalWorkflow, err = legalworkflow.New(enc, legalworkflow.Config{Enabled: true, PolicyID: id, Environment: environment})
+		if err != nil {
+			return deps, err
+		}
+		deps.LegalReports, err = legalreport.New(legalreport.Config{Enabled: true, PolicyID: id, Environment: environment})
+		if err != nil {
+			return deps, err
+		}
+	}
 	var fixtureCheck func(context.Context) error
 	if raw := os.Getenv("ADMIN_LOOKUP_FIXTURE_ID"); raw != "" {
 		id, err := uuid.Parse(raw)
@@ -98,6 +140,9 @@ func buildAdminServices(cfg config.AdminConfig, environment string, pool *pgxpoo
 	deps.AdminActions, deps.AdminStore, deps.RBAC = actions, queries, queries
 	deps.LegalHold, deps.AdminLimiter = holds, limiter
 	deps.AdminReady = func(ctx context.Context) error {
+		if err := checkPolicy(ctx); err != nil {
+			return errors.New("admin: governance approval unavailable")
+		}
 		if fixtureCheck != nil {
 			if err := fixtureCheck(ctx); err != nil {
 				return err

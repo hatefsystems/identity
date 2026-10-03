@@ -89,6 +89,24 @@ go test -p 1 ./...   # DB-backed packages serialized
 
 ## Endpoints
 
+### Legal review and transparency
+
+Task 5.5 adds opt-in `internal/legalworkflow`, `internal/legalpolicy` and
+`internal/legalreport` services. `ADMIN_GOVERNANCE_POLICY_ID` binds the approved
+baseline; `LEGAL_WORKFLOW_ENABLED` and `LEGAL_WORKFLOW_POLICY_ID` additionally
+gate case intake. No numeric narrative-retention defaults or production approval
+are supplied. The controlled `admin-legal` command installs an external policy
+artifact and performs hold-aware workflow cleanup, including a dry run. It is
+packaged in the non-root runtime image.
+
+Run `npm exec -- nx run identity-api:test-legal-workflow-integration` with
+disposable PostgreSQL, Redis and JetStream credentials. This mandatory target
+includes policy/role tests, workflow/report tests and HTTP auditing tests; missing
+dependencies are failures. See [admin operations](../../docs/admin-operations.md#legal-review-and-transparency-task-55)
+and [API contracts](../../docs/api-design.md#18-operational-legal-workflow).
+
+### Authentication endpoints
+
 | Method | Path                                        | Purpose                                              |
 | :----- | :------------------------------------------ | :--------------------------------------------------- |
 | GET    | `/healthz`                                  | Liveness probe. Always 200 while running.            |

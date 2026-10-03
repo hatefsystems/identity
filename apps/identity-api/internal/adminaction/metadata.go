@@ -16,6 +16,42 @@ import (
 
 var eventName = regexp.MustCompile(`^(admin|legal)\.[a-z_]+(\.[a-z_]+)*$`)
 
+// IsLegalWorkflowOperation identifies the restricted routes whose response
+// bodies must never become permanent content fingerprints in general audit.
+func IsLegalWorkflowOperation(operation string) bool {
+	switch operation {
+	case "POST /api/v1/admin/legal-cases", "GET /api/v1/admin/legal-cases",
+		"GET /api/v1/admin/legal-cases/{case_id}",
+		"POST /api/v1/admin/legal-cases/{case_id}/revisions",
+		"POST /api/v1/admin/legal-cases/{case_id}/reviews",
+		"POST /api/v1/admin/legal-cases/{case_id}/close",
+		"GET /api/v1/admin/legal-reviews",
+		"POST /api/v1/admin/legal-holds/{hold_id}/reviews",
+		"POST /api/v1/admin/legal-cases/{case_id}/response",
+		"POST /api/v1/admin/legal-cases/{case_id}/response/approve",
+		"POST /api/v1/admin/legal-cases/{case_id}/response/delivery",
+		"GET /api/v1/admin/legal-transparency/monthly",
+		"POST /api/v1/admin/legal-transparency/reports",
+		"GET /api/v1/admin/legal-transparency/reports/{report_id}",
+		"POST /api/v1/admin/legal-transparency/reports/{report_id}/approve",
+		"POST /api/v1/admin/legal-transparency/reports/{report_id}/download":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsLegalWorkflowPath also covers failures before chi resolves a route template.
+// The path selects a privacy policy only; it is never copied into audit metadata.
+func IsLegalWorkflowPath(path string) bool {
+	for _, prefix := range []string{"/api/v1/admin/legal-cases", "/api/v1/admin/legal-reviews", "/api/v1/admin/legal-transparency"} {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return strings.HasPrefix(path, "/api/v1/admin/legal-holds/") && strings.HasSuffix(path, "/reviews")
+}
+
 // Unknown keys are discarded, not passed through. Allowed keys also have typed,
 // bounded values so a narrative cannot be smuggled through (say) result_count.
 func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) {
@@ -24,11 +60,25 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 		return audit.Event{}, ErrInvalidEvent
 	}
 	payload := map[string]any{"action_id": actionID.String()}
+	operation, _ := event.Payload["operation"].(string)
+	restricted, _ := event.Payload["workflow_restricted"].(bool)
+	workflow := IsLegalWorkflowOperation(operation) || restricted
 	for key, value := range event.Payload {
+		if workflow {
+			switch key {
+			case "operation", "http_status", "outcome", "result_count", "total", "limit", "offset", "replayed", "noop":
+			default:
+				continue
+			}
+		}
 		var clean any
 		var valid bool
 		switch key {
 		case "operation":
+			if IsLegalWorkflowOperation(operation) {
+				clean, valid = operation, true
+				break
+			}
 			clean, valid = enum(value,
 				"GET /api/v1/admin/users", "GET /api/v1/admin/users/{user_id}",
 				"POST /api/v1/admin/users/lookup", "PATCH /api/v1/admin/users/{user_id}/status",
@@ -126,6 +176,9 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 	}
 	event.Payload = payload
 	event.Security = nil
+	if workflow {
+		event.ClientIP, event.UserAgent = "", ""
+	}
 	// The action ID is the general-audit reference; legal target attribution is
 	// kept in restricted storage, not in an FK or immutable payload correlation key.
 	event.SubjectID = nil

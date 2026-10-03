@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalreport"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
 
@@ -115,6 +116,26 @@ func (s *Server) registerAdminRoutes() {
 			}
 		} else {
 			s.logger.Warn("admin: no legal hold service configured; legal routes not mounted")
+		}
+		if s.cfg.Admin.WorkflowEnabled && s.deps.LegalWorkflow != nil && s.deps.LegalReports != nil {
+			mount(r, http.MethodPost, "/legal-cases", permLegalCasesWrite, true, s.handleCreateLegalCase())
+			mount(r, http.MethodGet, "/legal-cases", permLegalCasesRead, false, s.handleListLegalCases(false))
+			mount(r, http.MethodGet, "/legal-cases/{case_id}", permLegalCasesRead, false, s.handleGetLegalCase())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/revisions", permLegalCasesWrite, true, s.handleReviseLegalCase())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/reviews", permLegalCasesWrite, true, s.handleReviewLegalCase())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/close", permLegalCasesWrite, true, s.handleCloseLegalCase())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/response", permLegalCasesWrite, true, s.handlePrepareLegalResponse())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/response/approve", permLegalResponsesApprove, true, s.handleApproveLegalResponse())
+			mount(r, http.MethodPost, "/legal-cases/{case_id}/response/delivery", permLegalCasesWrite, true, s.handleDeliverLegalResponse())
+			if holdRead, ok := perm(permLegalHoldsRead); ok {
+				mount(r.With(holdRead), http.MethodGet, "/legal-reviews", permLegalCasesRead, false, s.handleListLegalCases(true))
+			}
+			mount(r, http.MethodPost, "/legal-holds/{hold_id}/reviews", permLegalHoldsWrite, true, s.handleReviewExistingHold())
+			mount(r, http.MethodGet, "/legal-transparency/monthly", legalreport.PermissionRead, false, s.handleMonthlyLegalTransparency())
+			mount(r, http.MethodPost, "/legal-transparency/reports", legalreport.PermissionRead, true, s.handleLegalReport("prepare"))
+			mount(r, http.MethodGet, "/legal-transparency/reports/{report_id}", legalreport.PermissionRead, false, s.handleLegalReport("get"))
+			mount(r, http.MethodPost, "/legal-transparency/reports/{report_id}/approve", legalreport.PermissionApprove, true, s.handleLegalReport("approve"))
+			mount(r, http.MethodPost, "/legal-transparency/reports/{report_id}/download", legalreport.PermissionRead, true, s.handleLegalReport("download"))
 		}
 	})
 }
