@@ -40,7 +40,8 @@ import (
 // handler tests lightweight and startup order explicit.
 type Deps struct {
 	AdminReady   func(context.Context) error
-	AdminRevoke  func(string) error
+	AdminRevoke  func(context.Context, string) error
+	GRPCReady    func(context.Context) error
 	AdminActions *adminaction.Service
 	AdminStore   AdminStore
 	// LedgerProofDB opens a snapshot separate from the admin audit transaction.
@@ -63,8 +64,7 @@ type Deps struct {
 	// the token route is not mounted.
 	TokenService *token.Service
 	// DPoPValidator sender-constrains tokens issued at /oauth2/token (RFC
-	// 9449). When nil, the endpoint ignores any DPoP proof header and only
-	// issues plain Bearer tokens; when set, a presented proof is validated
+	// 9449). When nil, proof-bearing requests fail closed; when set, a proof is validated
 	// (with the server-nonce lifecycle) and its key bound into the token.
 	DPoPValidator *dpop.Validator
 	// SessionManager backs the browser session lifecycle: the logout endpoint
@@ -175,6 +175,9 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) *Server {
 func (s *Server) Handler() http.Handler {
 	return s.router
 }
+
+// Close terminates connections after the graceful HTTP shutdown budget expires.
+func (s *Server) Close() error { return s.http.Close() }
 
 // record emits one audit Event for the request being served (Task 5.2).
 //

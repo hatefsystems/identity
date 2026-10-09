@@ -444,6 +444,28 @@ func TestRecoveryEnrollmentRoutesAcceptOnlyRestrictedSession(t *testing.T) {
 	}
 }
 
+func TestRecoveryEnrollmentClaimUsesRequestContext(t *testing.T) {
+	fx := newWebAuthnTestServer(t)
+	current, _ := issueSession(t, fx.mgr, session.IssueParams{
+		UserID: fx.user.ID.String(),
+		Kind:   session.KindRecoveryEnrollment,
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/enrollment/webauthn/register/verify", bytes.NewBufferString(`{}`))
+	req = req.WithContext(session.WithSession(ctx, current))
+	cancel()
+	rec := httptest.NewRecorder()
+	fx.srv.handleRecoveryWebAuthnRegisterVerify().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled enrollment returned %d, want existing backend-error response", rec.Code)
+	}
+	claimed, err := fx.mgr.ClaimRecoveryEnrollment(t.Context(), current.UserID, current.ID)
+	if err != nil || !claimed {
+		t.Fatalf("canceled handler consumed enrollment claim: claimed=%v, err=%v", claimed, err)
+	}
+}
+
 // TestWebAuthnLoginRoutesAreUnauthenticated proves the login endpoints are
 // reachable without a session — they are how a user signs in — rather than being
 // short-circuited by the session guard that protects the enrolment routes.

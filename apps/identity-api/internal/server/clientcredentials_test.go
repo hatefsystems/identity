@@ -16,8 +16,10 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clientauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 const ccClientID = "search-core"
@@ -92,8 +94,10 @@ func newClientCredentialsServer(t *testing.T, sk *ccSigner) (*Server, string) {
 		t.Fatalf("clientauth.New: %v", err)
 	}
 
+	// User-grant dependencies are present but empty: machine tokens need no user session.
+	sessions := session.NewMemoryStore()
 	svc, err := token.NewService(
-		token.Config{Issuer: testIssuer},
+		token.Config{Issuer: testIssuer, Sessions: tokenSessionLookupFunc(sessions.GetByID), RevokeUser: sessions.DeleteAllForUser},
 		manager,
 		registry,
 		token.NewMemoryCodeStore(),
@@ -159,6 +163,9 @@ func TestClientCredentialsPrivateKeyJWTEndToEnd(t *testing.T) {
 	if resp.RefreshToken != "" {
 		t.Error("client_credentials must not issue a refresh token")
 	}
+	if resp.IDToken != "" || resp.TokenType != token.TokenTypeBearer {
+		t.Error("unbound client credentials must issue only a Bearer access token")
+	}
 
 	claims, err := token.Verify(resp.AccessToken, srv.deps.Keys.ActiveSigner())
 	if err != nil {
@@ -166,6 +173,69 @@ func TestClientCredentialsPrivateKeyJWTEndToEnd(t *testing.T) {
 	}
 	if claims["sub"] != ccClientID || claims["client_id"] != ccClientID {
 		t.Errorf("unexpected claims: %+v", claims)
+	}
+	grantID, ok := claims["grant_id"].(string)
+	if claims["principal_type"] != token.PrincipalClient || claims["scope"] != "search.full" || !ok || grantID == "" {
+		t.Errorf("missing explicit client grant claims: %+v", claims)
+	}
+	for _, name := range []string{"sid", "auth_version", "cnf"} {
+		if _, ok := claims[name]; ok {
+			t.Errorf("unbound client token must not carry %q", name)
+		}
+	}
+}
+
+func TestClientCredentialsDPoPNonceRetryAndAssertionReplay(t *testing.T) {
+	sk := newCCSigner(t)
+	srv, audience := newClientCredentialsServer(t, sk)
+	_, nonces := attachTokenEndpointDPoP(t, srv)
+	proofKey, jkt := newTokenProofKey(t)
+	assertion := sk.assertion(t, ccClaims(audience, time.Now()))
+	form := ccForm(assertion, "search.full")
+
+	challenge := postFormDPoP(t, srv, form, tokenEndpointProof(t, proofKey, ""))
+	if challenge.Code != http.StatusBadRequest || decodeError(t, challenge).Error != "use_dpop_nonce" {
+		t.Fatalf("client nonce challenge = %d, %s", challenge.Code, challenge.Body.String())
+	}
+	nonce := challenge.Header().Get(dpop.HeaderNonce)
+	if nonce == "" || nonces.realm != "as:"+testIssuer || nonces.jkt != jkt {
+		t.Fatal("client nonce challenge did not use the verified proof scope")
+	}
+	// The nonce challenge must not consume the independent client assertion.
+	rec := postFormDPoP(t, srv, form, tokenEndpointProof(t, proofKey, nonce))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client nonce retry = %d, %s", rec.Code, rec.Body.String())
+	}
+	response := decodeTokenResponse(t, rec)
+	if response.TokenType != token.TokenTypeDPoP || response.RefreshToken != "" || response.IDToken != "" {
+		t.Fatal("bound client credentials must issue only a DPoP access token")
+	}
+	claims, err := token.Verify(response.AccessToken, srv.deps.Keys.ActiveSigner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cnf, ok := claims["cnf"].(map[string]any)
+	if !ok || cnf["jkt"] != jkt || claims["principal_type"] != token.PrincipalClient || claims["sub"] != ccClientID {
+		t.Fatalf("client DPoP binding or principal was lost: %v", claims)
+	}
+	for _, name := range []string{"sid", "auth_version"} {
+		if _, ok := claims[name]; ok {
+			t.Errorf("client token must not acquire a user %q claim", name)
+		}
+	}
+
+	// Even a new DPoP nonce/proof cannot revive a consumed client assertion.
+	challenge = postFormDPoP(t, srv, form, tokenEndpointProof(t, proofKey, ""))
+	if challenge.Code != http.StatusBadRequest || decodeError(t, challenge).Error != "use_dpop_nonce" {
+		t.Fatalf("fresh proof challenge = %d, %s", challenge.Code, challenge.Body.String())
+	}
+	nonce = challenge.Header().Get(dpop.HeaderNonce)
+	if nonce == "" {
+		t.Fatal("fresh proof challenge omitted nonce")
+	}
+	rec = postFormDPoP(t, srv, form, tokenEndpointProof(t, proofKey, nonce))
+	if rec.Code != http.StatusUnauthorized || decodeError(t, rec).Error != token.ErrCodeInvalidClient {
+		t.Fatalf("assertion replay with fresh DPoP proof = %d, %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -40,7 +40,8 @@ func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 	state := &tokenAccountState{active: true, version: 5}
 	svc.cfg.AccountState = state
 	verifier := strings.Repeat("v", 50)
-	data := AuthorizationCodeData{UserID: "subject", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersion: 5, AuthVersionSet: true}
+	seedTestSession(svc, "subject", "account-session", 5)
+	data := AuthorizationCodeData{UserID: "subject", SessionID: "account-session", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersion: 5, AuthVersionSet: true}
 	code, err := svc.IssueCode(data)
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +54,7 @@ func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := refresh.Get(HashSecret(response.RefreshToken))
+	stored, err := refresh.Get(context.Background(), HashSecret(response.RefreshToken))
 	if err != nil || stored.AuthVersion != 5 || !stored.AuthVersionSet {
 		t.Fatalf("snapshot lost: %+v %v", stored, err)
 	}
@@ -62,7 +63,7 @@ func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err = refresh.Get(HashSecret(rotated.RefreshToken))
+	stored, err = refresh.Get(context.Background(), HashSecret(rotated.RefreshToken))
 	if err != nil || stored.AuthVersion != 5 {
 		t.Fatalf("rotation restamped: %+v %v", stored, err)
 	}
@@ -79,6 +80,8 @@ func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 		t.Fatalf("stale session issued code: %v", err)
 	}
 	data.AuthVersion = 7
+	data.SessionID = "new-account-session"
+	seedTestSession(svc, "subject", data.SessionID, 7)
 	if _, err := svc.IssueCode(data); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +90,7 @@ func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 func TestTokenAccountStateUnavailableOrUnstamped(t *testing.T) {
 	svc, _ := newTestService(t, nil, nil)
 	code, verifier := issueTestCode(t, svc)
-	state := &tokenAccountState{active: true}
+	state := &tokenAccountState{active: true, version: 1}
 	svc.cfg.AccountState = state
 	_, err := svc.Exchange(context.Background(), authCodeForm(code, verifier))
 	wantTokenError(t, err, ErrCodeInvalidGrant)
@@ -101,14 +104,15 @@ func TestTokenAccountStateUnavailableOrUnstamped(t *testing.T) {
 
 func TestRefreshRotationIsCompareAndSet(t *testing.T) {
 	store := NewMemoryRefreshTokenStore()
-	if err := store.Save("hash", RefreshTokenData{Status: StatusActive, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	grant, data := storeFixture("family", "user")
+	if err := store.CreateGrant(context.Background(), grant, "hash", data); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
 	for range 2 {
 		wg.Add(1)
-		go func() { defer wg.Done(); results <- store.MarkRotated("hash") }()
+		go func() { defer wg.Done(); results <- store.Rotate(context.Background(), "hash", data, "next", data) }()
 	}
 	wg.Wait()
 	close(results)
@@ -146,7 +150,8 @@ func TestTokenIssuanceCannotRestampAcrossConcurrentReactivation(t *testing.T) {
 			state := &tokenAccountState{active: true}
 			svc.cfg.AccountState = state
 			verifier := strings.Repeat("v", 50)
-			data := AuthorizationCodeData{UserID: "subject", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersionSet: true}
+			seedTestSession(svc, "subject", "account-session", 0)
+			data := AuthorizationCodeData{UserID: "subject", SessionID: "account-session", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersionSet: true}
 			code, err := svc.IssueCode(data)
 			if err != nil {
 				t.Fatal(err)
@@ -208,7 +213,8 @@ func TestTokenCutoffAcrossIndependentInstances(t *testing.T) {
 		svc, _ := newTestService(t, nil, nil)
 		svc.cfg.AccountState = state
 		verifier := strings.Repeat("v", 50)
-		data := AuthorizationCodeData{UserID: "subject", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersionSet: true}
+		seedTestSession(svc, "subject", "account-session", 0)
+		data := AuthorizationCodeData{UserID: "subject", SessionID: "account-session", ClientID: testPublicID, RedirectURI: testRedirectURI, CodeChallenge: challengeFor(verifier), AuthVersionSet: true}
 		code, err := svc.IssueCode(data)
 		if err != nil {
 			t.Fatal(err)

@@ -3,6 +3,16 @@
   "name": "identity-api",
   "projectType": "application",
   "sourceRoot": "apps/identity-api",
+  "implicitDependencies": ["schemas"],
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "{workspaceRoot}/libs/schemas/proto/**/*",
+      "{workspaceRoot}/libs/schemas/buf*.yaml",
+      "{workspaceRoot}/libs/schemas/go.mod",
+      "{workspaceRoot}/libs/schemas/go.sum"
+    ]
+  },
   "tags": [
     "lang:go",
     "scope:backend"
@@ -107,6 +117,7 @@
     },
     "sqlc-generate": {
       "executor": "nx:run-commands",
+      "dependsOn": [{"projects": ["schemas"], "target": "generate-go"}],
       "options": {
         "cwd": "apps/identity-api",
         "command": "go tool sqlc generate"
@@ -228,6 +239,15 @@
       "dependsOn": [
         "sqlc-generate"
       ],
+      "cache": false
+    },
+    "test-grpc-integration": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/identitygrpc','./internal/session','./internal/oidc/token','./internal/oidc/dpop'], {stdio:'inherit',env:{...process.env,REQUIRE_GRPC_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+      },
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "test-retention-integration": {

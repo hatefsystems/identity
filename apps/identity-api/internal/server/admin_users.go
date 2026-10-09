@@ -255,7 +255,7 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 			return
 		}
 		if req.Status != "active" && s.deps.AdminRevoke != nil {
-			op.AfterCommit = func() error { return s.deps.AdminRevoke(userID.String()) }
+			op.AfterCommit = func() error { return s.deps.AdminRevoke(r.Context(), userID.String()) }
 		}
 		if err := adminaction.SetDetails(r.Context(), struct {
 			Reason string `json:"reason"`

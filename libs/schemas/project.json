@@ -5,6 +5,16 @@
   "sourceRoot": "libs/schemas/proto",
   "tags": ["lang:proto", "scope:shared"],
   "targets": {
+    "generate-go": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "libs/schemas",
+        "command": "go tool buf generate --template buf.gen.go.yaml"
+      },
+      "inputs": ["{projectRoot}/proto/**/*", "{projectRoot}/buf.gen.go.yaml", "{projectRoot}/buf.yaml", "{projectRoot}/go.mod", "{projectRoot}/go.sum"],
+      "outputs": ["{projectRoot}/gen/go"],
+      "cache": true
+    },
     "generate": {
       "executor": "nx:run-commands",
       "options": {
@@ -34,7 +44,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "libs/schemas",
-        "command": "go tool buf breaking --against .git#branch=main,subdir=libs/schemas"
+        "command": "go tool buf breaking --against ../../.git#branch=main,subdir=libs/schemas"
       }
     }
   }

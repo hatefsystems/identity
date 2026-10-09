@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -46,15 +48,46 @@ func (s *Server) handleToken() http.HandlerFunc {
 			return
 		}
 
-		// DPoP sender-constraining (RFC 9449). When the client presents a DPoP
-		// proof header, validate it against this endpoint and bind the issued
-		// token to the proof's key via the request context. A proof is optional
-		// here — a client that does not present one receives a plain Bearer
-		// token — but a malformed/replayed proof, or a missing server nonce, is
-		// rejected before any grant processing.
 		ctx := r.Context()
-		if proofHeader := r.Header.Get(dpop.HeaderProof); proofHeader != "" && s.deps.DPoPValidator != nil {
-			proof, dErr := s.validateTokenDPoP(r, proofHeader)
+		proofHeaders := r.Header.Values(dpop.HeaderProof)
+		if len(proofHeaders) > 1 || (len(proofHeaders) == 1 &&
+			(strings.TrimSpace(proofHeaders[0]) == "" || len(proofHeaders[0]) > dpop.MaxProofSize || strings.Contains(proofHeaders[0], ","))) {
+			s.writeTokenDPoPError(w, r, dpop.ErrMalformedProof)
+			return
+		}
+		proofHeader := ""
+		if len(proofHeaders) == 1 {
+			proofHeader = proofHeaders[0]
+		}
+
+		// Refresh must retain the original family binding. Resolve it before
+		// consuming either DPoP nonce or replay state, including on a reuse.
+		expectedJKT := ""
+		if r.PostForm.Get("grant_type") == token.GrantRefreshToken {
+			expectedJKT, err = s.deps.TokenService.RefreshBinding(ctx, r.PostForm.Get("refresh_token"))
+			if err != nil {
+				s.writeTokenError(w, r, err)
+				return
+			}
+			if expectedJKT != "" && proofHeader == "" {
+				s.writeTokenDPoPError(w, r, dpop.ErrMissingProof)
+				return
+			}
+			if expectedJKT == "" && proofHeader != "" {
+				s.writeTokenError(w, r, &token.Error{
+					Code: token.ErrCodeInvalidGrant, Description: "refresh token binding is invalid", Status: http.StatusBadRequest,
+				})
+				return
+			}
+		}
+
+		// Fresh grants may opt into DPoP; a presented proof is never ignored.
+		if proofHeader != "" {
+			if s.deps.DPoPValidator == nil {
+				s.writeTokenDPoPError(w, r, dpop.ErrStoreUnavailable)
+				return
+			}
+			proof, dErr := s.validateTokenDPoP(r, proofHeader, expectedJKT)
 			if dErr != nil {
 				s.writeTokenDPoPError(w, r, dErr)
 				return
@@ -64,25 +97,32 @@ func (s *Server) handleToken() http.HandlerFunc {
 
 		resp, err := s.deps.TokenService.Exchange(ctx, r.PostForm)
 		if err != nil {
-			s.recordTokenDenied(r, err)
-			var tokenErr *token.Error
-			if errors.As(err, &tokenErr) {
-				writeJSON(w, tokenErr.Status, tokenErrorResponse{
-					Error:            tokenErr.Code,
-					ErrorDescription: tokenErr.Description,
-				})
-				return
-			}
-			s.logger.Error("token endpoint: unexpected error", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, tokenErrorResponse{
-				Error: token.ErrCodeServerError,
-			})
+			s.writeTokenError(w, r, err)
 			return
 		}
 
 		s.recordTokenIssued(r, resp)
 		writeJSON(w, http.StatusOK, resp)
 	}
+}
+
+func (s *Server) writeTokenError(w http.ResponseWriter, r *http.Request, err error) {
+	s.recordTokenDenied(r, err)
+	var tokenErr *token.Error
+	if errors.As(err, &tokenErr) {
+		response := tokenErrorResponse{Error: tokenErr.Code, ErrorDescription: tokenErr.Description}
+		if tokenErr.Status >= http.StatusInternalServerError {
+			response = tokenErrorResponse{Error: token.ErrCodeServerError}
+		}
+		writeJSON(w, tokenErr.Status, response)
+		return
+	}
+	status := http.StatusInternalServerError
+	if errors.Is(err, token.ErrStoreUnavailable) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		status = http.StatusServiceUnavailable
+	}
+	s.logger.Error("token endpoint: unexpected error")
+	writeJSON(w, status, tokenErrorResponse{Error: token.ErrCodeServerError})
 }
 
 // recordTokenIssued records a successful grant.
@@ -194,8 +234,10 @@ func clampAuditValue(v string) string {
 // r.URL carries no scheme/host, and pinning the issuer-derived URL means a
 // proof minted for a different endpoint is rejected. RequireNonce enforces the
 // server-issued DPoP-Nonce lifecycle (RFC 9449 §8).
-func (s *Server) validateTokenDPoP(r *http.Request, proofHeader string) (*dpop.Proof, error) {
+func (s *Server) validateTokenDPoP(r *http.Request, proofHeader, expectedJKT string) (*dpop.Proof, error) {
 	return s.deps.DPoPValidator.Validate(r.Context(), proofHeader, dpop.VerifyParams{
+		Realm:        "as:" + s.deps.OIDC.Issuer,
+		ExpectedJKT:  expectedJKT,
 		Method:       http.MethodPost,
 		URL:          s.deps.OIDC.Issuer + "/oauth2/token",
 		RequireNonce: true,
@@ -205,12 +247,22 @@ func (s *Server) validateTokenDPoP(r *http.Request, proofHeader string) (*dpop.P
 // writeTokenDPoPError translates a DPoP validation failure into an RFC 9449
 // §5.2 token endpoint error. A missing/invalid server nonce yields HTTP 400
 // use_dpop_nonce together with a fresh DPoP-Nonce header the client echoes on
-// retry; every other failure is an opaque 400 invalid_dpop_proof.
+// retry. Invalid proofs receive opaque 400 errors; state-store/configuration
+// failures receive sanitized 5xx responses, never an empty nonce challenge.
 func (s *Server) writeTokenDPoPError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, dpop.ErrNonceRequired) {
-		if nonce, nErr := s.deps.DPoPValidator.IssueNonce(r.Context()); nErr == nil && nonce != "" {
-			w.Header().Set(dpop.HeaderNonce, nonce)
+	if errors.Is(err, dpop.ErrStoreUnavailable) || errors.Is(err, dpop.ErrInvalidParams) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		writeJSON(w, http.StatusServiceUnavailable, tokenErrorResponse{Error: token.ErrCodeServerError})
+		return
+	}
+	var challenge *dpop.NonceChallenge
+	if errors.As(err, &challenge) {
+		nonce, nErr := s.deps.DPoPValidator.IssueNonce(r.Context(), challenge.Realm, challenge.JKT)
+		if nErr != nil {
+			writeJSON(w, http.StatusServiceUnavailable, tokenErrorResponse{Error: token.ErrCodeServerError})
+			return
 		}
+		w.Header().Set(dpop.HeaderNonce, nonce)
 		writeJSON(w, http.StatusBadRequest, tokenErrorResponse{
 			Error:            "use_dpop_nonce",
 			ErrorDescription: "authorization server requires nonce in DPoP proof",

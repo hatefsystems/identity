@@ -1,204 +1,232 @@
 package session
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
 )
 
-// MemoryStore is a thread-safe, in-memory Store for the single-node MVP. It
-// keeps sessions in a map keyed by token hash, plus a secondary index by user
-// id for O(user) listing and bulk revocation (the same technique used by
-// token.MemoryRefreshTokenStore). Expiry is enforced lazily on read, mirroring
-// Redis TTL semantics; the Redis-backed Store replaces it when Redis wiring
-// lands.
+// MemoryStore is a single-process Store for isolated tests and development.
+// Expiry is reclaimed lazily; all mutations and owner lookups share one lock.
 type MemoryStore struct {
-	mu sync.Mutex
-	// byHash maps the SHA-256 token hash to the stored session.
+	mu     sync.Mutex
 	byHash map[string]Session
-	// byUser indexes token hashes per user id for listing and bulk revocation.
-	byUser map[string]map[string]struct{}
-	// now is injectable so expiry behavior is deterministic in tests.
-	now func() time.Time
+	byUser map[string]map[string]string // user ID -> public session ID -> token hash
+	now    func() time.Time
 }
 
-// NewMemoryStore constructs an empty MemoryStore.
+var _ Store = (*MemoryStore)(nil)
+
+// NewMemoryStore constructs an empty single-process session store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		byHash: make(map[string]Session),
-		byUser: make(map[string]map[string]struct{}),
+		byUser: make(map[string]map[string]string),
 		now:    time.Now,
 	}
 }
 
-// expired reports whether s has lapsed at instant t, by either the idle or the
-// absolute deadline.
-func expired(s Session, t time.Time) bool {
-	return t.After(s.AbsoluteExpiry) || t.After(s.IdleExpiry)
-}
-
-// Create implements Store.
-func (m *MemoryStore) Create(tokenHash string, s Session) error {
+// Create inserts a live session without replacing existing authority.
+func (m *MemoryStore) Create(ctx context.Context, tokenHash string, s Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.byHash[tokenHash] = s
-	set, ok := m.byUser[s.UserID]
-	if !ok {
-		set = make(map[string]struct{})
-		m.byUser[s.UserID] = set
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	set[tokenHash] = struct{}{}
+	if tokenHash == "" || !validSession(s) {
+		return ErrStoreUnavailable
+	}
+	if expired(s, m.now()) {
+		return ErrSessionNotFound
+	}
+	if _, exists := m.byHash[tokenHash]; exists || m.byUser[s.UserID][s.ID] != "" {
+		return ErrStoreUnavailable
+	}
+	m.byHash[tokenHash] = s
+	if m.byUser[s.UserID] == nil {
+		m.byUser[s.UserID] = make(map[string]string)
+	}
+	m.byUser[s.UserID][s.ID] = tokenHash
 	return nil
 }
 
-// Get implements Store. An expired session is deleted and reported as
-// ErrSessionNotFound so a lapsed token behaves exactly like an unknown one.
-func (m *MemoryStore) Get(tokenHash string) (Session, error) {
+// Get reads a live session by its bearer-token hash.
+func (m *MemoryStore) Get(ctx context.Context, tokenHash string) (Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s, ok := m.byHash[tokenHash]
-	if !ok {
-		return Session{}, ErrSessionNotFound
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
 	}
-	if expired(s, m.now()) {
-		m.deleteLocked(tokenHash, s.UserID)
-		return Session{}, ErrSessionNotFound
-	}
-	return s, nil
+	return m.getLocked(tokenHash)
 }
 
-// Touch implements Store.
-func (m *MemoryStore) Touch(tokenHash string, idleExpiry time.Time) error {
+// GetByID performs an owner-scoped lookup without extending idle expiry.
+func (m *MemoryStore) GetByID(ctx context.Context, userID, sessionID string) (Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s, ok := m.byHash[tokenHash]
-	if !ok {
-		return ErrSessionNotFound
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
 	}
-	if expired(s, m.now()) {
-		m.deleteLocked(tokenHash, s.UserID)
-		return ErrSessionNotFound
+	return m.getLocked(m.byUser[userID][sessionID])
+}
+
+// Touch advances only live sessions and never exceeds absolute expiry.
+func (m *MemoryStore) Touch(ctx context.Context, tokenHash string, idleExpiry time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	s.IdleExpiry = idleExpiry
-	s.LastSeenAt = m.now()
+	s, err := m.getLocked(tokenHash)
+	if err != nil {
+		return err
+	}
+	if idleExpiry.After(s.AbsoluteExpiry) {
+		idleExpiry = s.AbsoluteExpiry
+	}
+	if idleExpiry.After(s.IdleExpiry) {
+		s.IdleExpiry = idleExpiry
+	}
+	if now := m.now(); now.After(s.LastSeenAt) {
+		s.LastSeenAt = now
+	}
 	m.byHash[tokenHash] = s
 	return nil
 }
 
-// Delete implements Store. Removing an unknown session is not an error.
-func (m *MemoryStore) Delete(tokenHash string) error {
+// Delete removes a session and its owner index entry.
+func (m *MemoryStore) Delete(ctx context.Context, tokenHash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s, ok := m.byHash[tokenHash]; ok {
-		m.deleteLocked(tokenHash, s.UserID)
+		m.deleteLocked(tokenHash, s)
 	}
 	return nil
 }
 
-// ListForUser implements Store, returning live sessions newest-first and
-// reclaiming any expired entries encountered along the way.
-func (m *MemoryStore) ListForUser(userID string) ([]Session, error) {
+// ListForUser returns live sessions, newest first.
+func (m *MemoryStore) ListForUser(ctx context.Context, userID string) ([]Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := m.now()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []Session
-	for hash := range m.byUser[userID] {
-		s, ok := m.byHash[hash]
-		if !ok {
+	for _, hash := range m.byUser[userID] {
+		s, err := m.getLocked(hash)
+		if err == ErrSessionNotFound {
 			continue
 		}
-		if expired(s, now) {
-			m.deleteLocked(hash, userID)
-			continue
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, s)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
 }
 
-// DeleteForUser implements Store. It removes the session with the given public
-// ID only when it belongs to userID.
-func (m *MemoryStore) DeleteForUser(userID, sessionID string) (bool, error) {
+// DeleteForUser removes a session only when the requested owner matches.
+func (m *MemoryStore) DeleteForUser(ctx context.Context, userID, sessionID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for hash := range m.byUser[userID] {
-		s, ok := m.byHash[hash]
-		if !ok {
-			continue
-		}
-		if s.ID == sessionID {
-			m.deleteLocked(hash, userID)
-			return true, nil
-		}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	return false, nil
+	hash := m.byUser[userID][sessionID]
+	s, err := m.getLocked(hash)
+	if err == ErrSessionNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	m.deleteLocked(hash, s)
+	return true, nil
 }
 
-// DeleteAllForUser implements Store.
-func (m *MemoryStore) DeleteAllForUser(userID string) error {
+// DeleteAllForUser atomically removes the user's current sessions.
+func (m *MemoryStore) DeleteAllForUser(ctx context.Context, userID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for hash := range m.byUser[userID] {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, hash := range m.byUser[userID] {
 		delete(m.byHash, hash)
 	}
 	delete(m.byUser, userID)
 	return nil
 }
 
-// ClaimRecoveryEnrollment implements Store with a single mutex-protected
-// compare-and-set over the restricted session state.
-func (m *MemoryStore) ClaimRecoveryEnrollment(userID, sessionID string) (bool, error) {
+// ClaimRecoveryEnrollment admits at most one pending replacement-key ceremony.
+func (m *MemoryStore) ClaimRecoveryEnrollment(ctx context.Context, userID, sessionID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := m.now()
-	for hash := range m.byUser[userID] {
-		s, ok := m.byHash[hash]
-		if !ok || s.ID != sessionID {
-			continue
-		}
-		if expired(s, now) {
-			m.deleteLocked(hash, userID)
-			return false, nil
-		}
-		if s.Kind != KindRecoveryEnrollment || s.EnrollmentClaimed {
-			return false, nil
-		}
-		s.EnrollmentClaimed = true
-		m.byHash[hash] = s
-		return true, nil
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	return false, nil
+	hash := m.byUser[userID][sessionID]
+	s, err := m.getLocked(hash)
+	if err == ErrSessionNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if s.Kind != KindRecoveryEnrollment || s.EnrollmentClaimed {
+		return false, nil
+	}
+	s.EnrollmentClaimed = true
+	m.byHash[hash] = s
+	return true, nil
 }
 
-// ReleaseRecoveryEnrollment implements Store.
-func (m *MemoryStore) ReleaseRecoveryEnrollment(userID, sessionID string) error {
+// ReleaseRecoveryEnrollment releases a claim only on a still-live restricted session.
+func (m *MemoryStore) ReleaseRecoveryEnrollment(ctx context.Context, userID, sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for hash := range m.byUser[userID] {
-		s, ok := m.byHash[hash]
-		if !ok || s.ID != sessionID {
-			continue
-		}
-		if s.Kind == KindRecoveryEnrollment {
-			s.EnrollmentClaimed = false
-			m.byHash[hash] = s
-		}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	hash := m.byUser[userID][sessionID]
+	s, err := m.getLocked(hash)
+	if err == ErrSessionNotFound {
 		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if s.Kind == KindRecoveryEnrollment {
+		s.EnrollmentClaimed = false
+		m.byHash[hash] = s
 	}
 	return nil
 }
 
-// deleteLocked removes a token hash from both indexes. The caller must hold the
-// mutex.
-func (m *MemoryStore) deleteLocked(tokenHash, userID string) {
-	delete(m.byHash, tokenHash)
-	if set, ok := m.byUser[userID]; ok {
-		delete(set, tokenHash)
-		if len(set) == 0 {
-			delete(m.byUser, userID)
-		}
+func (m *MemoryStore) getLocked(hash string) (Session, error) {
+	s, ok := m.byHash[hash]
+	if !ok {
+		return Session{}, ErrSessionNotFound
+	}
+	if !validSession(s) {
+		return Session{}, ErrStoreUnavailable
+	}
+	if expired(s, m.now()) {
+		m.deleteLocked(hash, s)
+		return Session{}, ErrSessionNotFound
+	}
+	return s, nil
+}
+
+func (m *MemoryStore) deleteLocked(hash string, s Session) {
+	delete(m.byHash, hash)
+	delete(m.byUser[s.UserID], s.ID)
+	if len(m.byUser[s.UserID]) == 0 {
+		delete(m.byUser, s.UserID)
 	}
 }

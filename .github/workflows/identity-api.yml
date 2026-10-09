@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'apps/identity-api/**'
+      - 'libs/schemas/**'
       - '.env.example'
       - 'nx.json'
       - 'package.json'
@@ -12,6 +13,7 @@ on:
   push:
     paths:
       - 'apps/identity-api/**'
+      - 'libs/schemas/**'
       - '.env.example'
       - 'nx.json'
       - 'package.json'
@@ -46,7 +48,9 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: apps/identity-api/go.sum
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
 
       - name: Set up npm 11 and workspace dependencies
         run: |
@@ -62,14 +66,20 @@ jobs:
       - name: Vet sqlc queries
         run: npm exec -- nx run identity-api:sqlc-vet --skipNxCache
 
+      - name: Lint canonical protobuf contracts
+        run: npm exec -- nx run schemas:lint --skipNxCache
+
       - name: Check generated-code reproducibility
         shell: bash
         run: |
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           snapshot=$(mktemp -d)
           cp -R apps/identity-api/internal/db "$snapshot/db"
+          cp -R libs/schemas/gen/go "$snapshot/schema-go"
+          npm exec -- nx run schemas:generate-go --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           diff -ru "$snapshot/db" apps/identity-api/internal/db
+          diff -ru "$snapshot/schema-go" libs/schemas/gen/go
 
       - name: Run fresh tests
         run: npm exec -- nx run identity-api:test --skipNxCache
@@ -93,7 +103,7 @@ jobs:
         run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge -p identity-api --skipNxCache
 
       - name: Build non-root runtime image
-        run: docker build --tag identity-api:ci apps/identity-api
+        run: docker build --file apps/identity-api/Dockerfile --tag identity-api:ci .
 
       - name: Smoke-test packaged maintenance entrypoints without credentials
         shell: bash
@@ -159,7 +169,9 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: apps/identity-api/go.sum
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
 
       - name: Set up npm 11 and workspace dependencies
         run: |
@@ -182,3 +194,6 @@ jobs:
 
       - name: Run mandatory legal workflow and transparency integration tests
         run: npm exec -- nx run identity-api:test-legal-workflow-integration --skipNxCache
+
+      - name: Run mandatory gRPC and shared-credential integration tests
+        run: npm exec -- nx run identity-api:test-grpc-integration --skipNxCache

@@ -6,10 +6,13 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // fakeAuthenticator is a ClientAuthenticator stand-in until Task 3.4 lands
@@ -40,9 +43,47 @@ const (
 	testRedirectURI = "https://app.test/callback"
 )
 
+type testSessions struct {
+	mu     sync.Mutex
+	values map[string]session.Session
+}
+
+func (s *testSessions) LookupByID(ctx context.Context, userID, id string) (session.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return session.Session{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[id]
+	if !ok || value.UserID != userID {
+		return session.Session{}, session.ErrSessionNotFound
+	}
+	return value, nil
+}
+
+func (s *testSessions) revoke(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, value := range s.values {
+		if value.UserID == userID {
+			delete(s.values, id)
+		}
+	}
+	return nil
+}
+
+func seedTestSession(svc *Service, userID, id string, version int64) {
+	sessions := svc.cfg.Sessions.(*testSessions)
+	sessions.mu.Lock()
+	defer sessions.mu.Unlock()
+	now := svc.now()
+	sessions.values[id] = session.Session{ID: id, UserID: userID, Kind: session.KindAuthenticated,
+		AuthVersion: version, AuthVersionSet: true, AbsoluteExpiry: now.Add(24 * time.Hour), IdleExpiry: now.Add(2 * time.Hour)}
+}
+
 // newTestService builds a Service with in-memory stores, an ephemeral key,
 // and the standard test client registry.
-func newTestService(t *testing.T, auth ClientAuthenticator, breach BreachRecorder) (*Service, *MemoryRefreshTokenStore) {
+func newTestService(t testing.TB, auth ClientAuthenticator, breach BreachRecorder) (*Service, *MemoryRefreshTokenStore) {
 	t.Helper()
 	key := testES256Key(t)
 	next := testES256Key(t)
@@ -63,8 +104,9 @@ func newTestService(t *testing.T, auth ClientAuthenticator, breach BreachRecorde
 		t.Fatalf("NewStaticRegistry: %v", err)
 	}
 	refresh := NewMemoryRefreshTokenStore()
+	sessions := &testSessions{values: make(map[string]session.Session)}
 	svc, err := NewService(
-		Config{Issuer: testIssuer},
+		Config{Issuer: testIssuer, Sessions: sessions, RevokeUser: sessions.revoke},
 		manager,
 		registry,
 		NewMemoryCodeStore(),
@@ -76,6 +118,7 @@ func newTestService(t *testing.T, auth ClientAuthenticator, breach BreachRecorde
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
+	seedTestSession(svc, "user-1", "session-1", 0)
 	return svc, refresh
 }
 
@@ -85,12 +128,14 @@ func issueTestCode(t *testing.T, svc *Service) (code, verifier string) {
 	t.Helper()
 	verifier = strings.Repeat("v", 50)
 	code, err := svc.IssueCode(AuthorizationCodeData{
-		ClientID:      testPublicID,
-		RedirectURI:   testRedirectURI,
-		UserID:        "user-1",
-		Scope:         "openid profile",
-		Nonce:         "n-123",
-		CodeChallenge: challengeFor(verifier),
+		ClientID:       testPublicID,
+		RedirectURI:    testRedirectURI,
+		UserID:         "user-1",
+		SessionID:      "session-1",
+		AuthVersionSet: true,
+		Scope:          "openid profile",
+		Nonce:          "n-123",
+		CodeChallenge:  challengeFor(verifier),
 	})
 	if err != nil {
 		t.Fatalf("IssueCode: %v", err)
@@ -278,7 +323,7 @@ func TestRefreshTokenReuseTriggersBreach(t *testing.T) {
 
 func TestRefreshTokenWrongClientTriggersBreach(t *testing.T) {
 	breach := &recordingBreach{}
-	svc, refresh := newTestService(t, nil, breach)
+	svc, _ := newTestService(t, nil, breach)
 	code, verifier := issueTestCode(t, svc)
 	ctx := context.Background()
 
@@ -287,23 +332,18 @@ func TestRefreshTokenWrongClientTriggersBreach(t *testing.T) {
 		t.Fatalf("code exchange: %v", err)
 	}
 
-	// Register a second client by swapping the registry is not possible with
-	// StaticRegistry; instead present the token under a client_id that exists
-	// in the registry check first. Simulate by tampering the stored record's
-	// client binding.
-	hash := HashSecret(first.RefreshToken)
-	data, err := refresh.Get(hash)
+	// Use another registered client rather than corrupting authoritative state.
+	svc.registry, err = clients.NewStaticRegistry([]clients.Client{
+		{ID: testPublicID, RedirectURIs: []string{testRedirectURI}, TokenEndpointAuthMethod: clients.AuthMethodNone, AllowedScopes: []string{"openid", "profile"}},
+		{ID: "another-client", RedirectURIs: []string{testRedirectURI}, TokenEndpointAuthMethod: clients.AuthMethodNone, AllowedScopes: []string{"openid", "profile"}},
+	})
 	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	data.ClientID = "another-client"
-	if err := refresh.Save(hash, data); err != nil {
-		t.Fatalf("Save: %v", err)
+		t.Fatal(err)
 	}
 
 	form := url.Values{
 		"grant_type":    {GrantRefreshToken},
-		"client_id":     {testPublicID},
+		"client_id":     {"another-client"},
 		"refresh_token": {first.RefreshToken},
 	}
 	_, err = svc.Exchange(ctx, form)

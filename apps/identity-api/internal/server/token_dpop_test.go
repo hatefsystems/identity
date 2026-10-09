@@ -1,13 +1,12 @@
 package server
 
 import (
-	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"log/slog"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
@@ -27,47 +24,12 @@ import (
 // lifecycle can be exercised end-to-end.
 func newDPoPTokenTestServer(t *testing.T) (*Server, *token.Service, *dpop.Validator) {
 	t.Helper()
-	active, err := keys.NewEphemeralES256()
-	if err != nil {
-		t.Fatalf("active key: %v", err)
-	}
-	next, err := keys.NewEphemeralES256()
-	if err != nil {
-		t.Fatalf("next key: %v", err)
-	}
-	manager, err := keys.NewManager(active, next, nil)
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-	registry, err := clients.NewStaticRegistry([]clients.Client{{
-		ID:                      testClientID,
-		RedirectURIs:            []string{testRedirectURI},
-		TokenEndpointAuthMethod: clients.AuthMethodNone,
-		AllowedScopes:           []string{"openid", "profile"},
-	}})
-	if err != nil {
-		t.Fatalf("NewStaticRegistry: %v", err)
-	}
-	svc, err := token.NewService(
-		token.Config{Issuer: testIssuer},
-		manager, registry,
-		token.NewMemoryCodeStore(), token.NewMemoryRefreshTokenStore(),
-		nil, nil, slog.Default(),
-	)
-	if err != nil {
-		t.Fatalf("NewService: %v", err)
-	}
+	srv, svc := newTokenTestServer(t, nil)
 	validator, err := dpop.NewValidator(dpop.NewMemoryReplayGuard(), dpop.NewMemoryNonceStore())
 	if err != nil {
 		t.Fatalf("NewValidator: %v", err)
 	}
-	srv := New(testConfig(t), nil, Deps{
-		OIDC:          config.OIDCConfig{Issuer: testIssuer},
-		Keys:          manager,
-		Clients:       registry,
-		TokenService:  svc,
-		DPoPValidator: validator,
-	})
+	srv.deps.DPoPValidator = validator
 	return srv, svc, validator
 }
 
@@ -153,8 +115,22 @@ func TestTokenEndpointDPoPBindsCnfJKT(t *testing.T) {
 		t.Fatalf("key: %v", err)
 	}
 
-	// Obtain a nonce, then present a proof echoing it.
-	nonce, err := validator.IssueNonce(context.Background())
+	// Issue only from a signature-verified challenge, then echo the nonce.
+	wantJKT, err := keys.Thumbprint(key.PublicJWK)
+	if err != nil {
+		t.Fatalf("Thumbprint: %v", err)
+	}
+	verified, err := validator.Validate(t.Context(), dpopTokenProof(t, key.Signer.(*ecdsa.PrivateKey), key.PublicJWK, ""), dpop.VerifyParams{
+		Realm: "as:" + testIssuer, Method: http.MethodPost, URL: testIssuer + "/oauth2/token", RequireNonce: true,
+	})
+	var challenge *dpop.NonceChallenge
+	if verified != nil || !errors.As(err, &challenge) || !errors.Is(err, dpop.ErrNonceRequired) {
+		t.Fatalf("verified nonce challenge = %v, %v", verified, err)
+	}
+	if challenge.Realm != "as:"+testIssuer || challenge.JKT != wantJKT {
+		t.Fatalf("incorrect challenge scope: %#v", challenge)
+	}
+	nonce, err := validator.IssueNonce(t.Context(), challenge.Realm, challenge.JKT)
 	if err != nil {
 		t.Fatalf("IssueNonce: %v", err)
 	}
@@ -177,7 +153,6 @@ func TestTokenEndpointDPoPBindsCnfJKT(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing cnf claim: %+v", claims)
 	}
-	wantJKT, _ := keys.Thumbprint(key.PublicJWK)
 	if cnf["jkt"] != wantJKT {
 		t.Errorf("cnf.jkt = %v, want %q", cnf["jkt"], wantJKT)
 	}

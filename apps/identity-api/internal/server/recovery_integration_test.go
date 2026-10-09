@@ -157,7 +157,7 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 	if succeeded != 1 || rejected != 1 || issuedCookies != 1 {
 		t.Fatalf("success/rejected/cookies = %d/%d/%d, want 1/1/1", succeeded, rejected, issuedCookies)
 	}
-	live, err := sessions.List(user.ID.String())
+	live, err := sessions.List(ctx, user.ID.String())
 	if err != nil {
 		t.Fatalf("List sessions: %v", err)
 	}

@@ -12,7 +12,7 @@ mounted only when its dependency is configured.
 ```
 apps/identity-api/
 ├── cmd/
-│   ├── server/          # main entry point (HTTP server + graceful shutdown)
+│   ├── server/          # HTTP + optional private gRPC; bounded shutdown
 │   └── migrate/         # goose migration runner CLI (up/down/reset/status)
 ├── internal/
 │   ├── config/          # env-based configuration (no hardcoded secrets)
@@ -37,12 +37,12 @@ required — it runs via `go tool sqlc`. The generated `internal/db` package is 
 build artifact (gitignored) regenerated from the SQL sources:
 
 ```bash
-pnpm nx run identity-api:sqlc-generate   # go tool sqlc generate -> internal/db
-pnpm nx run identity-api:sqlc-vet        # go tool sqlc vet (static query checks)
+npm exec -- nx run identity-api:sqlc-generate
+npm exec -- nx run identity-api:sqlc-vet
 ```
 
-`nx build identity-api` depends on `sqlc-generate`, so a fresh checkout
-regenerates the DB layer before compiling.
+Nx compilation targets depend on `sqlc-generate` and canonical schema Go
+generation, so a fresh checkout regenerates both layers before compiling.
 
 ## Database migrations (goose)
 
@@ -64,9 +64,9 @@ hardcoded. With the dev stack running (`docker compose -f
 docker-compose.dev.yml up -d`):
 
 ```bash
-pnpm nx run identity-api:migrate-up       # apply pending migrations
-pnpm nx run identity-api:migrate-down     # roll back the latest migration
-pnpm nx run identity-api:migrate-status   # show per-migration applied state
+npm exec -- nx run identity-api:migrate-up
+npm exec -- nx run identity-api:migrate-down
+npm exec -- nx run identity-api:migrate-status
 ```
 
 Or directly: `go run ./cmd/migrate <up|down|reset|status>`.
@@ -200,6 +200,43 @@ then requires normal login. Invalid, spent, foreign, and decoy transactions all
 return `401 invalid_credentials`; duplicate enrollment claims return
 `409 enrollment_already_used`.
 
+### Private IdentityService (Task 6.2)
+
+`internal/identitygrpc` implements ValidateToken, CheckPermission and GetInternalUserInfo behind `internal/grpcauth` TLS 1.3/SPIFFE admission. The listener is off by default. Enabling it requires PostgreSQL, Redis, a local Workload API and explicit method/audience/origin policies; missing requirements never produce plaintext or memory-backed gRPC. User validation uses local rotating keys, Redis grant/browser/DPoP state and one live primary account check. Client principals are explicitly distinct and perform no user lookup. Permission checks are exact, live database queries. Profiles disclose email only for active/pending-verification users, return status only for suspended/banned users, and hide deleting/deleted accounts; display name is currently empty.
+
+| Variable | Default | Contract |
+|---|---|---|
+| `GRPC_ENABLED` | `false` | Enable the private TLS-only listener alongside HTTP. |
+| `GRPC_ADDR` | `127.0.0.1:9090` | Explicit private bind address; no public proxy route or host-wide port publishing is added. |
+| `GRPC_TRUST_DOMAIN` | Required when enabled | Bare canonical SPIFFE trust domain. |
+| `SPIFFE_ENDPOINT_SOCKET` | Required when enabled | Authorized local `unix` socket or Windows named pipe. |
+| `GRPC_METHOD_GRANTS_JSON` | Explicit map required | Exact full RPC methods to SPIFFE-ID arrays; `{}` denies all. |
+| `GRPC_VALIDATION_POLICIES_JSON` | Explicit map required | ValidateToken caller IDs to `audiences` and canonical `origins`; no implicit grants. |
+| `GRPC_REQUEST_TIMEOUT` | `2s` | Positive, at most `30s`; shorter caller deadlines win. |
+
+Compact tokens/proofs are capped at 16 KiB each, messages at 64 KiB, and audience/URI fields at 2 KiB. Initial acquisition has a ten-second budget; connections have a five-second handshake bound and five-minute maximum age with 30-second grace. Enabled gRPC dependencies contribute to HTTP readiness, not liveness. Both listeners stop before audit draining and source cleanup, with forced close after bounded graceful shutdown.
+
+Redis is credential authority, not a disposable performance cache. Validation/refresh never touches browser activity: two-hour idle and 24-hour absolute defaults cap linked OAuth authority, and `offline_access` does not override them. Atomic refresh rotation preserves the original proof key; recognized reuse invalidates primary account authority and every user session/family. A coordinated issuer/store cutover requires reauthentication because unlinked legacy JWTs do not pass the new RPC. Successful results must not be cached until `expires_at`. Offline JWT consumers still retain their token's residual lifetime, at most ten minutes. See the [contract and rollout guide](../../docs/client-integration.md#34-runtime-configuration-and-rollout).
+
+The API imports the existing schemas Go module through a local replacement. Go 1.26.5 or later and fresh ignored schema/sqlc outputs are required. Nx compilation targets generate them automatically. A Go-only Buf template avoids remote TypeScript plugins in the backend/image build. From the repository root:
+
+```bash
+npm exec -- nx run schemas:lint
+npm exec -- nx run schemas:generate-go
+npm exec -- nx run identity-api:test
+npm exec -- nx run identity-api:lint
+npm exec -- nx run identity-api:test-grpc-integration --skipNxCache
+docker build --file apps/identity-api/Dockerfile --tag identity-api:dev .
+```
+
+The mandatory integration target requires disposable `DATABASE_URL` and `REDIS_URL`, sets `REQUIRE_GRPC_INTEGRATION=1`, and runs PostgreSQL/Redis/mTLS tests serially. Missing dependencies fail rather than skip; do not run database suites concurrently. The Docker context is now the repository root. `Dockerfile.dockerignore` excludes secrets and locally generated code, so schema/sqlc outputs are rebuilt inside the image. WebAuthn challenge and client-assertion replay stores remain separate single-process boundaries; this does not claim complete multi-instance HTTP login readiness.
+
+The `BenchmarkAccessValidation` CPU/allocation baseline on 2026-10-09 (Windows
+amd64, Intel i7-10750H, ES256) measured approximately 81.1 us/op, 4,784 B/op and
+58 allocations for user tokens, and 80.0 us/op, 4,744 B/op and 56 allocations
+for client tokens. This uses in-memory authority and a stubbed primary account
+gate; it is not a Redis/PostgreSQL/network latency measurement or production SLO.
+
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at
@@ -227,10 +264,10 @@ WebAuthn, and SMS OTP variables.
 The workspace package manager is used to drive tasks through Nx:
 
 ```bash
-pnpm nx serve identity-api   # go run ./cmd/server
-pnpm nx build identity-api   # go build -o bin/identity-api ./cmd/server
-pnpm nx test identity-api    # go test ./...
-pnpm nx lint identity-api    # golangci-lint run ./...
+npm exec -- nx run identity-api:serve
+npm exec -- nx run identity-api:build
+npm exec -- nx run identity-api:test
+npm exec -- nx run identity-api:lint
 ```
 
 Or directly with the Go toolchain from this directory:

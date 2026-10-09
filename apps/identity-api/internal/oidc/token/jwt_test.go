@@ -11,7 +11,7 @@ import (
 )
 
 // testES256Key generates an ephemeral ES256 signing key for tests.
-func testES256Key(t *testing.T) *keys.SigningKey {
+func testES256Key(t testing.TB) *keys.SigningKey {
 	t.Helper()
 	key, err := keys.NewEphemeralES256()
 	if err != nil {

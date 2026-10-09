@@ -111,6 +111,62 @@ server {
 }
 ```
 
+### 1.0.1 Private IdentityService Runtime (Task 6.2)
+
+The API can also host private TLS 1.3 gRPC on `GRPC_ADDR` (default
+`127.0.0.1:9090`). It is disabled by default and must not be added to the public
+Nginx/Traefik routes above. `GRPC_ENABLED=true` requires PostgreSQL, standalone
+Redis, a maintained local SPIRE Workload API, an explicit canonical trust domain,
+exact method grants and audience/origin policies. This implements application
+support, not permission to provision the post-MVP SPIRE/Kubernetes manifests.
+See [client configuration](client-integration.md#34-runtime-configuration-and-rollout)
+for the environment contract and a non-production example.
+
+Build from the repository root so the existing schemas Go module is available:
+
+```bash
+docker build --file apps/identity-api/Dockerfile --tag identity-api:dev .
+```
+
+The Dockerfile-specific ignore rules exclude secrets, unrelated workspace
+content and local generated outputs. The image regenerates schema Go and sqlc
+code using pinned local tools before building all existing API/worker binaries.
+Generated Go remains uncommitted; Go 1.26.5 or later is required. No remote
+TypeScript generator is needed for this backend build.
+
+Before enabling consumers, deploy the shared-state-aware issuers on all API
+instances, drain process-local sessions and require reauthentication. New user
+tokens bind to their browser session, OAuth grant and captured account version.
+Legacy unlinked JWTs cannot pass the RPC. Do not promise complete multi-node HTTP
+login readiness: WebAuthn challenges and client-assertion replay state are still
+separate single-process boundaries. Independent offline grants and the consent
+UI completion remain separate tasks.
+
+Operate Redis as security authority: use appropriate ACLs/TLS and an eviction
+policy that does not silently treat credential state as expendable cache data.
+Missing records invalidate credentials, while errors/corruption fail validation
+with Unavailable. Runtime clients honor context deadlines, have bounded I/O, and
+do not transparently retry consumptive commands. Never roll Redis back to a
+snapshot that could restore revoked grants or forget consumed proofs; discard
+credential/replay namespaces and reauthenticate instead.
+
+Enabled `/readyz` verifies the private listener, current usable SVID/bundle,
+PostgreSQL and Redis; `/healthz` remains dependency-independent. SVID acquisition
+is bounded to ten seconds. Connections age out after five minutes with
+30-second grace; requests default to a two-second deadline. On either listener's
+failure or termination, both stop admissions and drain under the shutdown bound,
+then force-close if needed before audit/source/backing-resource cleanup.
+Monitor readiness, dependency errors, forced shutdowns and certificate renewal;
+no successful token response is a reusable authorization cache entry.
+
+Use `npm exec -- nx run identity-api:test-grpc-integration --skipNxCache` with
+disposable PostgreSQL/Redis and run database suites serially. Missing test
+dependencies fail rather than skip. Unit transport tests use real mTLS and
+generated clients. Production enablement still needs approved workload grants,
+socket access controls, private networking and verified consumer error/nonce
+forwarding. Disable/drain the listener for rollback; never silently weaken a
+consumer to an offline or unauthenticated fallback.
+
 ### 1.1 Traefik Ingress Configuration
 
 To ensure optimal performance and isolate concerns, path-based routing separates Next.js (web frontend) from the Go IdP API engine.

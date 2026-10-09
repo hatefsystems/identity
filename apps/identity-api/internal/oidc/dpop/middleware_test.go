@@ -1,8 +1,11 @@
 package dpop
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -207,8 +210,13 @@ func TestNewMiddlewareValidation(t *testing.T) {
 		t.Error("expected error for nil validator")
 	}
 	v, _ := NewValidator(NewMemoryReplayGuard(), nil)
-	if _, err := NewMiddleware(v, "   "); err == nil {
-		t.Error("expected error for empty base URL")
+	for _, base := range []string{"   ", "/relative", mwBaseURL + "/path", mwBaseURL + "?query", mwBaseURL + "#fragment", "https://user@identity.hatef.ir"} {
+		if _, err := NewMiddleware(v, base); err != ErrInvalidParams {
+			t.Errorf("invalid base %q: %v", base, err)
+		}
+	}
+	if _, err := NewMiddleware(v, mwBaseURL, WithRequireNonce(true)); err != ErrInvalidParams {
+		t.Errorf("missing required nonce store: %v", err)
 	}
 }
 
@@ -235,4 +243,136 @@ func keysThumbprint(t *testing.T, s *proofSigner) (string, error) {
 		return "", err
 	}
 	return proof.JKT, nil
+}
+
+func TestMiddlewareStoreFailuresAreServiceUnavailable(t *testing.T) {
+	now := time.Now()
+	s := newES256Signer(t)
+	failure := errors.New("private backend failure")
+	for _, stage := range []string{"replay", "validate nonce", "issue nonce", "empty nonce", "canceled", "deadline"} {
+		t.Run(stage, func(t *testing.T) {
+			nonces := nonceStoreFuncs{
+				issue: func(context.Context, string, string) (string, error) {
+					if stage == "empty nonce" {
+						return "", nil
+					}
+					return "", failure
+				},
+				validate: func(context.Context, string, string, string) (bool, error) { return false, failure },
+			}
+			v, err := NewValidator(replayGuardFunc(func(context.Context, string, time.Time) (bool, error) {
+				return false, failure
+			}), nonces, WithClock(fixedClock(now)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := NewMiddleware(v, mwBaseURL, WithRequireNonce(stage != "replay"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := resourceClaims(now)
+			if stage == "validate nonce" {
+				c.nonce = "nonce"
+			}
+			req := httptest.NewRequest(mwHTMethod, mwPath, nil)
+			if stage == "canceled" {
+				ctx, cancel := context.WithCancel(req.Context())
+				cancel()
+				req = req.WithContext(ctx)
+			}
+			if stage == "deadline" {
+				ctx, cancel := context.WithDeadline(req.Context(), now.Add(-time.Second))
+				defer cancel()
+				req = req.WithContext(ctx)
+			}
+			req.Header.Set(HeaderProof, s.sign(t, c, TypDPoP, s.alg, nil))
+			ran, seen := new(bool), new(*Proof)
+			rec := serve(m, ran, seen, req)
+			if rec.Code != http.StatusServiceUnavailable || *ran || *seen != nil {
+				t.Fatalf("failed store response = %d, ran=%v, proof=%v", rec.Code, *ran, *seen)
+			}
+			if rec.Header().Get(HeaderNonce) != "" || rec.Header().Get("WWW-Authenticate") != "" || rec.Body.Len() != 0 {
+				t.Fatalf("outage leaked an authentication challenge or backend details: %v %s", rec.Header(), rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMiddlewareInvalidProofDoesNotIssueNonce(t *testing.T) {
+	now := time.Now()
+	s := newES256Signer(t)
+	for _, tc := range []struct {
+		name   string
+		change func(*proofClaims)
+	}{
+		{"missing jti", func(c *proofClaims) { c.jti = "" }},
+		{"wrong method", func(c *proofClaims) { c.htm = "POST" }},
+		{"wrong URI", func(c *proofClaims) { c.htu += "/other" }},
+		{"oversized", func(c *proofClaims) { c.jti = strings.Repeat("x", MaxProofSize) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := NewValidator(NewMemoryReplayGuard(), nonceStoreFuncs{
+				issue: func(context.Context, string, string) (string, error) {
+					t.Fatal("invalid proof triggered nonce issuance")
+					return "", nil
+				},
+			}, WithClock(fixedClock(now)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := NewMiddleware(v, mwBaseURL, WithRequireNonce(true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := resourceClaims(now)
+			tc.change(&c)
+			req := httptest.NewRequest(mwHTMethod, mwPath, nil)
+			req.Header.Set(HeaderProof, s.sign(t, c, TypDPoP, s.alg, nil))
+			ran, seen := new(bool), new(*Proof)
+			rec := serve(m, ran, seen, req)
+			if rec.Code != http.StatusUnauthorized || *ran || rec.Header().Get(HeaderNonce) != "" ||
+				!strings.Contains(rec.Header().Get("WWW-Authenticate"), errCodeInvalidProof) {
+				t.Fatalf("invalid proof response = %d, %v", rec.Code, rec.Header())
+			}
+		})
+	}
+}
+
+func TestMiddlewareNonceUsesVerifiedKeyAndTrustedRealm(t *testing.T) {
+	now := time.Now()
+	m, ran, seen, nonces := newMiddlewareHarness(t, now, true)
+	s := newES256Signer(t)
+	req := httptest.NewRequest(mwHTMethod, "http://attacker.invalid"+mwPath, nil)
+	req.Header.Set("X-Forwarded-Host", "attacker.invalid")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set(HeaderProof, s.sign(t, resourceClaims(now), TypDPoP, s.alg, nil))
+	rec := serve(m, ran, seen, req)
+	nonce := rec.Header().Get(HeaderNonce)
+	if rec.Code != http.StatusUnauthorized || nonce == "" || *ran ||
+		!strings.Contains(rec.Header().Get("WWW-Authenticate"), errCodeUseNonce) {
+		t.Fatalf("nonce challenge = %d, %v", rec.Code, rec.Header())
+	}
+	jkt := s.thumbprint(t)
+	for _, scope := range [][2]string{{"rs:http://attacker.invalid", jkt}, {"rs:" + mwBaseURL, "other-key"}} {
+		if ok, err := nonces.Validate(context.Background(), scope[0], scope[1], nonce); ok || err != nil {
+			t.Fatalf("untrusted nonce scope = %v, %v", ok, err)
+		}
+	}
+	if ok, err := nonces.Validate(context.Background(), "rs:"+mwBaseURL, jkt, nonce); !ok || err != nil {
+		t.Fatalf("verified nonce scope = %v, %v", ok, err)
+	}
+}
+
+func TestMiddlewareUsesEscapedObservedPath(t *testing.T) {
+	now := time.Now()
+	m, ran, seen, _ := newMiddlewareHarness(t, now, false)
+	s := newES256Signer(t)
+	path := "/api/v1/a%2Fb"
+	c := resourceClaims(now)
+	c.htu = mwBaseURL + path
+	req := httptest.NewRequest(mwHTMethod, path+"?ignored=query", nil)
+	req.Header.Set(HeaderProof, s.sign(t, c, TypDPoP, s.alg, nil))
+	if rec := serve(m, ran, seen, req); rec.Code != http.StatusOK || !*ran {
+		t.Fatalf("escaped path response = %d", rec.Code)
+	}
 }

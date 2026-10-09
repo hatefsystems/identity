@@ -1,6 +1,8 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -298,7 +300,7 @@ func TestManagerListAndRevokeByID(t *testing.T) {
 		t.Fatalf("Issue 2: %v", err)
 	}
 
-	sessions, err := m.List("user-1")
+	sessions, err := m.List(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -307,7 +309,7 @@ func TestManagerListAndRevokeByID(t *testing.T) {
 	}
 
 	// Revoke by ID scoped to a different user must not remove it.
-	removed, err := m.RevokeByID("user-2", s1.ID)
+	removed, err := m.RevokeByID(t.Context(), "user-2", s1.ID)
 	if err != nil {
 		t.Fatalf("RevokeByID: %v", err)
 	}
@@ -315,7 +317,7 @@ func TestManagerListAndRevokeByID(t *testing.T) {
 		t.Fatal("RevokeByID allowed cross-user revocation")
 	}
 
-	removed, err = m.RevokeByID("user-1", s1.ID)
+	removed, err = m.RevokeByID(t.Context(), "user-1", s1.ID)
 	if err != nil {
 		t.Fatalf("RevokeByID: %v", err)
 	}
@@ -333,10 +335,10 @@ func TestManagerRevokeAllForUser(t *testing.T) {
 			t.Fatalf("Issue: %v", err)
 		}
 	}
-	if err := m.RevokeAllForUser("user-1"); err != nil {
+	if err := m.RevokeAllForUser(t.Context(), "user-1"); err != nil {
 		t.Fatalf("RevokeAllForUser: %v", err)
 	}
-	sessions, err := m.List("user-1")
+	sessions, err := m.List(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -350,5 +352,73 @@ func TestManagerCookieName(t *testing.T) {
 	m := newTestManager(t, &now)
 	if m.CookieName() != "session" {
 		t.Fatalf("CookieName() = %q, want session", m.CookieName())
+	}
+}
+
+func TestManagerContextCancellation(t *testing.T) {
+	now := time.Now()
+	m := newTestManager(t, &now)
+	rec := httptest.NewRecorder()
+	s, err := m.Issue(rec, IssueParams{UserID: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	request := requestWithCookies(rec).WithContext(ctx)
+	operations := map[string]func() error{
+		"issue": func() error {
+			_, err := m.IssueContext(ctx, httptest.NewRecorder(), IssueParams{UserID: "owner"})
+			return err
+		},
+		"authenticate": func() error { _, err := m.Authenticate(request); return err },
+		"lookup":       func() error { _, err := m.LookupByID(ctx, s.UserID, s.ID); return err },
+		"list":         func() error { _, err := m.List(ctx, s.UserID); return err },
+		"revoke":       func() error { _, _, err := m.Revoke(httptest.NewRecorder(), request); return err },
+		"revoke_id":    func() error { _, err := m.RevokeByID(ctx, s.UserID, s.ID); return err },
+		"revoke_all":   func() error { return m.RevokeAllForUser(ctx, s.UserID) },
+		"claim":        func() error { _, err := m.ClaimRecoveryEnrollment(ctx, s.UserID, s.ID); return err },
+		"release":      func() error { return m.ReleaseRecoveryEnrollment(ctx, s.UserID, s.ID) },
+	}
+	for name, operation := range operations {
+		if err := operation(); !errors.Is(err, context.Canceled) {
+			t.Errorf("%s lost request cancellation: %v", name, err)
+		}
+	}
+	if _, err := m.LookupByID(t.Context(), s.UserID, s.ID); err != nil {
+		t.Fatalf("canceled revocation removed the session: %v", err)
+	}
+}
+
+type lookupStore struct {
+	Store
+	lookup Session
+}
+
+func (s lookupStore) GetByID(context.Context, string, string) (Session, error) { return s.lookup, nil }
+
+func TestManagerLookupDefendsAgainstMalformedOrExpiredStoreResults(t *testing.T) {
+	now := time.Now()
+	m := newTestManager(t, &now)
+	s := liveSession(now, "owner", "id")
+	for _, test := range []struct {
+		name   string
+		change func(*Session)
+		want   error
+	}{
+		{"owner mismatch", func(s *Session) { s.UserID = "other" }, ErrStoreUnavailable},
+		{"ID mismatch", func(s *Session) { s.ID = "other" }, ErrStoreUnavailable},
+		{"unsupported kind", func(s *Session) { s.Kind = "" }, ErrStoreUnavailable},
+		{"invalid version", func(s *Session) { s.AuthVersion = -1 }, ErrStoreUnavailable},
+		{"deadline reached", func(s *Session) { s.CreatedAt = now.Add(-time.Hour); s.LastSeenAt = s.CreatedAt; s.IdleExpiry = now }, ErrSessionNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := s
+			test.change(&value)
+			m.store = lookupStore{lookup: value}
+			if _, err := m.LookupByID(t.Context(), s.UserID, s.ID); !errors.Is(err, test.want) {
+				t.Fatalf("LookupByID: %v, want %v", err, test.want)
+			}
+		})
 	}
 }

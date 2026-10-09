@@ -107,12 +107,21 @@ type Signer interface {
 
 // Config carries the tunable lifetimes for issued artifacts.
 type Config struct {
-	AccountState    session.AccountState
+	AccountState session.AccountState
+	Sessions     SessionLookup
+	// RevokeUser invalidates the primary account version and browser sessions
+	// before refresh-family cleanup. It runs outside WithActive's transaction.
+	RevokeUser      func(context.Context, string) error
 	Issuer          string
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
 	CodeTTL         time.Duration
 	IDTokenTTL      time.Duration
+}
+
+// SessionLookup reads browser authority without touching its idle lifetime.
+type SessionLookup interface {
+	LookupByID(context.Context, string, string) (session.Session, error)
 }
 
 // withDefaults fills zero durations with the platform defaults.
@@ -183,8 +192,8 @@ func NewService(
 	breach BreachRecorder,
 	logger *slog.Logger,
 ) (*Service, error) {
-	if signer == nil || registry == nil || codes == nil || refresh == nil {
-		return nil, errors.New("token: signer, registry, code store and refresh store are required")
+	if signer == nil || registry == nil || codes == nil || refresh == nil || cfg.Sessions == nil || cfg.RevokeUser == nil {
+		return nil, errors.New("token: signer, registry, credential stores, sessions and revoker are required")
 	}
 	if cfg.Issuer == "" {
 		return nil, errors.New("token: issuer is required")
@@ -222,10 +231,17 @@ func (s *Service) IssueCodeContext(ctx context.Context, data AuthorizationCodeDa
 	if err != nil {
 		return "", err
 	}
-	if data.ExpiresAt.IsZero() {
-		data.ExpiresAt = s.now().Add(s.cfg.CodeTTL)
+	persist := func() error {
+		parent, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet)
+		if err != nil {
+			return err
+		}
+		expires := minTime(s.now().Add(s.cfg.CodeTTL), parent.AbsoluteExpiry)
+		if data.ExpiresAt.IsZero() || data.ExpiresAt.After(expires) {
+			data.ExpiresAt = expires
+		}
+		return s.codes.Save(ctx, hash, data)
 	}
-	persist := func() error { return s.codes.Save(hash, data) }
 	if s.cfg.AccountState != nil {
 		if !data.AuthVersionSet {
 			return "", session.ErrAccountIneligible
@@ -265,7 +281,8 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 	if clientID == "" {
 		return nil, newError(ErrCodeInvalidRequest, "missing client_id", 400)
 	}
-	if _, err := s.registry.Lookup(clientID); err != nil {
+	client, err := s.registry.Lookup(clientID)
+	if err != nil {
 		return nil, newError(ErrCodeInvalidClient, "unknown client", 401)
 	}
 
@@ -284,9 +301,12 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 
 	// Single-use consumption: the code is atomically removed on first read,
 	// so a concurrent or later replay always lands in ErrCodeNotFound.
-	data, err := s.codes.Consume(HashSecret(code))
+	data, err := s.codes.Consume(ctx, HashSecret(code))
 	if err != nil {
-		return nil, newError(ErrCodeInvalidGrant, "invalid or expired authorization code", 400)
+		if errors.Is(err, ErrCodeNotFound) {
+			return nil, newError(ErrCodeInvalidGrant, "invalid or expired authorization code", 400)
+		}
+		return nil, s.serverError("consume authorization code", err)
 	}
 
 	// Binding checks: the code must belong to this client and the exact
@@ -302,13 +322,25 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 	if !VerifyPKCE(verifier, data.CodeChallenge) {
 		return nil, newError(ErrCodeInvalidGrant, "PKCE verification failed", 400)
 	}
+	for _, scope := range splitScopes(data.Scope) {
+		if !client.AllowsScope(scope) {
+			return nil, newError(ErrCodeInvalidGrant, "grant is no longer valid", 400)
+		}
+	}
 
 	return s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+		parent, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet)
+		if err != nil {
+			return nil, s.sessionError(err)
+		}
 		now := s.now()
 		// Sender-constrain the access token to the client's DPoP key when the
 		// request carried a validated proof (RFC 9449 §5); otherwise Bearer.
 		jkt, tokenType := s.tokenBinding(ctx)
-		accessToken, err := s.signAccessToken(data.UserID, clientID, data.Scope, jkt, now)
+		grant := GrantData{ID: uuid.NewString(), PrincipalType: PrincipalUser, Subject: data.UserID,
+			ClientID: clientID, Scope: data.Scope, SessionID: data.SessionID, AuthVersion: data.AuthVersion,
+			AuthVersionSet: true, DPoPJKT: jkt, Status: StatusActive, ExpiresAt: parent.AbsoluteExpiry}
+		accessToken, expires, err := s.signAccessToken(grant, now)
 		if err != nil {
 			return nil, s.serverError("sign access token", err)
 		}
@@ -317,16 +349,18 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 			return nil, s.serverError("sign id token", err)
 		}
 
-		// Start a fresh refresh-token family for this grant/session.
-		refreshToken, err := s.issueRefreshToken(uuid.NewString(), data.UserID, clientID, data.Scope, now, data.AuthVersion, data.AuthVersionSet)
+		refreshToken, refreshHash, err := NewSecret()
 		if err != nil {
 			return nil, s.serverError("issue refresh token", err)
+		}
+		if err := s.refresh.CreateGrant(ctx, grant, refreshHash, s.refreshForGrant(grant, now)); err != nil {
+			return nil, s.serverError("persist grant", err)
 		}
 
 		return &Response{
 			AccessToken:  accessToken,
 			TokenType:    tokenType,
-			ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
+			ExpiresIn:    expires.Unix() - now.Unix(),
 			RefreshToken: refreshToken,
 			IDToken:      idToken,
 			Scope:        data.Scope,
@@ -359,18 +393,26 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 	}
 
 	hash := HashSecret(presented)
-	data, err := s.refresh.Get(hash)
+	data, err := s.refresh.Get(ctx, hash)
 	if err != nil {
 		// Unknown or expired: plain invalid_grant. No breach signal — there
 		// is no record to attribute the attempt to.
-		return nil, newError(ErrCodeInvalidGrant, "invalid or expired refresh token", 400)
+		if errors.Is(err, ErrRefreshTokenNotFound) {
+			return nil, newError(ErrCodeInvalidGrant, "invalid or expired refresh token", 400)
+		}
+		return nil, s.serverError("load refresh token", err)
+	}
+	// The original proof key must be demonstrated before any destructive breach
+	// response. A stolen sender-constrained secret alone cannot log out its owner.
+	jkt, tokenType := s.tokenBinding(ctx)
+	if jkt != data.DPoPJKT {
+		return nil, newError(ErrCodeInvalidGrant, "refresh token binding is invalid", 400)
 	}
 
 	if data.ClientID != clientID {
 		// A token presented by the wrong client is treated with the same
 		// severity as a replay: it cannot happen without leakage.
-		s.triggerBreach(ctx, data)
-		return nil, newError(ErrCodeInvalidGrant, "refresh token was not issued to this client", 400)
+		return nil, s.breachError(ctx, data)
 	}
 
 	switch data.Status {
@@ -379,44 +421,62 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 	case StatusRotated, StatusRevoked:
 		// Duplicate/replayed presentation — breach detected. Revoke ALL
 		// active refresh tokens for the user (every family, every session).
-		s.triggerBreach(ctx, data)
-		return nil, newError(ErrCodeInvalidGrant, "refresh token reuse detected; all sessions revoked", 400)
+		return nil, s.breachError(ctx, data)
 	default:
 		return nil, s.serverError("refresh token state", fmt.Errorf("unknown status %q", data.Status))
 	}
 
-	return s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
-		// Rotate: retire the presented token first so a crash between the two
-		// writes can never leave two active tokens in the family.
-		if err := s.refresh.MarkRotated(hash); err != nil {
-			if errors.Is(err, ErrRefreshTokenNotFound) {
-				s.triggerBreach(ctx, data)
-				return nil, newError(ErrCodeInvalidGrant, "invalid or consumed refresh token", 400)
-			}
-			return nil, s.serverError("rotate refresh token", err)
+	breach := false
+	response, err := s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+		if _, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet); err != nil {
+			return nil, s.sessionError(err)
 		}
-
+		grant, err := s.refresh.GetGrant(ctx, data.FamilyID)
+		if errors.Is(err, ErrGrantNotFound) {
+			return nil, newError(ErrCodeInvalidGrant, "grant is no longer valid", 400)
+		}
+		if err != nil {
+			return nil, s.serverError("load grant", err)
+		}
+		if grant.Status != StatusActive {
+			breach = true
+			return nil, newError(ErrCodeInvalidGrant, "grant is no longer valid", 400)
+		}
 		now := s.now()
-		newRefreshToken, err := s.issueRefreshToken(data.FamilyID, data.UserID, data.ClientID, data.Scope, now, data.AuthVersion, data.AuthVersionSet)
+		newRefreshToken, nextHash, err := NewSecret()
 		if err != nil {
 			return nil, s.serverError("issue rotated refresh token", err)
 		}
-		jkt, tokenType := s.tokenBinding(ctx)
-		accessToken, err := s.signAccessToken(data.UserID, data.ClientID, data.Scope, jkt, now)
+		accessToken, expires, err := s.signAccessToken(grant, now)
 		if err != nil {
 			return nil, s.serverError("sign access token", err)
+		}
+		if err := s.refresh.Rotate(ctx, hash, data, nextHash, s.refreshForGrant(grant, now)); err != nil {
+			if errors.Is(err, ErrRefreshReuse) {
+				breach = true
+				return nil, newError(ErrCodeInvalidGrant, "refresh token already used", 400)
+			}
+			if errors.Is(err, ErrRefreshTokenNotFound) {
+				return nil, newError(ErrCodeInvalidGrant, "grant is no longer valid", 400)
+			}
+			return nil, s.serverError("rotate refresh token", err)
 		}
 
 		return &Response{
 			AccessToken:  accessToken,
 			TokenType:    tokenType,
-			ExpiresIn:    int64(s.cfg.AccessTokenTTL.Seconds()),
+			ExpiresIn:    expires.Unix() - now.Unix(),
 			RefreshToken: newRefreshToken,
 			Scope:        data.Scope,
 			Subject:      data.UserID,
 			ClientID:     data.ClientID,
 		}, nil
 	})
+	// Do not reenter the account row lock from inside WithActive's callback.
+	if breach {
+		return nil, s.breachError(ctx, data)
+	}
+	return response, err
 }
 
 func (s *Service) withAccount(ctx context.Context, userID string, version int64, captured bool, issue func() (*Response, error)) (*Response, error) {
@@ -472,15 +532,20 @@ func (s *Service) exchangeClientCredentials(ctx context.Context, form url.Values
 	now := s.now()
 	// sub == client_id for machine tokens: the client acts on its own behalf.
 	jkt, tokenType := s.tokenBinding(ctx)
-	accessToken, err := s.signAccessToken(client.ID, client.ID, scope, jkt, now)
+	grant := GrantData{ID: uuid.NewString(), PrincipalType: PrincipalClient, Subject: client.ID,
+		ClientID: client.ID, Scope: scope, DPoPJKT: jkt, Status: StatusActive, ExpiresAt: now.Add(s.cfg.AccessTokenTTL)}
+	accessToken, expires, err := s.signAccessToken(grant, now)
 	if err != nil {
 		return nil, s.serverError("sign access token", err)
+	}
+	if err := s.refresh.CreateGrant(ctx, grant, "", RefreshTokenData{}); err != nil {
+		return nil, s.serverError("persist client grant", err)
 	}
 
 	return &Response{
 		AccessToken: accessToken,
 		TokenType:   tokenType,
-		ExpiresIn:   int64(s.cfg.AccessTokenTTL.Seconds()),
+		ExpiresIn:   expires.Unix() - now.Unix(),
 		Scope:       scope,
 		// Subject stays empty on purpose: see Response.Subject.
 		ClientID: client.ID,
@@ -489,12 +554,14 @@ func (s *Service) exchangeClientCredentials(ctx context.Context, form url.Values
 
 // triggerBreach executes the RTR breach response: revoke every refresh token
 // belonging to the user and emit a structured security signal.
-func (s *Service) triggerBreach(ctx context.Context, data RefreshTokenData) {
-	if err := s.refresh.RevokeAllForUser(data.UserID); err != nil {
-		// Revocation failure is itself a security-critical condition; log at
-		// error level so it pages via log-based alerting.
-		s.logger.Error("RTR breach: failed to revoke user refresh tokens",
-			slog.String("user_id", data.UserID), slog.String("error", err.Error()))
+func (s *Service) breachError(ctx context.Context, data RefreshTokenData) error {
+	// Invalidate primary authority first. Even failed Redis cleanup cannot leave
+	// old access tokens valid or let an in-flight issuer restore their authority.
+	accountErr := s.cfg.RevokeUser(ctx, data.UserID)
+	storeErr := s.refresh.RevokeAllForUser(ctx, data.UserID)
+	if accountErr != nil || storeErr != nil {
+		s.logger.Error("RTR breach revocation failed", slog.String("user_id", data.UserID))
+		return newError(ErrCodeServerError, "credential revocation unavailable", 503)
 	}
 	s.logger.Warn("RTR breach detected: refresh token reuse; all user sessions revoked",
 		slog.String("event", "security.rtr_breach"),
@@ -503,48 +570,93 @@ func (s *Service) triggerBreach(ctx context.Context, data RefreshTokenData) {
 	if s.breach != nil {
 		s.breach.RecordRTRBreach(ctx, data.UserID, data.ClientID)
 	}
+	return newError(ErrCodeInvalidGrant, "refresh token reuse detected; all sessions revoked", 400)
 }
 
-// issueRefreshToken mints and stores a new active refresh token in familyID.
-func (s *Service) issueRefreshToken(familyID, userID, clientID, scope string, now time.Time, version int64, captured bool) (string, error) {
-	tokenValue, hash, err := NewSecret()
-	if err != nil {
-		return "", err
-	}
-	err = s.refresh.Save(hash, RefreshTokenData{
-		AuthVersion:    version,
-		AuthVersionSet: captured,
-		FamilyID:       familyID,
-		UserID:         userID,
-		ClientID:       clientID,
-		Scope:          scope,
-		Status:         StatusActive,
-		ExpiresAt:      now.Add(s.cfg.RefreshTokenTTL),
-	})
-	if err != nil {
-		return "", fmt.Errorf("token: save refresh token: %w", err)
-	}
-	return tokenValue, nil
+func (s *Service) refreshForGrant(g GrantData, now time.Time) RefreshTokenData {
+	return RefreshTokenData{AuthVersion: g.AuthVersion, AuthVersionSet: g.AuthVersionSet,
+		FamilyID: g.ID, UserID: g.Subject, SessionID: g.SessionID, ClientID: g.ClientID,
+		Scope: g.Scope, DPoPJKT: g.DPoPJKT, Status: StatusActive,
+		ExpiresAt: minTime(now.Add(s.cfg.RefreshTokenTTL), g.ExpiresAt)}
 }
 
 // signAccessToken builds and signs an RFC 9068 JWT access token. When jkt is
 // non-empty the token is sender-constrained to the client's DPoP key via the
 // RFC 9449 §6 cnf.jkt confirmation claim.
-func (s *Service) signAccessToken(sub, clientID, scope, jkt string, now time.Time) (string, error) {
+func (s *Service) signAccessToken(g GrantData, now time.Time) (string, time.Time, error) {
+	expires := minTime(now.Add(s.cfg.AccessTokenTTL), g.ExpiresAt)
+	if expires.Unix() <= now.Unix() {
+		return "", time.Time{}, session.ErrAccountIneligible
+	}
 	claims := Claims{
-		"iss":       s.cfg.Issuer,
-		"sub":       sub,
-		"aud":       s.cfg.Issuer,
-		"client_id": clientID,
-		"scope":     scope,
-		"jti":       uuid.NewString(),
-		"iat":       now.Unix(),
-		"exp":       now.Add(s.cfg.AccessTokenTTL).Unix(),
+		"iss":            s.cfg.Issuer,
+		"sub":            g.Subject,
+		"aud":            s.cfg.Issuer,
+		"client_id":      g.ClientID,
+		"scope":          g.Scope,
+		"principal_type": g.PrincipalType,
+		"grant_id":       g.ID,
+		"jti":            uuid.NewString(),
+		"iat":            now.Unix(),
+		"exp":            expires.Unix(),
 	}
-	if jkt != "" {
-		claims["cnf"] = map[string]string{"jkt": jkt}
+	if g.PrincipalType == PrincipalUser {
+		claims["sid"] = g.SessionID
+		claims["auth_version"] = g.AuthVersion
 	}
-	return Sign(s.keys.ActiveSigner(), TypAccessToken, claims)
+	if g.DPoPJKT != "" {
+		claims["cnf"] = map[string]string{"jkt": g.DPoPJKT}
+	}
+	signed, err := Sign(s.keys.ActiveSigner(), TypAccessToken, claims)
+	return signed, expires, err
+}
+
+func (s *Service) parentSession(ctx context.Context, userID, id string, version int64, captured bool) (session.Session, error) {
+	if id == "" || !captured || version < 0 {
+		return session.Session{}, session.ErrAccountIneligible
+	}
+	parent, err := s.cfg.Sessions.LookupByID(ctx, userID, id)
+	if errors.Is(err, session.ErrSessionNotFound) {
+		return session.Session{}, session.ErrAccountIneligible
+	}
+	if err != nil {
+		return session.Session{}, err
+	}
+	if parent.ID != id || parent.UserID != userID || parent.Kind != session.KindAuthenticated ||
+		!parent.AuthVersionSet || parent.AuthVersion != version || !parent.AbsoluteExpiry.After(s.now()) || !parent.IdleExpiry.After(s.now()) {
+		return session.Session{}, session.ErrAccountIneligible
+	}
+	return parent, nil
+}
+
+func (s *Service) sessionError(err error) error {
+	if errors.Is(err, session.ErrAccountIneligible) {
+		return newError(ErrCodeInvalidGrant, "browser session is no longer valid", 400)
+	}
+	return s.serverError("browser session", err)
+}
+
+// RefreshBinding lets the HTTP adapter enforce the original proof key before
+// consuming a nonce. The service independently checks it on direct exchanges.
+func (s *Service) RefreshBinding(ctx context.Context, secret string) (string, error) {
+	if secret == "" {
+		return "", newError(ErrCodeInvalidRequest, "missing refresh_token", 400)
+	}
+	r, err := s.refresh.Get(ctx, HashSecret(secret))
+	if errors.Is(err, ErrRefreshTokenNotFound) {
+		return "", newError(ErrCodeInvalidGrant, "invalid or expired refresh token", 400)
+	}
+	if err != nil {
+		return "", s.serverError("refresh token binding", err)
+	}
+	return r.DPoPJKT, nil
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // tokenBinding resolves the DPoP confirmation thumbprint (cnf.jkt) and the
@@ -577,7 +689,10 @@ func (s *Service) signIDToken(sub, clientID, nonce string, now time.Time) (strin
 // serverError logs the internal cause and returns an opaque server_error so
 // internals never leak to clients.
 func (s *Service) serverError(op string, err error) *Error {
-	s.logger.Error("token endpoint internal error", slog.String("op", op), slog.String("error", err.Error()))
+	s.logger.Error("token endpoint internal error", slog.String("op", op))
+	if errors.Is(err, ErrStoreUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return newError(ErrCodeServerError, "credential service unavailable", 503)
+	}
 	return newError(ErrCodeServerError, "internal error", 500)
 }
 

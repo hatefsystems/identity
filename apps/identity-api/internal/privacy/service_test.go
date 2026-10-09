@@ -324,6 +324,42 @@ func TestRequestDeletionSurvivesRevokerFailure(t *testing.T) {
 	}
 }
 
+func TestRevocationUsesBoundedCleanupContext(t *testing.T) {
+	h := newHarness(t, Config{})
+	user := h.store.addActiveUser("cleanup@test.local")
+	type requestKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), requestKey{}, "request-value"))
+	cancel()
+	var cleanupContexts []context.Context
+	for _, revoker := range []*fakeRevoker{h.sessions, h.tokens} {
+		revoker.onRevoke = func(cleanup context.Context, userID string) {
+			if err := cleanup.Err(); err != nil {
+				t.Errorf("request cancellation reached post-commit cleanup: %v", err)
+			}
+			if userID != user.ID.String() || cleanup.Value(requestKey{}) != "request-value" {
+				t.Error("cleanup lost the account or request context values")
+			}
+			deadline, ok := cleanup.Deadline()
+			if remaining := time.Until(deadline); !ok || remaining <= 0 || remaining > 5*time.Second {
+				t.Errorf("cleanup deadline = %v (present=%v), want a live five-second bound", deadline, ok)
+			}
+			cleanupContexts = append(cleanupContexts, cleanup)
+		}
+	}
+	h.svc.revokeEverything(ctx, user.ID)
+	if h.sessions.count() != 1 || h.tokens.count() != 1 || len(cleanupContexts) != 2 {
+		t.Fatal("canceled request did not attempt both revocations")
+	}
+	if cleanupContexts[0] != cleanupContexts[1] {
+		t.Fatal("revocations did not share the bounded cleanup context")
+	}
+	for _, cleanup := range cleanupContexts {
+		if !errors.Is(cleanup.Err(), context.Canceled) {
+			t.Error("cleanup context was not canceled after revocation finished")
+		}
+	}
+}
+
 func TestRequestDeletionUnknownUser(t *testing.T) {
 	h := newHarness(t, Config{})
 	if _, err := h.svc.RequestDeletion(context.Background(), h.store.addActiveUser("x@test.local").ID, ""); err != nil {

@@ -1,6 +1,8 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +15,7 @@ func TestMemoryClaimRecoveryEnrollmentIsAtomicAndReleasable(t *testing.T) {
 	store := newFixedStore(&now)
 	s := liveSession(base, "user-1", "recovery-1")
 	s.Kind = KindRecoveryEnrollment
-	if err := store.Create("hash-1", s); err != nil {
+	if err := store.Create(t.Context(), "hash-1", s); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -23,7 +25,7 @@ func TestMemoryClaimRecoveryEnrollmentIsAtomicAndReleasable(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			claimed, err := store.ClaimRecoveryEnrollment("user-1", "recovery-1")
+			claimed, err := store.ClaimRecoveryEnrollment(t.Context(), "user-1", "recovery-1")
 			if err != nil {
 				t.Errorf("ClaimRecoveryEnrollment: %v", err)
 				return
@@ -38,10 +40,10 @@ func TestMemoryClaimRecoveryEnrollmentIsAtomicAndReleasable(t *testing.T) {
 		t.Fatalf("successful claims = %d, want 1", got)
 	}
 
-	if err := store.ReleaseRecoveryEnrollment("user-1", "recovery-1"); err != nil {
+	if err := store.ReleaseRecoveryEnrollment(t.Context(), "user-1", "recovery-1"); err != nil {
 		t.Fatalf("ReleaseRecoveryEnrollment: %v", err)
 	}
-	claimed, err := store.ClaimRecoveryEnrollment("user-1", "recovery-1")
+	claimed, err := store.ClaimRecoveryEnrollment(t.Context(), "user-1", "recovery-1")
 	if err != nil || !claimed {
 		t.Fatalf("claim after release = %v, %v; want true, nil", claimed, err)
 	}
@@ -60,6 +62,7 @@ func newFixedStore(at *time.Time) *MemoryStore {
 func liveSession(base time.Time, userID, id string) Session {
 	return Session{
 		ID:             id,
+		Kind:           KindAuthenticated,
 		UserID:         userID,
 		CreatedAt:      base,
 		LastSeenAt:     base,
@@ -74,11 +77,11 @@ func TestMemoryCreateAndGet(t *testing.T) {
 	store := newFixedStore(&now)
 
 	want := liveSession(base, "user-1", "sess-1")
-	if err := store.Create("hash-1", want); err != nil {
+	if err := store.Create(t.Context(), "hash-1", want); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	got, err := store.Get("hash-1")
+	got, err := store.Get(t.Context(), "hash-1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -92,7 +95,7 @@ func TestMemoryGetUnknown(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if _, err := store.Get("missing"); err != ErrSessionNotFound {
+	if _, err := store.Get(t.Context(), "missing"); err != ErrSessionNotFound {
 		t.Fatalf("Get(missing) error = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -102,17 +105,17 @@ func TestMemoryGetExpiredByIdle(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
+	if err := store.Create(t.Context(), "hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	// Advance past the idle deadline but before the absolute deadline.
 	now = base.Add(3 * time.Hour)
-	if _, err := store.Get("hash-1"); err != ErrSessionNotFound {
+	if _, err := store.Get(t.Context(), "hash-1"); err != ErrSessionNotFound {
 		t.Fatalf("Get after idle expiry error = %v, want ErrSessionNotFound", err)
 	}
 	// The lapsed entry must have been reclaimed from the user index too.
-	sessions, err := store.ListForUser("user-1")
+	sessions, err := store.ListForUser(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("ListForUser: %v", err)
 	}
@@ -129,12 +132,12 @@ func TestMemoryGetExpiredByAbsolute(t *testing.T) {
 	s := liveSession(base, "user-1", "sess-1")
 	// Keep idle sliding, but the absolute ceiling still kills it.
 	s.IdleExpiry = base.Add(24 * time.Hour)
-	if err := store.Create("hash-1", s); err != nil {
+	if err := store.Create(t.Context(), "hash-1", s); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	now = base.Add(25 * time.Hour)
-	if _, err := store.Get("hash-1"); err != ErrSessionNotFound {
+	if _, err := store.Get(t.Context(), "hash-1"); err != ErrSessionNotFound {
 		t.Fatalf("Get after absolute expiry error = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -144,17 +147,17 @@ func TestMemoryTouchSlidesIdle(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
+	if err := store.Create(t.Context(), "hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	now = base.Add(1 * time.Hour)
 	newIdle := now.Add(2 * time.Hour)
-	if err := store.Touch("hash-1", newIdle); err != nil {
+	if err := store.Touch(t.Context(), "hash-1", newIdle); err != nil {
 		t.Fatalf("Touch: %v", err)
 	}
 
-	got, err := store.Get("hash-1")
+	got, err := store.Get(t.Context(), "hash-1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -170,7 +173,7 @@ func TestMemoryTouchUnknown(t *testing.T) {
 	base := time.Now()
 	now := base
 	store := newFixedStore(&now)
-	if err := store.Touch("missing", now.Add(time.Hour)); err != ErrSessionNotFound {
+	if err := store.Touch(t.Context(), "missing", now.Add(time.Hour)); err != ErrSessionNotFound {
 		t.Fatalf("Touch(missing) error = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -180,17 +183,17 @@ func TestMemoryDeleteIdempotent(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
+	if err := store.Create(t.Context(), "hash-1", liveSession(base, "user-1", "sess-1")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := store.Delete("hash-1"); err != nil {
+	if err := store.Delete(t.Context(), "hash-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	// Deleting again is not an error.
-	if err := store.Delete("hash-1"); err != nil {
+	if err := store.Delete(t.Context(), "hash-1"); err != nil {
 		t.Fatalf("Delete (second): %v", err)
 	}
-	if _, err := store.Get("hash-1"); err != ErrSessionNotFound {
+	if _, err := store.Get(t.Context(), "hash-1"); err != ErrSessionNotFound {
 		t.Fatalf("Get after delete error = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -202,14 +205,14 @@ func TestMemoryListForUserNewestFirst(t *testing.T) {
 
 	older := liveSession(base, "user-1", "old")
 	newer := liveSession(base.Add(time.Minute), "user-1", "new")
-	if err := store.Create("hash-old", older); err != nil {
+	if err := store.Create(t.Context(), "hash-old", older); err != nil {
 		t.Fatalf("Create old: %v", err)
 	}
-	if err := store.Create("hash-new", newer); err != nil {
+	if err := store.Create(t.Context(), "hash-new", newer); err != nil {
 		t.Fatalf("Create new: %v", err)
 	}
 
-	sessions, err := store.ListForUser("user-1")
+	sessions, err := store.ListForUser(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("ListForUser: %v", err)
 	}
@@ -226,14 +229,14 @@ func TestMemoryListForUserScoped(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-a", liveSession(base, "user-1", "a")); err != nil {
+	if err := store.Create(t.Context(), "hash-a", liveSession(base, "user-1", "a")); err != nil {
 		t.Fatalf("Create a: %v", err)
 	}
-	if err := store.Create("hash-b", liveSession(base, "user-2", "b")); err != nil {
+	if err := store.Create(t.Context(), "hash-b", liveSession(base, "user-2", "b")); err != nil {
 		t.Fatalf("Create b: %v", err)
 	}
 
-	sessions, err := store.ListForUser("user-1")
+	sessions, err := store.ListForUser(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("ListForUser: %v", err)
 	}
@@ -247,12 +250,12 @@ func TestMemoryDeleteForUserScoping(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-a", liveSession(base, "user-1", "sess-a")); err != nil {
+	if err := store.Create(t.Context(), "hash-a", liveSession(base, "user-1", "sess-a")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	// A different user cannot revoke user-1's session.
-	removed, err := store.DeleteForUser("user-2", "sess-a")
+	removed, err := store.DeleteForUser(t.Context(), "user-2", "sess-a")
 	if err != nil {
 		t.Fatalf("DeleteForUser: %v", err)
 	}
@@ -261,7 +264,7 @@ func TestMemoryDeleteForUserScoping(t *testing.T) {
 	}
 
 	// The owner can.
-	removed, err = store.DeleteForUser("user-1", "sess-a")
+	removed, err = store.DeleteForUser(t.Context(), "user-1", "sess-a")
 	if err != nil {
 		t.Fatalf("DeleteForUser: %v", err)
 	}
@@ -270,7 +273,7 @@ func TestMemoryDeleteForUserScoping(t *testing.T) {
 	}
 
 	// Revoking an unknown id reports not-removed.
-	removed, err = store.DeleteForUser("user-1", "sess-a")
+	removed, err = store.DeleteForUser(t.Context(), "user-1", "sess-a")
 	if err != nil {
 		t.Fatalf("DeleteForUser: %v", err)
 	}
@@ -284,21 +287,21 @@ func TestMemoryDeleteAllForUser(t *testing.T) {
 	now := base
 	store := newFixedStore(&now)
 
-	if err := store.Create("hash-a", liveSession(base, "user-1", "a")); err != nil {
+	if err := store.Create(t.Context(), "hash-a", liveSession(base, "user-1", "a")); err != nil {
 		t.Fatalf("Create a: %v", err)
 	}
-	if err := store.Create("hash-b", liveSession(base, "user-1", "b")); err != nil {
+	if err := store.Create(t.Context(), "hash-b", liveSession(base, "user-1", "b")); err != nil {
 		t.Fatalf("Create b: %v", err)
 	}
-	if err := store.Create("hash-c", liveSession(base, "user-2", "c")); err != nil {
+	if err := store.Create(t.Context(), "hash-c", liveSession(base, "user-2", "c")); err != nil {
 		t.Fatalf("Create c: %v", err)
 	}
 
-	if err := store.DeleteAllForUser("user-1"); err != nil {
+	if err := store.DeleteAllForUser(t.Context(), "user-1"); err != nil {
 		t.Fatalf("DeleteAllForUser: %v", err)
 	}
 
-	sessions, err := store.ListForUser("user-1")
+	sessions, err := store.ListForUser(t.Context(), "user-1")
 	if err != nil {
 		t.Fatalf("ListForUser: %v", err)
 	}
@@ -307,11 +310,113 @@ func TestMemoryDeleteAllForUser(t *testing.T) {
 	}
 
 	// user-2 is untouched.
-	other, err := store.ListForUser("user-2")
+	other, err := store.ListForUser(t.Context(), "user-2")
 	if err != nil {
 		t.Fatalf("ListForUser: %v", err)
 	}
 	if len(other) != 1 {
 		t.Fatalf("user-2 has %d sessions, want 1 (bulk revoke leaked across users)", len(other))
+	}
+}
+
+func TestMemoryLookupDoesNotTouchAndExpiresAtBoundary(t *testing.T) {
+	for _, absolute := range []bool{false, true} {
+		now := time.Now()
+		store := newFixedStore(&now)
+		s := liveSession(now, "owner", "id")
+		if absolute {
+			s.IdleExpiry = s.AbsoluteExpiry
+		}
+		if err := store.Create(t.Context(), "hash", s); err != nil {
+			t.Fatal(err)
+		}
+		now = s.IdleExpiry.Add(-time.Nanosecond)
+		got, err := store.GetByID(t.Context(), s.UserID, s.ID)
+		if err != nil || got != s {
+			t.Fatalf("lookup modified state: %+v, %v", got, err)
+		}
+		if _, err := store.GetByID(t.Context(), "other", s.ID); err != ErrSessionNotFound {
+			t.Fatalf("foreign lookup: %v", err)
+		}
+		now = s.IdleExpiry
+		if err := store.Touch(t.Context(), "hash", now.Add(time.Hour)); err != ErrSessionNotFound {
+			t.Fatalf("touch at boundary: %v", err)
+		}
+		if _, err := store.GetByID(t.Context(), s.UserID, s.ID); err != ErrSessionNotFound {
+			t.Fatalf("lookup at boundary: %v", err)
+		}
+	}
+}
+
+func TestMemoryTouchClampsAndNeverMovesActivityBackwards(t *testing.T) {
+	now := time.Now()
+	store := newFixedStore(&now)
+	s := liveSession(now, "owner", "id")
+	if err := store.Create(t.Context(), "hash", s); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	if err := store.Touch(t.Context(), "hash", s.AbsoluteExpiry.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	seen := now
+	now = now.Add(-time.Minute)
+	if err := store.Touch(t.Context(), "hash", s.IdleExpiry); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(t.Context(), "hash")
+	if err != nil || !got.IdleExpiry.Equal(s.AbsoluteExpiry) || !got.LastSeenAt.Equal(seen) {
+		t.Fatalf("touch regressed or exceeded absolute expiry: %+v, %v", got, err)
+	}
+}
+
+func TestMemoryStoreCancellation(t *testing.T) {
+	testStoreCancellation(t, NewMemoryStore())
+}
+
+func testStoreCancellation(t *testing.T, store Store) {
+	t.Helper()
+	s := liveSession(time.Now(), "cancel-owner", "existing")
+	s.Kind = KindRecoveryEnrollment
+	if err := store.Create(t.Context(), "existing-hash", s); err != nil {
+		t.Fatal(err)
+	}
+	for _, deadline := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(t.Context())
+		want := context.Canceled
+		if deadline {
+			cancel()
+			ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+			want = context.DeadlineExceeded
+		} else {
+			cancel()
+		}
+		fresh := s
+		fresh.ID = "fresh"
+		operations := map[string]func() error{
+			"create":     func() error { return store.Create(ctx, "fresh-hash", fresh) },
+			"get":        func() error { _, err := store.Get(ctx, "existing-hash"); return err },
+			"get_id":     func() error { _, err := store.GetByID(ctx, s.UserID, s.ID); return err },
+			"touch":      func() error { return store.Touch(ctx, "existing-hash", s.AbsoluteExpiry) },
+			"delete":     func() error { return store.Delete(ctx, "existing-hash") },
+			"list":       func() error { _, err := store.ListForUser(ctx, s.UserID); return err },
+			"delete_id":  func() error { _, err := store.DeleteForUser(ctx, s.UserID, s.ID); return err },
+			"delete_all": func() error { return store.DeleteAllForUser(ctx, s.UserID) },
+			"claim":      func() error { _, err := store.ClaimRecoveryEnrollment(ctx, s.UserID, s.ID); return err },
+			"release":    func() error { return store.ReleaseRecoveryEnrollment(ctx, s.UserID, s.ID) },
+		}
+		for name, operation := range operations {
+			if err := operation(); !errors.Is(err, want) {
+				t.Errorf("%s: %v, want %v", name, err, want)
+			}
+		}
+		cancel()
+	}
+	got, err := store.Get(t.Context(), "existing-hash")
+	if err != nil || !got.LastSeenAt.Equal(s.LastSeenAt) || !got.IdleExpiry.Equal(s.IdleExpiry) || got.EnrollmentClaimed {
+		t.Fatalf("canceled operation mutated state: %+v, %v", got, err)
+	}
+	if _, err := store.Get(t.Context(), "fresh-hash"); err != ErrSessionNotFound {
+		t.Fatalf("canceled Create persisted: %v", err)
 	}
 }

@@ -1,9 +1,11 @@
 package dpop
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -41,8 +43,10 @@ type Middleware struct {
 	// externalBaseURL is the public origin (scheme://host) clients address,
 	// e.g. "https://identity.hatef.ir". Because TLS is terminated at the
 	// reverse proxy (docs/devops-operations.md §1.0), r.URL carries no scheme
-	// or host; htu is reconstructed from this trusted base plus r.URL.Path.
+	// or host; htu is reconstructed from this trusted base plus r.URL.EscapedPath().
 	externalBaseURL string
+	// realm separates resource nonces/replay state from authorization servers.
+	realm string
 	// requireNonce toggles the server-issued nonce lifecycle for the route.
 	requireNonce bool
 }
@@ -60,17 +64,23 @@ func WithRequireNonce(require bool) MiddlewareOption {
 // the proof must match.
 func NewMiddleware(v *Validator, externalBaseURL string, opts ...MiddlewareOption) (*Middleware, error) {
 	if v == nil {
-		return nil, errors.New("dpop: validator is required")
+		return nil, ErrInvalidParams
 	}
-	if strings.TrimSpace(externalBaseURL) == "" {
-		return nil, errors.New("dpop: external base URL is required")
+	u, err := url.Parse(externalBaseURL)
+	base := strings.TrimSuffix(canonicalURI(externalBaseURL), "/")
+	if err != nil || base == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery {
+		return nil, ErrInvalidParams
 	}
 	m := &Middleware{
 		validator:       v,
-		externalBaseURL: strings.TrimSuffix(externalBaseURL, "/"),
+		externalBaseURL: base,
+		realm:           "rs:" + base,
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+	if m.requireNonce && v.nonces == nil {
+		return nil, ErrInvalidParams
 	}
 	return m, nil
 }
@@ -80,14 +90,15 @@ func (m *Middleware) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proofHeader := r.Header.Get(HeaderProof)
 		if proofHeader == "" {
-			m.writeError(w, r, http.StatusUnauthorized, errCodeInvalidProof,
-				"DPoP proof required", nil)
+			m.writeError(w, http.StatusUnauthorized, errCodeInvalidProof,
+				"DPoP proof required")
 			return
 		}
 
 		params := VerifyParams{
+			Realm:        m.realm,
 			Method:       r.Method,
-			URL:          m.externalBaseURL + r.URL.Path,
+			URL:          m.externalBaseURL + r.URL.EscapedPath(),
 			RequireNonce: m.requireNonce,
 		}
 		// When the caller presents a DPoP-bound access token, the proof must
@@ -98,13 +109,28 @@ func (m *Middleware) Handler(next http.Handler) http.Handler {
 
 		proof, err := m.validator.Validate(r.Context(), proofHeader, params)
 		if err != nil {
-			if errors.Is(err, ErrNonceRequired) {
-				m.writeError(w, r, http.StatusUnauthorized, errCodeUseNonce,
-					"resource server requires nonce in DPoP proof", err)
+			if errors.Is(err, ErrStoreUnavailable) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			m.writeError(w, r, http.StatusUnauthorized, errCodeInvalidProof,
-				"DPoP proof validation failed", err)
+			if errors.Is(err, ErrInvalidParams) {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			var challenge *NonceChallenge
+			if errors.As(err, &challenge) {
+				nonce, nErr := m.validator.IssueNonce(r.Context(), challenge.Realm, challenge.JKT)
+				if nErr != nil {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set(HeaderNonce, nonce)
+				m.writeError(w, http.StatusUnauthorized, errCodeUseNonce,
+					"resource server requires nonce in DPoP proof")
+				return
+			}
+			m.writeError(w, http.StatusUnauthorized, errCodeInvalidProof,
+				"DPoP proof validation failed")
 			return
 		}
 
@@ -112,15 +138,9 @@ func (m *Middleware) Handler(next http.Handler) http.Handler {
 	})
 }
 
-// writeError emits an RFC 9449 §7.2 WWW-Authenticate challenge. When the code
-// is use_dpop_nonce it also supplies a fresh DPoP-Nonce so the client can
-// retry immediately.
-func (m *Middleware) writeError(w http.ResponseWriter, r *http.Request, status int, code, desc string, _ error) {
-	if code == errCodeUseNonce {
-		if nonce, nErr := m.validator.IssueNonce(r.Context()); nErr == nil && nonce != "" {
-			w.Header().Set(HeaderNonce, nonce)
-		}
-	}
+// writeError emits an RFC 9449 §7.2 WWW-Authenticate challenge. Nonce issuance
+// must succeed before this is called with use_dpop_nonce.
+func (m *Middleware) writeError(w http.ResponseWriter, status int, code, desc string) {
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
 		`%s error=%q, error_description=%q`, authSchemeDPoP, code, desc))
 	w.WriteHeader(status)

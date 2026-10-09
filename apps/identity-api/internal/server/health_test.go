@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
@@ -87,4 +90,37 @@ func TestUnknownRouteReturns404(t *testing.T) {
 	}
 	// Drain body to avoid resource warnings.
 	_, _ = io.Copy(io.Discard, rec.Body)
+}
+
+func TestGRPCReadinessDoesNotChangeLiveness(t *testing.T) {
+	for _, mode := range []string{"missing", "unavailable", "ready"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.GRPC.Enabled = true
+			deps := Deps{}
+			if mode != "missing" {
+				deps.GRPCReady = func(ctx context.Context) error {
+					if _, ok := ctx.Deadline(); !ok {
+						t.Error("unbounded readiness check")
+					}
+					if mode == "unavailable" {
+						return errors.New("private dependency details")
+					}
+					return nil
+				}
+			}
+			srv := New(cfg, nil, deps)
+			for _, path := range []string{"/readyz", "/healthz"} {
+				response := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+				want := http.StatusOK
+				if path == "/readyz" && mode != "ready" {
+					want = http.StatusServiceUnavailable
+				}
+				if response.Code != want || strings.Contains(response.Body.String(), "private dependency details") {
+					t.Fatalf("%s: %d %s", path, response.Code, response.Body.String())
+				}
+			}
+		})
+	}
 }

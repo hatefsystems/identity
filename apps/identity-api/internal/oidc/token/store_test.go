@@ -1,189 +1,257 @@
 package token
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestNewSecret(t *testing.T) {
 	secret, hash, err := NewSecret()
-	if err != nil {
-		t.Fatalf("NewSecret: %v", err)
+	if err != nil || secret == "" || hash == "" || HashSecret(secret) != hash {
+		t.Fatalf("secret generation failed: %v", err)
 	}
-	if secret == "" || hash == "" {
-		t.Fatal("NewSecret returned empty secret or hash")
-	}
-	if HashSecret(secret) != hash {
-		t.Error("hash does not match HashSecret(secret)")
-	}
-
 	other, _, err := NewSecret()
-	if err != nil {
-		t.Fatalf("NewSecret: %v", err)
-	}
-	if secret == other {
-		t.Error("two generated secrets must differ")
+	if err != nil || secret == other {
+		t.Fatalf("secret repeated: %v", err)
 	}
 }
 
-func TestMemoryCodeStoreConsumeSingleUse(t *testing.T) {
-	store := NewMemoryCodeStore()
-	data := AuthorizationCodeData{ClientID: "app", UserID: "user-1", ExpiresAt: time.Now().Add(time.Minute)}
-	if err := store.Save("hash-1", data); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	got, err := store.Consume("hash-1")
-	if err != nil {
-		t.Fatalf("first Consume: %v", err)
-	}
-	if got.ClientID != "app" || got.UserID != "user-1" {
-		t.Errorf("Consume returned wrong data: %+v", got)
-	}
-
-	if _, err := store.Consume("hash-1"); !errors.Is(err, ErrCodeNotFound) {
-		t.Errorf("second Consume: want ErrCodeNotFound, got %v", err)
-	}
+func storeFixture(id, user string) (GrantData, RefreshTokenData) {
+	expires := time.Now().Add(time.Hour)
+	g := GrantData{ID: id, PrincipalType: PrincipalUser, Subject: user, ClientID: "app", Scope: "openid",
+		SessionID: "session-" + user, AuthVersion: 9007199254740993, AuthVersionSet: true, Status: StatusActive, ExpiresAt: expires}
+	r := RefreshTokenData{FamilyID: id, UserID: user, ClientID: g.ClientID, Scope: g.Scope, SessionID: g.SessionID,
+		AuthVersion: g.AuthVersion, AuthVersionSet: true, Status: StatusActive, ExpiresAt: expires}
+	return g, r
 }
 
-func TestMemoryCodeStoreConsumeConcurrent(t *testing.T) {
-	store := NewMemoryCodeStore()
-	if err := store.Save("hash-c", AuthorizationCodeData{ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
+func codeFixture() AuthorizationCodeData {
+	return AuthorizationCodeData{UserID: "user", SessionID: "session", AuthVersionSet: true, ClientID: "app",
+		RedirectURI: "https://app.test/cb", CodeChallenge: "challenge", ExpiresAt: time.Now().Add(time.Minute)}
+}
 
-	const attempts = 32
-	var wg sync.WaitGroup
-	wins := make(chan struct{}, attempts)
-	for i := 0; i < attempts; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := store.Consume("hash-c"); err == nil {
-				wins <- struct{}{}
+func eachStore(t *testing.T, test func(*testing.T, RefreshTokenStore, RefreshTokenStore)) {
+	t.Helper()
+	t.Run("memory", func(t *testing.T) {
+		s := NewMemoryRefreshTokenStore()
+		test(t, s, s)
+	})
+	t.Run("redis", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+		t.Cleanup(func() { _ = client.Close() })
+		a, err := NewRedisRefreshTokenStore(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := NewRedisRefreshTokenStore(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		test(t, a, b)
+	})
+}
+
+func TestCodeStoreSingleUseAndCancellation(t *testing.T) {
+	for _, backend := range []string{"memory", "redis"} {
+		t.Run(backend, func(t *testing.T) {
+			var a, b AuthorizationCodeStore
+			if backend == "memory" {
+				a = NewMemoryCodeStore()
+				b = a
+			} else {
+				server := miniredis.RunT(t)
+				client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { _ = client.Close() })
+				var err error
+				a, err = NewRedisCodeStore(client)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err = NewRedisCodeStore(client)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
-		}()
-	}
-	wg.Wait()
-	close(wins)
-
-	var winners int
-	for range wins {
-		winners++
-	}
-	if winners != 1 {
-		t.Errorf("exactly one concurrent Consume must win, got %d", winners)
+			if err := a.Save(t.Context(), "hash", codeFixture()); err != nil {
+				t.Fatal(err)
+			}
+			var wg sync.WaitGroup
+			wins := make(chan bool, 32)
+			for range 32 {
+				wg.Go(func() {
+					got, err := b.Consume(t.Context(), "hash")
+					if err == nil && got.SessionID != "session" {
+						t.Error("lost code linkage")
+					}
+					if err != nil && !errors.Is(err, ErrCodeNotFound) {
+						t.Error(err)
+					}
+					wins <- err == nil
+				})
+			}
+			wg.Wait()
+			close(wins)
+			count := 0
+			for won := range wins {
+				if won {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("consume winners = %d", count)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := a.Consume(ctx, "hash"); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation lost: %v", err)
+			}
+		})
 	}
 }
 
-func TestMemoryCodeStoreExpiry(t *testing.T) {
-	store := NewMemoryCodeStore()
-	base := time.Now()
-	store.now = func() time.Time { return base.Add(2 * time.Minute) }
-	if err := store.Save("hash-e", AuthorizationCodeData{ExpiresAt: base.Add(time.Minute)}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-	if _, err := store.Consume("hash-e"); !errors.Is(err, ErrCodeNotFound) {
-		t.Errorf("expired code: want ErrCodeNotFound, got %v", err)
-	}
+func TestGrantStoreAtomicRotation(t *testing.T) {
+	eachStore(t, func(t *testing.T, a, b RefreshTokenStore) {
+		g, r := storeFixture("family", "user")
+		if err := a.CreateGrant(t.Context(), g, "first", r); err != nil {
+			t.Fatal(err)
+		}
+		if loaded, err := b.GetGrant(t.Context(), g.ID); err != nil || loaded.AuthVersion != g.AuthVersion {
+			t.Fatalf("version lost: %+v %v", loaded, err)
+		}
+		var wg sync.WaitGroup
+		results := make(chan error, 16)
+		for i := range 16 {
+			wg.Go(func() { results <- b.Rotate(t.Context(), "first", r, fmt.Sprintf("next-%d", i), r) })
+		}
+		wg.Wait()
+		close(results)
+		winners := 0
+		for err := range results {
+			if err == nil {
+				winners++
+			} else if !errors.Is(err, ErrRefreshReuse) {
+				t.Error(err)
+			}
+		}
+		if winners != 1 {
+			t.Fatalf("rotation winners = %d", winners)
+		}
+		old, err := a.Get(t.Context(), "first")
+		if err != nil || old.Status != StatusRotated {
+			t.Fatalf("old secret not retired: %+v %v", old, err)
+		}
+		grant, err := a.GetGrant(t.Context(), g.ID)
+		if err != nil || grant.Status != StatusActive {
+			t.Fatalf("ordinary rotation revoked access tokens: %+v %v", grant, err)
+		}
+		if err := a.Rotate(t.Context(), "absent", r, "other", r); !errors.Is(err, ErrRefreshTokenNotFound) {
+			t.Fatal(err)
+		}
+	})
 }
 
-func TestMemoryRefreshTokenStoreLifecycle(t *testing.T) {
+func TestGrantStoreFamilyAndUserRevocation(t *testing.T) {
+	eachStore(t, func(t *testing.T, a, b RefreshTokenStore) {
+		for _, item := range []struct{ id, user string }{{"one", "alice"}, {"two", "alice"}, {"three", "bob"}} {
+			g, r := storeFixture(item.id, item.user)
+			if err := a.CreateGrant(t.Context(), g, item.id, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := b.RevokeFamily(t.Context(), "one"); err != nil {
+			t.Fatal(err)
+		}
+		assertStatus(t, a, "one", StatusRevoked)
+		assertStatus(t, a, "two", StatusActive)
+		if err := b.RevokeAllForUser(t.Context(), "alice"); err != nil {
+			t.Fatal(err)
+		}
+		assertStatus(t, a, "two", StatusRevoked)
+		assertStatus(t, a, "three", StatusActive)
+		_, stale := storeFixture("two", "alice")
+		if err := a.Rotate(t.Context(), "two", stale, "resurrected", stale); !errors.Is(err, ErrRefreshReuse) {
+			t.Fatalf("revocation lost: %v", err)
+		}
+		if _, err := a.Get(t.Context(), "resurrected"); !errors.Is(err, ErrRefreshTokenNotFound) {
+			t.Fatalf("revoked successor created: %v", err)
+		}
+	})
+}
+
+func TestMemoryCredentialExpiry(t *testing.T) {
+	code := NewMemoryCodeStore()
+	data := codeFixture()
+	if err := code.Save(t.Context(), "code", data); err != nil {
+		t.Fatal(err)
+	}
+	code.now = func() time.Time { return data.ExpiresAt }
+	if _, err := code.Consume(t.Context(), "code"); !errors.Is(err, ErrCodeNotFound) {
+		t.Fatal(err)
+	}
+	g, r := storeFixture("family", "user")
 	store := NewMemoryRefreshTokenStore()
-	data := RefreshTokenData{
-		FamilyID:  "fam-1",
-		UserID:    "user-1",
-		ClientID:  "app",
-		Status:    StatusActive,
-		ExpiresAt: time.Now().Add(time.Hour),
+	if err := store.CreateGrant(t.Context(), g, "hash", r); err != nil {
+		t.Fatal(err)
 	}
-	if err := store.Save("h1", data); err != nil {
-		t.Fatalf("Save: %v", err)
+	store.now = func() time.Time { return g.ExpiresAt }
+	if _, err := store.Get(t.Context(), "hash"); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatal(err)
 	}
+}
 
-	got, err := store.Get("h1")
+func TestRedisCredentialTTLAndCorruption(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1, DialTimeout: 50 * time.Millisecond, ReadTimeout: 50 * time.Millisecond})
+	t.Cleanup(func() { _ = client.Close() })
+	store, err := NewRedisRefreshTokenStore(client)
 	if err != nil {
-		t.Fatalf("Get: %v", err)
+		t.Fatal(err)
 	}
-	if got.Status != StatusActive {
-		t.Errorf("fresh token status = %q, want active", got.Status)
+	g, r := storeFixture("family", "user")
+	if err := store.CreateGrant(t.Context(), g, "hash", r); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := store.MarkRotated("h1"); err != nil {
-		t.Fatalf("MarkRotated: %v", err)
+	for _, key := range server.Keys() {
+		if server.TTL(key) <= 0 {
+			t.Errorf("missing TTL: %s", key)
+		}
 	}
-	got, err = store.Get("h1")
+	if err := client.Set(t.Context(), redisGrantPrefix+g.ID, "invalid state", time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetGrant(t.Context(), g.ID); !errors.Is(err, ErrStoreUnavailable) {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(g)
 	if err != nil {
-		t.Fatalf("Get after rotate: %v", err)
+		t.Fatal(err)
 	}
-	if got.Status != StatusRotated {
-		t.Errorf("rotated token status = %q, want rotated", got.Status)
+	if err := client.Set(t.Context(), redisGrantPrefix+g.ID, encoded, time.Hour).Err(); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := store.MarkRotated("missing"); !errors.Is(err, ErrRefreshTokenNotFound) {
-		t.Errorf("MarkRotated on missing hash: want ErrRefreshTokenNotFound, got %v", err)
+	server.FastForward(2 * time.Hour)
+	if _, err := store.Get(t.Context(), "hash"); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatal(err)
 	}
-}
-
-func TestMemoryRefreshTokenStoreExpiry(t *testing.T) {
-	store := NewMemoryRefreshTokenStore()
-	base := time.Now()
-	store.now = func() time.Time { return base.Add(2 * time.Hour) }
-	if err := store.Save("h-exp", RefreshTokenData{Status: StatusActive, ExpiresAt: base.Add(time.Hour)}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-	if _, err := store.Get("h-exp"); !errors.Is(err, ErrRefreshTokenNotFound) {
-		t.Errorf("expired token: want ErrRefreshTokenNotFound, got %v", err)
+	server.Close()
+	if _, err := store.GetGrant(t.Context(), g.ID); !errors.Is(err, ErrStoreUnavailable) {
+		t.Fatalf("outage hidden: %v", err)
 	}
 }
 
-func TestMemoryRefreshTokenStoreRevokeFamily(t *testing.T) {
-	store := NewMemoryRefreshTokenStore()
-	exp := time.Now().Add(time.Hour)
-	mustSave(t, store, "f1-a", RefreshTokenData{FamilyID: "fam-1", UserID: "u1", Status: StatusRotated, ExpiresAt: exp})
-	mustSave(t, store, "f1-b", RefreshTokenData{FamilyID: "fam-1", UserID: "u1", Status: StatusActive, ExpiresAt: exp})
-	mustSave(t, store, "f2-a", RefreshTokenData{FamilyID: "fam-2", UserID: "u1", Status: StatusActive, ExpiresAt: exp})
-
-	if err := store.RevokeFamily("fam-1"); err != nil {
-		t.Fatalf("RevokeFamily: %v", err)
-	}
-	assertStatus(t, store, "f1-a", StatusRevoked)
-	assertStatus(t, store, "f1-b", StatusRevoked)
-	assertStatus(t, store, "f2-a", StatusActive)
-}
-
-func TestMemoryRefreshTokenStoreRevokeAllForUser(t *testing.T) {
-	store := NewMemoryRefreshTokenStore()
-	exp := time.Now().Add(time.Hour)
-	mustSave(t, store, "u1-f1", RefreshTokenData{FamilyID: "fam-1", UserID: "u1", Status: StatusActive, ExpiresAt: exp})
-	mustSave(t, store, "u1-f2", RefreshTokenData{FamilyID: "fam-2", UserID: "u1", Status: StatusActive, ExpiresAt: exp})
-	mustSave(t, store, "u2-f3", RefreshTokenData{FamilyID: "fam-3", UserID: "u2", Status: StatusActive, ExpiresAt: exp})
-
-	if err := store.RevokeAllForUser("u1"); err != nil {
-		t.Fatalf("RevokeAllForUser: %v", err)
-	}
-	// Every family of u1 is revoked; the unrelated user is untouched.
-	assertStatus(t, store, "u1-f1", StatusRevoked)
-	assertStatus(t, store, "u1-f2", StatusRevoked)
-	assertStatus(t, store, "u2-f3", StatusActive)
-}
-
-func mustSave(t *testing.T, store *MemoryRefreshTokenStore, hash string, data RefreshTokenData) {
+func assertStatus(t *testing.T, store RefreshTokenStore, hash, want string) {
 	t.Helper()
-	if err := store.Save(hash, data); err != nil {
-		t.Fatalf("Save(%q): %v", hash, err)
-	}
-}
-
-func assertStatus(t *testing.T, store *MemoryRefreshTokenStore, hash, want string) {
-	t.Helper()
-	got, err := store.Get(hash)
-	if err != nil {
-		t.Fatalf("Get(%q): %v", hash, err)
-	}
-	if got.Status != want {
-		t.Errorf("token %q status = %q, want %q", hash, got.Status, want)
+	got, err := store.Get(t.Context(), hash)
+	if err != nil || got.Status != want {
+		t.Fatalf("status for %s = %s, %v; want %s", hash, got.Status, err, want)
 	}
 }

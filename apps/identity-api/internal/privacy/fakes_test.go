@@ -325,15 +325,19 @@ func (f *fakeRecorder) lastOf(eventType string) (audit.Event, bool) {
 
 // fakeRevoker counts revocations and can fail on demand.
 type fakeRevoker struct {
-	mu    sync.Mutex
-	calls []string
-	err   error
+	mu       sync.Mutex
+	calls    []string
+	err      error
+	onRevoke func(context.Context, string)
 }
 
-func (f *fakeRevoker) RevokeAllForUser(userID string) error {
+func (f *fakeRevoker) RevokeAllForUser(ctx context.Context, userID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, userID)
+	if f.onRevoke != nil {
+		f.onRevoke(ctx, userID)
+	}
 	return f.err
 }
 

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -54,7 +55,7 @@ func main() {
 // run wires up configuration and the server, then blocks until a termination
 // signal is received and a graceful shutdown completes. It is separated from
 // main so it can return errors instead of calling os.Exit directly.
-func run(logger *slog.Logger) error {
+func run(logger *slog.Logger) (runErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -86,25 +87,41 @@ func run(logger *slog.Logger) error {
 	if pool != nil {
 		accounts = session.NewDBAccountState(pool)
 	}
-	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger, accounts)
-	if err != nil {
-		return err
-	}
-	dpopValidator, err := buildDPoPValidator()
-	if err != nil {
-		return err
-	}
-	sessionManager, err := buildSessionManager(accounts)
-	if err != nil {
-		return err
-	}
-
 	redisClient, err := buildRedisClient(cfg.Environment, logger)
 	if err != nil {
 		return err
 	}
 	if redisClient != nil {
 		defer func() { _ = redisClient.Close() }()
+	}
+	if cfg.GRPC.Enabled && (pool == nil || redisClient == nil) {
+		return errors.New("main: enabled gRPC requires DATABASE_URL and REDIS_URL")
+	}
+	sessionManager, err := buildSessionManager(accounts, redisClient)
+	if err != nil {
+		return err
+	}
+	revokeUser := func(ctx context.Context, userID string) error {
+		// Persistent invalidation precedes cache cleanup and fences in-flight
+		// ceremonies through the existing auth-epoch trigger.
+		if pool != nil {
+			id, err := uuid.Parse(userID)
+			if err != nil {
+				return errors.New("main: invalid revocation subject")
+			}
+			if err := db.New(pool).RevokeUserCredentials(ctx, id); err != nil {
+				return err
+			}
+		}
+		return sessionManager.RevokeAllForUser(ctx, userID)
+	}
+	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger, accounts, sessionManager, redisClient, revokeUser)
+	if err != nil {
+		return err
+	}
+	dpopValidator, err := buildDPoPValidator(redisClient)
+	if err != nil {
+		return err
 	}
 
 	// The SMS OTP service shares the WebAuthn database pool (it persists the
@@ -151,6 +168,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var grpcServer *privateGRPC
+	defer func() {
+		runErr = errors.Join(runErr, drainAuditRecorder(closeAudit, cfg.ShutdownTimeout, logger))
+		if grpcServer != nil {
+			runErr = errors.Join(runErr, grpcServer.Close())
+		}
+	}()
 
 	// Capture attribution before ordinary security events cross the async boundary.
 	if pool != nil && os.Getenv(config.EnvBlindIndexPepper) != "" {
@@ -185,12 +209,29 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	var grpcReady func(context.Context) error
+	if cfg.GRPC.Enabled {
+		validator, err := token.NewAccessValidator(token.AccessValidatorConfig{Issuer: oidcCfg.Issuer, Keys: keyManager,
+			Clients: clientRegistry, Grants: refreshTokenStore, Sessions: sessionManager, Accounts: accounts})
+		if err != nil {
+			return err
+		}
+		grpcServer, err = buildPrivateGRPC(context.Background(), cfg.GRPC, grpcDependencies{Validator: validator,
+			Queries: db.New(pool), DPoP: dpopValidator, Recorder: auditRecorder, Redis: redisClient,
+			DatabaseReady: pool.Ping, AllowHTTP: cfg.Environment == "development"}, logger, nil)
+		if err != nil {
+			return err
+		}
+		grpcReady = grpcServer.Ready
+	}
+
 	srv := server.New(cfg, logger, server.Deps{
 		AdminActions: adminDeps.AdminActions,
 		AdminReady:   adminDeps.AdminReady,
-		AdminRevoke: func(userID string) error {
-			return errors.Join(sessionManager.RevokeAllForUser(userID), refreshTokenStore.RevokeAllForUser(userID))
+		AdminRevoke: func(ctx context.Context, userID string) error {
+			return errors.Join(sessionManager.RevokeAllForUser(ctx, userID), refreshTokenStore.RevokeAllForUser(ctx, userID))
 		},
+		GRPCReady:      grpcReady,
 		AdminStore:     adminDeps.AdminStore,
 		LedgerProofDB:  pool,
 		RBAC:           adminDeps.RBAC,
@@ -219,29 +260,45 @@ func run(logger *slog.Logger) error {
 	defer stop()
 
 	// Run the server in a goroutine so we can wait on the signal context.
-	serverErr := make(chan error, 1)
+	serverErr := make(chan error, 2)
 	go func() {
 		serverErr <- srv.Start()
 	}()
+	if grpcServer != nil {
+		go func() { serverErr <- grpcServer.Start() }()
+	}
 
+	var serveErr error
 	select {
 	case err := <-serverErr:
-		// Server stopped on its own (e.g. failed to bind the port).
-		// The recorder is still drained: handlers may have recorded events before
-		// the failure, and they are only in the buffer until it is.
-		return errors.Join(err, drainAuditRecorder(closeAudit, cfg.ShutdownTimeout, logger))
+		serveErr = err
 	case <-ctx.Done():
-		// Signal received; begin graceful shutdown.
-		stop()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-		// Strictly ordered: the audit buffer is drained only after the HTTP server has
-		// stopped accepting and finished its in-flight requests. Draining first would
-		// discard the audit events of the requests still being served — exactly the
-		// records a shutdown-time investigation would need.
-		shutdownErr := srv.Shutdown(shutdownCtx)
-		return errors.Join(shutdownErr, drainAuditRecorder(closeAudit, cfg.ShutdownTimeout, logger))
 	}
+	stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
+}
+
+func shutdownServers(ctx context.Context, httpServer *server.Server, grpcServer *privateGRPC) error {
+	results := make(chan error, 2)
+	go func() {
+		err := httpServer.Shutdown(ctx)
+		if err != nil {
+			err = errors.Join(err, httpServer.Close())
+		}
+		results <- err
+	}()
+	count := 1
+	if grpcServer != nil {
+		count++
+		go func() { results <- grpcServer.Shutdown(ctx) }()
+	}
+	var result error
+	for range count {
+		result = errors.Join(result, <-results)
+	}
+	return result
 }
 
 // drainAuditRecorder flushes the audit transport during shutdown.
@@ -308,9 +365,7 @@ func buildKeyManager(cfg config.OIDCConfig, environment string, logger *slog.Log
 	return keys.NewManager(active, next, previous)
 }
 
-// buildTokenService assembles the /oauth2/token service: in-memory code and
-// refresh-token stores (the MVP backing; both sit behind interfaces so a Redis
-// store can replace them later) plus the RFC 7523 private_key_jwt client
+// buildTokenService assembles shared code/grant authority and the RFC 7523 private_key_jwt client
 // authenticator for the client_credentials grant. The authenticator's expected
 // audience is the fully-qualified token endpoint URL so an assertion minted for
 // a different endpoint is rejected (audience-confusion defence).
@@ -326,6 +381,9 @@ func buildTokenService(
 	clientRegistry *clients.StaticRegistry,
 	logger *slog.Logger,
 	accounts session.AccountState,
+	sessions *session.Manager,
+	redisClient *redis.Client,
+	revokeUser func(context.Context, string) error,
 ) (*token.Service, token.RefreshTokenStore, error) {
 	tokenEndpoint := oidcCfg.Issuer + "/oauth2/token"
 	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, clientauth.NewMemoryJTIGuard())
@@ -333,12 +391,23 @@ func buildTokenService(
 		return nil, nil, fmt.Errorf("main: build client authenticator: %w", err)
 	}
 
-	refreshTokens := token.NewMemoryRefreshTokenStore()
+	var codes token.AuthorizationCodeStore = token.NewMemoryCodeStore()
+	var refreshTokens token.RefreshTokenStore = token.NewMemoryRefreshTokenStore()
+	if redisClient != nil {
+		codes, err = token.NewRedisCodeStore(redisClient)
+		if err != nil {
+			return nil, nil, err
+		}
+		refreshTokens, err = token.NewRedisRefreshTokenStore(redisClient)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	svc, err := token.NewService(
-		token.Config{Issuer: oidcCfg.Issuer, AccountState: accounts},
+		token.Config{Issuer: oidcCfg.Issuer, AccountState: accounts, Sessions: sessions, RevokeUser: revokeUser},
 		keyManager,
 		clientRegistry,
-		token.NewMemoryCodeStore(),
+		codes,
 		refreshTokens,
 		authenticator,
 		nil,
@@ -350,14 +419,23 @@ func buildTokenService(
 	return svc, refreshTokens, nil
 }
 
-// buildDPoPValidator assembles the RFC 9449 DPoP validator used to
-// sender-constrain tokens issued at /oauth2/token. It uses in-memory single-use
-// jti replay tracking and a server-issued DPoP-Nonce store (the MVP backing;
-// both sit behind interfaces so a Redis-backed guard — key dpop:jti:{jti},
-// TTL 60s per docs/data-architecture.md §3.1 — can replace them cluster-wide
-// without touching the validator).
-func buildDPoPValidator() (*dpop.Validator, error) {
-	validator, err := dpop.NewValidator(dpop.NewMemoryReplayGuard(), dpop.NewMemoryNonceStore())
+// buildDPoPValidator shares replay and nonce authority across HTTP and gRPC.
+// Memory stores are used only for development without Redis and without gRPC.
+func buildDPoPValidator(redisClient *redis.Client) (*dpop.Validator, error) {
+	var replay dpop.ReplayGuard = dpop.NewMemoryReplayGuard()
+	var nonces dpop.NonceStore = dpop.NewMemoryNonceStore()
+	var err error
+	if redisClient != nil {
+		replay, err = dpop.NewRedisReplayGuard(redisClient)
+		if err != nil {
+			return nil, err
+		}
+		nonces, err = dpop.NewRedisNonceStore(redisClient)
+		if err != nil {
+			return nil, err
+		}
+	}
+	validator, err := dpop.NewValidator(replay, nonces)
 	if err != nil {
 		return nil, fmt.Errorf("main: build DPoP validator: %w", err)
 	}
@@ -365,15 +443,12 @@ func buildDPoPValidator() (*dpop.Validator, error) {
 }
 
 // buildSessionManager assembles the stateful browser-session lifecycle: the
-// hardened __Host- cookie codec, the in-memory session store (the MVP backing;
-// it sits behind the session.Store interface so a Redis-backed store — key
-// session:token:{token_hash}, Hash type, 24h TTL per docs/data-architecture.md
-// §3.1 — can replace it without touching the manager or handlers), and the
+// hardened __Host- cookie codec, shared Redis authority when configured, and the
 // Manager that owns the absolute/idle lifetime policy. Configuration (cookie
 // name/Secure and the two TTLs) is loaded from the environment; the
 // __Host-/Secure invariant is enforced inside NewCookieCodec so a misconfigured
 // dev override fails fast at startup.
-func buildSessionManager(accounts session.AccountState) (*session.Manager, error) {
+func buildSessionManager(accounts session.AccountState, redisClient *redis.Client) (*session.Manager, error) {
 	sc, err := config.LoadSession()
 	if err != nil {
 		return nil, err
@@ -388,7 +463,14 @@ func buildSessionManager(accounts session.AccountState) (*session.Manager, error
 		return nil, fmt.Errorf("main: build session cookie codec: %w", err)
 	}
 
-	manager, err := session.NewManager(session.NewMemoryStore(), codec, session.ManagerConfig{
+	var store session.Store = session.NewMemoryStore()
+	if redisClient != nil {
+		store, err = session.NewRedisStore(redisClient)
+		if err != nil {
+			return nil, err
+		}
+	}
+	manager, err := session.NewManager(store, codec, session.ManagerConfig{
 		AccountState: accounts,
 		AbsoluteTTL:  sc.AbsoluteTTL,
 		IdleTTL:      sc.IdleTTL,
@@ -504,6 +586,14 @@ func buildRedisClient(environment string, logger *slog.Logger) (*redis.Client, e
 	if err != nil {
 		return nil, fmt.Errorf("main: parse REDIS_URL: %w", err)
 	}
+	// These stores consume single-use credentials. Do not transparently replay
+	// an operation after an ambiguous response, or ignore a caller's deadline.
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	opts.DialTimeout = 2 * time.Second
+	opts.ReadTimeout = time.Second
+	opts.WriteTimeout = time.Second
+	opts.PoolTimeout = time.Second
 	client := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), redisConnectTimeout)

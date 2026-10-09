@@ -121,7 +121,7 @@ func (s *Server) handleListSessions() http.HandlerFunc {
 			return
 		}
 
-		sessions, err := s.deps.SessionManager.List(current.UserID)
+		sessions, err := s.deps.SessionManager.List(r.Context(), current.UserID)
 		if err != nil {
 			s.logger.Error("session: list failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{Error: "server_error"})
@@ -163,7 +163,7 @@ func (s *Server) handleRevokeSession() http.HandlerFunc {
 			return
 		}
 
-		revoked, err := s.deps.SessionManager.RevokeByID(current.UserID, id)
+		revoked, err := s.deps.SessionManager.RevokeByID(r.Context(), current.UserID, id)
 		if err != nil {
 			s.logger.Error("session: revoke by id failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{Error: "server_error"})

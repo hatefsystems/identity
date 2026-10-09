@@ -1,8 +1,8 @@
 # Container image for the identity-api Go module.
 #
-# Build context is this directory (the Go module root), not the workspace root:
+# Build context is the workspace root so the canonical schemas module is present:
 #
-#   docker build -t identity-api:dev apps/identity-api
+#   docker build -f apps/identity-api/Dockerfile -t identity-api:dev .
 #
 # ONE IMAGE, SEVERAL ENTRYPOINTS
 # Every binary under ./cmd is built; the runtime binaries listed below are copied
@@ -37,16 +37,19 @@ WORKDIR /src
 
 # Dependencies are resolved before the source is copied so an edit to a .go file
 # does not invalidate the (slow) module download layer.
-COPY go.mod go.sum ./
-RUN go mod download
+COPY libs/schemas/go.mod libs/schemas/go.sum ./libs/schemas/
+COPY apps/identity-api/go.mod apps/identity-api/go.sum ./apps/identity-api/
+RUN go -C /src/libs/schemas mod download && go -C /src/apps/identity-api mod download
 
-COPY . .
+COPY libs/schemas ./libs/schemas
+COPY apps/identity-api ./apps/identity-api
+WORKDIR /src/apps/identity-api
 
 # internal/db is sqlc-generated and deliberately untracked (see .gitignore), so it
 # does not exist in a clean checkout and must be generated here. Skipping this would
 # fail the build with "no required module provides package .../internal/db" — or,
 # worse, silently compile a stale copy if one ever leaked into the context.
-RUN go tool sqlc generate
+RUN go -C /src/libs/schemas tool buf generate --template buf.gen.go.yaml && go tool sqlc generate
 
 # CGO is disabled so the result is a static binary that runs on a distroless static
 # base with no libc. -trimpath keeps absolute build paths out of panic traces, and

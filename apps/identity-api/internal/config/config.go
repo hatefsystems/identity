@@ -64,6 +64,7 @@ type Config struct {
 	// the values are consumed by the HTTP handlers themselves (page sizes,
 	// time windows), not by any domain package.
 	Admin AdminConfig
+	GRPC  GRPCConfig
 }
 
 // Addr returns the host:port address string the server should listen on.
@@ -156,6 +157,10 @@ func Load() (Config, error) {
 	}
 	cfg.TrustedProxyCIDRs = trustedProxyCIDRs
 	cfg.Admin, err = LoadAdmin()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.GRPC, err = LoadGRPC()
 	if err != nil {
 		return Config{}, err
 	}

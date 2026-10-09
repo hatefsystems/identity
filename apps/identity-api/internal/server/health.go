@@ -34,6 +34,18 @@ func (s *Server) handleLiveness() http.HandlerFunc {
 // Enabled admin capabilities require their gates and live dependency probe.
 func (s *Server) handleReadiness() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.GRPC.Enabled {
+			ready := s.deps.GRPCReady != nil
+			if ready {
+				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+				ready = s.deps.GRPCReady(ctx) == nil
+				cancel()
+			}
+			if !ready {
+				writeJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "not_ready", Service: serviceName, Time: time.Now().UTC().Format(time.RFC3339)})
+				return
+			}
+		}
 		if s.cfg.Admin.Enabled {
 			ready := s.deps.AdminActions != nil && s.deps.AdminStore != nil && s.deps.RBAC != nil &&
 				s.deps.AdminLimiter != nil && s.deps.SessionManager != nil && s.deps.LegalHold != nil && s.deps.AdminReady != nil

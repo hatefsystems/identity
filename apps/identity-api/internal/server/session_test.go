@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -205,7 +208,7 @@ func TestRevokeOwnSessionReturns204(t *testing.T) {
 
 	// The session is revoked: a follow-up authenticated request now fails, and
 	// the store no longer lists it.
-	if remaining, err := mgr.List("user-1"); err != nil {
+	if remaining, err := mgr.List(t.Context(), "user-1"); err != nil {
 		t.Fatalf("List after revoke: %v", err)
 	} else if len(remaining) != 0 {
 		t.Errorf("len(sessions) after revoke = %d, want 0", len(remaining))
@@ -225,6 +228,37 @@ func TestRevokeUnknownSessionReturns404(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 	_, _ = io.Copy(io.Discard, rec.Body)
+}
+
+func TestSessionHandlersPreserveRequestCancellation(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			srv, mgr := newSessionTestServer(t)
+			current, _ := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ctx = session.WithSession(ctx, current)
+			route := chi.NewRouteContext()
+			route.URLParams.Add("id", current.ID)
+			ctx = context.WithValue(ctx, chi.RouteCtxKey, route)
+			req := httptest.NewRequest(method, "/api/v1/users/me/sessions/"+current.ID, nil).WithContext(ctx)
+			cancel()
+			rec := httptest.NewRecorder()
+			// Call the handler directly: cancellation must reach its store call,
+			// independently of RequireSession's own cancellation check.
+			handler := srv.handleListSessions()
+			if method == http.MethodDelete {
+				handler = srv.handleRevokeSession()
+			}
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("canceled %s returned %d, want existing backend-error response", method, rec.Code)
+			}
+			if _, err := mgr.LookupByID(t.Context(), current.UserID, current.ID); err != nil {
+				t.Fatalf("canceled handler revoked a session: %v", err)
+			}
+		})
+	}
 }
 
 // TestSessionRoutesAbsentWithoutManager proves the lifecycle routes are only

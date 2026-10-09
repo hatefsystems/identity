@@ -79,7 +79,7 @@ If issuing the restricted session fails after a recovery code was consumed, the 
 - `DELETE /api/v1/users/me`: "Right to be Forgotten" - Initiates soft delete of the account. Strictly requires the valid Step-up ACR token passed in the `X-Step-Up-Auth` header. Returns `204`. In one transaction the account becomes `pending_deletion` with `deleted_at` stamped, every outstanding reclaim token is invalidated, and a fresh single-use reclaim token is minted; after the commit all stateful sessions and refresh-token families are revoked and the token is emailed to the primary and (when set) backup address.
   - **Idempotent.** A repeat call on an account already in `pending_deletion` also returns `204` and does not deactivate twice, so a client retrying after a dropped response cannot use the endpoint to probe prior account state.
   - **Resend cooldown.** Whether a repeat call also mints and re-sends a fresh token is governed by `GDPR_DELETE_RESEND_COOLDOWN` (default 1h), measured from the last *delivered* notice. Inside the cooldown the call succeeds and does nothing; outside it, a user who lost the first mail gets a replacement. Without this the idempotent endpoint would be an email bomb. A notice that failed to send never arms the cooldown, so the next call retries delivery.
-  - **Residual access-token authority.** Sessions and refresh tokens are revoked synchronously, but an access token already issued to a downstream client remains valid until it expires — at most the 10-minute access-token TTL. There is no revocation epoch and no per-request account-status re-read, so cutoff across the ecosystem is bounded by that TTL rather than instantaneous. Clients must not assume otherwise.
+  - **Residual access-token authority.** `IdentityService.ValidateToken` checks live Redis authority and the primary PostgreSQL account status/auth-version on every user-token call. Deletion and session revocation therefore reject subsequent RPC validation, and reactivation cannot revive an older version. Clients that validate JWTs offline instead of using this RPC still retain the residual authority of an already-issued token until its expiry, at most ten minutes. Already admitted requests are not retroactively cancelled.
   - **Fail-closed mounting.** The route is not mounted when the Step-up service is unavailable (see §1.3), nor when no notifier capable of delivering the reclaim token is configured: a deletion whose reclaim token cannot be delivered has no recovery window at all, which is strictly worse than refusing the request.
   - Rate limited per account per day (`GDPR_DELETE_PER_ACCOUNT_PER_DAY`, default 3); a saturated limit returns `429 {"error":"rate_limited"}`.
 
@@ -170,7 +170,7 @@ sequence boundaries that are not explained by retention remain invalid requests.
 checkpoints and Class C receipts do not independently defeat a privileged coherent
 database rewrite or backup rollback. External anchoring is explicitly deferred.
 
-HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate stateful credentials across instances; previously issued downstream JWTs retain at most their configured 10-minute lifetime. Reactivation does not revive old credentials or prevent re-registration.
+HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate credentials across instances. `ValidateToken` applies the live account/version gate; offline JWT consumers still retain at most the configured ten-minute token lifetime. Reactivation does not revive old credentials or prevent re-registration.
 
 ### 1.8 Operational Legal Workflow
 
@@ -221,7 +221,7 @@ this contract. See [operator procedures](admin-operations.md#legal-review-and-tr
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 
-Task 6.1 implements the reusable `internal/grpcauth` security layer and its TLS/gRPC tests. The current API runtime remains HTTP-only; Task 6.2 must activate the private listener and implement the RPCs below. No SPIRE deployment, production identity grants, or public gRPC routing is implied.
+Task 6.1 supplies `internal/grpcauth`; Task 6.2 composes it with `IdentityService` and an opt-in private listener in the existing API process. `GRPC_ENABLED=false` retains HTTP-only operation. Enabling requires PostgreSQL, Redis, a local Workload API socket, an explicit trust domain, exact method grants, and caller validation policies. No SPIRE deployment, production grants, or public gRPC routing is implied.
 
 ### 2.1 Identity SAN Validation (gRPC RBAC)
 `grpcauth` verifies the client's X.509-SVID at each unary call or stream creation, using exactly one URI **Subject Alternative Name (SAN)** containing a valid workload **SPIFFE ID**, for example `spiffe://hatef.ir/ns/identity/sa/email-service`. The identity must belong to the explicitly configured trust domain and its certificate chain must verify against the current injected bundle. CN, DNS SANs, metadata, forwarding headers, OAuth clients, and administrator roles are not workload authentication.
@@ -231,10 +231,23 @@ Service RBAC is an immutable exact-full-method-to-SPIFFE-ID allowlist supplied b
 RPC-stage authentication failures return `Unauthenticated`, unavailable trust material returns `Unavailable`, and authenticated callers without a matching grant receive `PermissionDenied`. Allowed handlers can read the verified service identity through `grpcauth.IdentityFromContext`. Streaming authorization is admission-only; already-open streams are not revoked automatically. Interceptor denials produce sanitized, best-effort `grpc.access.denied` audit events, without user/security-ledger attribution or request contents. Handshake failures and unregistered-method dispatch can occur before an interceptor. See [client integration](client-integration.md#3-internal-grpc-integration-zero-trust) for wiring, certificate renewal, error, and audit limits.
 
 ### 2.2 `IdentityService`
-Planned for Task 6.2, using the [canonical protobuf contract](../libs/schemas/proto/hatef/identity/v1/identity_service.proto). Method-level workload permission does not replace these user-level checks.
-- `rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse)`: Parses a JWT, checks if it's revoked in Redis, and returns user claims. Extremely fast, heavily cached.
-- `rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse)`: Evaluates if a specific User ID has a specific role or permission (RBAC evaluation).
-- `rpc GetInternalUserInfo(GetInternalUserInfoRequest) returns (GetInternalUserInfoResponse)`: Fetches basic user info (e.g., email, display name) needed by other services (e.g., Email service needing to address the user).
+Implemented by `internal/identitygrpc` using the [canonical protobuf contract](../libs/schemas/proto/hatef/identity/v1/identity_service.proto). Workload admission does not replace token, account, scope, or permission checks.
+
+| RPC | Contract |
+|---|---|
+| `ValidateToken` | Required raw `access_token`, explicit `expected_audience`, and observed `authorization_scheme` (`Bearer` or `DPoP`). DPoP also requires `dpop_proof`, original `http_method`, and independently observed absolute `http_uri`. Any supplied HTTP context is validated against the caller's exact permitted origins. |
+| `CheckPermission` | Nonzero `user_id` UUID and exact `permission` identifier, at most 100 characters. Uses the existing primary-DB predicate for active, nondeleted accounts. Role names, OAuth scopes, wildcard expansion, and administrator bypasses are not supported. Unknown users/permissions return `allowed=false`. |
+| `GetInternalUserInfo` | Nonzero `user_id` UUID. Active/pending-verification users return ID, primary email and status. Suspended/banned users return ID/status only. Missing, deleted and pending-deletion users return `NotFound`. `display_name` remains empty because no stored display-name field exists. No encrypted contacts, factors, hashes or legal metadata are returned. |
+
+`ValidateToken` verifies the local rotating key, `typ=at+jwt`, algorithm, issuer, audience, expiry and required claims. User tokens require the matching live normal browser session, OAuth grant, and captured primary-DB `auth_version`; client-credentials tokens use an explicit `CLIENT` principal and never acquire a user identity, even when the client ID is UUID-shaped. Recovery-enrollment sessions, ID tokens, step-up grants, assertions and legacy unlinked access JWTs are rejected.
+
+Active responses contain `principal_type`, `subject`, `client_id`, scopes and JWT `expires_at`; `user_id` is populated only for `USER`. Invalid, expired or revoked authority returns `active=false` without claims. Invalid required proofs additionally return `DPOP_OUTCOME_INVALID_PROOF`. A nonce challenge returns only `DPOP_OUTCOME_USE_NONCE` and `dpop_nonce`, not claims or a revocation assertion. Malformed RPC envelopes return `InvalidArgument`, caller policy violations `PermissionDenied`, dependency/corrupt-state failures `Unavailable`, and cancellation/deadlines preserve their gRPC codes.
+
+Signatures use local keys; shared Redis serves session/grant and DPoP state. Successful user validation still performs an indexed primary-DB account check. Neither validation results nor positive permissions are cached, and `expires_at` is not a safe cache lifetime. Validation and refresh never touch browser activity. Logout, device revocation, two-hour default idle expiry, or 24-hour default absolute expiry end linked access/refresh authority, even if a refresh token's own lifetime is longer. The retained `offline_access` scope name does not grant independent offline lifetime.
+
+Refresh rotation is atomic across instances, cannot change its original DPoP key, and retains consumed-secret evidence. Recognized reuse preserves the account-wide breach policy: advance primary account authority, revoke browser sessions, and invalidate all user grants. A Redis cleanup failure cannot revive old account versions. Missing Redis authority is inactive; backend failures never become successful validation or an in-memory fallback.
+
+`CheckPermission` and profile lookup authorize the calling workload to query a supplied user ID; they do not prove that an end user delegated that operation. Consuming services must bind their action to the validated subject and enforce relevant scopes. Profile disclosures emit sanitized, best-effort audit events, without security-ledger attribution or sensitive response contents. See the client integration guide for error forwarding and rollout requirements.
 
 ---
 

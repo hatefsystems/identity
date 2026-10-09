@@ -113,6 +113,9 @@ func (m *Manager) Issue(w http.ResponseWriter, p IssueParams) (Session, error) {
 // IssueContext preserves the version earned by authentication and serializes
 // final issuance with account transitions. No cookie is sent on DB failure.
 func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p IssueParams) (Session, error) {
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
+	}
 	if p.UserID == "" {
 		return Session{}, ErrMissingUserID
 	}
@@ -160,7 +163,7 @@ func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p Iss
 		IdleExpiry:     idleExpiry,
 	}
 
-	persist := func() error { return m.store.Create(hash, s) }
+	persist := func() error { return m.store.Create(ctx, hash, s) }
 	if m.accounts != nil {
 		if !p.AuthVersionSet {
 			return Session{}, ErrAccountIneligible
@@ -183,17 +186,23 @@ func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p Iss
 // is unknown, revoked, or expired. The returned session reflects the refreshed
 // idle deadline.
 func (m *Manager) Authenticate(r *http.Request) (Session, error) {
+	if err := r.Context().Err(); err != nil {
+		return Session{}, err
+	}
 	token, err := m.cookie.Read(r)
 	if err != nil {
 		return Session{}, ErrNoSession
 	}
 	hash := HashToken(token)
 
-	s, err := m.store.Get(hash)
+	s, err := m.store.Get(r.Context(), hash)
 	if err != nil {
 		return Session{}, err
 	}
-	if s.Kind != KindAuthenticated && s.Kind != KindRecoveryEnrollment {
+	if !validSession(s) {
+		return Session{}, ErrStoreUnavailable
+	}
+	if expired(s, m.now()) {
 		return Session{}, ErrSessionNotFound
 	}
 	if m.accounts != nil {
@@ -206,29 +215,55 @@ func (m *Manager) Authenticate(r *http.Request) (Session, error) {
 	}
 
 	// Slide the idle window forward, clamped to the absolute ceiling.
-	newIdle := m.now().Add(m.idleTTL)
+	now := m.now()
+	newIdle := now.Add(m.idleTTL)
 	if newIdle.After(s.AbsoluteExpiry) {
 		newIdle = s.AbsoluteExpiry
 	}
-	if err := m.store.Touch(hash, newIdle); err != nil {
+	if newIdle.Before(s.IdleExpiry) {
+		newIdle = s.IdleExpiry
+	}
+	if err := m.store.Touch(r.Context(), hash, newIdle); err != nil {
 		// The session lapsed between Get and Touch; treat as not found.
 		return Session{}, err
 	}
 	s.IdleExpiry = newIdle
-	s.LastSeenAt = m.now()
+	if now.After(s.LastSeenAt) {
+		s.LastSeenAt = now
+	}
+	return s, nil
+}
+
+// LookupByID reads live browser authority without extending its lifetime or
+// consulting account state. Token callers must check the session kind and the
+// captured version, then call AccountState.Validate once for their whole flow.
+func (m *Manager) LookupByID(ctx context.Context, userID, sessionID string) (Session, error) {
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
+	}
+	s, err := m.store.GetByID(ctx, userID, sessionID)
+	if err != nil {
+		return Session{}, err
+	}
+	if !validSession(s) || s.UserID != userID || s.ID != sessionID {
+		return Session{}, ErrStoreUnavailable
+	}
+	if expired(s, m.now()) {
+		return Session{}, ErrSessionNotFound
+	}
 	return s, nil
 }
 
 // ClaimRecoveryEnrollment atomically reserves a restricted session for one
 // enrollment completion. A successful caller must revoke the session; a
 // conclusively failed ceremony may release it to permit a retry.
-func (m *Manager) ClaimRecoveryEnrollment(userID, sessionID string) (bool, error) {
-	return m.store.ClaimRecoveryEnrollment(userID, sessionID)
+func (m *Manager) ClaimRecoveryEnrollment(ctx context.Context, userID, sessionID string) (bool, error) {
+	return m.store.ClaimRecoveryEnrollment(ctx, userID, sessionID)
 }
 
 // ReleaseRecoveryEnrollment releases a failed enrollment claim.
-func (m *Manager) ReleaseRecoveryEnrollment(userID, sessionID string) error {
-	return m.store.ReleaseRecoveryEnrollment(userID, sessionID)
+func (m *Manager) ReleaseRecoveryEnrollment(ctx context.Context, userID, sessionID string) error {
+	return m.store.ReleaseRecoveryEnrollment(ctx, userID, sessionID)
 }
 
 // Revoke deletes the session bound to the request cookie and clears the cookie
@@ -248,6 +283,9 @@ func (m *Manager) ReleaseRecoveryEnrollment(userID, sessionID string) error {
 // is the harmless direction: the cookie is cleared either way, and the audit
 // record still names the account that held the token.
 func (m *Manager) Revoke(w http.ResponseWriter, r *http.Request) (Session, bool, error) {
+	if err := r.Context().Err(); err != nil {
+		return Session{}, false, err
+	}
 	var (
 		revoked Session
 		ok      bool
@@ -255,13 +293,17 @@ func (m *Manager) Revoke(w http.ResponseWriter, r *http.Request) (Session, bool,
 	token, err := m.cookie.Read(r)
 	if err == nil {
 		hash := HashToken(token)
-		// A failed lookup is not fatal: the delete below must still run so a
-		// session the reader could not decode cannot survive a logout.
-		if s, getErr := m.store.Get(hash); getErr == nil {
+		// A failed lookup must not prevent attempting deletion. Report any
+		// infrastructure error rather than claiming logout succeeded.
+		s, getErr := m.store.Get(r.Context(), hash)
+		if getErr == nil {
 			revoked, ok = s, true
 		}
-		if delErr := m.store.Delete(hash); delErr != nil {
+		if delErr := m.store.Delete(r.Context(), hash); delErr != nil {
 			return Session{}, false, fmt.Errorf("session: revoke: %w", delErr)
+		}
+		if getErr != nil && !errors.Is(getErr, ErrSessionNotFound) {
+			return Session{}, false, fmt.Errorf("session: revoke lookup: %w", getErr)
 		}
 	}
 	m.cookie.Clear(w)
@@ -270,21 +312,21 @@ func (m *Manager) Revoke(w http.ResponseWriter, r *http.Request) (Session, bool,
 
 // List returns every live session for userID, newest-first, for the
 // self-service session list (GET /api/v1/users/me/sessions).
-func (m *Manager) List(userID string) ([]Session, error) {
-	return m.store.ListForUser(userID)
+func (m *Manager) List(ctx context.Context, userID string) ([]Session, error) {
+	return m.store.ListForUser(ctx, userID)
 }
 
 // RevokeByID deletes a single session identified by its public ID, scoped to
 // userID so a user can only revoke their own sessions. It reports whether a
 // session was removed (false => 404 to the caller).
-func (m *Manager) RevokeByID(userID, sessionID string) (bool, error) {
-	return m.store.DeleteForUser(userID, sessionID)
+func (m *Manager) RevokeByID(ctx context.Context, userID, sessionID string) (bool, error) {
+	return m.store.DeleteForUser(ctx, userID, sessionID)
 }
 
 // RevokeAllForUser deletes every session belonging to userID, backing the
 // "log out everywhere" action and the RTR breach response.
-func (m *Manager) RevokeAllForUser(userID string) error {
-	return m.store.DeleteAllForUser(userID)
+func (m *Manager) RevokeAllForUser(ctx context.Context, userID string) error {
+	return m.store.DeleteAllForUser(ctx, userID)
 }
 
 // CookieName reports the configured session cookie name, exposed for handlers

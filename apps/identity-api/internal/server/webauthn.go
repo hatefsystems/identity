@@ -224,7 +224,7 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 			return
 		}
 
-		claimed, err := s.deps.SessionManager.ClaimRecoveryEnrollment(current.UserID, current.ID)
+		claimed, err := s.deps.SessionManager.ClaimRecoveryEnrollment(r.Context(), current.UserID, current.ID)
 		if err != nil {
 			s.logger.Error("webauthn: claim recovery enrollment failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
@@ -238,7 +238,7 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 		row, err := s.deps.WebAuthn.FinishRecoveryRegistration(r.Context(), userID, current.ID, body)
 		if err != nil {
 			if isConclusiveWebAuthnCeremonyFailure(err) {
-				_ = s.deps.SessionManager.ReleaseRecoveryEnrollment(current.UserID, current.ID)
+				_ = s.deps.SessionManager.ReleaseRecoveryEnrollment(r.Context(), current.UserID, current.ID)
 			}
 			s.writeWebAuthnRegistrationError(w, "finish recovery registration", err)
 			return

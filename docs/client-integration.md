@@ -148,7 +148,7 @@ The Go Identity Server looks up the public key matching `kid` from its database/
 
 Internal microservices must bypass public HTTP routing and authenticate directly to the Identity Platform over **gRPC with mTLS**. Forwarded headers and caller-supplied metadata are not workload credentials.
 
-**Implementation boundary:** Task 6.1 provides `apps/identity-api/internal/grpcauth`, a reusable security layer and self-contained TLS/gRPC tests. The running API is still HTTP-only. Listener activation, Workload API lifecycle, production grants, and the business RPC implementations remain Task 6.2; SPIRE provisioning remains separately approved infrastructure work. The examples below are integration guidance, not a deployed configuration.
+**Implementation boundary:** Task 6.1 provides `internal/grpcauth`; Task 6.2 implements the three business RPCs and an opt-in private listener in the API process. HTTP-only operation remains the default. SPIRE provisioning, workload registrations, production grants and private networking remain operator-approved infrastructure work. The examples below are guidance, not deployed permissions.
 
 ### 3.1 SPIFFE/SPIRE Bootstrapping
 
@@ -192,6 +192,7 @@ tlsConfig.MinVersion = tls.VersionTLS13
 
 conn, err := grpc.NewClient("dns:///idp-core.internal:9090",
     grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+    grpc.WithDisableRetry(),
 )
 if err != nil {
     log.Fatalf("gRPC client configuration failure: %v", err)
@@ -201,13 +202,13 @@ defer conn.Close()
 
 The SPIFFE TLS helper verifies the certificate chain and pinned SPIFFE identity instead of a DNS hostname. Do not replace it with a raw `InsecureSkipVerify` configuration. `grpc.NewClient` is lazy: construction is not proof of connectivity or readiness; calls need deadlines and normal error handling.
 
-The server helper requires TLS 1.3 and disables session tickets. New connections perform a fresh handshake, while every new RPC also verifies the peer certificate against the current local trust bundle. Renewing the source does not replace the certificate on an established connection. Define reconnection/connection-age behavior before production so calls do not continue using expired peer credentials.
+The server requires TLS 1.3 and disables session tickets. New connections perform a fresh handshake, while every new RPC verifies the peer certificate against the current local trust bundle. Source renewal does not replace certificates on established connections. The runtime therefore uses a five-minute maximum connection age with 30-second grace; clients must maintain their source and reconnect with renewed credentials. Do not add automatic application retries to a proof-consuming RPC: after an ambiguous failure, the external client must generate a new proof rather than replay the old one.
 
 ### 3.3 Method Grants and IdentityService
 
-The canonical contract is [`hatef.identity.v1.IdentityService`](../libs/schemas/proto/hatef/identity/v1/identity_service.proto), not a separate `TokenValidationService`. It defines three unary methods: `ValidateToken`, `CheckPermission`, and `GetInternalUserInfo`. Their business implementations remain Task 6.2. User tokens and DPoP proofs belong to those handlers, not to workload authentication.
+The canonical contract is [`hatef.identity.v1.IdentityService`](../libs/schemas/proto/hatef/identity/v1/identity_service.proto), not a separate `TokenValidationService`. It implements three unary methods: `ValidateToken`, `CheckPermission`, and `GetInternalUserInfo`. User tokens and DPoP proofs belong to those handlers, not to workload authentication.
 
-The future server composition root can construct the guard as follows, using an existing `audit.Recorder` and maintained source. This example is not a production permission grant:
+The server composition root uses the following guard pattern, with an existing `audit.Recorder` and maintained source. This example is not a production permission grant:
 
 ```go
 import "github.com/hatefsystems/identity/apps/identity-api/internal/grpcauth"
@@ -231,7 +232,8 @@ if err != nil {
     return err
 }
 server := grpc.NewServer(options...)
-// Task 6.2 must register the service, bind a private listener, and own shutdown.
+// cmd/server additionally registers IdentityService, applies limits/deadlines,
+// binds the private listener, and owns bounded shutdown and source cleanup.
 ```
 
 Install these options before additional business interceptor chains and never override their transport credentials. The helper registers no services and enables no reflection. Workload policy is immutable and copied on construction: no wildcards, namespace/prefix grants, or defaults. An empty policy denies all methods. The example grants Search Core only `ValidateToken`, not the other two methods. Full method names are limited to 512 characters and SPIFFE IDs to 2048; the configured trust domain must be a bare canonical name.
@@ -250,3 +252,41 @@ Health and reflection methods have no automatic exemption. Unregistered methods 
 Streaming support authorizes **stream creation only**. Expiry and trust changes block new RPC admissions but do not terminate or reauthorize already-open streams. Continuous revocation and forced stream expiry are not provided.
 
 The guard emits `grpc.access.denied` through the existing best-effort recorder for interceptor-stage denials only. Events contain bounded method/status/reason metadata and a verified workload actor when available, never tokens, RPC bodies, raw certificates, or asserted metadata. The existing audit actor column is limited to 255 characters: longer verified IDs are omitted in full and marked with `actor_spiffe_id_omitted: true`, never truncated, hashed, or copied into the payload. These events are audit-only, with no fabricated user or security-ledger attribution. Recorder errors do not alter the rejection. Successful business operations and transport-handshake failures are outside this event's coverage.
+
+### 3.4 Runtime Configuration and Rollout
+
+Use shared PostgreSQL/Redis and an authorized local Workload API. This example uses reserved domains and grants only the named methods:
+
+```dotenv
+GRPC_ENABLED=true
+GRPC_ADDR=127.0.0.1:9090
+GRPC_TRUST_DOMAIN=example.test
+SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
+GRPC_REQUEST_TIMEOUT=2s
+GRPC_METHOD_GRANTS_JSON={"/hatef.identity.v1.IdentityService/ValidateToken":["spiffe://example.test/search"],"/hatef.identity.v1.IdentityService/GetInternalUserInfo":["spiffe://example.test/email"]}
+GRPC_VALIDATION_POLICIES_JSON={"spiffe://example.test/search":{"audiences":["https://identity.example.test"],"origins":["https://search.example.test"]}}
+```
+
+`OIDC_ISSUER` must match the explicitly allowed audience; current tokens use `aud == issuer`, not independently selected resource audiences. Origins are canonical scheme/host/port values, without paths or wildcard suffixes. HTTPS is required except explicitly configured loopback HTTP in development. Every ValidateToken grant needs a validation policy; missing/invalid configuration fails startup. Explicit empty maps deny all. Neither an origin policy nor an administrator role implicitly grants an RPC.
+
+The runtime bounds initial dependency/SVID acquisition to ten seconds, handshakes to five seconds, messages to 64 KiB, compact tokens/proofs to 16 KiB each, and audience/URI fields to 2 KiB. The default RPC deadline is two seconds, configurable to a positive value at most 30 seconds; shorter caller deadlines are preserved. Each HTTP/2 connection admits at most 100 concurrent streams. HTTP `/readyz` additionally checks enabled gRPC readiness, live usable SVID/trust, Redis and PostgreSQL. `/healthz` remains dependency-independent. No gRPC health or reflection bypass is registered.
+
+Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
+
+### 3.5 Validation and Error Forwarding
+
+Send the exact raw access token, observed authorization scheme and expected audience. For DPoP, forward the proof plus original HTTP method and absolute URI observed at the resource's trusted HTTP edge. Do not extract method/URI from the proof or trust end-user forwarding headers. The service excludes query data during RFC 9449 URI comparison and never fetches the supplied URI. A bound token cannot be sent as Bearer or rebound to another key during refresh.
+
+| Result | Consumer behavior |
+|---|---|
+| `active=true` | Use `principal_type` and `subject`; only USER has `user_id`. Enforce the resource's scopes/permissions and bind the action to this subject. Do not cache until `expires_at`. |
+| `active=false`, unspecified DPoP outcome | Reject the access token without claims; typically HTTP 401 `invalid_token`. |
+| `DPOP_OUTCOME_INVALID_PROOF` | Reject with HTTP 401 and the appropriate DPoP `WWW-Authenticate` error. No identity claims are returned. |
+| `DPOP_OUTCOME_USE_NONCE` | Return HTTP 401, `DPoP-Nonce: <dpop_nonce>` and `WWW-Authenticate: DPoP error="use_dpop_nonce"`. The external client creates a new proof/JTI containing that nonce. |
+| `Unavailable` | Treat as a dependency outage, not user inactivity. Fail closed; never authorize from an old success or switch to an offline verifier. |
+| `InvalidArgument` / `PermissionDenied` | Correct the request or operator policy; neither is resolved by repeatedly submitting a user proof. |
+| `Canceled` / `DeadlineExceeded` | Preserve cancellation semantics. An ambiguous proof-consuming attempt must not be automatically replayed. |
+
+Browser logout, device revocation, idle expiry and absolute expiry end all linked user access/refresh authority. Validation and refresh do not count as browser activity. The existing `offline_access` scope name remains accepted, but does not extend that browser lifetime. Client-credentials tokens have no browser or user identity. Read-only permission/profile RPCs are independently workload-authorized queries: a returned profile is not an authorization decision. Profiles disclose email only for active/pending-verification accounts, omit it for suspended/banned accounts, and return NotFound for deleting/deleted accounts; display name is currently empty.
+
+WebAuthn challenge and client-assertion replay stores remain separate single-process boundaries. Shared credential/RPC state does not claim complete multi-instance HTTP login readiness. See [API design](api-design.md#22-identityservice) for account freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifecycle/TTL details.

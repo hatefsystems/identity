@@ -1,0 +1,25 @@
+# Dockerfile-specific exclusions for the repository-root context.
+**
+!apps/
+!apps/identity-api/
+!apps/identity-api/**
+!libs/
+!libs/schemas/
+!libs/schemas/**
+
+# Generate these from source inside the image, never from a local stale copy.
+apps/identity-api/internal/db/
+libs/schemas/gen/
+
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/node_modules/
+**/bin/
+**/*.exe
+**/*.out
+**/*.test
+**/coverage.html
+**/Dockerfile
+**/*.dockerignore

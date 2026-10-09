@@ -80,13 +80,13 @@ type Transacter interface {
 // SessionRevoker kills every stateful browser session for an account.
 // *session.Manager satisfies it.
 type SessionRevoker interface {
-	RevokeAllForUser(userID string) error
+	RevokeAllForUser(ctx context.Context, userID string) error
 }
 
 // TokenRevoker kills every refresh-token family for an account.
 // token.RefreshTokenStore satisfies it.
 type TokenRevoker interface {
-	RevokeAllForUser(userID string) error
+	RevokeAllForUser(ctx context.Context, userID string) error
 }
 
 // PasskeyReclaimer runs the dedicated, distinctly tagged WebAuthn ceremony that a
@@ -749,8 +749,11 @@ func (s *Service) recordFailedAttempt(ctx context.Context, request db.DeletionRe
 // is bounded — an already-issued access token remains valid until it expires, at
 // most the access-token TTL (see the package doc).
 func (s *Service) revokeEverything(ctx context.Context, userID uuid.UUID) {
+	// Deletion has committed, so a disconnected caller must not cancel cleanup.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	if s.sessions != nil {
-		if err := s.sessions.RevokeAllForUser(userID.String()); err != nil {
+		if err := s.sessions.RevokeAllForUser(ctx, userID.String()); err != nil {
 			s.logger.Error("privacy: revoke sessions after deletion request",
 				slog.String("user_id", userID.String()), slog.String("error", err.Error()))
 			s.record(ctx, audit.Event{
@@ -763,7 +766,7 @@ func (s *Service) revokeEverything(ctx context.Context, userID uuid.UUID) {
 		}
 	}
 	if s.tokens != nil {
-		if err := s.tokens.RevokeAllForUser(userID.String()); err != nil {
+		if err := s.tokens.RevokeAllForUser(ctx, userID.String()); err != nil {
 			s.logger.Error("privacy: revoke refresh tokens after deletion request",
 				slog.String("user_id", userID.String()), slog.String("error", err.Error()))
 			s.record(ctx, audit.Event{

@@ -5,12 +5,9 @@
 // server-side, and hands the client a hardened cookie (see cookie.go) that
 // carries only the opaque token.
 //
-// Following the convention established by the token and DPoP packages, the
-// backing store is defined as an interface with an in-memory implementation
-// for the single-node MVP (memory.go). A Redis-backed implementation
-// (key session:token:{token_hash}, Hash type, 24h TTL per
-// docs/data-architecture.md §3.1) can be slotted in later behind the same
-// interface without touching the manager or handlers.
+// RedisStore is the shared session authority; MemoryStore is for isolated tests
+// and explicit single-process development. Missing state is never reconstructed
+// from a credential or a secondary index.
 //
 // Secrets are never stored raw: the store is keyed by the SHA-256 digest of
 // the session token (same technique as internal/oidc/token), so a dump of the
@@ -18,6 +15,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -51,6 +49,9 @@ var (
 	// ErrSessionNotFound indicates the session token is unknown, was revoked,
 	// or has expired (idle or absolute).
 	ErrSessionNotFound = errors.New("session: not found")
+	// ErrStoreUnavailable indicates a backend failure or corrupt stored state,
+	// not an authentication rejection. Context errors remain distinguishable.
+	ErrStoreUnavailable = errors.New("session: store unavailable")
 )
 
 // Session is the server-side state bound to an issued session token. It mirrors
@@ -98,39 +99,60 @@ type Session struct {
 // Store persists sessions keyed by the SHA-256 hash of the session token.
 // Implementations must be safe for concurrent use.
 type Store interface {
-	// Create stores s under tokenHash. It overwrites any existing entry for
-	// the same hash (hash collisions are cryptographically negligible).
-	Create(tokenHash string, s Session) error
+	// Create inserts a new session. Existing hashes or public IDs must not be
+	// overwritten; updates use the conditional operations below.
+	Create(ctx context.Context, tokenHash string, s Session) error
 	// Get returns the session for tokenHash. Expired sessions (idle or
 	// absolute) must be reported as ErrSessionNotFound and are eligible for
 	// reclamation, mirroring Redis TTL semantics.
-	Get(tokenHash string) (Session, error)
-	// Touch slides the idle expiry of the session identified by tokenHash to
-	// idleExpiry (already clamped to the absolute expiry by the caller). It is
-	// a no-op returning ErrSessionNotFound when the session is gone.
-	Touch(tokenHash string, idleExpiry time.Time) error
+	Get(ctx context.Context, tokenHash string) (Session, error)
+	// GetByID returns a live session only for its owner, without touching activity.
+	GetByID(ctx context.Context, userID, sessionID string) (Session, error)
+	// Touch advances activity without moving it backwards or extending absolute
+	// expiry. It returns ErrSessionNotFound when any required authority is gone.
+	Touch(ctx context.Context, tokenHash string, idleExpiry time.Time) error
 	// Delete removes the session identified by tokenHash. Deleting an unknown
 	// session is not an error (idempotent logout).
-	Delete(tokenHash string) error
+	Delete(ctx context.Context, tokenHash string) error
 	// ListForUser returns every live (non-expired) session belonging to
 	// userID, ordered newest-first. It is the backing for
 	// GET /api/v1/users/me/sessions.
-	ListForUser(userID string) ([]Session, error)
+	ListForUser(ctx context.Context, userID string) ([]Session, error)
 	// DeleteForUser removes the session with the given public ID only when it
 	// belongs to userID, and reports whether a session was removed. Scoping by
 	// userID prevents one user revoking another's session.
-	DeleteForUser(userID, sessionID string) (bool, error)
+	DeleteForUser(ctx context.Context, userID, sessionID string) (bool, error)
 	// DeleteAllForUser removes every session belonging to userID. It backs the
 	// "log out everywhere" action and the RTR breach response
 	// (docs/architecture.md "Refresh Token Rotation").
-	DeleteAllForUser(userID string) error
+	DeleteAllForUser(ctx context.Context, userID string) error
 	// ClaimRecoveryEnrollment atomically claims the live restricted session
 	// identified by its public ID. It returns false when the session is absent,
 	// expired, the wrong kind, or was already claimed.
-	ClaimRecoveryEnrollment(userID, sessionID string) (bool, error)
+	ClaimRecoveryEnrollment(ctx context.Context, userID, sessionID string) (bool, error)
 	// ReleaseRecoveryEnrollment releases a prior claim after a conclusively
 	// failed enrollment ceremony so the caller may retry.
-	ReleaseRecoveryEnrollment(userID, sessionID string) error
+	ReleaseRecoveryEnrollment(ctx context.Context, userID, sessionID string) error
+}
+
+// expired uses half-open lifetimes: a session is already dead at either deadline.
+func expired(s Session, at time.Time) bool {
+	return !at.Before(s.AbsoluteExpiry) || !at.Before(s.IdleExpiry)
+}
+
+func validSession(s Session) bool {
+	if s.ID == "" || s.UserID == "" || s.AuthVersion < 0 ||
+		(s.Kind != KindAuthenticated && s.Kind != KindRecoveryEnrollment) ||
+		(s.EnrollmentClaimed && s.Kind != KindRecoveryEnrollment) {
+		return false
+	}
+	for _, at := range []time.Time{s.CreatedAt, s.LastSeenAt, s.AbsoluteExpiry, s.IdleExpiry} {
+		if at.UnixNano() <= 0 || !time.Unix(0, at.UnixNano()).Equal(at) {
+			return false
+		}
+	}
+	return !s.LastSeenAt.Before(s.CreatedAt) && s.LastSeenAt.Before(s.IdleExpiry) &&
+		!s.IdleExpiry.After(s.AbsoluteExpiry)
 }
 
 // NewToken generates a 256-bit random session token encoded as base64url, plus

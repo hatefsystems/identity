@@ -330,14 +330,21 @@ $$\text{blind\_index} = \text{SHA-256}(\text{PII} \ + \ \text{secret\_pepper})$$
 
 ## 3. Redis Session & OTP Storage Layout
 
-Redis acts as a low-latency data cache for session tokens, DPoP nonces, and temporary state (such as OTP verification metadata).
+Redis provides low-latency credential authority and temporary state. Session/grant misses are not cache misses that may be reconstructed from a signed token. The table distinguishes the implemented Task 6.2 namespaces from other feature-specific state.
 
 ### 3.1 Redis Keyspaces & TTL Policies
 
 | Keyspace Pattern | Data Type | TTL Value | Purpose |
 | :--- | :--- | :--- | :--- |
-| `session:token:{token_hash}` | Hash | By session kind | Stored session meta: User ID, kind, IP, client device, DPoP key fingerprint, absolute/idle expiry, and the recovery-enrollment claim flag. Normal `authenticated` sessions use the configured lifetime; `recovery_enrollment` sessions have a hard ten-minute lifetime and may claim at most one replacement passkey. |
-| `dpop:jti:{jti}` | String | 60 Seconds | Caches the DPoP proof identifier `jti` to prevent replay attacks. |
+| `identity:session:v1:token:<token_hash>` | Hash | Remaining idle lifetime | User, kind, captured auth-version, IP/device metadata, key binding, absolute/idle times and restricted-enrollment claim. Normal sessions default to 2h idle / 24h absolute; restricted sessions have a hard 10-minute lifetime. |
+| `identity:session:v1:id:<n>:<user_id>:<session_id>` | String | Idle lifetime; revoked marker until absolute expiry | Owner-scoped public-ID lookup. `<n>` is the UTF-8 byte length of the user ID. Revoked markers prevent delayed creation retries from restoring authority. |
+| `identity:session:v1:user:<n>:<user_id>` | Hash | Latest indexed absolute expiry | Owner index for live-session lists and atomic account-wide session revocation. |
+| `identity:v1:oauth:code:<code_hash>` | String (JSON) | At most 60s, capped by parent absolute expiry | Single-use code with captured normal-session ID/version, client, redirect URI and PKCE challenge. Consumed with `GETDEL`. |
+| `identity:v1:oauth:grant:<grant_id>` | String (JSON) | Parent browser absolute expiry; client grant at most 10m | Immutable principal/client/scope/key/session/version binding and active/revoked state. Every access JWT references this authority. |
+| `identity:v1:oauth:refresh:<token_hash>` | String (JSON) | Grant lifetime | Active/rotated/revoked refresh metadata. Active-token expiry is checked separately; retired evidence survives while the grant can remain usable. Atomic rotation writes the successor and retires the old token together. |
+| `identity:v1:oauth:user:<user_id>` | ZSET | Latest grant expiry | Account-wide grant index, never a global key scan on the request path. |
+| `dpop:v1:replay:<scoped_hash>` | String | Complete acceptance window plus a rounded-up Redis millisecond | Hash of realm, verified JKT and JTI; includes allowed future-clock skew and proof-age skew rather than a fixed 60-second cache. |
+| `dpop:v1:nonce:<scoped_hash>` | String | 5 Minutes | Single-use nonce bound to the authorization-server or resource-origin realm and verified proof key. No raw proof, nonce or JTI is stored in a key. |
 | `otp:sms:secret:{verification_id}` | Hash | 3 Minutes | Pending phone proof addressed by a 256-bit opaque ID and bound to the exact user, initiating session, normalized phone, HMAC-SHA-256 code hash, issue time, and attempt counter. |
 | `recovery:transaction:{sha256(transaction_id)}` | String | 10 Minutes | One-time recovery-start subject. `GETDEL` consumes the transaction before the submitted recovery code is evaluated, so spent, invalid, and replayed transactions converge on the same failure surface. |
 | `rate:otp:phone:{phone}` | String | 1 Hour | Tracks SMS OTP requests made to a specific phone number. |
@@ -351,8 +358,27 @@ Redis acts as a low-latency data cache for session tokens, DPoP nonces, and temp
 > use Redis and every replica must share the same `STEPUP_REPLAY_HMAC_KEY`.
 > `SET NX` failures and Redis errors fail closed. The in-process replay guard is a
 > development-only fallback; it is not safe for horizontally scaled deployment.
-> The session store remains separately abstracted and may still use its documented
-> single-node MVP implementation.
+> Task 6.2 likewise uses shared Redis for browser sessions, OAuth codes/grants,
+> refresh families, and DPoP replay/nonces. Memory backing is only for explicit
+> development without Redis and with gRPC disabled; dependency failures never
+> trigger fallback. Multi-key session/grant operations require standalone Redis,
+> not Redis Cluster.
+
+User JWTs carry `principal_type`, `grant_id`, `sid`, and the captured numeric
+`auth_version`. A captured zero is valid; omission is not. Redis JSON stores
+versions as decimal strings to prevent Lua double rounding, and session hashes
+also preserve exact time/version strings. Each user-token RPC checks current
+primary-PostgreSQL status/version after reading Redis authority. Restrictions and
+reactivation therefore cannot restore old credentials after failed cache cleanup.
+Client grants have no user/session/version authority and do not perform a user
+lookup. No successful authorization decision is positively cached.
+
+Redis eviction/reset fails closed and requires reauthentication. Use appropriate
+ACLs/TLS and an eviction/availability policy suitable for authority, not a
+disposable performance cache. Never restore stale session/grant/replay snapshots
+after revocation; invalidate the namespace and require new authentication instead.
+WebAuthn challenge and client-assertion replay storage remain separate single-node
+boundaries; shared Task 6.2 state alone does not make every HTTP ceremony multi-node ready.
 
 ### 3.2 OTP Rate Limiting Structure
 
