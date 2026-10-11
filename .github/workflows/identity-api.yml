@@ -2,47 +2,44 @@ name: Identity API
 
 on:
   pull_request:
-    paths:
-      - 'apps/identity-api/**'
-      - 'libs/schemas/**'
-      - '.env.example'
-      - 'nx.json'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/identity-api.yml'
   push:
-    paths:
-      - 'apps/identity-api/**'
-      - 'libs/schemas/**'
-      - '.env.example'
-      - 'nx.json'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/identity-api.yml'
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CI: 'true'
+  NX_DAEMON: 'false'
+  NEXT_TELEMETRY_DISABLED: '1'
+
 concurrency:
   group: identity-api-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   quality:
     name: Generated code, tests, and static checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
+
+      - name: Validate image metadata
+        id: image
+        run: node .github/scripts/release-images.mjs metadata
 
       - name: Set up Go 1.26
         uses: actions/setup-go@v7
@@ -54,7 +51,7 @@ jobs:
 
       - name: Set up npm 11 and workspace dependencies
         run: |
-          npm install --global npm@11
+          npm install --global npm@11.21.0
           npm --version
           npm ci
 
@@ -85,6 +82,8 @@ jobs:
         run: npm exec -- nx run identity-api:test --skipNxCache
 
       - name: Run race detector
+        env:
+          CGO_ENABLED: '1'
         run: npm exec -- nx run identity-api:test-race --skipNxCache
 
       - name: Run go vet
@@ -92,6 +91,14 @@ jobs:
 
       - name: Run golangci-lint
         run: npm exec -- nx run identity-api:lint --skipNxCache
+
+      - name: Vet integration-tagged packages
+        env:
+          GOFLAGS: -tags=integration
+        run: npm exec -- nx run identity-api:vet --skipNxCache
+
+      - name: Lint integration-tagged packages
+        run: npm exec -- nx run identity-api:lint --skipNxCache --args='--build-tags=integration'
 
       - name: Build identity API
         run: npm exec -- nx run identity-api:build --skipNxCache
@@ -103,24 +110,38 @@ jobs:
         run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge -p identity-api --skipNxCache
 
       - name: Build non-root runtime image
-        run: docker build --file apps/identity-api/Dockerfile --tag identity-api:ci .
+        env:
+          IMAGE_SOURCE: ${{ steps.image.outputs.source }}
+          IMAGE_REVISION: ${{ steps.image.outputs.revision }}
+          IMAGE_VERSION: ${{ steps.image.outputs.version }}
+        run: >-
+          docker build --platform linux/amd64
+          --file apps/identity-api/Dockerfile --tag identity-api:ci
+          --label "org.opencontainers.image.source=$IMAGE_SOURCE"
+          --label "org.opencontainers.image.revision=$IMAGE_REVISION"
+          --label "org.opencontainers.image.version=$IMAGE_VERSION" .
 
       - name: Smoke-test packaged maintenance entrypoints without credentials
-        shell: bash
-        run: |
-          image=$(docker image inspect --format '{{.Id}}' identity-api:ci)
-          test "$(docker image inspect --format '{{.Config.User}}' "$image")" = 'nonroot:nonroot'
-          for binary in security-ledger-purge admin-audit-publisher admin-legal; do
-            status=0
-            output=$(docker run --rm --network none --entrypoint "/usr/local/bin/$binary" "$image" 2>&1) || status=$?
-            printf '%s\n' "$output"
-            test "$status" -eq 1
-            printf '%s\n' "$output" | grep -q '"level":"ERROR"'
-          done
+        run: node .github/scripts/smoke-image.mjs api identity-api:ci
+
+      - name: Export tested backend release image
+        if: steps.image.outputs.release == 'true'
+        run: node .github/scripts/release-images.mjs export api identity-api:ci "$RUNNER_TEMP/release-api"
+
+      - name: Upload tested backend release image
+        if: steps.image.outputs.release == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-api
+          path: ${{ runner.temp }}/release-api/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 1
+          overwrite: true
 
   security-db:
     name: PostgreSQL security integration tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Includes the serial legal-workflow and real-role suites; local runs of the
     # complete sequence exceed the former 20-minute budget.
     timeout-minutes: 45
@@ -158,6 +179,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
@@ -175,12 +198,18 @@ jobs:
 
       - name: Set up npm 11 and workspace dependencies
         run: |
-          npm install --global npm@11
+          npm install --global npm@11.21.0
           npm --version
           npm ci
 
       - name: Start disposable NATS JetStream
-        run: docker run --detach --name admin-test-nats --publish 127.0.0.1:4222:4222 nats:2.10-alpine -js
+        run: |
+          docker run --detach --name admin-test-nats \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.10-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 30 --retry-delay 1 \
+            --retry-connrefused --max-time 2 --retry-max-time 60 \
+            'http://127.0.0.1:8222/healthz?js-enabled-only=true'
 
       - name: Run serial database security tests
         run: npm exec -- nx run identity-api:test-security-db --skipNxCache
@@ -197,3 +226,151 @@ jobs:
 
       - name: Run mandatory gRPC and shared-credential integration tests
         run: npm exec -- nx run identity-api:test-grpc-integration --skipNxCache
+
+      - name: Collect disposable service diagnostics
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          docker logs "$POSTGRES_CONTAINER" || true
+          docker logs "$REDIS_CONTAINER" || true
+          docker logs admin-test-nats || true
+
+      - name: Remove disposable NATS container
+        if: always()
+        run: docker rm --force admin-test-nats || true
+
+  frontend:
+    name: Frontend checks and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Validate image metadata
+        id: image
+        run: node .github/scripts/release-images.mjs metadata
+
+      - name: Set up npm 11 and workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm --version
+          npm ci
+
+      - name: Test CI release and container policies
+        run: npm exec -- nx exec -p schemas -- node --test "$GITHUB_WORKSPACE"/.github/scripts/*.test.mjs
+
+      - name: Lint web and shared UI
+        run: npm exec -- nx run-many -t lint -p web,ui --skipNxCache
+
+      - name: Type-check shared UI
+        run: npm exec -- nx run ui:typecheck --skipNxCache
+
+      - name: Test shared UI
+        run: npm exec -- nx run ui:test --skipNxCache --ci --runInBand --coverage
+
+      - name: Test web
+        run: npm exec -- nx run web:test --skipNxCache --ci --runInBand --coverage
+
+      - name: Build production web app
+        run: npm exec -- nx run web:build --skipNxCache
+
+      - name: Build non-root web image
+        env:
+          IMAGE_SOURCE: ${{ steps.image.outputs.source }}
+          IMAGE_REVISION: ${{ steps.image.outputs.revision }}
+          IMAGE_VERSION: ${{ steps.image.outputs.version }}
+        run: >-
+          docker build --platform linux/amd64
+          --file apps/web/Dockerfile --tag identity-web:ci
+          --label "org.opencontainers.image.source=$IMAGE_SOURCE"
+          --label "org.opencontainers.image.revision=$IMAGE_REVISION"
+          --label "org.opencontainers.image.version=$IMAGE_VERSION" .
+
+      - name: Smoke-test standalone web image
+        run: node .github/scripts/smoke-image.mjs web identity-web:ci
+
+      - name: Export tested web release image
+        if: steps.image.outputs.release == 'true'
+        run: node .github/scripts/release-images.mjs export web identity-web:ci "$RUNNER_TEMP/release-web"
+
+      - name: Upload tested web release image
+        if: steps.image.outputs.release == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-web
+          path: ${{ runner.temp }}/release-web/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 1
+          overwrite: true
+
+      - name: Upload frontend coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-coverage
+          path: |
+            coverage/apps/web/
+            libs/ui/test-output/jest/coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    name: Publish release images
+    needs: [quality, security-db, frontend]
+    if: >-
+      github.repository == 'hatefsystems/identity' &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-release-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Download this run's tested images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified versions and promote stable aliases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/release-images.mjs publish "$RUNNER_TEMP/release"

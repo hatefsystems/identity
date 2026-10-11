@@ -275,7 +275,7 @@ func (f *authorityFixture) code(t *testing.T, replica int, browser session.Sessi
 	return url.Values{"grant_type": {token.GrantAuthorizationCode}, "client_id": {f.publicID}, "redirect_uri": {authorityRedirect}, "code": {code}, "code_verifier": {authorityVerifier}}
 }
 
-func (f *authorityFixture) exchange(t *testing.T, replica int, ctx context.Context, form url.Values) *token.Response {
+func (f *authorityFixture) exchange(ctx context.Context, t *testing.T, replica int, form url.Values) *token.Response {
 	t.Helper()
 	response, err := f.tokens[replica].Exchange(ctx, form)
 	if err != nil || response == nil || response.AccessToken == "" {
@@ -369,7 +369,7 @@ func TestTokenAuthorityCrossReplicaExchangeIntegration(t *testing.T) {
 				t.Fatalf("captured version did not survive Redis session storage: %v", err)
 			}
 			form := f.code(t, 0, browser)
-			issued := f.exchange(t, 1, f.ctx, form)
+			issued := f.exchange(f.ctx, t, 1, form)
 			claims := issuedClaims(t, issued.AccessToken)
 			if claims.AuthVersion == nil || *claims.AuthVersion != version || claims.SessionID != browser.ID || claims.ExpiresAt > browser.AbsoluteExpiry.Unix() {
 				t.Fatal("issuer changed the captured version/session or exceeded browser lifetime")
@@ -377,7 +377,7 @@ func TestTokenAuthorityCrossReplicaExchangeIntegration(t *testing.T) {
 			f.active(t, 0, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 			replayed, err := f.tokens[0].Exchange(f.ctx, form)
 			assertInvalidGrant(t, replayed, err)
-			rotated := f.exchange(t, 0, f.ctx, refreshForm(issued))
+			rotated := f.exchange(f.ctx, t, 0, refreshForm(issued))
 			f.active(t, 1, rotated, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 			f.active(t, 1, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 			old, err := f.refresh[1].Get(f.ctx, token.HashSecret(issued.RefreshToken))
@@ -392,7 +392,7 @@ func TestTokenAuthorityCrossReplicaExchangeIntegration(t *testing.T) {
 			if err != nil || !after.IdleExpiry.Equal(before.IdleExpiry) || !after.LastSeenAt.Equal(before.LastSeenAt) {
 				t.Fatalf("validation or refresh silently touched browser lifetime: %v", err)
 			}
-			machine := f.exchange(t, 0, f.ctx, url.Values{"grant_type": {token.GrantClientCredentials}, "client_id": {f.machineID}, "scope": {"objects.read"}})
+			machine := f.exchange(f.ctx, t, 0, url.Values{"grant_type": {token.GrantClientCredentials}, "client_id": {f.machineID}, "scope": {"objects.read"}})
 			if machine.RefreshToken != "" || issuedClaims(t, machine.AccessToken).AuthVersion != nil {
 				t.Fatal("machine credentials acquired user authority or a refresh token")
 			}
@@ -404,8 +404,8 @@ func TestTokenAuthorityCrossReplicaExchangeIntegration(t *testing.T) {
 func TestTokenAuthorityBrowserRevocationIntegration(t *testing.T) {
 	f := newAuthorityFixture(t, 0)
 	first, second := f.browser(t, 0, 0), f.browser(t, 1, 0)
-	one := f.exchange(t, 1, f.ctx, f.code(t, 0, first))
-	two := f.exchange(t, 0, f.ctx, f.code(t, 1, second))
+	one := f.exchange(f.ctx, t, 1, f.code(t, 0, first))
+	two := f.exchange(f.ctx, t, 0, f.code(t, 1, second))
 	f.active(t, 0, one, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 	removed, err := f.sessions[1].RevokeByID(f.ctx, f.userID.String(), first.ID)
 	if err != nil || !removed {
@@ -416,7 +416,7 @@ func TestTokenAuthorityBrowserRevocationIntegration(t *testing.T) {
 	refreshed, err := f.tokens[0].Exchange(f.ctx, refreshForm(one))
 	assertInvalidGrant(t, refreshed, err)
 	f.active(t, 1, two, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
-	f.exchange(t, 1, f.ctx, refreshForm(two))
+	f.exchange(f.ctx, t, 1, refreshForm(two))
 	if f.revocations.Load() != 0 {
 		t.Fatal("single-browser revocation incorrectly invalidated the whole account")
 	}
@@ -425,9 +425,9 @@ func TestTokenAuthorityBrowserRevocationIntegration(t *testing.T) {
 func TestTokenAuthorityRefreshReuseInvalidatesAccountIntegration(t *testing.T) {
 	f := newAuthorityFixture(t, largeAuthVersion)
 	first, second := f.browser(t, 0, largeAuthVersion), f.browser(t, 1, largeAuthVersion)
-	one := f.exchange(t, 1, f.ctx, f.code(t, 0, first))
-	two := f.exchange(t, 0, f.ctx, f.code(t, 1, second))
-	rotated := f.exchange(t, 0, f.ctx, refreshForm(one))
+	one := f.exchange(f.ctx, t, 1, f.code(t, 0, first))
+	two := f.exchange(f.ctx, t, 0, f.code(t, 1, second))
+	rotated := f.exchange(f.ctx, t, 0, refreshForm(one))
 	f.active(t, 1, rotated, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 	ctx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
 	defer cancel()
@@ -452,7 +452,7 @@ func TestTokenAuthorityRefreshReuseInvalidatesAccountIntegration(t *testing.T) {
 		}
 	}
 	fresh := f.browser(t, 0, state.AuthVersion)
-	reauthenticated := f.exchange(t, 1, f.ctx, f.code(t, 0, fresh))
+	reauthenticated := f.exchange(f.ctx, t, 1, f.code(t, 0, fresh))
 	f.active(t, 0, reauthenticated, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 	f.inactive(t, 0, one.AccessToken)
 	stale, err := f.tokens[1].IssueCodeContext(f.ctx, f.codeData(first))
@@ -498,8 +498,8 @@ func (b *refreshReadBarrier) ProcessHook(next redis.ProcessHook) redis.ProcessHo
 func TestTokenAuthorityConcurrentRefreshReuseIntegration(t *testing.T) {
 	f := newAuthorityFixture(t, 0)
 	first, second := f.browser(t, 0, 0), f.browser(t, 1, 0)
-	one := f.exchange(t, 1, f.ctx, f.code(t, 0, first))
-	two := f.exchange(t, 0, f.ctx, f.code(t, 1, second))
+	one := f.exchange(f.ctx, t, 1, f.code(t, 0, first))
+	two := f.exchange(f.ctx, t, 0, f.code(t, 1, second))
 	barrier := &refreshReadBarrier{key: "identity:v1:oauth:refresh:" + token.HashSecret(one.RefreshToken), ready: make(chan struct{})}
 	for _, client := range f.redis {
 		client.AddHook(barrier)
@@ -550,7 +550,7 @@ func TestTokenAuthorityConcurrentRefreshReuseIntegration(t *testing.T) {
 func TestTokenAuthoritySuspendReactivateIntegration(t *testing.T) {
 	f := newAuthorityFixture(t, 0)
 	browser := f.browser(t, 0, 0)
-	issued := f.exchange(t, 1, f.ctx, f.code(t, 0, browser))
+	issued := f.exchange(f.ctx, t, 1, f.code(t, 0, browser))
 	pendingCode := f.code(t, 0, browser)
 	f.active(t, 0, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 	for _, storedStatus := range []string{"suspended", "active"} {
@@ -582,7 +582,7 @@ func TestTokenAuthoritySuspendReactivateIntegration(t *testing.T) {
 		t.Fatalf("stale authentication version was restamped: %v", err)
 	}
 	fresh := f.browser(t, 1, state.AuthVersion)
-	reauthenticated := f.exchange(t, 0, f.ctx, f.code(t, 1, fresh))
+	reauthenticated := f.exchange(f.ctx, t, 0, f.code(t, 1, fresh))
 	f.active(t, 1, reauthenticated, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 	f.inactive(t, 1, issued.AccessToken)
 }
@@ -622,7 +622,7 @@ func TestTokenAuthorityBoundDPoPRoundtripIntegration(t *testing.T) {
 	// HTTP proof-validation tests are separate; this explicit verified context
 	// exercises the real internal issuance boundary, not a synthetic JWT.
 	verified := dpop.WithProof(f.ctx, &dpop.Proof{JKT: key.KID})
-	issued := f.exchange(t, 1, verified, f.code(t, 0, browser))
+	issued := f.exchange(verified, t, 1, f.code(t, 0, browser))
 	if issued.TokenType != token.TokenTypeDPoP {
 		t.Fatal("verified issuance context did not produce a bound token")
 	}
@@ -648,7 +648,7 @@ func TestTokenAuthorityBoundDPoPRoundtripIntegration(t *testing.T) {
 		response, err := f.tokens[0].Exchange(ctx, refreshForm(issued))
 		assertInvalidGrant(t, response, err)
 	}
-	rotated := f.exchange(t, 0, verified, refreshForm(issued))
+	rotated := f.exchange(verified, t, 0, refreshForm(issued))
 	record, err := f.refresh[1].Get(f.ctx, token.HashSecret(rotated.RefreshToken))
 	if err != nil || record.DPoPJKT != key.KID || f.revocations.Load() != 0 {
 		t.Fatalf("invalid proof burned refresh authority or changed its key: %v", err)
@@ -667,7 +667,7 @@ func TestTokenAuthorityStateFailuresIntegration(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			f := newAuthorityFixture(t, 0)
 			browser := f.browser(t, 0, 0)
-			issued := f.exchange(t, 1, f.ctx, f.code(t, 0, browser))
+			issued := f.exchange(f.ctx, t, 1, f.code(t, 0, browser))
 			f.active(t, 0, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 			key := "identity:v1:oauth:grant:" + issuedClaims(t, issued.AccessToken).GrantID
 			failingReplica := 0
@@ -694,7 +694,7 @@ func TestTokenAuthorityStateFailuresIntegration(t *testing.T) {
 				}
 				f.active(t, 1, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
 			case "primary DB connection":
-				machine := f.exchange(t, 0, f.ctx, url.Values{"grant_type": {token.GrantClientCredentials}, "client_id": {f.machineID}, "scope": {"objects.read"}})
+				machine := f.exchange(f.ctx, t, 0, url.Values{"grant_type": {token.GrantClientCredentials}, "client_id": {f.machineID}, "scope": {"objects.read"}})
 				f.pools[1].Close()
 				failingReplica = 1
 				f.active(t, 0, issued, identityv1.PrincipalType_PRINCIPAL_TYPE_USER, f.userID.String())
