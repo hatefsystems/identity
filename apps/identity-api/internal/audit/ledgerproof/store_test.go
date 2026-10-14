@@ -58,9 +58,12 @@ func TestSnapshotReadOnlyRepeatableReadSeparateAndBounded(t *testing.T) {
 	tx := &snapshotTx{queryErr: pgx.ErrNoRows}
 	pool := &snapshotPool{tx: tx}
 	start := time.Now()
-	r, err := VerifySnapshot(context.Background(), pool, Params{Limit: 10})
-	if err != nil || r.Verified || r.FailureReason == nil || *r.FailureReason != "missing_head" {
-		t.Fatalf("%+v %v", r, err)
+	// An uninitialized head is an error, not a clean "unverified" result: v2
+	// refuses to report on a chain whose tip it cannot establish, rather than
+	// treating the absence as genesis.
+	_, err := VerifySnapshot(context.Background(), pool, Params{Chain: ChainLedger, Limit: 10})
+	if !errors.Is(err, ErrMissingHead) {
+		t.Fatalf("error = %v, want ErrMissingHead", err)
 	}
 	if pool.options.IsoLevel != pgx.RepeatableRead || pool.options.AccessMode != pgx.ReadOnly {
 		t.Fatalf("options %+v", pool.options)
@@ -87,7 +90,7 @@ func TestSnapshotFailureAndCancelledCleanup(t *testing.T) {
 			if phase == "setup" {
 				tx.execErr = failure
 			}
-			_, err := VerifySnapshot(ctx, pool, Params{Limit: 1})
+			_, err := VerifySnapshot(ctx, pool, Params{Chain: ChainLedger, Limit: 1})
 			if !errors.Is(err, failure) {
 				t.Fatal(err)
 			}

@@ -65,14 +65,8 @@ type AdminStore interface {
 	AssignRoleToUser(ctx context.Context, arg db.AssignRoleToUserParams) error
 	ListUserRoles(ctx context.Context, userID uuid.UUID) ([]db.Role, error)
 
-	ListAuditLogs(ctx context.Context, arg db.ListAuditLogsParams) ([]db.MvpAuditLog, error)
+	ListAuditLogs(ctx context.Context, arg db.ListAuditLogsParams) ([]db.ListAuditLogsRow, error)
 	CountAuditLogs(ctx context.Context, arg db.CountAuditLogsParams) (int64, error)
-	ListAuditLogsForChainVerification(ctx context.Context, arg db.ListAuditLogsForChainVerificationParams) ([]db.MvpAuditLog, error)
-	GetAuditLogChainHashBySeq(ctx context.Context, seq int64) (string, error)
-	GetAuditLogHighWaterSeq(ctx context.Context) (int64, error)
-	ListSecurityEventsForChainVerification(ctx context.Context, arg db.ListSecurityEventsForChainVerificationParams) ([]db.SecurityEventLedger, error)
-	GetSecurityEventChainHashBySeq(ctx context.Context, seq int64) (string, error)
-	GetSecurityEventHighWaterSeq(ctx context.Context) (int64, error)
 
 	HasActiveLegalHold(ctx context.Context, accountRef uuid.UUID) (bool, error)
 }
@@ -161,6 +155,7 @@ type adminAuditLogResponse struct {
 	UserAgent       string     `json:"user_agent"`
 	Payload         string     `json:"payload"`
 	Timestamp       *time.Time `json:"timestamp"`
+	SHA256LeafHash  string     `json:"sha256_leaf_hash"`
 	SHA256ChainHash string     `json:"sha256_chain_hash"`
 	Seq             int64      `json:"seq"`
 }
@@ -174,7 +169,7 @@ type adminChainVerifyResponse struct {
 	SeedHash      string  `json:"seed_hash"`
 	SeedSource    string  `json:"seed_source"`
 	Scope         string  `json:"scope"`
-	LastHash      *string `json:"last_hash"`
+	LastHash      string  `json:"last_hash"`
 	Complete      bool    `json:"complete"`
 	// Verified is false as soon as any row's recomputed digest differs.
 	Verified bool `json:"verified"`
@@ -195,13 +190,18 @@ type adminChainVerifyResponse struct {
 	NextAfterSeq *int64 `json:"next_after_seq"`
 }
 
-// adminLedgerVerifyResponse distinguishes recomputed content from erased proof.
+// adminLedgerVerifyResponse adds the erasure accounting that only the ledger
+// chain currently produces.
+//
+// v1 reported purged_count, purged_spans, proof_steps and restart_required: all
+// four described the checkpoint bridging a removed chain link required. v2 has no
+// removed links, so the only remaining question about an erased record is whether
+// its absence was authorized — which erased_checked answers, and which a
+// verification failure of "payload_absent_without_erasure_record" reports when it
+// was not.
 type adminLedgerVerifyResponse struct {
 	adminChainVerifyResponse
-	PurgedCount     int64 `json:"purged_count"`
-	PurgedSpans     int   `json:"purged_spans"`
-	ProofSteps      int   `json:"proof_steps"`
-	RestartRequired bool  `json:"restart_required"`
+	ErasedChecked int `json:"erased_checked"`
 }
 
 // writeAdminError writes the uniform admin error envelope with no-store.

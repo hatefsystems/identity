@@ -265,7 +265,14 @@ func buildBlindIndexer(environment string, logger *slog.Logger) (*blindindex.Ind
 			slog.String("error", err.Error()))
 		return nil, false
 	}
-	indexer, err := blindindex.New(pepper)
+	pepperVersion, err := config.LoadBlindIndexPepperVersion()
+	if err != nil {
+		logger.Error("audit-signer: blind index pepper version invalid; ledger rows will have a NULL identity_blind_index",
+			slog.String("environment", environment),
+			slog.String("error", err.Error()))
+		return nil, false
+	}
+	indexer, err := blindindex.New(pepper, pepperVersion)
 	if err != nil {
 		logger.Error("audit-signer: blind indexer unavailable; ledger rows will have a NULL identity_blind_index",
 			slog.String("environment", environment),

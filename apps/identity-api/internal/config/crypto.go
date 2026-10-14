@@ -29,14 +29,25 @@ type CryptoConfig struct {
 	// SHA-256 blind index. Sourced from ENVELOPE_BLIND_INDEX_PEPPER
 	// (base64-encoded).
 	BlindIndexPepper []byte
+	// BlindIndexPepperVersion is the generation number stamped alongside every
+	// blind index and hashed into the security ledger's signed body. Sourced
+	// from ENVELOPE_BLIND_INDEX_PEPPER_VERSION (defaults to 0, the
+	// pre-rotation generation).
+	//
+	// Rotating the pepper means provisioning new material and incrementing this
+	// number. Historical rows keep their recorded generation, so a lawful-inquiry
+	// lookup can compute one candidate digest per retained generation instead of
+	// losing the lookup path entirely.
+	BlindIndexPepperVersion int16
 }
 
 // Environment variable names for the crypto secrets. Kept as constants so the
 // loader and tests agree on the exact keys (matching devops-operations.md).
 const (
-	EnvMasterKEK        = "ENVELOPE_MASTER_KEK"
-	EnvMasterKEKVersion = "ENVELOPE_MASTER_KEK_VERSION"
-	EnvBlindIndexPepper = "ENVELOPE_BLIND_INDEX_PEPPER"
+	EnvMasterKEK               = "ENVELOPE_MASTER_KEK"
+	EnvMasterKEKVersion        = "ENVELOPE_MASTER_KEK_VERSION"
+	EnvBlindIndexPepper        = "ENVELOPE_BLIND_INDEX_PEPPER"
+	EnvBlindIndexPepperVersion = "ENVELOPE_BLIND_INDEX_PEPPER_VERSION"
 )
 
 // kekSizeBytes is the required decoded length of the master KEK (AES-256).
@@ -59,6 +70,11 @@ func LoadCrypto() (CryptoConfig, error) {
 		return CryptoConfig{}, err
 	}
 	cfg.BlindIndexPepper = pepper
+	version, err := LoadBlindIndexPepperVersion()
+	if err != nil {
+		return CryptoConfig{}, err
+	}
+	cfg.BlindIndexPepperVersion = version
 	return cfg, nil
 }
 
@@ -110,4 +126,28 @@ func LoadBlindIndexPepper() ([]byte, error) {
 		return nil, fmt.Errorf("config: %s must decode to at least %d bytes, got %d", EnvBlindIndexPepper, minPepperBytes, len(pepper))
 	}
 	return pepper, nil
+}
+
+// maxBlindIndexPepperVersion bounds the generation number at the SMALLINT column
+// width it is stored in.
+const maxBlindIndexPepperVersion = 32767
+
+// LoadBlindIndexPepperVersion reads the pepper generation, defaulting to 0.
+//
+// The default is 0 rather than 1 so that deployments predating pepper versioning
+// keep producing the generation their existing rows already record. Defaulting to
+// 1 would silently claim a rotation that never happened.
+func LoadBlindIndexPepperVersion() (int16, error) {
+	raw, ok := os.LookupEnv(EnvBlindIndexPepperVersion)
+	if !ok || raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: invalid %s %q: %w", EnvBlindIndexPepperVersion, raw, err)
+	}
+	if v < 0 || v > maxBlindIndexPepperVersion {
+		return 0, fmt.Errorf("config: %s %d out of range (0-%d)", EnvBlindIndexPepperVersion, v, maxBlindIndexPepperVersion)
+	}
+	return int16(v), nil
 }

@@ -57,7 +57,12 @@ func ProbeMaintenance(ctx context.Context, tx pgx.Tx) error {
       AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY[
         'users','roles','permissions','user_roles','role_permissions','legal_holds',
         'legal_governance_policies','legal_governance_baseline','mvp_audit_logs','security_event_ledger',
-        'security_ledger_head','security_ledger_checkpoints','security_ledger_retention_settings',
+        -- Canonical format v2: the chain and erasure tables replaced
+        -- security_ledger_checkpoints. They are the tamper-evidence and the proof
+        -- that an erasure was lawful, so the workflow maintenance login must hold
+        -- nothing on them at all.
+        'audit_log_chain','security_ledger_chain','security_ledger_erasures',
+        'security_ledger_head','audit_log_head','security_ledger_retention_settings',
         'legal_transparency_coverage','legal_transparency_years','legal_transparency_months',
         'legal_transparency_reports','legal_transparency_replays']) AS protected(name)
         WHERE has_table_privilege(current_user,name,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER')
@@ -70,7 +75,9 @@ func ProbeMaintenance(ctx context.Context, tx pgx.Tx) error {
       AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY['operation','scope','idempotency_key','result_id']) AS immutable(name)
         WHERE has_column_privilege(current_user,'legal_workflow_replays',name,'UPDATE'))
       AND NOT has_any_column_privilege(current_user,'event_outbox','UPDATE')
-      AND NOT EXISTS(SELECT 1 FROM pg_proc p WHERE p.proname IN ('purge_security_ledger_batch','advance_security_ledger_head') AND has_function_privilege(current_user,p.oid,'EXECUTE'))`).Scan(&safe)
+      AND NOT EXISTS(SELECT 1 FROM pg_proc p WHERE p.proname IN
+        ('advance_chain_head','chain_table_guard','security_event_ledger_guard','mvp_audit_logs_guard')
+        AND has_function_privilege(current_user,p.oid,'EXECUTE'))`).Scan(&safe)
 	if err != nil || !safe {
 		return ErrUnavailable
 	}

@@ -31,11 +31,11 @@ func (r fixtureReader) QueryRow(context.Context, string, ...any) pgx.Row { retur
 
 func TestLookupFixtureRejectsMissingAndMismatchedSignerKeys(t *testing.T) {
 	id := uuid.New()
-	indexer, err := blindindex.New([]byte(strings.Repeat("a", 32)))
+	indexer, err := blindindex.New([]byte(strings.Repeat("a", 32)), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := blindindex.New([]byte(strings.Repeat("b", 32)))
+	other, err := blindindex.New([]byte(strings.Repeat("b", 32)), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

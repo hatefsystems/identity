@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
@@ -55,7 +56,38 @@ func openRecoveryHandlerIntegrationPool(ctx context.Context, t *testing.T) *pgxp
 		t.Fatalf("ping PostgreSQL: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	bootstrapChainHeads(ctx, t, pool)
 	return pool
+}
+
+// bootstrapChainHeads performs the one-time head initialization that an operator
+// runs in production (docs/admin-operations.md).
+//
+// Canonical format v2 requires it before anything reads or writes either chain:
+// an uninitialized head and a genuinely empty chain are different states, and
+// refusing to conflate them is what stops a signer from restarting at genesis
+// over existing history. v1 needed no audit head at all, because the audit tip
+// was inferred from the table — which was only safe while audit rows could never
+// be erased.
+//
+//nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
+func bootstrapChainHeads(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.security_ledger_head(singleton,seq,chain_hash) VALUES (true,0,$1)
+		 ON CONFLICT (singleton) DO NOTHING`, audit.LedgerGenesis().Bytes()); err != nil {
+		t.Fatalf("bootstrap ledger head: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.audit_log_head(singleton,seq,chain_hash) VALUES (true,0,$1)
+		 ON CONFLICT (singleton) DO NOTHING`, audit.AuditGenesis().Bytes()); err != nil {
+		t.Fatalf("bootstrap audit head: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.security_ledger_retention_settings(singleton,audit_subject) VALUES (true,'identity.audit.logs')
+		 ON CONFLICT (singleton) DO NOTHING`); err != nil {
+		t.Fatalf("bootstrap retention subject: %v", err)
+	}
 }
 
 func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testing.T) {

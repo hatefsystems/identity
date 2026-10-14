@@ -51,10 +51,15 @@ type Fetcher interface {
 	Fetch(batch int, opts ...jetstream.FetchOpt) (jetstream.MessageBatch, error)
 }
 
-// BlindIndexer derives the ledger's identity_blind_index.
-// *blindindex.Indexer satisfies it.
+// BlindIndexer derives the ledger's identity_blind_index and reports which
+// pepper generation produced it. *blindindex.Indexer satisfies it.
+//
+// Version is part of the interface because the digest alone is not enough: the
+// generation is hashed into the signed ledger body, so a row written without it
+// could never be re-derived after a pepper rotation.
 type BlindIndexer interface {
 	Compute(pii string) string
+	Version() int16
 }
 
 // Config carries the signer's batching and retention policy.
@@ -97,11 +102,13 @@ type Signer struct {
 	logger   *slog.Logger
 	now      func() time.Time
 
-	// auditTip is cached while the daemon holds the single-writer lock. ledgerTip
-	// records the last observed logical head; every batch re-reads it under the
-	// ledger coordination lock rather than trusting surviving payload rows.
-	auditTip    [sha256.Size]byte
-	ledgerTip   [sha256.Size]byte
+	// Both tips and their head sequences are re-read from the durable head rows
+	// at the start of every batch, under the coordination lock. Caching them
+	// across batches would make a failed commit's uncertainty unrecoverable.
+	auditTip    audit.Digest
+	ledgerTip   audit.Digest
+	auditSeq    int64
+	ledgerSeq   int64
 	tipsUnknown bool
 }
 
@@ -246,42 +253,61 @@ func (s *Signer) RunUntilDone(ctx context.Context) error {
 	}
 }
 
-// seedChainTips reads both chain tips from the database.
+// seedChainTips reads both durable heads and verifies the ledger chain before the
+// signer appends to it.
 func (s *Signer) seedChainTips(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, BatchTimeout)
 	defer cancel()
-	// Class C cannot be purged and the daemon lock excludes another signer.
-	// Read it before opening a transaction so even a one-connection pool works.
-	auditTip, err := s.readTip(ctx, s.store.GetLatestAuditLogChainHash)
-	if err != nil {
-		return fmt.Errorf("signer: read audit chain tip: %w", err)
-	}
 	tx, err := s.opener.BeginBatch(ctx)
 	if err != nil {
 		return err
 	}
 	defer s.rollbackBatch(ctx, tx)
+	auditSeq, auditTip, err := readAuditHead(ctx, tx.Store())
+	if err != nil {
+		return fmt.Errorf("signer: read audit chain head: %w", err)
+	}
 	ledgerSeq, ledgerTip, err := readLedgerHead(ctx, tx.Store())
 	if err != nil {
-		return fmt.Errorf("signer: read ledger chain tip: %w", err)
+		return fmt.Errorf("signer: read ledger chain head: %w", err)
 	}
 	if err := tx.ValidateLedgerState(ctx, ledgerSeq); err != nil {
 		return fmt.Errorf("signer: verify ledger state: %w", err)
 	}
-	s.auditTip = auditTip
-	s.ledgerTip = ledgerTip
+	s.auditSeq, s.auditTip = auditSeq, auditTip
+	s.ledgerSeq, s.ledgerTip = ledgerSeq, ledgerTip
 	s.tipsUnknown = false
 	return nil
 }
 
-func readLedgerHead(ctx context.Context, store Store) (int64, [sha256.Size]byte, error) {
-	head, err := store.GetSignerLedgerHead(ctx)
+// readAuditHead reads the audit chain's durable head.
+//
+// A missing or inconsistent head is fatal rather than being treated as genesis.
+// Both chains now get the same treatment: under v1 the audit tip was read with
+// ORDER BY seq DESC LIMIT 1 and an empty table was accepted as genesis, which was
+// only safe while audit rows were un-purgeable. The split makes a Class C
+// retention policy possible, so "the table looks empty" must stop meaning "this
+// chain has never been written".
+func readAuditHead(ctx context.Context, store Store) (int64, audit.Digest, error) {
+	head, err := store.GetAuditLogHead(ctx)
 	if err != nil {
-		return 0, [sha256.Size]byte{}, fmt.Errorf("%w: read head: %w", ErrLedgerStateInvalid, err)
+		return 0, audit.Digest{}, fmt.Errorf("%w: read audit head: %w", ErrLedgerStateInvalid, err)
 	}
-	tip, err := audit.DecodeChainHash(head.ChainHash)
-	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.GenesisChainHash) {
-		return 0, [sha256.Size]byte{}, ErrLedgerStateInvalid
+	tip, err := audit.DecodeDigest(head.ChainHash)
+	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.AuditGenesis()) {
+		return 0, audit.Digest{}, ErrLedgerStateInvalid
+	}
+	return head.Seq, tip, nil
+}
+
+func readLedgerHead(ctx context.Context, store Store) (int64, audit.Digest, error) {
+	head, err := store.GetSecurityLedgerHead(ctx)
+	if err != nil {
+		return 0, audit.Digest{}, fmt.Errorf("%w: read head: %w", ErrLedgerStateInvalid, err)
+	}
+	tip, err := audit.DecodeDigest(head.ChainHash)
+	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.LedgerGenesis()) {
+		return 0, audit.Digest{}, ErrLedgerStateInvalid
 	}
 	return head.Seq, tip, nil
 }
@@ -294,18 +320,6 @@ func (s *Signer) rollbackBatch(ctx context.Context, tx BatchTx) {
 	}
 }
 
-// readTip fetches one chain tip, treating an empty table as genesis.
-func (s *Signer) readTip(ctx context.Context, get func(context.Context) (string, error)) ([sha256.Size]byte, error) {
-	stored, err := get(ctx)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return audit.GenesisChainHash, nil
-	}
-	if err != nil {
-		return audit.GenesisChainHash, err
-	}
-	return audit.DecodeChainHash(stored)
-}
-
 // batchStats is the per-batch observability record. It is one log line rather than
 // Prometheus counters because this repo has no metrics endpoint yet (Task 5.2 D6);
 // log-based alerting keys off these fields until it does.
@@ -315,8 +329,17 @@ type batchStats struct {
 	ledgerRowsWritten int
 	duplicatesSkipped int
 	quarantined       int
-	ledgerSkipped     int
-	streamPending     uint64
+	// ledgerUnattributable counts Class B events that could NOT be written to the
+	// ledger because their attribution was unusable. It deliberately does not
+	// count ordinary audit-only events.
+	//
+	// v1 reported `ledger_rows_skipped = kept - ledgerRows`, which is large in
+	// normal operation because most audit events are not Class B at all. That made
+	// the number useless for alerting and hid the condition that actually matters:
+	// an event declared as a ledger type whose account_ref cannot be resolved, so
+	// attribution evidence is silently lost.
+	ledgerUnattributable int
+	streamPending        uint64
 }
 
 // processBatch decodes, chains, and persists one batch, then acknowledges it.
@@ -354,9 +377,14 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 
 	store := tx.Store()
 
-	// BeginBatch holds the ledger lock before any account/subject lock. A separate
+	// BeginBatch holds the ledger lock before any account/subject lock. Both heads
+	// are re-read here rather than trusted from the previous batch: a separate
 	// READ COMMITTED statement sees the latest committed head after a lock wait.
-	auditTip := s.auditTip
+	auditSeq, auditTip, err := readAuditHead(batchCtx, store)
+	if err != nil {
+		s.nakAll(msgs)
+		return err
+	}
 	ledgerSeq, ledgerTip, err := readLedgerHead(batchCtx, store)
 	if err != nil {
 		s.nakAll(msgs)
@@ -375,6 +403,17 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		return err
 	}
 	stats.duplicatesSkipped = skipped
+	if len(kept) == 0 {
+		// Nothing new survived deduplication. Commit so the (empty) transaction
+		// releases its locks, then settle the messages: they are already durable.
+		if err := tx.Commit(batchCtx); err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: commit empty batch: %w", err)
+		}
+		s.acknowledge(outcomes)
+		s.logBatch(stats, s.now().Sub(started))
+		return nil
+	}
 
 	subjectIDs := make([]uuid.UUID, 0, len(kept))
 	accountIDs := make([]uuid.UUID, 0, 2*len(kept))
@@ -405,71 +444,160 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		}
 	}
 
-	auditRows := make([]db.InsertAuditLogsParams, 0, len(kept))
-	ledgerRows := make([]db.InsertSecurityEventsParams, 0, len(kept))
+	// Resolve ledger attribution before allocating sequences, because only the
+	// subset that produces a ledger row consumes a ledger position. Allocating
+	// per-record and discarding the unused values would leave gaps that are
+	// harmless but make an operator's "is my chain contiguous?" check useless.
+	type ledgerPending struct {
+		record     audit.LedgerRecord
+		blindIndex *string
+		version    int16
+	}
+	ledgerQueue := make([]ledgerPending, 0, len(kept))
 	blindIndexes := make(map[uuid.UUID]*string, len(kept))
+	ledgerContexts := make([]*ledgerContext, len(kept))
+	for i, rec := range kept {
+		lc, ok, resolveErr := s.resolveLedgerContext(rec.envelope)
+		if resolveErr != nil {
+			stats.ledgerUnattributable++
+		}
+		if !ok {
+			continue
+		}
+		ctxCopy := lc
+		ledgerContexts[i] = &ctxCopy
+	}
 
-	for _, rec := range kept {
+	auditSeqs, err := store.AllocateAuditLogSeqs(batchCtx, int32(len(kept))) //nolint:gosec // G115: bounded by BatchSize.
+	if err != nil {
+		s.nakAll(msgs)
+		return fmt.Errorf("signer: allocate audit chain positions: %w", err)
+	}
+	if len(auditSeqs) != len(kept) {
+		s.nakAll(msgs)
+		return fmt.Errorf("signer: allocated %d audit positions for %d records", len(auditSeqs), len(kept))
+	}
+
+	auditChain := make([]db.InsertAuditLogChainParams, 0, len(kept))
+	auditRows := make([]db.InsertAuditLogsParams, 0, len(kept))
+
+	for i, rec := range kept {
 		env := rec.envelope
 		// Covers old queued envelopes and synthetic events as well as new producers.
 		env.OccurredAt = audit.NormalizeChainTime(env.OccurredAt)
 
-		auditRec := env.AuditRecord()
-		auditHash := audit.ChainHash(auditTip, audit.SerializeAudit(auditRec))
-		nextAuditTip, err := audit.DecodeChainHash(auditHash)
+		leafHash, err := audit.LeafAudit(env.AuditRecord())
 		if err != nil {
-			// Unreachable: ChainHash always returns 64 hex characters. Handled rather
-			// than ignored so a future change cannot silently corrupt the chain.
 			s.nakAll(msgs)
-			return fmt.Errorf("signer: decode computed audit chain hash: %w", err)
+			return fmt.Errorf("signer: serialize audit record: %w", err)
 		}
-		auditTip = nextAuditTip
-		row := buildAuditRow(env, auditHash)
+		auditTip = audit.ChainAudit(auditTip, leafHash)
+		seq := auditSeqs[i]
+		auditChain = append(auditChain, db.InsertAuditLogChainParams{
+			Seq:       seq,
+			EventID:   env.EventID,
+			LeafHash:  leafHash.Bytes(),
+			ChainHash: auditTip.Bytes(),
+		})
+		row := buildAuditRow(env, seq)
 		if !liveSubjects[row.UserID.UUID] {
 			row.UserID = uuid.NullUUID{}
 		}
 		auditRows = append(auditRows, row)
 
-		ledgerCtx, ok := s.resolveLedgerContext(env)
-		if !ok {
+		lc := ledgerContexts[i]
+		if lc == nil {
 			continue
 		}
-
-		blindIndex := ledgerCtx.identityBlindIndex
+		blindIndex := lc.identityBlindIndex
+		version := lc.blindIndexVersion
 		if blindIndex == nil {
-			blindIndex, err = s.blindIndexFor(batchCtx, store, blindIndexes, ledgerCtx.accountRef)
+			blindIndex, err = s.blindIndexFor(batchCtx, store, blindIndexes, lc.accountRef)
 			if err != nil {
 				s.nakAll(msgs)
 				return err
 			}
+			if blindIndex != nil && s.indexer != nil {
+				version = s.indexer.Version()
+			}
 		}
+		ledgerQueue = append(ledgerQueue, ledgerPending{
+			record:     s.buildLedgerRecord(env, *lc, blindIndex, version),
+			blindIndex: blindIndex,
+			version:    version,
+		})
+	}
 
-		ledgerRec := s.buildLedgerRecord(env, ledgerCtx, blindIndex)
-		ledgerHash := audit.ChainHash(ledgerTip, audit.SerializeLedger(ledgerRec))
-		nextLedgerTip, err := audit.DecodeChainHash(ledgerHash)
+	ledgerChain := make([]db.InsertSecurityLedgerChainParams, 0, len(ledgerQueue))
+	ledgerRows := make([]db.InsertSecurityEventsParams, 0, len(ledgerQueue))
+	if len(ledgerQueue) > 0 {
+		ledgerSeqs, err := store.AllocateSecurityLedgerSeqs(batchCtx, int32(len(ledgerQueue))) //nolint:gosec // G115: bounded by BatchSize.
 		if err != nil {
 			s.nakAll(msgs)
-			return fmt.Errorf("signer: decode computed ledger chain hash: %w", err)
+			return fmt.Errorf("signer: allocate ledger chain positions: %w", err)
 		}
-		ledgerTip = nextLedgerTip
-		ledgerRows = append(ledgerRows, buildLedgerRow(ledgerRec, ledgerHash))
+		if len(ledgerSeqs) != len(ledgerQueue) {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: allocated %d ledger positions for %d records", len(ledgerSeqs), len(ledgerQueue))
+		}
+		for i, item := range ledgerQueue {
+			leafHash, err := audit.LeafLedger(item.record)
+			if err != nil {
+				s.nakAll(msgs)
+				return fmt.Errorf("signer: serialize ledger record: %w", err)
+			}
+			ledgerTip = audit.ChainLedger(ledgerTip, leafHash)
+			eventID, parseErr := uuid.Parse(item.record.ID)
+			if parseErr != nil {
+				s.nakAll(msgs)
+				return fmt.Errorf("signer: ledger record id %q: %w", item.record.ID, parseErr)
+			}
+			ledgerChain = append(ledgerChain, db.InsertSecurityLedgerChainParams{
+				Seq:       ledgerSeqs[i],
+				EventID:   eventID,
+				LeafHash:  leafHash.Bytes(),
+				ChainHash: ledgerTip.Bytes(),
+			})
+			ledgerRows = append(ledgerRows, buildLedgerRow(item.record, ledgerSeqs[i]))
+		}
 	}
-	stats.ledgerSkipped = len(kept) - len(ledgerRows)
 
-	if len(auditRows) > 0 {
+	// Chain nodes first: the payload rows reference them.
+	if len(auditChain) > 0 {
+		if _, err := store.InsertAuditLogChain(batchCtx, auditChain); err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: copy audit chain nodes: %w", err)
+		}
 		if _, err := store.InsertAuditLogs(batchCtx, auditRows); err != nil {
 			s.nakAll(msgs)
 			return fmt.Errorf("signer: copy audit rows: %w", err)
 		}
+		if err := store.AdvanceChainHead(batchCtx, db.AdvanceChainHeadParams{
+			Which:       "audit",
+			ExpectedSeq: auditSeq,
+			FirstSeq:    auditChain[0].Seq,
+			LastSeq:     auditChain[len(auditChain)-1].Seq,
+			NodeCount:   int64(len(auditChain)),
+		}); err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: advance audit head: %w", err)
+		}
 	}
-	if len(ledgerRows) > 0 {
+	if len(ledgerChain) > 0 {
+		if _, err := store.InsertSecurityLedgerChain(batchCtx, ledgerChain); err != nil {
+			s.nakAll(msgs)
+			return fmt.Errorf("signer: copy ledger chain nodes: %w", err)
+		}
 		if _, err := store.InsertSecurityEvents(batchCtx, ledgerRows); err != nil {
 			s.nakAll(msgs)
 			return fmt.Errorf("signer: copy ledger rows: %w", err)
 		}
-		if err := store.AdvanceSecurityLedgerHead(batchCtx, db.AdvanceSecurityLedgerHeadParams{
+		if err := store.AdvanceChainHead(batchCtx, db.AdvanceChainHeadParams{
+			Which:       "ledger",
 			ExpectedSeq: ledgerSeq,
-			TerminalID:  ledgerRows[len(ledgerRows)-1].ID,
+			FirstSeq:    ledgerChain[0].Seq,
+			LastSeq:     ledgerChain[len(ledgerChain)-1].Seq,
+			NodeCount:   int64(len(ledgerChain)),
 		}); err != nil {
 			s.nakAll(msgs)
 			return fmt.Errorf("signer: advance ledger head: %w", err)
@@ -492,8 +620,13 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		return fmt.Errorf("signer: commit batch: %w", err)
 	}
 
-	s.auditTip = auditTip
-	s.ledgerTip = ledgerTip
+	s.auditTip, s.ledgerTip = auditTip, ledgerTip
+	if len(auditChain) > 0 {
+		s.auditSeq = auditChain[len(auditChain)-1].Seq
+	}
+	if len(ledgerChain) > 0 {
+		s.ledgerSeq = ledgerChain[len(ledgerChain)-1].Seq
+	}
 	stats.eventsWritten = len(auditRows)
 	stats.ledgerRowsWritten = len(ledgerRows)
 
@@ -682,38 +815,42 @@ type ledgerContext struct {
 	scope              string
 	deviceFingerprint  string
 	identityBlindIndex *string
+	blindIndexVersion  int16
 }
 
 // resolveLedgerContext decides whether an envelope produces a ledger row.
 //
-// Both mismatch directions are reported rather than silently accepted, because both
-// are bugs with compliance consequences: a declared ledger event with no usable
-// account loses attribution evidence, and a ledger event type published without
-// SecurityContext means a call site forgot the declaration.
-func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool) {
+// It returns (context, produceRow, attributionErr). The third value is what the
+// batch counts as ledger_unattributable: a declared Class B event whose evidence
+// could not be recorded. An ordinary audit-only event returns (zero, false, nil)
+// and is not an error at all — conflating the two is what made v1's skip counter
+// unusable.
+func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool, error) {
 	// The type allowlist, not producer-controlled Security, defines Class B.
 	if !audit.IsLedgerEventType(env.EventType) {
-		return ledgerContext{}, false
+		return ledgerContext{}, false, nil
 	}
+
 	if env.Security == nil {
-		if !audit.IsLedgerEventType(env.EventType) {
-			// Audit-only event: nothing to resolve.
-			return ledgerContext{}, false
-		}
-		// Declared as a ledger event type but published without SecurityContext. Fall
-		// back to the audit subject so the evidence is not lost outright.
+		// Declared as a ledger event type but published without SecurityContext,
+		// which means a call site forgot the declaration. Fall back to the audit
+		// subject so the evidence is not lost outright.
+		//
+		// v1 re-tested IsLedgerEventType here, inside a branch the outer guard had
+		// already made unreachable. The dead check implied this path handled
+		// audit-only events; it never could.
 		accountRef, err := uuid.Parse(env.SubjectID)
 		if err != nil || accountRef == uuid.Nil {
 			s.logger.Error("signer: ledger event type has neither security context nor a usable subject; no ledger row written",
 				slog.String("event_id", env.EventID.String()),
 				slog.String("event_type", env.EventType))
-			return ledgerContext{}, false
+			return ledgerContext{}, false, errUnattributableLedgerEvent
 		}
 		s.logger.Error("signer: ledger event type published without a security context; falling back to the audit subject",
 			slog.String("event_id", env.EventID.String()),
 			slog.String("event_type", env.EventType),
 			slog.String("account_ref", accountRef.String()))
-		return ledgerContext{accountRef: accountRef}, true
+		return ledgerContext{accountRef: accountRef}, true, errUnattributableLedgerEvent
 	}
 
 	accountRef, err := uuid.Parse(env.Security.AccountRef)
@@ -723,7 +860,7 @@ func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool) 
 		s.logger.Error("signer: security context has no usable account_ref; audit row written without a ledger row",
 			slog.String("event_id", env.EventID.String()),
 			slog.String("event_type", env.EventType))
-		return ledgerContext{}, false
+		return ledgerContext{}, false, errUnattributableLedgerEvent
 	}
 
 	return ledgerContext{
@@ -732,8 +869,14 @@ func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool) 
 		scope:              env.Security.Scope,
 		deviceFingerprint:  env.Security.DeviceFingerprint,
 		identityBlindIndex: env.Security.IdentityBlindIndex,
-	}, true
+		blindIndexVersion:  env.Security.BlindIndexVersion,
+	}, true, nil
 }
+
+// errUnattributableLedgerEvent marks a Class B event whose attribution could not
+// be fully resolved. It is counted, never returned to the caller: the audit row is
+// still written, and failing the batch would lose more evidence than it preserves.
+var errUnattributableLedgerEvent = errors.New("signer: ledger event attribution incomplete")
 
 // blindIndexFor resolves and caches identity_blind_index for one account.
 //
@@ -773,11 +916,12 @@ func (s *Signer) blindIndexFor(ctx context.Context, store Store, cache map[uuid.
 }
 
 // buildLedgerRecord assembles the chained ledger fields for one envelope.
-func (s *Signer) buildLedgerRecord(env audit.Envelope, lc ledgerContext, blindIndex *string) audit.LedgerRecord {
+func (s *Signer) buildLedgerRecord(env audit.Envelope, lc ledgerContext, blindIndex *string, version int16) audit.LedgerRecord {
 	rec := audit.LedgerRecord{
 		ID:                 env.EventID.String(),
 		AccountRef:         lc.accountRef.String(),
 		IdentityBlindIndex: blindIndex,
+		BlindIndexVersion:  version,
 		EventType:          env.EventType,
 		ClientIP:           optional(env.ClientIP),
 		UserAgent:          optional(env.UserAgent),
@@ -838,20 +982,25 @@ func (s *Signer) logBatch(stats batchStats, elapsed time.Duration) {
 		slog.Int("ledger_rows_written", stats.ledgerRowsWritten),
 		slog.Int("duplicates_skipped", stats.duplicatesSkipped),
 		slog.Int("quarantined", stats.quarantined),
-		slog.Int("ledger_rows_skipped", stats.ledgerSkipped),
+		// Any non-zero value here is a producer bug with compliance consequences:
+		// a declared Class B event whose attribution could not be resolved.
+		slog.Int("ledger_unattributable", stats.ledgerUnattributable),
 		slog.Uint64("stream_pending", stats.streamPending),
 		slog.String("batch_duration", elapsed.String()))
 }
 
-// buildAuditRow converts a chained envelope into COPY parameters.
+// buildAuditRow converts an envelope into payload COPY parameters.
 //
 // SubjectID becomes user_id here even though it is excluded from the hash: the column
 // is the operational join for "show me this user's activity", while the hash must stay
 // stable across the ON DELETE SET NULL that a GDPR purge triggers. See
 // audit.AuditRecord.
-func buildAuditRow(env audit.Envelope, chainHash string) db.InsertAuditLogsParams {
+//
+// The event UUID is not written here. It belongs to the chain node, which is never
+// deleted, because it is the pipeline's idempotency key.
+func buildAuditRow(env audit.Envelope, seq int64) db.InsertAuditLogsParams {
 	row := db.InsertAuditLogsParams{
-		ID:            env.EventID,
+		Seq:           seq,
 		ActorSpiffeID: env.ActorSPIFFEID,
 		EventType:     env.EventType,
 		ActionStatus:  env.ActionStatus,
@@ -859,7 +1008,6 @@ func buildAuditRow(env audit.Envelope, chainHash string) db.InsertAuditLogsParam
 		UserAgent:     env.UserAgent,
 		Payload:       env.Payload,
 		Timestamp:     timestamptz(env.OccurredAt),
-		ChainHash:     chainHash,
 	}
 	if actorID, err := uuid.Parse(env.ActorID); err == nil {
 		row.ActorID = actorID
@@ -870,10 +1018,12 @@ func buildAuditRow(env audit.Envelope, chainHash string) db.InsertAuditLogsParam
 	return row
 }
 
-// buildLedgerRow converts a chained ledger record into COPY parameters.
-func buildLedgerRow(rec audit.LedgerRecord, chainHash string) db.InsertSecurityEventsParams {
+// buildLedgerRow converts a ledger record into payload COPY parameters.
+func buildLedgerRow(rec audit.LedgerRecord, seq int64) db.InsertSecurityEventsParams {
 	row := db.InsertSecurityEventsParams{
+		Seq:                seq,
 		IdentityBlindIndex: rec.IdentityBlindIndex,
+		BlindIndexVersion:  rec.BlindIndexVersion,
 		EventType:          rec.EventType,
 		ClientIp:           rec.ClientIP,
 		IpSubnet:           rec.IPSubnet,
@@ -883,11 +1033,9 @@ func buildLedgerRow(rec audit.LedgerRecord, chainHash string) db.InsertSecurityE
 		Scope:              rec.Scope,
 		Timestamp:          timestamptz(rec.Timestamp),
 		RetainUntil:        timestamptz(rec.RetainUntil),
-		ChainHash:          chainHash,
 	}
-	// Both ids were rendered from real UUIDs by buildLedgerRecord, so these parses
+	// AccountRef was rendered from a real UUID by buildLedgerRecord, so this parse
 	// cannot fail; ignoring the error keeps the happy path readable.
-	row.ID, _ = uuid.Parse(rec.ID)
 	row.AccountRef, _ = uuid.Parse(rec.AccountRef)
 	return row
 }

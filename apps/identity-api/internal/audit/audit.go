@@ -294,6 +294,11 @@ type SecurityContext struct {
 	DeviceFingerprint string
 	// IdentityBlindIndex is captured synchronously, never copied to Payload.
 	IdentityBlindIndex *string
+	// BlindIndexVersion names the pepper generation that produced
+	// IdentityBlindIndex. Callers that derive the index must set it from the same
+	// Indexer, because the pair is what makes a historical row re-derivable after
+	// a pepper rotation.
+	BlindIndexVersion int16
 }
 
 // Event is one security-relevant occurrence, shaped to match the columns of

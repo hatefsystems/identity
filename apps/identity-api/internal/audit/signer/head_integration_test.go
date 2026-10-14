@@ -3,6 +3,7 @@
 package signer_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -71,30 +73,28 @@ func isolatedSignerDatabase(t *testing.T, dsn string) string {
 //nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
 func provisionSignerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
-	_, err := pool.Exec(ctx, `
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='identity_ledger_maintenance_owner') THEN
-        CREATE ROLE identity_ledger_maintenance_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-    END IF;
-EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
-END $$;
-GRANT USAGE ON SCHEMA public TO identity_ledger_maintenance_owner;
-GRANT SELECT, DELETE, UPDATE(seq) ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT SELECT, UPDATE ON public.security_ledger_head TO identity_ledger_maintenance_owner;
-GRANT SELECT, INSERT, DELETE ON public.security_ledger_checkpoints TO identity_ledger_maintenance_owner;
-GRANT SELECT ON public.legal_holds, public.security_ledger_retention_settings TO identity_ledger_maintenance_owner;
-GRANT INSERT ON public.event_outbox TO identity_ledger_maintenance_owner;
-GRANT EXECUTE ON FUNCTION public.security_ledger_require_owner(),
-    public.security_ledger_chain_time(timestamptz),
-    public.security_ledger_canonical_body(public.security_event_ledger),
-    public.security_ledger_account_lock_key(uuid),
-    public.security_ledger_predecessor(bigint) TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.advance_security_ledger_head(bigint,uuid) OWNER TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) OWNER TO identity_ledger_maintenance_owner;
-INSERT INTO public.security_ledger_head(singleton,seq,chain_hash) VALUES (true,0,repeat('0',64));
-INSERT INTO public.security_ledger_retention_settings(singleton,audit_subject) VALUES (true,'identity.audit.logs');`)
-	if err != nil {
-		t.Fatalf("explicit signer fixture provisioning/bootstrap: %v", err)
+	// v2 bootstrap is just the two heads and the receipt subject. There is no
+	// maintenance-owner role to create and no SECURITY DEFINER routine to re-own,
+	// because erasure is an ordinary DELETE controlled by table privilege.
+	//
+	// Both heads are seeded with their derived genesis digest. The CHECK
+	// constraints reject anything else at seq 0, so this is also an assertion that
+	// the migration and internal/audit agree about the canonical format.
+	// One statement per Exec: pgx prepares any statement carrying parameters, and
+	// a prepared statement cannot hold multiple commands.
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO public.security_ledger_head(singleton,seq,chain_hash) VALUES (true,0,$1)",
+		audit.LedgerGenesis().Bytes()); err != nil {
+		t.Fatalf("explicit ledger head bootstrap: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO public.audit_log_head(singleton,seq,chain_hash) VALUES (true,0,$1)",
+		audit.AuditGenesis().Bytes()); err != nil {
+		t.Fatalf("explicit audit head bootstrap: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO public.security_ledger_retention_settings(singleton,audit_subject) VALUES (true,'identity.audit.logs')"); err != nil {
+		t.Fatalf("retention subject provisioning: %v", err)
 	}
 }
 
@@ -134,8 +134,8 @@ func signerFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
 
 type integrationSignerMessage struct {
 	jetstream.Msg
-	body         []byte
-	acked, naked bool
+	body                     []byte
+	acked, naked, terminated bool
 }
 
 func (m *integrationSignerMessage) Data() []byte { return m.body }
@@ -144,6 +144,12 @@ func (m *integrationSignerMessage) Metadata() (*jetstream.MsgMetadata, error) {
 }
 func (m *integrationSignerMessage) Ack() error                       { m.acked = true; return nil }
 func (m *integrationSignerMessage) NakWithDelay(time.Duration) error { m.naked = true; return nil }
+
+// TermWithReason is how an undecodable message is settled: the quarantine record
+// is durable, so redelivering the message forever would only re-quarantine it.
+// The fixture has to implement it, or a quarantine path reaches the embedded nil
+// interface instead of being observed.
+func (m *integrationSignerMessage) TermWithReason(string) error { m.terminated = true; return nil }
 
 type integrationSignerBatch struct{ messages chan jetstream.Msg }
 
@@ -204,19 +210,25 @@ func runSignerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, env
 		return err
 	}
 	for _, msg := range messages {
-		if !msg.acked || msg.naked {
-			return errors.New("batch did not commit and acknowledge")
+		// A committed batch settles every message, either by acking a signed event
+		// or by terminating an undecodable one. A nak means the batch did not commit.
+		if msg.naked || (!msg.acked && !msg.terminated) {
+			return errors.New("batch did not commit and settle every message")
 		}
 	}
 	return nil
 }
 
 func signerLedgerEnvelope() audit.Envelope {
-	return audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), ActorID: uuid.Nil.String(),
+	return audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(),
 		OccurredAt: time.Now().UTC().Add(-2 * 365 * 24 * time.Hour), EventType: audit.EventLoginSucceeded,
 		ActionStatus: audit.StatusSuccess, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: uuid.NewString()}}
 }
 
+// purgeSignerFixture erases the payloads at the given sequences exactly as the
+// retention worker does: delete the payload, record the span, leave the chain
+// node and the head untouched.
+//
 //nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
 func purgeSignerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, seqs []int64) {
 	t.Helper()
@@ -231,129 +243,145 @@ func purgeSignerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s
 	if err := pglock.LockLedger(ctx, tx); err != nil {
 		t.Fatal(err)
 	}
-	queries := db.New(tx)
-	head, err := queries.GetSignerLedgerHead(ctx)
+	tag, err := tx.Exec(ctx, "DELETE FROM public.security_event_ledger WHERE seq = ANY($1::bigint[])", seqs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := queries.ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{ThroughSeq: head.Seq, PageLimit: 100})
-	if err != nil {
-		t.Fatal(err)
+	if tag.RowsAffected() != int64(len(seqs)) {
+		t.Fatalf("erased %d payloads, want %d", tag.RowsAffected(), len(seqs))
 	}
-	var hashes []string
-	var bodies [][]byte
+	operation := uuid.New()
 	for _, seq := range seqs {
-		found := false
-		for _, row := range rows {
-			if row.Seq == seq {
-				hashes = append(hashes, row.ChainHash)
-				bodies = append(bodies, audit.SerializeLedger(ledgerproof.Record(row)))
-				found = true
-			}
+		if _, err := tx.Exec(ctx, `INSERT INTO public.security_ledger_erasures
+(first_seq,last_seq,operation_id,erased_at) VALUES($1,$1,$2,statement_timestamp())`, seq, operation); err != nil {
+			t.Fatal(err)
 		}
-		if !found {
-			t.Fatalf("missing selected fixture seq %d", seq)
-		}
-	}
-	var deleted, held int64
-	// The production worker captures database time too. Host/VM clock skew must
-	// not accidentally exercise the routine's future-cutoff rejection here.
-	var cutoff time.Time
-	if err := tx.QueryRow(ctx, "SELECT statement_timestamp()").Scan(&cutoff); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.QueryRow(ctx, "SELECT deleted_count,held_count FROM public.purge_security_ledger_batch($1,$2,$3,$4,$5,$6,$7)",
-		cutoff, head.Seq, seqs, hashes, bodies, uuid.New(), "identity.audit.logs").Scan(&deleted, &held); err != nil {
-		t.Fatal(err)
-	}
-	if deleted != int64(len(seqs)) || held != 0 {
-		t.Fatalf("purge counts deleted=%d held=%d", deleted, held)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSignerAppendRestartAfterRetentionIntegration(t *testing.T) {
+// TestSignerAppendsAfterRetentionIntegration is the interaction the whole split
+// exists to make safe: the signer keeps appending to a chain whose payloads have
+// been erased, and the chain stays verifiable from genesis throughout.
+//
+// Under v1 this was the hardest case in the system. Erasure removed chain links,
+// so the signer had to reconstruct its tip from a mixture of surviving rows and
+// checkpoint terminal digests, and "all payloads erased" was a distinct state
+// that needed compaction to stay appendable. None of that applies now: the chain
+// table is untouched by retention, so the signer's tip is simply the head.
+func TestSignerAppendsAfterRetentionIntegration(t *testing.T) {
 	ctx, pool := signerFixture(t)
 	first, second, third := signerLedgerEnvelope(), signerLedgerEnvelope(), signerLedgerEnvelope()
 	if err := runSignerFixture(t, ctx, pool, first, second, third); err != nil {
 		t.Fatal(err)
 	}
 	q := db.New(pool)
-	head, err := q.GetSignerLedgerHead(ctx)
+
+	headBefore, err := q.GetSecurityLedgerHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := q.ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{ThroughSeq: head.Seq, PageLimit: 10})
+	nodes, err := q.ListSecurityLedgerChainForVerification(ctx, db.ListSecurityLedgerChainForVerificationParams{
+		ThroughSeq: headBefore.Seq, PageLimit: 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	purgeSignerFixture(t, ctx, pool, []int64{rows[2].Seq})
+	if len(nodes) != 3 {
+		t.Fatalf("chain nodes = %d, want 3", len(nodes))
+	}
+
+	// Erase the middle payload, then append again.
+	purgeSignerFixture(t, ctx, pool, []int64{nodes[1].Seq})
+	assertLedgerChainVerifies(t, ctx, pool)
+
 	fourth := signerLedgerEnvelope()
 	if err := runSignerFixture(t, ctx, pool, fourth); err != nil {
-		t.Fatal(err)
+		t.Fatalf("signer refused to append over an erased span: %v", err)
 	}
-	head, err = q.GetSignerLedgerHead(ctx)
+	assertLedgerChainVerifies(t, ctx, pool)
+
+	// Now erase every remaining payload. The head must not move, and the signer
+	// must still be able to append.
+	headMid, err := q.GetSecurityLedgerHead(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err = q.ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{ThroughSeq: head.Seq, PageLimit: 10})
+	remaining, err := pool.Query(ctx, "SELECT seq FROM public.security_event_ledger ORDER BY seq")
 	if err != nil {
 		t.Fatal(err)
 	}
-	seqs := make([]int64, len(rows))
-	for i, row := range rows {
-		seqs[i] = row.Seq
+	var seqs []int64
+	for remaining.Next() {
+		var seq int64
+		if err := remaining.Scan(&seq); err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
 	}
+	remaining.Close()
 	purgeSignerFixture(t, ctx, pool, seqs)
-	afterPurge, err := q.GetSignerLedgerHead(ctx)
-	if err != nil || afterPurge != head {
-		t.Fatalf("purge moved head: %v %v", afterPurge, err)
+
+	headAfter, err := q.GetSecurityLedgerHead(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var count int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM public.security_ledger_checkpoints").Scan(&count); err != nil || count != 1 {
-		t.Fatalf("all-purged proof not compact: %d %v", count, err)
+	if headAfter.Seq != headMid.Seq || !bytes.Equal(headAfter.ChainHash, headMid.ChainHash) {
+		t.Fatal("erasing every payload moved the chain head")
 	}
-	// Replay is still suppressed by Class C after all Class B payloads disappear.
+	if !headAfter.StateValid {
+		t.Fatal("a fully erased ledger reports an invalid head; the signer could never append again")
+	}
+	assertLedgerChainVerifies(t, ctx, pool)
+
+	// Replay of an already-signed event must still be suppressed, even though its
+	// payload is gone. This is exactly why the dedupe key lives on the chain node.
 	if err := runSignerFixture(t, ctx, pool, third); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT nextval(pg_get_serial_sequence('security_event_ledger','seq'))"); err != nil {
-		t.Fatal(err)
+	if got := countSigner(t, ctx, pool, "SELECT count(*) FROM public.security_event_ledger"); got != 0 {
+		t.Fatalf("a redelivered message resurrected an erased payload: %d rows", got)
 	}
+
+	// And a genuinely new event still appends on top.
 	fifth := signerLedgerEnvelope()
 	if err := runSignerFixture(t, ctx, pool, fifth); err != nil {
 		t.Fatal(err)
 	}
-	final, err := q.GetSignerLedgerHead(ctx)
-	if err != nil || !final.StateValid || final.Seq <= head.Seq+1 {
-		t.Fatalf("append after gap/all purge: %v %v", final, err)
-	}
-	rows, err = q.ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{ThroughSeq: final.Seq, PageLimit: 10})
-	if err != nil || len(rows) != 1 || rows[0].ID != fifth.EventID {
-		t.Fatalf("duplicate replay resurrected erased payload: %v %v", rows, err)
-	}
-	if _, err := ledgerproof.VerifyRecord(head.ChainHash, ledgerproof.Record(rows[0]), rows[0].ChainHash); err != nil {
+	final, err := q.GetSecurityLedgerHead(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if !final.StateValid || final.Seq <= headAfter.Seq {
+		t.Fatalf("append after a full erasure did not advance the head: %+v", final)
+	}
+	assertLedgerChainVerifies(t, ctx, pool)
+
+	// Restart must accept the resulting state.
 	if err := runSignerFixture(t, ctx, pool); err != nil {
-		t.Fatalf("restart: %v", err)
+		t.Fatalf("restart over an erased chain: %v", err)
 	}
 }
 
-func TestSignerStartupRejectsMissingProofIntegration(t *testing.T) {
+// TestSignerStartupRejectsMissingStateIntegration keeps startup failing closed.
+func TestSignerStartupRejectsMissingStateIntegration(t *testing.T) {
 	ctx, pool := signerFixture(t)
-	if err := runSignerFixture(t, ctx, pool, signerLedgerEnvelope(), signerLedgerEnvelope(), signerLedgerEnvelope()); err != nil {
+	if err := runSignerFixture(t, ctx, pool, signerLedgerEnvelope(), signerLedgerEnvelope()); err != nil {
 		t.Fatal(err)
 	}
-	purgeSignerFixture(t, ctx, pool, []int64{2})
-	if _, err := pool.Exec(ctx, "DELETE FROM public.security_ledger_checkpoints"); err != nil {
+
+	// An erased payload with no erasure record is indistinguishable from a
+	// deletion, so the signer must refuse to extend the chain.
+	if _, err := pool.Exec(ctx, "DELETE FROM public.security_event_ledger WHERE seq=(SELECT min(seq) FROM public.security_event_ledger)"); err != nil {
 		t.Fatal(err)
 	}
 	if err := runSignerFixture(t, ctx, pool); !errors.Is(err, signer.ErrLedgerStateInvalid) {
-		t.Fatalf("missing interior checkpoint accepted: %v", err)
+		t.Fatalf("unexplained missing payload accepted at startup: %v", err)
 	}
+
+	// A missing head must never be treated as genesis.
 	if _, err := pool.Exec(ctx, "DELETE FROM public.security_ledger_head"); err != nil {
 		t.Fatal(err)
 	}
@@ -362,35 +390,102 @@ func TestSignerStartupRejectsMissingProofIntegration(t *testing.T) {
 	}
 }
 
+//nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
+func countSigner(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, query).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// assertLedgerChainVerifies replays the whole ledger chain through the production
+// verifier, so these tests assert the same property an operator's
+// GET /admin/ledger/verify would report.
+//
+//nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
+func assertLedgerChainVerifies(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	params := ledgerproof.Params{Chain: ledgerproof.ChainLedger, Limit: 100}
+	for {
+		result, err := ledgerproof.VerifySnapshot(ctx, pool, params)
+		if err != nil {
+			t.Fatalf("verify ledger chain: %v", err)
+		}
+		if !result.Verified {
+			reason := "<nil>"
+			if result.FailureReason != nil {
+				reason = *result.FailureReason
+			}
+			t.Fatalf("ledger chain failed verification at seq %v: %s", result.BrokenAtSeq, reason)
+		}
+		next, ok := result.NextParams(params)
+		if !ok {
+			if !result.Complete {
+				t.Fatal("verification stopped before completing")
+			}
+			return
+		}
+		params = next
+	}
+}
+
+// TestSignerSequenceResetCannotCommitBelowHeadIntegration covers an operator or
+// restore mistake that rewinds the chain sequence. The signer allocates positions
+// from that sequence, so a rewind would make it try to write nodes at positions
+// the head has already passed — producing a fork that nothing could repair,
+// because the chain table forbids UPDATE and DELETE outright.
+//
+// advance_chain_head's expected-seq check is what stops it.
 func TestSignerSequenceResetCannotCommitBelowHeadIntegration(t *testing.T) {
 	ctx, pool := signerFixture(t)
-	// Consume unused values so resetting into an allocation gap cannot rely on a
-	// duplicate-key error to protect the chain.
-	if _, err := pool.Exec(ctx, "SELECT nextval(pg_get_serial_sequence('security_event_ledger','seq')), nextval(pg_get_serial_sequence('security_event_ledger','seq'))"); err != nil {
+	// Consume unused values first, so a rewind lands in an allocation gap and
+	// cannot rely on a duplicate-key error to protect the chain.
+	if _, err := pool.Exec(ctx, "SELECT nextval('public.security_ledger_chain_seq'), nextval('public.security_ledger_chain_seq')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := runSignerFixture(t, ctx, pool, signerLedgerEnvelope()); err != nil {
 		t.Fatal(err)
 	}
-	head, err := db.New(pool).GetSignerLedgerHead(ctx)
-	if err != nil || head.Seq != 3 {
-		t.Fatalf("gap fixture: %v %v", head, err)
+	q := db.New(pool)
+	head, err := q.GetSecurityLedgerHead(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "SELECT setval(pg_get_serial_sequence('security_event_ledger','seq'),1,false)"); err != nil {
+	if head.Seq != 3 {
+		t.Fatalf("gap fixture: head seq = %d, want 3", head.Seq)
+	}
+
+	if _, err := pool.Exec(ctx, "SELECT setval('public.security_ledger_chain_seq',1,false)"); err != nil {
 		t.Fatal(err)
 	}
 	bad := signerLedgerEnvelope()
 	if err := runSignerFixture(t, ctx, pool, bad); err == nil {
-		t.Fatal("sequence-reset batch acknowledged")
+		t.Fatal("a batch allocated below the head was acknowledged")
 	}
-	after, err := db.New(pool).GetSignerLedgerHead(ctx)
-	if err != nil || after != head {
-		t.Fatalf("sequence reset changed logical head: %v %v", after, err)
+
+	after, err := q.GetSecurityLedgerHead(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if after.Seq != head.Seq || !bytes.Equal(after.ChainHash, head.ChainHash) {
+		t.Fatalf("sequence reset changed the logical head: %+v -> %+v", head, after)
+	}
+
+	// Neither chain may contain the rejected event: the batch is one transaction,
+	// so a partial commit would leave the audit chain counting an event the ledger
+	// chain never recorded.
 	var leaked bool
-	if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM public.security_event_ledger WHERE id=$1) OR EXISTS(SELECT 1 FROM public.mvp_audit_logs WHERE id=$1)", bad.EventID).Scan(&leaked); err != nil || leaked {
-		t.Fatalf("failed advancement committed one chain: %v %v", leaked, err)
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM public.security_ledger_chain WHERE event_id=$1)
+		     OR EXISTS(SELECT 1 FROM public.audit_log_chain WHERE event_id=$1)`, bad.EventID).Scan(&leaked); err != nil {
+		t.Fatal(err)
 	}
+	if leaked {
+		t.Fatal("a failed head advancement still committed one of the chains")
+	}
+	assertLedgerChainVerifies(t, ctx, pool)
 }
 
 func TestSignerLedgerWaitUsesFreshReadCommittedHeadIntegration(t *testing.T) {
@@ -439,12 +534,29 @@ func TestSignerLedgerWaitUsesFreshReadCommittedHeadIntegration(t *testing.T) {
 	}
 	// A cooperating writer commits while BeginBatch is waiting. The next statement
 	// must see it even though this connection defaults to REPEATABLE READ.
-	rec := audit.LedgerRecord{ID: uuid.NewString(), AccountRef: uuid.NewString(), EventType: audit.EventLoginSucceeded, Timestamp: time.Now().UTC().Truncate(time.Microsecond), RetainUntil: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)}
-	hash := audit.ChainHash(audit.GenesisChainHash, audit.SerializeLedger(rec))
-	if _, err := blocker.Exec(ctx, "INSERT INTO public.security_event_ledger(id,account_ref,event_type,timestamp,retain_until,chain_hash) VALUES($1,$2,$3,$4,$5,$6)", rec.ID, rec.AccountRef, rec.EventType, rec.Timestamp, rec.RetainUntil, hash); err != nil {
+	rec := audit.LedgerRecord{
+		ID: uuid.NewString(), AccountRef: uuid.NewString(), BlindIndexVersion: 0,
+		EventType: audit.EventLoginSucceeded,
+		Timestamp: audit.NormalizeChainTime(time.Now()), RetainUntil: audit.NormalizeChainTime(time.Now().Add(time.Hour)),
+	}
+	leaf, err := audit.LeafLedger(rec)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.New(blocker).AdvanceSecurityLedgerHead(ctx, db.AdvanceSecurityLedgerHeadParams{TerminalID: uuid.MustParse(rec.ID)}); err != nil {
+	chainDigest := audit.ChainLedger(audit.LedgerGenesis(), leaf)
+	seq, err := db.New(blocker).InsertSecurityEventWithChain(ctx, db.InsertSecurityEventWithChainParams{
+		EventID: uuid.MustParse(rec.ID), LeafHash: leaf.Bytes(), ChainHash: chainDigest.Bytes(),
+		AccountRef: uuid.MustParse(rec.AccountRef), BlindIndexVersion: rec.BlindIndexVersion,
+		EventType:   rec.EventType,
+		Timestamp:   pgtype.Timestamptz{Time: rec.Timestamp, Valid: true},
+		RetainUntil: pgtype.Timestamptz{Time: rec.RetainUntil, Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.New(blocker).AdvanceChainHead(ctx, db.AdvanceChainHeadParams{
+		Which: "ledger", ExpectedSeq: 0, FirstSeq: seq, LastSeq: seq, NodeCount: 1,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := blocker.Commit(ctx); err != nil {
@@ -455,12 +567,57 @@ func TestSignerLedgerWaitUsesFreshReadCommittedHeadIntegration(t *testing.T) {
 		t.Fatal(result.err)
 	}
 	defer func() { _ = result.batch.Rollback(context.Background()) }()
-	head, err := result.batch.Store().GetSignerLedgerHead(ctx)
-	if err != nil || head.Seq != 1 || head.ChainHash != hash || !head.StateValid {
-		t.Fatalf("stale head after ledger lock: %v %v", head, err)
+	head, err := result.batch.Store().GetSecurityLedgerHead(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Seq != seq || !bytes.Equal(head.ChainHash, chainDigest.Bytes()) || !head.StateValid {
+		t.Fatalf("stale head after ledger lock: %+v, want seq %d / %s", head, seq, chainDigest.Hex())
 	}
 	var isolation string
 	if err := conn.QueryRow(ctx, "SHOW transaction_isolation").Scan(&isolation); err != nil || isolation != "read committed" {
 		t.Fatalf("isolation=%s err=%v", isolation, err)
 	}
+}
+
+// TestSignerQuarantinesV1EnvelopeIntegration covers the schema-version gate
+// against a real database.
+//
+// A v1 envelope cannot state which pepper generation produced its blind index,
+// so the signer must not sign it: defaulting the generation would record a claim
+// the producer never made, and because the ledger body is hashed with that
+// generation inside it, the wrong value would be unfixable afterwards. The event
+// is quarantined instead — a Class C audit record is written describing the
+// rejection, and no ledger row is produced.
+func TestSignerQuarantinesV1EnvelopeIntegration(t *testing.T) {
+	ctx, pool := signerFixture(t)
+
+	legacy := signerLedgerEnvelope()
+	legacy.SchemaVersion = 1
+	if err := runSignerFixture(t, ctx, pool, legacy); err != nil {
+		t.Fatalf("a quarantined envelope must still commit and settle: %v", err)
+	}
+
+	// The event's own id must not appear in either chain.
+	var present bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM public.audit_log_chain WHERE event_id=$1)
+		     OR EXISTS(SELECT 1 FROM public.security_ledger_chain WHERE event_id=$1)`,
+		legacy.EventID).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("a v1 envelope was signed into a chain")
+	}
+
+	// A quarantine record was written to Class C, and nothing to Class B: the
+	// rejection is itself auditable, but it is not a security event about a
+	// subject.
+	if got := countSigner(t, ctx, pool, "SELECT count(*) FROM public.audit_log_chain"); got == 0 {
+		t.Fatal("no quarantine audit record was written")
+	}
+	if got := countSigner(t, ctx, pool, "SELECT count(*) FROM public.security_ledger_chain"); got != 0 {
+		t.Fatalf("a quarantined envelope produced %d ledger nodes", got)
+	}
+	assertLedgerChainVerifies(t, ctx, pool)
 }

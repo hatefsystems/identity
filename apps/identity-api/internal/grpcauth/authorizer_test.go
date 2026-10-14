@@ -207,9 +207,24 @@ func TestAuthenticationMatrix(t *testing.T) {
 		{"CRL signing usage", func(c *x509.Certificate) { c.KeyUsage |= x509.KeyUsageCRLSign }, codes.Unauthenticated},
 		{"no digital signature", func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment }, codes.Unauthenticated},
 		{"no key usage", func(c *x509.Certificate) { c.KeyUsage = 0 }, codes.Unauthenticated},
-		{"client auth only", func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth} }, codes.Unauthenticated},
+		// clientAuth alone is admitted. This is validating a *client* certificate,
+		// so serverAuth is irrelevant to it. SPIRE happens to set both today, but
+		// the SPIFFE X.509-SVID profile does not require it, and rejecting a
+		// clientAuth-only SVID surfaces as "invalid_certificate_usage" — which
+		// reads like a trust-bundle problem and sends an operator to the wrong
+		// place entirely.
+		{"client auth only is admitted", func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+		}, codes.OK},
+		{"client auth with server auth is admitted", func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
+		}, codes.OK},
+		// An EKU extension that is present but does not permit client
+		// authentication is still a rejection: the issuer stated what the key may
+		// be used for, and this is not it.
 		{"server auth only", func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }, codes.Unauthenticated},
-		{"any EKU is not both", func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageAny} }, codes.Unauthenticated},
+		{"any EKU does not grant client auth", func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageAny} }, codes.Unauthenticated},
+		{"code signing only", func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning} }, codes.Unauthenticated},
 		{"unknown EKU only", func(c *x509.Certificate) {
 			c.ExtKeyUsage = nil
 			c.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 2, 3, 4}}

@@ -33,6 +33,18 @@ type AuditConfig struct {
 	// deliberate replay, not a rename.
 	ConsumerName string
 
+	// SpoolPath is the durable fallback sink for envelopes the transport could
+	// not publish. Sourced from AUDIT_SPOOL_PATH; empty disables it, in which
+	// case an unpublishable event survives only as a log line.
+	//
+	// The directory must exist and be writable. It is deliberately not created
+	// at startup: a fallback that is only exercised during an outage must fail
+	// loudly at boot rather than at the moment it is first needed.
+	SpoolPath string
+	// SpoolLimitBytes bounds the spool so a sustained outage cannot fill the
+	// volume. Sourced from AUDIT_SPOOL_LIMIT_BYTES.
+	SpoolLimitBytes int
+
 	// PublishBuffer is the depth of the publisher's in-process channel. It is the
 	// burst absorber between request handlers and the network: once it is full,
 	// events take the log-fallback path rather than blocking the handler.
@@ -88,6 +100,8 @@ const (
 	EnvAuditSubject            = "AUDIT_SUBJECT"
 	EnvAuditConsumerName       = "AUDIT_CONSUMER_NAME"
 	EnvAuditPublishBuffer      = "AUDIT_PUBLISH_BUFFER"
+	EnvAuditSpoolPath          = "AUDIT_SPOOL_PATH"
+	EnvAuditSpoolLimitBytes    = "AUDIT_SPOOL_LIMIT_BYTES"
 	EnvAuditBatchSize          = "AUDIT_BATCH_SIZE"
 	EnvAuditFlushInterval      = "AUDIT_FLUSH_INTERVAL"
 	EnvAuditStreamMaxBytes     = "AUDIT_STREAM_MAX_BYTES"
@@ -103,6 +117,7 @@ const (
 	defaultAuditSubject         = "identity.audit.logs"
 	defaultAuditConsumerName    = "audit-signer"
 	defaultAuditPublishBuffer   = 4096
+	defaultAuditSpoolLimitBytes = 64 << 20
 	defaultAuditBatchSize       = 1000
 	defaultAuditFlushInterval   = 5 * time.Second
 	defaultAuditStreamMaxBytes  = int64(512 << 20) // 512 MiB
@@ -174,6 +189,11 @@ func LoadAudit(environment string) (AuditConfig, error) {
 	}
 
 	var err error
+	cfg.SpoolPath = strings.TrimSpace(os.Getenv(EnvAuditSpoolPath))
+	if cfg.SpoolLimitBytes, err = getEnvPositiveInt(
+		EnvAuditSpoolLimitBytes, defaultAuditSpoolLimitBytes); err != nil {
+		return AuditConfig{}, err
+	}
 	if cfg.PublishBuffer, err = getEnvPositiveInt(
 		EnvAuditPublishBuffer, defaultAuditPublishBuffer); err != nil {
 		return AuditConfig{}, err

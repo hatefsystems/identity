@@ -29,11 +29,17 @@ import (
 // # What happens when that is not enough
 //
 // The channel is bounded, so a sustained outage must eventually shed load. Nothing is
-// dropped quietly: a full buffer or a terminal publish failure emits a single
-// slog.Error containing the entire envelope JSON tagged with
-// AuditTransportFailureMarker, so the event survives in the container log and is
-// recoverable by hand. That is why Event.Payload's "no raw PII" rule is load-bearing
-// rather than belt-and-braces — this path writes payload values, not just their keys.
+// dropped quietly. A full buffer or a terminal publish failure does two things:
+//
+//   - appends the envelope to a durable Spool, when one is configured, so recovery
+//     is a replay command rather than log archaeology; and
+//   - emits one slog.Error containing the whole envelope JSON tagged with
+//     AuditTransportFailureMarker, which remains the alerting signal.
+//
+// The log line is retained even with a spool, because the spool is a recovery
+// artifact and the log is what a human or an alerting rule notices. Both write
+// payload values, which is why Event.Payload's "no raw PII" rule is load-bearing
+// rather than belt-and-braces.
 type JetStreamRecorder struct {
 	js      jetstream.JetStream
 	subject string
@@ -49,6 +55,10 @@ type JetStreamRecorder struct {
 	closeOnce sync.Once
 	// done is closed by the publishing goroutine when it has finished draining.
 	done chan struct{}
+
+	// spool is the durable fallback sink. Nil disables it, in which case the
+	// fallback degrades to the log line alone.
+	spool *Spool
 
 	// newID and now are seams for deterministic tests.
 	newID func() uuid.UUID
@@ -89,6 +99,16 @@ func WithRecorderIDs(newID func() uuid.UUID) RecorderOption {
 			r.newID = newID
 		}
 	}
+}
+
+// WithSpool attaches a durable fallback sink.
+//
+// Without it the fallback degrades to a log line, which is an alerting signal but
+// not an executable recovery procedure. The recorder does not own the spool's
+// lifetime: the caller opens it and closes it, so a shared spool can outlive a
+// recorder restart.
+func WithSpool(spool *Spool) RecorderOption {
+	return func(r *JetStreamRecorder) { r.spool = spool }
 }
 
 // WithPublishStallWait overrides how long one async publish waits for a free
@@ -214,11 +234,22 @@ func (r *JetStreamRecorder) publish(env Envelope) {
 	}
 }
 
-// fallback is the last-resort durability path: one structured error line carrying
-// the whole envelope, including payload values, so the event can be reconstructed
-// from the container log.
+// fallback is the last-resort durability path: append the envelope to the durable
+// spool when one is configured, then emit one structured error line carrying the
+// whole envelope so the failure is also visible to alerting.
 func (r *JetStreamRecorder) fallback(env Envelope, reason string, cause error) {
 	r.countDrop()
+
+	spoolErr := "not_configured"
+	if r.spool != nil {
+		if err := r.spool.Append(env); err != nil {
+			// The spool failing is itself worth reporting, but it must not prevent
+			// the log line: that would turn a degraded fallback into a lost event.
+			spoolErr = err.Error()
+		} else {
+			spoolErr = ""
+		}
+	}
 
 	encoded, err := json.Marshal(env)
 	if err != nil {
@@ -228,7 +259,9 @@ func (r *JetStreamRecorder) fallback(env Envelope, reason string, cause error) {
 			slog.String("reason", reason),
 			slog.String("event_id", env.EventID.String()),
 			slog.String("event_type", env.EventType),
-			slog.String("action_status", env.ActionStatus))
+			slog.String("action_status", env.ActionStatus),
+			slog.String("spool", r.spool.Path()),
+			slog.String("spool_error", spoolErr))
 		return
 	}
 
@@ -239,11 +272,19 @@ func (r *JetStreamRecorder) fallback(env Envelope, reason string, cause error) {
 		slog.String("event_type", env.EventType),
 		slog.String("subject", r.subject),
 		slog.String("envelope", string(encoded)),
+		// Names the spool so the operator does not have to find it, and reports
+		// why it did not take the event when it did not.
+		slog.String("spool", r.spool.Path()),
+		slog.String("spool_error", spoolErr),
 	}
 	if cause != nil {
 		attrs = append(attrs, slog.String("error", cause.Error()))
 	}
-	r.logger.Error("audit: event not published; recorded to log for manual recovery", attrs...)
+	message := "audit: event not published; spooled for replay"
+	if spoolErr != "" {
+		message = "audit: event not published and not spooled; recorded to log for manual recovery"
+	}
+	r.logger.Error(message, attrs...)
 }
 
 // countDrop increments the shed-event counter.

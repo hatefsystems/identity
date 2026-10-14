@@ -24,15 +24,15 @@ func TestNewInvalidPepper(t *testing.T) {
 	}
 	for name, size := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(make([]byte, size)); !errors.Is(err, ErrInvalidPepper) {
-				t.Fatalf("New(len=%d) error = %v, want ErrInvalidPepper", size, err)
+			if _, err := New(make([]byte, size), 0); !errors.Is(err, ErrInvalidPepper) {
+				t.Fatalf("New(len=%d, 0) error = %v, want ErrInvalidPepper", size, err)
 			}
 		})
 	}
 }
 
 func TestComputeDeterministic(t *testing.T) {
-	idx, err := New(newTestPepper(t))
+	idx, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestComputeDeterministic(t *testing.T) {
 }
 
 func TestComputeDigestFormat(t *testing.T) {
-	idx, err := New(newTestPepper(t))
+	idx, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestComputeDigestFormat(t *testing.T) {
 }
 
 func TestComputeDifferentInputs(t *testing.T) {
-	idx, err := New(newTestPepper(t))
+	idx, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -73,11 +73,11 @@ func TestComputeDifferentInputs(t *testing.T) {
 // different indexes, so an exfiltrated database cannot be correlated without
 // the in-memory pepper.
 func TestPepperSensitivity(t *testing.T) {
-	idx1, err := New(newTestPepper(t))
+	idx1, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	idx2, err := New(newTestPepper(t))
+	idx2, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestPepperSensitivity(t *testing.T) {
 // TestComputeNormalization ensures trivial representation differences map to
 // the same index (case + surrounding whitespace).
 func TestComputeNormalization(t *testing.T) {
-	idx, err := New(newTestPepper(t))
+	idx, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestComputeNormalization(t *testing.T) {
 // construction does not change computed indexes.
 func TestPepperDefensiveCopy(t *testing.T) {
 	pepper := newTestPepper(t)
-	idx, err := New(pepper)
+	idx, err := New(pepper, 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestPepperDefensiveCopy(t *testing.T) {
 }
 
 func TestEqual(t *testing.T) {
-	idx, err := New(newTestPepper(t))
+	idx, err := New(newTestPepper(t), 0)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -141,5 +141,67 @@ func TestEqual(t *testing.T) {
 	}
 	if Equal(a, "") {
 		t.Error("Equal(a, empty) = true")
+	}
+}
+
+// TestVersionIsReportedAndIndependentOfTheDigest covers the pepper-rotation
+// contract. The generation number travels alongside the digest and is hashed
+// into the security ledger's signed body, but it must not feed the HMAC itself:
+// if it did, re-stating a row's generation would change its digest and the
+// lookup path for that row would break instead of being preserved.
+func TestVersionIsReportedAndIndependentOfTheDigest(t *testing.T) {
+	pepper := newTestPepper(t)
+
+	v0, err := New(pepper, 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	v7, err := New(pepper, 7)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if v0.Version() != 0 {
+		t.Errorf("Version() = %d, want 0", v0.Version())
+	}
+	if v7.Version() != 7 {
+		t.Errorf("Version() = %d, want 7", v7.Version())
+	}
+	if v0.Compute("user@example.com") != v7.Compute("user@example.com") {
+		t.Error("the generation number altered the digest; restating a row's generation would orphan its lookup path")
+	}
+}
+
+func TestNewRejectsNegativeVersion(t *testing.T) {
+	if _, err := New(newTestPepper(t), -1); !errors.Is(err, ErrInvalidVersion) {
+		t.Errorf("New(pepper, -1) error = %v, want ErrInvalidVersion", err)
+	}
+}
+
+// TestComputeAppliesUnicodeNormalization is the attribution-correctness case.
+// An identifier captured in decomposed form (e + U+0301) and the same
+// identifier in composed form (U+00E9) are one address to a human and to a mail
+// server. Without NFKC they produce different indexes, so a lawful-inquiry
+// lookup silently misses rows captured in the other form — a false negative
+// indistinguishable from "no such subject".
+func TestComputeAppliesUnicodeNormalization(t *testing.T) {
+	idx, err := New(newTestPepper(t), 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	composed := "josé@example.com"             // U+00E9
+	decomposed := "jose\u0301@example.com"     // e + U+0301
+	if composed == decomposed {
+		t.Fatal("test inputs are byte-identical; the case under test is not being exercised")
+	}
+	if idx.Compute(composed) != idx.Compute(decomposed) {
+		t.Error("composed and decomposed spellings of one identifier produced different indexes")
+	}
+
+	// Compatibility folding also has to apply, or a fullwidth homograph indexes
+	// as a different subject.
+	if idx.Compute("ｕser@example.com") != idx.Compute("user@example.com") {
+		t.Error("a fullwidth homograph produced a different index")
 	}
 }

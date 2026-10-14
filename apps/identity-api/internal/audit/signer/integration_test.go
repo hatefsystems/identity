@@ -3,6 +3,7 @@
 package signer_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -112,25 +113,43 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readTip := func(get func(context.Context) (string, error)) [32]byte {
-		hash, err := get(ctx)
+	// Both chains are bootstrapped here, because v2 refuses to treat an
+	// uninitialized head as genesis.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.audit_log_head(singleton,seq,chain_hash) VALUES (true,0,$1)
+		 ON CONFLICT (singleton) DO NOTHING`, audit.AuditGenesis().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.security_ledger_head(singleton,seq,chain_hash) VALUES (true,0,$1)
+		 ON CONFLICT (singleton) DO NOTHING`, audit.LedgerGenesis().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	readTip := func(get func(context.Context) ([]byte, error)) audit.Digest {
+		raw, err := get(ctx)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return audit.GenesisChainHash
+			return audit.LedgerGenesis()
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		tip, err := audit.DecodeChainHash(hash)
+		tip, err := audit.DecodeDigest(raw)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return tip
 	}
-	auditTip := readTip(queries.GetLatestAuditLogChainHash)
-	ledgerTip := readTip(queries.GetLatestSecurityEventChainHash)
+	auditTip := readTip(func(c context.Context) ([]byte, error) {
+		head, err := queries.GetAuditLogHead(c)
+		return head.ChainHash, err
+	})
+	ledgerTip := readTip(func(c context.Context) ([]byte, error) {
+		head, err := queries.GetSecurityLedgerHead(c)
+		return head.ChainHash, err
+	})
 	// Allocate unused sequence values. Hash linkage, not numeric contiguity,
 	// must remain sufficient to verify the new segment.
-	if _, err := pool.Exec(ctx, "SELECT nextval(pg_get_serial_sequence('mvp_audit_logs', 'seq')), nextval(pg_get_serial_sequence('security_event_ledger', 'seq'))"); err != nil {
+	if _, err := pool.Exec(ctx, "SELECT nextval('public.audit_log_chain_seq'), nextval('public.security_ledger_chain_seq')"); err != nil {
 		t.Fatal(err)
 	}
 	testEmail := fmt.Sprintf("audit-user-%s@test.local", uid)
@@ -143,7 +162,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	}
 
 	pepper := []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-	indexer, err := blindindex.New(pepper)
+	indexer, err := blindindex.New(pepper, 0)
 	if err != nil {
 		t.Fatalf("blindindex.New: %v", err)
 	}
@@ -250,7 +269,11 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	}
 	event3ID := uuid.New()
 	index := indexer.Compute(testEmail)
-	injected := audit.Envelope{SchemaVersion: 1, EventID: event3ID, ActorID: uuid.Nil.String(), SubjectID: testUser.ID.String(), OccurredAt: time.Now().Truncate(time.Second).Add(456789123 * time.Nanosecond), EventType: audit.EventLegalHoldApplied, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: testUser.ID.String(), IdentityBlindIndex: &index}}
+	// A current-version envelope: this case is about a Class C event type carrying
+	// an injected Security context, which must not produce a ledger row. A v1
+	// envelope would instead be quarantined (see TestSignerQuarantinesV1Envelope),
+	// which would not exercise the allowlist at all.
+	injected := audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: event3ID, ActorID: uuid.Nil.String(), SubjectID: testUser.ID.String(), OccurredAt: time.Now().Truncate(time.Second).Add(456789123 * time.Nanosecond), EventType: audit.EventLegalHoldApplied, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: testUser.ID.String(), IdentityBlindIndex: &index}}
 	raw, err := json.Marshal(injected)
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +336,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persistedAudit, err := queries.ListAuditLogsForChainVerification(ctx, db.ListAuditLogsForChainVerificationParams{AfterSeq: auditAfter, ThroughSeq: auditThrough, PageLimit: 20})
+	persistedAudit, err := queries.ListAuditLogChainForVerification(ctx, db.ListAuditLogChainForVerificationParams{AfterSeq: auditAfter, ThroughSeq: auditThrough, PageLimit: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,15 +344,29 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 		t.Fatalf("got %d audit rows, want three events and quarantine", len(persistedAudit))
 	}
 	for _, row := range persistedAudit {
-		record := audit.AuditRecord{ID: row.ID.String(), ActorID: row.ActorID.String(), ActorSPIFFEID: row.ActorSpiffeID, EventType: row.EventType, ActionStatus: row.ActionStatus, ClientIP: row.ClientIp, UserAgent: row.UserAgent, Payload: row.Payload, Timestamp: row.Timestamp.Time}
-		if got := audit.ChainHash(auditTip, audit.SerializeAudit(record)); got != row.ChainHash {
-			t.Fatalf("persisted audit seq %d mismatch: got %s stored %s", row.Seq, got, row.ChainHash)
+		if !row.PayloadPresent {
+			t.Fatalf("audit seq %d has no payload", row.Seq)
 		}
-		auditTip, _ = audit.DecodeChainHash(row.ChainHash)
+		record := audit.AuditRecord{ID: row.EventID.String(), ActorID: row.ActorID.UUID.String(),
+			ActorSPIFFEID: derefString(row.ActorSpiffeID), EventType: derefString(row.EventType),
+			ActionStatus: derefString(row.ActionStatus), ClientIP: derefString(row.ClientIp),
+			UserAgent: derefString(row.UserAgent), Payload: derefString(row.Payload),
+			Timestamp: row.Timestamp.Time}
+		leaf, leafErr := audit.LeafAudit(record)
+		if leafErr != nil {
+			t.Fatal(leafErr)
+		}
+		if got, stored := leaf.Bytes(), row.LeafHash; !bytes.Equal(got, stored) {
+			t.Fatalf("persisted audit seq %d leaf mismatch: got %x stored %x", row.Seq, got, stored)
+		}
+		auditTip = audit.ChainAudit(auditTip, leaf)
+		if !bytes.Equal(auditTip.Bytes(), row.ChainHash) {
+			t.Fatalf("persisted audit seq %d chain mismatch: got %s stored %x", row.Seq, auditTip.Hex(), row.ChainHash)
+		}
 		if row.UserID.Valid {
 			t.Fatal("late subject attached a missing FK")
 		}
-		if strings.Contains(row.Payload, testEmail) || strings.Contains(row.Payload, index) {
+		if payload := derefString(row.Payload); strings.Contains(payload, testEmail) || strings.Contains(payload, index) {
 			t.Fatal("raw identity/index leaked to Class C payload")
 		}
 	}
@@ -340,16 +377,33 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persistedLedger, err := queries.ListSecurityEventsForChainVerification(ctx, db.ListSecurityEventsForChainVerificationParams{AfterSeq: ledgerAfter, ThroughSeq: ledgerThrough, PageLimit: 20})
+	persistedLedger, err := queries.ListSecurityLedgerChainForVerification(ctx, db.ListSecurityLedgerChainForVerificationParams{AfterSeq: ledgerAfter, ThroughSeq: ledgerThrough, PageLimit: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, row := range persistedLedger {
-		record := audit.LedgerRecord{ID: row.ID.String(), AccountRef: row.AccountRef.String(), IdentityBlindIndex: row.IdentityBlindIndex, EventType: row.EventType, ClientIP: row.ClientIp, IPSubnet: row.IpSubnet, UserAgent: row.UserAgent, DeviceFingerprint: row.DeviceFingerprint, ClientID: row.ClientID, Scope: row.Scope, Timestamp: row.Timestamp.Time, RetainUntil: row.RetainUntil.Time}
-		if got := audit.ChainHash(ledgerTip, audit.SerializeLedger(record)); got != row.ChainHash {
-			t.Fatalf("persisted ledger seq %d mismatch: got %s stored %s", row.Seq, got, row.ChainHash)
+		if !row.PayloadPresent {
+			t.Fatalf("ledger seq %d has no payload", row.Seq)
 		}
-		ledgerTip, _ = audit.DecodeChainHash(row.ChainHash)
+		record := audit.LedgerRecord{ID: row.EventID.String(), AccountRef: row.AccountRef.UUID.String(),
+			IdentityBlindIndex: row.IdentityBlindIndex, EventType: derefString(row.EventType),
+			ClientIP: row.ClientIp, IPSubnet: row.IpSubnet, UserAgent: row.UserAgent,
+			DeviceFingerprint: row.DeviceFingerprint, ClientID: row.ClientID, Scope: row.Scope,
+			Timestamp: row.Timestamp.Time, RetainUntil: row.RetainUntil.Time}
+		if row.BlindIndexVersion != nil {
+			record.BlindIndexVersion = *row.BlindIndexVersion
+		}
+		leaf, leafErr := audit.LeafLedger(record)
+		if leafErr != nil {
+			t.Fatal(leafErr)
+		}
+		if !bytes.Equal(leaf.Bytes(), row.LeafHash) {
+			t.Fatalf("persisted ledger seq %d leaf mismatch", row.Seq)
+		}
+		ledgerTip = audit.ChainLedger(ledgerTip, leaf)
+		if !bytes.Equal(ledgerTip.Bytes(), row.ChainHash) {
+			t.Fatalf("persisted ledger seq %d chain mismatch: got %s stored %x", row.Seq, ledgerTip.Hex(), row.ChainHash)
+		}
 	}
 
 	// Verify blind index attribution lookup.
@@ -382,8 +436,8 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if row.DeviceFingerprint == nil || *row.DeviceFingerprint != "device-xyz" {
 		t.Errorf("ledger row DeviceFingerprint = %v, want 'device-xyz'", row.DeviceFingerprint)
 	}
-	if len(row.ChainHash) != audit.ChainHashHexLen {
-		t.Errorf("ledger row ChainHash length = %d, want %d", len(row.ChainHash), audit.ChainHashHexLen)
+	if row.EventID == uuid.Nil {
+		t.Error("attribution lookup did not surface the chain node's event id")
 	}
 
 	// Verify retain_until is ~180 days in future relative to timestamp.
@@ -392,4 +446,13 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if diff < -time.Second || diff > time.Second {
 		t.Errorf("ledger retain_until %v differs from expected %v by %v", row.RetainUntil.Time, expectedRetain, diff)
 	}
+}
+
+// derefString reads an optional column that the verification projection returns
+// as a pointer because the payload may be absent.
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }

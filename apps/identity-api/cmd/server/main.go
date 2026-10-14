@@ -182,7 +182,11 @@ func run(logger *slog.Logger) (runErr error) {
 		if err != nil {
 			return err
 		}
-		indexer, err := blindindex.New(pepper)
+		pepperVersion, err := config.LoadBlindIndexPepperVersion()
+		if err != nil {
+			return err
+		}
+		indexer, err := blindindex.New(pepper, pepperVersion)
 		if err != nil {
 			return err
 		}
@@ -645,7 +649,7 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 	if err != nil {
 		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
 	}
-	indexer, err := blindindex.New(cryptoCfg.BlindIndexPepper)
+	indexer, err := blindindex.New(cryptoCfg.BlindIndexPepper, cryptoCfg.BlindIndexPepperVersion)
 	if err != nil {
 		return nil, fmt.Errorf("main: build blind indexer: %w", err)
 	}
@@ -1071,16 +1075,38 @@ func buildAuditRecorder(
 		return nil, func(context.Context) error { return nil }, err
 	}
 
-	recorder, err := audit.NewJetStreamRecorder(js, ac.Subject, ac.PublishBuffer, logger)
+	// The durable fallback sink, when configured. Opening it here rather than
+	// lazily is deliberate: a fallback only exercised during an outage must fail
+	// at boot if it is misconfigured, not at the moment it is first needed.
+	var spool *audit.Spool
+	var options []audit.RecorderOption
+	if ac.SpoolPath != "" {
+		spool, err = audit.OpenSpool(ac.SpoolPath, int64(ac.SpoolLimitBytes))
+		if err != nil {
+			nc.Close()
+			return nil, func(context.Context) error { return nil }, fmt.Errorf("main: open audit spool: %w", err)
+		}
+		options = append(options, audit.WithSpool(spool))
+	}
+
+	recorder, err := audit.NewJetStreamRecorder(js, ac.Subject, ac.PublishBuffer, logger, options...)
 	if err != nil {
 		nc.Close()
+		if spool != nil {
+			_ = spool.Close()
+		}
 		return nil, func(context.Context) error { return nil }, fmt.Errorf("main: build audit recorder: %w", err)
 	}
 
 	logger.Info("audit pipeline configured",
 		slog.String("subject", ac.Subject),
 		slog.Int("publish_buffer", ac.PublishBuffer),
+		slog.String("spool_path", ac.SpoolPath),
 	)
+	if ac.SpoolPath == "" {
+		logger.Warn("audit spool not configured; an unpublishable event survives only as a log line",
+			slog.String("environment", environment))
+	}
 
 	closer := func(shutdownCtx context.Context) error {
 		// Order matters: drain the recorder's buffer and wait for its acks before the
@@ -1097,6 +1123,13 @@ func buildAuditRecorder(
 				return closeErr
 			}
 			return fmt.Errorf("main: drain NATS connection: %w", drainErr)
+		}
+		// The spool closes last: the recorder's drain above is exactly when the
+		// tail of the buffer may fail to publish and need spooling.
+		if spool != nil {
+			if spoolErr := spool.Close(); spoolErr != nil && closeErr == nil {
+				return spoolErr
+			}
 		}
 		return closeErr
 	}

@@ -293,18 +293,24 @@ type adminLedgerEventResponse struct {
 	EventType         string     `json:"event_type"`
 	Timestamp         *time.Time `json:"timestamp"`
 	RetainUntil       *time.Time `json:"retain_until"`
-	ChainHash         string     `json:"chain_hash"`
 	ClientIP          *string    `json:"client_ip,omitempty"`
 	IPSubnet          *string    `json:"ip_subnet,omitempty"`
 	UserAgent         *string    `json:"user_agent,omitempty"`
 	DeviceFingerprint *string    `json:"device_fingerprint,omitempty"`
 	ClientID          *string    `json:"client_id,omitempty"`
 	Scope             *string    `json:"scope,omitempty"`
+	Seq               int64      `json:"seq"`
 }
 
-func newAdminLedgerEvent(e db.SecurityEventLedger, fields []string) adminLedgerEventResponse {
-	result := adminLedgerEventResponse{ID: e.ID, AccountRef: e.AccountRef, EventType: e.EventType,
-		Timestamp: timePtr(e.Timestamp), RetainUntil: timePtr(e.RetainUntil), ChainHash: e.ChainHash}
+// newAdminLedgerEvent projects one disclosure row.
+//
+// The event UUID comes from the chain node (e.EventID) rather than from the
+// payload row, which no longer carries one. Seq is disclosed alongside it because
+// it is the chain position an authority needs to request an inclusion proof, and
+// it is the cursor the next page is keyed on.
+func newAdminLedgerEvent(e db.LookupLegalAttributionRow, fields []string) adminLedgerEventResponse {
+	result := adminLedgerEventResponse{ID: e.EventID, AccountRef: e.AccountRef, EventType: e.EventType,
+		Timestamp: timePtr(e.Timestamp), RetainUntil: timePtr(e.RetainUntil), Seq: e.Seq}
 	for _, field := range fields {
 		switch field {
 		case "client_ip":
@@ -374,7 +380,7 @@ func (s *Server) handleAdminLegalInquiryLookup() http.HandlerFunc {
 			s.writeLegalHoldError(w, legalhold.ErrUnavailable)
 			return
 		}
-		fields := append([]string{"id", "account_ref", "event_type", "timestamp", "retain_until", "chain_hash"}, result.Fields...)
+		fields := append([]string{"id", "account_ref", "event_type", "timestamp", "retain_until", "seq"}, result.Fields...)
 		adminaction.SetEvent(r.Context(), audit.Event{EventType: audit.EventLegalInquiryLookup,
 			ActionStatus: audit.StatusSuccess, ActorID: actor, Payload: map[string]any{"result_count": len(items),
 				"limit": req.Limit, "start_time": start, "end_time": end, "through_seq": result.Coverage.ThroughSeq,

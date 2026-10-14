@@ -6,62 +6,142 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
-// This file owns the ledgers' tamper-evidence primitive:
+// This file owns the ledgers' tamper-evidence primitive. As of format v2 it is
+// computed in two stages:
 //
-//	chain_hash(N) = SHA-256( chain_hash(N-1) || serialize(record(N)) )
+//	leaf_hash(N)  = SHA-256( leaf_prefix  || serialize(record(N)) )
+//	chain_hash(N) = SHA-256( chain_prefix || chain_hash(N-1) || leaf_hash(N) )
 //
-// It lives in package audit rather than in the signer because two independent
+// # Why two stages
+//
+// In v1 the digest covered the record and was stored on the record's own row, so
+// erasing a row removed a chain link. Recovering from that required erased-span
+// checkpoints that recorded a removed segment's predecessor and terminal digests,
+// compaction of adjacent spans, and a second copy of serialize() in PL/pgSQL to
+// re-derive bodies inside the purge routine.
+//
+// Splitting the leaf out removes the whole problem. The chain is computed over
+// leaf digests and lives in its own append-only table that is never deleted; the
+// record body lives in a separate table that may be erased freely. A retention
+// purge or a GDPR erasure drops a body and leaves every digest in place, so the
+// chain stays complete and verifiable from genesis forever. Verification of a
+// retained record recomputes its leaf from the body and compares; an erased
+// record's leaf is simply retained without a body to re-derive it from.
+//
+// It lives in package audit rather than in the signer because three independent
 // components must agree on it byte-for-byte: the signing consumer that writes the
-// chain (Task 5.2) and the verification endpoint that recomputes it from genesis
-// (Task 5.3). A second implementation of serialize() would be a latent integrity
-// alarm, so there is exactly one.
+// chain, the verification endpoint that recomputes it, and the retention worker
+// that proves what it erased. A second implementation of serialize() would be a
+// latent integrity alarm, so there is exactly one — in this file, in this
+// language. Format v2 deliberately removed the PL/pgSQL copy that v1 required.
 //
 // # Why length-prefixed binary and not JSON
 //
 // A hash input must have exactly one encoding. JSON does not: key order, unicode
 // escaping, whitespace, and integer/float rendering are all encoder-dependent, and
 // a Go version or library upgrade that changes any of them would invalidate every
-// previously stored chain_hash with no code change and no way to tell the
-// difference from real tampering. Length-prefixing every field removes both the
-// ambiguity and the concatenation attack: without it, fields ("ab","c") and
-// ("a","bc") hash identically, so an attacker could shift a byte from one column
-// into the next and preserve the digest.
+// previously stored digest with no code change and no way to tell the difference
+// from real tampering. Length-prefixing every field removes both the ambiguity and
+// the concatenation attack: without it, fields ("ab","c") and ("a","bc") hash
+// identically, so an attacker could shift a byte from one column into the next and
+// preserve the digest.
 
-// Domain separation prefixes. The two ledgers are independent chains that share a
-// formula, so their serializations must not be interchangeable: without a prefix a
-// crafted ledger record could be replayed as an audit record (or vice versa) with a
-// matching digest. The trailing NUL keeps the prefix unambiguous against the first
-// length field.
+// Domain separation prefixes.
+//
+// There are four, not two. The leaf prefixes keep the two ledgers' bodies from
+// being interchangeable: without them a crafted ledger body could be replayed as
+// an audit body with a matching digest. The chain prefixes do the same job one
+// level up, and additionally make each chain's genesis distinct, so an audit
+// genesis digest can never seed a ledger chain. The trailing NUL keeps every
+// prefix unambiguous against the first length field.
 const (
-	auditDomainPrefix  = "hatef.audit.v1\x00"
-	ledgerDomainPrefix = "hatef.ledger.v1\x00"
+	auditLeafPrefix   = "hatef.audit.body.v2\x00"
+	ledgerLeafPrefix  = "hatef.ledger.body.v2\x00"
+	auditChainPrefix  = "hatef.audit.chain.v2\x00"
+	ledgerChainPrefix = "hatef.ledger.chain.v2\x00"
 )
 
-// ChainHashHexLen is the length of a hex-encoded SHA-256 chain hash, matching the
-// CHAR(64) columns on both tables.
-const ChainHashHexLen = 2 * sha256.Size
+// DigestSize is the raw length of every leaf and chain digest. Both are stored as
+// BYTEA(32) rather than the v1 CHAR(64) hex text, which halves the storage cost of
+// the chain tables' only two columns.
+const DigestSize = sha256.Size
 
-// GenesisChainHash is the predecessor digest used for the first record in a chain:
-// 32 zero bytes. A fixed, well-known seed means the very first record is chained
-// like every other one, so verification has no special case that could be abused to
-// forge a new "first" record.
-var GenesisChainHash = [sha256.Size]byte{}
+// ChainHashHexLen is the length of a hex-encoded digest. Storage is binary; hex is
+// only used at the admin API boundary and in operator runbooks.
+const ChainHashHexLen = 2 * DigestSize
 
-// ErrInvalidChainHash reports a stored chain_hash that is not 64 hex characters,
-// which means the column was written by something other than this package.
-var ErrInvalidChainHash = errors.New("audit: stored chain_hash is not a 64-character hex SHA-256 digest")
+// Digest is one raw SHA-256 leaf or chain digest.
+type Digest [DigestSize]byte
 
-// AuditRecord is the exact set of mvp_audit_logs fields covered by the chain, in
-// hash order.
+// Hex renders the digest for an API response or a runbook.
+func (d Digest) Hex() string { return hex.EncodeToString(d[:]) }
+
+// Bytes returns a copy suitable for a BYTEA bind parameter.
+func (d Digest) Bytes() []byte {
+	out := make([]byte, DigestSize)
+	copy(out, d[:])
+	return out
+}
+
+// Errors reported for malformed stored digests. A stored value that is not exactly
+// 32 bytes was written by something other than this package.
+var (
+	// ErrInvalidChainHash reports a stored digest of the wrong length.
+	ErrInvalidChainHash = errors.New("audit: stored digest is not a 32-byte SHA-256 value")
+	// ErrFieldTooLarge reports a field that cannot be length-prefixed.
+	ErrFieldTooLarge = errors.New("audit: field exceeds serialization limit")
+)
+
+// Genesis digests: the predecessor used for the first record in each chain.
 //
-// UserID is absent by design and must stay absent. mvp_audit_logs.user_id is
+// v1 used 32 zero bytes. A derived seed is strictly better: a zeroed, truncated,
+// or default-initialized column can no longer be mistaken for a legitimate
+// genesis, so a verifier cannot be tricked into accepting a forged new "first"
+// record by blanking the predecessor. The first record is still chained exactly
+// like every other one, so verification has no special case.
+var (
+	auditGenesis  = deriveGenesis(auditChainPrefix)
+	ledgerGenesis = deriveGenesis(ledgerChainPrefix)
+)
+
+func deriveGenesis(prefix string) Digest {
+	return Digest(sha256.Sum256([]byte(prefix + "genesis")))
+}
+
+// GoldenAuditGenesisHex and GoldenLedgerGenesisHex restate the two genesis
+// digests as literals.
+//
+// They exist because migration 00015 has to embed the same two values in the
+// chain heads' CHECK constraints, and a CHECK cannot call into Go. That makes the
+// migration the one place the canonical format is duplicated outside this file,
+// so the duplication is pinned from both ends: chain_golden_test.go asserts these
+// constants equal what the code derives, and internal/migrate's
+// TestGenesisMatchesMigration asserts the migration contains exactly these
+// strings. A format change that updated one and not the other would otherwise
+// surface as an opaque constraint violation during genesis bootstrap.
+const (
+	GoldenAuditGenesisHex  = "5c358544585235f7ae29b4a8370d5541ddd6bd40c81321fc92bbb54b31887ebb"
+	GoldenLedgerGenesisHex = "6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea2c54"
+)
+
+// AuditGenesis returns the audit chain's genesis predecessor digest.
+func AuditGenesis() Digest { return auditGenesis }
+
+// LedgerGenesis returns the security ledger's genesis predecessor digest.
+func LedgerGenesis() Digest { return ledgerGenesis }
+
+// AuditRecord is the exact set of audit_log_payload fields covered by the chain,
+// in hash order.
+//
+// UserID is absent by design and must stay absent. The user reference is
 // ON DELETE SET NULL, so a GDPR hard delete rewrites it to NULL while leaving the
-// rest of the row byte-identical. Hashing it would make every purged subject's rows
-// fail verification forever — a correct erasure presenting as permanent tampering.
-// Post-deletion attribution is security_event_ledger's job. See the package doc.
+// rest of the row byte-identical. Hashing it would make every purged subject's
+// rows fail verification forever — a correct erasure presenting as permanent
+// tampering. Post-deletion attribution is the security ledger's job.
 //
 //revive:disable-next-line:exported -- Paired with LedgerRecord in the public chain format.
 type AuditRecord struct {
@@ -87,70 +167,140 @@ type LedgerRecord struct {
 	ID                 string
 	AccountRef         string
 	IdentityBlindIndex *string
-	EventType          string
-	ClientIP           *string
-	IPSubnet           *string
-	UserAgent          *string
-	DeviceFingerprint  *string
-	ClientID           *string
-	Scope              *string
-	Timestamp          time.Time
-	RetainUntil        time.Time
+	// BlindIndexVersion identifies which pepper generation produced
+	// IdentityBlindIndex. It is hashed unconditionally, including when the index
+	// itself is NULL, because it records which pepper *would* have applied.
+	//
+	// Without it the pepper can never be rotated: the index is inside the signed
+	// body and the payload table forbids UPDATE, so a rotation would silently
+	// orphan the lookup path for every historical row with no way to tell which
+	// generation any given row used. Versioning it is what keeps a compromised
+	// pepper retirable.
+	BlindIndexVersion int16
+	EventType         string
+	ClientIP          *string
+	IPSubnet          *string
+	UserAgent         *string
+	DeviceFingerprint *string
+	ClientID          *string
+	Scope             *string
+	Timestamp         time.Time
+	RetainUntil       time.Time
 }
 
-// SerializeAudit returns the canonical hash input for one mvp_audit_logs row.
-func SerializeAudit(r AuditRecord) []byte {
+// SerializeAudit returns the canonical body for one audit record. The leaf prefix
+// is applied by LeafAudit, not here, so the body and the digest stay separable.
+func SerializeAudit(r AuditRecord) ([]byte, error) {
 	buf := make([]byte, 0, 256)
-	buf = append(buf, auditDomainPrefix...)
-	buf = appendField(buf, r.ID)
-	buf = appendField(buf, r.ActorID)
-	buf = appendField(buf, r.ActorSPIFFEID)
-	buf = appendField(buf, r.EventType)
-	buf = appendField(buf, r.ActionStatus)
-	buf = appendField(buf, r.ClientIP)
-	buf = appendField(buf, r.UserAgent)
-	buf = appendField(buf, r.Payload)
-	buf = appendField(buf, FormatChainTime(r.Timestamp))
-	return buf
+	var err error
+	for _, field := range []string{
+		r.ID, r.ActorID, r.ActorSPIFFEID, r.EventType, r.ActionStatus,
+		r.ClientIP, r.UserAgent, r.Payload, FormatChainTime(r.Timestamp),
+	} {
+		if buf, err = appendField(buf, field); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
 
-// SerializeLedger returns the canonical hash input for one security_event_ledger
-// row.
-func SerializeLedger(r LedgerRecord) []byte {
+// SerializeLedger returns the canonical body for one security ledger record.
+func SerializeLedger(r LedgerRecord) ([]byte, error) {
 	buf := make([]byte, 0, 256)
-	buf = append(buf, ledgerDomainPrefix...)
-	buf = appendField(buf, r.ID)
-	buf = appendField(buf, r.AccountRef)
-	buf = appendNullable(buf, r.IdentityBlindIndex)
-	buf = appendField(buf, r.EventType)
-	buf = appendNullable(buf, r.ClientIP)
-	buf = appendNullable(buf, r.IPSubnet)
-	buf = appendNullable(buf, r.UserAgent)
-	buf = appendNullable(buf, r.DeviceFingerprint)
-	buf = appendNullable(buf, r.ClientID)
-	buf = appendNullable(buf, r.Scope)
-	buf = appendField(buf, FormatChainTime(r.Timestamp))
-	buf = appendField(buf, FormatChainTime(r.RetainUntil))
-	return buf
+	var err error
+	if buf, err = appendField(buf, r.ID); err != nil {
+		return nil, err
+	}
+	if buf, err = appendField(buf, r.AccountRef); err != nil {
+		return nil, err
+	}
+	if buf, err = appendNullable(buf, r.IdentityBlindIndex); err != nil {
+		return nil, err
+	}
+	if buf, err = appendField(buf, strconv.FormatInt(int64(r.BlindIndexVersion), 10)); err != nil {
+		return nil, err
+	}
+	if buf, err = appendField(buf, r.EventType); err != nil {
+		return nil, err
+	}
+	for _, field := range []*string{
+		r.ClientIP, r.IPSubnet, r.UserAgent, r.DeviceFingerprint, r.ClientID, r.Scope,
+	} {
+		if buf, err = appendNullable(buf, field); err != nil {
+			return nil, err
+		}
+	}
+	if buf, err = appendField(buf, FormatChainTime(r.Timestamp)); err != nil {
+		return nil, err
+	}
+	return appendField(buf, FormatChainTime(r.RetainUntil))
 }
 
-// ChainHash computes the hex digest for a record given its predecessor's raw
-// digest.
-func ChainHash(prev [sha256.Size]byte, body []byte) string {
+// LeafAudit computes one audit record's leaf digest.
+func LeafAudit(r AuditRecord) (Digest, error) {
+	body, err := SerializeAudit(r)
+	if err != nil {
+		return Digest{}, err
+	}
+	return leaf(auditLeafPrefix, body), nil
+}
+
+// LeafLedger computes one ledger record's leaf digest.
+func LeafLedger(r LedgerRecord) (Digest, error) {
+	body, err := SerializeLedger(r)
+	if err != nil {
+		return Digest{}, err
+	}
+	return leaf(ledgerLeafPrefix, body), nil
+}
+
+func leaf(prefix string, body []byte) Digest {
 	h := sha256.New()
-	h.Write(prev[:])
-	h.Write(body)
-	return hex.EncodeToString(h.Sum(nil))
+	_, _ = h.Write([]byte(prefix))
+	_, _ = h.Write(body)
+	var out Digest
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
-// DecodeChainHash converts a stored hex chain_hash back into the raw 32 bytes used
-// as the next record's predecessor.
+// ChainAudit links one audit leaf onto its predecessor.
+func ChainAudit(prev, leafHash Digest) Digest {
+	return chain(auditChainPrefix, prev, leafHash)
+}
+
+// ChainLedger links one ledger leaf onto its predecessor.
+func ChainLedger(prev, leafHash Digest) Digest {
+	return chain(ledgerChainPrefix, prev, leafHash)
+}
+
+func chain(prefix string, prev, leafHash Digest) Digest {
+	h := sha256.New()
+	_, _ = h.Write([]byte(prefix))
+	_, _ = h.Write(prev[:])
+	_, _ = h.Write(leafHash[:])
+	var out Digest
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// DecodeDigest converts a stored BYTEA value into a Digest.
 //
-// Rehashing the hex text instead would still chain, but it would silently accept a
-// truncated or non-hex column, so the malformed value would propagate into every
-// later digest rather than being reported here.
-func DecodeChainHash(stored string) ([sha256.Size]byte, error) {
-	var out [sha256.Size]byte
+// The length check is load-bearing rather than defensive: silently accepting a
+// short or over-long column would propagate the malformed value into every later
+// digest instead of being reported at the row that carries it.
+func DecodeDigest(stored []byte) (Digest, error) {
+	var out Digest
+	if len(stored) != DigestSize {
+		return out, fmt.Errorf("%w: got %d bytes", ErrInvalidChainHash, len(stored))
+	}
+	copy(out[:], stored)
+	return out, nil
+}
+
+// DecodeDigestHex converts hex text (an admin API argument, or an operator-supplied
+// runbook value) into a Digest.
+func DecodeDigestHex(stored string) (Digest, error) {
+	var out Digest
 	if len(stored) != ChainHashHexLen {
 		return out, fmt.Errorf("%w: got %d characters", ErrInvalidChainHash, len(stored))
 	}
@@ -164,7 +314,7 @@ func DecodeChainHash(stored string) ([sha256.Size]byte, error) {
 
 // NormalizeChainTime prepares new timestamps for PostgreSQL's microsecond
 // precision before hashing AND insertion. Do not apply it as a historical repair:
-// existing hashes must be verified against exactly the values that survived.
+// existing digests must be verified against exactly the values that survived.
 func NormalizeChainTime(t time.Time) time.Time {
 	return t.UTC().Truncate(time.Microsecond)
 }
@@ -176,20 +326,23 @@ func FormatChainTime(t time.Time) string {
 }
 
 // appendField writes uint32be(len(s)) || s.
-func appendField(dst []byte, s string) []byte {
-	length := len(s)
-	if length < 0 || length > 1<<32-1 {
-		panic("audit: field exceeds serialization limit")
+//
+// An over-long field is an error rather than a panic: this runs inside the
+// single-writer signing worker, and killing the only process that can advance the
+// chain is a worse outcome than refusing one record.
+func appendField(dst []byte, s string) ([]byte, error) {
+	if uint64(len(s)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("%w: %d bytes", ErrFieldTooLarge, len(s))
 	}
-	dst = binary.BigEndian.AppendUint32(dst, uint32(length))
-	return append(dst, s...)
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(s)))
+	return append(dst, s...), nil
 }
 
 // appendNullable writes 0x00 for NULL, or 0x01 followed by a length-prefixed
 // value. The tag byte is what keeps NULL distinguishable from "".
-func appendNullable(dst []byte, s *string) []byte {
+func appendNullable(dst []byte, s *string) ([]byte, error) {
 	if s == nil {
-		return append(dst, 0x00)
+		return append(dst, 0x00), nil
 	}
 	dst = append(dst, 0x01)
 	return appendField(dst, *s)

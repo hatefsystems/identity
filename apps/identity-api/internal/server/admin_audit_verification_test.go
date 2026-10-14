@@ -3,17 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
@@ -22,228 +21,329 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
 
-func verificationRows(sequences ...int64) []chainRow {
-	var rows []chainRow
-	prev := audit.GenesisChainHash
-	for _, seq := range sequences {
-		body := audit.SerializeAudit(audit.AuditRecord{ID: uuid.NewString(), ActorID: uuid.NewString(), Payload: fmt.Sprintf(`{"private":"private-value-%d"}`, seq), ClientIP: "192.0.2.254", UserAgent: "private-agent", Timestamp: time.Unix(seq, 0)})
-		hash := audit.ChainHash(prev, body)
-		rows = append(rows, chainRow{seq: seq, storedHash: hash, body: body})
-		prev, _ = audit.DecodeChainHash(hash)
-	}
-	return rows
+// These tests cover the HTTP contract of the two verification routes: the status
+// code mapping, the recorded Class C event, and the response projection. The
+// chain walking itself is covered in internal/audit/ledgerproof; both routes now
+// share that one walker, so there is no second recomputation loop here to test.
+
+// verifySource is an in-memory chain for one of the two chains.
+type verifySource struct {
+	chain ledgerproof.Chain
+	head  ledgerproof.Head
+	nodes []ledgerproof.Node
 }
 
-func verifyPage(t *testing.T, rows []chainRow, query string, mutateFetch func([]chainRow) []chainRow) (*httptest.ResponseRecorder, adminChainVerifyResponse, *adminaction.Operation) {
+func (s *verifySource) Head(context.Context) (ledgerproof.Head, error) { return s.head, nil }
+
+func (s *verifySource) HashAt(_ context.Context, seq int64) ([]byte, error) {
+	for _, n := range s.nodes {
+		if n.Seq == seq {
+			return n.ChainHash, nil
+		}
+	}
+	return nil, ledgerproof.ErrUnknownSeq
+}
+
+func (s *verifySource) Page(_ context.Context, after, through int64, limit int32) ([]ledgerproof.Node, error) {
+	var out []ledgerproof.Node
+	for _, n := range s.nodes {
+		if n.Seq > after && n.Seq <= through && int32(len(out)) < limit {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// buildAuditSource creates a well-formed audit chain at the given positions.
+// Non-contiguous sequences are deliberate: allocation holes are legal and must
+// not break hash linkage.
+func buildAuditSource(t *testing.T, sequences ...int64) *verifySource {
 	t.Helper()
-	s := &Server{cfg: config.Config{Admin: config.AdminConfig{ChainVerifyMaxLimit: 5000}}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	src := &verifySource{chain: ledgerproof.ChainAudit}
+	prev := audit.AuditGenesis()
+	for _, seq := range sequences {
+		rec := audit.AuditRecord{
+			ID: uuid.NewString(), ActorID: uuid.NewString(),
+			Payload:   fmt.Sprintf(`{"private":"private-value-%d"}`, seq),
+			ClientIP:  "192.0.2.254",
+			UserAgent: "private-agent",
+			Timestamp: time.Unix(seq, 0).UTC(),
+		}
+		leafHash, err := audit.LeafAudit(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev = audit.ChainAudit(prev, leafHash)
+		src.nodes = append(src.nodes, ledgerproof.Node{
+			Seq: seq, LeafHash: leafHash.Bytes(), ChainHash: prev.Bytes(),
+			Recompute: func() (audit.Digest, error) { return audit.LeafAudit(rec) },
+		})
+	}
+	if n := len(sequences); n > 0 {
+		src.head = ledgerproof.Head{Seq: sequences[n-1], MaxSeq: sequences[n-1], Hash: prev.Bytes()}
+	} else {
+		src.head = ledgerproof.Head{Hash: audit.AuditGenesis().Bytes()}
+	}
+	return src
+}
+
+func verifyRequest(t *testing.T, chain ledgerproof.Chain, src *verifySource, query string) (*httptest.ResponseRecorder, adminLedgerVerifyResponse, *adminaction.Operation) {
+	t.Helper()
+	s := &Server{
+		cfg:    config.Config{Admin: config.AdminConfig{ChainVerifyMaxLimit: 5000}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
 	op := &adminaction.Operation{ID: uuid.New()}
-	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit-logs/verify"+query, nil)
+	route := "/api/v1/admin/audit-logs/verify"
+	if chain == ledgerproof.ChainLedger {
+		route = "/api/v1/admin/ledger/verify"
+	}
+	r := httptest.NewRequest(http.MethodGet, route+query, nil)
 	r = r.WithContext(adminaction.WithContext(rbac.WithActor(r.Context(), uuid.New()), op))
 	w := httptest.NewRecorder()
-	fetch := func(_ context.Context, p chainVerifyParams) ([]chainRow, error) {
-		var page []chainRow
-		for _, row := range rows {
-			if row.seq > p.afterSeq && row.seq <= p.throughSeq {
-				page = append(page, row)
-				if len(page) == int(p.limit)+1 {
-					break
-				}
-			}
-		}
-		if mutateFetch != nil {
-			page = mutateFetch(page)
-		}
-		return page, nil
+
+	verify := func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
+		return ledgerproof.Verify(ctx, src, p)
 	}
-	seed := func(_ context.Context, seq int64) (string, error) {
-		for _, row := range rows {
-			if row.seq == seq {
-				return row.storedHash, nil
-			}
-		}
-		return "", pgx.ErrNoRows
-	}
-	highWater := func(context.Context) (int64, error) {
-		if len(rows) == 0 {
-			return 0, nil
-		}
-		return rows[len(rows)-1].seq, nil
-	}
-	s.runChainVerification(w, r, "audit", fetch, seed, highWater)
-	var response adminChainVerifyResponse
+	s.runChainVerification(w, r, chain, verify)
+
+	var response adminLedgerVerifyResponse
 	if w.Code == http.StatusOK {
 		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-			t.Fatal(err)
+			t.Fatalf("decode response: %v (%s)", err, w.Body.String())
 		}
 	}
 	return w, response, op
 }
 
-func TestAdminVerificationFixedWatermarkAndTrueLookahead(t *testing.T) {
-	rows := verificationRows(2, 8, 11, 18) // Allocation holes do not break hash links.
-	w, first, op := verifyPage(t, rows, "?limit=2", nil)
-	if w.Code != http.StatusOK || !first.Verified || first.Complete || first.ThroughSeq != 18 || first.NextAfterSeq == nil || *first.NextAfterSeq != 8 || first.Checked != 2 {
+func TestAdminVerifyAuditChainClean(t *testing.T) {
+	src := buildAuditSource(t, 2, 8, 11, 18) // allocation holes
+	w, resp, op := verifyRequest(t, ledgerproof.ChainAudit, src, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if !resp.Verified || !resp.Complete || resp.Checked != 4 {
+		t.Fatalf("verified=%v complete=%v checked=%d reason=%v", resp.Verified, resp.Complete, resp.Checked, resp.FailureReason)
+	}
+	if resp.Chain != "audit" || resp.SeedSource != "genesis" {
+		t.Errorf("chain=%q seed_source=%q", resp.Chain, resp.SeedSource)
+	}
+	if resp.ThroughSeq != 18 || resp.LastSeq == nil || *resp.LastSeq != 18 {
+		t.Errorf("through_seq=%d last_seq=%v", resp.ThroughSeq, resp.LastSeq)
+	}
+
+	// Reading the tamper-evident log is itself auditable, and the recorded event
+	// must describe the window rather than the records.
+	if op.Event.EventType != audit.EventAdminChainVerified || op.Event.ActionStatus != audit.StatusSuccess {
+		t.Errorf("event = %q/%q", op.Event.EventType, op.Event.ActionStatus)
+	}
+	if op.Event.Security != nil {
+		t.Error("a verification read must not be recorded as a Class B security event")
+	}
+	encoded, err := json.Marshal(op.Event.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"private-value", "private-agent", "192.0.2.254"} {
+		if bytesContains(encoded, leaked) {
+			t.Errorf("verification audit payload leaked record content %q", leaked)
+		}
+	}
+}
+
+func TestAdminVerifyPaginatesWithCursor(t *testing.T) {
+	src := buildAuditSource(t, 2, 8, 11, 18)
+
+	w, first, _ := verifyRequest(t, ledgerproof.ChainAudit, src, "?limit=2")
+	if w.Code != http.StatusOK || !first.Verified || first.Complete || first.Checked != 2 {
 		t.Fatalf("first page: %s", w.Body.String())
 	}
-	if first.SeedSource != "genesis" || first.LastHash == nil || *first.LastHash != rows[1].storedHash {
-		t.Fatal("missing actual seed/continuation digest")
+	if first.NextAfterSeq == nil || *first.NextAfterSeq != 8 {
+		t.Fatalf("next_after_seq = %v, want 8", first.NextAfterSeq)
 	}
-	if op.Event.EventType != audit.EventAdminChainVerified || op.Event.Security != nil || op.Event.Payload["through_seq"] != int64(18) {
-		t.Fatal("verification did not record bounded Class C event")
+	if first.LastHash == "" {
+		t.Fatal("a partial page must report the continuation digest")
 	}
-	// A new row (including verification's own audit event) is outside the fixed head.
-	prev, _ := audit.DecodeChainHash(rows[3].storedHash)
-	body := []byte("new private record")
-	rows = append(rows, chainRow{seq: 21, body: body, storedHash: audit.ChainHash(prev, body)})
-	w, last, _ := verifyPage(t, rows, "?limit=2&after_seq=8&through_seq=18&predecessor_hash="+*first.LastHash, nil)
-	if w.Code != http.StatusOK || !last.Verified || !last.Complete || last.NextAfterSeq != nil || last.Checked != 2 || last.LastSeq == nil || *last.LastSeq != 18 {
-		t.Fatalf("full final page: %s", w.Body.String())
+
+	w, second, _ := verifyRequest(t, ledgerproof.ChainAudit, src,
+		"?limit=2&after_seq=8&through_seq=18&predecessor_hash="+first.LastHash)
+	if w.Code != http.StatusOK || !second.Verified || !second.Complete || second.Checked != 2 {
+		t.Fatalf("second page: %s", w.Body.String())
 	}
-	if last.SeedSource != "supplied_predecessor" || last.SeedHash != *first.LastHash {
-		t.Fatal("incorrect reported seed")
+	if second.SeedSource != "supplied_predecessor" {
+		t.Errorf("seed_source = %q, want supplied_predecessor", second.SeedSource)
 	}
-	for _, forbidden := range []string{"private-value", "192.0.2.254", "private-agent", "actor_id", "payload", "identity_blind_index", "account_ref"} {
-		if strings.Contains(w.Body.String(), forbidden) {
-			t.Fatalf("verification leaks %s", forbidden)
+}
+
+// TestAdminVerifyReportsTampering is the failure contract: a 200 carrying
+// verified=false, the offending seq, and a failed audit status. A rewritten
+// record must not surface as a 500, because an operator needs the seq.
+func TestAdminVerifyReportsTampering(t *testing.T) {
+	src := buildAuditSource(t, 1, 2, 3)
+	rewritten := audit.AuditRecord{ID: uuid.NewString(), EventType: "rewritten", Timestamp: time.Unix(2, 0).UTC()}
+	src.nodes[1].Recompute = func() (audit.Digest, error) { return audit.LeafAudit(rewritten) }
+
+	w, resp, op := verifyRequest(t, ledgerproof.ChainAudit, src, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 so the break is reportable", w.Code)
+	}
+	if resp.Verified {
+		t.Fatal("a rewritten record verified clean")
+	}
+	if resp.FailureReason == nil || *resp.FailureReason != "leaf_mismatch" {
+		t.Errorf("failure_reason = %v, want leaf_mismatch", resp.FailureReason)
+	}
+	if resp.BrokenAtSeq == nil || *resp.BrokenAtSeq != 2 {
+		t.Errorf("broken_at_seq = %v, want 2", resp.BrokenAtSeq)
+	}
+	if op.Event.ActionStatus != audit.StatusFailure {
+		t.Errorf("audit status = %q, want failure so alerting fires", op.Event.ActionStatus)
+	}
+}
+
+// TestAdminVerifyLedgerAcceptsLawfulErasure covers the v2 behaviour the HTTP
+// layer has to surface: an erased payload is verifiable and counted, not an
+// error. v1 reported purged spans and a restart flag here because a removed
+// record broke the chain; neither concept exists now.
+func TestAdminVerifyLedgerAcceptsLawfulErasure(t *testing.T) {
+	src := &verifySource{chain: ledgerproof.ChainLedger}
+	prev := audit.LedgerGenesis()
+	op := "33333333-3333-4333-8333-333333333333"
+	for seq := int64(1); seq <= 3; seq++ {
+		blind := "abc"
+		rec := audit.LedgerRecord{
+			ID: uuid.NewString(), AccountRef: uuid.NewString(),
+			IdentityBlindIndex: &blind, BlindIndexVersion: 1, EventType: "auth.login",
+			Timestamp: time.Unix(seq, 0).UTC(), RetainUntil: time.Unix(seq+1000, 0).UTC(),
 		}
-	}
-	if !strings.Contains(last.Scope, "not complete ingestion") {
-		t.Fatal("verification scope overclaims evidence")
-	}
-}
-
-func TestAdminVerificationMissingHistoryNeverProvesSegment(t *testing.T) {
-	rows := verificationRows(1, 3, 8)
-	tests := []struct {
-		name, query string
-		rows        []chainRow
-		code        int
-		reason      string
-	}{
-		{"empty", "", nil, 200, "no_stored_records"},
-		{"missing predecessor", "?after_seq=2&through_seq=8", rows, 400, ""},
-		{"missing upper boundary", "?through_seq=9", rows, 400, ""},
-		{"moving resume rejected", "?after_seq=1", rows, 400, ""},
-		{"empty segment", "?after_seq=8&through_seq=8", rows, 200, "no_stored_records"},
-		{"purged prefix", "", rows[1:], 200, "hash_mismatch"},
-		{"purged interior", "", []chainRow{rows[0], rows[2]}, 200, "hash_mismatch"},
-		{"wrong prior digest", "?after_seq=1&through_seq=8&predecessor_hash=" + strings.Repeat("a", 64), rows, 200, "predecessor_mismatch"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w, response, _ := verifyPage(t, tt.rows, tt.query, nil)
-			if w.Code != tt.code || response.Verified || response.Complete || response.NextAfterSeq != nil {
-				t.Fatalf("false proof: %d %s", w.Code, w.Body.String())
-			}
-			if tt.reason != "" && (response.FailureReason == nil || *response.FailureReason != tt.reason) {
-				t.Fatalf("failure reason: %s", w.Body.String())
-			}
-		})
-	}
-}
-
-func TestAdminVerificationReportsLegacyPrecisionDefectWithoutRepair(t *testing.T) {
-	record := audit.AuditRecord{ID: uuid.NewString(), ActorID: uuid.NewString(), Timestamp: time.Unix(1789695500, 123456789), Payload: "{}"}
-	oldHash := audit.ChainHash(audit.GenesisChainHash, audit.SerializeAudit(record))
-	record.Timestamp = record.Timestamp.Truncate(time.Microsecond)
-	rows := []chainRow{{seq: 4, storedHash: oldHash, body: audit.SerializeAudit(record)}}
-	w, result, _ := verifyPage(t, rows, "", nil)
-	if w.Code != 200 || result.Verified || result.Checked != 1 || result.BrokenAtSeq == nil || *result.BrokenAtSeq != 4 {
-		t.Fatalf("precision defect hidden: %s", w.Body.String())
-	}
-	if rows[0].storedHash != oldHash {
-		t.Fatal("historical hash rewritten")
-	}
-}
-
-func TestAdminVerificationDetectsUpperBoundaryLostDuringScan(t *testing.T) {
-	w, response, _ := verifyPage(t, verificationRows(1, 2), "", func(rows []chainRow) []chainRow { return rows[:1] })
-	if response.Verified || response.FailureReason == nil || *response.FailureReason != "missing_upper_boundary" {
-		t.Fatalf("lost tail falsely verified: %s", w.Body.String())
-	}
-}
-
-func TestAdminVerificationRejectsMalformedBounds(t *testing.T) {
-	for _, query := range []string{"?limit=-1", "?after_seq=-1", "?through_seq=-1", "?after_seq=3&through_seq=2", "?through_seq=", "?predecessor_hash=", "?predecessor_hash=abc", "?after_seq=9223372036854775808"} {
-		w, _, _ := verifyPage(t, verificationRows(1, 2), query, nil)
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("accepted %s: %d", query, w.Code)
+		leafHash, err := audit.LeafLedger(rec)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-}
-
-type ledgerHTTPSource struct {
-	head  ledgerproof.Head
-	steps []ledgerproof.Step
-}
-
-func (s ledgerHTTPSource) Head(context.Context) (ledgerproof.Head, error) { return s.head, nil }
-func (s ledgerHTTPSource) Boundary(_ context.Context, seq int64) ([]ledgerproof.Step, error) {
-	var out []ledgerproof.Step
-	for _, step := range s.steps {
-		if step.FirstSeq <= seq && step.LastSeq >= seq || step.Record == nil && step.PredecessorSeq == seq {
-			out = append(out, step)
+		prev = audit.ChainLedger(prev, leafHash)
+		node := ledgerproof.Node{Seq: seq, LeafHash: leafHash.Bytes(), ChainHash: prev.Bytes()}
+		if seq == 2 {
+			// Payload erased; leaf retained; erasure record present.
+			node.ErasureOperation = &op
+		} else {
+			node.Recompute = func() (audit.Digest, error) { return audit.LeafLedger(rec) }
 		}
+		src.nodes = append(src.nodes, node)
 	}
-	return out, nil
-}
-func (s ledgerHTTPSource) Page(_ context.Context, after, through int64, limit int32) ([]ledgerproof.Step, error) {
-	var out []ledgerproof.Step
-	for _, step := range s.steps {
-		if step.LastSeq > after && step.FirstSeq <= through {
-			out = append(out, step)
-			if len(out) == int(limit) {
-				break
-			}
-		}
+	src.head = ledgerproof.Head{Seq: 3, MaxSeq: 3, Hash: prev.Bytes()}
+
+	w, resp, operation := verifyRequest(t, ledgerproof.ChainLedger, src, "")
+	if w.Code != http.StatusOK || !resp.Verified || !resp.Complete {
+		t.Fatalf("an erased span broke ledger verification: %s", w.Body.String())
 	}
-	return out, nil
+	if resp.ErasedChecked != 1 {
+		t.Errorf("erased_checked = %d, want 1", resp.ErasedChecked)
+	}
+	if resp.Checked != 3 {
+		t.Errorf("checked = %d, want 3", resp.Checked)
+	}
+	if operation.Event.ActionStatus != audit.StatusSuccess {
+		t.Errorf("a lawful erasure must not be audited as a verification failure, got %q", operation.Event.ActionStatus)
+	}
 }
 
-func TestAdminLedgerRetentionResponseAndAudit(t *testing.T) {
-	record := audit.LedgerRecord{ID: uuid.NewString(), AccountRef: uuid.NewString(), EventType: "private-event", ClientIP: stringPtr("192.0.2.123"), Timestamp: time.Now().Truncate(time.Microsecond)}
-	hash := audit.ChainHash(audit.GenesisChainHash, audit.SerializeLedger(record))
-	live := ledgerproof.Step{Checkpoint: ledgerproof.Checkpoint{FirstSeq: 4, LastSeq: 4, TerminalHash: hash}, Record: &record}
-	erased := ledgerproof.Step{Checkpoint: ledgerproof.Checkpoint{FirstSeq: 1, LastSeq: 4, PredecessorHash: strings.Repeat("0", 64), TerminalHash: hash, ErasedCount: 2}}
-	for _, tc := range []struct {
-		name, query, reason, status string
-		step                        ledgerproof.Step
-		verified, restart           bool
-	}{
-		{"live", "", "", audit.StatusSuccess, live, true, false},
-		{"all purged", "", "no_retained_records", audit.StatusSuccess, erased, false, false},
-		{"compacted cursor", "?after_seq=1&through_seq=4", "retention_boundary_unavailable", audit.StatusSuccess, erased, false, true},
-		{"supplied mismatch", "?after_seq=4&through_seq=4&predecessor_hash=" + strings.Repeat("a", 64), "predecessor_mismatch", audit.StatusFailure, erased, false, false},
+// TestAdminVerifyLedgerRejectsUnexplainedGap is the check v1 could not make.
+func TestAdminVerifyLedgerRejectsUnexplainedGap(t *testing.T) {
+	src := &verifySource{chain: ledgerproof.ChainLedger}
+	prev := audit.LedgerGenesis()
+	for seq := int64(1); seq <= 2; seq++ {
+		rec := audit.LedgerRecord{
+			ID: uuid.NewString(), AccountRef: uuid.NewString(), BlindIndexVersion: 0,
+			EventType: "auth.login", Timestamp: time.Unix(seq, 0).UTC(), RetainUntil: time.Unix(seq+10, 0).UTC(),
+		}
+		leafHash, err := audit.LeafLedger(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev = audit.ChainLedger(prev, leafHash)
+		node := ledgerproof.Node{Seq: seq, LeafHash: leafHash.Bytes(), ChainHash: prev.Bytes()}
+		if seq == 1 {
+			node.Recompute = func() (audit.Digest, error) { return audit.LeafLedger(rec) }
+		}
+		// seq 2: payload gone, no erasure record.
+		src.nodes = append(src.nodes, node)
+	}
+	src.head = ledgerproof.Head{Seq: 2, MaxSeq: 2, Hash: prev.Bytes()}
+
+	w, resp, operation := verifyRequest(t, ledgerproof.ChainLedger, src, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if resp.Verified {
+		t.Fatal("an unexplained missing payload verified clean")
+	}
+	if resp.FailureReason == nil || *resp.FailureReason != "payload_absent_without_erasure_record" {
+		t.Errorf("failure_reason = %v", resp.FailureReason)
+	}
+	if operation.Event.ActionStatus != audit.StatusFailure {
+		t.Error("an unexplained deletion must audit as a failure")
+	}
+}
+
+func TestAdminVerifyRejectsUnknownSeq(t *testing.T) {
+	src := buildAuditSource(t, 1, 2)
+	w, _, _ := verifyRequest(t, ledgerproof.ChainAudit, src, "?after_seq=99&through_seq=100")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestAdminVerifyRejectsMalformedParams(t *testing.T) {
+	src := buildAuditSource(t, 1, 2)
+	for _, query := range []string{
+		"?limit=0&after_seq=1",            // after_seq without through_seq
+		"?after_seq=5&through_seq=1",      // inverted range
+		"?predecessor_hash=zz",            // not hex
+		"?limit=-1",                       // negative limit
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &Server{cfg: config.Config{Admin: config.AdminConfig{ChainVerifyMaxLimit: 5000}}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-			op := &adminaction.Operation{ID: uuid.New()}
-			r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/ledger/verify"+tc.query, nil)
-			r = r.WithContext(adminaction.WithContext(rbac.WithActor(r.Context(), uuid.New()), op))
-			w := httptest.NewRecorder()
-			source := ledgerHTTPSource{head: ledgerproof.Head{Seq: 4, MaxSeq: 4, Hash: hash}, steps: []ledgerproof.Step{tc.step}}
-			s.runLedgerVerification(w, r, func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
-				return ledgerproof.Verify(ctx, source, p)
-			})
-			var response adminLedgerVerifyResponse
-			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-				t.Fatal(err)
-			}
-			if w.Code != 200 || response.Verified != tc.verified || response.RestartRequired != tc.restart || (tc.reason != "" && (response.FailureReason == nil || *response.FailureReason != tc.reason)) {
-				t.Fatalf("%d %s", w.Code, w.Body.String())
-			}
-			if op.Event.EventType != audit.EventAdminChainVerified || op.Event.ActionStatus != tc.status || op.Event.Security != nil || op.Event.Payload["verification_scope"] != "database_relative_retained_segment" {
-				t.Fatalf("audit %+v", op.Event)
-			}
-			if tc.name == "all purged" && (response.Checked != 0 || response.PurgedCount != 2 || response.PurgedSpans != 1 || !response.Complete || response.BrokenAtSeq != nil) {
-				t.Fatalf("no-content status %s", w.Body.String())
-			}
-			for _, forbidden := range []string{record.ID, record.AccountRef, "192.0.2.123", "private-event", "account_ref", "payload", "identity_blind_index"} {
-				if strings.Contains(w.Body.String(), forbidden) {
-					t.Fatalf("leaked %s", forbidden)
-				}
-			}
-		})
+		w, _, _ := verifyRequest(t, ledgerproof.ChainAudit, src, query)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("query %q: status = %d, want 400", query, w.Code)
+		}
 	}
+}
+
+func TestAdminVerifyPropagatesVerifierFailure(t *testing.T) {
+	s := &Server{
+		cfg:    config.Config{Admin: config.AdminConfig{ChainVerifyMaxLimit: 5000}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit-logs/verify", nil)
+	r = r.WithContext(adminaction.WithContext(rbac.WithActor(r.Context(), uuid.New()), &adminaction.Operation{ID: uuid.New()}))
+	w := httptest.NewRecorder()
+	s.runChainVerification(w, r, ledgerproof.ChainAudit,
+		func(context.Context, ledgerproof.Params) (ledgerproof.Result, error) {
+			return ledgerproof.Result{}, errors.New("database unavailable")
+		})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestAdminVerifyMissingHeadIsBadRequest(t *testing.T) {
+	src := buildAuditSource(t, 1)
+	src.head.Hash = nil
+	w, _, _ := verifyRequest(t, ledgerproof.ChainAudit, src, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an uninitialized head", w.Code)
+	}
+}
+
+func bytesContains(haystack []byte, needle string) bool {
+	return len(needle) > 0 && len(haystack) >= len(needle) &&
+		indexOf(string(haystack), needle) >= 0
+}
+
+func indexOf(haystack, needle string) int {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return i
+		}
+	}
+	return -1
 }

@@ -23,7 +23,7 @@ import (
 
 type fakeStore struct {
 	holds          map[uuid.UUID]db.LegalHold
-	events         []db.SecurityEventLedger
+	events         []db.LookupLegalAttributionRow
 	accountPresent bool
 	lookupParams   db.LookupLegalAttributionParams
 	err            error
@@ -95,9 +95,9 @@ func (f *fakeStore) ObserveLegalSubject(_ context.Context, id uuid.UUID) (db.Obs
 	}
 	return result, nil
 }
-func (f *fakeStore) LookupLegalAttribution(_ context.Context, p db.LookupLegalAttributionParams) ([]db.SecurityEventLedger, error) {
+func (f *fakeStore) LookupLegalAttribution(_ context.Context, p db.LookupLegalAttributionParams) ([]db.LookupLegalAttributionRow, error) {
 	f.lookupParams = p
-	var result []db.SecurityEventLedger
+	var result []db.LookupLegalAttributionRow
 	for _, e := range f.events {
 		held := false
 		for _, h := range f.holds {
@@ -149,7 +149,7 @@ func testEncryptor(t *testing.T) *envelope.Encryptor {
 func testService(t *testing.T) (*Service, *fakeStore) {
 	t.Helper()
 	store := newFakeStore()
-	indexer, err := blindindex.New(bytes.Repeat([]byte{0x42}, 32))
+	indexer, err := blindindex.New(bytes.Repeat([]byte{0x42}, 32), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestPreservePostDeletionAndAdvisoryExpiry(t *testing.T) {
 			s, store := testService(t)
 			req := validApply()
 			if evidence {
-				store.events = []db.SecurityEventLedger{{AccountRef: req.AccountRef}}
+				store.events = []db.LookupLegalAttributionRow{{AccountRef: req.AccountRef}}
 			}
 			res, err := s.Preserve(context.Background(), PreserveRequest{AccountRef: req.AccountRef, AppliedBy: req.AppliedBy,
 				Reason: req.Reason, RequestingAuthority: req.RequestingAuthority, IdempotencyKey: req.IdempotencyKey, ExpiresAt: s.now().Add(-time.Hour)})
@@ -326,7 +326,7 @@ func lookupFixture(t *testing.T) (*Service, *fakeStore, LookupRequest) {
 	r := LookupRequest{IdentifierType: "email", Identifier: "alice@example.test", RequestingAuthority: "court", CaseReference: "case", Purpose: "investigation", ActorID: uuid.New(), StartTime: s.now().Add(-time.Hour), EndTime: s.now(), Limit: 2}
 	index := s.indexer.Compute(r.Identifier)
 	for i := int64(1); i <= 4; i++ {
-		store.events = append(store.events, db.SecurityEventLedger{ID: uuid.New(), AccountRef: uuid.New(), Seq: i,
+		store.events = append(store.events, db.LookupLegalAttributionRow{EventID: uuid.New(), AccountRef: uuid.New(), Seq: i,
 			IdentityBlindIndex: &index, Timestamp: timestamptz(s.now().Add(-time.Minute)), RetainUntil: timestamptz(s.now().Add(time.Hour))})
 	}
 	return s, store, r

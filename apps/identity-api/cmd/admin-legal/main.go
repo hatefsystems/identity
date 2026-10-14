@@ -186,7 +186,11 @@ func lookupProbe(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
-	indexer, err := blindindex.New(pepper)
+	pepperVersion, err := config.LoadBlindIndexPepperVersion()
+	if err != nil {
+		return err
+	}
+	indexer, err := blindindex.New(pepper, pepperVersion)
 	if err != nil {
 		return err
 	}

@@ -70,6 +70,10 @@ func (a *Authorizer) ServerOptions(svids x509svid.Source) ([]grpc.ServerOption, 
 	config.MinVersion = tls.VersionTLS13
 	// go-spiffe verifies through VerifyPeerCertificate, which resumed TLS
 	// sessions skip. Require a fresh handshake on each new connection.
+	//
+	// This is also what keeps the per-connection verification honest: a resumed
+	// session would carry forward an admission decision without re-presenting the
+	// certificate it was based on.
 	config.SessionTicketsDisabled = true
 	return []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(config)),

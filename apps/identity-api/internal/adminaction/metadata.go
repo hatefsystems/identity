@@ -88,14 +88,17 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 				"GET /api/v1/admin/*", "POST /api/v1/admin/*", "PATCH /api/v1/admin/*", "DELETE /api/v1/admin/*",
 				"PUT /api/v1/admin/*", "HEAD /api/v1/admin/*", "OPTIONS /api/v1/admin/*",
 				"TRACE /api/v1/admin/*", "CONNECT /api/v1/admin/*")
-		case "result_count", "total", "limit", "offset", "checked", "after_seq", "through_seq", "first_seq", "last_seq", "broken_at_seq", "next_after_seq", "http_status", "high_water_seq", "old_auth_version", "new_auth_version", "purged_count", "purged_spans", "proof_steps":
+		// erased_checked replaced purged_count/purged_spans/proof_steps: canonical
+		// format v2 has no erased-span bridging, so the only remaining quantity is
+		// how many retained nodes had a lawfully erased payload.
+		case "result_count", "total", "limit", "offset", "checked", "after_seq", "through_seq", "first_seq", "last_seq", "broken_at_seq", "next_after_seq", "before_seq", "next_before_seq", "http_status", "high_water_seq", "highwater_seq", "old_auth_version", "new_auth_version", "erased_checked":
 			clean, valid = nonnegativeInteger(value)
 		case "considered_count", "deleted_count", "held_count", "would_delete":
 			var count int64
 			count, valid = nonnegativeInteger(value)
 			valid = valid && count <= 5000
 			clean = count
-		case "verified", "complete", "replayed", "noop", "account_present", "ledger_evidence_present", "identifier_present", "has_more", "restart_required", "dry_run":
+		case "verified", "complete", "replayed", "noop", "account_present", "ledger_evidence_present", "identifier_present", "has_more", "dry_run":
 			clean, valid = value.(bool)
 		case "hold_id", "operation_id":
 			var id uuid.UUID
@@ -134,14 +137,26 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 			clean, valid = enum(value, "legal_hold", "preservation")
 		case "role_id":
 			clean, valid = enum(value, "super_admin", "moderator", "support", "dpo")
+		// checkpoint_boundary is gone with the checkpoint table: in v2 a resumed
+		// verification is always seeded from a retained chain node or an
+		// operator-supplied digest.
 		case "seed_source":
-			clean, valid = enum(value, "genesis", "database_predecessor", "supplied_predecessor", "checkpoint_boundary")
+			clean, valid = enum(value, "genesis", "database_predecessor", "supplied_predecessor")
+		// The v2 reason set. The checkpoint reasons are gone, and "hash_mismatch"
+		// split into the two stages it could previously conflate: chain_mismatch is
+		// a broken link, leaf_mismatch is a rewritten payload under an intact link.
+		// payload_absent_without_erasure_record is new, and is the distinction v1
+		// structurally could not make — an unexplained deletion rather than a
+		// lawful erasure.
 		case "failure_reason":
-			clean, valid = enum(value, "no_stored_records", "predecessor_mismatch", "hash_mismatch", "missing_upper_boundary",
-				"no_retained_records", "retention_boundary_unavailable", "missing_head", "head_mismatch", "invalid_checkpoint",
-				"checkpoint_overlap", "checkpoint_link_mismatch", "missing_proof")
+			clean, valid = enum(value, "no_stored_records", "predecessor_mismatch", "missing_head", "head_mismatch",
+				"chain_mismatch", "leaf_mismatch", "invalid_leaf_hash", "invalid_chain_hash",
+				"record_not_serializable", "payload_absent_without_erasure_record")
+		// A short stable token, not prose: this value is for alerting and
+		// correlation. The human-readable caveat about what a clean result does and
+		// does not prove belongs in the HTTP response, where an operator reads it.
 		case "verification_scope":
-			clean, valid = enum(value, "stored_segment_relative_to_seed", "database_relative_retained_segment")
+			clean, valid = enum(value, "audit_chain_database_relative", "ledger_chain_database_relative")
 		case "outcome":
 			clean, valid = enum(value, "success", "failure", "denied", "invalid", "not_found", "conflict", "unavailable", "noop", "replayed", "purged", "held", "ineligible")
 		case "fields", "selected_fields":
@@ -162,7 +177,10 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 			}
 			valid = len(fields) <= 32
 			for _, field := range fields {
-				_, ok := enum(field, "id", "account_ref", "event_type", "occurred_at", "retain_until", "chain_hash", "client_ip", "ip_subnet", "user_agent", "client_id", "scope", "device_fingerprint", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "timestamp", "retain_until", "is_mfa_enabled")
+				// "seq" replaced "chain_hash" in a disclosure: the payload row no
+				// longer carries a digest, and seq is what an authority needs to
+				// request an inclusion proof for a disclosed event.
+				_, ok := enum(field, "id", "account_ref", "event_type", "occurred_at", "retain_until", "seq", "client_ip", "ip_subnet", "user_agent", "client_id", "scope", "device_fingerprint", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "timestamp", "is_mfa_enabled")
 				valid = valid && ok
 			}
 			clean = append([]string{}, fields...)

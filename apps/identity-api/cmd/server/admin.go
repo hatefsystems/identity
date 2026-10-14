@@ -113,7 +113,11 @@ func buildAdminServices(cfg config.AdminConfig, environment string, pool *pgxpoo
 		if err != nil {
 			return deps, err
 		}
-		indexer, err := blindindex.New(pepper)
+		pepperVersion, err := config.LoadBlindIndexPepperVersion()
+		if err != nil {
+			return deps, err
+		}
+		indexer, err := blindindex.New(pepper, pepperVersion)
 		if err != nil {
 			return deps, err
 		}

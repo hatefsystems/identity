@@ -1,9 +1,10 @@
 //go:build integration
 
-package ledgerproof
+package ledgerproof_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -11,207 +12,439 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/ledgerproof"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 )
 
-// These query tests use a newly created disposable database, not production
-// maintenance privileges. Deliberately unconstrained fixtures model corrupt
-// proof state without disabling any production trigger or editing migrations.
-func proofDatabase(t *testing.T) *pgxpool.Pool {
+// Database-backed coverage for the proof Source.
+//
+// The unit tests drive the walker through an in-memory fake, so they cannot catch
+// the failure mode that matters most here: a SQL projection that disagrees with
+// the Go serializer. If ListSecurityLedgerChainForVerification omitted a column,
+// or mapped a NULL to "", every retained record would fail to reproduce its leaf
+// and an intact ledger would report as tampered. These tests therefore verify
+// against real rows, including the NULL/non-NULL boundary on every nullable
+// column and both branches of the payload-present split.
+
+func proofFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
-		if os.Getenv("REQUIRE_RETENTION_INTEGRATION") == "1" {
-			t.Fatal("DATABASE_URL required")
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		if os.Getenv("REQUIRE_RETENTION_INTEGRATION") == "1" || os.Getenv("REQUIRE_ADMIN_AUDIT_INTEGRATION") == "1" {
+			t.Fatal("DATABASE_URL is required by a mandatory integration gate")
 		}
-		t.Skip("DATABASE_URL not set")
+		t.Skip("DATABASE_URL is not set")
 	}
-	ctx := context.Background()
-	admin, err := pgxpool.New(ctx, url)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancel)
+
+	// A disposable database: verification walks the whole chain, so it cannot
+	// share history with suites that deliberately corrupt rows.
+	admin, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	name := "ledgerproof_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err = admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-		admin.Close()
+	name := "proof_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
-	cfg := admin.Config().Copy()
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop disposable proof database: %v", err)
+		}
+		_ = admin.Close(cleanup)
+	})
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.ConnConfig.Database = name
+	// A hostile session default: verification must set its own isolation.
+	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
+	cfg.ConnConfig.RuntimeParams["timezone"] = "Pacific/Honolulu"
+
+	dsnForMigrate := strings.Replace(dsn, "/identity?", "/"+name+"?", 1)
+	if dsnForMigrate == dsn {
+		t.Fatalf("could not derive a migration DSN for %s", name)
+	}
+	sqldb, err := migrate.Open(ctx, dsnForMigrate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Up(ctx, sqldb); err != nil {
+		_ = sqldb.Close()
+		t.Fatal(err)
+	}
+	_ = sqldb.Close()
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		pool.Close()
-		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := admin.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-			t.Error(err)
-		}
-		admin.Close()
-	})
-	_, err = pool.Exec(ctx, `
-CREATE TABLE public.security_event_ledger (
- id uuid NOT NULL, account_ref uuid NOT NULL, identity_blind_index text,
- event_type text NOT NULL, client_ip text, ip_subnet text, user_agent text,
- device_fingerprint text, client_id text, scope text,
- timestamp timestamptz NOT NULL, retain_until timestamptz NOT NULL,
- chain_hash text NOT NULL, seq bigint PRIMARY KEY);
-CREATE TABLE public.security_ledger_head (singleton boolean PRIMARY KEY, seq bigint NOT NULL, chain_hash text NOT NULL);
-CREATE TABLE public.security_ledger_checkpoints (
- first_seq bigint PRIMARY KEY, last_seq bigint UNIQUE, predecessor_seq bigint,
- predecessor_hash text, terminal_hash text, erased_count bigint);`)
-	if err != nil {
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO public.security_ledger_head VALUES (true,0,$1)", audit.LedgerGenesis().Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	return pool
+	return ctx, pool
 }
 
-func persistedFixture() *memorySource {
-	s := fixture(2, 8, 11, 18, 27)
-	prev := audit.GenesisChainHash
-	for i := range s.steps {
-		r := s.steps[i].Record
-		r.ID, r.AccountRef = uuid.NewString(), uuid.NewString()
-		r.IdentityBlindIndex, r.IPSubnet, r.UserAgent = ptr("private-index"), ptr("192.0.2.0/24"), ptr("")
-		r.DeviceFingerprint, r.ClientID, r.Scope = ptr("device"), ptr("client"), ptr("scope")
-		s.steps[i].TerminalHash = audit.ChainHash(prev, audit.SerializeLedger(*r))
-		prev, _ = audit.DecodeChainHash(s.steps[i].TerminalHash)
+// fullyPopulatedRecord sets every nullable column, so the non-NULL branch of
+// every pointer field is projected at least once.
+func fullyPopulatedRecord(retain time.Time) audit.LedgerRecord {
+	blind := strings.Repeat("a", 64)
+	ip := "203.0.113.9"
+	subnet := "203.0.113.0/24"
+	agent := "curl/8.7.1"
+	device := "device-abc"
+	client := "portal"
+	scope := "openid profile"
+	return audit.LedgerRecord{
+		ID: uuid.NewString(), AccountRef: uuid.NewString(),
+		IdentityBlindIndex: &blind, BlindIndexVersion: 3, EventType: audit.EventLoginSucceeded,
+		ClientIP: &ip, IPSubnet: &subnet, UserAgent: &agent, DeviceFingerprint: &device,
+		ClientID: &client, Scope: &scope,
+		Timestamp: audit.NormalizeChainTime(time.Now().Add(-time.Hour)), RetainUntil: audit.NormalizeChainTime(retain),
 	}
-	s.head.Hash = s.steps[len(s.steps)-1].TerminalHash
-	return s
 }
 
-func replaceProof(t *testing.T, pool *pgxpool.Pool, s *memorySource) {
+// sparseRecord leaves every nullable column NULL, so the NULL branch is
+// projected too. NULL and "" must hash differently, and a projection that
+// collapsed them would only show up here.
+func sparseRecord(retain time.Time) audit.LedgerRecord {
+	return audit.LedgerRecord{
+		ID: uuid.NewString(), AccountRef: uuid.NewString(),
+		IdentityBlindIndex: nil, BlindIndexVersion: 0, EventType: audit.EventRTRBreach,
+		Timestamp: audit.NormalizeChainTime(time.Now().Add(-time.Hour)), RetainUntil: audit.NormalizeChainTime(retain),
+	}
+}
+
+// emptyStringRecord sets the nullable columns to "" rather than NULL.
+func emptyStringRecord(retain time.Time) audit.LedgerRecord {
+	empty := ""
+	return audit.LedgerRecord{
+		ID: uuid.NewString(), AccountRef: uuid.NewString(),
+		IdentityBlindIndex: &empty, BlindIndexVersion: 1, EventType: audit.EventLoginFailed,
+		ClientIP: &empty, IPSubnet: &empty, UserAgent: &empty, DeviceFingerprint: &empty,
+		ClientID: &empty, Scope: &empty,
+		Timestamp: audit.NormalizeChainTime(time.Now().Add(-time.Hour)), RetainUntil: audit.NormalizeChainTime(retain),
+	}
+}
+
+//nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
+func seedProofChain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, records ...audit.LedgerRecord) []int64 {
 	t.Helper()
-	ctx := context.Background()
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err = tx.Exec(ctx, "DELETE FROM public.security_event_ledger; DELETE FROM public.security_ledger_checkpoints; DELETE FROM public.security_ledger_head"); err != nil {
-		t.Fatal(err)
-	}
-	for _, step := range s.steps {
-		if step.Record == nil {
-			_, err = tx.Exec(ctx, "INSERT INTO public.security_ledger_checkpoints VALUES($1,$2,$3,$4,$5,$6)", step.FirstSeq, step.LastSeq, step.PredecessorSeq, step.PredecessorHash, step.TerminalHash, step.ErasedCount)
-		} else {
-			r := step.Record
-			_, err = tx.Exec(ctx, "INSERT INTO public.security_event_ledger VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)", r.ID, r.AccountRef, r.IdentityBlindIndex, r.EventType, r.ClientIP, r.IPSubnet, r.UserAgent, r.DeviceFingerprint, r.ClientID, r.Scope, r.Timestamp, r.RetainUntil, step.TerminalHash, step.FirstSeq)
-		}
+	queries := db.New(pool)
+	previous := audit.LedgerGenesis()
+	seqs := make([]int64, 0, len(records))
+	for _, rec := range records {
+		leaf, err := audit.LeafLedger(rec)
 		if err != nil {
 			t.Fatal(err)
 		}
+		previous = audit.ChainLedger(previous, leaf)
+		seq, err := queries.InsertSecurityEventWithChain(ctx, db.InsertSecurityEventWithChainParams{
+			EventID: uuid.MustParse(rec.ID), LeafHash: leaf.Bytes(), ChainHash: previous.Bytes(),
+			AccountRef: uuid.MustParse(rec.AccountRef), IdentityBlindIndex: rec.IdentityBlindIndex,
+			BlindIndexVersion: rec.BlindIndexVersion, EventType: rec.EventType,
+			ClientIp: rec.ClientIP, IpSubnet: rec.IPSubnet, UserAgent: rec.UserAgent,
+			DeviceFingerprint: rec.DeviceFingerprint, ClientID: rec.ClientID, Scope: rec.Scope,
+			Timestamp:   pgtype.Timestamptz{Time: rec.Timestamp, Valid: true},
+			RetainUntil: pgtype.Timestamptz{Time: rec.RetainUntil, Valid: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
 	}
-	if s.headErr == nil {
-		if _, err = tx.Exec(ctx, "INSERT INTO public.security_ledger_head VALUES(true,$1,$2)", s.head.Seq, s.head.Hash); err != nil {
+	if len(seqs) > 0 {
+		if _, err := pool.Exec(ctx, "SELECT public.advance_chain_head('ledger',0,$1,$2,$3)",
+			seqs[0], seqs[len(seqs)-1], int64(len(seqs))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err = tx.Commit(ctx); err != nil {
+	return seqs
+}
+
+//nolint:revive // Testing helpers conventionally take testing.T before operation arguments.
+func verifyWhole(t *testing.T, ctx context.Context, pool *pgxpool.Pool, limit int32) ledgerproof.Result {
+	t.Helper()
+	params := ledgerproof.Params{Chain: ledgerproof.ChainLedger, Limit: limit}
+	var last ledgerproof.Result
+	total := 0
+	erased := 0
+	for {
+		result, err := ledgerproof.VerifySnapshot(ctx, pool, params)
+		if err != nil {
+			t.Fatalf("VerifySnapshot: %v", err)
+		}
+		if !result.Verified {
+			reason := "<nil>"
+			if result.FailureReason != nil {
+				reason = *result.FailureReason
+			}
+			t.Fatalf("verification failed at seq %v: %s", result.BrokenAtSeq, reason)
+		}
+		total += result.Checked
+		erased += result.ErasedChecked
+		last = result
+		next, ok := result.NextParams(params)
+		if !ok {
+			if !result.Complete {
+				t.Fatal("verification stopped before completing")
+			}
+			break
+		}
+		params = next
+	}
+	last.Checked, last.ErasedChecked = total, erased
+	return last
+}
+
+// TestProofProjectionReproducesEveryLeafIntegration is the core SQL↔Go parity
+// check. It covers all three nullable shapes in one chain, because a projection
+// bug typically affects exactly one of them.
+func TestProofProjectionReproducesEveryLeafIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+	seqs := seedProofChain(t, ctx, pool,
+		fullyPopulatedRecord(retain), sparseRecord(retain), emptyStringRecord(retain))
+
+	result := verifyWhole(t, ctx, pool, 100)
+	if result.Checked != 3 {
+		t.Fatalf("checked = %d, want 3", result.Checked)
+	}
+	if result.ErasedChecked != 0 {
+		t.Errorf("erased_checked = %d, want 0", result.ErasedChecked)
+	}
+	if result.LastSeq == nil || *result.LastSeq != seqs[len(seqs)-1] {
+		t.Errorf("last_seq = %v, want %d", result.LastSeq, seqs[len(seqs)-1])
+	}
+}
+
+// TestProofVerifiesAcrossErasedSpanIntegration exercises the LEFT JOIN against
+// real erased rows: the payload is gone, the leaf remains, and the erasure record
+// authorizes the absence.
+func TestProofVerifiesAcrossErasedSpanIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+	seqs := seedProofChain(t, ctx, pool,
+		fullyPopulatedRecord(retain), sparseRecord(retain),
+		emptyStringRecord(retain), fullyPopulatedRecord(retain))
+
+	// Erase the two middle payloads and record the span.
+	if _, err := pool.Exec(ctx,
+		"DELETE FROM public.security_event_ledger WHERE seq = ANY($1::bigint[])", seqs[1:3]); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO public.security_ledger_erasures
+(first_seq,last_seq,operation_id,erased_at) VALUES($1,$2,$3,now())`,
+		seqs[1], seqs[2], uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+
+	result := verifyWhole(t, ctx, pool, 100)
+	if result.Checked != 4 {
+		t.Fatalf("checked = %d, want 4", result.Checked)
+	}
+	if result.ErasedChecked != 2 {
+		t.Errorf("erased_checked = %d, want 2", result.ErasedChecked)
+	}
 }
 
-func TestProofQueriesIntegration(t *testing.T) {
-	pool := proofDatabase(t)
-	for _, tc := range []struct {
-		name, reason string
-		mutate       func(*memorySource)
-		verified     bool
-	}{
-		{"live", "", func(*memorySource) {}, true},
-		{"prefix", "", func(s *memorySource) { s.erase(0, 1) }, true},
-		{"interior and tail", "", func(s *memorySource) { s.erase(4, 4); s.erase(1, 2) }, true},
-		{"all purged", "no_retained_records", func(s *memorySource) { s.erase(0, 4) }, false},
-		{"missing head", "missing_head", func(s *memorySource) { s.headErr = ErrMissingHead }, false},
-		{"lost prefix", "hash_mismatch", func(s *memorySource) { s.steps = s.steps[1:] }, false},
-		{"lost tail", "head_mismatch", func(s *memorySource) { s.steps = s.steps[:4] }, false},
-		{"wrong head", "head_mismatch", func(s *memorySource) { s.head.Hash = strings.Repeat("b", 64) }, false},
-		{"malformed span", "invalid_checkpoint", func(s *memorySource) { s.erase(1, 2); s.steps[1].ErasedCount = 0 }, false},
-		{"missing span predecessor", "checkpoint_link_mismatch", func(s *memorySource) { s.erase(1, 2); s.steps = s.steps[1:] }, false},
-		{"wrong span predecessor", "checkpoint_link_mismatch", func(s *memorySource) { s.erase(1, 2); s.steps[1].PredecessorHash = strings.Repeat("a", 64) }, false},
-		{"live inside span", "checkpoint_overlap", func(s *memorySource) { live := s.steps[1]; s.erase(1, 2); s.steps = append(s.steps, live) }, false},
-		{"overlapping spans", "checkpoint_overlap", func(s *memorySource) {
-			s.erase(1, 2)
-			span := s.steps[1]
-			span.FirstSeq = 9
-			span.LastSeq = 17
-			s.steps = append(s.steps, span)
-		}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := persistedFixture()
-			tc.mutate(s)
-			replaceProof(t, pool, s)
-			r, err := VerifySnapshot(context.Background(), pool, Params{Limit: 20})
-			if err != nil || r.Verified != tc.verified || (tc.reason != "" && (r.FailureReason == nil || *r.FailureReason != tc.reason)) {
-				t.Fatalf("result=%+v err=%v want=%s", r, err, tc.reason)
-			}
+// TestProofRejectsUnexplainedDeletionIntegration is the check v1 could not make:
+// a payload removed without an erasure record is tampering, not retention.
+func TestProofRejectsUnexplainedDeletionIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+	seqs := seedProofChain(t, ctx, pool, fullyPopulatedRecord(retain), sparseRecord(retain))
+
+	if _, err := pool.Exec(ctx, "DELETE FROM public.security_event_ledger WHERE seq=$1", seqs[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainLedger, Limit: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Verified {
+		t.Fatal("an unexplained deletion verified clean")
+	}
+	if result.FailureReason == nil || *result.FailureReason != "payload_absent_without_erasure_record" {
+		t.Fatalf("failure_reason = %v", result.FailureReason)
+	}
+	if result.BrokenAtSeq == nil || *result.BrokenAtSeq != seqs[1] {
+		t.Errorf("broken_at_seq = %v, want %d", result.BrokenAtSeq, seqs[1])
+	}
+}
+
+// TestProofPaginationIsConsistentIntegration checks the keyset boundary against
+// real rows with allocation holes: an off-by-one would hash a node twice and
+// report a break in an intact chain.
+func TestProofPaginationIsConsistentIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+
+	// Burn sequence values so the chain is non-contiguous.
+	if _, err := pool.Exec(ctx, "SELECT nextval('public.security_ledger_chain_seq'), nextval('public.security_ledger_chain_seq')"); err != nil {
+		t.Fatal(err)
+	}
+	records := make([]audit.LedgerRecord, 0, 7)
+	for i := 0; i < 7; i++ {
+		records = append(records, fullyPopulatedRecord(retain))
+	}
+	seedProofChain(t, ctx, pool, records...)
+
+	// Every page size must reach the same verified conclusion.
+	for _, limit := range []int32{1, 2, 3, 100} {
+		result := verifyWhole(t, ctx, pool, limit)
+		if result.Checked != 7 {
+			t.Errorf("limit %d: checked = %d, want 7", limit, result.Checked)
+		}
+	}
+}
+
+// TestProofSnapshotIsolationIntegration proves verification reads one snapshot.
+// A batch committed mid-walk must not make an intact chain look like it ends
+// before its head, which is why the pass runs in a REPEATABLE READ READ ONLY
+// transaction rather than inheriting the session default set in the fixture.
+func TestProofSnapshotIsolationIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+	seedProofChain(t, ctx, pool, fullyPopulatedRecord(retain), sparseRecord(retain))
+
+	// A completed pass over the current chain.
+	first := verifyWhole(t, ctx, pool, 100)
+	if first.Checked != 2 {
+		t.Fatalf("checked = %d, want 2", first.Checked)
+	}
+
+	// The head must be reconciled, not merely the nodes: a chain that is
+	// internally consistent but does not match its head is what a coherent rewrite
+	// produces.
+	if _, err := pool.Exec(ctx, "UPDATE public.security_ledger_head SET chain_hash=$1", audit.LedgerGenesis().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainLedger, Limit: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Verified {
+		t.Fatal("a chain that does not match its head verified clean")
+	}
+	if result.FailureReason == nil || *result.FailureReason != "head_mismatch" {
+		t.Fatalf("failure_reason = %v, want head_mismatch", result.FailureReason)
+	}
+}
+
+// TestProofMissingHeadIsAnErrorIntegration keeps an uninitialized head from
+// being treated as genesis.
+func TestProofMissingHeadIsAnErrorIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	if _, err := pool.Exec(ctx, "DELETE FROM public.security_ledger_head"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainLedger, Limit: 10,
+	}); !errors.Is(err, ledgerproof.ErrMissingHead) {
+		t.Fatalf("error = %v, want ErrMissingHead", err)
+	}
+}
+
+// TestProofUnknownSeedSeqIsRejectedIntegration keeps a resumed verification from
+// being seeded with a neighbouring node's digest. Gaps are legal, so "at or
+// after" would hand the walker the wrong predecessor.
+func TestProofUnknownSeedSeqIsRejectedIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	retain := time.Now().Add(8760 * time.Hour)
+	seqs := seedProofChain(t, ctx, pool, fullyPopulatedRecord(retain))
+
+	if _, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainLedger, AfterSeq: seqs[0] + 500,
+		ThroughSeq: seqs[0] + 600, HasThrough: true, Limit: 10,
+	}); !errors.Is(err, ledgerproof.ErrUnknownSeq) {
+		t.Fatalf("error = %v, want ErrUnknownSeq", err)
+	}
+}
+
+// TestProofAuditChainIntegration exercises the same walker over the audit chain,
+// confirming the two per-chain projections and domain prefixes are both wired
+// correctly rather than only the ledger one.
+func TestProofAuditChainIntegration(t *testing.T) {
+	ctx, pool := proofFixture(t)
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.AuditGenesis().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	queries := db.New(pool)
+	previous := audit.AuditGenesis()
+	var firstSeq, lastSeq int64
+	for i := 0; i < 3; i++ {
+		eventID := uuid.New()
+		actorID := uuid.New()
+		timestamp := audit.NormalizeChainTime(time.Now().Add(-time.Duration(i) * time.Minute))
+		rec := audit.AuditRecord{
+			ID: eventID.String(), ActorID: actorID.String(),
+			ActorSPIFFEID: audit.APIActorSPIFFEID, EventType: audit.EventLoginSucceeded,
+			ActionStatus: audit.StatusSuccess, ClientIP: "203.0.113.9",
+			UserAgent: "curl/8.7.1", Payload: `{"k":"v"}`, Timestamp: timestamp,
+		}
+		leaf, err := audit.LeafAudit(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous = audit.ChainAudit(previous, leaf)
+		seq, err := queries.InsertAuditLogWithChain(ctx, db.InsertAuditLogWithChainParams{
+			EventID: eventID, LeafHash: leaf.Bytes(), ChainHash: previous.Bytes(),
+			ActorID: actorID, ActorSpiffeID: rec.ActorSPIFFEID, EventType: rec.EventType,
+			ActionStatus: rec.ActionStatus, ClientIp: rec.ClientIP, UserAgent: rec.UserAgent,
+			Payload:   rec.Payload,
+			Timestamp: pgtype.Timestamptz{Time: timestamp, Valid: true},
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstSeq = seq
+		}
+		lastSeq = seq
 	}
-}
+	if _, err := pool.Exec(ctx, "SELECT public.advance_chain_head('audit',0,$1,$2,3)", firstSeq, lastSeq); err != nil {
+		t.Fatal(err)
+	}
 
-type concurrentProofPool struct {
-	*pgxpool.Pool
-	afterHead func()
-}
-type concurrentProofTx struct {
-	pgx.Tx
-	afterHead func()
-}
+	result, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainAudit, Limit: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Verified || !result.Complete || result.Checked != 3 {
+		t.Fatalf("audit chain verification: %+v", result)
+	}
 
-func (p concurrentProofPool) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
-	tx, err := p.Pool.BeginTx(ctx, opts)
-	return &concurrentProofTx{Tx: tx, afterHead: p.afterHead}, err
-}
-func (tx *concurrentProofTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	row := tx.Tx.QueryRow(ctx, sql, args...)
-	if strings.Contains(sql, "GetLedgerVerificationHead") && tx.afterHead != nil {
-		change := tx.afterHead
-		tx.afterHead = nil
-		change()
+	// The ledger domain must reject this chain: the prefixes are what stop a node
+	// being replayed across chains.
+	crossed, err := ledgerproof.VerifySnapshot(ctx, pool, ledgerproof.Params{
+		Chain: ledgerproof.ChainLedger, Limit: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return row
-}
-
-func TestProofSnapshotConcurrentCompactionIntegration(t *testing.T) {
-	pool := proofDatabase(t)
-	s := persistedFixture()
-	replaceProof(t, pool, s)
-	wrapped := concurrentProofPool{Pool: pool, afterHead: func() { s.erase(0, 4); replaceProof(t, pool, s) }}
-	r, err := VerifySnapshot(context.Background(), wrapped, Params{Limit: 20})
-	if err != nil || !r.Verified || r.Checked != 5 || r.PurgedCount != 0 || !r.Complete {
-		t.Fatalf("mixed snapshots %+v %v", r, err)
-	}
-	r, err = VerifySnapshot(context.Background(), pool, Params{Limit: 20})
-	if err != nil || r.Verified || r.Checked != 0 || r.PurgedCount != 5 || !r.Complete {
-		t.Fatalf("new snapshot %+v %v", r, err)
-	}
-}
-
-func TestProofCursorCompactionIntegration(t *testing.T) {
-	pool := proofDatabase(t)
-	s := persistedFixture()
-	s.erase(0, 1)
-	replaceProof(t, pool, s)
-	r, err := VerifySnapshot(context.Background(), pool, Params{Limit: 1})
-	if err != nil || r.Checked != 0 || r.PurgedCount != 2 || r.ProofSteps != 1 || r.NextAfterSeq == nil || *r.NextAfterSeq != 8 {
-		t.Fatalf("unbounded page %+v %v", r, err)
-	}
-	p := Params{AfterSeq: *r.NextAfterSeq, ThroughSeq: r.ThroughSeq, HasThrough: true, PredecessorHash: *r.LastHash, Limit: 1}
-	r, err = VerifySnapshot(context.Background(), pool, p)
-	if err != nil || !r.Verified || r.Checked != 1 || r.NextAfterSeq == nil || *r.NextAfterSeq != 11 {
-		t.Fatalf("exact terminal %+v %v", r, err)
-	}
-	s.erase(0, 1)
-	replaceProof(t, pool, s)
-	r, err = VerifySnapshot(context.Background(), pool, p)
-	if err != nil || !r.RestartRequired || r.Verified || r.NextAfterSeq != nil || r.ThroughSeq != 27 {
-		t.Fatalf("compacted cursor approximated %+v %v", r, err)
+	if crossed.Checked != 0 && crossed.Verified {
+		t.Fatal("an audit chain verified in the ledger domain")
 	}
 }

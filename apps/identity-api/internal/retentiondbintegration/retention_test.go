@@ -3,14 +3,32 @@
 // Package retentiondbintegration exercises the destructive maintenance boundary
 // using actual non-owner logins. Every test creates a disposable database; the
 // supplied DATABASE_URL must identify a disposable, role-provisioning cluster.
+//
+// # What canonical format v2 changed here
+//
+// v1 routed erasure through a SECURITY DEFINER routine owned by a non-login
+// maintenance role, so this suite spent most of its effort proving that routine
+// could not be hijacked: function ownership, EXECUTE ACLs, search_path pinning,
+// SECURITY INVOKER downgrades, and the checkpoint table's exclusion constraints.
+// None of that exists now. Erasure is an ordinary DELETE on the payload table,
+// authorized by a plain GRANT, and the chain table is append-only for everyone
+// with no maintenance exemption at all.
+//
+// So this suite now proves the boundary that remains, which is a privilege
+// boundary rather than a routine boundary:
+//
+//   - no runtime role can mutate or erase anything it should not, including via
+//     trigger bypasses, role escalation, or search_path shadowing;
+//   - PUBLIC holds EXECUTE on none of the protected functions;
+//   - the destructive down-migration is still refused.
+//
+// The behavioural half of retention — spans, receipts, holds, dry run, and
+// chain-verifiability after an erasure — lives in internal/audit/retention's
+// worker integration suite, which runs as the real identity_ledger_purge login.
 package retentiondbintegration
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
@@ -24,20 +42,18 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 const (
-	owner        = "identity_ledger_maintenance_owner"
+	purgeRole    = "identity_ledger_purge"
 	auditSubject = "identity.audit.logs"
-	purgeSQL     = `SELECT deleted_count,held_count FROM public.purge_security_ledger_batch($1,$2,$3,$4,$5,$6,$7)`
 )
 
 type fixture struct {
 	ctx         context.Context
 	databaseURL string
 	admin       *pgx.Conn
-	worker      *pgx.Conn
+	purge       *pgx.Conn
 	signer      *pgx.Conn
 	api         *pgx.Conn
 	cleaner     *pgx.Conn
@@ -105,39 +121,58 @@ func newFixture(t *testing.T) *fixture {
 	}
 	conns = append(conns, admin)
 	f := &fixture{ctx: ctx, databaseURL: dbURL.String(), admin: admin, names: names}
+
+	// A migration must never bootstrap a head: an uninitialized head and an empty
+	// chain are different states, and only an operator may assert which one this is.
 	assertCount(t, f, "public.security_ledger_head", 0)
+	assertCount(t, f, "public.audit_log_head", 0)
 	assertCount(t, f, "public.security_ledger_retention_settings", 0)
-	_, err = admin.Exec(ctx, "SELECT public.advance_security_ledger_head(0,$1)", uuid.New())
-	assertSQLState(t, err, "42501")
-	// A deployment operator provisions this role, never a migration/runtime.
-	mustExec(t, ctx, admin, `DO $$ BEGIN CREATE ROLE identity_ledger_maintenance_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$`)
-	mustExec(t, ctx, admin, `GRANT USAGE ON SCHEMA public TO identity_ledger_maintenance_owner;
-GRANT SELECT,DELETE ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT UPDATE(seq) ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT SELECT,UPDATE ON public.security_ledger_head TO identity_ledger_maintenance_owner;
-GRANT SELECT,INSERT,DELETE ON public.security_ledger_checkpoints TO identity_ledger_maintenance_owner;
-GRANT SELECT ON public.legal_holds,public.security_ledger_retention_settings TO identity_ledger_maintenance_owner;
-GRANT INSERT ON public.event_outbox TO identity_ledger_maintenance_owner;
-GRANT EXECUTE ON FUNCTION public.security_ledger_require_owner(), public.security_ledger_chain_time(timestamptz),
-public.security_ledger_canonical_body(public.security_event_ledger), public.security_ledger_account_lock_key(uuid),
-public.security_ledger_predecessor(bigint) TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.advance_security_ledger_head(bigint,uuid) OWNER TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) OWNER TO identity_ledger_maintenance_owner;`)
-	for _, kind := range []string{"worker", "signer", "api", "cleaner"} {
+	// advance_chain_head must be SECURITY DEFINER with a pinned search_path and no
+	// PUBLIC EXECUTE. SECURITY DEFINER is what forces the signer to move a head
+	// *through* linkage verification: the signer deliberately holds no direct
+	// UPDATE on the head tables, so this function is its only path, and it cannot
+	// set a head to an arbitrary value.
+	//
+	// The function's owner — the role that ran the migration, i.e. the schema owner
+	// — does retain EXECUTE, which is unavoidable and harmless: that role already
+	// owns the tables and triggers. Narrowing it to a dedicated non-login owner is
+	// an operator-runbook hardening step, not something a migration may do, since a
+	// migration must never create or empower a role. The boundary this suite
+	// enforces is that no *runtime* login can execute it.
+	var secdef, pinned bool
+	if err := admin.QueryRow(ctx, `SELECT p.prosecdef,
+ EXISTS (SELECT 1 FROM unnest(coalesce(p.proconfig,'{}')) c WHERE c LIKE 'search_path=%')
+FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+WHERE n.nspname='public' AND p.proname='advance_chain_head'`).Scan(&secdef, &pinned); err != nil {
+		t.Fatal(err)
+	}
+	if !secdef {
+		t.Fatal("advance_chain_head is SECURITY INVOKER; the signer could then move a head without verification")
+	}
+	if !pinned {
+		t.Fatal("advance_chain_head has no pinned search_path; a caller could shadow the objects it reads")
+	}
+
+	for _, kind := range []string{"purge", "signer", "api", "cleaner"} {
 		name := "retention_" + kind + "_" + suffix
 		password := uuid.NewString()
 		quoted := pgx.Identifier{name}.Sanitize()
 		mustExec(t, ctx, admin, "CREATE ROLE "+quoted+" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '"+password+"'")
 		names[kind] = name
 		mustExec(t, ctx, admin, "GRANT USAGE ON SCHEMA public TO "+quoted)
-		mustExec(t, ctx, admin, "GRANT SELECT ON public.security_event_ledger,public.security_ledger_head,public.security_ledger_checkpoints,public.legal_holds,public.security_ledger_retention_settings TO "+quoted)
+		mustExec(t, ctx, admin, "GRANT SELECT ON public.security_event_ledger,public.security_ledger_chain,"+
+			"public.security_ledger_head,public.security_ledger_erasures,public.legal_holds,"+
+			"public.security_ledger_retention_settings TO "+quoted)
 		switch kind {
-		case "worker":
-			mustExec(t, ctx, admin, "GRANT EXECUTE ON FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) TO "+quoted)
+		case "purge":
+			// Exactly the v2 erasure privileges. No rights on the chain at all.
+			mustExec(t, ctx, admin, "GRANT DELETE ON public.security_event_ledger TO "+quoted)
+			mustExec(t, ctx, admin, "GRANT INSERT ON public.security_ledger_erasures TO "+quoted)
+			mustExec(t, ctx, admin, "GRANT INSERT ON public.event_outbox TO "+quoted)
 		case "signer":
-			mustExec(t, ctx, admin, "GRANT INSERT ON public.security_event_ledger TO "+quoted)
-			mustExec(t, ctx, admin, "GRANT USAGE ON SEQUENCE public.security_event_ledger_seq_seq TO "+quoted)
-			mustExec(t, ctx, admin, "GRANT EXECUTE ON FUNCTION public.advance_security_ledger_head(bigint,uuid) TO "+quoted)
+			mustExec(t, ctx, admin, "GRANT INSERT ON public.security_event_ledger,public.security_ledger_chain TO "+quoted)
+			mustExec(t, ctx, admin, "GRANT USAGE ON SEQUENCE public.security_ledger_chain_seq TO "+quoted)
+			mustExec(t, ctx, admin, "GRANT EXECUTE ON FUNCTION public.advance_chain_head(text,bigint,bigint,bigint,bigint) TO "+quoted)
 		case "api":
 			mustExec(t, ctx, admin, "GRANT INSERT,UPDATE ON public.legal_holds TO "+quoted)
 		}
@@ -150,8 +185,8 @@ ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],te
 		conns = append(conns, conn)
 		mustExec(t, ctx, conn, "SET statement_timeout='15s'")
 		switch kind {
-		case "worker":
-			f.worker = conn
+		case "purge":
+			f.purge = conn
 		case "signer":
 			f.signer = conn
 		case "api":
@@ -160,8 +195,10 @@ ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],te
 			f.cleaner = conn
 		}
 	}
+
 	// Only this fixture knows that the newly created database has no history.
-	mustExec(t, ctx, admin, "INSERT INTO public.security_ledger_head VALUES (true,0,repeat('0',64))")
+	mustExec(t, ctx, admin, "INSERT INTO public.security_ledger_head VALUES (true,0,$1)", audit.LedgerGenesis().Bytes())
+	mustExec(t, ctx, admin, "INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.AuditGenesis().Bytes())
 	mustExec(t, ctx, admin, "INSERT INTO public.security_ledger_retention_settings VALUES (true,$1)", auditSubject)
 	return f
 }
@@ -174,15 +211,34 @@ type executor interface {
 func mustExec(t *testing.T, ctx context.Context, conn executor, sql string, args ...any) {
 	t.Helper()
 	if _, err := conn.Exec(ctx, sql, args...); err != nil {
-		t.Fatalf("SQL operation: %v", err)
+		t.Fatalf("fixture SQL %q: %v", sql, err)
 	}
 }
 
 func assertSQLState(t *testing.T, err error, state string) {
 	t.Helper()
-	var pgerr *pgconn.PgError
-	if !errors.As(err, &pgerr) || pgerr.Code != state {
-		t.Fatalf("expected SQLSTATE %s, got %v", state, err)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != state {
+		t.Fatalf("error = %v, want SQLSTATE %s", err, state)
+	}
+}
+
+// assertRefused requires the statement to have been rejected, and reports which
+// statement slipped through rather than only the SQLSTATE.
+//
+// Two codes count as a refusal. 42501 is the privilege or trigger rejection.
+// 0A000 is PostgreSQL refusing to TRUNCATE a table that an enabled foreign key
+// references, which it checks before firing any trigger — a different mechanism
+// reaching the same outcome, and one the chain tables get for free from the
+// payload tables' ON DELETE RESTRICT reference.
+func assertRefused(t *testing.T, sql string, err error) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("statement was not refused: %q (err = %v)", sql, err)
+	}
+	if pgErr.Code != "42501" && pgErr.Code != "0A000" {
+		t.Fatalf("statement %q refused with SQLSTATE %s, want 42501 or 0A000", sql, pgErr.Code)
 	}
 }
 
@@ -193,524 +249,253 @@ func assertCount(t *testing.T, f *fixture, table string, want int64) {
 		t.Fatal(err)
 	}
 	if got != want {
-		t.Fatalf("%s count=%d, want %d", table, got, want)
+		t.Fatalf("%s rows = %d, want %d", table, got, want)
 	}
 }
 
-type ledgerRow struct {
-	record audit.LedgerRecord
-	seq    int64
-	hash   string
-}
-
-func (f *fixture) append(t *testing.T, records ...audit.LedgerRecord) []ledgerRow {
+// seedLedger appends one well-formed chain node and payload as the signer login,
+// so the row under test was produced through the same privileges production uses.
+func (f *fixture) seedLedger(t *testing.T, expires time.Time) int64 {
 	t.Helper()
-	tx, err := f.signer.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	eventID := uuid.New()
+	timestamp := audit.NormalizeChainTime(expires.Add(-365 * 24 * time.Hour))
+	retainUntil := audit.NormalizeChainTime(expires)
+	account := uuid.New()
+	leaf, err := audit.LeafLedger(audit.LedgerRecord{
+		ID: eventID.String(), AccountRef: account.String(), BlindIndexVersion: 0,
+		EventType: "auth.login", Timestamp: timestamp, RetainUntil: retainUntil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := audit.ChainLedger(audit.LedgerGenesis(), leaf)
+
+	tx, err := f.signer.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	mustExec(t, f.ctx, tx, "SELECT pg_advisory_xact_lock(5200002::bigint)")
-	var head int64
-	var hash string
-	if err := tx.QueryRow(f.ctx, "SELECT seq,chain_hash FROM public.security_ledger_head WHERE singleton").Scan(&head, &hash); err != nil {
+	var seq int64
+	if err := tx.QueryRow(f.ctx, `INSERT INTO public.security_ledger_chain(event_id,leaf_hash,chain_hash)
+VALUES($1,$2,$3) RETURNING seq`, eventID, leaf.Bytes(), chain.Bytes()).Scan(&seq); err != nil {
 		t.Fatal(err)
 	}
-	rows := make([]ledgerRow, 0, len(records))
-	for _, record := range records {
-		previous, err := audit.DecodeChainHash(hash)
-		if err != nil {
-			t.Fatal(err)
-		}
-		hash = audit.ChainHash(previous, audit.SerializeLedger(record))
-		row := ledgerRow{record: record, hash: hash}
-		if err := tx.QueryRow(f.ctx, `INSERT INTO public.security_event_ledger
-(id,account_ref,identity_blind_index,event_type,client_ip,ip_subnet,user_agent,device_fingerprint,client_id,scope,timestamp,retain_until,chain_hash)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING seq`,
-			record.ID, record.AccountRef, record.IdentityBlindIndex, record.EventType, record.ClientIP,
-			record.IPSubnet, record.UserAgent, record.DeviceFingerprint, record.ClientID, record.Scope,
-			record.Timestamp, record.RetainUntil, hash).Scan(&row.seq); err != nil {
-			t.Fatal(err)
-		}
-		rows = append(rows, row)
-	}
-	mustExec(t, f.ctx, tx, "SELECT public.advance_security_ledger_head($1,$2)", head, records[len(records)-1].ID)
+	mustExec(t, f.ctx, tx, `INSERT INTO public.security_event_ledger
+(seq,account_ref,blind_index_version,event_type,timestamp,retain_until) VALUES($1,$2,0,'auth.login',$3,$4)`,
+		seq, account, timestamp, retainUntil)
+	mustExec(t, f.ctx, tx, "SELECT public.advance_chain_head('ledger',0,$1,$1,1)", seq)
 	if err := tx.Commit(f.ctx); err != nil {
 		t.Fatal(err)
 	}
-	return rows
+	return seq
 }
 
-func record(expiry time.Time) audit.LedgerRecord {
-	return audit.LedgerRecord{ID: uuid.NewString(), AccountRef: uuid.NewString(), EventType: "auth.login",
-		Timestamp: audit.NormalizeChainTime(expiry.Add(-365 * 24 * time.Hour)), RetainUntil: audit.NormalizeChainTime(expiry)}
-}
-
-func batchArgs(rows []ledgerRow, cutoff time.Time, highwater int64, operation uuid.UUID) []any {
-	seqs := make([]int64, len(rows))
-	hashes := make([]string, len(rows))
-	bodies := make([][]byte, len(rows))
-	for i, row := range rows {
-		seqs[i], hashes[i], bodies[i] = row.seq, row.hash, audit.SerializeLedger(row.record)
-	}
-	return []any{cutoff, highwater, seqs, hashes, bodies, operation, auditSubject}
-}
-
-func (f *fixture) purge(t *testing.T, rows []ledgerRow, cutoff time.Time, highwater int64, commit bool) (int64, int64, uuid.UUID) {
-	t.Helper()
-	tx, err := f.worker.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	operation := uuid.New()
-	var deleted, held int64
-	if err := tx.QueryRow(f.ctx, purgeSQL, batchArgs(rows, cutoff, highwater, operation)...).Scan(&deleted, &held); err != nil {
-		t.Fatal(err)
-	}
-	if commit {
-		if err := tx.Commit(f.ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return deleted, held, operation
-}
-
-func TestCanonicalAndAccountLockParity(t *testing.T) {
+// TestNoRuntimeRoleCanMutateTheLedger is the privilege matrix. Every runtime
+// login is tried against every destructive statement, including the ones that
+// would disarm the guards rather than defeat them directly.
+func TestNoRuntimeRoleCanMutateTheLedger(t *testing.T) {
 	f := newFixture(t)
-	values := []string{"", "agent\n\"quoted\"", "\u062f\u0631\u0648\u062f \U0001f512", "a\\b\t"}
-	for i, fraction := range []int{0, 100000000, 123400000, 1000, 999999000} {
-		timestamp := time.Date(2025, 3, 7, 8, 9, 10, fraction, time.FixedZone("offset", -7*3600))
-		r := record(timestamp.Add(365 * 24 * time.Hour))
-		r.Timestamp = timestamp
-		if i > 0 {
-			r.IdentityBlindIndex = &values[0]
-			r.ClientIP, r.IPSubnet, r.UserAgent = &values[0], &values[1], &values[2]
-			r.DeviceFingerprint, r.ClientID, r.Scope = &values[3], &values[0], &values[2]
-		}
-		row := f.append(t, r)[0]
-		var body []byte
-		if err := f.admin.QueryRow(f.ctx, "SELECT public.security_ledger_canonical_body(l) FROM public.security_event_ledger l WHERE seq=$1", row.seq).Scan(&body); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(body, audit.SerializeLedger(r)) {
-			t.Fatalf("canonical bytes differ for fraction %d", fraction)
-		}
-	}
-	for _, text := range []string{"00000000-0000-0000-0000-000000000001", "ffffffff-ffff-ffff-ffff-ffffffffffff", "12345678-1234-5678-9abc-def012345678"} {
-		id := uuid.MustParse(text)
-		sum := sha256.Sum256(append([]byte("identity:account-lock:v1:"), id[:]...))
-		want := -int64(binary.BigEndian.Uint64(sum[:8])&0x7fffffffffffffff) - 1
-		keyBits := ^(binary.BigEndian.Uint64(sum[:8]) & 0x7fffffffffffffff)
-		var got int64
-		if err := f.admin.QueryRow(f.ctx, "SELECT public.security_ledger_account_lock_key($1)", id).Scan(&got); err != nil || got != want || got >= 0 {
-			t.Fatalf("account lock parity: got %d want %d: %v", got, want, err)
-		}
-		tx, err := f.api.Begin(f.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := pglock.LockAccount(f.ctx, tx, id); err != nil {
-			t.Fatal(err)
-		}
-		var observed bool
-		if err := f.admin.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory'
-AND classid::bigint=$2 AND objid::bigint=$3 AND objsubid=1 AND granted)`, f.api.PgConn().PID(), int64(keyBits>>32), int64(keyBits&0xffffffff)).Scan(&observed); err != nil || !observed {
-			t.Fatalf("Go did not hold the SQL-derived advisory lock: %v", err)
-		}
-		_ = tx.Rollback(f.ctx)
-	}
-}
+	seq := f.seedLedger(t, time.Now().Add(-time.Hour))
 
-func TestRealRolesAndSpoofedBypasses(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	row := f.append(t, record(cutoff.Add(-time.Hour)))[0]
-	for name, conn := range map[string]*pgx.Conn{"worker": f.worker, "signer": f.signer, "api": f.api, "cleaner": f.cleaner} {
-		t.Run(name, func(t *testing.T) {
-			for _, sql := range []string{
-				"DELETE FROM public.security_event_ledger", "UPDATE public.security_event_ledger SET event_type='changed'",
-				"TRUNCATE public.security_event_ledger", "UPDATE public.security_ledger_head SET seq=0",
-				"DELETE FROM public.security_ledger_checkpoints", "TRUNCATE public.security_ledger_head",
-				"ALTER TABLE public.security_event_ledger DISABLE TRIGGER ALL", "SET ROLE " + owner,
-				"SET session_replication_role='replica'", "CREATE ROLE retention_escalation SUPERUSER",
-				"INSERT INTO public.event_outbox(subject,payload) VALUES('identity.audit.logs','{}')",
-			} {
-				_, err := conn.Exec(f.ctx, sql)
-				assertSQLState(t, err, "42501")
-			}
-			if name != "worker" {
-				_, err := conn.Exec(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...)
-				assertSQLState(t, err, "42501")
-			}
-		})
-	}
-	// Even accidental table DELETE/UPDATE/TRUNCATE grants cannot bypass triggers.
-	mustExec(t, f.ctx, f.admin, "GRANT DELETE,UPDATE,TRUNCATE ON public.security_event_ledger TO "+pgx.Identifier{f.names["worker"]}.Sanitize())
-	mustExec(t, f.ctx, f.worker, "SET app.ledger_maintenance='true'; SET security_ledger.purge='on'")
-	for _, sql := range []string{"DELETE FROM public.security_event_ledger", "UPDATE public.security_event_ledger SET event_type='changed'", "TRUNCATE public.security_event_ledger"} {
-		_, err := f.worker.Exec(f.ctx, sql)
-		assertSQLState(t, err, "42501")
-	}
-	mustExec(t, f.ctx, f.worker, "CREATE TEMP TABLE legal_holds(account_ref uuid,is_active boolean); CREATE TEMP TABLE security_ledger_head(singleton boolean,seq bigint,chain_hash text); SET search_path=pg_temp")
-	deleted, _, _ := f.purge(t, []ledgerRow{row}, cutoff, row.seq, true)
-	if deleted != 1 {
-		t.Fatal("qualified maintenance objects were shadowed")
-	}
-}
-
-func TestPurgeBoundsAndDryRun(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	rows := f.append(t, record(cutoff.Add(-time.Hour)), record(cutoff), record(cutoff.Add(time.Hour)))
-	highwater := rows[len(rows)-1].seq
-	for name, mutate := range map[string]func([]any){
-		"future_cutoff":    func(a []any) { a[0] = time.Now().Add(time.Hour) },
-		"future_highwater": func(a []any) { a[1] = highwater + 1 },
-		"empty":            func(a []any) { a[2], a[3], a[4] = []int64{}, []string{}, [][]byte{} },
-		"duplicate":        func(a []any) { a[2] = []int64{rows[0].seq, rows[0].seq, rows[2].seq} },
-		"unbounded":        func(a []any) { a[2] = make([]int64, 5001) },
-		"missing":          func(a []any) { a[2] = []int64{highwater + 100} },
-		"uppercase_hash":   func(a []any) { a[3] = []string{strings.ToUpper(rows[0].hash), rows[1].hash, rows[2].hash} },
-		"wrong_body":       func(a []any) { a[4].([][]byte)[0] = []byte("fabricated") },
-		"null_body":        func(a []any) { a[4].([][]byte)[0] = nil },
-		"subject":          func(a []any) { a[6] = "identity.user.deleted" },
-		"zero_operation":   func(a []any) { a[5] = uuid.Nil },
+	for name, conn := range map[string]*pgx.Conn{
+		"purge": f.purge, "signer": f.signer, "api": f.api, "cleaner": f.cleaner,
 	} {
 		t.Run(name, func(t *testing.T) {
-			args := batchArgs(rows, cutoff, highwater, uuid.New())
-			mutate(args)
-			if _, err := f.worker.Exec(f.ctx, purgeSQL, args...); err == nil {
-				t.Fatal("unsafe arguments accepted")
+			statements := []string{
+				// The chain is the tamper-evidence. Nothing may touch it.
+				"UPDATE public.security_ledger_chain SET chain_hash=leaf_hash",
+				"DELETE FROM public.security_ledger_chain",
+				"TRUNCATE public.security_ledger_chain",
+				"UPDATE public.audit_log_chain SET chain_hash=leaf_hash",
+				"DELETE FROM public.audit_log_chain",
+				// Payload is immutable for everyone; erasable only by the purge role.
+				"UPDATE public.security_event_ledger SET event_type='changed'",
+				"TRUNCATE public.security_event_ledger",
+				// The heads are the signer's alone.
+				"UPDATE public.security_ledger_head SET seq=0",
+				"TRUNCATE public.security_ledger_head",
+				"UPDATE public.audit_log_head SET seq=0",
+				// Erasure records must not be removable: deleting one turns a lawful
+				// erasure back into an unexplained gap.
+				"UPDATE public.security_ledger_erasures SET operation_id=gen_random_uuid()",
+				"DELETE FROM public.security_ledger_erasures",
+				// Disarming or bypassing the guards.
+				"ALTER TABLE public.security_event_ledger DISABLE TRIGGER ALL",
+				"ALTER TABLE public.security_ledger_chain DISABLE TRIGGER ALL",
+				"SET session_replication_role='replica'",
+				"CREATE ROLE retention_escalation SUPERUSER",
 			}
-			assertCount(t, f, "public.security_event_ledger", 3)
-			assertCount(t, f, "public.security_ledger_checkpoints", 0)
-			assertCount(t, f, "public.event_outbox", 0)
+			// Escalating into another runtime login. The target must not be the
+			// current role: SET ROLE to yourself is always permitted and would make
+			// this case vacuous for whichever role it named.
+			for kind, target := range f.names {
+				if kind == name {
+					continue
+				}
+				statements = append(statements, "SET ROLE "+pgx.Identifier{target}.Sanitize())
+			}
+			if name != "purge" {
+				statements = append(statements,
+					"DELETE FROM public.security_event_ledger",
+					"INSERT INTO public.security_ledger_erasures(first_seq,last_seq,operation_id) VALUES(1,1,gen_random_uuid())",
+					"INSERT INTO public.event_outbox(subject,payload) VALUES('identity.audit.logs','{}')")
+			}
+			if name != "signer" {
+				statements = append(statements,
+					"INSERT INTO public.security_ledger_chain(seq,event_id,leaf_hash,chain_hash) VALUES(999,gen_random_uuid(),sha256('a'),sha256('b'))",
+					"SELECT public.advance_chain_head('ledger',0,1,1,1)")
+			}
+			for _, sql := range statements {
+				_, err := conn.Exec(f.ctx, sql)
+				assertRefused(t, sql, err)
+			}
 		})
 	}
-	mustExec(t, f.ctx, f.worker, "SET statement_timeout=0")
-	_, err := f.worker.Exec(f.ctx, purgeSQL, batchArgs(rows, cutoff, highwater, uuid.New())...)
-	assertSQLState(t, err, "22023")
-	mustExec(t, f.ctx, f.worker, "SET statement_timeout='15s'")
-	tx, err := f.worker.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+
+	// The seeded row and its chain node must still be intact and verifiable after
+	// every attempt above.
+	assertCount(t, f, "public.security_event_ledger", 1)
+	assertCount(t, f, "public.security_ledger_chain", 1)
+	var storedSeq int64
+	if err := f.admin.QueryRow(f.ctx, "SELECT seq FROM public.security_ledger_chain").Scan(&storedSeq); err != nil {
+		t.Fatal(err)
+	}
+	if storedSeq != seq {
+		t.Fatalf("chain node seq = %d, want %d", storedSeq, seq)
+	}
+}
+
+// TestTableGrantsCannotBypassTheGuards covers the operator-error case: even an
+// accidental UPDATE/TRUNCATE grant must not get past the triggers, because a
+// GRANT is a privilege decision and immutability is an integrity decision.
+func TestTableGrantsCannotBypassTheGuards(t *testing.T) {
+	f := newFixture(t)
+	f.seedLedger(t, time.Now().Add(-time.Hour))
+	quoted := pgx.Identifier{f.names["cleaner"]}.Sanitize()
+
+	mustExec(t, f.ctx, f.admin, "GRANT UPDATE,TRUNCATE ON public.security_event_ledger TO "+quoted)
+	mustExec(t, f.ctx, f.admin, "GRANT UPDATE,DELETE,TRUNCATE ON public.security_ledger_chain TO "+quoted)
+	// Session GUCs that a v1-style trigger might have consulted.
+	mustExec(t, f.ctx, f.cleaner, "SET app.ledger_maintenance='true'")
+	mustExec(t, f.ctx, f.cleaner, "SET security_ledger.purge='on'")
+
+	for _, sql := range []string{
+		"UPDATE public.security_event_ledger SET event_type='changed'",
+		"TRUNCATE public.security_event_ledger",
+		"UPDATE public.security_ledger_chain SET chain_hash=leaf_hash",
+		"DELETE FROM public.security_ledger_chain",
+		"TRUNCATE public.security_ledger_chain",
+	} {
+		_, err := f.cleaner.Exec(f.ctx, sql)
+		assertRefused(t, sql, err)
+	}
+	assertCount(t, f, "public.security_event_ledger", 1)
+	assertCount(t, f, "public.security_ledger_chain", 1)
+}
+
+// TestSearchPathShadowingCannotDeceiveTheGuards covers the temp-table attack:
+// every guard and every query must name its objects schema-qualified, or a role
+// that can create temp tables could substitute its own legal_holds and make a
+// held subject look unheld.
+func TestSearchPathShadowingCannotDeceiveTheGuards(t *testing.T) {
+	f := newFixture(t)
+	seq := f.seedLedger(t, time.Now().Add(-time.Hour))
+
+	// A hold that must be honoured regardless of what search_path says.
+	var account uuid.UUID
+	if err := f.admin.QueryRow(f.ctx, "SELECT account_ref FROM public.security_event_ledger WHERE seq=$1", seq).Scan(&account); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
+VALUES($1,'shadowing','court','legal claims',$2)`, account, uuid.New())
+
+	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE legal_holds(account_ref uuid, is_active boolean)")
+	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE security_ledger_head(singleton boolean, seq bigint, chain_hash bytea)")
+	mustExec(t, f.ctx, f.purge, "SET search_path=pg_temp")
+
+	// The schema-qualified DELETE still sees the real hold and erases nothing.
+	tag, err := f.purge.Exec(f.ctx, `DELETE FROM public.security_event_ledger l
+WHERE l.seq=$1 AND l.retain_until < now()
+  AND NOT EXISTS (SELECT 1 FROM public.legal_holds h WHERE h.account_ref=l.account_ref AND h.is_active)`, seq)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Exec(f.ctx, purgeSQL, batchArgs(rows, cutoff, highwater, uuid.New())...)
-	assertSQLState(t, err, "25001")
-	_ = tx.Rollback(f.ctx)
-	deleted, held, _ := f.purge(t, rows, cutoff, highwater, false)
-	if deleted != 1 || held != 0 {
-		t.Fatalf("strict boundary dry-run: deleted=%d held=%d", deleted, held)
+	if tag.RowsAffected() != 0 {
+		t.Fatal("a shadowed legal_holds let a held payload be erased")
 	}
-	assertCount(t, f, "public.security_event_ledger", 3)
-	assertCount(t, f, "public.security_ledger_checkpoints", 0)
-	assertCount(t, f, "public.event_outbox", 0)
-	deleted, _, _ = f.purge(t, rows, cutoff, highwater, true)
-	if deleted != 1 {
-		t.Fatal("strict cutoff did not preserve equality/future rows")
-	}
+	assertCount(t, f, "public.security_event_ledger", 1)
 }
 
-func TestSpansGapsHoldsReceiptsAndAppendAfterTailErasure(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	var rows []ledgerRow
-	for i := 0; i < 7; i++ {
-		// Simulate nontransactional sequence allocation gaps without overriding seq.
-		mustExec(t, f.ctx, f.admin, "SELECT nextval('public.security_event_ledger_seq_seq')")
-		rows = append(rows, f.append(t, record(cutoff.Add(-time.Hour)))...)
-	}
-	// Ledger eligibility is independent of live/deleted Class A subjects. Keep
-	// another Class C row with the same event ID to prove erasure leaves it alone.
-	mustExec(t, f.ctx, f.admin, "INSERT INTO public.users(id,email) VALUES($1,'live@retention.test'),($2,'deleted@retention.test')", rows[0].record.AccountRef, rows[1].record.AccountRef)
-	mustExec(t, f.ctx, f.admin, "DELETE FROM public.users WHERE id=$1", rows[1].record.AccountRef)
-	mustExec(t, f.ctx, f.admin, `INSERT INTO public.mvp_audit_logs(id,actor_id,actor_spiffe_id,event_type,action_status,client_ip,user_agent,payload,chain_hash)
-VALUES($1,$2,'system://identity/fixture','auth.login','success','','','{}',repeat('0',64))`, rows[0].record.ID, uuid.Nil)
-	highwater := rows[6].seq
-	for _, i := range []int{1, 5} {
-		mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,applied_by,reason,requesting_authority,legal_basis,review_at)
-VALUES($1,$2,'fixture','fixture','fixture',now()-interval '1 year')`, rows[i].record.AccountRef, uuid.New())
-	}
-	deleted, held, operation := f.purge(t, []ledgerRow{rows[0], rows[1], rows[2], rows[3], rows[5], rows[6]}, cutoff, highwater, true)
-	if deleted != 4 || held != 2 {
-		t.Fatalf("deleted=%d held=%d", deleted, held)
-	}
-	assertCount(t, f, "public.security_ledger_checkpoints", 3)
-	var overlap bool
-	if err := f.admin.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM public.security_ledger_checkpoints c
-JOIN public.security_event_ledger l ON l.seq BETWEEN c.first_seq AND c.last_seq)`).Scan(&overlap); err != nil || overlap {
-		t.Fatalf("checkpoint covered a retained island: %v", err)
-	}
-	var raw string
-	if err := f.admin.QueryRow(f.ctx, "SELECT payload FROM public.event_outbox WHERE id=$1 AND admin_action", operation).Scan(&raw); err != nil {
-		t.Fatal(err)
-	}
-	var env audit.Envelope
-	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Security != nil || env.SubjectID != "" || env.EventID != operation || env.EventType != "legal.ledger.purged" {
-		t.Fatalf("invalid Class C receipt: %v", err)
-	}
-	for _, row := range rows {
-		if strings.Contains(raw, row.record.ID) || strings.Contains(raw, row.record.AccountRef) || strings.Contains(raw, row.hash) {
-			t.Fatal("receipt contains erased evidence identifiers/proof history")
-		}
-	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(env.Payload), &payload); err != nil || payload["deleted_count"] != float64(4) || payload["held_count"] != float64(2) {
-		t.Fatalf("receipt counts do not match deletion: %v", err)
-	}
-	mustExec(t, f.ctx, f.admin, "UPDATE public.legal_holds SET is_active=false")
-	deleted, _, _ = f.purge(t, []ledgerRow{rows[1], rows[4], rows[5]}, cutoff, highwater, true)
-	if deleted != 3 {
-		t.Fatal("released hold restarted signed retention")
-	}
-	assertCount(t, f, "public.security_event_ledger", 0)
-	assertCount(t, f, "public.security_ledger_checkpoints", 1)
-	var first, last, predecessor, count, head int64
-	var predecessorHash, terminal, headHash string
-	if err := f.admin.QueryRow(f.ctx, "SELECT first_seq,last_seq,predecessor_seq,predecessor_hash,terminal_hash,erased_count FROM public.security_ledger_checkpoints").Scan(&first, &last, &predecessor, &predecessorHash, &terminal, &count); err != nil {
-		t.Fatal(err)
-	}
-	if first != rows[0].seq || last != highwater || predecessor != 0 || predecessorHash != strings.Repeat("0", 64) || terminal != rows[6].hash || count != 7 {
-		t.Fatal("all-erased proof was not maximally compact or lost its true boundary")
-	}
-	if err := f.admin.QueryRow(f.ctx, "SELECT seq,chain_hash FROM public.security_ledger_head WHERE singleton").Scan(&head, &headHash); err != nil || head != highwater || headHash != terminal {
-		t.Fatalf("erasure changed durable head: %v", err)
-	}
-	newRows := f.append(t, record(cutoff.Add(-time.Hour)))
-	if newRows[0].seq <= highwater {
-		t.Fatal("signer restarted erased history")
-	}
-	f.purge(t, newRows, cutoff, newRows[0].seq, true)
-	assertCount(t, f, "public.security_ledger_checkpoints", 1)
-	assertCount(t, f, "public.users", 1)
-	assertCount(t, f, "public.mvp_audit_logs", 1)
-}
-
-func TestOutboxAndCompactionFailureRollback(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	rows := f.append(t, record(cutoff.Add(-time.Hour)), record(cutoff.Add(-time.Hour)), record(cutoff.Add(-time.Hour)))
-	f.purge(t, rows[:1], cutoff, rows[2].seq, true)
-	operation := uuid.New()
-	mustExec(t, f.ctx, f.admin, "INSERT INTO public.event_outbox(id,subject,payload) VALUES($1,$2,'{}')", operation, auditSubject)
-	_, err := f.worker.Exec(f.ctx, purgeSQL, batchArgs(rows[1:], cutoff, rows[2].seq, operation)...)
-	assertSQLState(t, err, "23505")
-	assertCount(t, f, "public.security_event_ledger", 2)
-	assertCount(t, f, "public.security_ledger_checkpoints", 1)
-	var last int64
-	if err := f.admin.QueryRow(f.ctx, "SELECT last_seq FROM public.security_ledger_checkpoints").Scan(&last); err != nil || last != rows[0].seq {
-		t.Fatalf("failed receipt committed compaction: %v", err)
-	}
-	// Failure injection adds a rejecting trigger; no production trigger is disabled.
-	mustExec(t, f.ctx, f.admin, `CREATE FUNCTION public.reject_checkpoint_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN RAISE EXCEPTION 'checkpoint fixture failure'; END $$;
-CREATE TRIGGER reject_checkpoint_fixture BEFORE INSERT ON public.security_ledger_checkpoints FOR EACH ROW EXECUTE FUNCTION public.reject_checkpoint_fixture()`)
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs(rows[1:], cutoff, rows[2].seq, uuid.New())...)
-	assertSQLState(t, err, "P0001")
-	assertCount(t, f, "public.security_event_ledger", 2)
-	assertCount(t, f, "public.security_ledger_checkpoints", 1)
-}
-
-func waitForBlock(t *testing.T, f *fixture, waiter, blocker uint32) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(f.ctx, 3*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		var blocked bool
-		if err := f.admin.QueryRow(ctx, "SELECT $2::bigint = ANY(pg_blocking_pids($1))", waiter, int64(blocker)).Scan(&blocked); err != nil {
-			t.Fatal(err)
-		}
-		if blocked {
-			return
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			t.Fatal("did not observe required PostgreSQL lock wait")
-		}
-	}
-}
-
-func TestHoldWinsAfterObservedWaitAndPurgeWinsReverseOrder(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	row := f.append(t, record(cutoff.Add(-time.Hour)))[0]
-	account := uuid.MustParse(row.record.AccountRef)
-	holdTx, err := f.api.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holdTx.Rollback(context.Background()) }()
-	if err := pglock.LockAccount(f.ctx, holdTx, account); err != nil {
-		t.Fatal(err)
-	}
-	type result struct {
-		deleted, held int64
-		err           error
-	}
-	results := make(chan result, 1)
-	go func() {
-		var r result
-		r.err = f.worker.QueryRow(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...).Scan(&r.deleted, &r.held)
-		results <- r
-	}()
-	waitForBlock(t, f, f.worker.PgConn().PID(), f.api.PgConn().PID())
-	for i := 0; i < 2; i++ {
-		mustExec(t, f.ctx, holdTx, `INSERT INTO public.legal_holds(account_ref,applied_by,reason,requesting_authority,legal_basis,review_at)
-VALUES($1,$2,'fixture','fixture','fixture',now()-interval '1 year')`, account, uuid.New())
-	}
-	if err := holdTx.Commit(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	r := <-results
-	if r.err != nil || r.deleted != 0 || r.held != 1 {
-		t.Fatalf("post-lock READ COMMITTED snapshot missed hold: %+v", r)
-	}
-	assertCount(t, f, "public.security_ledger_checkpoints", 0)
-	mustExec(t, f.ctx, f.admin, "UPDATE public.legal_holds SET is_active=false WHERE id=(SELECT id FROM public.legal_holds LIMIT 1)")
-	deleted, held, _ := f.purge(t, []ledgerRow{row}, cutoff, row.seq, true)
-	if deleted != 0 || held != 1 {
-		t.Fatal("one independent hold release erased another hold")
-	}
-	mustExec(t, f.ctx, f.admin, "UPDATE public.legal_holds SET is_active=false")
-	purgeTx, err := f.worker.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = purgeTx.Rollback(context.Background()) }()
-	if err := purgeTx.QueryRow(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...).Scan(&deleted, &held); err != nil || deleted != 1 {
-		t.Fatalf("pre-hold purge: %v", err)
-	}
-	holdTx, err = f.api.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holdTx.Rollback(context.Background()) }()
-	waitResult := make(chan error, 1)
-	go func() { waitResult <- pglock.LockAccount(f.ctx, holdTx, account) }()
-	waitForBlock(t, f, f.api.PgConn().PID(), f.worker.PgConn().PID())
-	if err := purgeTx.Commit(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-waitResult; err != nil {
-		t.Fatal(err)
-	}
-	var remains bool
-	if err := holdTx.QueryRow(f.ctx, "SELECT EXISTS(SELECT 1 FROM public.security_event_ledger WHERE account_ref=$1)", account).Scan(&remains); err != nil || remains {
-		t.Fatalf("post-purge hold pretended erased payload survived: %v", err)
-	}
-}
-
-func TestHeadAdvancementAndCorruptionFailClosed(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	row := f.append(t, record(cutoff.Add(-time.Hour)))[0]
-	for _, args := range [][]any{{int64(0), row.record.ID}, {row.seq, row.record.ID}, {row.seq, uuid.New()}} {
-		_, err := f.signer.Exec(f.ctx, "SELECT public.advance_security_ledger_head($1,$2)", args...)
-		assertSQLState(t, err, "23000")
-	}
-	// An old signer can leave a committed row without advancing head. Even if an
-	// operator supplied its digest, the advancement routine must refuse adoption.
-	bad := record(cutoff.Add(-time.Hour))
-	var badSeq int64
-	if err := f.admin.QueryRow(f.ctx, `INSERT INTO public.security_event_ledger(id,account_ref,event_type,timestamp,retain_until,chain_hash)
-VALUES($1,$2,$3,$4,$5,$6) RETURNING seq`, bad.ID, bad.AccountRef, bad.EventType, bad.Timestamp, bad.RetainUntil, strings.Repeat("f", 64)).Scan(&badSeq); err != nil {
-		t.Fatal(err)
-	}
-	_, err := f.signer.Exec(f.ctx, "SELECT public.advance_security_ledger_head($1,$2)", row.seq, bad.ID)
-	assertSQLState(t, err, "23000")
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...)
-	assertSQLState(t, err, "23000")
-	// Simulate incorrectly initialized historical state without mutating bodies or
-	// disabling guards. A matching head does not launder a bad canonical hash.
-	mustExec(t, f.ctx, f.admin, "UPDATE public.security_ledger_head SET seq=$1,chain_hash=$2", badSeq, strings.Repeat("f", 64))
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs([]ledgerRow{{record: bad, seq: badSeq, hash: strings.Repeat("f", 64)}}, cutoff, badSeq, uuid.New())...)
-	assertSQLState(t, err, "23000")
-	assertCount(t, f, "public.security_event_ledger", 2)
-	assertCount(t, f, "public.security_ledger_checkpoints", 0)
-	assertCount(t, f, "public.event_outbox", 0)
-	mustExec(t, f.ctx, f.admin, "DELETE FROM public.security_ledger_head")
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...)
-	assertSQLState(t, err, "P0002")
-}
-
-func TestProtectedFunctionACLsProvisioningAndForwardOnlyMigration(t *testing.T) {
+// TestPublicHoldsNoExecuteOnProtectedFunctions keeps the function surface closed
+// by default. A PUBLIC EXECUTE grant on any of these would make every one of the
+// privilege tests above meaningless.
+func TestPublicHoldsNoExecuteOnProtectedFunctions(t *testing.T) {
 	f := newFixture(t)
 	var exposed int64
 	if err := f.admin.QueryRow(f.ctx, `SELECT count(*) FROM pg_proc p
 JOIN pg_namespace n ON n.oid=p.pronamespace,
 LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) acl
-WHERE n.nspname='public' AND (p.proname LIKE 'security_ledger_%'
- OR p.proname IN ('security_event_ledger_guard','advance_security_ledger_head','purge_security_ledger_batch'))
-AND acl.grantee=0 AND acl.privilege_type='EXECUTE'`).Scan(&exposed); err != nil || exposed != 0 {
-		t.Fatalf("PUBLIC can execute %d protected functions: %v", exposed, err)
+WHERE n.nspname='public'
+  AND p.proname IN ('advance_chain_head','chain_table_guard',
+                    'security_event_ledger_guard','mvp_audit_logs_guard')
+  AND acl.grantee=0 AND acl.privilege_type='EXECUTE'`).Scan(&exposed); err != nil {
+		t.Fatal(err)
 	}
-	for _, sql := range []string{
-		"SELECT public.security_ledger_require_owner()",
-		"SELECT public.security_ledger_predecessor(1)",
-		"SELECT public.security_ledger_account_lock_key('00000000-0000-0000-0000-000000000001')",
-		"SELECT public.advance_security_ledger_head(0,'00000000-0000-0000-0000-000000000001')",
-	} {
-		_, err := f.worker.Exec(f.ctx, sql)
-		assertSQLState(t, err, "42501")
+	if exposed != 0 {
+		t.Fatalf("PUBLIC can execute %d protected functions", exposed)
 	}
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	row := f.append(t, record(cutoff.Add(-time.Hour)))[0]
-	mustExec(t, f.ctx, f.admin, "ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) OWNER TO "+pgx.Identifier{f.names["api"]}.Sanitize())
-	_, err := f.worker.Exec(f.ctx, purgeSQL, batchArgs([]ledgerRow{row}, cutoff, row.seq, uuid.New())...)
-	assertSQLState(t, err, "42501")
-	assertCount(t, f, "public.security_event_ledger", 1)
-	mustExec(t, f.ctx, f.admin, "ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) OWNER TO identity_ledger_maintenance_owner")
-	f.purge(t, []ledgerRow{row}, cutoff, row.seq, true)
+
+	// And the v1 routines must be gone rather than merely unreachable: a surviving
+	// SECURITY DEFINER purge routine would be an erasure path outside the model.
+	var leftovers int64
+	if err := f.admin.QueryRow(f.ctx, `SELECT count(*) FROM pg_proc p
+JOIN pg_namespace n ON n.oid=p.pronamespace
+WHERE n.nspname='public' AND p.proname IN
+ ('purge_security_ledger_batch','security_ledger_canonical_body','security_ledger_predecessor',
+  'security_ledger_require_owner','security_ledger_account_lock_key','security_ledger_chain_time',
+  'advance_security_ledger_head')`).Scan(&leftovers); err != nil {
+		t.Fatal(err)
+	}
+	if leftovers != 0 {
+		t.Fatalf("%d v1 maintenance routines survived migration 00015", leftovers)
+	}
+
+	var checkpoints int64
+	if err := f.admin.QueryRow(f.ctx,
+		"SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename='security_ledger_checkpoints'").Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints != 0 {
+		t.Fatal("the v1 checkpoint table survived migration 00015")
+	}
+}
+
+// TestForwardOnlyMigrationIsRefused keeps the escape hatch closed. Reverting
+// would reinstate a format whose digests nothing can recompute, and would drop
+// the chain and erasure tables that are the only surviving record of what was
+// erased.
+func TestForwardOnlyMigrationIsRefused(t *testing.T) {
+	f := newFixture(t)
+	f.seedLedger(t, time.Now().Add(-time.Hour))
+
 	sqldb, err := migrate.Open(f.ctx, f.databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sqldb.Close() }()
-	if err := migrate.Down(f.ctx, sqldb); err == nil || !strings.Contains(err.Error(), "forward-only") {
-		t.Fatalf("destructive down migration was not refused: %v", err)
+
+	if err := migrate.Down(f.ctx, sqldb); err == nil {
+		t.Fatal("the destructive down migration was not refused")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "forward-only") {
+		t.Fatalf("down migration failed for the wrong reason: %v", err)
 	}
+	// Forward recovery must still work after the refusal, and must not have lost
+	// anything.
 	if err := migrate.Up(f.ctx, sqldb); err != nil {
-		t.Fatalf("forward recovery after refused downgrade: %v", err)
+		t.Fatalf("forward recovery after a refused downgrade: %v", err)
 	}
 	assertCount(t, f, "public.security_ledger_head", 1)
-	assertCount(t, f, "public.security_ledger_checkpoints", 1)
-	assertCount(t, f, "public.event_outbox", 1)
-}
-
-func TestCheckpointConstraintsAndTamperingAreNotLaundered(t *testing.T) {
-	f := newFixture(t)
-	cutoff := audit.NormalizeChainTime(time.Now().Add(-time.Minute))
-	rows := f.append(t, record(cutoff.Add(-time.Hour)), record(cutoff.Add(-time.Hour)), record(cutoff.Add(-time.Hour)))
-	f.purge(t, rows[1:2], cutoff, rows[2].seq, true)
-	_, err := f.admin.Exec(f.ctx, `INSERT INTO public.security_ledger_checkpoints VALUES($1,$2,0,repeat('0',64),$3,3)`, rows[0].seq, rows[2].seq, rows[2].hash)
-	assertSQLState(t, err, "23P01")
-	_, err = f.admin.Exec(f.ctx, `INSERT INTO public.security_ledger_checkpoints VALUES(100,101,$1,$2,$3,2)`, rows[0].seq, rows[0].hash, rows[2].hash)
-	assertSQLState(t, err, "23505")
-	for _, sql := range []string{
-		"UPDATE public.security_ledger_checkpoints SET terminal_hash='malformed'",
-		"UPDATE public.security_ledger_checkpoints SET predecessor_seq=first_seq",
-		"UPDATE public.security_ledger_checkpoints SET erased_count=0",
-		"UPDATE public.security_ledger_checkpoints SET erased_count=last_seq-first_seq+2",
-		"UPDATE public.security_ledger_head SET singleton=false",
-		"UPDATE public.security_ledger_head SET seq=-1",
-		"UPDATE public.security_ledger_head SET chain_hash=repeat('A',64)",
-	} {
-		_, err := f.admin.Exec(f.ctx, sql)
-		assertSQLState(t, err, "23514")
-	}
-	// A database owner can still tamper with valid-looking proof. The routine must
-	// detect local broken linkage instead of laundering it into a new certificate.
-	mustExec(t, f.ctx, f.admin, "UPDATE public.security_ledger_checkpoints SET terminal_hash=repeat('f',64)")
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs(rows[2:], cutoff, rows[2].seq, uuid.New())...)
-	assertSQLState(t, err, "23000")
-	assertCount(t, f, "public.security_event_ledger", 2)
-	mustExec(t, f.ctx, f.admin, "DELETE FROM public.security_ledger_checkpoints")
-	_, err = f.worker.Exec(f.ctx, purgeSQL, batchArgs(rows[2:], cutoff, rows[2].seq, uuid.New())...)
-	assertSQLState(t, err, "23000")
-	assertCount(t, f, "public.security_event_ledger", 2)
-	assertCount(t, f, "public.event_outbox", 1)
+	assertCount(t, f, "public.audit_log_head", 1)
+	assertCount(t, f, "public.security_ledger_chain", 1)
+	assertCount(t, f, "public.security_event_ledger", 1)
 }

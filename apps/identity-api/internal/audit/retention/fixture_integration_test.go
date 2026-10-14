@@ -26,8 +26,6 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
-const integrationPurgeRoutine = "public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text)"
-
 type workerFixture struct {
 	ctx     context.Context
 	admin   *pgxpool.Pool
@@ -81,10 +79,10 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 	}
 	t.Cleanup(func() { _ = root.Close(context.Background()) })
 	workerExec(t, ctx, root, "SELECT pg_advisory_lock(5299999)")
+	// v2 needs only the purge login. The non-login maintenance owner existed
+	// solely to own the SECURITY DEFINER purge routine, which no longer exists:
+	// erasure is now an ordinary DELETE controlled by table privilege.
 	workerExec(t, ctx, root, `DO $$ BEGIN
- CREATE ROLE identity_ledger_maintenance_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
- EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;
-DO $$ BEGIN
  CREATE ROLE identity_ledger_purge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'retention-worker-integration-only';
  EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;`)
 	var exists bool
@@ -124,25 +122,20 @@ DO $$ BEGIN
 		t.Fatal(err)
 	}
 	_ = sqldb.Close()
-	// Keep in sync with retentiondbintegration's real-role grants. No runtime
-	// role owns a table, inherits another role, or receives arbitrary outbox writes.
-	workerExec(t, ctx, admin, `GRANT USAGE ON SCHEMA public TO identity_ledger_maintenance_owner,identity_ledger_purge;
-GRANT SELECT,DELETE ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT UPDATE(seq) ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT SELECT,UPDATE ON public.security_ledger_head TO identity_ledger_maintenance_owner;
-GRANT SELECT,INSERT,DELETE ON public.security_ledger_checkpoints TO identity_ledger_maintenance_owner;
-GRANT SELECT ON public.legal_holds,public.security_ledger_retention_settings TO identity_ledger_maintenance_owner;
-GRANT INSERT ON public.event_outbox TO identity_ledger_maintenance_owner;
-GRANT EXECUTE ON FUNCTION public.security_ledger_require_owner(),public.security_ledger_chain_time(timestamptz),
- public.security_ledger_canonical_body(public.security_event_ledger),public.security_ledger_account_lock_key(uuid),
- public.security_ledger_predecessor(bigint) TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.advance_security_ledger_head(bigint,uuid) OWNER TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) OWNER TO identity_ledger_maintenance_owner;
-GRANT SELECT ON public.security_event_ledger,public.security_ledger_head,public.security_ledger_checkpoints,
+	// Exactly the v2 erasure privileges, and nothing more. Notably absent: any
+	// right on the chain tables, which is what keeps a retention purge from being
+	// able to remove a chain node, and EXECUTE on advance_chain_head, which is the
+	// signer's alone.
+	workerExec(t, ctx, admin, `GRANT USAGE ON SCHEMA public TO identity_ledger_purge;
+GRANT SELECT,DELETE ON public.security_event_ledger TO identity_ledger_purge;
+GRANT SELECT,INSERT ON public.security_ledger_erasures TO identity_ledger_purge;
+GRANT SELECT ON public.security_ledger_chain,public.security_ledger_head,
  public.legal_holds,public.security_ledger_retention_settings TO identity_ledger_purge;
-GRANT EXECUTE ON FUNCTION public.purge_security_ledger_batch(timestamptz,bigint,bigint[],text[],bytea[],uuid,text) TO identity_ledger_purge;
-REVOKE CREATE ON DATABASE worker_integration_agent FROM identity_ledger_purge;
-INSERT INTO public.security_ledger_head VALUES(true,0,repeat('0',64));`)
+GRANT INSERT ON public.event_outbox TO identity_ledger_purge;
+REVOKE CREATE ON DATABASE worker_integration_agent FROM identity_ledger_purge;`)
+	// Separate statement: a parameterized query cannot share an Exec with a
+	// multi-command string, because pgx prepares it.
+	workerExec(t, ctx, admin, "INSERT INTO public.security_ledger_head VALUES(true,0,$1)", audit.LedgerGenesis().Bytes())
 	subject := "identity.audit.retention." + strings.ReplaceAll(uuid.NewString(), "-", "")
 	workerExec(t, ctx, admin, "INSERT INTO public.security_ledger_retention_settings VALUES(true,$1)", subject)
 	config, err := pgxpool.ParseConfig(dsn.String())
@@ -188,16 +181,21 @@ func workerExec(t *testing.T, ctx context.Context, conn workerExecutor, query st
 type workerRecord struct {
 	Candidate
 	record audit.LedgerRecord
-	hash   string
+	leaf   audit.Digest
+	chain  audit.Digest
 }
 
 func workerLedgerRecord(account uuid.UUID, expires time.Time) audit.LedgerRecord {
 	return audit.LedgerRecord{ID: uuid.NewString(), AccountRef: account.String(), EventType: "auth.login",
-		Timestamp: audit.NormalizeChainTime(expires.Add(-365 * 24 * time.Hour)), RetainUntil: audit.NormalizeChainTime(expires)}
+		BlindIndexVersion: 1,
+		Timestamp:         audit.NormalizeChainTime(expires.Add(-365 * 24 * time.Hour)),
+		RetainUntil:       audit.NormalizeChainTime(expires)}
 }
 
-// Inserts signed fixtures without disabling guards. Explicit sequence gaps make
-// numeric adjacency an invalid shortcut in both preflight and compaction tests.
+// seed inserts signed fixtures without disabling any guard, writing both the
+// chain node and its payload exactly as the signer would. Explicit sequence gaps
+// make numeric adjacency an invalid shortcut: the chain defines adjacency, never
+// seq-1.
 func (f *workerFixture) seed(t *testing.T, records ...audit.LedgerRecord) []workerRecord {
 	t.Helper()
 	tx, err := f.admin.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -207,28 +205,36 @@ func (f *workerFixture) seed(t *testing.T, records ...audit.LedgerRecord) []work
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	workerExec(t, f.ctx, tx, "SELECT pg_advisory_xact_lock($1)", pglock.LedgerCoordinationKey)
 	var seq int64
-	var previous string
-	if err := tx.QueryRow(f.ctx, "SELECT seq,chain_hash FROM public.security_ledger_head WHERE singleton").Scan(&seq, &previous); err != nil {
+	var previousRaw []byte
+	if err := tx.QueryRow(f.ctx, "SELECT seq,chain_hash FROM public.security_ledger_head WHERE singleton").Scan(&seq, &previousRaw); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := audit.DecodeDigest(previousRaw)
+	if err != nil {
 		t.Fatal(err)
 	}
 	expected := seq
+	first := seq + 3
 	result := make([]workerRecord, 0, len(records))
 	for _, rec := range records {
-		prev, err := audit.DecodeChainHash(previous)
+		leaf, err := audit.LeafLedger(rec)
 		if err != nil {
 			t.Fatal(err)
 		}
 		seq += 3
-		previous = audit.ChainHash(prev, audit.SerializeLedger(rec))
+		previous = audit.ChainLedger(previous, leaf)
+		workerExec(t, f.ctx, tx, `INSERT INTO public.security_ledger_chain(seq,event_id,leaf_hash,chain_hash)
+ VALUES($1,$2,$3,$4)`, seq, rec.ID, leaf.Bytes(), previous.Bytes())
 		workerExec(t, f.ctx, tx, `INSERT INTO public.security_event_ledger
- (seq,id,account_ref,identity_blind_index,event_type,client_ip,ip_subnet,user_agent,device_fingerprint,client_id,scope,timestamp,retain_until,chain_hash)
- OVERRIDING SYSTEM VALUE
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, seq, rec.ID, rec.AccountRef, rec.IdentityBlindIndex,
-			rec.EventType, rec.ClientIP, rec.IPSubnet, rec.UserAgent, rec.DeviceFingerprint, rec.ClientID, rec.Scope, rec.Timestamp, rec.RetainUntil, previous)
-		result = append(result, workerRecord{Candidate{seq, uuid.MustParse(rec.AccountRef), rec.RetainUntil}, rec, previous})
+ (seq,account_ref,identity_blind_index,blind_index_version,event_type,client_ip,ip_subnet,user_agent,device_fingerprint,client_id,scope,timestamp,retain_until)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, seq, rec.AccountRef, rec.IdentityBlindIndex,
+			rec.BlindIndexVersion, rec.EventType, rec.ClientIP, rec.IPSubnet, rec.UserAgent,
+			rec.DeviceFingerprint, rec.ClientID, rec.Scope, rec.Timestamp, rec.RetainUntil)
+		result = append(result, workerRecord{Candidate{seq, uuid.MustParse(rec.AccountRef), rec.RetainUntil}, rec, leaf, previous})
 	}
 	if len(records) > 0 {
-		workerExec(t, f.ctx, tx, "SELECT public.advance_security_ledger_head($1,$2)", expected, records[len(records)-1].ID)
+		workerExec(t, f.ctx, tx, "SELECT public.advance_chain_head('ledger',$1,$2,$3,$4)",
+			expected, first, seq, int64(len(records)))
 	}
 	if err := tx.Commit(f.ctx); err != nil {
 		t.Fatal(err)
@@ -271,12 +277,12 @@ func (f *workerFixture) count(t *testing.T, query string, args ...any) int {
 	return n
 }
 
-func (f *workerFixture) assertState(t *testing.T, ledger, checkpoints, receipts int) {
+func (f *workerFixture) assertState(t *testing.T, ledger, erasures, receipts int) {
 	t.Helper()
 	for _, check := range []struct {
 		table string
 		want  int
-	}{{"security_event_ledger", ledger}, {"security_ledger_checkpoints", checkpoints}, {"event_outbox", receipts}} {
+	}{{"security_event_ledger", ledger}, {"security_ledger_erasures", erasures}, {"event_outbox", receipts}} {
 		if got := f.count(t, "SELECT count(*) FROM public."+check.table); got != check.want {
 			t.Errorf("%s rows=%d, want %d", check.table, got, check.want)
 		}
@@ -343,5 +349,120 @@ func (f *workerFixture) waitBlocked(t *testing.T, blocker uint32, waiterApp stri
 			t.Fatal("expected PostgreSQL lock wait was not observed")
 		case <-tick.C:
 		}
+	}
+}
+
+// chainHead reads the durable ledger head digest.
+func (f *workerFixture) chainHead(t *testing.T) audit.Digest {
+	t.Helper()
+	var raw []byte
+	if err := f.admin.QueryRow(f.ctx, "SELECT chain_hash FROM public.security_ledger_head WHERE singleton").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	head, err := audit.DecodeDigest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return head
+}
+
+// assertChainVerifies walks every chain node from genesis and confirms it still
+// reproduces the recorded head, and that each retained payload still reproduces
+// its own leaf.
+//
+// This is the assertion the v1 design could not make after an erasure: the chain
+// had a hole, so a verifier had to bridge it with stored checkpoint digests and
+// take the erased span's contents on trust.
+func (f *workerFixture) assertChainVerifies(t *testing.T) {
+	t.Helper()
+	rows, err := f.admin.Query(f.ctx, `SELECT c.seq, c.event_id, c.leaf_hash, c.chain_hash,
+ l.seq IS NOT NULL,
+ l.account_ref, l.identity_blind_index, l.blind_index_version, l.event_type,
+ l.client_ip, l.ip_subnet, l.user_agent, l.device_fingerprint, l.client_id, l.scope,
+ l.timestamp, l.retain_until,
+ EXISTS (SELECT 1 FROM public.security_ledger_erasures e WHERE c.seq BETWEEN e.first_seq AND e.last_seq)
+FROM public.security_ledger_chain c
+LEFT JOIN public.security_event_ledger l ON l.seq = c.seq
+ORDER BY c.seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	previous := audit.LedgerGenesis()
+	var lastSeq int64
+	nodes := 0
+	for rows.Next() {
+		var (
+			seq                                                   int64
+			eventID                                               uuid.UUID
+			leafRaw, chainRaw                                     []byte
+			present, erasureRecorded                              bool
+			accountRef                                            uuid.NullUUID
+			blindIndex, eventType, clientIP, subnet               *string
+			userAgent, fingerprint, clientID, scope               *string
+			blindVersion                                          *int16
+			timestamp, retainUntil                                *time.Time
+		)
+		if err := rows.Scan(&seq, &eventID, &leafRaw, &chainRaw, &present,
+			&accountRef, &blindIndex, &blindVersion, &eventType,
+			&clientIP, &subnet, &userAgent, &fingerprint, &clientID, &scope,
+			&timestamp, &retainUntil, &erasureRecorded); err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := audit.DecodeDigest(leafRaw)
+		if err != nil {
+			t.Fatalf("seq %d: leaf digest: %v", seq, err)
+		}
+		stored, err := audit.DecodeDigest(chainRaw)
+		if err != nil {
+			t.Fatalf("seq %d: chain digest: %v", seq, err)
+		}
+		if seq <= lastSeq {
+			t.Fatalf("chain is not ordered: %d after %d", seq, lastSeq)
+		}
+		if got := audit.ChainLedger(previous, leaf); got != stored {
+			t.Fatalf("chain broken at seq %d: computed %s, stored %s", seq, got.Hex(), stored.Hex())
+		}
+		switch {
+		case present:
+			rec := audit.LedgerRecord{
+				ID: eventID.String(), IdentityBlindIndex: blindIndex, ClientIP: clientIP,
+				IPSubnet: subnet, UserAgent: userAgent, DeviceFingerprint: fingerprint,
+				ClientID: clientID, Scope: scope,
+			}
+			if accountRef.Valid {
+				rec.AccountRef = accountRef.UUID.String()
+			}
+			if blindVersion != nil {
+				rec.BlindIndexVersion = *blindVersion
+			}
+			if eventType != nil {
+				rec.EventType = *eventType
+			}
+			if timestamp != nil {
+				rec.Timestamp = *timestamp
+			}
+			if retainUntil != nil {
+				rec.RetainUntil = *retainUntil
+			}
+			recomputed, err := audit.LeafLedger(rec)
+			if err != nil {
+				t.Fatalf("seq %d: serialize retained payload: %v", seq, err)
+			}
+			if recomputed != leaf {
+				t.Fatalf("seq %d: retained payload does not reproduce its leaf: %s vs %s", seq, recomputed.Hex(), leaf.Hex())
+			}
+		case !erasureRecorded:
+			t.Fatalf("seq %d: payload absent with no erasure record; indistinguishable from a deletion", seq)
+		}
+		previous, lastSeq = stored, seq
+		nodes++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if head := f.chainHead(t); nodes > 0 && previous != head {
+		t.Fatalf("replayed chain tip %s does not match the recorded head %s", previous.Hex(), head.Hex())
 	}
 }

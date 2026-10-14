@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
@@ -34,28 +33,44 @@ func TestSignerNormalizesLegacyAndSyntheticTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), ActorID: id.String(), SubjectID: id.String(), OccurredAt: now, EventType: audit.EventLoginSucceeded, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: id.String(), IdentityBlindIndex: &index}}
+	env := audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: id.String(), SubjectID: id.String(), OccurredAt: now, EventType: audit.EventLoginSucceeded, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: id.String(), IdentityBlindIndex: &index}}
 	if err := s.processBatch(context.Background(), []jetstream.Msg{integrityMessage(t, env), &fakeMsg{data: []byte("not json")}}); err != nil {
 		t.Fatal(err)
 	}
-	prev := audit.GenesisChainHash
-	for _, row := range store.insertedAuditLogs {
+	prev := audit.AuditGenesis()
+	for i, row := range store.insertedAuditLogs {
 		if row.Timestamp.Time.Nanosecond()%1000 != 0 {
 			t.Fatal("audit timestamp is not microsecond aligned")
 		}
-		record := audit.AuditRecord{ID: row.ID.String(), ActorID: row.ActorID.String(), ActorSPIFFEID: row.ActorSpiffeID, EventType: row.EventType, ActionStatus: row.ActionStatus, ClientIP: row.ClientIp, UserAgent: row.UserAgent, Payload: row.Payload, Timestamp: row.Timestamp.Time.Truncate(time.Microsecond)}
-		if row.ChainHash != audit.ChainHash(prev, audit.SerializeAudit(record)) {
-			t.Fatal("audit hash differs after PostgreSQL precision roundtrip")
+		node := store.insertedAuditChain[i]
+		record := audit.AuditRecord{ID: node.EventID.String(), ActorID: row.ActorID.String(), ActorSPIFFEID: row.ActorSpiffeID, EventType: row.EventType, ActionStatus: row.ActionStatus, ClientIP: row.ClientIp, UserAgent: row.UserAgent, Payload: row.Payload, Timestamp: row.Timestamp.Time.Truncate(time.Microsecond)}
+		leafHash, err := audit.LeafAudit(record)
+		if err != nil {
+			t.Fatal(err)
 		}
-		prev, _ = audit.DecodeChainHash(row.ChainHash)
+		if stored, _ := audit.DecodeDigest(node.LeafHash); stored != leafHash {
+			t.Fatal("audit leaf differs after PostgreSQL precision roundtrip")
+		}
+		prev = audit.ChainAudit(prev, leafHash)
+		if stored, _ := audit.DecodeDigest(node.ChainHash); stored != prev {
+			t.Fatal("audit chain digest differs after PostgreSQL precision roundtrip")
+		}
 	}
 	row := store.insertedSecurityEvents[0]
 	if row.Timestamp.Time.Nanosecond()%1000 != 0 || row.RetainUntil.Time.Nanosecond()%1000 != 0 {
 		t.Fatal("ledger timestamps not microsecond aligned")
 	}
-	record := audit.LedgerRecord{ID: row.ID.String(), AccountRef: row.AccountRef.String(), IdentityBlindIndex: row.IdentityBlindIndex, EventType: row.EventType, ClientIP: row.ClientIp, IPSubnet: row.IpSubnet, UserAgent: row.UserAgent, DeviceFingerprint: row.DeviceFingerprint, ClientID: row.ClientID, Scope: row.Scope, Timestamp: row.Timestamp.Time.Truncate(time.Microsecond), RetainUntil: row.RetainUntil.Time.Truncate(time.Microsecond)}
-	if row.ChainHash != audit.ChainHash(audit.GenesisChainHash, audit.SerializeLedger(record)) {
-		t.Fatal("ledger hash differs after PostgreSQL precision roundtrip")
+	node := store.insertedLedgerChain[0]
+	record := audit.LedgerRecord{ID: node.EventID.String(), AccountRef: row.AccountRef.String(), IdentityBlindIndex: row.IdentityBlindIndex, BlindIndexVersion: row.BlindIndexVersion, EventType: row.EventType, ClientIP: row.ClientIp, IPSubnet: row.IpSubnet, UserAgent: row.UserAgent, DeviceFingerprint: row.DeviceFingerprint, ClientID: row.ClientID, Scope: row.Scope, Timestamp: row.Timestamp.Time.Truncate(time.Microsecond), RetainUntil: row.RetainUntil.Time.Truncate(time.Microsecond)}
+	leafHash, err := audit.LeafLedger(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored, _ := audit.DecodeDigest(node.LeafHash); stored != leafHash {
+		t.Fatal("ledger leaf differs after PostgreSQL precision roundtrip")
+	}
+	if stored, _ := audit.DecodeDigest(node.ChainHash); stored != audit.ChainLedger(audit.LedgerGenesis(), leafHash) {
+		t.Fatal("ledger chain digest differs after PostgreSQL precision roundtrip")
 	}
 }
 
@@ -69,10 +84,10 @@ func TestSignerLateSubjectsAndClassC(t *testing.T) {
 	}
 	var msgs []jetstream.Msg
 	for _, subject := range []uuid.UUID{live, deleted} {
-		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), ActorID: live.String(), SubjectID: subject.String(), OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: subject.String(), IdentityBlindIndex: &index}}))
+		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: live.String(), SubjectID: subject.String(), OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: subject.String(), IdentityBlindIndex: &index}}))
 	}
 	for _, eventType := range []string{audit.EventAdminChainVerified, audit.EventLegalHoldApplied, audit.EventLegalInquiryLookup, "legal.future.action"} {
-		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), ActorID: live.String(), SubjectID: deleted.String(), OccurredAt: time.Now(), EventType: eventType, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: deleted.String(), IdentityBlindIndex: &index}}))
+		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: live.String(), SubjectID: deleted.String(), OccurredAt: time.Now(), EventType: eventType, Payload: "{}", Security: &audit.EnvelopeSecurity{AccountRef: deleted.String(), IdentityBlindIndex: &index}}))
 	}
 	if err := s.processBatch(context.Background(), msgs); err != nil {
 		t.Fatal(err)
@@ -103,7 +118,7 @@ func TestSignerSubjectLockFailureAbortsBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg := integrityMessage(t, audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), SubjectID: uuid.NewString(), EventType: audit.EventLegalHoldApplied})
+	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), SubjectID: uuid.NewString(), EventType: audit.EventLegalHoldApplied})
 	if err := s.processBatch(context.Background(), []jetstream.Msg{msg}); err == nil {
 		t.Fatal("lock failure accepted")
 	}
@@ -113,11 +128,11 @@ func TestSignerSubjectLockFailureAbortsBatch(t *testing.T) {
 }
 
 func TestSignerFailedReseedStopsBeforeNextFetch(t *testing.T) {
-	store := &fakeStore{latestAuditErr: pgx.ErrNoRows, head: genesisLedgerHead()}
+	store := &fakeStore{head: genesisLedgerHead()}
 	tx := &fakeBatchTx{store: store, commitErr: errors.New("commit outcome uncertain")}
-	tx.onCommit = func() { store.latestAuditErr = errors.New("database unreachable") }
+	tx.onCommit = func() { store.auditHeadErr = errors.New("database unreachable") }
 	ch := make(chan jetstream.Msg, 1)
-	msg := integrityMessage(t, audit.Envelope{SchemaVersion: 1, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut, Payload: "{}"})
+	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut, Payload: "{}"})
 	ch <- msg
 	close(ch)
 	fetcher := &fakeFetcher{batches: []jetstream.MessageBatch{&fakeMessageBatch{msgs: ch}}}

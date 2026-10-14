@@ -15,7 +15,14 @@ import (
 // than by a coordinated deploy: JetStream holds a backlog, so during any rollout
 // the signer will decode messages produced by the previous release. A consumer that
 // sees a version it does not know must quarantine, never guess.
-const EnvelopeSchemaVersion = 1
+//
+// Version 2 accompanies the chain/payload split: EnvelopeSecurity carries
+// BlindIndexVersion, and the signer computes leaf digests rather than hashing a
+// record directly into the chain. A v1 envelope is not forward-decodable into v2
+// because its security context cannot state which pepper generation applied, so
+// the signer quarantines it rather than defaulting the version and signing a claim
+// the producer never made.
+const EnvelopeSchemaVersion = 2
 
 // Envelope is the JSON message published to the audit subject.
 //
@@ -67,9 +74,18 @@ type EnvelopeSecurity struct {
 	ClientID          string `json:"client_id,omitempty"`
 	Scope             string `json:"scope,omitempty"`
 	DeviceFingerprint string `json:"device_fingerprint,omitempty"`
-	// Optional additive v1 field: old queued envelopes omit it and the signer
-	// attempts the legacy live-account lookup instead.
+	// IdentityBlindIndex is the producer-captured attribution index. It stays
+	// optional: when the pepper is unavailable the signer falls back to a live
+	// lookup, and a purged subject legitimately yields NULL.
 	IdentityBlindIndex *string `json:"identity_blind_index,omitempty"`
+	// BlindIndexVersion names the pepper generation that produced
+	// IdentityBlindIndex, and is hashed into the ledger body unconditionally.
+	//
+	// It is not omitempty: version 0 is a meaningful value (the pre-rotation
+	// generation), and omitting it would make "generation 0" and "unstated"
+	// indistinguishable on the wire — which is exactly the ambiguity that makes a
+	// pepper unrotatable.
+	BlindIndexVersion int16 `json:"blind_index_version"`
 }
 
 // emptyPayload is the JSON text used when an event carries no context. The column
@@ -115,6 +131,7 @@ func NewEnvelope(e Event, eventID uuid.UUID, occurredAt time.Time) (Envelope, er
 			ClientID:          e.Security.ClientID,
 			Scope:             e.Security.Scope,
 			DeviceFingerprint: e.Security.DeviceFingerprint,
+			BlindIndexVersion: e.Security.BlindIndexVersion,
 		}
 		if e.Security.IdentityBlindIndex != nil {
 			index := *e.Security.IdentityBlindIndex

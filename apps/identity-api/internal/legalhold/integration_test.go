@@ -362,21 +362,32 @@ func TestLegalPurgeBothLockOrdersIntegration(t *testing.T) {
 	}
 }
 
-func (f *legalIntegration) ledger(t *testing.T, account uuid.UUID, index *string, retain time.Time) db.SecurityEventLedger {
+func (f *legalIntegration) ledger(t *testing.T, account uuid.UUID, index *string, retain time.Time) db.LookupLegalAttributionRow {
 	t.Helper()
 	id := uuid.New()
-	_, err := db.New(f.pool).InsertSecurityEvents(f.ctx, []db.InsertSecurityEventsParams{{ID: id, AccountRef: account,
-		IdentityBlindIndex: index, EventType: audit.EventLoginSucceeded, Timestamp: timestamptz(f.svc.now().Add(-time.Minute)),
-		// A syntactically valid fixture digest, not a signed integrity proof.
-		RetainUntil: timestamptz(retain), ChainHash: "0000000000000000000000000000000000000000000000000000000000000000"}})
+	timestamp := audit.NormalizeChainTime(f.svc.now().Add(-time.Minute))
+	retainUntil := audit.NormalizeChainTime(retain)
+	// A real leaf digest. These fixtures feed attribution lookups rather than
+	// integrity checks, but writing a correct digest keeps them usable by a
+	// verification test later and keeps the chain table self-consistent.
+	leaf, err := audit.LeafLedger(audit.LedgerRecord{
+		ID: id.String(), AccountRef: account.String(), IdentityBlindIndex: index,
+		BlindIndexVersion: 0, EventType: audit.EventLoginSucceeded,
+		Timestamp: timestamp, RetainUntil: retainUntil,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var seq int64
-	if err := f.pool.QueryRow(f.ctx, "SELECT seq FROM security_event_ledger WHERE id=$1", id).Scan(&seq); err != nil {
+	seq, err := db.New(f.pool).InsertSecurityEventWithChain(f.ctx, db.InsertSecurityEventWithChainParams{
+		EventID: id, LeafHash: leaf.Bytes(),
+		ChainHash:  audit.ChainLedger(audit.LedgerGenesis(), leaf).Bytes(),
+		AccountRef: account, IdentityBlindIndex: index, BlindIndexVersion: 0,
+		EventType: audit.EventLoginSucceeded,
+		Timestamp: timestamptz(timestamp), RetainUntil: timestamptz(retainUntil)})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return db.SecurityEventLedger{ID: id, Seq: seq, AccountRef: account}
+	return db.LookupLegalAttributionRow{EventID: id, Seq: seq, AccountRef: account}
 }
 
 func TestLegalPostDeletionRetentionCursorIntegration(t *testing.T) {
@@ -407,11 +418,11 @@ func TestLegalPostDeletionRetentionCursorIntegration(t *testing.T) {
 	allReq := req
 	allReq.Limit = 200
 	all, err := f.svc.Lookup(ctx, allReq)
-	if err != nil || len(all.Events) != 3 || all.Events[0].ID != boundary.ID || all.Events[1].ID != held.ID || all.Events[2].ID != reused.ID {
+	if err != nil || len(all.Events) != 3 || all.Events[0].EventID != boundary.EventID || all.Events[1].EventID != held.EventID || all.Events[2].EventID != reused.EventID {
 		t.Fatalf("expired-held/expired-unheld eligibility: %+v %v", all, err)
 	}
 	first, err := f.svc.Lookup(ctx, req)
-	if err != nil || len(first.Events) != 1 || first.Events[0].ID != boundary.ID || first.NextCursor == "" {
+	if err != nil || len(first.Events) != 1 || first.Events[0].EventID != boundary.EventID || first.NextCursor == "" {
 		t.Fatalf("exact retention boundary/post-deletion lookup: %+v %v", first, err)
 	}
 	if err := op.Commit(ctx); err != nil {
@@ -428,7 +439,7 @@ func TestLegalPostDeletionRetentionCursorIntegration(t *testing.T) {
 	ctx, op = f.operation(t, 0)
 	req.Cursor = first.NextCursor
 	second, err := f.svc.Lookup(ctx, req)
-	if err != nil || len(second.Events) != 1 || second.Events[0].ID != reused.ID || second.NextCursor != "" ||
+	if err != nil || len(second.Events) != 1 || second.Events[0].EventID != reused.EventID || second.NextCursor != "" ||
 		second.Coverage.ThroughSeq != first.Coverage.ThroughSeq || !second.Coverage.ObservedAt.Equal(first.Coverage.ObservedAt) {
 		t.Fatalf("continuation disclosed released/new/unindexed evidence: %+v %v", second, err)
 	}

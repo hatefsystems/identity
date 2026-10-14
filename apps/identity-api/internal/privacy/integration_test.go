@@ -34,6 +34,7 @@
 package privacy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -235,23 +236,40 @@ func addChildRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID 
 	}
 }
 
-// insertAuditRow writes one mvp_audit_logs row attributed to userID. The table is
-// append-only, so it is never cleaned up; the assertions locate it by id.
-func insertAuditRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) uuid.UUID {
+// insertAuditRow writes one audit chain node and its payload, attributed to
+// userID. It returns the payload's seq, which is how the purge assertions locate
+// it: the payload row no longer carries a uuid of its own.
+//
+// The row matters to this suite because a GDPR hard delete must null its user_id
+// via ON DELETE SET NULL while leaving the rest of the row — and therefore its
+// leaf digest — untouched. That is why user_id is excluded from the hash.
+func insertAuditRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) int64 {
 	t.Helper()
 
-	var id uuid.UUID
-	err := pool.QueryRow(ctx, `
-		INSERT INTO mvp_audit_logs (
-			user_id, actor_id, actor_spiffe_id, event_type, action_status,
-			client_ip, user_agent, payload, chain_hash
-		) VALUES ($1, $1, 'test://privacy', 'privacy.test', 'success', '127.0.0.1', 'test', '{}', $2)
-		RETURNING id`,
-		userID, HashReclaimToken("chain-"+userID.String())).Scan(&id)
+	eventID := uuid.New()
+	timestamp := audit.NormalizeChainTime(time.Now())
+	rec := audit.AuditRecord{
+		ID: eventID.String(), ActorID: userID.String(), ActorSPIFFEID: "test://privacy",
+		EventType: "privacy.test", ActionStatus: "success", ClientIP: "127.0.0.1",
+		UserAgent: "test", Payload: "{}", Timestamp: timestamp,
+	}
+	leaf, err := audit.LeafAudit(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := db.New(pool).InsertAuditLogWithChain(ctx, db.InsertAuditLogWithChainParams{
+		EventID: eventID, LeafHash: leaf.Bytes(),
+		ChainHash: audit.ChainAudit(audit.AuditGenesis(), leaf).Bytes(),
+		UserID:    uuid.NullUUID{UUID: userID, Valid: true},
+		ActorID:   userID, ActorSpiffeID: rec.ActorSPIFFEID,
+		EventType: rec.EventType, ActionStatus: rec.ActionStatus,
+		ClientIp: rec.ClientIP, UserAgent: rec.UserAgent, Payload: rec.Payload,
+		Timestamp: pgtype.Timestamptz{Time: timestamp, Valid: true},
+	})
 	if err != nil {
 		t.Fatalf("insert audit row: %v", err)
 	}
-	return id
+	return seq
 }
 
 // insertLedgerRow writes one security_event_ledger row for the subject. It has no FK
@@ -259,13 +277,28 @@ func insertAuditRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userI
 func insertLedgerRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, accountRef uuid.UUID) {
 	t.Helper()
 
-	if _, err := db.New(pool).InsertSecurityEvent(ctx, db.InsertSecurityEventParams{
+	eventID := uuid.New()
+	retainUntil := audit.NormalizeChainTime(time.Now().Add(24 * time.Hour))
+	timestamp := audit.NormalizeChainTime(time.Now())
+	// A real leaf and chain digest, so this fixture row is actually verifiable
+	// rather than carrying filler bytes that would fail any integrity check.
+	leaf, err := audit.LeafLedger(audit.LedgerRecord{
+		ID: eventID.String(), AccountRef: accountRef.String(), BlindIndexVersion: 0,
+		EventType: "privacy.test", Timestamp: timestamp, RetainUntil: retainUntil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.New(pool).InsertSecurityEventWithChain(ctx, db.InsertSecurityEventWithChainParams{
+		EventID:     eventID,
+		LeafHash:    leaf.Bytes(),
+		ChainHash:   audit.ChainLedger(audit.LedgerGenesis(), leaf).Bytes(),
 		AccountRef:  accountRef,
 		EventType:   "privacy.test",
-		RetainUntil: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-		ChainHash:   HashReclaimToken("ledger-" + accountRef.String()),
+		Timestamp:   pgtype.Timestamptz{Time: timestamp, Valid: true},
+		RetainUntil: pgtype.Timestamptz{Time: retainUntil, Valid: true},
 	}); err != nil {
-		t.Fatalf("InsertSecurityEvent: %v", err)
+		t.Fatalf("InsertSecurityEventWithChain: %v", err)
 	}
 }
 
@@ -312,7 +345,7 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 
 	user := createTestUser(ctx, t, pool, "purge-e2e@privacy.test")
 	addChildRows(ctx, t, pool, user.ID)
-	auditID := insertAuditRow(ctx, t, pool, user.ID)
+	auditSeq := insertAuditRow(ctx, t, pool, user.ID)
 	insertLedgerRow(ctx, t, pool, user.ID)
 
 	ledgerBefore := countRows(ctx, t, pool, "SELECT COUNT(*) FROM security_event_ledger")
@@ -384,21 +417,41 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 		}
 	}
 
-	// The audit row survives with user_id nulled, which is what makes the ledger
-	// still verifiable after an erasure — and the reason Task 5.2's canonical
-	// serialization must exclude user_id.
+	// The audit row survives with user_id nulled, and — crucially — its leaf
+	// digest still verifies against the surviving payload. This is the reason the
+	// canonical serialization excludes user_id: the purge rewrites that column via
+	// ON DELETE SET NULL, so hashing it would turn every correct erasure into a
+	// permanent integrity alarm for that subject.
 	var auditUserID *uuid.UUID
-	var auditChainHash string
-	if err := pool.QueryRow(ctx,
-		"SELECT user_id, chain_hash FROM mvp_audit_logs WHERE id = $1", auditID).
-		Scan(&auditUserID, &auditChainHash); err != nil {
+	var actorID uuid.UUID
+	var spiffeID, eventType, actionStatus, clientIP, userAgent, payload string
+	var timestamp time.Time
+	var eventID uuid.UUID
+	var leafHash, chainHash []byte
+	if err := pool.QueryRow(ctx, `SELECT l.user_id, l.actor_id, l.actor_spiffe_id, l.event_type,
+ l.action_status, l.client_ip, l.user_agent, l.payload, l.timestamp,
+ c.event_id, c.leaf_hash, c.chain_hash
+FROM mvp_audit_logs l JOIN audit_log_chain c ON c.seq = l.seq WHERE l.seq = $1`, auditSeq).
+		Scan(&auditUserID, &actorID, &spiffeID, &eventType, &actionStatus, &clientIP,
+			&userAgent, &payload, &timestamp, &eventID, &leafHash, &chainHash); err != nil {
 		t.Fatalf("the audit row did not survive the purge: %v", err)
 	}
 	if auditUserID != nil {
 		t.Errorf("mvp_audit_logs.user_id = %v after purge, want NULL", *auditUserID)
 	}
-	if auditChainHash == "" {
-		t.Error("the audit row's chain_hash was cleared by the purge")
+	recomputed, err := audit.LeafAudit(audit.AuditRecord{
+		ID: eventID.String(), ActorID: actorID.String(), ActorSPIFFEID: spiffeID,
+		EventType: eventType, ActionStatus: actionStatus, ClientIP: clientIP,
+		UserAgent: userAgent, Payload: payload, Timestamp: timestamp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recomputed.Bytes(), leafHash) {
+		t.Error("nulling user_id changed the audit row's leaf digest; a correct GDPR erasure now reports as tampering")
+	}
+	if len(chainHash) != audit.DigestSize {
+		t.Error("the audit chain node's digest was damaged by the purge")
 	}
 
 	// The ledger must be byte-for-byte unchanged. This is enforced by the schema

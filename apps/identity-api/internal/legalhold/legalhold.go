@@ -27,7 +27,7 @@ type Store interface {
 	ReleaseLegalHold(context.Context, db.ReleaseLegalHoldParams) (db.LegalHold, error)
 	ListLegalHolds(context.Context, db.ListLegalHoldsParams) (db.ListLegalHoldsRow, error)
 	ObserveLegalSubject(context.Context, uuid.UUID) (db.ObserveLegalSubjectRow, error)
-	LookupLegalAttribution(context.Context, db.LookupLegalAttributionParams) ([]db.SecurityEventLedger, error)
+	LookupLegalAttribution(context.Context, db.LookupLegalAttributionParams) ([]db.LookupLegalAttributionRow, error)
 	LegalAttributionHighWater(context.Context) (int64, error)
 	CountUnencryptedLegalHolds(context.Context) (int64, error)
 }

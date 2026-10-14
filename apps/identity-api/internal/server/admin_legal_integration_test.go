@@ -24,7 +24,7 @@ import (
 func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	ctx := context.Background()
-	indexer, err := blindindex.New(bytes.Repeat([]byte{0x62}, 32))
+	indexer, err := blindindex.New(bytes.Repeat([]byte{0x62}, 32), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,9 +36,24 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	f.srv = New(f.srv.cfg, nil, f.srv.deps)
 	index := indexer.Compute(f.target.Email)
 	ip, agent := "203.0.113.42", "private-client-agent"
-	row, err := db.New(f.pool).InsertSecurityEvent(ctx, db.InsertSecurityEventParams{AccountRef: f.target.ID,
-		IdentityBlindIndex: &index, EventType: audit.EventLoginSucceeded, ClientIp: &ip, UserAgent: &agent,
-		RetainUntil: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}, ChainHash: strings.Repeat("a", 64)})
+	eventID := uuid.New()
+	timestamp := audit.NormalizeChainTime(time.Now())
+	retainUntil := audit.NormalizeChainTime(time.Now().Add(time.Hour))
+	leaf, err := audit.LeafLedger(audit.LedgerRecord{
+		ID: eventID.String(), AccountRef: f.target.ID.String(), IdentityBlindIndex: &index,
+		BlindIndexVersion: indexer.Version(), EventType: audit.EventLoginSucceeded,
+		ClientIP: &ip, UserAgent: &agent, Timestamp: timestamp, RetainUntil: retainUntil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.New(f.pool).InsertSecurityEventWithChain(ctx, db.InsertSecurityEventWithChainParams{
+		EventID: eventID, LeafHash: leaf.Bytes(),
+		ChainHash:  audit.ChainLedger(audit.LedgerGenesis(), leaf).Bytes(),
+		AccountRef: f.target.ID, IdentityBlindIndex: &index, BlindIndexVersion: indexer.Version(),
+		EventType: audit.EventLoginSucceeded, ClientIp: &ip, UserAgent: &agent,
+		Timestamp:   pgtype.Timestamptz{Time: timestamp, Valid: true},
+		RetainUntil: pgtype.Timestamptz{Time: retainUntil, Valid: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +81,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 || response.Items[0].ID != row.ID || response.Items[0].AccountRef != f.target.ID || response.Coverage.Note == "" {
+	if len(response.Items) != 1 || response.Items[0].ID != eventID || response.Items[0].AccountRef != f.target.ID || response.Coverage.Note == "" {
 		t.Fatalf("wrong disclosure or absent coverage: %s", w.Body.String())
 	}
 	for _, forbidden := range []string{f.target.Email, index, ip, agent, "identity_blind_index", "client_ip", "user_agent", "private-case-123"} {
@@ -120,7 +135,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	}
 	f.srv.deps.AdminActions = failedActions
 	w = send()
-	if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), row.ID.String()) || strings.Contains(w.Body.String(), ip) {
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), eventID.String()) || strings.Contains(w.Body.String(), ip) {
 		t.Fatalf("unaudited legal disclosure: %d %s", w.Code, w.Body.String())
 	}
 }

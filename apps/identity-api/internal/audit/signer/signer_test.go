@@ -39,12 +39,12 @@ func (l *fakeAdvisoryLocker) TryLock(_ context.Context) (bool, func(), error) {
 
 type fakeStore struct {
 	mu                     sync.Mutex
-	latestAuditHash        string
-	latestAuditErr         error
-	head                   db.GetSignerLedgerHeadRow
+	auditHead              db.GetAuditLogHeadRow
+	auditHeadErr           error
+	head                   db.GetSecurityLedgerHeadRow
 	headErr                error
 	advanceErr             error
-	advancedHeads          []db.AdvanceSecurityLedgerHeadParams
+	advancedHeads          []db.AdvanceChainHeadParams
 	onHeadRead             func()
 	onSubjectLock          func()
 	existingAuditIDs       []uuid.UUID
@@ -52,24 +52,36 @@ type fakeStore struct {
 	userEmails             map[uuid.UUID]string
 	userEmailErrs          map[uuid.UUID]error
 	subjectLockErr         error
+	allocErr               error
+	nextAuditSeq           int64
+	nextLedgerSeq          int64
+	insertedAuditChain     []db.InsertAuditLogChainParams
 	insertedAuditLogs      []db.InsertAuditLogsParams
+	insertedLedgerChain    []db.InsertSecurityLedgerChainParams
 	insertedSecurityEvents []db.InsertSecurityEventsParams
 }
 
-func (s *fakeStore) GetLatestAuditLogChainHash(_ context.Context) (string, error) {
+func genesisAuditHead() db.GetAuditLogHeadRow {
+	return db.GetAuditLogHeadRow{Seq: 0, ChainHash: audit.AuditGenesis().Bytes(), StateValid: true}
+}
+
+func genesisLedgerHead() db.GetSecurityLedgerHeadRow {
+	return db.GetSecurityLedgerHeadRow{Seq: 0, ChainHash: audit.LedgerGenesis().Bytes(), StateValid: true}
+}
+
+func (s *fakeStore) GetAuditLogHead(_ context.Context) (db.GetAuditLogHeadRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.latestAuditErr != nil {
-		return "", s.latestAuditErr
+	if s.auditHeadErr != nil {
+		return db.GetAuditLogHeadRow{}, s.auditHeadErr
 	}
-	return s.latestAuditHash, nil
+	if len(s.auditHead.ChainHash) == 0 {
+		return genesisAuditHead(), nil
+	}
+	return s.auditHead, nil
 }
 
-func genesisLedgerHead() db.GetSignerLedgerHeadRow {
-	return db.GetSignerLedgerHeadRow{Seq: 0, ChainHash: strings.Repeat("0", 64), StateValid: true}
-}
-
-func (s *fakeStore) GetSignerLedgerHead(_ context.Context) (db.GetSignerLedgerHeadRow, error) {
+func (s *fakeStore) GetSecurityLedgerHead(_ context.Context) (db.GetSecurityLedgerHeadRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.onHeadRead != nil {
@@ -78,11 +90,39 @@ func (s *fakeStore) GetSignerLedgerHead(_ context.Context) (db.GetSignerLedgerHe
 	return s.head, s.headErr
 }
 
-func (s *fakeStore) AdvanceSecurityLedgerHead(_ context.Context, arg db.AdvanceSecurityLedgerHeadParams) error {
+func (s *fakeStore) AdvanceChainHead(_ context.Context, arg db.AdvanceChainHeadParams) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.advancedHeads = append(s.advancedHeads, arg)
 	return s.advanceErr
+}
+
+func (s *fakeStore) AllocateAuditLogSeqs(_ context.Context, count int32) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.allocErr != nil {
+		return nil, s.allocErr
+	}
+	out := make([]int64, 0, count)
+	for i := int32(0); i < count; i++ {
+		s.nextAuditSeq++
+		out = append(out, s.nextAuditSeq)
+	}
+	return out, nil
+}
+
+func (s *fakeStore) AllocateSecurityLedgerSeqs(_ context.Context, count int32) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.allocErr != nil {
+		return nil, s.allocErr
+	}
+	out := make([]int64, 0, count)
+	for i := int32(0); i < count; i++ {
+		s.nextLedgerSeq++
+		out = append(out, s.nextLedgerSeq)
+	}
+	return out, nil
 }
 
 func (s *fakeStore) FilterExistingAuditLogIDs(_ context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
@@ -145,10 +185,24 @@ func (s *fakeStore) LockAuditSubjects(_ context.Context, ids []uuid.UUID) ([]uui
 	return live, nil
 }
 
+func (s *fakeStore) InsertAuditLogChain(_ context.Context, arg []db.InsertAuditLogChainParams) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.insertedAuditChain = append(s.insertedAuditChain, arg...)
+	return int64(len(arg)), nil
+}
+
 func (s *fakeStore) InsertAuditLogs(_ context.Context, arg []db.InsertAuditLogsParams) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.insertedAuditLogs = append(s.insertedAuditLogs, arg...)
+	return int64(len(arg)), nil
+}
+
+func (s *fakeStore) InsertSecurityLedgerChain(_ context.Context, arg []db.InsertSecurityLedgerChainParams) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.insertedLedgerChain = append(s.insertedLedgerChain, arg...)
 	return int64(len(arg)), nil
 }
 
@@ -283,13 +337,16 @@ func (f *fakeFetcher) Fetch(_ int, _ ...jetstream.FetchOpt) (jetstream.MessageBa
 }
 
 type fakeBlindIndexer struct {
-	pepper string
+	pepper  string
+	version int16
 }
 
 func (b *fakeBlindIndexer) Compute(pii string) string {
 	sum := sha256.Sum256([]byte(pii + b.pepper))
 	return hex.EncodeToString(sum[:])
 }
+
+func (b *fakeBlindIndexer) Version() int16 { return b.version }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -392,8 +449,7 @@ func TestSignerFailsClosedOnLockContention(t *testing.T) {
 func TestSignerGenesisChainTips(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditErr: pgx.ErrNoRows,
-		head:           genesisLedgerHead(),
+		head: genesisLedgerHead(),
 	}
 	opener := &fakeBatchTxOpener{tx: &fakeBatchTx{store: store}}
 	fetcher := &fakeFetcher{}
@@ -411,11 +467,13 @@ func TestSignerGenesisChainTips(t *testing.T) {
 		t.Fatalf("seedChainTips: %v", err)
 	}
 
-	if s.auditTip != audit.GenesisChainHash {
-		t.Errorf("auditTip = %x, want genesis %x", s.auditTip, audit.GenesisChainHash)
+	// Each chain has its own genesis seed, so an audit genesis can never seed the
+	// ledger chain or vice versa.
+	if s.auditTip != audit.AuditGenesis() {
+		t.Errorf("auditTip = %s, want audit genesis %s", s.auditTip.Hex(), audit.AuditGenesis().Hex())
 	}
-	if s.ledgerTip != audit.GenesisChainHash {
-		t.Errorf("ledgerTip = %x, want genesis %x", s.ledgerTip, audit.GenesisChainHash)
+	if s.ledgerTip != audit.LedgerGenesis() {
+		t.Errorf("ledgerTip = %x, want genesis %x", s.ledgerTip, audit.LedgerGenesis())
 	}
 }
 
@@ -432,9 +490,8 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 	userEmail := "alice@example.test"
 
 	store := &fakeStore{
-		latestAuditErr: pgx.ErrNoRows,
-		head:           genesisLedgerHead(),
-		userEmails:     map[uuid.UUID]string{accountRef: userEmail},
+		head:       genesisLedgerHead(),
+		userEmails: map[uuid.UUID]string{accountRef: userEmail},
 	}
 	batchTx := &fakeBatchTx{store: store}
 	opener := &fakeBatchTxOpener{tx: batchTx}
@@ -561,11 +618,16 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 		t.Errorf("row 2 EventType = %q, want %q", store.insertedAuditLogs[2].EventType, audit.EventLoginSucceeded)
 	}
 
-	// Verify cryptographic chaining for audit logs:
-	tip := audit.GenesisChainHash
+	// Verify the audit chain: each node's leaf must reproduce its payload, and
+	// each chain digest must link to its predecessor.
+	tip := audit.AuditGenesis()
 	for i, row := range store.insertedAuditLogs {
+		node := store.insertedAuditChain[i]
+		if node.Seq != row.Seq {
+			t.Errorf("row %d: chain node seq %d does not match payload seq %d", i, node.Seq, row.Seq)
+		}
 		rec := audit.AuditRecord{
-			ID:            row.ID.String(),
+			ID:            node.EventID.String(),
 			ActorID:       row.ActorID.String(),
 			ActorSPIFFEID: row.ActorSpiffeID,
 			EventType:     row.EventType,
@@ -575,11 +637,17 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 			Payload:       row.Payload,
 			Timestamp:     row.Timestamp.Time,
 		}
-		expectedHash := audit.ChainHash(tip, audit.SerializeAudit(rec))
-		if row.ChainHash != expectedHash {
-			t.Errorf("row %d chain hash = %q, want %q", i, row.ChainHash, expectedHash)
+		leafHash, err := audit.LeafAudit(rec)
+		if err != nil {
+			t.Fatalf("row %d: LeafAudit: %v", i, err)
 		}
-		tip, _ = audit.DecodeChainHash(row.ChainHash)
+		if stored, _ := audit.DecodeDigest(node.LeafHash); stored != leafHash {
+			t.Errorf("row %d leaf = %s, want %s", i, stored.Hex(), leafHash.Hex())
+		}
+		tip = audit.ChainAudit(tip, leafHash)
+		if stored, _ := audit.DecodeDigest(node.ChainHash); stored != tip {
+			t.Errorf("row %d chain digest = %s, want %s", i, stored.Hex(), tip.Hex())
+		}
 	}
 
 	// Verify ledger rows written:
@@ -608,10 +676,12 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 	}
 
 	// Verify cryptographic chaining for ledger:
+	lNode := store.insertedLedgerChain[0]
 	lRec := audit.LedgerRecord{
-		ID:                 lRow.ID.String(),
+		ID:                 lNode.EventID.String(),
 		AccountRef:         lRow.AccountRef.String(),
 		IdentityBlindIndex: lRow.IdentityBlindIndex,
+		BlindIndexVersion:  lRow.BlindIndexVersion,
 		EventType:          lRow.EventType,
 		ClientIP:           lRow.ClientIp,
 		IPSubnet:           lRow.IpSubnet,
@@ -622,9 +692,16 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 		Timestamp:          lRow.Timestamp.Time,
 		RetainUntil:        lRow.RetainUntil.Time,
 	}
-	expectedLedgerHash := audit.ChainHash(audit.GenesisChainHash, audit.SerializeLedger(lRec))
-	if lRow.ChainHash != expectedLedgerHash {
-		t.Errorf("ledger chain hash = %q, want %q", lRow.ChainHash, expectedLedgerHash)
+	lLeaf, err := audit.LeafLedger(lRec)
+	if err != nil {
+		t.Fatalf("LeafLedger: %v", err)
+	}
+	if stored, _ := audit.DecodeDigest(lNode.LeafHash); stored != lLeaf {
+		t.Errorf("ledger leaf = %s, want %s", stored.Hex(), lLeaf.Hex())
+	}
+	expectedLedgerHash := audit.ChainLedger(audit.LedgerGenesis(), lLeaf)
+	if stored, _ := audit.DecodeDigest(lNode.ChainHash); stored != expectedLedgerHash {
+		t.Errorf("ledger chain digest = %s, want %s", stored.Hex(), expectedLedgerHash.Hex())
 	}
 }
 
@@ -635,7 +712,6 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 	newID := uuid.MustParse("33333333-0000-0000-0000-000000000002")
 
 	store := &fakeStore{
-		latestAuditErr:   pgx.ErrNoRows,
 		head:             genesisLedgerHead(),
 		existingAuditIDs: []uuid.UUID{dupID},
 	}
@@ -680,8 +756,10 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 	if len(store.insertedAuditLogs) != 1 {
 		t.Fatalf("insertedAuditLogs len = %d, want 1", len(store.insertedAuditLogs))
 	}
-	if store.insertedAuditLogs[0].ID != newID {
-		t.Errorf("inserted ID = %v, want %v", store.insertedAuditLogs[0].ID, newID)
+	// The event id now lives on the never-deleted chain node, which is what makes
+	// deduplication keep working after a payload has been erased.
+	if store.insertedAuditChain[0].EventID != newID {
+		t.Errorf("inserted chain node event id = %v, want %v", store.insertedAuditChain[0].EventID, newID)
 	}
 }
 
@@ -689,8 +767,7 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 func TestSignerCommitFailureRollsBackAndNaks(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditHash: strings.Repeat("a", 64),
-		head:            db.GetSignerLedgerHeadRow{Seq: 8, ChainHash: strings.Repeat("b", 64), StateValid: true},
+		head: db.GetSecurityLedgerHeadRow{Seq: 8, ChainHash: fakeDigest(0xbb), StateValid: true},
 	}
 	batchTx := &fakeBatchTx{
 		store:     store,
@@ -738,8 +815,7 @@ func TestSignerCommitFailureRollsBackAndNaks(t *testing.T) {
 func TestSignerGracefulShutdown(t *testing.T) {
 	cfg := Config{BatchSize: 10, FlushInterval: time.Second, LedgerRetention: 24 * time.Hour}
 	store := &fakeStore{
-		latestAuditErr: pgx.ErrNoRows,
-		head:           genesisLedgerHead(),
+		head: genesisLedgerHead(),
 	}
 	batchTx := &fakeBatchTx{store: store}
 	opener := &fakeBatchTxOpener{tx: batchTx}

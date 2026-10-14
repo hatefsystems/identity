@@ -26,22 +26,33 @@ Personal data that exists to serve the user and is erased when the user is delet
 
 **Lifecycle:** Removed during hard-delete (see Section 5). Erasure is the default.
 
-### 2.2 Class B - Minimal Security Metadata (Platform-Owned)
+### 2.2 Class B - Minimal Security Metadata (Platform-Owned), Pseudonymized Personal Data
 Non-content, minimized metadata retained to attribute abusive or security-relevant actions even after an account is deleted. This is the class that answers "who did this, and when" after the fact.
-- Stable, non-reversible account reference (`account_ref`).
-- Identity **blind index** only (e.g., `SHA-256(email + pepper)`), never raw PII.
+- Stable account reference (`account_ref`). Stable, but **not** anonymous: it is the join key that makes post-deletion attribution work.
+- Identity **blind index** only (keyed HMAC-SHA-256 over a normalized identifier), never raw PII, plus the `blind_index_version` pepper generation that produced it.
 - Event type, timestamp, source IP / subnet, user-agent / device fingerprint.
 - Token/authorization issuance metadata (client_id, scope, issued-at).
 - Security signals (RTR breach, suspicious login, risk-based lockout).
 
 **Lifecycle:** Independent retention (see Section 7). **Not** deleted when the account is hard-deleted. Contains no raw PII and no action content.
 
+**Classification:** This is **pseudonymized personal data**, not non-PII - see Section 7.0 for why the distinction is load-bearing and what it obliges. Retaining it past an erasure request relies on an Art. 17(3) exemption that must be documented and disclosed.
+
 ### 2.3 Class C - Immutable Audit Logs
 Tamper-evident administrative and system audit trail.
-- Append-only, cryptographically chained (`chain_hash`).
-- Administrative DB roles hold no `UPDATE`/`DELETE` rights.
+- Append-only, cryptographically chained. Under canonical format v2 the chain lives in `audit_log_chain` (leaf digest + chain digest, one row per event), separate from the `mvp_audit_logs` payload.
+- No DB role holds `UPDATE`/`DELETE` on the chain table, with no maintenance exemption. The payload table rejects `UPDATE` for everyone.
 
 **Lifecycle:** Retained per the audit-retention policy; integrity verified periodically. Never rewritten.
+
+**Note on Class C retention.** Class C payload rows also carry `client_ip` and
+`user_agent`, which are personal data, and there is currently no Class C purge
+worker - so that retention policy has no implementation, and the data is retained
+indefinitely. The v2 split makes a purge *possible* for the first time (erasing a
+payload no longer breaks the chain, and `DELETE` on `mvp_audit_logs` can be
+granted to a dedicated role), but the worker and its retention number remain
+outstanding. Until they exist, Class C indefinite retention is a known
+storage-limitation gap under Art. 5(1)(e), not a settled position.
 
 ---
 
@@ -103,11 +114,64 @@ A Legal Hold is a **precedence lock**, not a timer.
 The ledger is the mechanism that answers a lawful request that arrives **after** an account has been deleted (e.g., a court inquiry at day 60 about an action taken before a day-30 deletion).
 
 - **Decoupled lifecycle:** Ledger rows survive account hard-delete. Their lifetime is tied to the ledger's own retention (Section 3), not to the account.
-- **Minimal & non-PII:** Rows carry a stable `account_ref`, an identity **blind index** (not raw email/phone), network/device metadata, event type, and timestamp - never action content and never raw PII.
+- **Minimal, and pseudonymized rather than anonymous:** Rows carry a stable `account_ref`, an identity **blind index** (keyed HMAC, never raw email/phone), its pepper generation, network/device metadata, event type, and timestamp - never action content and never raw PII.
 - **Attribution on request:** When an authority provides a person's identifier, we compute the blind index and match it against the ledger. This attributes an action to an identity without us having retained raw PII.
-- **Legal basis:** Legitimate interest (abuse prevention, security) and/or legal obligation - not user consent.
+- **Legal basis:** Art. 17(3)(e) (establishment, exercise or defence of legal claims) and/or Art. 17(3)(b) (legal obligation), supported by legitimate interest in abuse prevention and security - never user consent.
 
 This is the load-bearing difference from a design that only masks and nulls audit rows on deletion: the ledger is intentionally kept attributable (via blind index and stable ref) within a bounded, documented window.
+
+### 7.0 Class B is pseudonymized personal data, not non-PII
+
+This must be stated plainly, because an earlier framing of this table as
+"non-PII" was wrong and would not survive a DPA review:
+
+- A **keyed hash of an identifier is pseudonymization, not anonymization**
+  (Recital 26). It remains personal data for as long as the controller can
+  re-derive it - which is precisely the design goal, since re-deriving it is how
+  a lawful post-deletion inquiry is answered.
+- **IP addresses are personal data**, including dynamic ones (CJEU *Breyer*,
+  C-582/14). `client_ip` and `ip_subnet` are therefore personal data, not
+  metadata.
+- **`device_fingerprint` and `user_agent` are online identifiers** under
+  Art. 4(1).
+
+The consequence is a constraint, not a caveat: **if post-deletion attribution
+works, the data is still personal data.** A design cannot claim both. Class B
+retention after an erasure request is therefore an Art. 17(3) exemption that
+must be justified, documented in the DPIA, and disclosed - not an absence of
+personal data that needs no justification.
+
+Required disclosures, which are controller obligations rather than engineering
+ones:
+
+- The privacy notice must state that an erasure request does not remove Class B,
+  and must state the retention period.
+- The ROPA entry must record the Art. 17(3) basis and the balancing test.
+- A DSAR response must account for Class B rather than reporting the subject as
+  fully erased.
+
+**Open governance items.** Two decisions remain outstanding and are deliberately
+not settled in code:
+
+1. **Retention length.** `SECURITY_LEDGER_RETENTION` is 8760h (365 days), the top
+   of the stated 6-18 month range. If the purpose is RTR-breach and
+   credential-stuffing correlation, evidentiary value decays in weeks; 90-180
+   days is materially easier to defend. 365 days needs a written justification
+   tied to a concrete limitation period.
+2. **`client_ip` alongside `ip_subnet`.** The subnet is derivable from the
+   address, so storing both is redundant and weakens the minimization claim this
+   very section makes. Keeping only the subnet - or dropping the full address
+   after a short window - would be more minimal and still serve abuse
+   correlation.
+
+**Pepper compromise.** The blind index resists offline brute force while the
+pepper is secret, but email addresses and E.164 numbers are an enumerable input
+space: a leaked pepper re-identifies every indexed row. `blind_index_version`
+(migration 00015) exists so a compromised pepper can be retired - historical
+rows keep their recorded generation, so a lookup can compute one candidate digest
+per retained generation instead of losing the lookup path entirely. Multi-pepper
+lookup is the required follow-up; the column is the part that could not be added
+later, because the index sits inside a signed, UPDATE-forbidden row.
 
 ### 7.1 Authorized Retention and Proof Minimization
 
@@ -118,11 +182,26 @@ hard-delete does not remove that protection. Advisory dates are not releases;
 applying a hold after erasure cannot restore evidence. The Class A deletion
 worker and Class C audit history remain untouched.
 
-Minimal proof metadata can outlive erased events: sequence boundaries, counts
-and digests in compact checkpoints plus a durable logical head. These records
-must contain no erased account reference, source event ID, blind index,
-network/device metadata or body. Adjacent erased spans compact without crossing
-retained records. The purpose is validating surviving segments and future
+Minimal proof metadata outlives erased events, and under canonical format v2
+(migration 00015) it is simply the chain itself. Tamper-evidence lives in
+`security_ledger_chain`, one row per event holding a leaf digest and a chain
+digest, and that table is never deleted. Erasure removes the payload row and
+nothing else, so the chain stays complete and verifiable from genesis across an
+erased span.
+
+An erased span is additionally recorded in `security_ledger_erasures`
+(first_seq, last_seq, operation_id), paired with a chained receipt carrying the
+same operation id. That pairing is what makes a lawful erasure *provable*: a
+verifier that finds a missing payload with no erasure record reports tampering
+rather than absorbing it as retention. Neither the chain rows nor the erasure
+records contain an account reference, blind index, network/device metadata, or
+body.
+
+v1 instead stored each event's digest on its own row, so erasing a row removed a
+chain link and had to be bridged by checkpoints recording the removed span's
+predecessor and terminal digests, compacted whenever adjacent spans met. All of
+that machinery is gone, along with the duplicate PL/pgSQL copy of the canonical
+serializer it required. The purpose is validating surviving segments and future
 appends, not preserving erased evidence under a different name.
 
 Sanitized `legal.ledger.purged` / `legal.ledger.purge_skipped` Class C receipts

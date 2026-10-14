@@ -335,9 +335,16 @@ publisher subject-scoped outbox permissions remain required.
 \set metadata_role 'DEPLOYED_METADATA_MAINTENANCE_ROLE'
 SELECT current_database() AS ledger_database \gset
 
+-- Canonical format v2 (migration 00015).
+--
+-- There is no maintenance-owner role here and no SECURITY DEFINER purge routine
+-- to own. Erasure is an ordinary DELETE on the payload table, so the authority
+-- question is a plain privilege question, and the purge login is given exactly
+-- three write rights: DELETE on the payload, INSERT on the erasure index, and
+-- INSERT on the outbox for its receipt. It holds nothing at all on the chain
+-- tables, which is what keeps a retention purge from being able to remove
+-- tamper-evidence.
 BEGIN;
-CREATE ROLE identity_ledger_maintenance_owner NOLOGIN NOINHERIT NOSUPERUSER
-    NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 CREATE ROLE identity_ledger_purge LOGIN NOINHERIT NOSUPERUSER
     NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
@@ -346,56 +353,80 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC,
 REVOKE CREATE ON DATABASE :"ledger_database" FROM PUBLIC,
     :"signer_role", :"api_role", :"metadata_role";
 GRANT CONNECT ON DATABASE :"ledger_database" TO identity_ledger_purge;
-GRANT USAGE ON SCHEMA public TO identity_ledger_maintenance_owner,
-    identity_ledger_purge, :"signer_role", :"api_role";
+GRANT USAGE ON SCHEMA public TO identity_ledger_purge, :"signer_role", :"api_role";
 
-GRANT SELECT, DELETE ON public.security_event_ledger TO identity_ledger_maintenance_owner;
--- FOR UPDATE needs a column UPDATE grant; the unconditional trigger still rejects UPDATE.
-GRANT UPDATE(seq) ON public.security_event_ledger TO identity_ledger_maintenance_owner;
-GRANT SELECT, UPDATE ON public.security_ledger_head TO identity_ledger_maintenance_owner;
-GRANT SELECT, INSERT, DELETE ON public.security_ledger_checkpoints TO identity_ledger_maintenance_owner;
-GRANT SELECT ON public.legal_holds, public.security_ledger_retention_settings TO identity_ledger_maintenance_owner;
-GRANT INSERT ON public.event_outbox TO identity_ledger_maintenance_owner;
-GRANT EXECUTE ON FUNCTION public.security_ledger_require_owner(),
-    public.security_ledger_chain_time(timestamptz),
-    public.security_ledger_canonical_body(public.security_event_ledger),
-    public.security_ledger_account_lock_key(uuid),
-    public.security_ledger_predecessor(bigint) TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.advance_security_ledger_head(bigint, uuid)
-    OWNER TO identity_ledger_maintenance_owner;
-ALTER FUNCTION public.purge_security_ledger_batch(timestamptz, bigint, bigint[], text[], bytea[], uuid, text)
-    OWNER TO identity_ledger_maintenance_owner;
-
-REVOKE ALL ON FUNCTION public.purge_security_ledger_batch(timestamptz, bigint, bigint[], text[], bytea[], uuid, text)
-    FROM PUBLIC, :"signer_role", :"api_role", :"metadata_role";
-REVOKE ALL ON FUNCTION public.advance_security_ledger_head(bigint, uuid)
-    FROM PUBLIC, identity_ledger_purge, :"api_role", :"metadata_role";
+-- Nothing but the signer may append, and nothing may ever mutate the chain.
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
-    ON public.security_ledger_head, public.security_ledger_checkpoints,
-    public.security_ledger_retention_settings
-    FROM identity_ledger_purge, :"signer_role", :"api_role", :"metadata_role";
-REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON public.security_event_ledger
-    FROM identity_ledger_purge, :"signer_role", :"api_role", :"metadata_role";
-REVOKE INSERT ON public.security_event_ledger
+    ON public.security_ledger_chain, public.audit_log_chain,
+       public.security_ledger_head, public.audit_log_head,
+       public.security_ledger_erasures, public.security_ledger_retention_settings
+    FROM PUBLIC, identity_ledger_purge, :"signer_role", :"api_role", :"metadata_role";
+REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON public.security_event_ledger, public.mvp_audit_logs
+    FROM PUBLIC, identity_ledger_purge, :"signer_role", :"api_role", :"metadata_role";
+REVOKE INSERT ON public.security_event_ledger, public.mvp_audit_logs
     FROM identity_ledger_purge, :"api_role", :"metadata_role";
-GRANT SELECT ON public.security_event_ledger, public.security_ledger_head,
-    public.security_ledger_checkpoints, public.legal_holds,
-    public.security_ledger_retention_settings TO identity_ledger_purge;
-GRANT EXECUTE ON FUNCTION public.purge_security_ledger_batch(timestamptz, bigint, bigint[], text[], bytea[], uuid, text)
+REVOKE ALL ON FUNCTION public.advance_chain_head(text, bigint, bigint, bigint, bigint)
+    FROM PUBLIC, identity_ledger_purge, :"api_role", :"metadata_role";
+
+-- Purge worker: read what it must decide on, erase payloads, record the erasure.
+GRANT SELECT ON public.security_event_ledger, public.security_ledger_chain,
+    public.security_ledger_head, public.security_ledger_erasures,
+    public.legal_holds, public.security_ledger_retention_settings
     TO identity_ledger_purge;
-GRANT SELECT, INSERT ON public.security_event_ledger TO :"signer_role";
-GRANT USAGE ON SEQUENCE public.security_event_ledger_seq_seq TO :"signer_role";
-GRANT SELECT ON public.security_ledger_head, public.security_ledger_checkpoints TO :"signer_role";
-GRANT EXECUTE ON FUNCTION public.advance_security_ledger_head(bigint, uuid) TO :"signer_role";
-GRANT SELECT ON public.security_event_ledger, public.security_ledger_head,
-    public.security_ledger_checkpoints TO :"api_role";
+GRANT DELETE ON public.security_event_ledger TO identity_ledger_purge;
+GRANT INSERT ON public.security_ledger_erasures TO identity_ledger_purge;
+GRANT INSERT ON public.event_outbox TO identity_ledger_purge;
+
+-- Signer: append to both chains and both payloads, and advance a head only
+-- through the verifying routine. It deliberately holds no direct UPDATE on the
+-- head tables, so it cannot set a head to an arbitrary value.
+GRANT SELECT, INSERT ON public.security_event_ledger, public.security_ledger_chain,
+    public.mvp_audit_logs, public.audit_log_chain TO :"signer_role";
+GRANT USAGE ON SEQUENCE public.security_ledger_chain_seq, public.audit_log_chain_seq
+    TO :"signer_role";
+GRANT SELECT ON public.security_ledger_head, public.audit_log_head TO :"signer_role";
+GRANT EXECUTE ON FUNCTION public.advance_chain_head(text, bigint, bigint, bigint, bigint)
+    TO :"signer_role";
+
+-- API: read-only, for the gated verification and disclosure routes.
+GRANT SELECT ON public.security_event_ledger, public.security_ledger_chain,
+    public.mvp_audit_logs, public.audit_log_chain,
+    public.security_ledger_head, public.audit_log_head,
+    public.security_ledger_erasures TO :"api_role";
+
 ALTER ROLE identity_ledger_purge IN DATABASE :"ledger_database" SET statement_timeout = '15s';
 ALTER ROLE identity_ledger_purge IN DATABASE :"ledger_database" SET lock_timeout = '2s';
 COMMIT;
 ```
 
-Do not give the worker a table-write, sequence, helper-EXECUTE or owner-membership
-grant. The checkpoint owner does not need UPDATE. Deployment roles must have no
+**Recommended additional hardening.** `advance_chain_head` is SECURITY DEFINER
+and is owned by whichever role ran the migration — normally the schema owner,
+which already owns the tables and triggers, so this grants it nothing new. A
+tighter deployment re-owns it to a dedicated NOLOGIN role so that replacing the
+function would require compromising a principal that can do nothing else:
+
+```sql
+CREATE ROLE identity_chain_head_owner NOLOGIN NOINHERIT NOSUPERUSER
+    NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT USAGE ON SCHEMA public TO identity_chain_head_owner;
+GRANT SELECT ON public.security_ledger_chain, public.audit_log_chain
+    TO identity_chain_head_owner;
+GRANT SELECT, UPDATE ON public.security_ledger_head, public.audit_log_head
+    TO identity_chain_head_owner;
+ALTER FUNCTION public.advance_chain_head(text, bigint, bigint, bigint, bigint)
+    OWNER TO identity_chain_head_owner;
+```
+
+A migration must never create or empower a role, which is why this is an operator
+step rather than part of 00015. `internal/retentiondbintegration` asserts the
+properties that do not depend on it: SECURITY DEFINER, a pinned `search_path`,
+and no PUBLIC EXECUTE.
+
+Do not give the worker a chain-table grant, a sequence grant, or EXECUTE on
+`advance_chain_head`. Its startup probe refuses to run if it holds any of them,
+so an over-provisioned worker fails closed at boot rather than at the first
+erasure. Deployment roles must have no
 inherited ownership/CREATE/bypass grants either; the REVOKEs above do not remove
 indirect grants through other roles. Provision the worker's SCRAM credential with
 `\password identity_ledger_purge` in the controlled session (or the approved
@@ -405,47 +436,93 @@ do not use a trust-authenticated database endpoint for the worker.
 
 ### Explicit Head and Subject Bootstrap
 
-This is a one-time initialization, not a repair routine. First verify canonical
-history independently with the signer stopped and record the exact terminal
-sequence/hash. Replace the placeholder values below with that verified result.
-The SQL cross-checks the current terminal but does not itself certify the entire
-historical chain. For a demonstrably new ledger only, explicitly set sequence
-`0`, a 64-character zero hash and `confirmed_fresh_genesis=true`. The default
-false flag forbids inferring genesis from an empty table. Do not reset sequence
-allocation state or use this procedure after restoration of initialized proof.
+This is a one-time initialization, not a repair routine. **Both chains need a
+head** under canonical format v2: the audit chain no longer infers its tip from
+the table, because the v2 split makes a Class C purge possible and "the table
+looks empty" must therefore stop meaning "this chain has never been written".
+
+First verify canonical history independently with the signer stopped and record
+the exact terminal sequence/digest for each chain. Replace the placeholders below
+with that verified result. The SQL cross-checks the current terminal but does not
+itself certify the entire historical chain.
+
+For a demonstrably new ledger only, set sequence `0` with
+`confirmed_fresh_genesis=true`; the default false flag forbids inferring genesis
+from an empty table. At sequence `0` the digest must be the chain's **derived
+genesis seed**, which the `CHECK` constraints enforce:
+
+| Chain | Genesis digest |
+| --- | --- |
+| `security_ledger_head` | `6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea2c54` |
+| `audit_log_head` | `5c358544585235f7ae29b4a8370d5541ddd6bd40c81321fc92bbb54b31887ebb` |
+
+These are `SHA-256(chain_prefix || "genesis")`, not 32 zero bytes. v1 used zeros,
+which made a blanked or default-initialized column indistinguishable from a real
+genesis — so blanking a predecessor could pass a forged record off as the first
+one. `internal/audit.GoldenAuditGenesisHex` / `GoldenLedgerGenesisHex` hold the
+same constants, and `internal/migrate.TestGenesisMatchesMigration` asserts the
+schema and the code agree.
+
+Do not reset sequence allocation state or use this procedure after restoring an
+initialized chain.
 
 ```sql
 \set ON_ERROR_STOP on
-\set verified_head_seq 'VERIFIED_TERMINAL_SEQUENCE'
-\set verified_head_hash 'VERIFIED_TERMINAL_SHA256'
+\set ledger_head_seq 'VERIFIED_LEDGER_TERMINAL_SEQUENCE'
+\set ledger_head_hash 'VERIFIED_LEDGER_TERMINAL_SHA256'
+\set audit_head_seq 'VERIFIED_AUDIT_TERMINAL_SEQUENCE'
+\set audit_head_hash 'VERIFIED_AUDIT_TERMINAL_SHA256'
 \set confirmed_fresh_genesis false
 \set audit_subject 'identity.audit.logs'
+\set ledger_genesis '6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea2c54'
+\set audit_genesis '5c358544585235f7ae29b4a8370d5541ddd6bd40c81321fc92bbb54b31887ebb'
 
 BEGIN ISOLATION LEVEL READ COMMITTED;
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '15s';
 SELECT pg_advisory_xact_lock(5200002::bigint);
-LOCK TABLE public.security_event_ledger IN SHARE MODE;
+SELECT pg_advisory_xact_lock(5200003::bigint);
+-- SHARE MODE on the chain tables: they are what a terminal claim is checked
+-- against, and they are the tables that must not gain a row mid-bootstrap.
+LOCK TABLE public.security_ledger_chain, public.audit_log_chain IN SHARE MODE;
+
 WITH initialized AS (
     INSERT INTO public.security_ledger_head(singleton, seq, chain_hash)
-    SELECT true, :'verified_head_seq'::bigint, :'verified_head_hash'
+    SELECT true, :'ledger_head_seq'::bigint, decode(:'ledger_head_hash', 'hex')
     WHERE NOT EXISTS (SELECT 1 FROM public.security_ledger_head)
-      AND NOT EXISTS (SELECT 1 FROM public.security_ledger_checkpoints)
+      AND NOT EXISTS (SELECT 1 FROM public.security_ledger_erasures)
       AND NOT EXISTS (SELECT 1 FROM public.security_ledger_retention_settings)
       AND (
-        (:'verified_head_seq'::bigint > 0 AND EXISTS (
-            SELECT 1 FROM public.security_event_ledger
-            WHERE seq = :'verified_head_seq'::bigint
-              AND chain_hash = :'verified_head_hash'
-              AND seq = (SELECT max(seq) FROM public.security_event_ledger)
+        (:'ledger_head_seq'::bigint > 0 AND EXISTS (
+            SELECT 1 FROM public.security_ledger_chain
+            WHERE seq = :'ledger_head_seq'::bigint
+              AND chain_hash = decode(:'ledger_head_hash', 'hex')
+              AND seq = (SELECT max(seq) FROM public.security_ledger_chain)
         ))
-        OR (:'confirmed_fresh_genesis'::boolean AND :'verified_head_seq'::bigint = 0
-            AND :'verified_head_hash' = repeat('0', 64)
-            AND NOT EXISTS (SELECT 1 FROM public.security_event_ledger))
+        OR (:'confirmed_fresh_genesis'::boolean AND :'ledger_head_seq'::bigint = 0
+            AND :'ledger_head_hash' = :'ledger_genesis'
+            AND NOT EXISTS (SELECT 1 FROM public.security_ledger_chain))
+      )
+    RETURNING singleton
+), audit_initialized AS (
+    INSERT INTO public.audit_log_head(singleton, seq, chain_hash)
+    SELECT true, :'audit_head_seq'::bigint, decode(:'audit_head_hash', 'hex')
+    WHERE NOT EXISTS (SELECT 1 FROM public.audit_log_head)
+      AND (
+        (:'audit_head_seq'::bigint > 0 AND EXISTS (
+            SELECT 1 FROM public.audit_log_chain
+            WHERE seq = :'audit_head_seq'::bigint
+              AND chain_hash = decode(:'audit_head_hash', 'hex')
+              AND seq = (SELECT max(seq) FROM public.audit_log_chain)
+        ))
+        OR (:'confirmed_fresh_genesis'::boolean AND :'audit_head_seq'::bigint = 0
+            AND :'audit_head_hash' = :'audit_genesis'
+            AND NOT EXISTS (SELECT 1 FROM public.audit_log_chain))
       )
     RETURNING singleton
 )
-SELECT count(*) = 1 AS head_initialized FROM initialized \gset
+SELECT (SELECT count(*) FROM initialized) = 1
+   AND (SELECT count(*) FROM audit_initialized) = 1 AS head_initialized \gset
 \if :head_initialized
 INSERT INTO public.security_ledger_retention_settings(singleton, audit_subject)
     VALUES (true, :'audit_subject');
@@ -453,10 +530,15 @@ COMMIT;
 \else
 ROLLBACK;
 DO $$ BEGIN
-    RAISE EXCEPTION 'Bootstrap refused: existing proof/settings, terminal mismatch, or unapproved genesis.';
+    RAISE EXCEPTION 'Bootstrap refused: existing head/erasures/settings, terminal mismatch, or unapproved genesis.';
 END $$;
 \endif
 ```
+
+Both heads are initialized in one transaction on purpose. Initializing one and
+not the other leaves the signer able to append to a chain whose counterpart it
+cannot establish a tip for, which it refuses — so a partial bootstrap presents as
+a signer that will not start, with no indication of which half is missing.
 
 The selected subject must match `AUDIT_SUBJECT` on worker, publisher and signer.
 Keep the schedule disabled while validating deployed ACLs with `psql` metadata

@@ -1,305 +1,347 @@
-// Package ledgerproof verifies database-relative retained ledger segments.
-// Checkpoints preserve boundary digests, not the erased bodies or an external
-// trust anchor. All Source reads must belong to the same database snapshot.
+// Package ledgerproof verifies either cryptographic chain.
+//
+// # What v2 verification proves
+//
+// Under canonical format v2 each chain lives in its own append-only table, one
+// node per record, holding a leaf digest and a chain digest. Verification walks
+// those nodes in seq order and checks three things:
+//
+//   - every node links: chain_hash(N) == SHA-256(prefix || chain_hash(N-1) || leaf_hash(N));
+//   - every retained payload reproduces its node's leaf digest;
+//   - every absent payload is covered by an erasure record.
+//
+// The third check is new. In v1 an erased record left a hole in the chain, so
+// verification had to bridge it using predecessor/terminal digests stored in a
+// checkpoint table, and compaction of adjacent spans meant the bridge itself was
+// rewritten over time. The consequence was that "payload missing" could only be
+// tolerated, never judged: a lawful erasure and a malicious deletion were the same
+// observation. Now the chain is never broken, so an absent payload is a positive
+// claim that must be authorized, and an unauthorized one is reported as tampering.
+//
+// # Why one implementation serves both chains
+//
+// Both chains have the same shape after the split, so they are verified by this
+// one walker rather than by two handlers that could drift apart. The only
+// per-chain differences are the domain prefix, the genesis seed, and how a payload
+// row is projected back onto its canonical record — all supplied by the caller.
 package ledgerproof
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
-	"math"
-	"strings"
+	"fmt"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 )
 
-// Head is the initialized logical tip and the greatest live/checkpoint sequence.
+// Chain selects which of the two chains is being verified.
+type Chain string
+
+const (
+	// ChainAudit is the Class C audit log chain.
+	ChainAudit Chain = "audit"
+	// ChainLedger is the Class B security event ledger chain.
+	ChainLedger Chain = "ledger"
+)
+
+// Genesis returns the chain's genesis predecessor digest.
+func (c Chain) Genesis() audit.Digest {
+	if c == ChainAudit {
+		return audit.AuditGenesis()
+	}
+	return audit.LedgerGenesis()
+}
+
+// Link applies the chain's own chaining step, so a digest from one chain can
+// never be produced in the other's domain.
+func (c Chain) Link(prev, leafHash audit.Digest) audit.Digest {
+	if c == ChainAudit {
+		return audit.ChainAudit(prev, leafHash)
+	}
+	return audit.ChainLedger(prev, leafHash)
+}
+
+// Head is a chain's durable logical tip plus the highest position that exists.
+// MaxSeq comes from the chain table, which is never deleted, so unlike v1 it
+// cannot be depressed by retention.
 type Head struct {
-	Seq, MaxSeq int64
-	Hash        string
+	Seq    int64
+	MaxSeq int64
+	Hash   []byte
 }
 
-// Checkpoint is one authorized erased span in committed chain order.
-type Checkpoint struct {
-	FirstSeq, LastSeq, PredecessorSeq, ErasedCount int64
-	PredecessorHash, TerminalHash                  string
+// Node is one chain node and, when retained, a way to recompute its leaf.
+type Node struct {
+	Seq       int64
+	LeafHash  []byte
+	ChainHash []byte
+	// Recompute derives the leaf digest from the retained payload. It is nil when
+	// the payload has been erased.
+	Recompute func() (audit.Digest, error)
+	// ErasureOperation is non-nil when an erasure record covers this node. It is
+	// what distinguishes a lawful erasure from a deletion.
+	ErasureOperation *string
 }
 
-// Validate checks shape, including allocation gaps without inventing row counts.
-func (c Checkpoint) Validate() error {
-	if c.FirstSeq <= 0 || c.LastSeq < c.FirstSeq || c.PredecessorSeq < 0 || c.PredecessorSeq >= c.FirstSeq ||
-		c.ErasedCount <= 0 || c.ErasedCount > c.LastSeq-c.FirstSeq+1 ||
-		(c.FirstSeq != c.LastSeq && c.ErasedCount < 2) || !validHash(c.PredecessorHash) || !validHash(c.TerminalHash) ||
-		(c.PredecessorSeq == 0 && c.PredecessorHash != genesis()) {
-		return errors.New("invalid_checkpoint")
-	}
-	return nil
-}
-
-// VerifyRecord recomputes a retained body with the signer's canonical format.
-func VerifyRecord(predecessor string, record audit.LedgerRecord, stored string) (string, error) {
-	prev, err := audit.DecodeChainHash(predecessor)
-	if err != nil {
-		return "", err
-	}
-	expected := audit.ChainHash(prev, audit.SerializeLedger(record))
-	if expected != stored {
-		return expected, errors.New("hash_mismatch")
-	}
-	return expected, nil
-}
-
-// Step is a live record or an erased span. Problem reports local structural
-// checks by the source (overlap or a checkpoint's missing exact predecessor).
-type Step struct {
-	Checkpoint
-	Record  *audit.LedgerRecord
-	Problem string
-}
-
-// Source returns bounded proof nodes and exact boundary candidates. Boundary
-// includes covering checkpoints so an interior compacted digest is distinguished
-// from an unknown sequence. Page includes one lookahead node in its limit.
+// Source supplies head and nodes.
 type Source interface {
-	Head(context.Context) (Head, error)
-	Boundary(context.Context, int64) ([]Step, error)
-	Page(context.Context, int64, int64, int32) ([]Step, error)
+	Head(ctx context.Context) (Head, error)
+	Page(ctx context.Context, after, through int64, limit int32) ([]Node, error)
+	// HashAt returns the stored chain digest at an exact seq, or a not-found
+	// error. Exactness matters: gaps are legal, so "at or after" would hand
+	// verification a later node's digest and report a break in an intact chain.
+	HashAt(ctx context.Context, seq int64) ([]byte, error)
 }
 
-// ErrMissingHead distinguishes uninitialized proof state from an empty ledger.
+// ErrMissingHead reports an uninitialized head. It is deliberately not treated as
+// genesis: an uninitialized head and a genuinely empty chain are different states,
+// and conflating them is how a verifier blesses a chain that was restarted.
 var ErrMissingHead = errors.New("missing_head")
 
-// Params fixes the scan watermark for continuation requests.
+// ErrUnknownSeq reports a caller-named seq that does not exist.
+var ErrUnknownSeq = errors.New("unknown_seq")
+
+// Params bounds one verification pass.
 type Params struct {
-	AfterSeq, ThroughSeq int64
-	HasThrough           bool
-	PredecessorHash      string
-	Limit                int32
+	Chain Chain
+	// AfterSeq starts the walk; 0 means genesis.
+	AfterSeq int64
+	// PredecessorHash optionally overrides the seed with an operator-supplied
+	// digest. It is reported as a mismatch rather than trusted silently.
+	PredecessorHash []byte
+	// ThroughSeq caps the walk when HasThrough is set.
+	ThroughSeq int64
+	HasThrough bool
+	// Limit bounds one page.
+	Limit int32
 }
 
-// Result contains no ledger contents or subject identifiers. Checked counts
-// recomputed records only; ProofSteps also counts authorized erased spans.
+// Result reports one pass. Hash fields are hex for direct JSON use.
 type Result struct {
-	AfterSeq, ThroughSeq                int64
-	SeedHash, SeedSource                string
-	Verified, Complete, RestartRequired bool
-	Checked, PurgedSpans, ProofSteps    int
-	PurgedCount                         int64
-	FirstSeq, LastSeq, NextAfterSeq     *int64
-	BrokenAtSeq                         *int64
-	ExpectedHash, StoredHash, LastHash  *string
-	FailureReason                       *string
+	Chain      string
+	Verified   bool
+	Complete   bool
+	Checked    int
+	AfterSeq   int64
+	ThroughSeq int64
+	SeedHash   string
+	SeedSource string
+	FirstSeq   *int64
+	LastSeq    *int64
+	LastHash   string
+	// lastDigest is the raw form of LastHash, used to seed the next page without
+	// a hex round trip.
+	lastDigest   audit.Digest
+	NextAfterSeq *int64
+	// ErasedChecked counts nodes whose payload was absent but lawfully erased.
+	ErasedChecked int
+	BrokenAtSeq   *int64
+	ExpectedHash  *string
+	StoredHash    *string
+	FailureReason *string
 }
 
-// Verify traverses one bounded page. A no-content page can still have a next
-// cursor or complete proof traversal, but never reports Verified=true.
+const defaultLimit = 1000
+
+// Verify walks one page of a chain.
 func Verify(ctx context.Context, source Source, p Params) (Result, error) {
-	r := Result{AfterSeq: p.AfterSeq, ThroughSeq: p.ThroughSeq, SeedHash: genesis(), SeedSource: "genesis"}
-	if p.Limit < 1 || p.Limit > 5000 || p.AfterSeq < 0 || p.ThroughSeq < 0 || (p.HasThrough && p.AfterSeq > p.ThroughSeq) || (p.AfterSeq > 0 && !p.HasThrough) {
-		return r, errors.New("invalid_request")
+	if source == nil {
+		return Result{}, errors.New("ledgerproof: source is required")
 	}
+	if p.Chain != ChainAudit && p.Chain != ChainLedger {
+		return Result{}, errors.New("ledgerproof: unknown chain")
+	}
+	limit := p.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+
 	head, err := source.Head(ctx)
-	if errors.Is(err, ErrMissingHead) {
-		return fail(r, "missing_head", nil), nil
-	}
 	if err != nil {
-		return r, err
+		return Result{}, err
 	}
-	if !p.HasThrough {
-		p.ThroughSeq, r.ThroughSeq = head.Seq, head.Seq
+	if len(head.Hash) != audit.DigestSize {
+		return Result{}, ErrMissingHead
 	}
-	if head.Seq < 0 || head.Seq != head.MaxSeq || !validHash(head.Hash) || (head.Seq == 0 && head.Hash != genesis()) || p.ThroughSeq > head.Seq {
-		return fail(r, "head_mismatch", nil), nil
-	}
-	// Even a historical page must not conceal a lost tail or sequence reset.
-	if head.Seq > 0 {
-		hash, _, reason, err := boundary(ctx, source, head.Seq)
-		if err != nil {
-			return r, err
-		}
-		if reason != "" {
-			if reason == "missing_proof" || reason == "retention_boundary_unavailable" {
-				reason = "head_mismatch"
+
+	through := head.MaxSeq
+	if p.HasThrough {
+		through = p.ThroughSeq
+		// An explicit upper boundary must still exist, or a completed proof could
+		// be claimed over a tail that has disappeared between pages.
+		if through > 0 {
+			if _, err := source.HashAt(ctx, through); err != nil {
+				return Result{}, err
 			}
-			return fail(r, reason, &head.Seq), nil
-		}
-		if hash != head.Hash {
-			return fail(r, "head_mismatch", &head.Seq), nil
 		}
 	}
-	throughHash := genesis()
-	if p.ThroughSeq > 0 {
-		var reason string
-		throughHash, _, reason, err = boundary(ctx, source, p.ThroughSeq)
-		if err != nil {
-			return r, err
-		}
-		if reason != "" {
-			if reason == "missing_proof" {
-				return r, errors.New("unknown_through_seq")
-			}
-			return fail(r, reason, &p.ThroughSeq), nil
-		}
+
+	result := Result{
+		Chain: string(p.Chain), Verified: true, AfterSeq: p.AfterSeq, ThroughSeq: through,
+		SeedSource: "genesis",
 	}
+
+	// Seed the predecessor. after_seq == 0 starts at genesis, which is chained
+	// like any other node so there is no special case to forge a new "first"
+	// record against.
+	previous := p.Chain.Genesis()
 	if p.AfterSeq > 0 {
-		var reason string
-		r.SeedHash, r.SeedSource, reason, err = boundary(ctx, source, p.AfterSeq)
+		stored, seedErr := source.HashAt(ctx, p.AfterSeq)
+		if seedErr != nil {
+			return Result{}, seedErr
+		}
+		previous, err = audit.DecodeDigest(stored)
 		if err != nil {
-			return r, err
+			return Result{}, fmt.Errorf("ledgerproof: stored digest at seq %d: %w", p.AfterSeq, err)
 		}
-		if reason != "" {
-			if reason == "missing_proof" {
-				return r, errors.New("unknown_after_seq")
-			}
-			return fail(r, reason, &p.AfterSeq), nil
-		}
+		result.SeedSource = "database_predecessor"
 	}
-	if p.PredecessorHash != "" {
-		if !validHash(strings.ToLower(p.PredecessorHash)) {
-			return r, errors.New("invalid_request")
+	storedSeed := previous.Hex()
+
+	seedMismatch := false
+	if len(p.PredecessorHash) > 0 {
+		supplied, decodeErr := audit.DecodeDigest(p.PredecessorHash)
+		if decodeErr != nil {
+			return Result{}, decodeErr
 		}
-		stored := r.SeedHash
-		r.SeedHash, r.SeedSource = strings.ToLower(p.PredecessorHash), "supplied_predecessor"
-		if r.SeedHash != stored {
-			r.ExpectedHash, r.StoredHash = &r.SeedHash, &stored
-			return fail(r, "predecessor_mismatch", &p.AfterSeq), nil
-		}
+		seedMismatch = supplied != previous
+		previous = supplied
+		result.SeedSource = "supplied_predecessor"
 	}
-	steps, err := source.Page(ctx, p.AfterSeq, p.ThroughSeq, p.Limit+1)
+	result.SeedHash = previous.Hex()
+	result.LastHash, result.lastDigest = result.SeedHash, previous
+
+	if seedMismatch {
+		result.Verified = false
+		result.FailureReason = ptr("predecessor_mismatch")
+		result.BrokenAtSeq = ptr(p.AfterSeq)
+		result.ExpectedHash, result.StoredHash = ptr(result.SeedHash), ptr(storedSeed)
+		return result, nil
+	}
+	if p.AfterSeq >= through {
+		result.Complete = true
+		return result, nil
+	}
+
+	nodes, err := source.Page(ctx, p.AfterSeq, through, limit)
 	if err != nil {
-		return r, err
+		return Result{}, err
 	}
-	if len(steps) > int(p.Limit)+1 {
-		return fail(r, "invalid_checkpoint", nil), nil
+	if len(nodes) == 0 {
+		result.Verified = false
+		result.FailureReason = ptr("no_stored_records")
+		return result, nil
 	}
-	hasMore := len(steps) > int(p.Limit)
-	lastSeq, lastHash := p.AfterSeq, r.SeedHash
-	for i, step := range steps {
+
+	cursor := p.AfterSeq
+	for i, node := range nodes {
 		if err := ctx.Err(); err != nil {
-			return r, err
+			return Result{}, err
 		}
-		if problem := validateStep(step); problem != "" {
-			return fail(r, problem, &step.FirstSeq), nil
+		if node.Seq <= cursor || node.Seq > through {
+			return Result{}, fmt.Errorf("ledgerproof: node seq %d outside (%d, %d]", node.Seq, cursor, through)
 		}
-		if step.FirstSeq <= lastSeq || step.LastSeq > p.ThroughSeq {
-			return fail(r, "checkpoint_overlap", &step.FirstSeq), nil
+		leafHash, err := audit.DecodeDigest(node.LeafHash)
+		if err != nil {
+			return failAt(result, "invalid_leaf_hash", node.Seq), nil
 		}
-		// Validate the lookahead's boundary too; it may overlap the final span.
-		if step.Record == nil && (step.PredecessorSeq != lastSeq || step.PredecessorHash != lastHash) {
-			return fail(r, "checkpoint_link_mismatch", &step.FirstSeq), nil
+		storedChain, err := audit.DecodeDigest(node.ChainHash)
+		if err != nil {
+			return failAt(result, "invalid_chain_hash", node.Seq), nil
 		}
-		if i == int(p.Limit) {
-			break
+		if i == 0 {
+			result.FirstSeq = ptr(node.Seq)
 		}
-		if r.FirstSeq == nil {
-			r.FirstSeq = ptr(step.FirstSeq)
-		}
-		r.ProofSteps++
-		if step.Record != nil {
-			r.Checked++
-			expected, hashErr := VerifyRecord(lastHash, *step.Record, step.TerminalHash)
-			if hashErr != nil {
-				r.LastSeq = ptr(step.LastSeq)
-				r.ExpectedHash, r.StoredHash = &expected, &step.TerminalHash
-				return fail(r, "hash_mismatch", &step.FirstSeq), nil
-			}
-		} else {
-			if step.ErasedCount > math.MaxInt64-r.PurgedCount {
-				return fail(r, "invalid_checkpoint", &step.FirstSeq), nil
-			}
-			r.PurgedSpans++
-			r.PurgedCount += step.ErasedCount
-		}
-		lastSeq, lastHash = step.LastSeq, step.TerminalHash
-		r.LastSeq, r.LastHash = ptr(lastSeq), ptr(lastHash)
-	}
-	if hasMore {
-		r.NextAfterSeq = ptr(lastSeq)
-	} else if lastSeq != p.ThroughSeq || lastHash != throughHash {
-		return fail(r, "missing_proof", nil), nil
-	} else {
-		r.Complete = true
-	}
-	if r.Checked == 0 {
-		r.FailureReason = ptr("no_retained_records")
-	} else {
-		r.Verified = true
-	}
-	return r, nil
-}
+		result.Checked++
+		result.LastSeq = ptr(node.Seq)
 
-func boundary(ctx context.Context, source Source, seq int64) (hash, seed, reason string, err error) {
-	steps, err := source.Boundary(ctx, seq)
-	if err != nil {
-		return "", "", "", err
-	}
-	if len(steps) > 3 {
-		return "", "", "checkpoint_overlap", nil
-	}
-	covered := false
-	for _, step := range steps {
-		if problem := validateStep(step); problem != "" {
-			return "", "", problem, nil
+		// 1. Linkage.
+		expected := p.Chain.Link(previous, leafHash)
+		if expected != storedChain {
+			out := failAt(result, "chain_mismatch", node.Seq)
+			out.ExpectedHash, out.StoredHash = ptr(expected.Hex()), ptr(storedChain.Hex())
+			return out, nil
 		}
-		candidate, source := "", "checkpoint_boundary"
+
 		switch {
-		case step.LastSeq == seq:
-			candidate = step.TerminalHash
-			if step.Record != nil {
-				source = "database_predecessor"
+		// 2. A retained payload must reproduce the leaf.
+		case node.Recompute != nil:
+			recomputed, err := node.Recompute()
+			if err != nil {
+				return failAt(result, "record_not_serializable", node.Seq), nil
 			}
-		case step.Record == nil && step.PredecessorSeq == seq:
-			candidate = step.PredecessorHash
-		case step.FirstSeq <= seq && seq < step.LastSeq:
-			covered = true
-		}
-		if candidate != "" {
-			if hash != "" && candidate != hash {
-				return "", "", "checkpoint_link_mismatch", nil
+			if recomputed != leafHash {
+				out := failAt(result, "leaf_mismatch", node.Seq)
+				out.ExpectedHash, out.StoredHash = ptr(recomputed.Hex()), ptr(leafHash.Hex())
+				return out, nil
 			}
-			hash, seed = candidate, source
+		// 3. An absent payload must be authorized by an erasure record.
+		case node.ErasureOperation == nil:
+			return failAt(result, "payload_absent_without_erasure_record", node.Seq), nil
+		default:
+			result.ErasedChecked++
+		}
+
+		previous = storedChain
+		cursor = node.Seq
+	}
+
+	result.LastHash, result.lastDigest = previous.Hex(), previous
+	result.NextAfterSeq = ptr(cursor)
+	result.Complete = cursor >= through
+
+	if result.Complete && !p.HasThrough {
+		// The walk reached the chain's end, so the digest it arrived at must be the
+		// digest the head commits to. Without this the verifier would accept a
+		// chain that is internally consistent but is not the one the head names —
+		// which is exactly what a coherent rewrite produces.
+		expected, err := audit.DecodeDigest(head.Hash)
+		if err != nil {
+			return Result{}, ErrMissingHead
+		}
+		if head.Seq != cursor || previous != expected {
+			out := failAt(result, "head_mismatch", cursor)
+			out.ExpectedHash, out.StoredHash = ptr(previous.Hex()), ptr(expected.Hex())
+			return out, nil
 		}
 	}
-	if covered {
-		if hash != "" {
-			return "", "", "checkpoint_overlap", nil
-		}
-		return "", "", "retention_boundary_unavailable", nil
-	}
-	if hash == "" {
-		return "", "", "missing_proof", nil
-	}
-	return hash, seed, "", nil
+	return result, nil
 }
 
-func validateStep(step Step) string {
-	if step.Problem != "" {
-		return step.Problem
+// NextParams builds the continuation for a partially completed pass, carrying the
+// digest forward without a hex round trip.
+func (r Result) NextParams(p Params) (Params, bool) {
+	if r.Complete || r.NextAfterSeq == nil || !r.Verified {
+		return Params{}, false
 	}
-	if step.Record != nil {
-		if step.FirstSeq <= 0 || step.FirstSeq != step.LastSeq || step.ErasedCount != 0 || !validHash(step.TerminalHash) {
-			return "missing_proof"
-		}
-	} else if err := step.Validate(); err != nil {
-		return "invalid_checkpoint"
-	}
-	return ""
+	p.AfterSeq = *r.NextAfterSeq
+	p.PredecessorHash = r.lastDigest.Bytes()
+	return p, true
 }
 
-func fail(r Result, reason string, seq *int64) Result {
-	r.Verified, r.Complete, r.NextAfterSeq = false, false, nil
+func failAt(r Result, reason string, seq int64) Result {
+	r.Verified = false
+	r.Complete = false
 	r.FailureReason = &reason
-	r.RestartRequired = reason == "retention_boundary_unavailable"
-	if !r.RestartRequired {
-		r.BrokenAtSeq = seq
-	}
+	r.BrokenAtSeq = &seq
 	return r
 }
 
-func validHash(hash string) bool {
-	_, err := audit.DecodeChainHash(hash)
-	return err == nil && hash == strings.ToLower(hash)
-}
-
-func genesis() string   { return hex.EncodeToString(audit.GenesisChainHash[:]) }
 func ptr[T any](v T) *T { return &v }
+
+// VerifyRecord recomputes one ledger record's leaf digest and compares it to the
+// stored value. It is the single-record form used by the signer's smoke probe.
+func VerifyRecord(record audit.LedgerRecord, storedLeaf []byte) ([]byte, error) {
+	leafHash, err := audit.LeafLedger(record)
+	if err != nil {
+		return nil, fmt.Errorf("ledgerproof: serialize record: %w", err)
+	}
+	stored, err := audit.DecodeDigest(storedLeaf)
+	if err != nil {
+		return nil, err
+	}
+	if leafHash != stored {
+		return nil, fmt.Errorf("ledgerproof: leaf mismatch: recomputed %s, stored %s", leafHash.Hex(), stored.Hex())
+	}
+	return leafHash.Bytes(), nil
+}

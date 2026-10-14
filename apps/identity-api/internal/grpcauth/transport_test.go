@@ -249,7 +249,10 @@ func TestTransportRejectsInvalidCredentials(t *testing.T) {
 			case "source unavailable":
 				serverSource.err = errors.New("SVID temporarily unavailable")
 			case "invalid EKU":
-				clientSource.set(ca.issue(t, testClientID, func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth} }))
+				// serverAuth only: an EKU extension that is present but does not
+				// permit client authentication. A clientAuth-only SVID is valid and
+				// is covered as an admitted case in TestAuthenticationMatrix.
+				clientSource.set(ca.issue(t, testClientID, func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }))
 			}
 			creds := credentials.NewTLS(config)
 			if name == "plaintext" {

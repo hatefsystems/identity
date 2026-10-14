@@ -26,7 +26,7 @@ func (f identitySourceFunc) GetUserEmailForBlindIndex(ctx context.Context, id uu
 
 func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {
 	next := &capturedRecorder{}
-	indexer, err := blindindex.New([]byte(strings.Repeat("p", 32)))
+	indexer, err := blindindex.New([]byte(strings.Repeat("p", 32)), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {
 }
 
 func TestIndexingRecorderClassCRejectsInjectedSecurity(t *testing.T) {
-	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)))
+	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)), 0)
 	next := &capturedRecorder{}
 	r, err := NewIndexingRecorder(next, identitySourceFunc(func(context.Context, uuid.UUID) (string, error) {
 		t.Fatal("Class C queried identity source")
@@ -101,7 +101,7 @@ func TestIndexingRecorderClassCRejectsInjectedSecurity(t *testing.T) {
 }
 
 func TestIndexingRecorderCaptureFailureDoesNotLeakError(t *testing.T) {
-	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)))
+	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)), 0)
 	next := &capturedRecorder{}
 	var logs bytes.Buffer
 	r, err := NewIndexingRecorder(next, identitySourceFunc(func(context.Context, uuid.UUID) (string, error) {

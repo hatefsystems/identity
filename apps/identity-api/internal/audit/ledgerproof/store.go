@@ -2,8 +2,8 @@ package ledgerproof
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,93 +12,217 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 )
 
-// Beginner must be a pool (not the already account-locked admin transaction).
+// Beginner opens the read-only snapshot a verification runs in.
 type Beginner interface {
-	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
-// VerifySnapshot opens a separate, bounded, read-only snapshot. It never takes
-// the ledger coordination lock and never commits administrative audit intent.
+// VerifySnapshot runs one verification pass inside a bounded READ ONLY REPEATABLE
+// READ transaction, so the head and every node come from one snapshot. Without
+// that, a batch committed mid-walk would make an intact chain look like it ends
+// before its head.
 func VerifySnapshot(ctx context.Context, pool Beginner, params Params) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return Result{}, err
+	if pool == nil {
+		return Result{}, errors.New("ledgerproof: database is required")
 	}
+	// A verification pass is operator-triggered and read-only, but it walks a
+	// table that grows without bound, so both the client and the server need a
+	// ceiling. Without the client-side deadline a wedged snapshot would hold a
+	// connection indefinitely.
+	ctx, cancel := context.WithTimeout(ctx, snapshotTimeout)
+	defer cancel()
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("ledgerproof: begin snapshot: %w", err)
+	}
+	// Cleanup runs on a context detached from ctx: ctx may already be cancelled,
+	// and a rollback that cannot run leaks the connection.
 	defer func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		defer stop()
+		cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancelCleanup()
 		_ = tx.Rollback(cleanup)
 	}()
-	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '2s'"); err != nil {
-		return Result{}, err
+
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '2s'"); err != nil {
+		return Result{}, fmt.Errorf("ledgerproof: bound snapshot: %w", err)
 	}
-	return Verify(ctx, NewSource(tx), params)
+	return Verify(ctx, NewSource(tx, params.Chain), params)
 }
 
-// Store is a proof reader over a caller-owned transaction. Workers can reuse it
-// under their write locks; HTTP verification must use VerifySnapshot instead.
-type Store struct{ queries *db.Queries }
+const (
+	// snapshotTimeout bounds one whole verification pass.
+	snapshotTimeout = 15 * time.Second
+	// rollbackTimeout bounds the detached cleanup.
+	rollbackTimeout = 5 * time.Second
+)
 
-// NewSource does not acquire locks or start a transaction.
-func NewSource(conn db.DBTX) *Store { return &Store{queries: db.New(conn)} }
+// Store is the PostgreSQL-backed Source for one chain.
+type Store struct {
+	queries *db.Queries
+	chain   Chain
+}
 
-// Head reads explicit initialization and both live and erased terminal nodes.
+// NewSource builds a Source over any connection or transaction.
+func NewSource(conn db.DBTX, chain Chain) *Store {
+	return &Store{queries: db.New(conn), chain: chain}
+}
+
+// Head implements Source.
 func (s *Store) Head(ctx context.Context) (Head, error) {
-	h, err := s.queries.GetLedgerVerificationHead(ctx)
+	if s.chain == ChainAudit {
+		row, err := s.queries.GetAuditLogHead(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Head{}, ErrMissingHead
+		}
+		if err != nil {
+			return Head{}, err
+		}
+		maxSeq, err := s.queries.GetAuditLogHighWaterSeq(ctx)
+		if err != nil {
+			return Head{}, err
+		}
+		return Head{Seq: row.Seq, MaxSeq: maxSeq, Hash: row.ChainHash}, nil
+	}
+	row, err := s.queries.GetLedgerVerificationHead(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Head{}, ErrMissingHead
 	}
-	return Head{Seq: h.Seq, Hash: h.ChainHash, MaxSeq: h.MaxSeq}, err
+	if err != nil {
+		return Head{}, err
+	}
+	return Head{Seq: row.Seq, MaxSeq: row.MaxSeq, Hash: row.ChainHash}, nil
 }
 
-// Boundary returns at most four candidates, enough to reject ambiguous proof.
-func (s *Store) Boundary(ctx context.Context, seq int64) ([]Step, error) {
-	return s.nodes(ctx, db.ListLedgerVerificationNodesParams{AfterSeq: seq, ThroughSeq: seq, BoundaryOnly: true, NodeLimit: 4})
+// HashAt implements Source.
+func (s *Store) HashAt(ctx context.Context, seq int64) ([]byte, error) {
+	var (
+		hash []byte
+		err  error
+	)
+	if s.chain == ChainAudit {
+		hash, err = s.queries.GetAuditLogChainHashBySeq(ctx, seq)
+	} else {
+		hash, err = s.queries.GetSecurityEventChainHashBySeq(ctx, seq)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUnknownSeq
+	}
+	return hash, err
 }
 
-// Page bounds live records and erased spans together, not just surviving bodies.
-func (s *Store) Page(ctx context.Context, after, through int64, limit int32) ([]Step, error) {
-	return s.nodes(ctx, db.ListLedgerVerificationNodesParams{AfterSeq: after, ThroughSeq: through, NodeLimit: limit})
+// Page implements Source.
+func (s *Store) Page(ctx context.Context, after, through int64, limit int32) ([]Node, error) {
+	if s.chain == ChainAudit {
+		return s.auditPage(ctx, after, through, limit)
+	}
+	return s.ledgerPage(ctx, after, through, limit)
 }
 
-func (s *Store) nodes(ctx context.Context, params db.ListLedgerVerificationNodesParams) ([]Step, error) {
-	rows, err := s.queries.ListLedgerVerificationNodes(ctx, params)
+func (s *Store) auditPage(ctx context.Context, after, through int64, limit int32) ([]Node, error) {
+	rows, err := s.queries.ListAuditLogChainForVerification(ctx, db.ListAuditLogChainForVerificationParams{
+		AfterSeq: after, ThroughSeq: through, PageLimit: limit,
+	})
 	if err != nil {
 		return nil, err
 	}
-	steps := make([]Step, 0, len(rows))
+	nodes := make([]Node, 0, len(rows))
 	for _, row := range rows {
-		step := Step{Checkpoint: Checkpoint{FirstSeq: row.FirstSeq, LastSeq: row.LastSeq,
-			PredecessorSeq: row.PredecessorSeq, PredecessorHash: row.PredecessorHash,
-			TerminalHash: row.TerminalHash, ErasedCount: row.ErasedCount}}
-		if row.Overlaps {
-			step.Problem = "checkpoint_overlap"
-		} else if !row.PredecessorMatches {
-			step.Problem = "checkpoint_link_mismatch"
+		node := Node{Seq: row.Seq, LeafHash: row.LeafHash, ChainHash: row.ChainHash}
+		if row.PayloadPresent {
+			record := auditRecordFromRow(row)
+			node.Recompute = func() (audit.Digest, error) { return audit.LeafAudit(record) }
 		}
-		if !row.Erased {
-			var record db.SecurityEventLedger
-			if err := json.Unmarshal(row.LiveRecord, &record); err != nil {
-				return nil, err
-			}
-			if record.Seq != row.FirstSeq {
-				step.Problem = "missing_proof"
-			}
-			body := Record(record)
-			step.Record = &body
-		}
-		steps = append(steps, step)
+		nodes = append(nodes, node)
 	}
-	return steps, nil
+	return nodes, nil
 }
 
-// Record projects the signed fields without changing historical timestamps.
-func Record(e db.SecurityEventLedger) audit.LedgerRecord {
-	return audit.LedgerRecord{ID: e.ID.String(), AccountRef: e.AccountRef.String(),
-		IdentityBlindIndex: e.IdentityBlindIndex, EventType: e.EventType,
-		ClientIP: e.ClientIp, IPSubnet: e.IpSubnet, UserAgent: e.UserAgent,
-		DeviceFingerprint: e.DeviceFingerprint, ClientID: e.ClientID, Scope: e.Scope,
-		Timestamp: e.Timestamp.Time, RetainUntil: e.RetainUntil.Time}
+func (s *Store) ledgerPage(ctx context.Context, after, through int64, limit int32) ([]Node, error) {
+	rows, err := s.queries.ListSecurityLedgerChainForVerification(ctx, db.ListSecurityLedgerChainForVerificationParams{
+		AfterSeq: after, ThroughSeq: through, PageLimit: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]Node, 0, len(rows))
+	for _, row := range rows {
+		node := Node{Seq: row.Seq, LeafHash: row.LeafHash, ChainHash: row.ChainHash}
+		if row.PayloadPresent {
+			record := ledgerRecordFromRow(row)
+			node.Recompute = func() (audit.Digest, error) { return audit.LeafLedger(record) }
+		}
+		if row.ErasureOperationID.Valid {
+			op := row.ErasureOperationID.UUID.String()
+			node.ErasureOperation = &op
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+// The two projections must stay exhaustive: a column that is persisted but
+// omitted here would be absent from the recomputed leaf, so it could be rewritten
+// at will while verification still passed. The serializer's side of that contract
+// is pinned by audit.TestSerializeLedgerCoversEveryField and its audit twin.
+
+func auditRecordFromRow(row db.ListAuditLogChainForVerificationRow) audit.AuditRecord {
+	rec := audit.AuditRecord{ID: row.EventID.String()}
+	if row.ActorID.Valid {
+		rec.ActorID = row.ActorID.UUID.String()
+	}
+	if row.ActorSpiffeID != nil {
+		rec.ActorSPIFFEID = *row.ActorSpiffeID
+	}
+	if row.EventType != nil {
+		rec.EventType = *row.EventType
+	}
+	if row.ActionStatus != nil {
+		rec.ActionStatus = *row.ActionStatus
+	}
+	if row.ClientIp != nil {
+		rec.ClientIP = *row.ClientIp
+	}
+	if row.UserAgent != nil {
+		rec.UserAgent = *row.UserAgent
+	}
+	if row.Payload != nil {
+		rec.Payload = *row.Payload
+	}
+	if row.Timestamp.Valid {
+		rec.Timestamp = row.Timestamp.Time
+	}
+	return rec
+}
+
+func ledgerRecordFromRow(row db.ListSecurityLedgerChainForVerificationRow) audit.LedgerRecord {
+	rec := audit.LedgerRecord{
+		ID:                 row.EventID.String(),
+		IdentityBlindIndex: row.IdentityBlindIndex,
+		ClientIP:           row.ClientIp,
+		IPSubnet:           row.IpSubnet,
+		UserAgent:          row.UserAgent,
+		DeviceFingerprint:  row.DeviceFingerprint,
+		ClientID:           row.ClientID,
+		Scope:              row.Scope,
+	}
+	if row.AccountRef.Valid {
+		rec.AccountRef = row.AccountRef.UUID.String()
+	}
+	if row.BlindIndexVersion != nil {
+		rec.BlindIndexVersion = *row.BlindIndexVersion
+	}
+	if row.EventType != nil {
+		rec.EventType = *row.EventType
+	}
+	if row.Timestamp.Valid {
+		rec.Timestamp = row.Timestamp.Time
+	}
+	if row.RetainUntil.Valid {
+		rec.RetainUntil = row.RetainUntil.Time
+	}
+	return rec
 }

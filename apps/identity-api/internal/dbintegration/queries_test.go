@@ -19,7 +19,9 @@
 package dbintegration
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -28,6 +30,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 
 	. "github.com/hatefsystems/identity/apps/identity-api/internal/db" //nolint:revive // This suite intentionally exercises the complete generated query surface.
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
@@ -821,60 +825,149 @@ func TestAuditLogQueries(t *testing.T) {
 	t.Run("ChainVerificationPage", testAuditChainVerification(ctx, q))
 }
 
-// auditParams builds an InsertAuditLogParams with sane defaults.
-func auditParams(eventType, chainHash string) InsertAuditLogParams {
-	return InsertAuditLogParams{
-		ActorID:       uuid.New(),
-		ActorSpiffeID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
+// auditParams builds an InsertAuditLogWithChainParams carrying a real leaf and
+// chain digest, so a fixture row is actually verifiable instead of holding filler
+// bytes. The chain digest links to the supplied predecessor, which lets a caller
+// build a genuinely linked fixture chain.
+func auditParams(t *testing.T, eventType string, previous audit.Digest) InsertAuditLogWithChainParams {
+	t.Helper()
+	eventID := uuid.New()
+	timestamp := audit.NormalizeChainTime(time.Now())
+	actorID := uuid.New()
+	rec := audit.AuditRecord{
+		ID:            eventID.String(),
+		ActorID:       actorID.String(),
+		ActorSPIFFEID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
 		EventType:     eventType,
 		ActionStatus:  "success",
-		ClientIp:      "127.0.0.1",
+		ClientIP:      "127.0.0.1",
 		UserAgent:     "go-test",
 		Payload:       "{}",
-		ChainHash:     chainHash,
+		Timestamp:     timestamp,
+	}
+	leaf, err := audit.LeafAudit(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return InsertAuditLogWithChainParams{
+		EventID:       eventID,
+		LeafHash:      leaf.Bytes(),
+		ChainHash:     audit.ChainAudit(previous, leaf).Bytes(),
+		ActorID:       actorID,
+		ActorSpiffeID: rec.ActorSPIFFEID,
+		EventType:     eventType,
+		ActionStatus:  rec.ActionStatus,
+		ClientIp:      rec.ClientIP,
+		UserAgent:     rec.UserAgent,
+		Payload:       rec.Payload,
+		Timestamp:     ts(timestamp),
 	}
 }
 
 func testAuditInsertChainHash(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		hash1 := strings.Repeat("1", 64)
-		rec, err := q.InsertAuditLog(ctx, auditParams("test.chain.first", hash1))
-		if err != nil {
-			t.Fatalf("InsertAuditLog: %v", err)
-		}
-		if rec.ChainHash != hash1 {
-			t.Errorf("chain hash mismatch on insert")
-		}
-
-		// Latest chain hash must be the one just inserted.
-		latest, err := q.GetLatestAuditLogChainHash(ctx)
-		if err != nil {
-			t.Fatalf("GetLatestAuditLogChainHash: %v", err)
-		}
-		if latest != hash1 {
-			t.Errorf("expected latest chain hash %q, got %q", hash1, latest)
+		// Seed from the existing tip so this subtest composes with whatever the
+		// shared fixture database already holds.
+		previous := audit.AuditGenesis()
+		if tip, err := q.GetAuditLogChainTip(ctx); err == nil {
+			previous, err = audit.DecodeDigest(tip.ChainHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("GetAuditLogChainTip: %v", err)
 		}
 
-		// Insert a second record; latest must advance.
-		hash2 := strings.Repeat("2", 64)
-		if _, err := q.InsertAuditLog(ctx, auditParams("test.chain.second", hash2)); err != nil {
-			t.Fatalf("InsertAuditLog second: %v", err)
-		}
-		latest, err = q.GetLatestAuditLogChainHash(ctx)
+		first := auditParams(t, "test.chain.first", previous)
+		seq, err := q.InsertAuditLogWithChain(ctx, first)
 		if err != nil {
-			t.Fatalf("GetLatestAuditLogChainHash second: %v", err)
+			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
-		if latest != hash2 {
-			t.Errorf("expected latest chain hash %q, got %q", hash2, latest)
+
+		tip, err := q.GetAuditLogChainTip(ctx)
+		if err != nil {
+			t.Fatalf("GetAuditLogChainTip: %v", err)
+		}
+		if tip.Seq != seq || !bytes.Equal(tip.ChainHash, first.ChainHash) {
+			t.Errorf("tip = (seq %d, %x), want (seq %d, %x)", tip.Seq, tip.ChainHash, seq, first.ChainHash)
+		}
+
+		// A second node must link onto the first and advance the tip.
+		firstDigest, err := audit.DecodeDigest(first.ChainHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second := auditParams(t, "test.chain.second", firstDigest)
+		secondSeq, err := q.InsertAuditLogWithChain(ctx, second)
+		if err != nil {
+			t.Fatalf("InsertAuditLogWithChain second: %v", err)
+		}
+		if secondSeq <= seq {
+			t.Errorf("second seq %d did not advance past %d", secondSeq, seq)
+		}
+		tip, err = q.GetAuditLogChainTip(ctx)
+		if err != nil {
+			t.Fatalf("GetAuditLogChainTip second: %v", err)
+		}
+		if !bytes.Equal(tip.ChainHash, second.ChainHash) {
+			t.Errorf("tip = %x, want %x", tip.ChainHash, second.ChainHash)
+		}
+
+		// The payload must reproduce the stored leaf: that is the property the
+		// split exists to preserve independently of the chain linkage.
+		page, err := q.ListAuditLogChainForVerification(ctx, ListAuditLogChainForVerificationParams{
+			AfterSeq: seq - 1, ThroughSeq: secondSeq, PageLimit: 10,
+		})
+		if err != nil {
+			t.Fatalf("ListAuditLogChainForVerification: %v", err)
+		}
+		if len(page) < 2 {
+			t.Fatalf("verification page returned %d nodes, want at least 2", len(page))
+		}
+		for _, node := range page {
+			if !node.PayloadPresent {
+				t.Fatalf("seq %d: payload missing from a freshly inserted node", node.Seq)
+			}
+			rec := audit.AuditRecord{ID: node.EventID.String()}
+			if node.ActorID.Valid {
+				rec.ActorID = node.ActorID.UUID.String()
+			}
+			if node.ActorSpiffeID != nil {
+				rec.ActorSPIFFEID = *node.ActorSpiffeID
+			}
+			if node.EventType != nil {
+				rec.EventType = *node.EventType
+			}
+			if node.ActionStatus != nil {
+				rec.ActionStatus = *node.ActionStatus
+			}
+			if node.ClientIp != nil {
+				rec.ClientIP = *node.ClientIp
+			}
+			if node.UserAgent != nil {
+				rec.UserAgent = *node.UserAgent
+			}
+			if node.Payload != nil {
+				rec.Payload = *node.Payload
+			}
+			if node.Timestamp.Valid {
+				rec.Timestamp = node.Timestamp.Time
+			}
+			recomputed, err := audit.LeafAudit(rec)
+			if err != nil {
+				t.Fatalf("seq %d: %v", node.Seq, err)
+			}
+			if !bytes.Equal(recomputed.Bytes(), node.LeafHash) {
+				t.Errorf("seq %d: payload does not reproduce its stored leaf; the SQL projection and the Go serializer disagree", node.Seq)
+			}
 		}
 	}
 }
 
 func testAuditBoundedList(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		hash := strings.Repeat("3", 64)
-		if _, err := q.InsertAuditLog(ctx, auditParams("test.bounded.list", hash)); err != nil {
-			t.Fatalf("InsertAuditLog: %v", err)
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.bounded.list", audit.AuditGenesis())); err != nil {
+			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
 
 		now := time.Now()
@@ -894,8 +987,11 @@ func testAuditBoundedList(ctx context.Context, q *Queries) func(*testing.T) {
 			if l.EventType != "test.bounded.list" {
 				t.Errorf("event_type filter leaked: %q", l.EventType)
 			}
-			if l.ChainHash == "" {
-				t.Error("chain_hash must be included for client-side verification")
+			// Both digests travel with a listing so a client can verify the page
+			// itself: the leaf binds the record, the chain digest binds its position.
+			if len(l.ChainHash) != audit.DigestSize || len(l.LeafHash) != audit.DigestSize {
+				t.Errorf("listing must include both digests for client-side verification, got leaf=%d chain=%d bytes",
+					len(l.LeafHash), len(l.ChainHash))
 			}
 		}
 
@@ -931,13 +1027,11 @@ func testAuditBoundedList(ctx context.Context, q *Queries) func(*testing.T) {
 func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		// Insert two ordered records.
-		hashA := strings.Repeat("4", 64)
-		hashB := strings.Repeat("5", 64)
-		if _, err := q.InsertAuditLog(ctx, auditParams("test.verify.a", hashA)); err != nil {
-			t.Fatalf("InsertAuditLog a: %v", err)
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.a", audit.AuditGenesis())); err != nil {
+			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
-		if _, err := q.InsertAuditLog(ctx, auditParams("test.verify.b", hashB)); err != nil {
-			t.Fatalf("InsertAuditLog b: %v", err)
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.b", audit.AuditGenesis())); err != nil {
+			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
 
 		// Ascending keyset scan from genesis must return records in insertion
@@ -950,13 +1044,13 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		page, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
+		page, err := q.ListAuditLogChainForVerification(ctx, ListAuditLogChainForVerificationParams{
 			ThroughSeq: head,
 			AfterSeq:   0,
 			PageLimit:  1000,
 		})
 		if err != nil {
-			t.Fatalf("ListAuditLogsForChainVerification: %v", err)
+			t.Fatalf("ListAuditLogChainForVerification: %v", err)
 		}
 		if len(page) < 2 {
 			t.Fatalf("expected at least 2 records, got %d", len(page))
@@ -972,24 +1066,24 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		// The keyset boundary is exclusive: resuming from the first page's last seq
 		// must not repeat it. An off-by-one here would make a verifier hash one
 		// record twice and report a break in an intact chain.
-		firstOnly, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
+		firstOnly, err := q.ListAuditLogChainForVerification(ctx, ListAuditLogChainForVerificationParams{
 			ThroughSeq: head,
 			AfterSeq:   0,
 			PageLimit:  1,
 		})
 		if err != nil {
-			t.Fatalf("ListAuditLogsForChainVerification (page 1): %v", err)
+			t.Fatalf("ListAuditLogChainForVerification (page 1): %v", err)
 		}
 		if len(firstOnly) != 1 {
 			t.Fatalf("expected exactly 1 record with PageLimit=1, got %d", len(firstOnly))
 		}
-		next, err := q.ListAuditLogsForChainVerification(ctx, ListAuditLogsForChainVerificationParams{
+		next, err := q.ListAuditLogChainForVerification(ctx, ListAuditLogChainForVerificationParams{
 			ThroughSeq: head,
 			AfterSeq:   firstOnly[0].Seq,
 			PageLimit:  1,
 		})
 		if err != nil {
-			t.Fatalf("ListAuditLogsForChainVerification (page 2): %v", err)
+			t.Fatalf("ListAuditLogChainForVerification (page 2): %v", err)
 		}
 		if len(next) != 1 {
 			t.Fatalf("expected exactly 1 record on page 2, got %d", len(next))
@@ -999,47 +1093,66 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 				next[0].Seq, firstOnly[0].Seq)
 		}
 
-		// InsertAuditLogs (copyfrom batch used by the Task 5.2 signing consumer).
+		// The COPY batch path used by the signing consumer.
 		//
-		// id is supplied by the caller rather than defaulted by the database. That is
-		// what makes the pipeline idempotent: the publisher mints the id, ships it as
-		// the JetStream Nats-Msg-Id, and the signer filters ids that already exist
-		// before this COPY. A server-generated id would make a redelivered message a
-		// brand-new row, silently duplicating events inside the hash chain.
+		// The signer allocates sequences first, then COPYs chain nodes and payloads
+		// separately. event_id is supplied by the caller rather than defaulted by
+		// the database, and it lives on the chain node: the publisher mints it,
+		// ships it as the JetStream Nats-Msg-Id, and the signer filters ids that
+		// already exist before these COPYs. A server-generated id would make a
+		// redelivered message a brand-new row, silently duplicating events inside
+		// the hash chain — and keeping the id on the never-deleted chain node is
+		// what makes that guard survive a payload erasure.
 		now := time.Now().UTC()
-		batchIDs := []uuid.UUID{uuid.New(), uuid.New()}
-		batch := []InsertAuditLogsParams{
-			{
-				ID:            batchIDs[0],
-				ActorID:       uuid.New(),
-				ActorSpiffeID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
-				EventType:     "test.batch.insert",
-				ActionStatus:  "success",
-				ClientIp:      "127.0.0.1",
-				UserAgent:     "go-test",
-				Payload:       "{}",
-				Timestamp:     ts(now),
-				ChainHash:     strings.Repeat("6", 64),
-			},
-			{
-				ID:            batchIDs[1],
-				ActorID:       uuid.New(),
-				ActorSpiffeID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
-				EventType:     "test.batch.insert",
-				ActionStatus:  "success",
-				ClientIp:      "127.0.0.1",
-				UserAgent:     "go-test",
-				Payload:       "{}",
-				Timestamp:     ts(now.Add(time.Millisecond)),
-				ChainHash:     strings.Repeat("7", 64),
-			},
-		}
-		n, err := q.InsertAuditLogs(ctx, batch)
+		seqs, err := q.AllocateAuditLogSeqs(ctx, 2)
 		if err != nil {
-			t.Fatalf("InsertAuditLogs batch: %v", err)
+			t.Fatalf("AllocateAuditLogSeqs: %v", err)
 		}
-		if n != 2 {
-			t.Errorf("expected 2 batch rows inserted, got %d", n)
+		if len(seqs) != 2 || seqs[1] <= seqs[0] {
+			t.Fatalf("AllocateAuditLogSeqs = %v, want two ascending positions", seqs)
+		}
+
+		batchIDs := []uuid.UUID{uuid.New(), uuid.New()}
+		chainNodes := make([]InsertAuditLogChainParams, 0, 2)
+		payloads := make([]InsertAuditLogsParams, 0, 2)
+		previous := audit.AuditGenesis()
+		for i, id := range batchIDs {
+			timestamp := audit.NormalizeChainTime(now.Add(time.Duration(i) * time.Millisecond))
+			actorID := uuid.New()
+			rec := audit.AuditRecord{
+				ID: id.String(), ActorID: actorID.String(),
+				ActorSPIFFEID: "spiffe://hatef.ir/ns/identity/sa/idp-core",
+				EventType:     "test.batch.insert", ActionStatus: "success",
+				ClientIP: "127.0.0.1", UserAgent: "go-test", Payload: "{}",
+				Timestamp: timestamp,
+			}
+			leaf, leafErr := audit.LeafAudit(rec)
+			if leafErr != nil {
+				t.Fatal(leafErr)
+			}
+			previous = audit.ChainAudit(previous, leaf)
+			chainNodes = append(chainNodes, InsertAuditLogChainParams{
+				Seq: seqs[i], EventID: id, LeafHash: leaf.Bytes(), ChainHash: previous.Bytes(),
+			})
+			payloads = append(payloads, InsertAuditLogsParams{
+				Seq: seqs[i], ActorID: actorID, ActorSpiffeID: rec.ActorSPIFFEID,
+				EventType: rec.EventType, ActionStatus: rec.ActionStatus,
+				ClientIp: rec.ClientIP, UserAgent: rec.UserAgent, Payload: rec.Payload,
+				Timestamp: ts(timestamp),
+			})
+		}
+
+		// Chain nodes first: the payload rows reference them, and the FK is
+		// ON DELETE RESTRICT so the ordering is enforced rather than conventional.
+		if n, err := q.InsertAuditLogChain(ctx, chainNodes); err != nil {
+			t.Fatalf("InsertAuditLogChain batch: %v", err)
+		} else if n != 2 {
+			t.Errorf("expected 2 chain nodes inserted, got %d", n)
+		}
+		if n, err := q.InsertAuditLogs(ctx, payloads); err != nil {
+			t.Fatalf("InsertAuditLogs batch: %v", err)
+		} else if n != 2 {
+			t.Errorf("expected 2 payload rows inserted, got %d", n)
 		}
 
 		// FilterExistingAuditLogIDs is the signer's pre-COPY duplicate guard. It must
@@ -1055,14 +1168,19 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 			t.Errorf("FilterExistingAuditLogIDs = %v, want exactly [%v]", existing, batchIDs[0])
 		}
 
-		// The chain tip must be the most recent row by seq, which is the value the
-		// signer seeds its in-memory chain from on startup.
-		tip, err := q.GetLatestAuditLogChainHash(ctx)
+		// The chain tip must be the last node written by the batch.
+		//
+		// Runtime code does not read the tip this way: it reads the durable head,
+		// because an empty table and an uninitialized chain are different states and
+		// only the head distinguishes them. This assertion is about the COPY having
+		// landed in the order the signer computed.
+		tip, err := q.GetAuditLogChainTip(ctx)
 		if err != nil {
-			t.Fatalf("GetLatestAuditLogChainHash: %v", err)
+			t.Fatalf("GetAuditLogChainTip: %v", err)
 		}
-		if tip != strings.Repeat("7", 64) {
-			t.Errorf("GetLatestAuditLogChainHash = %q, want the last batch row's hash", tip)
+		last := chainNodes[len(chainNodes)-1]
+		if tip.Seq != last.Seq || !bytes.Equal(tip.ChainHash, last.ChainHash) {
+			t.Errorf("tip = (seq %d, %x), want (seq %d, %x)", tip.Seq, tip.ChainHash, last.Seq, last.ChainHash)
 		}
 	}
 }

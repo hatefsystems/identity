@@ -42,7 +42,9 @@ const coverageNote = "matching indexed retained records only; ingestion may be p
 
 // LookupResult holds one bounded disclosure and its authenticated continuation.
 type LookupResult struct {
-	Events     []db.SecurityEventLedger
+	// Events carries the joined chain+payload row: the payload columns plus the
+	// chain node's event_id, which is now the only place the event UUID lives.
+	Events     []db.LookupLegalAttributionRow
 	NextCursor string
 	Fields     []string
 	Coverage   Coverage

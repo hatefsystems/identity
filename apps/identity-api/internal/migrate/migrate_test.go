@@ -17,6 +17,7 @@
 package migrate
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 )
@@ -86,7 +88,11 @@ func TestInitialSchemaMigration(t *testing.T) {
 		tables := []string{
 			"users", "roles", "permissions", "role_permissions", "user_roles",
 			"webauthn_credentials", "recovery_codes", "mvp_audit_logs",
-			"security_event_ledger", "security_ledger_head", "security_ledger_checkpoints", "security_ledger_retention_settings",
+			"security_event_ledger", "security_ledger_head", "security_ledger_retention_settings",
+			// Canonical format v2 (migration 00015): tamper-evidence lives in its
+			// own append-only tables, and security_ledger_checkpoints is gone —
+			// erasure no longer breaks a chain, so there is nothing to bridge.
+			"audit_log_chain", "security_ledger_chain", "security_ledger_erasures", "audit_log_head",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -111,7 +117,9 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"idx_webauthn_user_id",
 			"idx_recovery_codes_hash", "idx_recovery_codes_user_id",
 			"idx_mvp_audit_logs_event_type", "idx_mvp_audit_logs_timestamp",
-			"idx_security_ledger_retention_seq",
+			// Drives the retention worker's candidate scan, which pages by
+			// (retain_until, seq). Replaced idx_security_ledger_retention_seq.
+			"idx_security_ledger_retention",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -193,51 +201,77 @@ func TestInitialSchemaMigration(t *testing.T) {
 			`INSERT INTO users (email) VALUES ('audit@test.local') RETURNING id`).Scan(&userID); err != nil {
 			t.Fatalf("insert user: %v", err)
 		}
-		var logID string
-		err := sqldb.QueryRowContext(ctx,
+		// Chain node first: the payload references it, and the FK is
+		// ON DELETE RESTRICT so the ordering is enforced rather than conventional.
+		var seq int64
+		if err := sqldb.QueryRowContext(ctx,
+			`INSERT INTO audit_log_chain (event_id, leaf_hash, chain_hash)
+			 VALUES (gen_random_uuid(), sha256('leaf'), sha256('chain')) RETURNING seq`).Scan(&seq); err != nil {
+			t.Fatalf("insert chain node: %v", err)
+		}
+		if _, err := sqldb.ExecContext(ctx,
 			`INSERT INTO mvp_audit_logs
-				(user_id, actor_id, actor_spiffe_id, event_type, action_status,
-				 client_ip, user_agent, payload, chain_hash)
-			 VALUES ($1, $1, 'spiffe://hatef.ir/ns/identity/sa/idp-core',
-				 'user.created', 'success', '127.0.0.1', 'go-test', '{}', $2)
-			 RETURNING id`, userID, strings.Repeat("b", 64)).Scan(&logID)
-		if err != nil {
+				(seq, user_id, actor_id, actor_spiffe_id, event_type, action_status,
+				 client_ip, user_agent, payload)
+			 VALUES ($1, $2, $2, 'spiffe://hatef.ir/ns/identity/sa/idp-core',
+				 'user.created', 'success', '127.0.0.1', 'go-test', '{}')`, seq, userID); err != nil {
 			t.Fatalf("insert audit log: %v", err)
 		}
 
-		// Direct UPDATE must be rejected by the append-only trigger.
+		// The payload is immutable and un-truncatable for every role.
 		if _, err := sqldb.ExecContext(ctx,
-			`UPDATE mvp_audit_logs SET payload = 'tampered' WHERE id = $1`, logID); err == nil {
+			`UPDATE mvp_audit_logs SET payload = 'tampered' WHERE seq = $1`, seq); err == nil {
 			t.Fatal("expected UPDATE on mvp_audit_logs to be rejected")
 		}
-		// Direct DELETE must be rejected.
-		if _, err := sqldb.ExecContext(ctx,
-			`DELETE FROM mvp_audit_logs WHERE id = $1`, logID); err == nil {
-			t.Fatal("expected DELETE on mvp_audit_logs to be rejected")
-		}
-		// TRUNCATE must be rejected.
 		if _, err := sqldb.ExecContext(ctx, `TRUNCATE mvp_audit_logs`); err == nil {
 			t.Fatal("expected TRUNCATE on mvp_audit_logs to be rejected")
 		}
+		// The chain node is additionally undeletable: erasing a payload is a
+		// retention operation, removing tamper-evidence never is.
+		if _, err := sqldb.ExecContext(ctx,
+			`UPDATE audit_log_chain SET chain_hash = sha256('x') WHERE seq = $1`, seq); err == nil {
+			t.Fatal("expected UPDATE on audit_log_chain to be rejected")
+		}
+		if _, err := sqldb.ExecContext(ctx,
+			`DELETE FROM audit_log_chain WHERE seq = $1`, seq); err == nil {
+			t.Fatal("expected DELETE on audit_log_chain to be rejected")
+		}
 
 		// The GDPR hard-delete purge path (FK ON DELETE SET NULL) must remain
-		// possible: deleting the user nulls user_id but keeps the ledger row.
+		// possible: deleting the user nulls user_id and keeps everything else
+		// byte-identical, which is why user_id is excluded from the leaf digest.
+		var leafBefore []byte
+		if err := sqldb.QueryRowContext(ctx,
+			`SELECT leaf_hash FROM audit_log_chain WHERE seq = $1`, seq).Scan(&leafBefore); err != nil {
+			t.Fatalf("read leaf: %v", err)
+		}
 		if _, err := sqldb.ExecContext(ctx,
 			`DELETE FROM users WHERE id = $1`, userID); err != nil {
 			t.Fatalf("hard-delete user (expected to succeed): %v", err)
 		}
 		var gotUserID sql.NullString
+		var leafAfter []byte
 		if err := sqldb.QueryRowContext(ctx,
-			`SELECT user_id FROM mvp_audit_logs WHERE id = $1`, logID).Scan(&gotUserID); err != nil {
+			`SELECT l.user_id, c.leaf_hash FROM mvp_audit_logs l
+			 JOIN audit_log_chain c ON c.seq = l.seq WHERE l.seq = $1`, seq).
+			Scan(&gotUserID, &leafAfter); err != nil {
 			t.Fatalf("re-read audit log: %v", err)
 		}
 		if gotUserID.Valid {
 			t.Errorf("expected audit log user_id to be NULL after user hard delete, got %q", gotUserID.String)
 		}
+		if !bytes.Equal(leafBefore, leafAfter) {
+			t.Error("the GDPR purge altered the stored leaf digest")
+		}
 	})
 
 	t.Run("ForwardOnlyRefusalPreservesState", func(t *testing.T) {
-		if _, err := sqldb.ExecContext(ctx, `INSERT INTO security_ledger_head(singleton,seq,chain_hash) VALUES(true,0,repeat('0',64))`); err != nil {
+		// The genesis seed is derived, not 32 zero bytes, and the CHECK constraint
+		// enforces it at seq 0 — so this insert doubles as a schema/code parity
+		// assertion. See TestGenesisMatchesMigration.
+		if _, err := sqldb.ExecContext(ctx,
+			`INSERT INTO security_ledger_head(singleton,seq,chain_hash) VALUES(true,0,decode($1,'hex'))`,
+			audit.GoldenLedgerGenesisHex); err != nil {
 			t.Fatal(err)
 		}
 		if err := Reset(ctx, sqldb); err == nil || !strings.Contains(err.Error(), "forward-only") {

@@ -60,8 +60,16 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 			return
 		}
 
-		limit, offset, err := s.parsePagination(r)
+		limit, _, err := s.parsePagination(r)
 		if err != nil {
+			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		// Keyset cursor. v1 took an offset, which made every page view re-scan and
+		// re-count the whole matching range; the mandatory time bounds do not bound
+		// that, because a DPO legitimately asks for a year.
+		beforeSeq, err := parseInt64Param(r, "before_seq", 0)
+		if err != nil || beforeSeq < 0 {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -81,11 +89,11 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 		end := pgtype.Timestamptz{Time: endTime, Valid: true}
 
 		page, err := s.adminStore(r).ListAuditLogsPage(r.Context(), db.ListAuditLogsPageParams{
-			StartTime:  start,
-			EndTime:    end,
-			EventType:  eventType,
-			PageOffset: offset,
-			PageLimit:  limit,
+			StartTime: start,
+			EndTime:   end,
+			EventType: eventType,
+			BeforeSeq: beforeSeq,
+			PageLimit: limit,
 		})
 		if err != nil {
 			s.logger.Error("admin: list audit logs failed", "error", err.Error())
@@ -102,7 +110,8 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 		payload := map[string]any{
 			"start_time":   startTime.Format(time.RFC3339Nano),
 			"end_time":     endTime.Format(time.RFC3339Nano),
-			"result_count": len(items), "limit": limit, "offset": offset,
+			"result_count": len(items), "limit": limit, "before_seq": beforeSeq,
+			"has_more": page.HasMore, "next_before_seq": page.NextBeforeSeq,
 			"record_set_digest": hex.EncodeToString(digest[:]),
 		}
 		if eventType != nil {
@@ -119,9 +128,15 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 			Payload:      payload,
 		})
 
-		s.writeAdminJSON(w, http.StatusOK, adminPage[adminAuditLogResponse]{
-			Items: items, Total: page.Total, Limit: limit, Offset: offset,
-		})
+		s.writeAdminJSON(w, http.StatusOK, struct {
+			Items []adminAuditLogResponse `json:"items"`
+			Limit int32                   `json:"limit"`
+			// HasMore and NextBeforeSeq replace the exact total: counting an
+			// append-only table that grows without bound is not worth an O(n) scan
+			// on every page view.
+			HasMore       bool  `json:"has_more"`
+			NextBeforeSeq int64 `json:"next_before_seq"`
+		}{items, limit, page.HasMore, page.NextBeforeSeq})
 	}
 }
 
@@ -130,7 +145,7 @@ type chainVerifyParams struct {
 	afterSeq        int64
 	throughSeq      int64
 	hasThrough      bool
-	predecessorHash string
+	predecessorHash []byte
 	limit           int32
 }
 
@@ -162,12 +177,13 @@ func (s *Server) parseChainVerifyParams(r *http.Request) (chainVerifyParams, err
 	if (hasThrough && strings.TrimSpace(r.URL.Query().Get("through_seq")) == "") || (afterSeq > 0 && !hasThrough) || (hasThrough && afterSeq > through) {
 		return chainVerifyParams{}, errors.New("invalid verification range")
 	}
-	predecessor := r.URL.Query().Get("predecessor_hash")
+	var predecessor []byte
 	if r.URL.Query().Has("predecessor_hash") {
-		if _, err := audit.DecodeChainHash(predecessor); err != nil {
+		digest, err := audit.DecodeDigestHex(strings.ToLower(r.URL.Query().Get("predecessor_hash")))
+		if err != nil {
 			return chainVerifyParams{}, errors.New("invalid predecessor hash")
 		}
-		predecessor = strings.ToLower(predecessor)
+		predecessor = digest.Bytes()
 	}
 	return chainVerifyParams{afterSeq: afterSeq, throughSeq: through, hasThrough: hasThrough, predecessorHash: predecessor, limit: int32(limit)}, nil
 }
@@ -177,58 +193,63 @@ const defaultChainVerifyLimit = 1000
 
 // handleAdminVerifyAuditChain serves GET /api/v1/admin/audit-logs/verify.
 //
-// It recomputes chain_hash(N) = SHA-256(chain_hash(N-1) || serialize(record))
-// over a page of mvp_audit_logs using audit.SerializeAudit and audit.ChainHash
-// — never a local reimplementation. A second serializer would eventually
-// disagree with the signer's by a byte and report tampering across an intact
-// chain, which is why internal/audit/chain.go owns exactly one.
+// Both verification routes go through one walker (internal/audit/ledgerproof),
+// which in turn uses internal/audit's single canonical serializer. v1 had a
+// separate recomputation loop here for the audit chain and a different one in
+// ledgerproof for the ledger; two implementations of the same check eventually
+// disagree by a byte and report tampering across an intact chain.
 func (s *Server) handleAdminVerifyAuditChain() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.runChainVerification(w, r, "audit", func(ctx context.Context, p chainVerifyParams) ([]chainRow, error) {
-			logs, err := s.adminStore(r).ListAuditLogsForChainVerification(ctx, db.ListAuditLogsForChainVerificationParams{
-				AfterSeq:   p.afterSeq,
-				ThroughSeq: p.throughSeq,
-				PageLimit:  p.limit + 1,
-			})
-			if err != nil {
-				return nil, err
-			}
-			rows := make([]chainRow, 0, len(logs))
-			for _, l := range logs {
-				rows = append(rows, chainRow{
-					seq:        l.Seq,
-					storedHash: l.ChainHash,
-					body: audit.SerializeAudit(audit.AuditRecord{
-						ID:            l.ID.String(),
-						ActorID:       l.ActorID.String(),
-						ActorSPIFFEID: l.ActorSpiffeID,
-						EventType:     l.EventType,
-						ActionStatus:  l.ActionStatus,
-						ClientIP:      l.ClientIp,
-						UserAgent:     l.UserAgent,
-						Payload:       l.Payload,
-						Timestamp:     l.Timestamp.Time,
-					}),
-				})
-			}
-			return rows, nil
-		}, s.adminStore(r).GetAuditLogChainHashBySeq, s.adminStore(r).GetAuditLogHighWaterSeq)
+		s.runChainVerification(w, r, ledgerproof.ChainAudit, s.snapshotVerifier())
+	}
+}
+
+// chainVerifier runs one verification pass. It is injected so a handler test can
+// drive the HTTP contract — status codes, the recorded audit event, the response
+// projection — against a constructed chain, without a database.
+type chainVerifier func(context.Context, ledgerproof.Params) (ledgerproof.Result, error)
+
+// snapshotVerifier is the production verifier: a bounded read-only snapshot.
+func (s *Server) snapshotVerifier() chainVerifier {
+	return func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
+		if s.deps.LedgerProofDB == nil {
+			return ledgerproof.Result{}, errors.New("verification database unavailable")
+		}
+		return ledgerproof.VerifySnapshot(ctx, s.deps.LedgerProofDB, p)
 	}
 }
 
 // handleAdminVerifyLedgerChain serves GET /api/v1/admin/ledger/verify.
 func (s *Server) handleAdminVerifyLedgerChain() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.runLedgerVerification(w, r, func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
-			if s.deps.LedgerProofDB == nil {
-				return ledgerproof.Result{}, errors.New("ledger snapshot database unavailable")
-			}
-			return ledgerproof.VerifySnapshot(ctx, s.deps.LedgerProofDB, p)
-		})
+		s.runChainVerification(w, r, ledgerproof.ChainLedger, s.snapshotVerifier())
 	}
 }
 
-func (s *Server) runLedgerVerification(w http.ResponseWriter, r *http.Request, verify func(context.Context, ledgerproof.Params) (ledgerproof.Result, error)) {
+// chainVerifyScope describes exactly what a clean result does and does not prove.
+// It is returned to the caller verbatim so an operator cannot mistake a
+// database-relative check for independent historical authenticity: everything
+// here is recomputed from the same database that would be rewritten by a
+// privileged attacker. External anchoring is deliberately out of scope.
+const (
+	auditVerifyScope  = "stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity"
+	ledgerVerifyScope = "database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity"
+)
+
+// Short, stable tokens for the audit record. The prose above is for the operator
+// reading the HTTP response; an audit payload needs a value that can be alerted
+// on and correlated, and internal/adminaction enforces the enum.
+const (
+	auditVerifyScopeToken  = "audit_chain_database_relative"
+	ledgerVerifyScopeToken = "ledger_chain_database_relative"
+)
+
+// runChainVerification verifies one chain and records the attempt.
+//
+// It stops at the first mismatch. Continuing would be misleading: every
+// subsequent node chains off the broken one, so they would all "fail" and bury
+// the single seq that actually matters under noise.
+func (s *Server) runChainVerification(w http.ResponseWriter, r *http.Request, chain ledgerproof.Chain, verify chainVerifier) {
 	actor, ok := s.adminActor(w, r)
 	if !ok {
 		return
@@ -238,261 +259,80 @@ func (s *Server) runLedgerVerification(w http.ResponseWriter, r *http.Request, v
 		s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	result, err := verify(r.Context(), ledgerproof.Params{AfterSeq: p.afterSeq, ThroughSeq: p.throughSeq,
-		HasThrough: p.hasThrough, PredecessorHash: p.predecessorHash, Limit: p.limit})
+
+	result, err := verify(r.Context(), ledgerproof.Params{
+		Chain: chain, AfterSeq: p.afterSeq, ThroughSeq: p.throughSeq,
+		HasThrough: p.hasThrough, PredecessorHash: p.predecessorHash, Limit: p.limit,
+	})
 	if err != nil {
-		switch err.Error() {
-		case "unknown_after_seq", "unknown_through_seq", "invalid_request":
-			s.writeAdminError(w, http.StatusBadRequest, err.Error())
+		switch {
+		case errors.Is(err, ledgerproof.ErrUnknownSeq):
+			// The caller named a seq that does not exist. Approximating with a
+			// neighbouring node would hand verification the wrong predecessor and
+			// report a break in an intact chain.
+			s.writeAdminError(w, http.StatusBadRequest, "unknown_seq")
+		case errors.Is(err, ledgerproof.ErrMissingHead):
+			s.writeAdminError(w, http.StatusBadRequest, "missing_head")
 		default:
-			s.logger.Error("admin: ledger snapshot verification failed")
+			s.logger.Error("admin: chain verification failed", "chain", string(chain))
 			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
 		}
 		return
 	}
-	resp := adminLedgerVerifyResponse{adminChainVerifyResponse: adminChainVerifyResponse{
-		Chain: "ledger", AfterSeq: result.AfterSeq, ThroughSeq: result.ThroughSeq,
-		SeedHash: result.SeedHash, SeedSource: result.SeedSource, Verified: result.Verified,
-		Complete: result.Complete, Checked: result.Checked, FirstSeq: result.FirstSeq,
-		LastSeq: result.LastSeq, LastHash: result.LastHash, NextAfterSeq: result.NextAfterSeq,
-		BrokenAtSeq: result.BrokenAtSeq, ExpectedHash: result.ExpectedHash, StoredHash: result.StoredHash,
-		FailureReason: result.FailureReason,
-		Scope:         "database_relative_retained_segment; erased bodies not recomputed; not complete ingestion or independent historical authenticity",
-	}, PurgedCount: result.PurgedCount, PurgedSpans: result.PurgedSpans,
-		ProofSteps: result.ProofSteps, RestartRequired: result.RestartRequired}
+
+	scope, scopeToken := auditVerifyScope, auditVerifyScopeToken
+	if chain == ledgerproof.ChainLedger {
+		scope, scopeToken = ledgerVerifyScope, ledgerVerifyScopeToken
+	}
+	base := adminChainVerifyResponse{
+		FailureReason: result.FailureReason, Chain: result.Chain,
+		AfterSeq: result.AfterSeq, ThroughSeq: result.ThroughSeq,
+		SeedHash: result.SeedHash, SeedSource: result.SeedSource, Scope: scope,
+		LastHash: result.LastHash, Complete: result.Complete, Verified: result.Verified,
+		Checked: result.Checked, FirstSeq: result.FirstSeq, LastSeq: result.LastSeq,
+		BrokenAtSeq: result.BrokenAtSeq, ExpectedHash: result.ExpectedHash,
+		StoredHash: result.StoredHash, NextAfterSeq: result.NextAfterSeq,
+	}
+
 	payload := map[string]any{
-		"chain": "ledger", "verified": resp.Verified, "checked": resp.Checked,
-		"after_seq": resp.AfterSeq, "through_seq": resp.ThroughSeq,
-		"verification_scope": "database_relative_retained_segment", "complete": resp.Complete,
-		"purged_count": resp.PurgedCount, "purged_spans": resp.PurgedSpans,
-		"proof_steps": resp.ProofSteps, "restart_required": resp.RestartRequired,
+		"chain": result.Chain, "verified": result.Verified, "checked": result.Checked,
+		"after_seq": result.AfterSeq, "through_seq": result.ThroughSeq,
+		"complete": result.Complete, "verification_scope": scopeToken,
+		"erased_checked": result.ErasedChecked,
 	}
-	if resp.SeedHash != "" {
-		payload["seed_hash"], payload["seed_source"] = resp.SeedHash, resp.SeedSource
+	if result.SeedHash != "" {
+		payload["seed_hash"], payload["seed_source"] = result.SeedHash, result.SeedSource
 	}
-	if resp.BrokenAtSeq != nil {
-		payload["broken_at_seq"] = *resp.BrokenAtSeq
+	if result.BrokenAtSeq != nil {
+		payload["broken_at_seq"] = *result.BrokenAtSeq
 	}
-	if resp.LastHash != nil {
-		payload["last_hash"] = *resp.LastHash
+	if result.LastHash != "" {
+		payload["last_hash"] = result.LastHash
 	}
 	status := audit.StatusSuccess
-	if resp.FailureReason != nil {
-		payload["failure_reason"] = *resp.FailureReason
-		// Retention and unavailable historical boundaries are not tamper alarms.
-		if *resp.FailureReason != "no_retained_records" && !resp.RestartRequired {
+	if result.FailureReason != nil {
+		payload["failure_reason"] = *result.FailureReason
+		// An empty range is not a tamper alarm; every other failure is. v1 also
+		// excused "no_retained_records", which existed because erasure could empty
+		// a span. That excuse is gone: in v2 an absent payload is either covered by
+		// an erasure record or it is tampering, and the walker already decided
+		// which.
+		if *result.FailureReason != "no_stored_records" {
 			status = audit.StatusFailure
 		}
 	}
+
+	// Reading the tamper-evident log is itself an auditable act: without this, the
+	// one surface that observes everything would observe nothing about its own use.
 	adminaction.SetEvent(r.Context(), audit.Event{EventType: audit.EventAdminChainVerified,
 		ActionStatus: status, ActorID: actor, Payload: payload})
+
 	// adminTransaction withholds this content-free response until audit commits.
-	s.writeAdminJSON(w, http.StatusOK, resp)
-}
-
-// chainRow is one row reduced to what verification needs.
-type chainRow struct {
-	seq        int64
-	storedHash string
-	body       []byte
-}
-
-// chainFetcher loads a page of rows for verification.
-type chainFetcher func(ctx context.Context, p chainVerifyParams) ([]chainRow, error)
-
-// chainSeeder returns the stored digest at an exact seq.
-type chainSeeder func(ctx context.Context, seq int64) (string, error)
-
-// runChainVerification verifies the unchanged Class C audit chain.
-//
-// It stops at the first mismatch. Continuing would be misleading: every
-// subsequent row chains off the broken one, so they would all "fail" and bury
-// the single seq that actually matters under noise.
-func (s *Server) runChainVerification(
-	w http.ResponseWriter,
-	r *http.Request,
-	chainName string,
-	fetch chainFetcher,
-	seed chainSeeder,
-	highWater func(context.Context) (int64, error),
-) {
-	actor, ok := s.adminActor(w, r)
-	if !ok {
+	if chain == ledgerproof.ChainLedger {
+		s.writeAdminJSON(w, http.StatusOK, adminLedgerVerifyResponse{
+			adminChainVerifyResponse: base, ErasedChecked: result.ErasedChecked,
+		})
 		return
 	}
-
-	params, err := s.parseChainVerifyParams(r)
-	if err != nil {
-		s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
-		return
-	}
-	if !params.hasThrough {
-		params.throughSeq, err = highWater(r.Context())
-		if err != nil {
-			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			return
-		}
-	}
-	// An explicit upper boundary must still exist. Never claim a completed proof
-	// when a requested tail has disappeared between pages.
-	if params.throughSeq > 0 {
-		if _, err := seed(r.Context(), params.throughSeq); err != nil {
-			if isNoRows(err) {
-				s.writeAdminError(w, http.StatusBadRequest, "unknown_through_seq")
-			} else {
-				s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			}
-			return
-		}
-	}
-
-	// Seed the predecessor digest. after_seq == 0 starts at genesis, which is
-	// chained like any other record so there is no special case to forge a new
-	// "first" row against.
-	prev := audit.GenesisChainHash
-	seedSource := "genesis"
-	if params.afterSeq > 0 {
-		stored, seedErr := seed(r.Context(), params.afterSeq)
-		if seedErr != nil {
-			if isNoRows(seedErr) {
-				// The caller named a seq that does not exist. Approximating
-				// with a neighbouring row would hand verification the wrong
-				// predecessor and report a break in an intact chain.
-				s.writeAdminError(w, http.StatusBadRequest, "unknown_after_seq")
-				return
-			}
-			s.logger.Error("admin: chain verify seed failed", "chain", chainName, "error", seedErr.Error())
-			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			return
-		}
-		decoded, decodeErr := audit.DecodeChainHash(stored)
-		if decodeErr != nil {
-			s.logger.Error("admin: stored chain hash is malformed",
-				"chain", chainName, "seq", params.afterSeq, "error", decodeErr.Error())
-			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			return
-		}
-		prev = decoded
-		seedSource = "database_predecessor"
-	}
-	storedSeed := hex.EncodeToString(prev[:])
-	seedMismatch := false
-	if params.predecessorHash != "" {
-		seedMismatch = params.predecessorHash != storedSeed
-		prev, _ = audit.DecodeChainHash(params.predecessorHash)
-		seedSource = "supplied_predecessor"
-	}
-	seedHash := hex.EncodeToString(prev[:])
-
-	rows, err := fetch(r.Context(), params)
-	if err != nil {
-		s.logger.Error("admin: chain verify fetch failed", "chain", chainName, "error", err.Error())
-		s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-		return
-	}
-
-	resp := adminChainVerifyResponse{
-		Verified: true, Chain: chainName, AfterSeq: params.afterSeq, ThroughSeq: params.throughSeq,
-		SeedHash: seedHash, SeedSource: seedSource,
-		Scope: "stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity",
-	}
-	hasMore := len(rows) > int(params.limit)
-	if hasMore {
-		rows = rows[:params.limit]
-	}
-	if seedMismatch {
-		resp.Verified = false
-		resp.FailureReason = stringPtr("predecessor_mismatch")
-		resp.BrokenAtSeq = int64Ptr(params.afterSeq)
-		resp.ExpectedHash, resp.StoredHash = stringPtr(seedHash), stringPtr(storedSeed)
-		rows = nil
-	} else if len(rows) == 0 {
-		resp.Verified = false
-		resp.FailureReason = stringPtr("no_stored_records")
-	}
-	lastSeq := params.afterSeq
-	for i, row := range rows {
-		if row.seq <= lastSeq || row.seq > params.throughSeq {
-			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			return
-		}
-		lastSeq = row.seq
-		expected := audit.ChainHash(prev, row.body)
-		if i == 0 {
-			resp.FirstSeq = int64Ptr(row.seq)
-		}
-		resp.Checked++
-		resp.LastSeq = int64Ptr(row.seq)
-
-		if expected != row.storedHash {
-			resp.Verified = false
-			resp.BrokenAtSeq = int64Ptr(row.seq)
-			resp.ExpectedHash = stringPtr(expected)
-			resp.StoredHash = stringPtr(row.storedHash)
-			resp.FailureReason = stringPtr("hash_mismatch")
-			break
-		}
-
-		decoded, decodeErr := audit.DecodeChainHash(row.storedHash)
-		if decodeErr != nil {
-			// Unreachable while expected == storedHash (expected is always
-			// well-formed hex), but a malformed column must never silently
-			// propagate into the next digest.
-			s.logger.Error("admin: stored chain hash is malformed mid-scan",
-				"chain", chainName, "seq", row.seq, "error", decodeErr.Error())
-			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
-			return
-		}
-		prev = decoded
-		resp.LastHash = stringPtr(row.storedHash)
-	}
-
-	// A full final page is final too: only a real lookahead row implies another
-	// page. Complete refers exclusively to this stored segment and watermark.
-	if resp.Verified && hasMore && resp.LastSeq != nil {
-		resp.NextAfterSeq = resp.LastSeq
-	} else if resp.Verified && resp.LastSeq != nil {
-		if *resp.LastSeq == params.throughSeq {
-			resp.Complete = true
-		} else {
-			resp.Verified = false
-			resp.FailureReason = stringPtr("missing_upper_boundary")
-		}
-	}
-
-	// A detected break is the highest-severity signal this system produces, so
-	// it goes into the tamper-evident log itself and not only into an HTTP
-	// response the caller is free to discard.
-	payload := map[string]any{
-		"chain":              chainName,
-		"verified":           resp.Verified,
-		"checked":            resp.Checked,
-		"after_seq":          params.afterSeq,
-		"through_seq":        params.throughSeq,
-		"seed_hash":          seedHash,
-		"seed_source":        seedSource,
-		"verification_scope": "stored_segment_relative_to_seed",
-		"complete":           resp.Complete,
-	}
-	if resp.BrokenAtSeq != nil {
-		payload["broken_at_seq"] = *resp.BrokenAtSeq
-	}
-	if resp.FailureReason != nil {
-		payload["failure_reason"] = *resp.FailureReason
-	}
-	if resp.LastHash != nil {
-		payload["last_hash"] = *resp.LastHash
-	}
-	status := audit.StatusSuccess
-	if !resp.Verified {
-		status = audit.StatusFailure
-	}
-	adminaction.SetEvent(r.Context(), audit.Event{
-		EventType:    audit.EventAdminChainVerified,
-		ActionStatus: status,
-		ActorID:      actor,
-		Payload:      payload,
-	})
-
-	s.writeAdminJSON(w, http.StatusOK, resp)
+	s.writeAdminJSON(w, http.StatusOK, base)
 }
