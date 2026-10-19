@@ -24,6 +24,7 @@
     "rootDir": "."
   },
   "include": [
+    "proxy.ts",
     "app/**/*.ts",
     "app/**/*.tsx",
     "app/**/*.js",

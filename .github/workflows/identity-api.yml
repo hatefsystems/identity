@@ -286,6 +286,10 @@ jobs:
       - name: Build production web app
         run: npm exec -- nx run web:build --skipNxCache
 
+      # Nx 23.1.0 silently skips exec commands with --excludeTaskDependencies.
+      - name: Type-check web and security tests
+        run: npm exec -- nx exec -p web -- tsc --project "$GITHUB_WORKSPACE/apps/web/tsconfig.spec.json" --noEmit
+
       - name: Build non-root web image
         env:
           IMAGE_SOURCE: ${{ steps.image.outputs.source }}
@@ -298,8 +302,11 @@ jobs:
           --label "org.opencontainers.image.revision=$IMAGE_REVISION"
           --label "org.opencontainers.image.version=$IMAGE_VERSION" .
 
-      - name: Smoke-test standalone web image
-        run: node .github/scripts/smoke-image.mjs web identity-web:ci
+      - name: Install Chromium for production CSP checks
+        run: npm exec -- playwright install --with-deps chromium
+
+      - name: Smoke-test standalone web image and browser CSP
+        run: npm exec -- nx exec -p web -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
 
       - name: Export tested web release image
         if: steps.image.outputs.release == 'true'

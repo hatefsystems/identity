@@ -5,6 +5,7 @@ This playbook provides configuration specifications, deployment practices, secre
 ---
 
 ## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes, No ClickHouse & No Traefik)
+
 In the current MVP phase, the system is deployed using standard **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. Additionally, **ClickHouse is completely bypassed** in this phase to reduce RAM utilization by ~1.2 GB (using PostgreSQL fallback tables for logging instead).
 
 Furthermore, **Traefik is not provisioned in the MVP phase**. Instead, the platform leverages the **existing host-level Nginx** on the Ubuntu host to handle Reverse Proxying, TLS Termination, and path-based routing directly to the Docker containers. Traefik Ingress will be adopted post-MVP when migrating to a production Kubernetes cluster.
@@ -35,7 +36,7 @@ server {
     # SSL Certificate Configuration (Certbot / Let's Encrypt)
     ssl_certificate /etc/letsencrypt/live/identity.hatef.ir/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/identity.hatef.ir/privkey.pem;
-    
+
     # Secure SSL Protocols and Ciphers
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
@@ -55,7 +56,7 @@ server {
         # Overwrite untrusted inbound forwarding headers at the public edge.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
+
         # WebSockets support for Next.js Fast Refresh
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -95,7 +96,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
+
         # Forward OAuth Authorization and DPoP headers verbatim
         proxy_pass_header Authorization;
         proxy_pass_header DPoP;
@@ -109,6 +110,26 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+```
+
+#### Portal Document CSP (Task 7.1)
+
+The standalone Next.js server owns the portal's enforcing `Content-Security-Policy`. Its proxy generates a new nonce per request and the root layout renders HTML on demand, including static-content pages and the application 404. This does not enable backend CSP, Trusted Types, static export, SSG, ISR, or PPR. See the [frontend policy contract](frontend-pages.md#52-client-side-sender-constrained-tokens-dpop--strict-nonce-csp).
+
+- Forward the application's single CSP header unchanged in every Next.js location above, including OAuth UI exceptions and the default route. Do not add a second CSP, replace it with a constant nonce, or hide the upstream header in Nginx/Traefik.
+- Preserve `Cache-Control: private, no-store` on portal HTML (Next may add stricter no-cache directives). Do not enable shared HTML caching or override these headers at the reverse proxy/CDN. Reusing cached HTML with a new response nonce breaks script execution; reusing the nonce itself violates the security contract.
+- Continue serving `/_next/static` JS/CSS with their public, immutable cache headers. The proxy excludes framework assets and the existing favicon from document nonce handling. Do not globally disable asset caching to solve an HTML-cache issue.
+- Run the production image with `NODE_ENV=production`. Development relaxations are only for local Next.js tooling. New external origins and inline-style components require explicit policy compatibility work.
+- During an operator-approved release, fetch `/` and an unknown/dotted URL repeatedly through the real HTTPS ingress. Verify the expected 200/404 status, exactly one enforcing CSP, matching HTML/header nonces, different nonces between document responses, and private/no-store headers. Verify scripts, CSS, and client navigation in a browser and confirm immutable asset caching. Container tests cannot establish ingress behavior.
+- Upstream outage pages and responses emitted before the Next.js proxy are outside its coverage. Rollback must restore the matching application image and header behavior together; do not weaken the CSP independently to hide a rendering failure.
+
+Frontend CI runs nonce/cache checks and Chromium enforcement tests against the actual non-root image before release export. The browser tests verify clean rendering and hydrated client navigation, then separately verify allowed nonced code and blocked parser-inserted scripts, handlers, and styles. The release publication smoke remains dependency-free and does not require browser packages. No publish or deployment is implied by local test completion.
+
+To repeat the browser check after building an image, from the repository root with npm dependencies installed:
+
+```bash
+npm exec -- playwright install --with-deps chromium
+npm exec -- nx exec -p web -- node "$PWD/.github/scripts/web-csp.browser.mjs" identity-web:ci
 ```
 
 ### 1.0.1 Private IdentityService Runtime (Task 6.2)
@@ -204,6 +225,7 @@ spec:
 ```
 
 #### 1.1.1 Security Middlewares Configuration:
+
 ```yaml
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
@@ -246,14 +268,14 @@ spec:
       containers:
         - name: spire-agent
           image: ghcr.io/spiffe/spire-agent:1.8.0
-          args: ["-config", "/run/spire/config/spire-agent.conf"]
+          args: ['-config', '/run/spire/config/spire-agent.conf']
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: '100m'
+              memory: '128Mi'
             limits:
-              cpu: "500m"
-              memory: "256Mi"
+              cpu: '500m'
+              memory: '256Mi'
           volumeMounts:
             - name: spire-config
               mountPath: /run/spire/config
@@ -303,7 +325,7 @@ metadata:
   name: hatef-idp-secrets
   namespace: identity
 spec:
-  refreshInterval: "5m" # Sync frequency with Infisical
+  refreshInterval: '5m' # Sync frequency with Infisical
   secretStoreRef:
     name: infisical-backend-store
     kind: ClusterSecretStore
@@ -362,14 +384,14 @@ Observability is core to detecting anomalies, token-theft attempts, and system e
 
 The Go backend and Next.js applications expose Prometheus metrics on `/metrics`.
 
-| Metric Name | Type | Labels | Description |
-| :--- | :--- | :--- | :--- |
-| `idp_http_request_duration_seconds` | Histogram | `path`, `method`, `status` | Latency distribution of external REST requests. |
-| `idp_grpc_request_duration_seconds` | Histogram | `method`, `status` | Latency distribution of internal validation RPCs. |
-| `idp_database_pool_active_connections` | Gauge | `pool` | Active connections to PostgreSQL and Redis. |
-| `idp_otp_failures_total` | Counter | `channel` (`sms`, `totp`) | Unsuccessful OTP login attempts. |
-| `idp_rtr_breach_detections_total` | Counter | `client_id` | Number of times a revoked/replayed Refresh Token was detected. |
-| `idp_envelope_encryption_errors_total` | Counter | `operation` (`encrypt`, `decrypt`) | Cryptographic failures in envelope encryption logic. |
+| Metric Name                            | Type      | Labels                             | Description                                                    |
+| :------------------------------------- | :-------- | :--------------------------------- | :------------------------------------------------------------- |
+| `idp_http_request_duration_seconds`    | Histogram | `path`, `method`, `status`         | Latency distribution of external REST requests.                |
+| `idp_grpc_request_duration_seconds`    | Histogram | `method`, `status`                 | Latency distribution of internal validation RPCs.              |
+| `idp_database_pool_active_connections` | Gauge     | `pool`                             | Active connections to PostgreSQL and Redis.                    |
+| `idp_otp_failures_total`               | Counter   | `channel` (`sms`, `totp`)          | Unsuccessful OTP login attempts.                               |
+| `idp_rtr_breach_detections_total`      | Counter   | `client_id`                        | Number of times a revoked/replayed Refresh Token was detected. |
+| `idp_envelope_encryption_errors_total` | Counter   | `operation` (`encrypt`, `decrypt`) | Cryptographic failures in envelope encryption logic.           |
 
 ### 3.2 Prometheus Alerting Rules
 
@@ -384,8 +406,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Potential Token Theft Breach Detected"
-          description: "A client attempted to present an already-used Refresh Token. All user active sessions have been automatically invalidated by the system."
+          summary: 'Potential Token Theft Breach Detected'
+          description: 'A client attempted to present an already-used Refresh Token. All user active sessions have been automatically invalidated by the system.'
 
       # 2. Alert for Sudden Spike in SMS OTP Failures (Potential Brute-force / Toll-fraud)
       - alert: HighOTPFailuresRate
@@ -394,8 +416,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "High volume of SMS OTP failures"
-          description: "SMS OTP failures exceed 10/minute over 5m, indicating possible automated enumeration or brute-force attempts."
+          summary: 'High volume of SMS OTP failures'
+          description: 'SMS OTP failures exceed 10/minute over 5m, indicating possible automated enumeration or brute-force attempts.'
 
       # 3. Alert for Envelope Cryptographic Failures
       - alert: EnvelopeEncryptionFailure
@@ -404,8 +426,8 @@ groups:
         labels:
           severity: page
         annotations:
-          summary: "Application-Layer Cryptographic Operations Failure"
-          description: "Database row envelope encryption or decryption is failing. This indicates KEK/DEK mismatch or corruption."
+          summary: 'Application-Layer Cryptographic Operations Failure'
+          description: 'Database row envelope encryption or decryption is failing. This indicates KEK/DEK mismatch or corruption.'
 
       # 4. Alert for Database Connection Pool Exhaustion
       - alert: DBConnectionPoolExhausted
@@ -414,8 +436,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Database connection pool utilization is critically high"
-          description: "Active database connections are over 90% of pool limits, risking query queuing and increased request latencies."
+          summary: 'Database connection pool utilization is critically high'
+          description: 'Active database connections are over 90% of pool limits, risking query queuing and increased request latencies.'
 ```
 
 ### Admin deployment gate

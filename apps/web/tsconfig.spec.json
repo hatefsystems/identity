@@ -1,26 +1,20 @@
 {
-  "extends": "../../tsconfig.base.json",
+  "extends": "./tsconfig.json",
   "compilerOptions": {
-    "outDir": "./out-tsc/jest",
-    "jsx": "preserve",
-    "types": ["jest", "node"]
+    "outDir": "./out-tsc/jest"
   },
   "include": [
-    "jest.config.ts",
-    "jest.config.cts",
-    "src/**/*.test.ts",
-    "src/**/*.spec.ts",
-    "src/**/*.test.tsx",
-    "src/**/*.spec.tsx",
-    "src/**/*.test.js",
-    "src/**/*.spec.js",
-    "src/**/*.test.jsx",
-    "src/**/*.spec.jsx",
-    "src/**/*.d.ts"
+    "app/**/*.ts",
+    "app/**/*.tsx",
+    "proxy.ts",
+    "specs/**/*.ts",
+    "specs/**/*.tsx",
+    "index.d.ts",
+    "next-env.d.ts"
   ],
   "references": [
     {
-      "path": "./tsconfig.json"
+      "path": "../../libs/ui"
     }
   ]
 }
