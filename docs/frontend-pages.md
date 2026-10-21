@@ -10,15 +10,26 @@ The routing is logically divided using Next.js Route Groups (e.g., `(auth)`, `(d
 
 ## 1. Authentication & Public Pages: `(auth)`
 
-These pages are accessible to unauthenticated users and handle the entry points into the ecosystem.
+These pages are accessible to unauthenticated users and define the entry points into the ecosystem. Task 7.2 implements six **UI-only** screens; their production submission actions are deliberately disabled. Recovery and email-verification screens remain planned.
 
-- `/login` : Primary login page (Username/Password).
-- `/login/webauthn` : Passwordless login flow using hardware keys or platform biometrics (FaceID/TouchID).
+- `/login` : Passkey-first login screen with an email/password alternative and links to registration and password reset.
+- `/login/webauthn` : Dedicated usernameless passkey screen explaining hardware keys, device PINs, and platform biometrics. It does not start a WebAuthn ceremony yet.
 - `/login/recovery` : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
-- `/register` : Account creation form.
-- `/forgot-password` : Request a password reset. Users can choose to receive the recovery OTP/Link via Primary Email, Backup Email, or Verified Phone (SMS).
-- `/reset-password` : The page users land on from the email link to set a new password.
+- `/register` : Email, new password, and password-confirmation form. Account creation is not connected.
+- `/verify-totp` : Neutral six-digit authenticator-code form. This is not an active login challenge, enrollment confirmation, or Step-up session.
+- `/forgot-password` : Primary-email reset-link request form with an account-enumeration-resistant acknowledgement presentation. Backup Email and Verified Phone (SMS) recovery choices remain planned, outside Task 7.2.
+- `/reset-password` : New-password and confirmation form, with invalid/expired-link presentations. Real reset-link validation and password changes are not connected.
 - `/verify-email` : Email verification landing page.
+
+### Task 7.2 UI Boundary
+
+- The six screens use the existing shadcn components exported by `@hatef/ui`, an English shared auth layout, and application-local field/status compositions. The light default, system font, and existing dark tokens are preserved; Tailwind explicitly retains the `dark` class so production builds do not remove its palette variables. There is no new theme switcher or localization framework.
+- `apps/web/app/(auth)/_components/screens.tsx` is the client boundary. Its public screens supply **no submission handler**. Each form shows "This form is not connected yet. Do not enter real credentials." and renders its submission button disabled in the initial HTML. Navigation, password visibility, and local blur validation remain usable. POST semantics and guarded submit handlers prevent credentials from becoming URL query strings; disabled buttons also prevent native submission before hydration or with JavaScript disabled.
+- Loading, success, cancellation, unsupported-passkey, rate-limit, and reset-link presentations are exercised through test-only handlers/props on the underlying form components. No public fixture route, magic credential, query parameter, or environment flag can simulate authentication or reset delivery. Reset forms default to an unverified link state; tests must explicitly provide a ready state and a handler to enable submission.
+- Form values stay in component state, not URLs, cookies, browser storage, telemetry, or logs. The UI neither calls an API nor invokes `navigator.credentials`, manages a session, follows OAuth continuation parameters, or redirects to a dashboard. Generic reset acknowledgements and credential errors do not disclose account existence.
+- Fields have visible labels, stable help/error associations, appropriate autocomplete, keyboard-operable password toggles, and at least 44px control targets. Local errors appear on blur; a test-enabled invalid submission focuses the first invalid field. Submission feedback is announced, duplicate submissions are blocked, and successful completion clears form values. A single text input preserves leading zeroes in TOTP codes, accepts whole-code paste, and requires exactly six ASCII digits without silently normalizing whitespace or non-ASCII digits. It never auto-submits or offers to resend an authenticator code.
+- Password checks intentionally cover presence and, for new passwords, matching confirmation only. Passwords are not trimmed, paste is not blocked, and the UI does not invent a length/complexity policy or claim backend enforcement. Account signup, password login/reset, email verification, browser-session/DPoP integration, and authoritative password policy require separate implementation. Existing backend TOTP enrollment and Step-up endpoints must not be repurposed as public login verification.
+- Auth HTML remains dynamically rendered and private/no-store under Task 7.1's strict nonce CSP. Styling uses classes and local resources only; the CSP, root rendering boundary, and deployment model are unchanged. Automated unit and production-browser checks cover these UI contracts, including both palettes, keyboard focus, contrast, narrow/short viewport reflow, native TOTP paste, and JavaScript-disabled submission safety. Desktop/mobile screenshots were visually inspected. Manual screen-reader review has not been performed; these checks are not a claim of full assistive-technology or WCAG certification.
 
 ---
 
@@ -72,8 +83,8 @@ Protected by strict RBAC. Accessible only to users with `Support`, `Moderator`, 
 
 ## Layout Structure Details
 
-- `app/layout.tsx`: Root layout, includes global providers (Theme, Auth Context, DPoP key initialization).
-- `app/(auth)/layout.tsx`: Minimalistic layout, usually a centered card design to focus entirely on the login/register action.
+- `app/layout.tsx`: Request-time root document for fresh CSP nonces. Theme/Auth Context providers and DPoP key initialization remain planned.
+- `app/(auth)/layout.tsx`: Shared brand link, main landmark, and fluid-width card layout. Minimum viewport height and normal vertical scrolling keep forms usable on narrow or short screens.
 - `app/(dashboard)/layout.tsx`: Includes the main authenticated navigation sidebar (Profile, Security, Privacy, Sessions) and a top header.
 - `app/(admin)/layout.tsx`: A distinct layout (often with different color schemes or warning banners) to clearly indicate to the user that they are in an elevated, sensitive environment.
 

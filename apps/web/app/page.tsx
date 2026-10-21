@@ -1,4 +1,5 @@
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from '@hatef/ui';
+import Link from 'next/link';
 
 export default function Index() {
   return (
@@ -6,8 +7,8 @@ export default function Index() {
       <div className="flex flex-col items-center gap-2 text-center">
         <h1 className="text-4xl font-bold tracking-tight">Hatef Identity Platform</h1>
         <p className="max-w-xl text-muted-foreground">
-          Centralized, privacy-first Identity Provider (IdP) and unified access portal for the
-          Hatef ecosystem.
+          Centralized, privacy-first Identity Provider (IdP) and unified access portal for the Hatef
+          ecosystem.
         </p>
       </div>
 
@@ -19,9 +20,11 @@ export default function Index() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <Button className="w-full">Sign in</Button>
-          <Button variant="outline" className="w-full">
-            Create an account
+          <Button asChild className="h-11 w-full">
+            <Link href="/login">Sign in</Link>
+          </Button>
+          <Button asChild variant="outline" className="h-11 w-full">
+            <Link href="/register">Create an account</Link>
           </Button>
         </CardContent>
       </Card>

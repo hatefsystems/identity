@@ -3,6 +3,8 @@ const { join } = require('path');
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   darkMode: ['class'],
+  // Keep the existing palette available before a theme switcher is introduced.
+  safelist: ['dark'],
   content: [
     join(__dirname, '{app,pages,components,specs}/**/*.{ts,tsx,html}'),
     join(__dirname, '../../libs/ui/src/**/*.{ts,tsx}'),
