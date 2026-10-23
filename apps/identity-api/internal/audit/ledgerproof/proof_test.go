@@ -58,7 +58,7 @@ func (f *fakeSource) Page(_ context.Context, after, through int64, limit int32) 
 	}
 	var out []Node
 	for _, n := range f.nodes {
-		if n.Seq > after && n.Seq <= through && int32(len(out)) < limit {
+		if n.Seq > after && n.Seq <= through && len(out) < int(limit) {
 			out = append(out, n)
 		}
 	}
@@ -285,7 +285,7 @@ func TestVerifyReportsSuppliedPredecessorMismatch(t *testing.T) {
 	t.Parallel()
 
 	src := buildChain(t, 3)
-	wrong := audit.AuditGenesis() // a real digest, but not this chain's node 1
+	wrong := audit.Genesis() // a real digest, but not this chain's node 1
 	result, err := Verify(context.Background(), src, Params{
 		Chain: ChainLedger, AfterSeq: 1, PredecessorHash: wrong.Bytes(), Limit: 10,
 	})

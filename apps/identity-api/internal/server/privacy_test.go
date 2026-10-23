@@ -39,6 +39,7 @@ const (
 type privacyFakeStore struct {
 	users    map[uuid.UUID]db.User
 	requests []db.DeletionRequest
+	intents  []db.InsertLifecycleEventParams
 	now      func() time.Time
 }
 
@@ -67,6 +68,21 @@ func (f *privacyFakeStore) SoftDeleteUser(_ context.Context, id uuid.UUID) (int6
 	u.DeletedAt = pgtype.Timestamptz{Time: f.now(), Valid: true}
 	f.users[id] = u
 	return 1, nil
+}
+
+func (f *privacyFakeStore) AdvanceUserLifecycleRevision(_ context.Context, id uuid.UUID) (int64, error) {
+	u, ok := f.users[id]
+	if !ok {
+		return 0, pgx.ErrNoRows
+	}
+	u.LifecycleRevision++
+	f.users[id] = u
+	return u.LifecycleRevision, nil
+}
+
+func (f *privacyFakeStore) InsertLifecycleEvent(_ context.Context, arg db.InsertLifecycleEventParams) error {
+	f.intents = append(f.intents, arg)
+	return nil
 }
 
 func (f *privacyFakeStore) ReclaimUser(_ context.Context, arg db.ReclaimUserParams) (int64, error) {

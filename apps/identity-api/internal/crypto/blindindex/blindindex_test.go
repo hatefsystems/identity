@@ -190,8 +190,8 @@ func TestComputeAppliesUnicodeNormalization(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	composed := "josé@example.com"             // U+00E9
-	decomposed := "jose\u0301@example.com"     // e + U+0301
+	composed := "josé@example.com"         // U+00E9
+	decomposed := "jose\u0301@example.com" // e + U+0301
 	if composed == decomposed {
 		t.Fatal("test inputs are byte-identical; the case under test is not being exercised")
 	}

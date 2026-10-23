@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ func TestSpoolAppendProducesReplayableJSONLines(t *testing.T) {
 		}
 	}
 
-	file, err := os.Open(path)
+	file, err := os.OpenInRoot(filepath.Dir(path), filepath.Base(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +113,12 @@ func TestSpoolSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(filepath.Base(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +186,38 @@ func TestOpenSpoolRejectsUnusableConfiguration(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent", "audit.spool")
 	if _, err := OpenSpool(missing, 0); err == nil {
 		t.Error("a spool in a nonexistent directory was accepted")
+	}
+}
+
+func TestOpenSpoolRejectsEscapingSymlink(t *testing.T) {
+	t.Parallel()
+	dir, outside := t.TempDir(), t.TempDir()
+	root, err := os.OpenRoot(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	const original = "outside the configured spool directory"
+	if err := root.WriteFile("outside.spool", []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "audit.spool")
+	if err := os.Symlink(filepath.Join(outside, "outside.spool"), path); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("creating symbolic links requires Windows developer mode or privileges")
+		}
+		t.Fatal(err)
+	}
+	spool, err := OpenSpool(path, 0)
+	if spool != nil {
+		_ = spool.Close()
+	}
+	if err == nil {
+		t.Fatal("spool followed a symlink outside its configured directory")
+	}
+	data, err := root.ReadFile("outside.spool")
+	if err != nil || string(data) != original {
+		t.Fatalf("rejected spool modified the outside file: %v", err)
 	}
 }
 

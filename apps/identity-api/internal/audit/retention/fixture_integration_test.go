@@ -394,15 +394,15 @@ ORDER BY c.seq`)
 	nodes := 0
 	for rows.Next() {
 		var (
-			seq                                                   int64
-			eventID                                               uuid.UUID
-			leafRaw, chainRaw                                     []byte
-			present, erasureRecorded                              bool
-			accountRef                                            uuid.NullUUID
-			blindIndex, eventType, clientIP, subnet               *string
-			userAgent, fingerprint, clientID, scope               *string
-			blindVersion                                          *int16
-			timestamp, retainUntil                                *time.Time
+			seq                                     int64
+			eventID                                 uuid.UUID
+			leafRaw, chainRaw                       []byte
+			present, erasureRecorded                bool
+			accountRef                              uuid.NullUUID
+			blindIndex, eventType, clientIP, subnet *string
+			userAgent, fingerprint, clientID, scope *string
+			blindVersion                            *int16
+			timestamp, retainUntil                  *time.Time
 		)
 		if err := rows.Scan(&seq, &eventID, &leafRaw, &chainRaw, &present,
 			&accountRef, &blindIndex, &blindVersion, &eventType,

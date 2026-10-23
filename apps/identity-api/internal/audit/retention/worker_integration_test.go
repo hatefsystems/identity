@@ -247,12 +247,12 @@ func TestWorkerCannotTouchChainTable(t *testing.T) {
 	seeded := f.seed(t, expired(t, f, account, 400*24*time.Hour))
 
 	for name, query := range map[string]string{
-		"delete node":   "DELETE FROM public.security_ledger_chain WHERE seq=$1",
-		"update node":   "UPDATE public.security_ledger_chain SET chain_hash=leaf_hash WHERE seq=$1",
-		"insert node":   "INSERT INTO public.security_ledger_chain(seq,event_id,leaf_hash,chain_hash) VALUES($1,gen_random_uuid(),sha256('a'),sha256('b'))",
-		"truncate":      "TRUNCATE public.security_ledger_chain",
-		"advance head":  "SELECT public.advance_chain_head('ledger',0,1,1,1)",
-		"update head":   "UPDATE public.security_ledger_head SET seq=0",
+		"delete node":    "DELETE FROM public.security_ledger_chain WHERE seq=$1",
+		"update node":    "UPDATE public.security_ledger_chain SET chain_hash=leaf_hash WHERE seq=$1",
+		"insert node":    "INSERT INTO public.security_ledger_chain(seq,event_id,leaf_hash,chain_hash) VALUES($1,gen_random_uuid(),sha256('a'),sha256('b'))",
+		"truncate":       "TRUNCATE public.security_ledger_chain",
+		"advance head":   "SELECT public.advance_chain_head('ledger',0,1,1,1)",
+		"update head":    "UPDATE public.security_ledger_head SET seq=0",
 		"update payload": "UPDATE public.security_event_ledger SET event_type='rewritten' WHERE seq=$1",
 		"delete erasure": "DELETE FROM public.security_ledger_erasures WHERE first_seq=$1",
 	} {

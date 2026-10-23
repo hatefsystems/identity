@@ -94,6 +94,43 @@
         "sqlc-generate"
       ]
     },
+    "build-lifecycle-publisher": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go build -o bin/lifecycle-publisher ./cmd/lifecycle-publisher"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": true
+    },
+    "lifecycle-publisher": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/lifecycle-publisher"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-lifecycle": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go test -count=1 ./internal/lifecycle"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": true
+    },
+    "test-lifecycle-integration": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "node -e \"for (const k of ['DATABASE_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/lifecycle'], {stdio:'inherit',env:{...process.env,REQUIRE_LIFECYCLE_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false,
+      "parallelism": false
+    },
     "build-admin-roles": {
       "executor": "nx:run-commands",
       "options": {

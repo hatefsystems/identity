@@ -368,26 +368,33 @@ func TestAdminActionCleanupHoldPrecedenceIntegration(t *testing.T) {
 	ctx := context.Background()
 	account := uuid.New()
 	op := expiredContext(t, pool, enc, account)
+	unheld := expiredContext(t, pool, enc, uuid.New())
 	hold := uuid.New()
 	if _, err := pool.Exec(ctx, "INSERT INTO legal_holds(id,account_ref,applied_by,idempotency_key,details_encrypted,review_at) VALUES($1,$2,$3,$4,$5,NOW()-INTERVAL '1 day')", hold, account, uuid.New(), uuid.New(), []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DELETE FROM legal_holds WHERE id=$1", hold) })
-	if n, err := CleanupExpired(ctx, pool, 500); err != nil || n != 0 {
-		t.Fatalf("active hold ignored past advisory review date: n=%d err=%v", n, err)
+	if _, err := CleanupExpired(ctx, pool, 500); err != nil {
+		t.Fatal(err)
+	}
+	// Other suites may have left expired metadata in this shared disposable DB.
+	// Check these subjects, not a global deletion count, to prove hold precedence.
+	var heldSurvives, unheldSurvives bool
+	if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM admin_action_contexts WHERE action_id=$1),EXISTS(SELECT 1 FROM admin_action_contexts WHERE action_id=$2)", op.ID, unheld.ID).Scan(&heldSurvives, &unheldSurvives); err != nil || !heldSurvives || unheldSurvives {
+		t.Fatalf("hold/retention precedence failed: held=%t unheld=%t err=%v", heldSurvives, unheldSurvives, err)
 	}
 	if _, err := pool.Exec(ctx, "UPDATE legal_holds SET is_active=FALSE,released_at=NOW(),details_encrypted=NULL,details_purged_at=NOW() WHERE id=$1", hold); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := CleanupExpired(ctx, pool, 500); err != nil || n != 1 {
+	if n, err := CleanupExpired(ctx, pool, 500); err != nil || n < 1 {
 		t.Fatalf("released context not removed on original clock: n=%d err=%v", n, err)
 	}
-	var tombstones, outbox int
-	if err := pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM legal_holds WHERE id=$1),(SELECT count(*) FROM event_outbox WHERE id=$2)", hold, op.ID).Scan(&tombstones, &outbox); err != nil {
+	var tombstones, outbox, contexts int
+	if err := pool.QueryRow(ctx, "SELECT (SELECT count(*) FROM legal_holds WHERE id=$1),(SELECT count(*) FROM event_outbox WHERE id=$2),(SELECT count(*) FROM admin_action_contexts WHERE action_id=$2)", hold, op.ID).Scan(&tombstones, &outbox, &contexts); err != nil {
 		t.Fatal(err)
 	}
-	if tombstones != 1 || outbox != 1 {
-		t.Fatal("cleanup removed opaque tombstone or audit intent")
+	if tombstones != 1 || outbox != 1 || contexts != 0 {
+		t.Fatal("cleanup removed protected evidence or retained a released expired context")
 	}
 }
 

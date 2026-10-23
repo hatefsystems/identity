@@ -74,11 +74,14 @@ func OpenSpool(path string, limit int64) (*Spool, error) {
 	if limit <= 0 {
 		limit = DefaultSpoolLimit
 	}
-	if info, err := os.Stat(filepath.Dir(path)); err != nil || !info.IsDir() {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
 		return nil, fmt.Errorf("audit: spool directory is not usable: %w", err)
 	}
+	defer func() { _ = root.Close() }()
+	// Constrain resolution to the configured directory, including symlink targets.
 	// 0600: the spool contains full envelopes, including payload values.
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := root.OpenFile(filepath.Base(path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("audit: open spool: %w", err)
 	}

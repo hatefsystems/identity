@@ -868,7 +868,7 @@ func testAuditInsertChainHash(ctx context.Context, q *Queries) func(*testing.T) 
 	return func(t *testing.T) {
 		// Seed from the existing tip so this subtest composes with whatever the
 		// shared fixture database already holds.
-		previous := audit.AuditGenesis()
+		previous := audit.Genesis()
 		if tip, err := q.GetAuditLogChainTip(ctx); err == nil {
 			previous, err = audit.DecodeDigest(tip.ChainHash)
 			if err != nil {
@@ -966,7 +966,7 @@ func testAuditInsertChainHash(ctx context.Context, q *Queries) func(*testing.T) 
 
 func testAuditBoundedList(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.bounded.list", audit.AuditGenesis())); err != nil {
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.bounded.list", audit.Genesis())); err != nil {
 			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
 
@@ -1027,10 +1027,10 @@ func testAuditBoundedList(ctx context.Context, q *Queries) func(*testing.T) {
 func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		// Insert two ordered records.
-		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.a", audit.AuditGenesis())); err != nil {
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.a", audit.Genesis())); err != nil {
 			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
-		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.b", audit.AuditGenesis())); err != nil {
+		if _, err := q.InsertAuditLogWithChain(ctx, auditParams(t, "test.verify.b", audit.Genesis())); err != nil {
 			t.Fatalf("InsertAuditLogWithChain: %v", err)
 		}
 
@@ -1115,7 +1115,7 @@ func testAuditChainVerification(ctx context.Context, q *Queries) func(*testing.T
 		batchIDs := []uuid.UUID{uuid.New(), uuid.New()}
 		chainNodes := make([]InsertAuditLogChainParams, 0, 2)
 		payloads := make([]InsertAuditLogsParams, 0, 2)
-		previous := audit.AuditGenesis()
+		previous := audit.Genesis()
 		for i, id := range batchIDs {
 			timestamp := audit.NormalizeChainTime(now.Add(time.Duration(i) * time.Millisecond))
 			actorID := uuid.New()

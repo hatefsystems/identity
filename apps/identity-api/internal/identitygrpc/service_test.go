@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -20,7 +21,11 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -38,7 +43,7 @@ func TestFrozenWireContract(t *testing.T) {
 		{&identityv1.CheckPermissionRequest{}, []protoreflect.Name{"user_id", "permission"}},
 		{&identityv1.CheckPermissionResponse{}, []protoreflect.Name{"allowed"}},
 		{&identityv1.GetInternalUserInfoRequest{}, []protoreflect.Name{"user_id"}},
-		{&identityv1.GetInternalUserInfoResponse{}, []protoreflect.Name{"user_id", "email", "display_name", "status"}},
+		{&identityv1.GetInternalUserInfoResponse{}, []protoreflect.Name{"user_id", "email", "display_name", "status", "lifecycle_revision"}},
 	} {
 		descriptor := tc.message.ProtoReflect().Descriptor()
 		for i, name := range tc.fields {
@@ -59,6 +64,57 @@ func TestFrozenWireContract(t *testing.T) {
 		if int(value) != i {
 			t.Errorf("wire user status %s was renumbered", value)
 		}
+	}
+}
+
+func TestProfileRevisionAdditiveWireCompatibility(t *testing.T) {
+	current := (&identityv1.GetInternalUserInfoResponse{}).ProtoReflect().Descriptor()
+	revision := current.Fields().ByName("lifecycle_revision")
+	if revision == nil || revision.Number() != 5 || revision.Kind() != protoreflect.Uint64Kind || revision.HasPresence() {
+		t.Fatal("profile lifecycle revision must remain an additive uint64 field 5")
+	}
+	// Model an already deployed client with precisely the original four fields.
+	legacyMessage := protodesc.ToDescriptorProto(current)
+	legacyMessage.Field = legacyMessage.Field[:4]
+	legacyFile, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: proto.String("profile_legacy_fixture.proto"), Package: proto.String("hatef.identity.legacyfixture"), Syntax: proto.String("proto3"),
+		Dependency:  []string{"hatef/identity/v1/common.proto"},
+		MessageType: []*descriptorpb.DescriptorProto{legacyMessage},
+	}, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDescriptor := legacyFile.Messages().Get(0)
+	wantLegacy := &identityv1.GetInternalUserInfoResponse{
+		UserId: testUserID, Email: "profile@example.invalid", Status: identityv1.UserStatus_USER_STATUS_ACTIVE,
+	}
+	wantCurrent := proto.Clone(wantLegacy).(*identityv1.GetInternalUserInfoResponse)
+	wantCurrent.LifecycleRevision = 1<<53 + 1
+	newWire, err := proto.Marshal(wantCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dynamicpb.NewMessage(legacyDescriptor)
+	if err := proto.Unmarshal(newWire, legacy); err != nil || len(legacy.GetUnknown()) == 0 {
+		t.Fatalf("legacy client could not preserve the unknown additive revision: %v", err)
+	}
+	forwarded, err := proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var currentAgain identityv1.GetInternalUserInfoResponse
+	if err := proto.Unmarshal(forwarded, &currentAgain); err != nil || !proto.Equal(&currentAgain, wantCurrent) {
+		t.Fatalf("legacy protobuf forwarding changed original fields or revision: %v", err)
+	}
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(newWire, legacy); err != nil {
+		t.Fatal(err)
+	}
+	oldWire, err := proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(oldWire, &currentAgain); err != nil || !proto.Equal(&currentAgain, wantLegacy) || currentAgain.LifecycleRevision != 0 {
+		t.Fatalf("old profile snapshot no longer decodes with a zero revision: %v", err)
 	}
 }
 
@@ -370,7 +426,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
-				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: "profile@example.invalid"}, tc.queryErr
+				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: "profile@example.invalid", LifecycleRevision: 42}, tc.queryErr
 			}}
 			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 			response, err := client.GetInternalUserInfo(rpcContext(t), &identityv1.GetInternalUserInfoRequest{UserId: testUserID})
@@ -384,7 +440,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 				}
 				return
 			}
-			want := &identityv1.GetInternalUserInfoResponse{UserId: testUserID, Status: tc.status}
+			want := &identityv1.GetInternalUserInfoResponse{UserId: testUserID, Status: tc.status, LifecycleRevision: 42}
 			if tc.email {
 				want.Email = "profile@example.invalid"
 			}
@@ -403,6 +459,44 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 			encoded, err := json.Marshal(e)
 			if err != nil || bytes.Contains(encoded, []byte("profile@example.invalid")) {
 				t.Fatal("audit copied profile PII")
+			}
+		})
+	}
+}
+
+func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
+	for _, storedStatus := range []string{"active", "pending_verification", "suspended", "banned"} {
+		t.Run(storedStatus, func(t *testing.T) {
+			cfg := testConfig(t)
+			var revision, calls atomic.Int64
+			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
+				calls.Add(1)
+				return db.GetInternalUserInfoRow{ID: id, Status: storedStatus, Email: "profile@example.invalid", LifecycleRevision: revision.Load()}, nil
+			}}
+			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
+			values := []int64{0, 1, 1<<53 + 1, math.MaxInt64, -1, math.MinInt64, 2}
+			for _, value := range values {
+				revision.Store(value)
+				before := len(cfg.Recorder.(*testRecorder).snapshot())
+				response, err := client.GetInternalUserInfo(rpcContext(t), &identityv1.GetInternalUserInfoRequest{UserId: testUserID})
+				if value < 0 {
+					if response != nil || status.Code(err) != codes.Internal || len(cfg.Recorder.(*testRecorder).snapshot()) != before {
+						t.Fatalf("negative stored revision was disclosed or cast to uint64: %v, %v", response, err)
+					}
+					if strings.Contains(err.Error(), "profile@example.invalid") || strings.Contains(err.Error(), testUserID) {
+						t.Fatal("corrupt revision error exposed profile data")
+					}
+					continue
+				}
+				if err != nil || response == nil || response.LifecycleRevision != uint64(value) || len(cfg.Recorder.(*testRecorder).snapshot()) != before+1 {
+					t.Fatalf("live snapshot revision=%d response=%v err=%v", value, response, err)
+				}
+				if (storedStatus == "suspended" || storedStatus == "banned") && response.Email != "" {
+					t.Fatal("revision disclosure bypassed status-dependent email redaction")
+				}
+			}
+			if calls.Load() != int64(len(values)) {
+				t.Fatal("profile revisions were cached instead of read live")
 			}
 		})
 	}

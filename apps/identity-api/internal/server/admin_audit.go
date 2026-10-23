@@ -236,12 +236,12 @@ const (
 	ledgerVerifyScope = "database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity"
 )
 
-// Short, stable tokens for the audit record. The prose above is for the operator
+// Short, stable codes for the audit record. The prose above is for the operator
 // reading the HTTP response; an audit payload needs a value that can be alerted
 // on and correlated, and internal/adminaction enforces the enum.
 const (
-	auditVerifyScopeToken  = "audit_chain_database_relative"
-	ledgerVerifyScopeToken = "ledger_chain_database_relative"
+	auditVerifyScopeCode  = "audit_chain_database_relative"
+	ledgerVerifyScopeCode = "ledger_chain_database_relative"
 )
 
 // runChainVerification verifies one chain and records the attempt.
@@ -280,9 +280,9 @@ func (s *Server) runChainVerification(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 
-	scope, scopeToken := auditVerifyScope, auditVerifyScopeToken
+	scope, scopeCode := auditVerifyScope, auditVerifyScopeCode
 	if chain == ledgerproof.ChainLedger {
-		scope, scopeToken = ledgerVerifyScope, ledgerVerifyScopeToken
+		scope, scopeCode = ledgerVerifyScope, ledgerVerifyScopeCode
 	}
 	base := adminChainVerifyResponse{
 		FailureReason: result.FailureReason, Chain: result.Chain,
@@ -297,7 +297,7 @@ func (s *Server) runChainVerification(w http.ResponseWriter, r *http.Request, ch
 	payload := map[string]any{
 		"chain": result.Chain, "verified": result.Verified, "checked": result.Checked,
 		"after_seq": result.AfterSeq, "through_seq": result.ThroughSeq,
-		"complete": result.Complete, "verification_scope": scopeToken,
+		"complete": result.Complete, "verification_scope": scopeCode,
 		"erased_checked": result.ErasedChecked,
 	}
 	if result.SeedHash != "" {

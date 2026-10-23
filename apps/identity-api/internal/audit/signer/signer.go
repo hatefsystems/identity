@@ -294,7 +294,7 @@ func readAuditHead(ctx context.Context, store Store) (int64, audit.Digest, error
 		return 0, audit.Digest{}, fmt.Errorf("%w: read audit head: %w", ErrLedgerStateInvalid, err)
 	}
 	tip, err := audit.DecodeDigest(head.ChainHash)
-	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.AuditGenesis()) {
+	if err != nil || !head.StateValid || head.Seq < 0 || (head.Seq == 0 && tip != audit.Genesis()) {
 		return 0, audit.Digest{}, ErrLedgerStateInvalid
 	}
 	return head.Seq, tip, nil

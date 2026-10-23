@@ -26,9 +26,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 )
 
 // testTimeout bounds the whole migration lifecycle per test run.

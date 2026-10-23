@@ -47,7 +47,7 @@ const (
 // Genesis returns the chain's genesis predecessor digest.
 func (c Chain) Genesis() audit.Digest {
 	if c == ChainAudit {
-		return audit.AuditGenesis()
+		return audit.Genesis()
 	}
 	return audit.LedgerGenesis()
 }

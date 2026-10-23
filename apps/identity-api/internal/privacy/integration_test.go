@@ -50,6 +50,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 )
 
@@ -259,7 +260,7 @@ func insertAuditRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userI
 	}
 	seq, err := db.New(pool).InsertAuditLogWithChain(ctx, db.InsertAuditLogWithChainParams{
 		EventID: eventID, LeafHash: leaf.Bytes(),
-		ChainHash: audit.ChainAudit(audit.AuditGenesis(), leaf).Bytes(),
+		ChainHash: audit.ChainAudit(audit.Genesis(), leaf).Bytes(),
 		UserID:    uuid.NullUUID{UUID: userID, Valid: true},
 		ActorID:   userID, ActorSpiffeID: rec.ActorSPIFFEID,
 		EventType: rec.EventType, ActionStatus: rec.ActionStatus,
@@ -350,7 +351,7 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 
 	ledgerBefore := countRows(ctx, t, pool, "SELECT COUNT(*) FROM security_event_ledger")
 	outboxBefore := countRows(ctx, t, pool,
-		"SELECT COUNT(*) FROM event_outbox WHERE payload::jsonb ->> 'user_id' = $1", user.ID.String())
+		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String())
 
 	result, err := env.svc.RequestDeletion(ctx, user.ID, "203.0.113.10")
 	if err != nil {
@@ -465,25 +466,25 @@ FROM mvp_audit_logs l JOIN audit_log_chain c ON c.seq = l.seq WHERE l.seq = $1`,
 		t.Errorf("the subject's ledger row count = %d, want 1", got)
 	}
 
-	// Exactly one outbox event, carrying only the user id.
+	// Exactly one terminal event, in addition to the reversible soft-delete event.
 	outboxAfter := countRows(ctx, t, pool,
-		"SELECT COUNT(*) FROM event_outbox WHERE payload::jsonb ->> 'user_id' = $1", user.ID.String())
+		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String())
 	if outboxAfter-outboxBefore != 1 {
 		t.Fatalf("outbox rows for the subject = %d, want exactly 1", outboxAfter-outboxBefore)
 	}
-	var subject string
-	var payloadKeys int
+	var subject, eventPayload string
 	if err := pool.QueryRow(ctx, `
-		SELECT subject, (SELECT COUNT(*) FROM jsonb_object_keys(payload::jsonb))
+		SELECT subject, payload
 		FROM event_outbox
-		WHERE payload::jsonb ->> 'user_id' = $1`, user.ID.String()).Scan(&subject, &payloadKeys); err != nil {
+		WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1`, user.ID.String()).Scan(&subject, &eventPayload); err != nil {
 		t.Fatalf("read outbox row: %v", err)
 	}
 	if subject != SubjectDeletedEvent {
 		t.Errorf("outbox subject = %q, want %q", subject, SubjectDeletedEvent)
 	}
-	if payloadKeys != 1 {
-		t.Errorf("outbox payload has %d keys, want exactly 1 (user_id only; anything else escapes the erasure)", payloadKeys)
+	tombstone, err := lifecycle.UnmarshalEvent([]byte(eventPayload))
+	if err != nil || tombstone.UserId != user.ID.String() || tombstone.GetRevision() != 2 || tombstone.Status != nil || len(tombstone.ChangedFields) != 0 {
+		t.Fatalf("invalid metadata-only terminal event: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(),
@@ -543,7 +544,7 @@ func TestIntegrationLegalHoldBlocksPurge(t *testing.T) {
 		t.Errorf("%s events = %d, want at least 1", audit.EventDeletionSkippedLegalHold, got)
 	}
 	if got := countRows(ctx, t, pool,
-		"SELECT COUNT(*) FROM event_outbox WHERE payload::jsonb ->> 'user_id' = $1", user.ID.String()); got != 0 {
+		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String()); got != 0 {
 		t.Errorf("a held subject enqueued %d outbox rows, want 0", got)
 	}
 
@@ -815,7 +816,7 @@ func TestIntegrationConcurrentReclaimVersusPurge(t *testing.T) {
 	}
 
 	outbox := countRows(ctx, t, pool,
-		"SELECT COUNT(*) FROM event_outbox WHERE payload::jsonb ->> 'user_id' = $1", user.ID.String())
+		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String())
 
 	switch {
 	case purged:

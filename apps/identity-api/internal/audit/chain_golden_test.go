@@ -95,7 +95,7 @@ const (
 func TestGoldenGenesisDigests(t *testing.T) {
 	t.Parallel()
 
-	if got := AuditGenesis().Hex(); got != GoldenAuditGenesisHex {
+	if got := Genesis().Hex(); got != GoldenAuditGenesisHex {
 		t.Errorf("audit genesis = %s, want %s", got, GoldenAuditGenesisHex)
 	}
 	if got := LedgerGenesis().Hex(); got != GoldenLedgerGenesisHex {
@@ -121,7 +121,7 @@ func TestGoldenAuditVector(t *testing.T) {
 	if got := leafHash.Hex(); got != goldenAuditLeafHex {
 		t.Errorf("audit leaf = %s, want %s", got, goldenAuditLeafHex)
 	}
-	if got := ChainAudit(AuditGenesis(), leafHash).Hex(); got != goldenAuditChain1Hex {
+	if got := ChainAudit(Genesis(), leafHash).Hex(); got != goldenAuditChain1Hex {
 		t.Errorf("audit chain[1] = %s, want %s", got, goldenAuditChain1Hex)
 	}
 }

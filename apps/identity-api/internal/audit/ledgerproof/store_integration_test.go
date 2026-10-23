@@ -385,12 +385,12 @@ func TestProofUnknownSeedSeqIsRejectedIntegration(t *testing.T) {
 func TestProofAuditChainIntegration(t *testing.T) {
 	ctx, pool := proofFixture(t)
 	if _, err := pool.Exec(ctx,
-		"INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.AuditGenesis().Bytes()); err != nil {
+		"INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.Genesis().Bytes()); err != nil {
 		t.Fatal(err)
 	}
 
 	queries := db.New(pool)
-	previous := audit.AuditGenesis()
+	previous := audit.Genesis()
 	var firstSeq, lastSeq int64
 	for i := 0; i < 3; i++ {
 		eventID := uuid.New()

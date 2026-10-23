@@ -62,7 +62,7 @@ type fakeStore struct {
 }
 
 func genesisAuditHead() db.GetAuditLogHeadRow {
-	return db.GetAuditLogHeadRow{Seq: 0, ChainHash: audit.AuditGenesis().Bytes(), StateValid: true}
+	return db.GetAuditLogHeadRow{Seq: 0, ChainHash: audit.Genesis().Bytes(), StateValid: true}
 }
 
 func genesisLedgerHead() db.GetSecurityLedgerHeadRow {
@@ -469,8 +469,8 @@ func TestSignerGenesisChainTips(t *testing.T) {
 
 	// Each chain has its own genesis seed, so an audit genesis can never seed the
 	// ledger chain or vice versa.
-	if s.auditTip != audit.AuditGenesis() {
-		t.Errorf("auditTip = %s, want audit genesis %s", s.auditTip.Hex(), audit.AuditGenesis().Hex())
+	if s.auditTip != audit.Genesis() {
+		t.Errorf("auditTip = %s, want audit genesis %s", s.auditTip.Hex(), audit.Genesis().Hex())
 	}
 	if s.ledgerTip != audit.LedgerGenesis() {
 		t.Errorf("ledgerTip = %x, want genesis %x", s.ledgerTip, audit.LedgerGenesis())
@@ -620,7 +620,7 @@ func TestSignerProcessBatchChainingAndPersistence(t *testing.T) {
 
 	// Verify the audit chain: each node's leaf must reproduce its payload, and
 	// each chain digest must link to its predecessor.
-	tip := audit.AuditGenesis()
+	tip := audit.Genesis()
 	for i, row := range store.insertedAuditLogs {
 		node := store.insertedAuditChain[i]
 		if node.Seq != row.Seq {

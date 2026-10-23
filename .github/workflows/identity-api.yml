@@ -106,6 +106,9 @@ jobs:
       - name: Build admin operational commands
         run: npm exec -- nx run-many -t build-admin-audit-publisher,build-admin-roles,build-admin-legal -p identity-api --skipNxCache
 
+      - name: Build lifecycle broadcast publisher
+        run: npm exec -- nx run identity-api:build-lifecycle-publisher --skipNxCache
+
       - name: Build compatible signer and purge workers
         run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge -p identity-api --skipNxCache
 
@@ -204,9 +207,9 @@ jobs:
 
       - name: Start disposable NATS JetStream
         run: |
-          docker run --detach --name admin-test-nats \
+          docker run --detach --name admin-test-nats --label ldp.task=6.3 \
             --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
-            nats:2.10-alpine -js -m 8222
+            nats:2.10-alpine -js -sd /data -m 8222
           curl --fail --silent --show-error --retry 30 --retry-delay 1 \
             --retry-connrefused --max-time 2 --retry-max-time 60 \
             'http://127.0.0.1:8222/healthz?js-enabled-only=true'
@@ -226,6 +229,11 @@ jobs:
 
       - name: Run mandatory gRPC and shared-credential integration tests
         run: npm exec -- nx run identity-api:test-grpc-integration --skipNxCache
+
+      - name: Run mandatory lifecycle broadcast integration tests
+        env:
+          LIFECYCLE_TEST_NATS_CONTAINER: admin-test-nats
+        run: npm exec -- nx run identity-api:test-lifecycle-integration --skipNxCache
 
       - name: Collect disposable service diagnostics
         if: failure()

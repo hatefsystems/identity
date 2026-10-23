@@ -13,6 +13,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -254,6 +255,10 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
 			return
 		}
+		if err := lifecycle.EnqueueStatusChange(r.Context(), op.Queries, userID, existing.Status, updated.Status); err != nil {
+			s.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
+			return
+		}
 		if req.Status != "active" && s.deps.AdminRevoke != nil {
 			op.AfterCommit = func() error { return s.deps.AdminRevoke(r.Context(), userID.String()) }
 		}
@@ -267,7 +272,7 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 			EventType: audit.EventAdminUserStatusChanged, ActionStatus: audit.StatusSuccess, ActorID: actor, SubjectID: &userID,
 			Payload: map[string]any{"old_status": existing.Status, "new_status": updated.Status, "old_auth_version": existing.AuthVersion, "new_auth_version": updated.AuthVersion},
 		})
-		// Middleware commits this mutation, encrypted reason and audit outbox
+		// Middleware commits this mutation, encrypted reason and both outbox intents
 		// together before releasing the response. DB versions are the authority;
 		// process-local credential cleanup must never be the security boundary.
 		w.WriteHeader(http.StatusNoContent)

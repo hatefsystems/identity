@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   assertStaticAssetHeaders,
+  maintenanceEntrypoints,
   maintenanceSucceeded,
   smokeImage,
   staticAssets,
@@ -51,6 +52,13 @@ test('maintenance smoke requires structured ERROR logging and exit one', () => {
   assert(!maintenanceSucceeded({ ...good, status: null }));
   assert(!maintenanceSucceeded({ ...good, stderr: 'not JSON, "level":"ERROR"' }));
   assert(!maintenanceSucceeded({ ...good, stderr: '{"level":"INFO"}' }));
+});
+
+test('all packaged entrypoints are covered by the production-configuration smoke', () => {
+  assert.deepEqual(maintenanceEntrypoints, [
+    'identity-api', 'audit-signer', 'purge-worker', 'migrate', 'security-ledger-purge',
+    'admin-audit-publisher', 'lifecycle-publisher', 'admin-legal',
+  ]);
 });
 
 test('migration smoke checks its missing-database error instead of a JSON log or usage error', () => {

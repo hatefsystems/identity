@@ -37,7 +37,7 @@ func TestSignerNormalizesLegacyAndSyntheticTimestamps(t *testing.T) {
 	if err := s.processBatch(context.Background(), []jetstream.Msg{integrityMessage(t, env), &fakeMsg{data: []byte("not json")}}); err != nil {
 		t.Fatal(err)
 	}
-	prev := audit.AuditGenesis()
+	prev := audit.Genesis()
 	for i, row := range store.insertedAuditLogs {
 		if row.Timestamp.Time.Nanosecond()%1000 != 0 {
 			t.Fatal("audit timestamp is not microsecond aligned")

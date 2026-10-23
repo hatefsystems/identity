@@ -237,6 +237,45 @@ amd64, Intel i7-10750H, ES256) measured approximately 81.1 us/op, 4,784 B/op and
 for client tokens. This uses in-memory authority and a stubbed primary account
 gate; it is not a Redis/PostgreSQL/network latency measurement or production SLO.
 
+## User Lifecycle Broadcast
+
+Task 6.3 publishes metadata-only `identity.user.created`, `identity.user.updated`,
+`identity.user.suspended` and `identity.user.deleted` events through a transactional
+outbox and the separate `IDENTITY_USERS` JetStream stream. Account mutations do
+not wait on NATS; outbox persistence failure rolls the mutation back. Deletion
+retains the existing legal-hold and exactly-one-row guarantees.
+
+`internal/lifecycle.CreateUser` requires a caller-owned `pgx.Tx`; commit only after
+it succeeds, and roll back on any error. It is the supported creation boundary for
+future registration code, not a new HTTP endpoint. The raw sqlc query remains for
+the synthetic operator lookup probe and fixtures. Implemented capture covers real
+moderation, soft deletion, reclamation and purge, not credential/phone bookkeeping.
+
+```bash
+npm exec -- nx run identity-api:build-lifecycle-publisher
+npm exec -- nx run identity-api:lifecycle-publisher --args="provision"
+npm exec -- nx run identity-api:lifecycle-publisher
+npm exec -- nx run identity-api:lifecycle-publisher --args="cleanup-published"
+npm exec -- nx run identity-api:test-lifecycle --skipNxCache
+npm exec -- nx run identity-api:test-lifecycle-integration --skipNxCache
+```
+
+Provisioning uses broker/topology configuration only and never overwrites a
+conflicting existing stream. Normal publishing needs `DATABASE_URL` and `NATS_URL`
+and cannot create/update topology. Cleanup is DB-only and requires the separate
+`LIFECYCLE_CLEANUP_DATABASE_URL`; it never falls back to API credentials. Both
+retention durations must be explicitly configured outside explicit development.
+See [.env.example](../../.env.example) and the
+[operations runbook](../../docs/devops-operations.md#user-lifecycle-publisher-task-63).
+
+The mandatory integration target requires disposable PostgreSQL and JetStream,
+fails on missing/unavailable configured dependencies, and runs serially. The
+optional `LIFECYCLE_TEST_NATS_CONTAINER` restart check additionally requires Docker
+and a recognized disposable container name with label `ldp.task=6.3`; a configured
+restart check fails rather than skips when its prerequisites are unavailable.
+Do not run schema-resetting suites concurrently. The same non-root image packages
+`/usr/local/bin/lifecycle-publisher` for all three modes. No deployment is implied.
+
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at

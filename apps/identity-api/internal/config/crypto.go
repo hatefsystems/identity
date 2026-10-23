@@ -142,7 +142,7 @@ func LoadBlindIndexPepperVersion() (int16, error) {
 	if !ok || raw == "" {
 		return 0, nil
 	}
-	v, err := strconv.Atoi(raw)
+	v, err := strconv.ParseInt(raw, 10, 16)
 	if err != nil {
 		return 0, fmt.Errorf("config: invalid %s %q: %w", EnvBlindIndexPepperVersion, raw, err)
 	}

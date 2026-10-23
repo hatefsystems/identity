@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -79,15 +80,15 @@ func integrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	// Reuse the real identity/RBAC migrations in an isolated schema. Later
-	// retention migrations deliberately target public and are unrelated here.
+	// Reuse the real identity/RBAC and lifecycle migrations in an isolated
+	// schema. Unrelated retention migrations deliberately target public.
 	files := fstest.MapFS{}
 	entries, err := fs.ReadDir(embedded.Migrations, "migrations")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" {
+		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" {
 			continue
 		}
 		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
@@ -131,6 +132,9 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Queries = queries
 	client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
+	if profile, err := client.GetInternalUserInfo(ctx, &identityv1.GetInternalUserInfoRequest{UserId: id.String()}); err != nil || profile == nil || profile.LifecycleRevision != 0 {
+		t.Fatalf("uncaptured account must start at revision zero: %v, %v", profile, err)
+	}
 	check := func(t *testing.T, want bool, permission string) {
 		t.Helper()
 		response, err := client.CheckPermission(ctx, &identityv1.CheckPermissionRequest{UserId: id.String(), Permission: permission})
@@ -154,7 +158,7 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, tc := range []struct {
+	for i, tc := range []struct {
 		name, stored string
 		status       identityv1.UserStatus
 		email        bool
@@ -169,12 +173,13 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 		{"soft deleted", "active", 0, false, true, codes.NotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			revision := int64(i + 1)
 			var deletedAt *time.Time
 			if tc.deleted {
 				now := time.Now()
 				deletedAt = &now
 			}
-			if _, err := pool.Exec(ctx, "UPDATE users SET status=$2, deleted_at=$3 WHERE id=$1", id, tc.stored, deletedAt); err != nil {
+			if _, err := pool.Exec(ctx, "UPDATE users SET status=$2, deleted_at=$3, lifecycle_revision=$4 WHERE id=$1", id, tc.stored, deletedAt, revision); err != nil {
 				t.Fatal(err)
 			}
 			row, queryErr := queries.GetInternalUserInfo(ctx, id)
@@ -187,11 +192,15 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 					t.Fatalf("SQL did not exclude deleted/pending-deletion profile: %v", queryErr)
 				}
 			} else {
-				want := &identityv1.GetInternalUserInfoResponse{UserId: id.String(), Status: tc.status}
+				wireRevision, parseErr := strconv.ParseUint(strconv.FormatInt(revision, 10), 10, 64)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				want := &identityv1.GetInternalUserInfoResponse{UserId: id.String(), Status: tc.status, LifecycleRevision: wireRevision}
 				if tc.email {
 					want.Email = email
 				}
-				if queryErr != nil || row.ID != id || row.Email != want.Email || !proto.Equal(response, want) {
+				if queryErr != nil || row.ID != id || row.Email != want.Email || row.LifecycleRevision != revision || !proto.Equal(response, want) {
 					t.Fatalf("SQL or RPC profile minimization failed: %v", queryErr)
 				}
 			}

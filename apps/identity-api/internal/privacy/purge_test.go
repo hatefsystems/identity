@@ -2,7 +2,6 @@ package privacy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 )
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ type fakePurgeWorld struct {
 	mu     sync.Mutex
 	users  map[uuid.UUID]db.User
 	holds  map[uuid.UUID]bool
-	outbox []db.EnqueueOutboxEventParams
+	outbox []db.InsertLifecycleEventParams
 
 	// Injectable faults.
 	listErr        error
@@ -165,8 +165,8 @@ func (w *fakePurgeWorld) HardDeleteUser(context.Context, db.HardDeleteUserParams
 	return 0, errors.New("privacy: hard delete must go through a subject transaction")
 }
 
-func (w *fakePurgeWorld) EnqueueOutboxEvent(context.Context, db.EnqueueOutboxEventParams) (db.EventOutbox, error) {
-	return db.EventOutbox{}, errors.New("privacy: outbox insert must go through a subject transaction")
+func (w *fakePurgeWorld) InsertLifecycleEvent(context.Context, db.InsertLifecycleEventParams) error {
+	return errors.New("privacy: outbox insert must go through a subject transaction")
 }
 
 // BeginSubject implements SubjectTxOpener.
@@ -184,7 +184,7 @@ func (w *fakePurgeWorld) BeginSubject(context.Context) (SubjectTx, error) {
 type fakePurgeTx struct {
 	w             *fakePurgeWorld
 	deletes       []uuid.UUID
-	events        []db.EnqueueOutboxEventParams
+	events        []db.InsertLifecycleEventParams
 	closed        bool
 	accountLocked uuid.UUID
 }
@@ -261,14 +261,14 @@ func (t *fakePurgeTx) HardDeleteUser(_ context.Context, arg db.HardDeleteUserPar
 	return 1, nil
 }
 
-func (t *fakePurgeTx) EnqueueOutboxEvent(_ context.Context, arg db.EnqueueOutboxEventParams) (db.EventOutbox, error) {
+func (t *fakePurgeTx) InsertLifecycleEvent(_ context.Context, arg db.InsertLifecycleEventParams) error {
 	t.w.mu.Lock()
 	defer t.w.mu.Unlock()
 	if t.w.enqueueErr != nil {
-		return db.EventOutbox{}, t.w.enqueueErr
+		return t.w.enqueueErr
 	}
 	t.events = append(t.events, arg)
-	return db.EventOutbox{ID: uuid.New(), Subject: arg.Subject, Payload: arg.Payload}, nil
+	return nil
 }
 
 func (t *fakePurgeTx) Commit(context.Context) error {
@@ -397,17 +397,13 @@ func TestRunOncePurgesAndEnqueuesEvent(t *testing.T) {
 	if event.Subject != SubjectDeletedEvent {
 		t.Errorf("outbox subject = %q, want %q", event.Subject, SubjectDeletedEvent)
 	}
-	// The payload must carry the user id and nothing else: these rows outlive the
-	// account, so any PII here would escape the erasure entirely.
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(event.Payload), &payload); err != nil {
-		t.Fatalf("outbox payload is not JSON: %v", err)
+	// The versioned tombstone contains identity/replay metadata, never profile data.
+	payload, err := lifecycle.UnmarshalEvent([]byte(event.Payload))
+	if err != nil {
+		t.Fatalf("invalid tombstone: %v", err)
 	}
-	if len(payload) != 1 {
-		t.Errorf("outbox payload = %v, want exactly one field", payload)
-	}
-	if payload["user_id"] != subject.String() {
-		t.Errorf("outbox payload user_id = %v, want %s", payload["user_id"], subject)
+	if payload.UserId != subject.String() || payload.GetRevision() != 1 || payload.Status != nil || len(payload.ChangedFields) != 0 || payload.EventId != event.ID.String() {
+		t.Error("tombstone identity, terminal revision or metadata-only contract changed")
 	}
 
 	if got := h.recorder.countOf(audit.EventDeletionPurged, audit.StatusSuccess); got != 1 {

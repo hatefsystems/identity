@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -103,6 +104,36 @@ func TestNewAppliesDefaults(t *testing.T) {
 	}
 	if h.svc.deleteResendCooldown != defaultDeleteResendCooldown {
 		t.Errorf("deleteResendCooldown = %v, want %v", h.svc.deleteResendCooldown, defaultDeleteResendCooldown)
+	}
+}
+
+func TestDeletionResendsDoNotRepeatLifecycleTransition(t *testing.T) {
+	h := newHarness(t, Config{})
+	user := h.store.addActiveUser("metadata-only@test.local")
+	for i := 0; i < 3; i++ {
+		if _, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10"); err != nil {
+			t.Fatal(err)
+		}
+		h.clock.advance(10 * time.Minute)
+	}
+	if len(h.store.intents) != 1 || h.store.user(user.ID).LifecycleRevision != 1 {
+		t.Fatal("a deletion resend advanced the lifecycle revision")
+	}
+	event, err := lifecycle.UnmarshalEvent([]byte(h.store.intents[0].Payload))
+	if err != nil || event.EventType != lifecycle.SubjectUpdated || event.GetRevision() != 1 || event.UserId != user.ID.String() {
+		t.Fatalf("invalid reversible deactivation: %v", err)
+	}
+}
+
+func TestDeletionOutboxFailurePreventsSuccessAndNotification(t *testing.T) {
+	h := newHarness(t, Config{})
+	user := h.store.addActiveUser("metadata-only@test.local")
+	h.store.lifecycleErr = errors.New("injected outbox error")
+	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10"); !errors.Is(err, lifecycle.ErrEnqueue) {
+		t.Fatalf("durable intent failure hidden: %v", err)
+	}
+	if h.notifier.count() != 0 || len(h.store.intents) != 0 || len(h.store.requests) != 0 {
+		t.Fatal("failed lifecycle write produced a success side effect")
 	}
 }
 

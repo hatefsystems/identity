@@ -2,7 +2,6 @@ package privacy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,13 +14,14 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 // SubjectDeletedEvent is the NATS subject the outbox row carries
 // (docs/api-design.md §3). Downstream services consume it to scrub their local
 // copies of the subject's PII.
-const SubjectDeletedEvent = "identity.user.deleted"
+const SubjectDeletedEvent = lifecycle.SubjectDeleted
 
 // PurgeAdvisoryLockKey is the PostgreSQL advisory-lock key the purge worker holds
 // for the duration of a run, so two overlapping CronJob invocations (a slow run
@@ -36,11 +36,11 @@ const PurgeAdvisoryLockKey int64 = pglock.PurgeKey
 // by *db.Queries, both pool-bound (for the batch listing) and transaction-bound
 // (for the per-subject work).
 type PurgeStore interface {
+	lifecycle.EventStore
 	ListUsersDueForHardDelete(ctx context.Context, arg db.ListUsersDueForHardDeleteParams) ([]uuid.UUID, error)
 	GetUserForUpdateIncludingDeleted(ctx context.Context, id uuid.UUID) (db.User, error)
 	HasActiveLegalHold(ctx context.Context, accountRef uuid.UUID) (bool, error)
 	HardDeleteUser(ctx context.Context, arg db.HardDeleteUserParams) (int64, error)
-	EnqueueOutboxEvent(ctx context.Context, arg db.EnqueueOutboxEventParams) (db.EventOutbox, error)
 }
 
 // SubjectTx is one per-subject transaction: a transaction-bound query set plus its
@@ -383,15 +383,7 @@ func (p *Purger) purgeSubject(ctx context.Context, userID uuid.UUID, cutoff time
 		return outcomeFailed
 	}
 
-	payload, err := json.Marshal(map[string]string{"user_id": user.ID.String()})
-	if err != nil {
-		p.failSubject(ctx, userID, "marshal_event", err)
-		return outcomeFailed
-	}
-	if _, err := store.EnqueueOutboxEvent(ctx, db.EnqueueOutboxEventParams{
-		Subject: SubjectDeletedEvent,
-		Payload: string(payload),
-	}); err != nil {
+	if err := lifecycle.EnqueueDeletion(ctx, store, user.ID, user.LifecycleRevision); err != nil {
 		p.failSubject(ctx, userID, "enqueue_event", err)
 		return outcomeFailed
 	}

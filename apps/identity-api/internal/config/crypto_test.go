@@ -124,3 +124,30 @@ func TestLoadCryptoInvalidVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadBlindIndexPepperVersionBounds(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int16
+		bad  bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"-0", 0, false},
+		{"+7", 7, false},
+		{"32767", 32767, false},
+		{"-1", 0, true},
+		{"32768", 0, true},
+		{"65536", 0, true},
+		{"18446744073709551616", 0, true},
+		{"invalid", 0, true},
+	} {
+		t.Run("value_"+tc.raw, func(t *testing.T) {
+			t.Setenv(EnvBlindIndexPepperVersion, tc.raw)
+			got, err := LoadBlindIndexPepperVersion()
+			if (err != nil) != tc.bad || (!tc.bad && got != tc.want) {
+				t.Fatalf("version %q = %d, %v; want %d, error=%t", tc.raw, got, err, tc.want, tc.bad)
+			}
+		})
+	}
+}

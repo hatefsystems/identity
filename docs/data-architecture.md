@@ -240,6 +240,32 @@ verification. This proof is database-relative; external anchoring is deferred,
 so a privileged coherent database rewrite/rollback is not independently detected.
 
 
+### 1.1.3 Lifecycle Revisions and Outbox (Task 6.3)
+
+Migration `00016_user_lifecycle_events.sql` adds nonnegative
+`users.lifecycle_revision`, independent of credential `auth_version`/`auth_epoch`.
+Explicit Go business transactions advance it and insert metadata-only lifecycle
+intent in `event_outbox` in the same commit. No CDC or lifecycle triggers are
+installed. Existing users begin at 0 without synthesized history; transactional
+creation starts at 1, and purge uses the removed locked user's last revision plus
+one for its terminal event.
+
+Nullable `lifecycle_user_id`/`lifecycle_revision` outbox metadata supports indexed
+per-account ordering and uniqueness without a user FK, so tombstones survive
+erasure. Existing admin and legacy deletion rows remain valid. The lifecycle
+publisher excludes `admin_action` rows and unrelated subjects; a lower unpublished
+revision blocks that account's later events even during retry. Stable IDs/times
+and acknowledged delivery bookkeeping permit replay after a crash, not loss of
+accepted intent.
+
+Payloads exclude profile values/secrets but contain linkable identifiers/times.
+Apply approved transport/acknowledged-outbox retention, preserve active-held rows,
+and never expire unpublished intent. Raw legacy `{"user_id":"<uuid>"}` deletions
+are adapted at delivery without rewriting them or inventing revisions. The
+broadcast stream is not the audit work queue or legal-evidence archive. See the
+[wire contract](api-design.md#3-asynchronous-events-nats-jetstream) and
+[operations boundaries](devops-operations.md#user-lifecycle-publisher-task-63).
+
 ### 1.2 `sqlc` & `pgx` Configurations
 
 To generate the idiomatic, type-safe Go code, the database queries must be defined inside `.sql` files.

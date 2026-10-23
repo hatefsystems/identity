@@ -237,7 +237,7 @@ Implemented by `internal/identitygrpc` using the [canonical protobuf contract](.
 |---|---|
 | `ValidateToken` | Required raw `access_token`, explicit `expected_audience`, and observed `authorization_scheme` (`Bearer` or `DPoP`). DPoP also requires `dpop_proof`, original `http_method`, and independently observed absolute `http_uri`. Any supplied HTTP context is validated against the caller's exact permitted origins. |
 | `CheckPermission` | Nonzero `user_id` UUID and exact `permission` identifier, at most 100 characters. Uses the existing primary-DB predicate for active, nondeleted accounts. Role names, OAuth scopes, wildcard expansion, and administrator bypasses are not supported. Unknown users/permissions return `allowed=false`. |
-| `GetInternalUserInfo` | Nonzero `user_id` UUID. Active/pending-verification users return ID, primary email and status. Suspended/banned users return ID/status only. Missing, deleted and pending-deletion users return `NotFound`. `display_name` remains empty because no stored display-name field exists. No encrypted contacts, factors, hashes or legal metadata are returned. |
+| `GetInternalUserInfo` | Nonzero `user_id` UUID. Active/pending-verification users return ID, primary email, status and `lifecycle_revision`; suspended/banned users omit email. Missing, deleted and pending-deletion users return `NotFound`. `display_name` remains empty. The revision orders shared-profile changes, not credentials or authorization. No encrypted contacts, factors, hashes or legal metadata are returned. |
 
 `ValidateToken` verifies the local rotating key, `typ=at+jwt`, algorithm, issuer, audience, expiry and required claims. User tokens require the matching live normal browser session, OAuth grant, and captured primary-DB `auth_version`; client-credentials tokens use an explicit `CLIENT` principal and never acquire a user identity, even when the client ID is UUID-shaped. Recovery-enrollment sessions, ID tokens, step-up grants, assertions and legacy unlinked access JWTs are rejected.
 
@@ -252,8 +252,20 @@ Refresh rotation is atomic across instances, cannot change its original DPoP key
 ---
 
 ## 3. Asynchronous Events (NATS JetStream)
-The IdP broadcasts events to the NATS broker so other services can react asynchronously.
-- **Subject:** `identity.user.created` (Payload: User ID, Email) - Triggered on registration.
-- **Subject:** `identity.user.updated` (Payload: User ID, changed fields)
-- **Subject:** `identity.user.suspended` (Payload: User ID, Reason) - Search core or other services can instantly cut off access.
-- **Subject:** `identity.user.deleted` (Payload: User ID) - Signals other services to scrub this user's PII from their localized databases (GDPR propagation). Published through a **transactional outbox** (`event_outbox`), not directly from the purge worker: the outbox insert and the physical `DELETE` share one transaction, so there is no event without a commit and no commit without an event. A `DELETE` affecting anything other than exactly one row rolls both back, which is what stops an `identity.user.deleted` from ever naming a subject that still exists. Draining the outbox into JetStream is a separate task; until it lands, rows accumulate and an unpublished-row-count alert is required.
+
+Task 6.3 uses the canonical [`UserLifecycleEvent`](../libs/schemas/proto/hatef/identity/v1/user_lifecycle_event.proto) contract and a separate `IDENTITY_USERS` stream. The Go worker publishes committed outbox intent with JetStream acknowledgements. The audit stream, signer and legal evidence retention are independent.
+
+| Subject | Trigger |
+|---|---|
+| `identity.user.created` | Transactional `lifecycle.CreateUser` for a new active/pending-verification account. No new registration HTTP endpoint is provided; passkey enrollment and the synthetic lookup probe are not account creation. |
+| `identity.user.updated` | Actual ban/reactivation, pending-deletion or reclamation transition. `changed_fields` names the changed shared fields, never their values. Primary-email changes are reserved in the contract but that mutation endpoint is separate work. |
+| `identity.user.suspended` | Actual transition into the literal `suspended` status, including from banned. Repeating the same status does not emit an event even when credentials are invalidated. |
+| `identity.user.deleted` | Exactly one hold-checked physical user DELETE and its terminal intent commit atomically. Soft deletion, dry runs, held subjects, no-row deletes and rolled-back transactions never emit a tombstone. |
+
+Version 1 uses ProtoJSON with snake_case keys: `schema_version`, UUID `event_id`, exact `event_type`, UUID `user_id`, UTC `occurred_at`, positive `revision` as a decimal JSON string, optional named-enum `status`, and `changed_fields`. Deletion omits status/changed fields. Payloads are limited to 16 KiB and exclude email/contact values, credentials, ciphertexts, IPs and moderation narratives. Identifiers/timestamps remain linkable metadata, not anonymous data.
+
+`users.lifecycle_revision` is independent of `auth_version` and `auth_epoch`. Existing accounts begin at 0 without synthetic history; transaction-aware creation starts at 1. Each real captured change increments once, and deletion uses the locked account's last revision plus one. Outbox IDs/times/revisions stay stable across retries. Phone, MFA, password, passkey, recovery-code, role and session mutations do not belong to this shared-profile stream. Direct SQL and fixtures are outside the explicit Go capture boundary.
+
+The worker accepts existing exact `{"user_id":"<uuid>"}` deletion payloads, validates them, and creates a versioned terminal envelope from their persisted row ID/time without inventing a revision. This is the only supported revision-less event. Persisted legacy payloads are not rewritten.
+
+Delivery is **at least once**. A PubAck followed by an uncertain database commit can replay the same ID, including outside the broker's finite deduplication window. Limits retention enables independent consumers; it is not the audit stream's work queue. A delayed or poisoned per-account head blocks its later revisions while other accounts can progress. Consumers must implement [idempotency, reconciliation and terminal tombstones](client-integration.md#4-user-lifecycle-consumption). Events synchronize projections, not instantaneous access revocation; continue using live authorization checks.

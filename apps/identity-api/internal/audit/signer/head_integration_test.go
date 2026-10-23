@@ -89,7 +89,7 @@ func provisionSignerFixture(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 	}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO public.audit_log_head(singleton,seq,chain_hash) VALUES (true,0,$1)",
-		audit.AuditGenesis().Bytes()); err != nil {
+		audit.Genesis().Bytes()); err != nil {
 		t.Fatalf("explicit audit head bootstrap: %v", err)
 	}
 	if _, err := pool.Exec(ctx,

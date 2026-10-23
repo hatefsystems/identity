@@ -1,0 +1,35 @@
+// Metadata-only account notifications for the identity.user.* subjects.
+syntax = "proto3";
+
+package hatef.identity.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hatef/identity/v1/common.proto";
+
+// UserLifecycleEvent carries no profile values, credentials, or free-form data.
+// Encode with ProtoJSON using proto field names. Consumers must validate the
+// schema version and event-specific metadata before applying a notification.
+message UserLifecycleEvent {
+  // Exactly 1 for this contract.
+  uint32 schema_version = 1;
+  // Canonical nonzero UUID; stable across retries and equal to the outbox ID.
+  string event_id = 2;
+  // Exact NATS subject: identity.user.created, identity.user.updated,
+  // identity.user.suspended, or identity.user.deleted.
+  string event_type = 3;
+  // Canonical nonzero account UUID, never an email or credential identifier.
+  string user_id = 4;
+  // Time captured with the committed intent, encoded as a UTC timestamp.
+  google.protobuf.Timestamp occurred_at = 5;
+  // Positive per-account revision bounded by PostgreSQL's signed bigint range.
+  // ProtoJSON encodes uint64 as a decimal string, not a JSON number. Only a
+  // legacy deletion tombstone may omit this field; zero is never a revision.
+  optional uint64 revision = 6;
+  // Exact resulting account status; absent for terminal deletion tombstones.
+  optional UserStatus status = 7;
+  // At most two unique names from the allowlist "status", "email", not values.
+  // Creation includes both; suspension includes only "status". Updates include
+  // at least one; deletion omits this field. A transition into suspended uses
+  // identity.user.suspended, not identity.user.updated.
+  repeated string changed_fields = 8;
+}

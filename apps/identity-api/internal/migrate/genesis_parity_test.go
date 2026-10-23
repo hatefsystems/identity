@@ -54,7 +54,7 @@ func TestGenesisMatchesMigration(t *testing.T) {
 func TestGenesisConstantsMatchDerivation(t *testing.T) {
 	t.Parallel()
 
-	if got := audit.AuditGenesis().Hex(); got != audit.GoldenAuditGenesisHex {
+	if got := audit.Genesis().Hex(); got != audit.GoldenAuditGenesisHex {
 		t.Errorf("audit genesis = %s, golden constant = %s", got, audit.GoldenAuditGenesisHex)
 	}
 	if got := audit.LedgerGenesis().Hex(); got != audit.GoldenLedgerGenesisHex {

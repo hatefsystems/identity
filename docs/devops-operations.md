@@ -14,6 +14,61 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ---
 
+## User Lifecycle Publisher (Task 6.3)
+
+`lifecycle-publisher` ships in the same non-root backend image. Run it as a
+separate MVP worker, not in request handlers or the audit signer. It needs no
+Redis, encryption keys or SPIRE. Broker outages accumulate durable intent instead
+of turning into log-only delivery.
+
+| Mode | Credentials and behavior |
+|---|---|
+| `provision` | Broker/topology credentials only. Create `IDENTITY_USERS` or validate compatible existing topology; never overwrite drift or the audit stream. |
+| `publish` (default) | Scoped `DATABASE_URL` and `NATS_URL`. Open existing topology, claim committed intent, mark delivered only after the expected stream's PubAck. |
+| `cleanup-published` | Separate `LIFECYCLE_CLEANUP_DATABASE_URL` and approved `LIFECYCLE_OUTBOX_RETENTION`, no broker/API secrets. Bounded, hold-aware deletion of acknowledged lifecycle rows only. |
+
+The stream uses the four exact lifecycle subjects, File storage, Limits retention,
+DiscardNew, a two-minute deduplication window, a 16-KiB message limit and one
+replica. Default capacity is 128 MiB. `LIFECYCLE_STREAM_MAX_AGE` and
+`LIFECYCLE_OUTBOX_RETENTION` require explicit positive finite production values;
+stream age must exceed the duplicate window. Their `168h` defaults apply only with
+explicit `APP_ENV=development` and are not production policy approval. One replica
+is not broker HA. Size disk/capacity for the approved replay horizon;
+acknowledgements do not free history early under Limits retention.
+
+1. Apply migration `00016_user_lifecycle_events.sql`, drain old mutation writers,
+   and deploy compatible producers, profile RPC and worker together. Existing
+   users start at revision 0; no registrations or historical events are synthesized.
+2. Provision with a separately approved broker identity. Ordinary publishers must
+   not mutate topology. Each service needs independent durable/grant permissions.
+   API DB roles may insert intent, not mark it delivered; publishers cannot mutate
+   users/audits; cleanup access is separate. Verify deployed grants/RLS, not merely
+   SQL predicates.
+3. Establish authoritative consumer baselines/checkpoints before activation.
+   Lost/recreated/expired history requires reconciliation, not starting at latest.
+   No bulk bootstrap or snapshot API is supplied. Follow the
+   [consumer contract](client-integration.md#4-user-lifecycle-consumption).
+4. Select `/usr/local/bin/lifecycle-publisher` as the image entrypoint. Defaults
+   are 50 rows/batch, 5s/publish, 30s/batch, 1s polling and 15s startup. Shutdown
+   stops new claims and bounds in-flight work. Uncertain commits can replay a stable
+   ID; consumer idempotency remains mandatory.
+5. Monitor aggregate pending count, oldest age, accumulated attempts and invalid
+   rows from structured diagnostics/`Backlog`, plus broker storage and consumer lag.
+   Alert on sustained failures/growth, invalid envelopes and age approaching the
+   replay horizon. No Prometheus endpoint, alert rules or paging route is installed
+   by this change; approved thresholds/routing are production release gates.
+6. Schedule cleanup only after retention approval. Unpublished intent never expires;
+   held candidates are excluded and rechecked under account locking. Malformed
+   published rows are retained/reported and require controlled repair, not silent
+   erasure to clear a backlog. Never disable holds or manually mark rows delivered
+   to hide failures. Cleanup does not purge broker history or legal evidence.
+7. Rollback preserves revisions/accepted intent; migration 00016 is forward-only.
+   Stop incompatible writers, restore related database state consistently, and
+   reconcile baselines/deletions before reopening traffic.
+
+Task 6.3 validation does not grant production permissions, approve retention,
+deploy consumers or remove earlier tasks' production enablement gates.
+
 ## 1. Kubernetes Deployment & Networking
 
 The platform leverages **Traefik** as the Ingress Controller and API Gateway at the cluster boundary, and **SPIRE** to orchestrate dynamic zero-trust workloads.

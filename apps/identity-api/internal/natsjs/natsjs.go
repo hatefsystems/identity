@@ -108,27 +108,18 @@ func Connect(ctx context.Context, url, name string, logger *slog.Logger) (*nats.
 		// exits before reconnecting. Failing the publish routes it into the audit
 		// publisher's log fallback, which is recoverable.
 		nats.ReconnectBufSize(-1),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			attrs := []any{slog.String("nats_name", name)}
-			if err != nil {
-				attrs = append(attrs, slog.String("error", err.Error()))
-			}
-			logger.Error("natsjs: disconnected from NATS; audit transport is degraded", attrs...)
+		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+			logger.Error("natsjs: disconnected from NATS; transport is degraded", slog.String("nats_name", name))
 		}),
-		nats.ReconnectHandler(func(nc *nats.Conn) {
+		nats.ReconnectHandler(func(_ *nats.Conn) {
 			logger.Warn("natsjs: reconnected to NATS",
-				slog.String("nats_name", name),
-				slog.String("url", nc.ConnectedUrl()))
+				slog.String("nats_name", name))
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			logger.Warn("natsjs: NATS connection closed", slog.String("nats_name", name))
 		}),
-		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
-			attrs := []any{slog.String("nats_name", name), slog.String("error", err.Error())}
-			if sub != nil {
-				attrs = append(attrs, slog.String("subject", sub.Subject))
-			}
-			logger.Error("natsjs: asynchronous NATS error", attrs...)
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {
+			logger.Error("natsjs: asynchronous NATS error", slog.String("nats_name", name))
 		}),
 	}
 

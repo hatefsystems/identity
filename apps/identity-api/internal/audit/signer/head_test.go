@@ -38,7 +38,7 @@ func TestSignerHeadFailsClosed(t *testing.T) {
 		{"negative sequence", db.GetSecurityLedgerHeadRow{Seq: -1, ChainHash: audit.LedgerGenesis().Bytes(), StateValid: true}, nil},
 		// seq 0 must pair with the derived genesis seed. v1 used 32 zero bytes, so a
 		// blanked column was indistinguishable from a real genesis.
-		{"false genesis", db.GetSecurityLedgerHeadRow{Seq: 0, ChainHash: audit.AuditGenesis().Bytes(), StateValid: true}, nil},
+		{"false genesis", db.GetSecurityLedgerHeadRow{Seq: 0, ChainHash: audit.Genesis().Bytes(), StateValid: true}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &fakeStore{head: tc.head, headErr: tc.err}

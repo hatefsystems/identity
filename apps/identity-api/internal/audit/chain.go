@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -128,8 +129,8 @@ const (
 	GoldenLedgerGenesisHex = "6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea2c54"
 )
 
-// AuditGenesis returns the audit chain's genesis predecessor digest.
-func AuditGenesis() Digest { return auditGenesis }
+// Genesis returns the audit chain's genesis predecessor digest.
+func Genesis() Digest { return auditGenesis }
 
 // LedgerGenesis returns the security ledger's genesis predecessor digest.
 func LedgerGenesis() Digest { return ledgerGenesis }
@@ -331,10 +332,11 @@ func FormatChainTime(t time.Time) string {
 // single-writer signing worker, and killing the only process that can advance the
 // chain is a worse outcome than refusing one record.
 func appendField(dst []byte, s string) ([]byte, error) {
-	if uint64(len(s)) > uint64(^uint32(0)) {
+	length := uint64(len(s))
+	if length > math.MaxUint32 {
 		return nil, fmt.Errorf("%w: %d bytes", ErrFieldTooLarge, len(s))
 	}
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(s)))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(length))
 	return append(dst, s...), nil
 }
 

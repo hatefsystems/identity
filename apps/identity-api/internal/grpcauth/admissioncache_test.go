@@ -270,8 +270,8 @@ func TestSetGrantsRejectsInvalidPolicyAtomically(t *testing.T) {
 	ctx := testPeerContext(svid.Certificates)
 
 	for name, policy := range map[string]map[string][]string{
-		"invalid method":       {"not-a-method": {testClientID}},
-		"foreign trust domain": {testOtherMethod: {"spiffe://other.test/ns/x/sa/y"}},
+		"invalid method":        {"not-a-method": {testClientID}},
+		"foreign trust domain":  {testOtherMethod: {"spiffe://other.test/ns/x/sa/y"}},
 		"identity with no path": {testOtherMethod: {"spiffe://hatef.ir"}},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -117,7 +117,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	// uninitialized head as genesis.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO public.audit_log_head(singleton,seq,chain_hash) VALUES (true,0,$1)
-		 ON CONFLICT (singleton) DO NOTHING`, audit.AuditGenesis().Bytes()); err != nil {
+		 ON CONFLICT (singleton) DO NOTHING`, audit.Genesis().Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx,

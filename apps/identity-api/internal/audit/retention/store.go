@@ -300,13 +300,13 @@ func (s *PgStore) enqueueReceipt(ctx context.Context, tx pgx.Tx, operationID uui
 		eventType = audit.EventLegalLedgerPurged
 	}
 	payload := map[string]any{
-		"operation_id":   operationID.String(),
-		"cutoff":         audit.FormatChainTime(b.Cutoff),
-		"deleted_count":  deleted,
-		"held_count":     held,
-		"dry_run":        dryRun,
-		"outcome":        outcome,
-		"highwater_seq":  b.ThroughSeq,
+		"operation_id":  operationID.String(),
+		"cutoff":        audit.FormatChainTime(b.Cutoff),
+		"deleted_count": deleted,
+		"held_count":    held,
+		"dry_run":       dryRun,
+		"outcome":       outcome,
+		"highwater_seq": b.ThroughSeq,
 	}
 	envelope, err := audit.NewEnvelope(audit.Event{
 		EventType:     eventType,

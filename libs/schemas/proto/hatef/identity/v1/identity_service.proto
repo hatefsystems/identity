@@ -86,4 +86,7 @@ message GetInternalUserInfoResponse {
   // Empty until an actual display-name field is implemented in storage.
   string display_name = 3;
   UserStatus status = 4;
+  // Revision of this profile snapshot; zero for accounts not yet captured by
+  // lifecycle events. ProtoJSON encodes this uint64 as a decimal string.
+  uint64 lifecycle_revision = 5;
 }

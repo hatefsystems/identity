@@ -293,6 +293,10 @@ func (s *Service) GetInternalUserInfo(ctx context.Context, req *identityv1.GetIn
 	default:
 		return nil, status.Error(codes.Internal, "invalid stored profile")
 	}
+	if profile.LifecycleRevision < 0 {
+		return nil, status.Error(codes.Internal, "invalid stored profile")
+	}
+	response.LifecycleRevision = uint64(profile.LifecycleRevision)
 	event := audit.Event{
 		EventType: audit.EventGRPCProfileRead, ActionStatus: audit.StatusSuccess,
 		ActorSPIFFEID: caller.String(), SubjectID: &id,

@@ -47,7 +47,7 @@ func (s *verifySource) HashAt(_ context.Context, seq int64) ([]byte, error) {
 func (s *verifySource) Page(_ context.Context, after, through int64, limit int32) ([]ledgerproof.Node, error) {
 	var out []ledgerproof.Node
 	for _, n := range s.nodes {
-		if n.Seq > after && n.Seq <= through && int32(len(out)) < limit {
+		if n.Seq > after && n.Seq <= through && len(out) < int(limit) {
 			out = append(out, n)
 		}
 	}
@@ -60,7 +60,7 @@ func (s *verifySource) Page(_ context.Context, after, through int64, limit int32
 func buildAuditSource(t *testing.T, sequences ...int64) *verifySource {
 	t.Helper()
 	src := &verifySource{chain: ledgerproof.ChainAudit}
-	prev := audit.AuditGenesis()
+	prev := audit.Genesis()
 	for _, seq := range sequences {
 		rec := audit.AuditRecord{
 			ID: uuid.NewString(), ActorID: uuid.NewString(),
@@ -82,7 +82,7 @@ func buildAuditSource(t *testing.T, sequences ...int64) *verifySource {
 	if n := len(sequences); n > 0 {
 		src.head = ledgerproof.Head{Seq: sequences[n-1], MaxSeq: sequences[n-1], Hash: prev.Bytes()}
 	} else {
-		src.head = ledgerproof.Head{Hash: audit.AuditGenesis().Bytes()}
+		src.head = ledgerproof.Head{Hash: audit.Genesis().Bytes()}
 	}
 	return src
 }
@@ -296,10 +296,10 @@ func TestAdminVerifyRejectsUnknownSeq(t *testing.T) {
 func TestAdminVerifyRejectsMalformedParams(t *testing.T) {
 	src := buildAuditSource(t, 1, 2)
 	for _, query := range []string{
-		"?limit=0&after_seq=1",            // after_seq without through_seq
-		"?after_seq=5&through_seq=1",      // inverted range
-		"?predecessor_hash=zz",            // not hex
-		"?limit=-1",                       // negative limit
+		"?limit=0&after_seq=1",       // after_seq without through_seq
+		"?after_seq=5&through_seq=1", // inverted range
+		"?predecessor_hash=zz",       // not hex
+		"?limit=-1",                  // negative limit
 	} {
 		w, _, _ := verifyRequest(t, ledgerproof.ChainAudit, src, query)
 		if w.Code != http.StatusBadRequest {

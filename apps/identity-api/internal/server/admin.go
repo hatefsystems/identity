@@ -337,11 +337,5 @@ func nullUUIDPtr(n uuid.NullUUID) *uuid.UUID {
 	return &id
 }
 
-// int64Ptr returns a pointer to v.
-func int64Ptr(v int64) *int64 { return &v }
-
-// stringPtr returns a pointer to v.
-func stringPtr(v string) *string { return &v }
-
 // isNoRows reports whether err is pgx.ErrNoRows.
 func isNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }

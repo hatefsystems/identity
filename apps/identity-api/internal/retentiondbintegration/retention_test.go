@@ -198,7 +198,7 @@ WHERE n.nspname='public' AND p.proname='advance_chain_head'`).Scan(&secdef, &pin
 
 	// Only this fixture knows that the newly created database has no history.
 	mustExec(t, ctx, admin, "INSERT INTO public.security_ledger_head VALUES (true,0,$1)", audit.LedgerGenesis().Bytes())
-	mustExec(t, ctx, admin, "INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.AuditGenesis().Bytes())
+	mustExec(t, ctx, admin, "INSERT INTO public.audit_log_head VALUES (true,0,$1)", audit.Genesis().Bytes())
 	mustExec(t, ctx, admin, "INSERT INTO public.security_ledger_retention_settings VALUES (true,$1)", auditSubject)
 	return f
 }

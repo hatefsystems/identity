@@ -14,6 +14,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
@@ -47,6 +48,7 @@ const totpReplayWindow = 90 * time.Second
 // returned by db.New(tx) — so runInTx can execute the same calls inside or outside
 // a transaction without a second interface.
 type Store interface {
+	lifecycle.Store
 	// GetUserByIDForAdmin resolves an account *including* soft-deleted ones. Every
 	// lookup in this package uses it: GetUserByID filters deleted_at IS NULL and
 	// would therefore be blind to exactly the accounts this flow operates on.
@@ -421,6 +423,12 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, clientI
 				return fmt.Errorf("privacy: load active deletion request: %w", getErr)
 			}
 		} else {
+			if affected != 1 {
+				return errors.New("privacy: soft delete affected an unexpected row count")
+			}
+			if err := lifecycle.EnqueueStatusChange(ctx, store, userID, locked.Status, statusPendingDeletion); err != nil {
+				return err
+			}
 			// Re-read inside the transaction so expires_at is derived from the
 			// database's own deleted_at. That is what makes the token expiry and
 			// the purge cutoff arithmetically inseparable rather than two clocks
@@ -550,7 +558,8 @@ func (s *Service) Reclaim(ctx context.Context, token string, attempt ReclaimAtte
 
 	cutoff := pgtype.Timestamptz{Time: s.now().Add(-s.gracePeriod), Valid: true}
 	err = s.runInTx(ctx, func(store Store) error {
-		if _, lockErr := s.lockUser(ctx, store, user.ID); lockErr != nil {
+		locked, lockErr := s.lockUser(ctx, store, user.ID)
+		if lockErr != nil {
 			return lockErr
 		}
 		affected, reclaimErr := store.ReclaimUser(ctx, db.ReclaimUserParams{
@@ -566,6 +575,9 @@ func (s *Service) Reclaim(ctx context.Context, token string, attempt ReclaimAtte
 			// worker won the row. Refuse rather than report a success that did not
 			// happen.
 			return ErrInvalidToken
+		}
+		if err := lifecycle.EnqueueStatusChange(ctx, store, user.ID, locked.Status, "active"); err != nil {
+			return err
 		}
 		if _, expErr := store.ExpireDeletionRequestsForUser(ctx, user.ID); expErr != nil {
 			return fmt.Errorf("privacy: invalidate outstanding deletion requests: %w", expErr)

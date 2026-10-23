@@ -3,6 +3,7 @@ package audit
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -141,7 +142,7 @@ func TestChainHashMatchesFormula(t *testing.T) {
 func TestDigestHexIsLowerCaseSHA256(t *testing.T) {
 	t.Parallel()
 
-	got := ChainAudit(AuditGenesis(), mustLeafAudit(t, sampleAudit())).Hex()
+	got := ChainAudit(Genesis(), mustLeafAudit(t, sampleAudit())).Hex()
 	if len(got) != ChainHashHexLen {
 		t.Errorf("digest hex length = %d, want %d", len(got), ChainHashHexLen)
 	}
@@ -161,16 +162,16 @@ func TestGenesisIsDerivedNotZero(t *testing.T) {
 	t.Parallel()
 
 	var zero Digest
-	for name, got := range map[string]Digest{"audit": AuditGenesis(), "ledger": LedgerGenesis()} {
+	for name, got := range map[string]Digest{"audit": Genesis(), "ledger": LedgerGenesis()} {
 		if got == zero {
 			t.Errorf("%s genesis is 32 zero bytes; a blanked column would be accepted as genesis", name)
 		}
 	}
-	if AuditGenesis() == LedgerGenesis() {
+	if Genesis() == LedgerGenesis() {
 		t.Error("the two chains share a genesis digest; an audit genesis could seed the ledger chain")
 	}
-	if want := Digest(sha256.Sum256([]byte(auditChainPrefix + "genesis"))); AuditGenesis() != want {
-		t.Errorf("audit genesis = %s, want %s", AuditGenesis().Hex(), want.Hex())
+	if want := Digest(sha256.Sum256([]byte(auditChainPrefix + "genesis"))); Genesis() != want {
+		t.Errorf("audit genesis = %s, want %s", Genesis().Hex(), want.Hex())
 	}
 	if want := Digest(sha256.Sum256([]byte(ledgerChainPrefix + "genesis"))); LedgerGenesis() != want {
 		t.Errorf("ledger genesis = %s, want %s", LedgerGenesis().Hex(), want.Hex())
@@ -188,14 +189,14 @@ func TestChainDetectsTamperedPredecessor(t *testing.T) {
 	second := sampleAudit()
 	second.ID = "6f1d3c2b-0000-4000-8000-00000000000f"
 
-	tip1 := ChainAudit(AuditGenesis(), mustLeafAudit(t, first))
+	tip1 := ChainAudit(Genesis(), mustLeafAudit(t, first))
 	chain2 := ChainAudit(tip1, mustLeafAudit(t, second))
 
 	// An auditor recomputing after record 1's action_status was flipped to hide a
 	// failed login must not arrive at the stored chain2.
 	tampered := first
 	tampered.ActionStatus = StatusFailure
-	tamperedTip := ChainAudit(AuditGenesis(), mustLeafAudit(t, tampered))
+	tamperedTip := ChainAudit(Genesis(), mustLeafAudit(t, tampered))
 	if ChainAudit(tamperedTip, mustLeafAudit(t, second)) == chain2 {
 		t.Error("tampering with record 1 left record 2's chain digest valid; the chain provides no tamper evidence")
 	}
@@ -216,14 +217,14 @@ func TestChainDetectsRemovedChainNode(t *testing.T) {
 	}
 
 	chains := make([]Digest, len(records))
-	tip := AuditGenesis()
+	tip := Genesis()
 	for i, rec := range records {
 		tip = ChainAudit(tip, mustLeafAudit(t, rec))
 		chains[i] = tip
 	}
 
 	// Replay skipping the middle node, as a reader would after someone deleted it.
-	tip = AuditGenesis()
+	tip = Genesis()
 	for _, rec := range []AuditRecord{records[0], records[2]} {
 		tip = ChainAudit(tip, mustLeafAudit(t, rec))
 	}
@@ -317,7 +318,7 @@ func TestLeafAndChainPrefixesAreNotInterchangeable(t *testing.T) {
 		t.Error("one body produced the same leaf in both domains; a record could be replayed across chains")
 	}
 	// And the same (prev, leaf) pair chained in the two domains must differ.
-	prev := AuditGenesis()
+	prev := Genesis()
 	leafHash := mustLeafAudit(t, sampleAudit())
 	if ChainAudit(prev, leafHash) == ChainLedger(prev, leafHash) {
 		t.Error("one (prev, leaf) pair produced the same chain digest in both domains")
@@ -515,6 +516,20 @@ func TestSerializeIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestAppendFieldPreservesByteLengthEncoding(t *testing.T) {
+	t.Parallel()
+	for _, field := range []string{"", "audit", "a\x00b", "\u00e9\U0001f600"} {
+		prefix := []byte{0xde, 0xad}
+		encoded, err := appendField(prefix, field)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(encoded[:2], prefix) || int(binary.BigEndian.Uint32(encoded[2:6])) != len(field) || string(encoded[6:]) != field {
+			t.Fatalf("canonical byte-length encoding changed for %q", field)
+		}
+	}
+}
+
 // TestFormatChainTimeNormalizesToUTC covers the round-trip through PostgreSQL:
 // timestamptz carries no zone, so a value written as +03:30 comes back as UTC. If
 // the publisher's local rendering were hashed, nothing would ever verify.
@@ -549,7 +564,7 @@ func TestFormatChainTimeKeepsSubSecondPrecision(t *testing.T) {
 func TestDecodeDigestRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	want := ChainAudit(AuditGenesis(), mustLeafAudit(t, sampleAudit()))
+	want := ChainAudit(Genesis(), mustLeafAudit(t, sampleAudit()))
 
 	got, err := DecodeDigest(want.Bytes())
 	if err != nil {
@@ -574,7 +589,7 @@ func TestDecodeDigestRoundTrip(t *testing.T) {
 func TestDigestBytesIsACopy(t *testing.T) {
 	t.Parallel()
 
-	d := ChainAudit(AuditGenesis(), mustLeafAudit(t, sampleAudit()))
+	d := ChainAudit(Genesis(), mustLeafAudit(t, sampleAudit()))
 	raw := d.Bytes()
 	raw[0] ^= 0xff
 	if d.Bytes()[0] == raw[0] {

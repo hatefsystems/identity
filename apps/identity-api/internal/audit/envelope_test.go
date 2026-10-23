@@ -181,8 +181,8 @@ func TestEnvelopeSurvivesJSONRoundTripForHashing(t *testing.T) {
 		t.Fatalf("Unmarshal: %v", err)
 	}
 
-	want := ChainAudit(AuditGenesis(), mustLeafAudit(t, env.AuditRecord()))
-	got := ChainAudit(AuditGenesis(), mustLeafAudit(t, decoded.AuditRecord()))
+	want := ChainAudit(Genesis(), mustLeafAudit(t, env.AuditRecord()))
+	got := ChainAudit(Genesis(), mustLeafAudit(t, decoded.AuditRecord()))
 	if got != want {
 		t.Errorf("chain digest after a JSON round trip = %s, want %s; the signer would write a digest the publisher's record does not verify against", got.Hex(), want.Hex())
 	}
@@ -212,8 +212,8 @@ func TestAuditRecordExcludesSubjectID(t *testing.T) {
 		t.Fatalf("NewEnvelope: %v", err)
 	}
 
-	before := ChainAudit(AuditGenesis(), mustLeafAudit(t, withSubject.AuditRecord()))
-	after := ChainAudit(AuditGenesis(), mustLeafAudit(t, afterPurge.AuditRecord()))
+	before := ChainAudit(Genesis(), mustLeafAudit(t, withSubject.AuditRecord()))
+	after := ChainAudit(Genesis(), mustLeafAudit(t, afterPurge.AuditRecord()))
 	if before != after {
 		t.Errorf("chain digest changed when user_id was nulled (%s -> %s); a GDPR hard delete would make every audit row of that subject report tampering", before.Hex(), after.Hex())
 	}

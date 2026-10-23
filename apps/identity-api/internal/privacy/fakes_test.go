@@ -44,6 +44,7 @@ type fakeStore struct {
 	mu       sync.Mutex
 	users    map[uuid.UUID]db.User
 	requests []db.DeletionRequest
+	intents  []db.InsertLifecycleEventParams
 	now      func() time.Time
 
 	// Injectable faults, per method, so the "infrastructure error must not be
@@ -53,6 +54,7 @@ type fakeStore struct {
 	createRequestErr error
 	incrementErr     error
 	lookupErr        error
+	lifecycleErr     error
 
 	// Call counters for the assertions that care about *not* being called.
 	incrementCalls int
@@ -119,6 +121,28 @@ func (f *fakeStore) SoftDeleteUser(_ context.Context, id uuid.UUID) (int64, erro
 	u.DeletedAt = ts(f.now())
 	f.users[id] = u
 	return 1, nil
+}
+
+func (f *fakeStore) AdvanceUserLifecycleRevision(_ context.Context, id uuid.UUID) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[id]
+	if !ok {
+		return 0, pgx.ErrNoRows
+	}
+	u.LifecycleRevision++
+	f.users[id] = u
+	return u.LifecycleRevision, nil
+}
+
+func (f *fakeStore) InsertLifecycleEvent(_ context.Context, arg db.InsertLifecycleEventParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lifecycleErr != nil {
+		return f.lifecycleErr
+	}
+	f.intents = append(f.intents, arg)
+	return nil
 }
 
 func (f *fakeStore) ReclaimUser(_ context.Context, arg db.ReclaimUserParams) (int64, error) {

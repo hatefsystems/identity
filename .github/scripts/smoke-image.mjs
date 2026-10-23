@@ -18,6 +18,17 @@ function docker(args, allowFailure = false) {
   return result;
 }
 
+export const maintenanceEntrypoints = [
+  'identity-api',
+  'audit-signer',
+  'purge-worker',
+  'migrate',
+  'security-ledger-purge',
+  'admin-audit-publisher',
+  'lifecycle-publisher',
+  'admin-legal',
+];
+
 export function maintenanceSucceeded(result, binary = '') {
   if (result.status !== 1) return false;
   if (binary === 'migrate') {
@@ -236,15 +247,7 @@ export async function smokeImage(kind, reference, validateWeb) {
 
   if (kind === 'api') {
     assert.equal(image.Config.User, 'nonroot:nonroot');
-    for (const binary of [
-      'identity-api',
-      'audit-signer',
-      'purge-worker',
-      'migrate',
-      'security-ledger-purge',
-      'admin-audit-publisher',
-      'admin-legal',
-    ]) {
+    for (const binary of maintenanceEntrypoints) {
       const name = `ci-api-${randomUUID()}`;
       try {
         const result = docker(
