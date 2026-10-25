@@ -7,8 +7,8 @@
 -- name: CreateWebauthnCredential :one
 INSERT INTO webauthn_credentials (
     id, user_id, public_key, attestation_type, sign_count,
-    user_present, user_verified, backup_eligible, backup_state, aaguid
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    user_present, user_verified, backup_eligible, backup_state, aaguid, name
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 RETURNING *;
 
 -- name: GetWebauthnCredential :one
@@ -59,3 +59,11 @@ FOR UPDATE;
 DELETE FROM webauthn_credentials
 WHERE id = $1
   AND user_id = $2;
+
+-- name: RenameWebauthnCredential :one
+-- Cosmetic, owner-scoped update; never changes authenticator authority.
+UPDATE webauthn_credentials
+SET name = $3
+WHERE id = $1
+  AND user_id = $2
+RETURNING *;

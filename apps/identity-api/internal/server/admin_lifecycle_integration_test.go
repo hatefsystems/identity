@@ -34,7 +34,7 @@ func TestAdminLifecycleTransitionsIntegration(t *testing.T) {
 		{"banned", 2, lifecycle.SubjectUpdated},
 		{"active", 3, lifecycle.SubjectUpdated},
 	} {
-		response := f.request("moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
+		response := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
 			`{"status":"`+tc.status+`","reason":"restricted lifecycle test reason"}`, f.grant(t, "moderator"))
 		if response.Code != http.StatusNoContent {
 			t.Fatalf("moderation %d: status %d", i, response.Code)
@@ -85,7 +85,7 @@ func TestLifecycleFailureRollsBackModerationIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.srv.deps.AdminActions = actions
-	response := f.request("moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
+	response := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
 		`{"status":"suspended","reason":"must not commit"}`, f.grant(t, "moderator"))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("missing lifecycle intent returned success: %d", response.Code)

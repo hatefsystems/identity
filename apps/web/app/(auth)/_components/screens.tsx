@@ -3,15 +3,15 @@
 import {
   ForgotPasswordForm,
   LoginForm,
-  PasskeyForm,
   RegistrationForm,
   ResetPasswordForm,
   TotpForm,
 } from './forms';
+import { PasskeyLogin } from '../../_components/passkey-login';
 
-// Keep submission callbacks behind this boundary; no public route has an auth implementation.
+// Only passkey sign-in is live. Other Task 7.2 forms remain disconnected.
 export function LoginScreen() {
-  return <LoginForm />;
+  return <LoginForm passkeyAction={<PasskeyLogin label="Continue with a passkey" />} />;
 }
 
 export function RegistrationScreen() {
@@ -19,7 +19,7 @@ export function RegistrationScreen() {
 }
 
 export function PasskeyScreen() {
-  return <PasskeyForm />;
+  return <PasskeyLogin introduction />;
 }
 
 export function TotpScreen() {

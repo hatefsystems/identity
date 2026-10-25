@@ -88,6 +88,7 @@ func (f *fakeWebAuthnCredentialStore) CreateWebauthnCredential(_ context.Context
 		BackupEligible:  arg.BackupEligible,
 		BackupState:     arg.BackupState,
 		Aaguid:          arg.Aaguid,
+		Name:            arg.Name,
 	}
 	f.byUser[arg.UserID] = append(f.byUser[arg.UserID], row)
 	return row, nil
@@ -142,6 +143,17 @@ func (f *fakeWebAuthnCredentialStore) DeleteWebauthnCredential(_ context.Context
 	return 0, nil
 }
 
+func (f *fakeWebAuthnCredentialStore) RenameWebauthnCredential(_ context.Context, arg db.RenameWebauthnCredentialParams) (db.WebauthnCredential, error) {
+	for i, row := range f.byUser[arg.UserID] {
+		if bytes.Equal(row.ID, arg.ID) {
+			row.Name = arg.Name
+			f.byUser[arg.UserID][i] = row
+			return row, nil
+		}
+	}
+	return db.WebauthnCredential{}, pgx.ErrNoRows
+}
+
 func (f *fakeWebAuthnCredentialStore) UpdateWebauthnSignCount(_ context.Context, arg db.UpdateWebauthnSignCountParams) (int64, error) {
 
 	for userID, rows := range f.byUser {
@@ -160,12 +172,14 @@ func (f *fakeWebAuthnCredentialStore) UpdateWebauthnSignCount(_ context.Context,
 // real WebAuthn service over in-memory stores, plus the seeded account the
 // authenticated routes act on.
 type webAuthnTestServer struct {
-	srv    *Server
-	mgr    *session.Manager
-	users  *fakeWebAuthnUserStore
-	creds  *fakeWebAuthnCredentialStore
-	user   db.User
-	stepUp *stepup.Service
+	t       *testing.T
+	browser *portalTestClient
+	srv     *Server
+	mgr     *session.Manager
+	users   *fakeWebAuthnUserStore
+	creds   *fakeWebAuthnCredentialStore
+	user    db.User
+	stepUp  *stepup.Service
 }
 
 // newWebAuthnTestServer builds that fixture. The session cookie is non-Secure so
@@ -233,31 +247,41 @@ func newWebAuthnTestServerWithStepUp(t *testing.T, withStepUp bool) *webAuthnTes
 		)
 	}
 
+	browser := newPortalTestClient(t, "http://localhost:8080")
+	cfg := testConfig(t)
+	cfg.PortalOrigin = browser.origin
 	return &webAuthnTestServer{
-		srv:    New(testConfig(t), nil, Deps{SessionManager: mgr, WebAuthn: svc, StepUp: stepUpSvc}),
-		mgr:    mgr,
-		users:  users,
-		creds:  creds,
-		user:   user,
-		stepUp: stepUpSvc,
+		t:       t,
+		browser: browser,
+		srv:     New(cfg, nil, Deps{SessionManager: mgr, WebAuthn: svc, StepUp: stepUpSvc, DPoPValidator: browser.validator}),
+		mgr:     mgr,
+		users:   users,
+		creds:   creds,
+		user:    user,
+		stepUp:  stepUpSvc,
 	}
 }
 
 // login issues a session for the seeded account and returns its cookies.
 func (w *webAuthnTestServer) login(t *testing.T) []*http.Cookie {
 	t.Helper()
-	_, cookies := issueSession(t, w.mgr, session.IssueParams{UserID: w.user.ID.String()})
+	_, cookies := w.browser.issueSession(t, w.mgr, session.IssueParams{UserID: w.user.ID.String()})
 	return cookies
 }
 
 // do executes a request against the server and returns the recorder.
 func (w *webAuthnTestServer) do(method, path string, body []byte, cookies []*http.Cookie) *httptest.ResponseRecorder {
 	var reader io.Reader
-	if body != nil {
+	if len(body) > 0 {
 		reader = bytes.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
 	addCookies(req, cookies)
+	if current, err := w.mgr.Resolve(req); err == nil && current.Kind == session.KindAuthenticated {
+		w.browser.authorize(w.t, req, current)
+	} else {
+		w.browser.sign(w.t, req)
+	}
 	rec := httptest.NewRecorder()
 	w.srv.Handler().ServeHTTP(rec, req)
 	return rec
@@ -272,9 +296,18 @@ func (w *webAuthnTestServer) doWithGrant(
 	sess session.Session,
 ) *httptest.ResponseRecorder {
 	t.Helper()
+	return w.doWithGrantBody(t, method, path, nil, cookies, sess)
+}
 
-	req := httptest.NewRequest(method, path, nil)
-	addCookies(req, cookies)
+func (w *webAuthnTestServer) doWithGrantBody(t *testing.T, method, path string, body []byte, cookies []*http.Cookie, sess session.Session) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	w.browser.authorize(t, req, sess, cookies...)
 	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, w.stepUp, sess.UserID, sess.ID))
 	rec := httptest.NewRecorder()
 	w.srv.Handler().ServeHTTP(rec, req)
@@ -357,7 +390,9 @@ func assertionBodyFor(t *testing.T, challenge string) []byte {
 // mounted when a WebAuthn service is configured, mirroring the session and OIDC
 // routes' dependency gating.
 func TestWebAuthnRoutesAbsentWithoutService(t *testing.T) {
-	srv := New(testConfig(t), nil, Deps{})
+	cfg := testConfig(t)
+	cfg.PortalOrigin = testPortalOrigin
+	srv := New(cfg, nil, Deps{})
 
 	routes := []struct {
 		method string
@@ -372,6 +407,7 @@ func TestWebAuthnRoutesAbsentWithoutService(t *testing.T) {
 	for _, route := range routes {
 		t.Run(route.path, func(t *testing.T) {
 			req := httptest.NewRequest(route.method, route.path, nil)
+			req.Header.Set("Origin", srv.cfg.PortalOrigin)
 			rec := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rec, req)
 
@@ -411,7 +447,7 @@ func TestWebAuthnAccountRoutesRequireSession(t *testing.T) {
 
 func TestRecoveryEnrollmentRoutesAcceptOnlyRestrictedSession(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
-	_, fullCookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	_, fullCookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
 	_, recoveryCookies := issueSession(t, fx.mgr, session.IssueParams{
 		UserID: fx.user.ID.String(),
 		Kind:   session.KindRecoveryEnrollment,
@@ -492,7 +528,7 @@ func TestWebAuthnLoginRoutesAreUnauthenticated(t *testing.T) {
 // well-formed CredentialCreation payload.
 func TestRegisterOptionsReturns200(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
 
 	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
 
@@ -539,7 +575,7 @@ func TestRegisterOptionsReturns200(t *testing.T) {
 // its account cannot start an enrolment.
 func TestRegisterOptionsForDeletedAccountReturns401(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
 	delete(fx.users.byID, fx.user.ID)
 
 	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
@@ -547,8 +583,8 @@ func TestRegisterOptionsForDeletedAccountReturns401(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
-	if got := decodeWebAuthnError(t, rec); got.Error != "unauthorized" {
-		t.Errorf("error = %q, want %q", got.Error, "unauthorized")
+	if got := decodeWebAuthnError(t, rec); got.Error != "session_required" {
+		t.Errorf("error = %q, want %q", got.Error, "session_required")
 	}
 }
 
@@ -601,12 +637,13 @@ func TestWebAuthnErrorMapping(t *testing.T) {
 			wantStatus int
 			wantCode   string
 		}{
-			{webauthn.ErrUserNotFound, http.StatusUnauthorized, "unauthorized"},
+			{webauthn.ErrUserNotFound, http.StatusUnauthorized, "session_required"},
 			{webauthn.ErrInvalidResponse, http.StatusBadRequest, "invalid_request"},
 			{webauthn.ErrChallengeNotFound, http.StatusBadRequest, "challenge_invalid"},
 			{webauthn.ErrChallengeExpired, http.StatusBadRequest, "challenge_invalid"},
 			{webauthn.ErrVerification, http.StatusBadRequest, "verification_failed"},
-			{errors.New("database on fire"), http.StatusInternalServerError, "server_error"},
+			{errors.New("database on fire"), http.StatusServiceUnavailable, "temporarily_unavailable"},
+			{webauthn.ErrChallengeStoreUnavailable, http.StatusServiceUnavailable, "temporarily_unavailable"},
 		}
 		for _, tc := range tests {
 			t.Run(tc.wantCode+"/"+tc.err.Error(), func(t *testing.T) {
@@ -665,11 +702,11 @@ func TestWebAuthnErrorMapping(t *testing.T) {
 			rec := httptest.NewRecorder()
 			srv.writeWebAuthnLoginError(rec, "test", errors.New("database on fire"))
 
-			if rec.Code != http.StatusInternalServerError {
-				t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 			}
-			if got := decodeWebAuthnError(t, rec); got.Error != "server_error" {
-				t.Errorf("error = %q, want %q", got.Error, "server_error")
+			if got := decodeWebAuthnError(t, rec); got.Error != "temporarily_unavailable" {
+				t.Errorf("error = %q, want %q", got.Error, "temporarily_unavailable")
 			}
 		})
 	})
@@ -975,7 +1012,7 @@ func TestWebAuthnDeleteKeyRequiresAGrant(t *testing.T) {
 // TestWebAuthnDeleteKeyWithGrant is the happy path.
 func TestWebAuthnDeleteKeyWithGrant(t *testing.T) {
 	ts := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	sess, cookies := ts.browser.issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
 	row := ts.seedCredential([]byte("cred-a"))
 	ts.seedCredential([]byte("cred-b"))
 
@@ -996,7 +1033,7 @@ func TestWebAuthnDeleteKeyWithGrant(t *testing.T) {
 // order to act on it (enrol another passkey, enable TOTP, or set a password).
 func TestWebAuthnDeleteKeyRefusesTheLastFactor(t *testing.T) {
 	ts := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	sess, cookies := ts.browser.issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
 	row := ts.seedCredential([]byte("only-cred"))
 
 	path := "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)
@@ -1017,7 +1054,7 @@ func TestWebAuthnDeleteKeyRefusesTheLastFactor(t *testing.T) {
 // caller cannot probe for credential IDs belonging to other accounts.
 func TestWebAuthnDeleteKeyUnknownAndMalformedIDs(t *testing.T) {
 	ts := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	sess, cookies := ts.browser.issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
 	ts.seedCredential([]byte("cred-a"))
 	ts.seedCredential([]byte("cred-b"))
 
@@ -1046,7 +1083,7 @@ func TestWebAuthnDeleteKeyUnknownAndMalformedIDs(t *testing.T) {
 // such credential".
 func TestWebAuthnDeleteKeyIsScopedToTheOwner(t *testing.T) {
 	ts := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
+	sess, cookies := ts.browser.issueSession(t, ts.mgr, session.IssueParams{UserID: ts.user.ID.String()})
 	ts.seedCredential([]byte("mine-a"))
 	ts.seedCredential([]byte("mine-b"))
 

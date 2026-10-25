@@ -68,7 +68,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return f.request("dpo", "POST", "/legal-inquiry/lookup", string(encoded), f.grant(t, "dpo"))
+		return f.request(t, "dpo", "POST", "/legal-inquiry/lookup", string(encoded), f.grant(t, "dpo"))
 	}
 	w := send()
 	if w.Code != 200 {
@@ -144,7 +144,7 @@ func TestAdminLegalAuditFailureRollsBackIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	account := uuid.New()
 	body := `{"account_ref":"` + account.String() + `","reason":"confidential-hold-reason","requesting_authority":"private-authority","legal_basis":"private-order"}`
-	w := f.request("dpo", "POST", "/legal-holds", body, f.grant(t, "dpo"))
+	w := f.request(t, "dpo", "POST", "/legal-holds", body, f.grant(t, "dpo"))
 	if w.Code != 201 {
 		t.Fatalf("initial hold: %d %s", w.Code, w.Body.String())
 	}
@@ -163,7 +163,7 @@ func TestAdminLegalAuditFailureRollsBackIntegration(t *testing.T) {
 		{"DELETE", "/legal-holds/" + hold.ID.String(), ""},
 		{"GET", "/legal-holds?account_ref=" + account.String(), ""},
 	} {
-		w := f.request("dpo", call.method, call.path, call.body, f.grant(t, "dpo"))
+		w := f.request(t, "dpo", call.method, call.path, call.body, f.grant(t, "dpo"))
 		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), "confidential-hold-reason") {
 			t.Fatalf("%s %s did not fail closed: %d %s", call.method, call.path, w.Code, w.Body.String())
 		}

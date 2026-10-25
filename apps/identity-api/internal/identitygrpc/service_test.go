@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -426,7 +427,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
-				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: "profile@example.invalid", LifecycleRevision: 42}, tc.queryErr
+				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: "profile@example.invalid", DisplayName: "Private display name", LifecycleRevision: 42}, tc.queryErr
 			}}
 			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 			response, err := client.GetInternalUserInfo(rpcContext(t), &identityv1.GetInternalUserInfoRequest{UserId: testUserID})
@@ -443,6 +444,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 			want := &identityv1.GetInternalUserInfoResponse{UserId: testUserID, Status: tc.status, LifecycleRevision: 42}
 			if tc.email {
 				want.Email = "profile@example.invalid"
+				want.DisplayName = "Private display name"
 			}
 			if !proto.Equal(response, want) {
 				t.Fatalf("profile=%v want=%v", response, want)
@@ -453,11 +455,11 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 			e := events[0]
 			if e.EventType != audit.EventGRPCProfileRead || e.ActionStatus != audit.StatusSuccess || e.ActorSPIFFEID != testCaller ||
 				e.ActorID != uuid.Nil || e.SubjectID == nil || *e.SubjectID != uuid.MustParse(testUserID) || e.Security != nil ||
-				e.ClientIP != "" || e.UserAgent != "" || !reflect.DeepEqual(e.Payload, map[string]any{"email_disclosed": tc.email}) || audit.IsLedgerEventType(e.EventType) {
+				e.ClientIP != "" || e.UserAgent != "" || !reflect.DeepEqual(e.Payload, map[string]any{"email_disclosed": tc.email, "display_name_disclosed": tc.email}) || audit.IsLedgerEventType(e.EventType) {
 				t.Fatalf("unsafe or incomplete routine disclosure audit: %+v", e)
 			}
 			encoded, err := json.Marshal(e)
-			if err != nil || bytes.Contains(encoded, []byte("profile@example.invalid")) {
+			if err != nil || bytes.Contains(encoded, []byte("profile@example.invalid")) || bytes.Contains(encoded, []byte("Private display name")) {
 				t.Fatal("audit copied profile PII")
 			}
 		})
@@ -471,7 +473,8 @@ func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
 			var revision, calls atomic.Int64
 			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
 				calls.Add(1)
-				return db.GetInternalUserInfoRow{ID: id, Status: storedStatus, Email: "profile@example.invalid", LifecycleRevision: revision.Load()}, nil
+				value := revision.Load()
+				return db.GetInternalUserInfoRow{ID: id, Status: storedStatus, Email: "profile@example.invalid", DisplayName: strconv.FormatInt(value, 10), LifecycleRevision: value}, nil
 			}}
 			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 			values := []int64{0, 1, 1<<53 + 1, math.MaxInt64, -1, math.MinInt64, 2}
@@ -491,8 +494,12 @@ func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
 				if err != nil || response == nil || response.LifecycleRevision != uint64(value) || len(cfg.Recorder.(*testRecorder).snapshot()) != before+1 {
 					t.Fatalf("live snapshot revision=%d response=%v err=%v", value, response, err)
 				}
-				if (storedStatus == "suspended" || storedStatus == "banned") && response.Email != "" {
-					t.Fatal("revision disclosure bypassed status-dependent email redaction")
+				if storedStatus == "suspended" || storedStatus == "banned" {
+					if response.Email != "" || response.DisplayName != "" {
+						t.Fatal("revision disclosure bypassed status-dependent profile redaction")
+					}
+				} else if response.DisplayName != strconv.FormatInt(value, 10) {
+					t.Fatal("name and revision did not come from the same snapshot")
 				}
 			}
 			if calls.Load() != int64(len(values)) {

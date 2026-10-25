@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-webauthn/webauthn/protocol"
@@ -17,6 +18,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
@@ -55,7 +57,8 @@ type webauthnLoginOptionsRequest struct {
 // base64url-encoded so it round-trips through a URL path for deletion.
 type webauthnCredentialResponse struct {
 	// ID is the base64url (unpadded) credential ID.
-	ID string `json:"id"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// AAGUID identifies the authenticator model, or the nil UUID when the
 	// authenticator withheld it.
 	AAGUID string `json:"aaguid"`
@@ -102,8 +105,8 @@ func (s *Server) registerWebAuthnRoutes() {
 	stepGuard, hasStepUp := s.stepUpGuard("webauthn")
 
 	s.router.Route("/api/v1/auth/webauthn", func(r chi.Router) {
-		r.Post("/login/generate-options", s.handleWebAuthnLoginOptions())
-		r.Post("/login/verify", s.handleWebAuthnLoginVerify())
+		r.With(s.webAuthnChallengeAdmission, s.browserLogin).Post("/login/generate-options", s.handleWebAuthnLoginOptions())
+		r.With(s.webAuthnChallengeAdmission, s.browserLogin).Post("/login/verify", s.handleWebAuthnLoginVerify())
 
 		if !hasSession {
 			return
@@ -126,6 +129,7 @@ func (s *Server) registerWebAuthnRoutes() {
 			// session and a fresh step-up grant.
 			pr.Group(func(sr chi.Router) {
 				sr.Use(stepGuard.Handler)
+				sr.Patch("/keys/{id}", s.handleWebAuthnRenameKey())
 				sr.Delete("/keys/{id}", s.handleWebAuthnDeleteKey())
 			})
 		})
@@ -158,8 +162,12 @@ func (s *Server) handleWebAuthnRegisterOptions() http.HandlerFunc {
 			return
 		}
 
+		name, ok := s.readWebAuthnName(w, r, false)
+		if !ok {
+			return
+		}
 		current, _ := session.FromContext(r.Context())
-		options, err := s.deps.WebAuthn.BeginRegistration(r.Context(), userID, current.ID)
+		options, err := s.deps.WebAuthn.BeginRegistration(r.Context(), userID, current.ID, name)
 		if err != nil {
 			s.writeWebAuthnRegistrationError(w, "begin registration", err)
 			return
@@ -380,6 +388,7 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 			AuthVersion:    login.AuthVersion,
 			AuthVersionSet: true,
 			UserID:         userID.String(),
+			DPoPJKT:        login.DPoPJKT,
 			IP:             clientip.FromRequest(r),
 			UserAgent:      r.UserAgent(),
 		}); err != nil {
@@ -400,6 +409,37 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 			Security:     &audit.SecurityContext{AccountRef: userID},
 		})
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (s *Server) handleWebAuthnRenameKey() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.webauthnSessionUser(w, r)
+		if !ok {
+			return
+		}
+		credentialID, err := base64.RawURLEncoding.DecodeString(chi.URLParam(r, "id"))
+		if err != nil || len(credentialID) == 0 || len(credentialID) > 1024 {
+			writeJSON(w, http.StatusNotFound, webauthnErrorResponse{Error: "credential_not_found"})
+			return
+		}
+		name, ok := s.readWebAuthnName(w, r, true)
+		if !ok {
+			return
+		}
+		row, err := s.deps.WebAuthn.RenameCredential(r.Context(), userID, credentialID, name)
+		if err != nil {
+			s.writeWebAuthnDeleteError(w, err)
+			return
+		}
+		// Cosmetic metadata is audit-only. Never retain the label or credential ID
+		// in either the audit payload or the security attribution ledger.
+		s.record(r, audit.Event{
+			EventType: webauthnRenamedEvent, ActionStatus: audit.StatusSuccess,
+			ActorID: userID, SubjectID: &userID,
+			Payload: map[string]any{"method": webauthnLoginMethod},
+		})
+		writeJSON(w, http.StatusOK, toWebAuthnCredentialResponse(row))
 	}
 }
 
@@ -475,24 +515,60 @@ func (s *Server) readWebAuthnBody(w http.ResponseWriter, r *http.Request) ([]byt
 	return body, true
 }
 
+func (s *Server) readWebAuthnName(w http.ResponseWriter, r *http.Request, required bool) (string, bool) {
+	body, ok := s.readWebAuthnBody(w, r)
+	if !ok {
+		return "", false
+	}
+	if len(bytes.TrimSpace(body)) == 0 && !required {
+		return "", true
+	}
+	var fields map[string]json.RawMessage
+	if !utf8.Valid(body) || !uniqueJSONFields(body) || json.Unmarshal(body, &fields) != nil || fields == nil || len(fields) > 1 {
+		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+		return "", false
+	}
+	raw, present := fields["name"]
+	if !present {
+		if !required && len(fields) == 0 {
+			return "", true
+		}
+		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+		return "", false
+	}
+	var name *string
+	if json.Unmarshal(raw, &name) != nil || name == nil || !validNameJSONString(raw) {
+		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+		return "", false
+	}
+	normalized, err := profile.NormalizeName(*name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+		return "", false
+	}
+	return normalized, true
+}
+
 // writeWebAuthnRegistrationError maps a registration failure to a status code.
 // Registration runs inside an authenticated session, so it can afford to
 // distinguish a malformed body from a stale challenge (both are user-actionable:
 // retry the ceremony) without leaking anything useful to an attacker.
 func (s *Server) writeWebAuthnRegistrationError(w http.ResponseWriter, op string, err error) {
 	switch {
-	case errors.Is(err, webauthn.ErrUserNotFound):
+	case errors.Is(err, webauthn.ErrUserNotFound), errors.Is(err, webauthn.ErrAccountNotActive):
 		// The session outlived its account (deleted mid-session).
-		writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "unauthorized"})
-	case errors.Is(err, webauthn.ErrInvalidResponse):
+		s.writeBrowserSessionError(w, session.ErrAccountIneligible)
+	case errors.Is(err, webauthn.ErrInvalidResponse), errors.Is(err, profile.ErrInvalidName):
 		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
-	case errors.Is(err, webauthn.ErrChallengeNotFound), errors.Is(err, webauthn.ErrChallengeExpired):
+	case errors.Is(err, webauthn.ErrChallengeNotFound), errors.Is(err, webauthn.ErrChallengeExpired), errors.Is(err, webauthn.ErrChallengeFlowMismatch):
 		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "challenge_invalid"})
 	case errors.Is(err, webauthn.ErrVerification):
 		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "verification_failed"})
+	case errors.Is(err, webauthn.ErrUserVerificationRequired):
+		writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "user_verification_required"})
 	default:
-		s.logger.Error("webauthn: "+op+" failed", "error", err.Error())
-		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+		s.logger.Error("webauthn: " + op + " failed")
+		writeJSON(w, http.StatusServiceUnavailable, webauthnErrorResponse{Error: "temporarily_unavailable"})
 	}
 }
 
@@ -521,12 +597,13 @@ func (s *Server) writeWebAuthnLoginError(w http.ResponseWriter, op string, err e
 		// A suspended, unverified, or pending-deletion account. Also opaque:
 		// "this account is banned" is itself an existence oracle.
 		errors.Is(err, webauthn.ErrAccountNotActive),
+		errors.Is(err, webauthn.ErrDPoPBindingRequired),
 		errors.Is(err, webauthn.ErrChallengeFlowMismatch):
 		writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "invalid_credentials"})
 
 	default:
-		s.logger.Error("webauthn: "+op+" failed", "error", err.Error())
-		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+		s.logger.Error("webauthn: " + op + " failed")
+		writeJSON(w, http.StatusServiceUnavailable, webauthnErrorResponse{Error: "temporarily_unavailable"})
 	}
 }
 
@@ -543,12 +620,14 @@ func (s *Server) writeWebAuthnDeleteError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusNotFound, webauthnErrorResponse{Error: "credential_not_found"})
 	case errors.Is(err, webauthn.ErrLastCredential):
 		writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "last_credential"})
-	case errors.Is(err, webauthn.ErrUserNotFound):
+	case errors.Is(err, profile.ErrInvalidName):
+		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+	case errors.Is(err, webauthn.ErrUserNotFound), errors.Is(err, webauthn.ErrAccountNotActive):
 		// The session outlived its account (deleted mid-session).
-		writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "unauthorized"})
+		s.writeBrowserSessionError(w, session.ErrAccountIneligible)
 	default:
-		s.logger.Error("webauthn: delete credential failed", "error", err.Error())
-		writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+		s.logger.Error("webauthn: update credential failed")
+		writeJSON(w, http.StatusServiceUnavailable, webauthnErrorResponse{Error: "temporarily_unavailable"})
 	}
 }
 
@@ -558,6 +637,7 @@ func (s *Server) writeWebAuthnDeleteError(w http.ResponseWriter, err error) {
 func toWebAuthnCredentialResponse(row db.WebauthnCredential) webauthnCredentialResponse {
 	out := webauthnCredentialResponse{
 		ID:              base64.RawURLEncoding.EncodeToString(row.ID),
+		Name:            row.Name,
 		AAGUID:          row.Aaguid.String(),
 		AttestationType: row.AttestationType,
 		UserVerified:    row.UserVerified,
@@ -577,6 +657,7 @@ func toWebAuthnCredentialResponse(row db.WebauthnCredential) webauthnCredentialR
 
 // Audit payload constants for the passkey routes (Task 5.2).
 const (
+	webauthnRenamedEvent = "auth.webauthn.credential.renamed"
 	// webauthnLoginMethod names the factor in the audit payload. It exists so a
 	// future second session-issuing method is distinguishable in the ledger rather
 	// than being retroactively indistinguishable from a passkey login.

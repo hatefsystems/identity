@@ -52,6 +52,7 @@ describe('CSP proxy', () => {
     ]);
     expect(response.headers.get('x-middleware-request-content-security-policy')).toBe(policy);
     expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
     expect(response.headers.get('Content-Security-Policy-Report-Only')).toBeNull();
     expect(policy).not.toMatch(/[\r\n]|unsafe-inline|unsafe-eval|trusted-types/);
   });

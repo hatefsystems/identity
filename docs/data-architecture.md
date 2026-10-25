@@ -266,6 +266,35 @@ broadcast stream is not the audit work queue or legal-evidence archive. See the
 [wire contract](api-design.md#3-asynchronous-events-nats-jetstream) and
 [operations boundaries](devops-operations.md#user-lifecycle-publisher-task-63).
 
+### 1.1.4 Portal Names and Profile Transactions (Task 7.3)
+
+Additive migration `00017_profile_names.sql` adds `users.display_name` and
+`webauthn_credentials.name` as non-null text defaulting to the empty string, with
+`char_length(...) <= 80` constraints. Existing users/credentials remain valid;
+names are optional, not unique, and no historical profile events are synthesized.
+Application validation rejects invalid UTF-8, control and line-separator characters
+before trimming outer Unicode whitespace and counting Unicode code points.
+
+Both fields are Class A profile data, erased with their owning rows. Registration
+temporarily freezes the optional credential label in its bounded Redis ceremony;
+it expires with that challenge and cannot be replaced by the verification body.
+Names are not copied into audit or lifecycle payload values. Sanitized ordinary
+audit metadata uses the existing best-effort recorder, not a new ledger category.
+
+Profile updates acquire the common account advisory/row lock, recheck active
+status and captured auth-version, and compare the exact lifecycle revision.
+A no-op at the current revision writes nothing. A real update, one revision
+increment and one metadata-only `identity.user.updated` v2 outbox row commit
+together; outbox failure rolls back the name. Credential auth-version/epoch and
+sessions are unchanged. HTTP revisions stay decimal strings to avoid JavaScript
+rounding. gRPC name and revision are read from the same minimized snapshot.
+
+V1 lifecycle validation/producers are retained. V2 adds only the explicit
+`display_name` changed-field capability; both versions and legacy v1 tombstones
+remain readable. Unknown versions/fields still fail validation. Retain additive
+columns and v2-compatible publisher/readers during rollback, and upgrade downstream
+consumers before deploying name writers.
+
 ### 1.2 `sqlc` & `pgx` Configurations
 
 To generate the idiomatic, type-safe Go code, the database queries must be defined inside `.sql` files.
@@ -356,7 +385,7 @@ $$\text{blind\_index} = \text{SHA-256}(\text{PII} \ + \ \text{secret\_pepper})$$
 
 ## 3. Redis Session & OTP Storage Layout
 
-Redis provides low-latency credential authority and temporary state. Session/grant misses are not cache misses that may be reconstructed from a signed token. The table distinguishes the implemented Task 6.2 namespaces from other feature-specific state.
+Redis provides low-latency credential authority and temporary state. Session/grant misses are not cache misses that may be reconstructed from a signed token. Task 7.3 also shares WebAuthn ceremonies across API replicas, separately from the existing session/grant and DPoP namespaces.
 
 ### 3.1 Redis Keyspaces & TTL Policies
 
@@ -370,7 +399,8 @@ Redis provides low-latency credential authority and temporary state. Session/gra
 | `identity:v1:oauth:refresh:<token_hash>` | String (JSON) | Grant lifetime | Active/rotated/revoked refresh metadata. Active-token expiry is checked separately; retired evidence survives while the grant can remain usable. Atomic rotation writes the successor and retires the old token together. |
 | `identity:v1:oauth:user:<user_id>` | ZSET | Latest grant expiry | Account-wide grant index, never a global key scan on the request path. |
 | `dpop:v1:replay:<scoped_hash>` | String | Complete acceptance window plus a rounded-up Redis millisecond | Hash of realm, verified JKT and JTI; includes allowed future-clock skew and proof-age skew rather than a fixed 60-second cache. |
-| `dpop:v1:nonce:<scoped_hash>` | String | 5 Minutes | Single-use nonce bound to the authorization-server or resource-origin realm and verified proof key. No raw proof, nonce or JTI is stored in a key. |
+| `dpop:v1:nonce:<scoped_hash>` | String | 5 Minutes | Single-use nonce bound to the authorization-server, resource-origin or dedicated browser realm and verified proof key. No raw proof, nonce or JTI is stored in a key. |
+| `webauthn:challenge:v1:<sha256_challenge>` | Hash | Ceremony TTL, default 5m, maximum 15m | Versioned, bounded pending ceremony with exact flow/account/session/applicable DPoP binding and frozen optional registration name. Atomic binding check precedes deletion; wrong bindings do not consume it. |
 | `otp:sms:secret:{verification_id}` | Hash | 3 Minutes | Pending phone proof addressed by a 256-bit opaque ID and bound to the exact user, initiating session, normalized phone, HMAC-SHA-256 code hash, issue time, and attempt counter. |
 | `recovery:transaction:{sha256(transaction_id)}` | String | 10 Minutes | One-time recovery-start subject. `GETDEL` consumes the transaction before the submitted recovery code is evaluated, so spent, invalid, and replayed transactions converge on the same failure surface. |
 | `rate:otp:phone:{phone}` | String | 1 Hour | Tracks SMS OTP requests made to a specific phone number. |
@@ -399,12 +429,21 @@ reactivation therefore cannot restore old credentials after failed cache cleanup
 Client grants have no user/session/version authority and do not perform a user
 lookup. No successful authorization decision is positively cached.
 
-Redis eviction/reset fails closed and requires reauthentication. Use appropriate
+Normal browser cookies are not sufficient authority: Task 7.3 requires a bound
+DPoP key and checks cookie kind/account/expected key/session intent before shared
+nonce/replay consumption. Failed authorization does not renew idle activity.
+The WebAuthn store preserves 64-bit auth versions/epochs as exact decimal strings,
+not Lua JSON numbers; rejects collisions/oversized or corrupt state; uses native
+TTLs and two-second request deadlines; and never falls back after Redis errors.
+Anonymous login options/verification and reclaim options share subnet rate limits
+before allocating challenge/nonce state.
+
+Redis eviction/reset fails closed and requires reauthentication or a new ceremony. Use appropriate
 ACLs/TLS and an eviction/availability policy suitable for authority, not a
 disposable performance cache. Never restore stale session/grant/replay snapshots
 after revocation; invalidate the namespace and require new authentication instead.
-WebAuthn challenge and client-assertion replay storage remain separate single-node
-boundaries; shared Task 6.2 state alone does not make every HTTP ceremony multi-node ready.
+Client-assertion replay storage remains a separate single-process boundary; shared
+portal/WebAuthn state does not claim unrelated OAuth client-assertion scaling.
 
 ### 3.2 OTP Rate Limiting Structure
 

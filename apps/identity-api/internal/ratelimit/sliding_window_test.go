@@ -2,7 +2,9 @@ package ratelimit
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,5 +202,37 @@ func TestAllowFallsBackToEvalOnNoScript(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("expected the request to be admitted via the EVAL fallback")
+	}
+}
+
+func TestConcurrentAdmissionAfterScriptEviction(t *testing.T) {
+	limiter, _, client := newTestLimiter(t)
+	for round := range 3 {
+		if err := client.ScriptFlush(t.Context()).Err(); err != nil {
+			t.Fatal(err)
+		}
+		const limit = 7
+		var allowed atomic.Int32
+		var group sync.WaitGroup
+		start := make(chan struct{})
+		key := fmt.Sprintf("rate:test:concurrent-eviction:%d", round)
+		for range 32 {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				<-start
+				ok, err := limiter.Allow(t.Context(), key, limit, time.Minute)
+				if err != nil {
+					t.Errorf("concurrent admission: %v", err)
+				} else if ok {
+					allowed.Add(1)
+				}
+			}()
+		}
+		close(start)
+		group.Wait()
+		if got := allowed.Load(); got != limit {
+			t.Fatalf("admitted %d requests after cache eviction, want %d", got, limit)
+		}
 	}
 }

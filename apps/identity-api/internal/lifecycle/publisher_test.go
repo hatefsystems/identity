@@ -393,9 +393,21 @@ func TestPublisherPoisonDoesNotBlockUnrelatedAccounts(t *testing.T) {
 }
 
 func TestPublisherUncertainCommitReplaysStableIdentity(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(map[bool]string{false: "revisioned", true: "legacy"}[legacy], func(t *testing.T) {
+	for _, mode := range []string{"v1", "v2", "legacy"} {
+		t.Run(mode, func(t *testing.T) {
+			legacy := mode == "legacy"
 			row := queuedLifecycle(t, legacy)
+			if mode == "v2" {
+				event, err := NewDisplayNameEvent(row.ID, row.LifecycleUserID.UUID, *row.LifecycleRevision, "active", row.CreatedAt.Time)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload, err := MarshalEvent(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				row.Payload = string(payload)
+			}
 			first, second := runtimeBatch(row), runtimeBatch(row)
 			first.commitErr = errRuntimePrivate
 			js := &runtimePublisher{}
@@ -413,6 +425,13 @@ func TestPublisherUncertainCommitReplaysStableIdentity(t *testing.T) {
 				event, err := UnmarshalEvent(msg.Data)
 				if err != nil || event.EventId != row.ID.String() || !event.OccurredAt.AsTime().Equal(row.CreatedAt.Time) || (event.Revision == nil) != legacy {
 					t.Fatalf("stored envelope boundary lost: %v", err)
+				}
+				wantVersion := uint32(SchemaVersion)
+				if mode == "v2" {
+					wantVersion = SchemaVersionV2
+				}
+				if event.SchemaVersion != wantVersion || !legacy && !bytes.Equal(msg.Data, []byte(row.Payload)) {
+					t.Fatal("publication rewrote the stored lifecycle version/payload")
 				}
 			}
 		})

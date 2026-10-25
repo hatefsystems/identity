@@ -65,6 +65,8 @@ type CredentialStore interface {
 	// DeleteWebauthnCredential removes a credential, scoped to its owner so one
 	// user can never delete another's authenticator. It reports rows affected.
 	DeleteWebauthnCredential(ctx context.Context, arg db.DeleteWebauthnCredentialParams) (int64, error)
+	// RenameWebauthnCredential updates a cosmetic name, scoped to its owner.
+	RenameWebauthnCredential(ctx context.Context, arg db.RenameWebauthnCredentialParams) (db.WebauthnCredential, error)
 }
 
 // signCountToUint32 clamps the DB's int64 sign_count into the uint32 domain the

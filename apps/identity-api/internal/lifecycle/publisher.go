@@ -196,6 +196,8 @@ func decodeOutboxEvent(row db.EventOutbox) ([]byte, uuid.UUID, error) {
 		if !row.LifecycleUserID.Valid || row.LifecycleUserID.UUID == uuid.Nil || row.LifecycleRevision == nil || *row.LifecycleRevision <= 0 {
 			return nil, uuid.Nil, ErrInvalidEvent
 		}
+		// The dual-version reader validates persisted v1/v2 in place. Preserve
+		// the original bytes on publication; rollout never rewrites old intent.
 		event, err := UnmarshalEvent([]byte(row.Payload))
 		if err != nil || event.EventType != row.Subject || event.EventId != row.ID.String() ||
 			event.UserId != row.LifecycleUserID.UUID.String() || event.Revision == nil ||
@@ -228,6 +230,7 @@ func decodeOutboxEvent(row db.EventOutbox) ([]byte, uuid.UUID, error) {
 	if err != nil || userID == uuid.Nil || rawID != userID.String() {
 		return nil, uuid.Nil, ErrInvalidEvent
 	}
+	// Revision-less historical tombstones remain v1, never inferred as v2.
 	payload, err := MarshalEvent(&identityv1.UserLifecycleEvent{
 		SchemaVersion: SchemaVersion, EventId: row.ID.String(), EventType: SubjectDeleted,
 		UserId: userID.String(), OccurredAt: timestamppb.New(occurredAt),

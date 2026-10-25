@@ -10,7 +10,9 @@ import "hatef/identity/v1/common.proto";
 // Encode with ProtoJSON using proto field names. Consumers must validate the
 // schema version and event-specific metadata before applying a notification.
 message UserLifecycleEvent {
-  // Exactly 1 for this contract.
+  // Exactly 1 or 2. Version 1 retains its strict status/email-only contract;
+  // version 2 additionally permits display_name in changed_fields. Only profile
+  // name updates emit v2 in this rollout; unknown versions must be rejected.
   uint32 schema_version = 1;
   // Canonical nonzero UUID; stable across retries and equal to the outbox ID.
   string event_id = 2;
@@ -23,12 +25,14 @@ message UserLifecycleEvent {
   google.protobuf.Timestamp occurred_at = 5;
   // Positive per-account revision bounded by PostgreSQL's signed bigint range.
   // ProtoJSON encodes uint64 as a decimal string, not a JSON number. Only a
-  // legacy deletion tombstone may omit this field; zero is never a revision.
+  // version 1 legacy deletion tombstone may omit this field; zero is never a
+  // revision. Version 2 always requires a revision, including for deletion.
   optional uint64 revision = 6;
   // Exact resulting account status; absent for terminal deletion tombstones.
   optional UserStatus status = 7;
-  // At most two unique names from the allowlist "status", "email", not values.
-  // Creation includes both; suspension includes only "status". Updates include
+  // Version 1: at most two unique names from "status", "email", not values.
+  // Version 2: at most three unique names from "status", "email", "display_name".
+  // Creation includes "status" and "email"; suspension includes only "status". Updates include
   // at least one; deletion omits this field. A transition into suspended uses
   // identity.user.suspended, not identity.user.updated.
   repeated string changed_fields = 8;

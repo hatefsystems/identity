@@ -21,13 +21,14 @@ var (
 // This is an executable consumer contract, not a production client. The JSON
 // round trip models restarting from a locally committed projection/checkpoint.
 type contractProjection struct {
-	Revision  uint64
-	Visible   bool
-	Terminal  bool
-	ClassA    string
-	ClassB    string
-	Scrubs    int
-	Refreshes int
+	Revision    uint64
+	Visible     bool
+	Terminal    bool
+	ClassA      string
+	DisplayName string
+	ClassB      string
+	Scrubs      int
+	Refreshes   int
 }
 
 type contractStore struct {
@@ -63,6 +64,7 @@ func (s *contractStore) refresh(user string, triggeringRevision uint64, snapshot
 			return errContractRetry
 		}
 		current.Revision, current.Visible = snapshot.LifecycleRevision, true
+		current.DisplayName = snapshot.DisplayName
 	}
 	current.Refreshes++
 	s.Users[user] = current
@@ -87,6 +89,7 @@ func (s *contractStore) consume(identity string, sequence uint64, payload []byte
 	if !s.Seen[event.EventId] && !current.Terminal {
 		if event.EventType == lifecycle.SubjectDeleted {
 			current.Terminal, current.Visible, current.ClassA = true, false, ""
+			current.DisplayName = ""
 			current.Revision = max(current.Revision, event.GetRevision())
 			current.Scrubs++
 			s.Users[event.UserId] = current
@@ -105,6 +108,57 @@ func (s *contractStore) consume(identity string, sequence uint64, payload []byte
 	s.Seen[event.EventId] = true
 	s.Checkpoint = sequence
 	return nil
+}
+
+func TestConsumerContractMixedVersionsAndLegacyNameErasure(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "revisioned deletion", true: "legacy tombstone"}[legacy], func(t *testing.T) {
+			s, user := contractBaseline(), uuid.New()
+			s.Users[user.String()] = contractProjection{ClassB: "retained evidence"}
+			named, err := lifecycle.NewDisplayNameEvent(uuid.New(), user, 2, "active", time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := []*identityv1.UserLifecycleEvent{contractEvent(t, user, 1, lifecycle.SubjectCreated), named,
+				contractEvent(t, user, 3, lifecycle.SubjectSuspended), contractEvent(t, user, 4, lifecycle.SubjectUpdated)}
+			for i, event := range events {
+				name := "Private shared name"
+				if event.EventType == lifecycle.SubjectSuspended {
+					name = ""
+				}
+				if err := s.consume(s.StreamIdentity, uint64(i+1), contractPayload(t, event), func() (*identityv1.GetInternalUserInfoResponse, error) {
+					return &identityv1.GetInternalUserInfoResponse{UserId: user.String(), LifecycleRevision: event.GetRevision(), DisplayName: name}, nil
+				}); err != nil || s.Users[user.String()].DisplayName != name {
+					t.Fatalf("mixed-version refresh failed: %v", err)
+				}
+				s = reloadContract(t, s)
+			}
+			if err := s.consume(s.StreamIdentity, 5, contractPayload(t, named), nil); err != nil || s.Users[user.String()].Revision != 4 || s.Users[user.String()].Refreshes != 4 {
+				t.Fatal("old v2 replay repeated or regressed profile refresh")
+			}
+			deleted := contractEvent(t, user, 5, lifecycle.SubjectDeleted)
+			if legacy {
+				deleted.Revision = nil
+			}
+			if err := s.consume(s.StreamIdentity, 6, contractPayload(t, deleted), nil); err != nil {
+				t.Fatal(err)
+			}
+			s = reloadContract(t, s)
+			future, err := lifecycle.NewDisplayNameEvent(uuid.New(), user, 99, "active", time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, event := range []*identityv1.UserLifecycleEvent{named, future, deleted} {
+				if err := s.consume(s.StreamIdentity, uint64(7+i), contractPayload(t, event), nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			projection := s.Users[user.String()]
+			if !projection.Terminal || projection.Visible || projection.DisplayName != "" || projection.Scrubs != 1 || projection.ClassB != "retained evidence" || projection.Refreshes != 4 {
+				t.Fatal("mixed-version replay resurrected name or erased retained evidence")
+			}
+		})
+	}
 }
 
 func contractEvent(t *testing.T, user uuid.UUID, revision int64, subject string) *identityv1.UserLifecycleEvent {
@@ -250,7 +304,7 @@ func TestConsumerContractRequiresReconciledHistory(t *testing.T) {
 	event := contractEvent(t, user, 1, lifecycle.SubjectCreated)
 	payload := contractPayload(t, event)
 	unknown := proto.Clone(event).(*identityv1.UserLifecycleEvent)
-	unknown.SchemaVersion = 2
+	unknown.SchemaVersion = 3
 	// A future writer is outside today's strict MarshalEvent contract.
 	var wire map[string]any
 	if err := json.Unmarshal(payload, &wire); err != nil {

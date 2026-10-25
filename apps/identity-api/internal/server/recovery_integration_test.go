@@ -143,7 +143,8 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
-	srv := New(config.Config{Environment: "development"}, nil, Deps{
+	browser := newPortalTestClient(t, testPortalOrigin)
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 		SessionManager: sessions,
 		Recovery:       codes,
 		RecoveryFlow:   flow,
@@ -166,6 +167,7 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 			}
 			req := httptest.NewRequest(http.MethodPost, recoveryVerifyPath, bytes.NewReader(body))
 			req.RemoteAddr = "203.0.113.8:4242"
+			browser.prepare(req)
 			rec := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(rec, req)
 			results <- result{status: rec.Code, cookies: rec.Result().Cookies()}

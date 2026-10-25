@@ -14,6 +14,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
 type stepUpErrorResponse struct {
@@ -200,6 +201,8 @@ func (s *Server) handleStepUpVerify() http.HandlerFunc {
 //     or TOTP must be enrolled before sensitive operations become reachable.
 func (s *Server) writeStepUpError(w http.ResponseWriter, op string, err error) {
 	switch {
+	case errors.Is(err, webauthn.ErrChallengeStoreUnavailable):
+		writeJSON(w, http.StatusServiceUnavailable, stepUpErrorResponse{Error: "temporarily_unavailable"})
 	case errors.Is(err, stepup.ErrUserNotFound),
 		errors.Is(err, stepup.ErrAccountNotActive):
 		writeJSON(w, http.StatusUnauthorized, stepUpErrorResponse{Error: "unauthorized"})

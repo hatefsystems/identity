@@ -69,6 +69,113 @@ acknowledgements do not free history early under Limits retention.
 Task 6.3 validation does not grant production permissions, approve retention,
 deploy consumers or remove earlier tasks' production enablement gates.
 
+## User Portal Cutover (Task 7.3)
+
+The portal serves existing passkey-enabled accounts. It does not provision users,
+enable password login, add OAuth consent, or deploy downstream services. The
+browser and API must be released as one compatible boundary, not a mixed fleet of
+new DPoP-required and old cookie-only replicas.
+
+1. Apply additive `00017_profile_names.sql` first. Existing users/keys have empty
+   names; do not synthesize historical profile events. Verify deployed DB grants
+   for profile reads/writes and transactional outbox insertion.
+2. Deploy dual-version lifecycle publishers/readers and upgrade actual downstream
+   consumers before deploying writers that emit display-name v2 events. V1 and
+   legacy revision-less deletion adaptation remain supported. Validate mixed
+   replay and gRPC name/revision snapshots. External consumer deployment and
+   baseline/checkpoint reconciliation are operator prerequisites, not implied by CI.
+3. Use shared standalone Redis for browser sessions, DPoP nonce/replay, step-up
+   claims and `webauthn:challenge:v1:<sha256 challenge>`. Configure appropriate
+   ACLs/TLS, capacity and availability; credential state is authority, not a cache.
+   WebAuthn state is capped at 64 KiB, native TTL at fifteen minutes (five-minute
+   default), and operations at two seconds. Anonymous login options/verification
+   and reclaim options share 30 requests/subnet/minute, including nonce retries.
+   Redis faults fail closed.
+4. Drain old API processes and in-flight memory ceremonies, then deploy the new
+   API and compatible frontend together. Existing unbound cookies require fresh
+   passkey login. Do not rebind them or mix acceptance rules across replicas.
+   Keep signing material and `STEPUP_REPLAY_HMAC_KEY` consistent across the fleet.
+5. Set one canonical `PORTAL_ORIGIN`, matching the `OIDC_ISSUER` origin and an exact
+   `WEBAUTHN_RP_ORIGINS` entry. Use HTTPS, no trailing slash/path/query/default port.
+   Serve only the canonical host. Pages/assets route to Next; `/api` routes directly
+   to Go. Preserve Origin, DPoP, `X-Portal-Session`, `X-Step-Up-Auth`, cookies and
+   nonce/error responses. There is no CORS/BFF workaround.
+6. Keep `SESSION_COOKIE_NAME=__Host-session` and `SESSION_COOKIE_SECURE=true`.
+   Defaults are `SESSION_ABSOLUTE_TTL=24h` and `SESSION_IDLE_TTL=2h`. Explicit
+   loopback HTTP experimentation is development-only; do not weaken cookies or
+   production Next CSP for browser acceptance. The `.env.example` uses local
+   HTTPS at `https://localhost:8443` and requires an ingress, not separate origins.
+7. Verify private/no-store/no-referrer on API errors and empty responses as well
+   as successful reads. Next's document policy does not cover `/api`. Disable
+   shared API/HTML caching and redact request bodies, credentials, proofs, names,
+   grants, recovery batches and identity-bearing URLs at ingress/APM/log shippers.
+   Use constant route-template diagnostics, not `$request_uri` or `$request`.
+8. Rehearse login, names, UV/TOTP step-up, individual/current revocation and
+   one-time-code exports through the actual deployed HTTPS ingress. A successful
+   local harness cannot prove deployed proxy forwarding, redaction, workload
+   grants or downstream compatibility. Already admitted requests may finish after
+   revocation; do not promise immediate erasure of another browser's rendered DOM.
+
+Rollback must stop/drain new writes while preserving accepted intent and
+v2-compatible publication/consumption for the full outbox/replay horizon. Keep
+the additive columns; never run a strict-v1 worker on v2 rows. Do not restore old
+Redis authority/replay snapshots or re-enable cookie-only access. A rollback that
+requires old auth code must withdraw portal traffic and coordinate reauthentication.
+Existing audit/legal/retention and private-gRPC deployment gates remain in force.
+
+### Automated Portal Acceptance
+
+From the workspace root, with npm dependencies, Go 1.26.5+ and Docker available:
+
+```bash
+npm exec -- nx run identity-api:test-portal --skipNxCache
+npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
+npm exec -- nx run-many -t build,build-portal-fixture -p identity-api --skipNxCache
+npm exec -- nx run web:build --skipNxCache
+npm exec -- playwright install --with-deps chromium
+npm exec -- nx run web:test-portal-browser --skipNxCache
+```
+
+`web:test-portal-browser` owns unique disposable PostgreSQL/Redis/JetStream
+containers, ephemeral loopback ports and fresh volumes. It starts two real
+production-configured Go API processes, production Next.js and a local HTTPS
+ingress; Chromium trusts only that run's ephemeral certificate SPKI. Ceremony
+starts use API A and completions use B, including nonce retries. It does not use
+development cookie/CSP exceptions or inherited database/secrets configuration.
+
+`cmd/portal-fixture` is included only with `-tags=portalfixture` and is absent from
+normal builds/runtime images. It refuses unarmed/production invocations,
+non-loopback/run-mismatched databases and unowned/nonempty Redis. The harness
+seeds random accounts, eight-byte anonymized handles and matching real ES256
+COSE/CDP credentials through that private command, never an HTTP endpoint or magic
+account. Fixture secrets travel over child-process pipes, not checked-in files,
+browser storage snapshots or CI artifacts. Only this run's session TTLs can be
+shortened for expiry checks. Cleanup removes only run-owned containers/volumes.
+
+The separate focused database target requires explicitly configured disposable
+`DATABASE_URL`, `REDIS_URL` and `NATS_URL`, and fails if they are absent:
+
+```bash
+npm exec -- nx run identity-api:test-portal-integration --skipNxCache
+```
+
+Run database suites serially; existing migration fixtures reset schema, and
+lifecycle tests can restart their explicitly identified disposable NATS container.
+Never point them at shared development or deployed data. CI keeps the existing
+security, lifecycle, gRPC, generated-code, vet/lint/Linux race, image and CSP suites;
+it adds focused portal integration and a separate `portal-browser` release gate.
+The existing `web-csp.browser.mjs` still validates the actual non-root web image,
+strict parser-inserted attack probes and inactive public forms.
+
+Set optional `PORTAL_BROWSER_ARTIFACT_DIR` for masked layout screenshots and
+`portal-evidence.json`. The suite does not persist plaintext recovery downloads,
+browser traces, cookies, proofs or fixture private keys. It records whether native
+hidden-tab/bfcache transitions were observed; injected resume events and browser
+clock advancement are not a claim of native platform coverage. Missing native
+coverage, manual assistive-technology/authenticator review, real-ingress checks and
+downstream-consumer validation remain explicit release gates. Record actual test
+results before task completion; adding these commands does not establish a pass.
+
 ## 1. Kubernetes Deployment & Networking
 
 The platform leverages **Traefik** as the Ingress Controller and API Gateway at the cluster boundary, and **SPIRE** to orchestrate dynamic zero-trust workloads.
@@ -84,9 +191,12 @@ Below is the production-ready Nginx configuration file (`/etc/nginx/sites-availa
 ```nginx
 # http{} scope: constant route template, never request URI/query/referrer/headers.
 log_format admin_safe '$request_method /api/v1/admin/* $status $request_time';
+log_format portal_api_safe '$request_method /api/* $status $request_time';
 server {
     listen 443 ssl http2;
     server_name identity.hatef.ir;
+    # This vhost must not serve a sibling/unknown host as its default site.
+    if ($host != identity.hatef.ir) { return 421; }
 
     # SSL Certificate Configuration (Certbot / Let's Encrypt)
     ssl_certificate /etc/letsencrypt/live/identity.hatef.ir/fullchain.pem;
@@ -142,6 +252,25 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # First-party browser API: no BFF, shared cache, request-URI or body logging.
+    # The longer admin prefix above retains its separate access-log contract.
+    location ^~ /api/ {
+        access_log /var/log/nginx/portal-api-access.log portal_api_safe;
+        error_log /dev/null crit;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Origin $http_origin;
+        proxy_set_header DPoP $http_dpop;
+        proxy_set_header X-Portal-Session $http_x_portal_session;
+        proxy_set_header X-Step-Up-Auth $http_x_step_up_auth;
+        # Preserve upstream Set-Cookie, DPoP-Nonce, WWW-Authenticate,
+        # Cache-Control: private, no-store and Referrer-Policy: no-referrer.
     }
 
     # 2. Route for Core IdP API operations, token exchange, and JWKS endpoints (Go Backend)
@@ -213,10 +342,10 @@ TypeScript generator is needed for this backend build.
 Before enabling consumers, deploy the shared-state-aware issuers on all API
 instances, drain process-local sessions and require reauthentication. New user
 tokens bind to their browser session, OAuth grant and captured account version.
-Legacy unlinked JWTs cannot pass the RPC. Do not promise complete multi-node HTTP
-login readiness: WebAuthn challenges and client-assertion replay state are still
-separate single-process boundaries. Independent offline grants and the consent
-UI completion remain separate tasks.
+Legacy unlinked JWTs cannot pass the RPC. Task 7.3 additionally shares WebAuthn
+ceremonies and enforces bound browser sessions across API replicas. Client-assertion
+replay remains a separate single-process boundary. Independent offline grants and
+consent UI completion remain separate tasks.
 
 Operate Redis as security authority: use appropriate ACLs/TLS and an eviction
 policy that does not silently treat credential state as expendable cache data.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -178,6 +179,7 @@ func (f *phoneCapturingSender) code() string {
 
 type phoneTestFixture struct {
 	server         *Server
+	browser        *portalTestClient
 	users          *phoneFakeUserStore
 	otps           *phoneFakeOTPStore
 	sender         *phoneCapturingSender
@@ -233,12 +235,14 @@ func newPhoneTestFixture(t *testing.T, limiterAllows, withStepUp bool) *phoneTes
 		t.Fatalf("session.NewManager: %v", err)
 	}
 
-	// Pre-issue a valid session and capture its cookie.
+	browser := newPortalTestClient(t, testPortalOrigin)
+	// Pre-issue a bound session and capture its cookie.
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
 		UserID:    userID.String(),
 		IP:        "127.0.0.1",
 		UserAgent: "test-agent",
+		DPoPJKT:   browser.jkt,
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)
@@ -263,14 +267,16 @@ func newPhoneTestFixture(t *testing.T, limiterAllows, withStepUp bool) *phoneTes
 		)
 	}
 
-	srv := New(config.Config{Environment: "development"}, nil, Deps{
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 		SessionManager: sessMgr,
+		DPoPValidator:  browser.validator,
 		SMSOTP:         svc,
 		StepUp:         stepUpSvc,
 	})
 
 	return &phoneTestFixture{
 		server:         srv,
+		browser:        browser,
 		users:          users,
 		otps:           otps,
 		sender:         sender,
@@ -288,7 +294,7 @@ func (fx *phoneTestFixture) deletePhone(t *testing.T, withGrant bool) *httptest.
 	t.Helper()
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	if withGrant {
 		req.Header.Set(stepup.HeaderStepUpAuth,
 			mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
@@ -300,24 +306,23 @@ func (fx *phoneTestFixture) deletePhone(t *testing.T, withGrant bool) *httptest.
 
 // doPhone issues a request against the phone routes with explicitly selected
 // session and step-up credentials.
-func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, cookie *http.Cookie, grant string) *httptest.ResponseRecorder {
+func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current session.Session, cookie *http.Cookie, grant string) *httptest.ResponseRecorder {
 	t.Helper()
 
-	var reader *bytes.Reader
+	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
 			t.Fatalf("marshal body: %v", err)
 		}
 		reader = bytes.NewReader(raw)
-	} else {
-		reader = bytes.NewReader(nil)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, path, reader)
 	req.RemoteAddr = "203.0.113.9:5555"
+	fx.browser.prepare(req)
 	if cookie != nil {
-		req.AddCookie(cookie)
+		fx.browser.authorize(t, req, current, cookie)
 	}
 	if grant != "" {
 		req.Header.Set(stepup.HeaderStepUpAuth, grant)
@@ -339,6 +344,7 @@ func (fx *phoneTestFixture) issueSession(t *testing.T) (session.Session, *http.C
 		UserID:    fx.userID.String(),
 		IP:        "127.0.0.2",
 		UserAgent: "second-test-agent",
+		DPoPJKT:   fx.browser.jkt,
 	})
 	if err != nil {
 		t.Fatalf("issue second session: %v", err)
@@ -367,11 +373,9 @@ func TestPhoneRoutesRequireSession(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 
 	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "+15550102020"}, nil, "")
+		map[string]string{"phone": "+15550102020"}, session.Session{}, nil, "")
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("unauthenticated send-code: expected 401, got %d (body: %s)", rec.Code, rec.Body.String())
-	}
+	requirePortalSessionRequired(t, rec)
 	if fx.sender.calls != 0 {
 		t.Error("no SMS should be dispatched for an unauthenticated request")
 	}
@@ -381,9 +385,12 @@ func TestPhoneSendCodeRequiresStepUp(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 
 	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "+15550102020"}, fx.cookie, "")
+		map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, "")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("send-code without grant: expected 403, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := errorBody(t, rec); got != "insufficient_user_authentication" {
+		t.Fatalf("send-code without step-up error = %q", got)
 	}
 	if fx.sender.calls != 0 || len(fx.otps.records) != 0 {
 		t.Fatal("request without step-up dispatched or stored an OTP")
@@ -394,8 +401,10 @@ func TestPhoneSendCodeConsumesGrantBeforeBodyParsing(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 	grant := fx.freshGrant(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/phone/send-code", strings.NewReader("{"))
-	req.AddCookie(fx.cookie)
+	// The browser boundary accepts this object; decoding the phone's type is
+	// still a handler concern and must happen after grant consumption.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users/me/phone/send-code", strings.NewReader(`{"phone":true}`))
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, grant)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -404,7 +413,7 @@ func TestPhoneSendCodeConsumesGrantBeforeBodyParsing(t *testing.T) {
 	}
 
 	rec = fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "+15550102020"}, fx.cookie, grant)
+		map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, grant)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("replayed grant: expected 403, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -418,12 +427,12 @@ func TestPhoneVerifyEndToEnd(t *testing.T) {
 	const phone = "+15550102020"
 
 	// 1. Request a code.
-	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": phone}, fx.cookie, fx.freshGrant(t))
+	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": phone}, fx.sess, fx.cookie, fx.freshGrant(t))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("send-code: expected 200, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
-	if rec.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("send-code Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+	if rec.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("send-code Cache-Control = %q, want private, no-store", rec.Header().Get("Cache-Control"))
 	}
 	if fx.sender.calls != 1 {
 		t.Fatalf("expected exactly one SMS dispatched, got %d", fx.sender.calls)
@@ -440,7 +449,7 @@ func TestPhoneVerifyEndToEnd(t *testing.T) {
 
 	// 2. Verify with the delivered code.
 	rec = fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": response.VerificationID, "code": code}, fx.cookie, "")
+		map[string]string{"verification_id": response.VerificationID, "code": code}, fx.sess, fx.cookie, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("verify: expected 200, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -464,14 +473,14 @@ func TestPhoneVerifyWrongCode(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 	const phone = "+15550102020"
 
-	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": phone}, fx.cookie, fx.freshGrant(t))
+	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": phone}, fx.sess, fx.cookie, fx.freshGrant(t))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("send-code: expected 200, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
 
 	response := decodePhoneSendResponse(t, rec)
 	rec = fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": response.VerificationID, "code": "000000"}, fx.cookie, "")
+		map[string]string{"verification_id": response.VerificationID, "code": "000000"}, fx.sess, fx.cookie, "")
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("verify wrong code: expected 400, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -484,7 +493,7 @@ func TestPhoneSendCodeInvalidPhone(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 
 	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "not-a-phone"}, fx.cookie, fx.freshGrant(t))
+		map[string]string{"phone": "not-a-phone"}, fx.sess, fx.cookie, fx.freshGrant(t))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("send-code invalid phone: expected 400, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -498,7 +507,7 @@ func TestPhoneSendCodeRateLimited(t *testing.T) {
 	fx := setupPhoneTestFixture(t, false)
 
 	rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "+15550102020"}, fx.cookie, fx.freshGrant(t))
+		map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, fx.freshGrant(t))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Errorf("send-code rate limited: expected 429, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -512,16 +521,16 @@ func TestPhoneVerifyForeignSessionDoesNotConsumeChallenge(t *testing.T) {
 	const phone = "+15550102020"
 
 	send := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": phone}, fx.cookie, fx.freshGrant(t))
+		map[string]string{"phone": phone}, fx.sess, fx.cookie, fx.freshGrant(t))
 	if send.Code != http.StatusOK {
 		t.Fatalf("send-code: expected 200, got %d (body: %s)", send.Code, send.Body.String())
 	}
 	response := decodePhoneSendResponse(t, send)
 	code := fx.sender.code()
 
-	_, foreignCookie := fx.issueSession(t)
+	foreignSession, foreignCookie := fx.issueSession(t)
 	foreign := fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": response.VerificationID, "code": code}, foreignCookie, "")
+		map[string]string{"verification_id": response.VerificationID, "code": code}, foreignSession, foreignCookie, "")
 	if foreign.Code != http.StatusBadRequest {
 		t.Fatalf("foreign-session verify: expected 400, got %d (body: %s)", foreign.Code, foreign.Body.String())
 	}
@@ -541,7 +550,7 @@ func TestPhoneVerifyForeignSessionDoesNotConsumeChallenge(t *testing.T) {
 	fx.otps.mu.Unlock()
 
 	owner := fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": response.VerificationID, "code": code}, fx.cookie, "")
+		map[string]string{"verification_id": response.VerificationID, "code": code}, fx.sess, fx.cookie, "")
 	if owner.Code != http.StatusOK {
 		t.Fatalf("initiating-session verify: expected 200, got %d (body: %s)", owner.Code, owner.Body.String())
 	}
@@ -604,7 +613,7 @@ func TestPhoneRemoveIsSingleUsePerGrant(t *testing.T) {
 
 	send := func() int {
 		req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
-		req.AddCookie(fx.cookie)
+		fx.browser.authorize(t, req, fx.sess, fx.cookie)
 		req.Header.Set(stepup.HeaderStepUpAuth, grant)
 		rec := httptest.NewRecorder()
 		fx.server.Handler().ServeHTTP(rec, req)
@@ -626,14 +635,13 @@ func TestPhoneRemoveRequiresSessionBeforeStepUp(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
+	fx.browser.prepare(req)
 	req.Header.Set(stepup.HeaderStepUpAuth,
 		mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 from the session guard", rec.Code)
-	}
+	requirePortalSessionRequired(t, rec)
 	if fx.users.removeCalled {
 		t.Error("the phone was removed without a session")
 	}
@@ -649,16 +657,16 @@ func TestPhoneRemoveAbsentWithoutStepUpService(t *testing.T) {
 	// issued under step-up and bound to a session. Sending and deletion must be
 	// withheld when their gate cannot be constructed.
 	if rec := fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": "missing", "code": "000000"}, fx.cookie, ""); rec.Code == http.StatusNotFound {
-		t.Fatal("expected the session-bound verify route to remain mounted")
+		map[string]string{"verification_id": "missing", "code": "000000"}, fx.sess, fx.cookie, ""); rec.Code != http.StatusBadRequest || errorBody(t, rec) != "no_active_code" {
+		t.Fatalf("expected the authenticated verify route to reject a missing challenge: %d %s", rec.Code, rec.Body.String())
 	}
 	if rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code",
-		map[string]string{"phone": "+15550102020"}, fx.cookie, ""); rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+		map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, ""); rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("send-code status = %d, want the route to be withheld", rec.Code)
 	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 

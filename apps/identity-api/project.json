@@ -13,10 +13,7 @@
       "{workspaceRoot}/libs/schemas/go.sum"
     ]
   },
-  "tags": [
-    "lang:go",
-    "scope:backend"
-  ],
+  "tags": ["lang:go", "scope:backend"],
   "targets": {
     "build": {
       "executor": "nx:run-commands",
@@ -24,9 +21,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/identity-api ./cmd/server"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "build-purge-worker": {
@@ -35,9 +30,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/purge-worker ./cmd/purge-worker"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "build-audit-signer": {
@@ -46,10 +39,55 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/audit-signer ./cmd/audit-signer"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
+    },
+    "build-portal-fixture": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go build -tags=portalfixture -o bin/portal-fixture ./cmd/portal-fixture"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "outputs": ["{projectRoot}/bin/portal-fixture"],
+      "cache": true
+    },
+    "test-portal-fixture": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go test -tags=portalfixture -count=1 ./cmd/portal-fixture"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-portal": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go test -count=1 ./internal/config ./internal/profile ./internal/session ./internal/server ./internal/webauthn ./internal/recovery ./internal/stepup ./internal/oidc/dpop ./internal/oidc/token ./internal/lifecycle ./internal/identitygrpc"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-webauthn": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go test -count=1 ./internal/webauthn"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-portal-integration": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/profile','./internal/session','./internal/server','./internal/webauthn','./internal/recovery','./internal/stepup','./internal/oidc/dpop','./internal/oidc/token','./internal/lifecycle','./internal/identitygrpc'], {stdio:'inherit',env:{...process.env,REQUIRE_PORTAL_INTEGRATION:'1',REQUIRE_PROFILE_INTEGRATION:'1',REQUIRE_GRPC_INTEGRATION:'1',REQUIRE_LIFECYCLE_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false,
+      "parallelism": false
     },
     "build-security-ledger-purge": {
       "executor": "nx:run-commands",
@@ -57,9 +95,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/security-ledger-purge ./cmd/security-ledger-purge"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "security-ledger-purge": {
@@ -68,9 +104,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/security-ledger-purge"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "build-admin-audit-publisher": {
@@ -79,9 +113,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/admin-audit-publisher ./cmd/admin-audit-publisher"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "admin-audit-publisher": {
@@ -90,9 +122,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/admin-audit-publisher"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "build-lifecycle-publisher": {
       "executor": "nx:run-commands",
@@ -137,9 +167,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/admin-roles ./cmd/admin-roles"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "admin-roles": {
@@ -148,13 +176,11 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/admin-roles"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "sqlc-generate": {
       "executor": "nx:run-commands",
-      "dependsOn": [{"projects": ["schemas"], "target": "generate-go"}],
+      "dependsOn": [{ "projects": ["schemas"], "target": "generate-go" }],
       "options": {
         "cwd": "apps/identity-api",
         "command": "go tool sqlc generate"
@@ -166,9 +192,7 @@
         "{projectRoot}/db/migrations/**/*.sql",
         "{projectRoot}/db/queries/**/*.sql"
       ],
-      "outputs": [
-        "{projectRoot}/internal/db"
-      ],
+      "outputs": ["{projectRoot}/internal/db"],
       "cache": true
     },
     "sqlc-vet": {
@@ -205,9 +229,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/server"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "purge-worker": {
       "executor": "nx:run-commands",
@@ -215,9 +237,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/purge-worker"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "audit-signer": {
       "executor": "nx:run-commands",
@@ -225,9 +245,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/audit-signer"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "test": {
       "executor": "nx:run-commands",
@@ -235,10 +253,7 @@
         "cwd": "apps/identity-api",
         "command": "go test -count=1 ./..."
       },
-      "dependsOn": [
-        "sqlc-generate",
-        "^build"
-      ],
+      "dependsOn": ["sqlc-generate", "^build"],
       "cache": true
     },
     "test-race": {
@@ -247,9 +262,7 @@
         "cwd": "apps/identity-api",
         "command": "go test -race -count=1 ./..."
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "test-security-db": {
@@ -262,9 +275,7 @@
         ],
         "parallel": false
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "test-admin-integration": {
@@ -273,9 +284,7 @@
         "cwd": "apps/identity-api",
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/adminaction','./internal/legalhold','./internal/rbac','./internal/session','./internal/server','./internal/audit/signer','./internal/pglock'], {stdio:'inherit',env:{...process.env,REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "test-grpc-integration": {
@@ -293,9 +302,7 @@
         "cwd": "apps/identity-api",
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/audit/retention','./internal/audit/ledgerproof','./internal/retentiondbintegration'], {stdio:'inherit',env:{...process.env,REQUIRE_RETENTION_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "test-legal-workflow-integration": {
@@ -304,9 +311,7 @@
         "cwd": "apps/identity-api",
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/legalpolicy','./internal/legalworkflow','./internal/legalreport','./internal/server'], {stdio:'inherit',env:{...process.env,REQUIRE_LEGAL_WORKFLOW_INTEGRATION:'1',REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": false
     },
     "lint": {
@@ -315,9 +320,7 @@
         "cwd": "apps/identity-api",
         "command": "golangci-lint run ./..."
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "vet": {
@@ -326,9 +329,7 @@
         "cwd": "apps/identity-api",
         "command": "go vet ./..."
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     },
     "tidy": {
       "executor": "nx:run-commands",
@@ -343,9 +344,7 @@
         "cwd": "apps/identity-api",
         "command": "go build -o bin/admin-legal ./cmd/admin-legal"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ],
+      "dependsOn": ["sqlc-generate"],
       "cache": true
     },
     "admin-legal": {
@@ -354,9 +353,7 @@
         "cwd": "apps/identity-api",
         "command": "go run ./cmd/admin-legal"
       },
-      "dependsOn": [
-        "sqlc-generate"
-      ]
+      "dependsOn": ["sqlc-generate"]
     }
   }
 }

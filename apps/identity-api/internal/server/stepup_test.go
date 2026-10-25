@@ -236,6 +236,12 @@ func TestStepUpChallengeListsAvailableFactors(t *testing.T) {
 			passkeys:   &stepUpFakePasskeys{beginErr: webauthn.ErrNoCredentials},
 			wantStatus: http.StatusConflict,
 		},
+		{
+			name:       "Redis challenge outage never falls back to TOTP",
+			mfaEnabled: true,
+			passkeys:   &stepUpFakePasskeys{beginErr: webauthn.ErrChallengeStoreUnavailable},
+			wantStatus: http.StatusServiceUnavailable,
+		},
 	}
 
 	for _, tc := range tests {
@@ -311,8 +317,8 @@ func TestStepUpVerifyIssuesUsableGrant(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("expected Cache-Control no-store, got %q", got)
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("expected Cache-Control private, no-store, got %q", got)
 	}
 
 	var body stepUpVerifyResponse
@@ -407,6 +413,13 @@ func TestStepUpVerifyErrorMapping(t *testing.T) {
 			passkeys:   &stepUpFakePasskeys{finishErr: webauthn.ErrVerification},
 			wantStatus: http.StatusUnauthorized,
 			wantError:  "invalid_credentials",
+		},
+		{
+			name:       "Redis challenge outage is not invalid credentials",
+			body:       `{"method":"webauthn","assertion":{}}`,
+			passkeys:   &stepUpFakePasskeys{finishErr: webauthn.ErrChallengeStoreUnavailable},
+			wantStatus: http.StatusServiceUnavailable,
+			wantError:  "temporarily_unavailable",
 		},
 	}
 
@@ -549,7 +562,7 @@ func TestStepUpGatedRoutesAbsentWithoutService(t *testing.T) {
 	// Sanity: the pending-enrollment finish sibling remains mounted, so a 404 below means
 	// "this route was withheld", not "no routes were registered".
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	if rec.Code == http.StatusNotFound {
@@ -565,7 +578,7 @@ func TestStepUpGatedRoutesAbsentWithoutService(t *testing.T) {
 		{http.MethodPost, stepUpVerifyPath},
 	} {
 		req := httptest.NewRequest(route.method, route.path, nil)
-		req.AddCookie(fx.cookie)
+		fx.browser.authorize(t, req, fx.sess, fx.cookie)
 		rec := httptest.NewRecorder()
 		fx.server.Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
@@ -580,20 +593,23 @@ func TestStepUpGatedRoutesAbsentWithoutService(t *testing.T) {
 // stepUpFixture is a server with a live session, a step-up service, and the two
 // gated subsystems the step-up tests probe.
 type stepUpFixture struct {
-	server *Server
-	sess   session.Session
-	cookie *http.Cookie
-	stepUp *stepup.Service
+	browser *portalTestClient
+	server  *Server
+	sess    session.Session
+	cookie  *http.Cookie
+	stepUp  *stepup.Service
 }
 
 func newStepUpFixture(t *testing.T, userID uuid.UUID, stepUpSvc *stepup.Service) *stepUpFixture {
 	t.Helper()
 
 	sessMgr := newRecoverySessionManager(t)
+	browser := newPortalTestClient(t, testPortalOrigin)
 
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
 		UserID:    userID.String(),
+		DPoPJKT:   browser.jkt,
 		IP:        "127.0.0.1",
 		UserAgent: "test-agent",
 	})
@@ -627,14 +643,15 @@ func newStepUpFixture(t *testing.T, userID uuid.UUID, stepUpSvc *stepup.Service)
 		t.Fatalf("recovery.New: %v", err)
 	}
 
-	srv := New(config.Config{Environment: "development"}, nil, Deps{
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 		SessionManager: sessMgr,
+		DPoPValidator:  browser.validator,
 		MFA:            mfaSvc,
 		Recovery:       recoverySvc,
 		StepUp:         stepUpSvc,
 	})
 
-	return &stepUpFixture{server: srv, sess: sess, cookie: cookie, stepUp: stepUpSvc}
+	return &stepUpFixture{server: srv, sess: sess, cookie: cookie, stepUp: stepUpSvc, browser: browser}
 }
 
 // do issues a request carrying the session cookie but no step-up grant.
@@ -646,7 +663,7 @@ func (fx *stepUpFixture) do(t *testing.T, method, path string, body []byte) *htt
 		reader = bytes.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
@@ -663,7 +680,7 @@ func (fx *stepUpFixture) sendWithGrant(t *testing.T, grant string) int {
 	t.Helper()
 
 	req := httptest.NewRequest(http.MethodDelete, mfaDisablePath, nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, grant)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)

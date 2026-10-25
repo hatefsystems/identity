@@ -29,6 +29,9 @@ type adminResponseBuffer struct {
 	body     bytes.Buffer
 	status   int
 	overflow bool
+	// Set only by the browser guard after proof/authority validation. Renewal
+	// waits until the durable transaction's final response, not this buffer.
+	authenticatedSession *session.Session
 }
 
 func (w *adminResponseBuffer) Header() http.Header { return w.header }
@@ -153,13 +156,20 @@ func (s *Server) adminTransaction(next http.Handler) http.Handler {
 			s.writeAdminError(w, http.StatusServiceUnavailable, "audit_unavailable")
 			return
 		}
-		for key, values := range buffer.header {
-			w.Header()[key] = values
+		response := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			for key, values := range buffer.header {
+				w.Header()[key] = values
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			w.WriteHeader(buffer.status)
+			_, _ = w.Write(buffer.body.Bytes())
+		})
+		if buffer.authenticatedSession != nil {
+			s.deps.SessionManager.TrackActivity(response).ServeHTTP(w, r.WithContext(session.WithSession(r.Context(), *buffer.authenticatedSession)))
+		} else {
+			response.ServeHTTP(w, r)
 		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.WriteHeader(buffer.status)
-		_, _ = w.Write(buffer.body.Bytes())
 	})
 }
 

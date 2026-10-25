@@ -168,8 +168,8 @@ func New(cfg Config, users UserStore, creds CredentialStore, challenges Challeng
 	if len(cfg.RPOrigins) == 0 {
 		return nil, errors.New("webauthn: at least one RP origin is required")
 	}
-	if cfg.ChallengeTTL <= 0 {
-		return nil, fmt.Errorf("webauthn: challenge TTL must be positive, got %v", cfg.ChallengeTTL)
+	if cfg.ChallengeTTL < time.Millisecond || cfg.ChallengeTTL > MaxChallengeTTL {
+		return nil, fmt.Errorf("webauthn: challenge TTL must be between 1ms and %v", MaxChallengeTTL)
 	}
 	// Without a key the derived decoys would be computable by anyone, so the
 	// mock ceremony would be recognisable and the user-named login path would

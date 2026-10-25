@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -97,7 +98,7 @@ func newWorkflowHTTPIntegration(t *testing.T) *adminIntegration {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	sess, err := f.sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true})
+	sess, err := f.sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,11 +116,16 @@ func workflowHTTPRequest(t *testing.T, f *adminIntegration, role, method, path s
 			t.Fatal(err)
 		}
 	}
-	r := httptest.NewRequest(method, "https://identity.example/api/v1/admin"+path, strings.NewReader(string(data)))
-	if cookie := f.cookies[role]; cookie != nil {
-		r.AddCookie(cookie)
+	var reader io.Reader
+	if data != nil {
+		reader = strings.NewReader(string(data))
 	}
+	r := httptest.NewRequest(method, "https://identity.example/api/v1/admin"+path, reader)
 	r.Header.Set("Origin", "https://identity.example")
+	f.browser.prepare(r)
+	if cookie := f.cookies[role]; cookie != nil {
+		f.browser.authorize(t, r, f.actors[role], cookie)
+	}
 	r.Header.Set("Idempotency-Key", key.String())
 	if method != http.MethodGet {
 		r.Header.Set(stepup.HeaderStepUpAuth, f.grant(t, role))
@@ -229,7 +235,7 @@ func TestLegalWorkflowHTTPGuardsAndAuditRollback(t *testing.T) {
 		}
 	}
 	for _, body := range []string{`{"actor":"spoof"}`, `{} {}`, `{"content":{},"key":"spoof"}`} {
-		if w := f.request("dpo", "POST", "/legal-cases", body, f.grant(t, "dpo")); w.Code != 400 {
+		if w := f.request(t, "dpo", "POST", "/legal-cases", body, f.grant(t, "dpo")); w.Code != 400 {
 			t.Fatalf("invalid body accepted: %d %s", w.Code, w.Body.String())
 		}
 	}
@@ -295,12 +301,12 @@ func TestLegalTransparencyHTTPReviewedArtifactBytes(t *testing.T) {
 		t.Fatalf("failed download committed replay count=%d err=%v", replays, err)
 	}
 	f.srv = New(f.srv.cfg, nil, deps)
-	if denied := f.request("dpo", "POST", path+"/download", `{}`, ""); denied.Code != 403 {
+	if denied := f.request(t, "dpo", "POST", path+"/download", `{}`, ""); denied.Code != 403 {
 		t.Fatalf("missing step-up: %d", denied.Code)
 	}
 	r := httptest.NewRequest("POST", "https://identity.example/api/v1/admin"+path+"/download", strings.NewReader(`{}`))
-	r.AddCookie(f.cookies["dpo"])
 	r.Header.Set("Origin", "https://untrusted.invalid")
+	f.browser.authorize(t, r, f.actors["dpo"], f.cookies["dpo"])
 	r.Header.Set("User-Agent", "workflow-early-denial-secret")
 	r.Header.Set("Idempotency-Key", uuid.NewString())
 	r.Header.Set(stepup.HeaderStepUpAuth, f.grant(t, "dpo"))
@@ -318,7 +324,7 @@ func TestLegalTransparencyHTTPReviewedArtifactBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	grant := f.grant(t, "dpo")
-	w = f.request("dpo", "POST", path+"/download", string(downloadBody), grant)
+	w = f.request(t, "dpo", "POST", path+"/download", string(downloadBody), grant)
 	if w.Code != 200 {
 		t.Fatalf("download: %d %s", w.Code, w.Body.String())
 	}
@@ -331,7 +337,7 @@ func TestLegalTransparencyHTTPReviewedArtifactBytes(t *testing.T) {
 			t.Fatalf("artifact leaked %s", forbidden)
 		}
 	}
-	if reused := f.request("dpo", "POST", path+"/download", string(downloadBody), grant); reused.Code != 403 {
+	if reused := f.request(t, "dpo", "POST", path+"/download", string(downloadBody), grant); reused.Code != 403 {
 		t.Fatalf("reused step-up download: %d", reused.Code)
 	}
 }
@@ -341,19 +347,19 @@ func TestLegalWorkflowOptInAndStepUpBoundaries(t *testing.T) {
 	cfg, deps := f.srv.cfg, f.srv.deps
 	cfg.Admin.WorkflowEnabled = false
 	f.srv = New(cfg, nil, deps)
-	if w := f.request("dpo", "GET", "/legal-cases", "", ""); w.Code != 404 {
+	if w := f.request(t, "dpo", "GET", "/legal-cases", "", ""); w.Code != 404 {
 		t.Fatalf("disabled workflow route exposed: %d %s", w.Code, w.Body.String())
 	}
-	if w := f.request("dpo", "GET", "/legal-holds", "", ""); w.Code != 200 {
+	if w := f.request(t, "dpo", "GET", "/legal-holds", "", ""); w.Code != 200 {
 		t.Fatalf("workflow disable broke existing hold access: %d %s", w.Code, w.Body.String())
 	}
 	cfg.Admin.WorkflowEnabled = true
 	deps.StepUp = nil
 	f.srv = New(cfg, nil, deps)
-	if w := f.request("dpo", "POST", "/legal-cases", `{}`, ""); w.Code != 404 && w.Code != 405 {
+	if w := f.request(t, "dpo", "POST", "/legal-cases", `{}`, ""); w.Code != 404 && w.Code != 405 {
 		t.Fatalf("mutation mounted without step-up: %d %s", w.Code, w.Body.String())
 	}
-	if w := f.request("dpo", "GET", "/legal-cases", "", ""); w.Code != 200 {
+	if w := f.request(t, "dpo", "GET", "/legal-cases", "", ""); w.Code != 200 {
 		t.Fatalf("read unnecessarily requires step-up: %d %s", w.Code, w.Body.String())
 	}
 }

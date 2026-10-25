@@ -2,7 +2,9 @@ package server
 
 import (
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -40,20 +42,13 @@ type sessionErrorResponse struct {
 
 // registerSessionRoutes mounts the browser session lifecycle endpoints. It is
 // only called when a session manager is configured (Deps.SessionManager !=
-// nil). Logout is unauthenticated by design — it is idempotent and only ever
-// clears the caller's own cookie — while the self-service list/revoke routes
-// are gated behind RequireSession so a request must present a live session for
-// the user it acts on.
+// nil). A live logout uses the same binding/intent checks as all other browser
+// mutations; missing or expired cookies retain idempotent cookie clearing.
 func (s *Server) registerSessionRoutes() {
-	s.router.Post("/api/v1/auth/logout", s.handleLogout())
+	s.router.With(s.browserLogout).Post("/api/v1/auth/logout", s.handleLogout())
 
-	// RequireSession is constructed once; the manager is guaranteed non-nil by
-	// the caller, so NewRequireSession cannot fail here.
-	guard, err := session.NewRequireSession(s.deps.SessionManager)
-	if err != nil {
-		// Unreachable given the non-nil manager, but surface it rather than
-		// mounting unguarded routes.
-		s.logger.Error("session: failed to build RequireSession middleware", "error", err.Error())
+	guard, ok := s.sessionGuard("sessions")
+	if !ok {
 		return
 	}
 
@@ -72,18 +67,15 @@ func (s *Server) handleLogout() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		revoked, ok, err := s.deps.SessionManager.Revoke(w, r)
 		if err != nil {
-			s.logger.Error("session: logout failed", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{
-				Error: "logout_failed",
+			s.logger.Error("session: logout unavailable")
+			writeJSON(w, http.StatusServiceUnavailable, sessionErrorResponse{
+				Error: "temporarily_unavailable",
 			})
 			return
 		}
 
-		// Audited only when a live session was actually revoked. This route is
-		// unauthenticated, so recording every call would let any client append
-		// rows to the audit chain with no account to attribute them to —
-		// mvp_audit_logs.actor_id is NOT NULL, and uuid.Nil would be a fabrication.
-		// A no-cookie or already-expired logout is a no-op and stays out of the log.
+		// Anonymous and expired-cookie no-ops are handled by the outer boundary;
+		// a revocation racing this request still must not fabricate an audit actor.
 		if ok {
 			if userID, parseErr := uuid.Parse(revoked.UserID); parseErr == nil {
 				s.record(r, audit.Event{
@@ -123,8 +115,8 @@ func (s *Server) handleListSessions() http.HandlerFunc {
 
 		sessions, err := s.deps.SessionManager.List(r.Context(), current.UserID)
 		if err != nil {
-			s.logger.Error("session: list failed", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{Error: "server_error"})
+			s.logger.Error("session: list unavailable")
+			writeJSON(w, http.StatusServiceUnavailable, sessionErrorResponse{Error: "temporarily_unavailable"})
 			return
 		}
 
@@ -132,8 +124,8 @@ func (s *Server) handleListSessions() http.HandlerFunc {
 		for _, sess := range sessions {
 			out = append(out, sessionResponse{
 				ID:         sess.ID,
-				IP:         sess.IP,
-				UserAgent:  sess.UserAgent,
+				IP:         boundedSessionMetadata(sess.IP, 64),
+				UserAgent:  boundedSessionMetadata(sess.UserAgent, 256),
 				Current:    sess.ID == current.ID,
 				CreatedAt:  sess.CreatedAt,
 				LastSeenAt: sess.LastSeenAt,
@@ -141,6 +133,22 @@ func (s *Server) handleListSessions() http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, out)
 	}
+}
+
+func boundedSessionMetadata(value string, limit int) string {
+	var out strings.Builder
+	count := 0
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			continue
+		}
+		if count == limit {
+			break
+		}
+		out.WriteRune(r)
+		count++
+	}
+	return out.String()
 }
 
 // handleRevokeSession serves DELETE /api/v1/users/me/sessions/{id}. It revokes a
@@ -165,13 +173,16 @@ func (s *Server) handleRevokeSession() http.HandlerFunc {
 
 		revoked, err := s.deps.SessionManager.RevokeByID(r.Context(), current.UserID, id)
 		if err != nil {
-			s.logger.Error("session: revoke by id failed", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, sessionErrorResponse{Error: "server_error"})
+			s.logger.Error("session: revoke by id unavailable")
+			writeJSON(w, http.StatusServiceUnavailable, sessionErrorResponse{Error: "temporarily_unavailable"})
 			return
 		}
 		if !revoked {
 			writeJSON(w, http.StatusNotFound, sessionErrorResponse{Error: "not_found"})
 			return
+		}
+		if id == current.ID {
+			s.deps.SessionManager.ClearCookie(w)
 		}
 
 		// RevokeByID already scopes to the caller's own account and reports whether

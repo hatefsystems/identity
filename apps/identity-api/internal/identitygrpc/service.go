@@ -282,8 +282,10 @@ func (s *Service) GetInternalUserInfo(ctx context.Context, req *identityv1.GetIn
 	switch profile.Status {
 	case "active":
 		response.Status, response.Email = identityv1.UserStatus_USER_STATUS_ACTIVE, profile.Email
+		response.DisplayName = profile.DisplayName
 	case "pending_verification":
 		response.Status, response.Email = identityv1.UserStatus_USER_STATUS_PENDING_VERIFICATION, profile.Email
+		response.DisplayName = profile.DisplayName
 	case "suspended":
 		response.Status = identityv1.UserStatus_USER_STATUS_SUSPENDED
 	case "banned":
@@ -300,7 +302,7 @@ func (s *Service) GetInternalUserInfo(ctx context.Context, req *identityv1.GetIn
 	event := audit.Event{
 		EventType: audit.EventGRPCProfileRead, ActionStatus: audit.StatusSuccess,
 		ActorSPIFFEID: caller.String(), SubjectID: &id,
-		Payload: map[string]any{"email_disclosed": response.Email != ""},
+		Payload: map[string]any{"email_disclosed": response.Email != "", "display_name_disclosed": response.DisplayName != ""},
 	}
 	if len(event.ActorSPIFFEID) > maxAuditSPIFFEIDLength {
 		event.ActorSPIFFEID = ""

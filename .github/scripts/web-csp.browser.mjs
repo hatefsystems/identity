@@ -29,8 +29,9 @@ const authRoutes = [
     path: '/login/webauthn',
     heading: 'Sign in with a passkey',
     submit: 'Use a passkey',
+    passkey: true,
     fields: [],
-    back: 'Use email and password instead',
+    back: 'Return to sign in',
   },
   {
     path: '/verify-totp',
@@ -177,7 +178,25 @@ function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
   }
 }
 
-async function assertUnavailable(page, route) {
+async function assertUnavailable(page, route, noScript = false) {
+  if (route.passkey) {
+    const action = page.getByTestId('passkey-login');
+    await action.waitFor({ state: 'visible' });
+    assert.equal(await action.getAttribute('type'), 'button');
+    if (noScript) {
+      assert(await action.isDisabled(), 'Passkey action stays disabled without JavaScript');
+    } else {
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="passkey-login"]')?.disabled
+      );
+    }
+    assert.equal(
+      await page.getByRole('form').count(),
+      0,
+      'Passkey action has no native submission'
+    );
+    return;
+  }
   const form = page.getByRole('form');
   await form.getByText('UI preview', { exact: true }).waitFor({ state: 'visible' });
   await form.getByText(previewNotice).waitFor({ state: 'visible' });
@@ -449,7 +468,7 @@ async function storageSnapshot(page) {
   };
 }
 
-async function assertInertInteraction(page, route, observed, beforeStorage) {
+async function assertInertInteraction(page, route, observed, beforeStorage, noScript = false) {
   const marker = randomUUID();
   const before = {
     url: page.url(),
@@ -485,14 +504,14 @@ async function assertInertInteraction(page, route, observed, beforeStorage) {
     before,
     `${route.path}: disabled Enter/click must not navigate, replace the document or persist credentials`
   );
-  await assertUnavailable(page, route);
+  await assertUnavailable(page, route, noScript);
 }
 
 export async function validateWebCsp({
   baseURL,
   notFoundPaths = [`/__csp-browser-${randomUUID()}`, `/__csp-browser-${randomUUID()}.html`],
 }) {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ channel: 'chromium' });
   try {
     const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block' });
     context.setDefaultTimeout(15_000);
@@ -616,10 +635,12 @@ export async function validateWebCsp({
       await navigate('Return home', '/');
     }
 
-    // Exercise both homepage CTAs and the passkey-first/password/reset client-navigation paths.
+    // Preserve both homepage CTAs and inactive password/reset navigation. Passkey
+    // authentication is now an explicit button action, tested with the real API
+    // in web-portal.browser.mjs, not against this standalone image-only fixture.
     await navigate('Sign in', '/login');
-    await navigate('Continue with a passkey', '/login/webauthn');
-    await navigate('Use email and password instead', '/login');
+    await visit('/login/webauthn', 200, 'Sign in with a passkey');
+    await navigate('Return to sign in', '/login');
     await navigate('Forgot password?', '/forgot-password');
     await navigate('Return to sign in', '/login');
     await navigate('Hatef Identity home', '/');
@@ -629,7 +650,10 @@ export async function validateWebCsp({
     for (const route of authRoutes) {
       await visit(route.path, 200, route.heading);
       await assertUnavailable(page, route);
-      await waitForReactHandler(page.getByRole('form'), 'onSubmit');
+      await waitForReactHandler(
+        route.passkey ? page.getByTestId('passkey-login') : page.getByRole('form'),
+        route.passkey ? 'onClick' : 'onSubmit'
+      );
       assert(
         await page.evaluate(() => document.activeElement === document.body),
         `${route.path}: no autofocus on direct load`
@@ -745,7 +769,7 @@ export async function validateWebCsp({
         new URL(route.path, baseURL).href,
         'Typing, validation and paste must not navigate'
       );
-      await assertInertInteraction(page, route, observed, beforeStorage);
+      if (!route.passkey) await assertInertInteraction(page, route, observed, beforeStorage);
       await assertCleanBaseline();
       await navigate(route.back, route.backPath || '/login');
       await navigate('Hatef Identity home', '/');
@@ -781,11 +805,11 @@ export async function validateWebCsp({
         await noScript
           .getByRole('heading', { name: route.heading, level: 1, exact: true })
           .waitFor({ state: 'visible' });
-        await assertUnavailable(noScript, route);
+        await assertUnavailable(noScript, route, true);
         const beforeStorage = await storageSnapshot(noScript);
         for (const field of route.fields)
           await noScript.getByLabel(field.label, { exact: true }).fill(values[field.name]);
-        await assertInertInteraction(noScript, route, noScriptObserved, beforeStorage);
+        await assertInertInteraction(noScript, route, noScriptObserved, beforeStorage, true);
         assertSafeRequests(noScriptObserved, baseURL, documentPaths, secrets);
         assert.deepEqual(noScriptObserved.errors, [], 'JavaScript-disabled runtime/CSP errors');
       }
@@ -900,7 +924,7 @@ export async function validateWebCsp({
     }
     assert.deepEqual(attackErrors, [], 'Unexpected attack-fixture errors');
     console.log(
-      'Production browser CSP, auth previews, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
+      'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
     );
   } finally {
     await browser.close();

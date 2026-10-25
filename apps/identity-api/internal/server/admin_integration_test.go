@@ -8,10 +8,12 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,14 +36,26 @@ import (
 )
 
 type adminIntegration struct {
-	pool     *pgxpool.Pool
-	srv      *Server
-	sessions *session.Manager
-	step     *stepup.Service
-	enc      *envelope.Encryptor
-	actors   map[string]session.Session
-	cookies  map[string]*http.Cookie
-	target   db.User
+	pool         *pgxpool.Pool
+	srv          *Server
+	browser      *portalTestClient
+	sessions     *session.Manager
+	sessionStore *adminCountingSessionStore
+	step         *stepup.Service
+	enc          *envelope.Encryptor
+	actors       map[string]session.Session
+	cookies      map[string]*http.Cookie
+	target       db.User
+}
+
+type adminCountingSessionStore struct {
+	session.Store
+	touches atomic.Int64
+}
+
+func (s *adminCountingSessionStore) Touch(ctx context.Context, hash string, expiry time.Time) error {
+	s.touches.Add(1)
+	return s.Store.Touch(ctx, hash, expiry)
 }
 
 func newAdminIntegration(t *testing.T) *adminIntegration {
@@ -74,7 +88,8 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 		t.Fatal(err)
 	}
 	accounts := session.NewDBAccountState(pool)
-	sessions, err := session.NewManager(session.NewMemoryStore(), codec, session.ManagerConfig{AbsoluteTTL: time.Hour, IdleTTL: time.Hour, AccountState: accounts})
+	sessionStore := &adminCountingSessionStore{Store: session.NewMemoryStore()}
+	sessions, err := session.NewManager(sessionStore, codec, session.ManagerConfig{AbsoluteTTL: time.Hour, IdleTTL: time.Hour, AccountState: accounts})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,12 +115,12 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &adminIntegration{pool: pool, sessions: sessions, step: step, enc: enc, actors: map[string]session.Session{}, cookies: map[string]*http.Cookie{}}
-	f.srv = New(config.Config{Environment: "development", Admin: config.AdminConfig{
+	f := &adminIntegration{pool: pool, browser: newPortalTestClient(t, testPortalOrigin), sessions: sessions, sessionStore: sessionStore, step: step, enc: enc, actors: map[string]session.Session{}, cookies: map[string]*http.Cookie{}}
+	f.srv = New(config.Config{Environment: "development", PortalOrigin: f.browser.origin, Admin: config.AdminConfig{
 		Enabled: true, AllowedOrigins: []string{"https://identity.example"}, RequestTimeout: 5 * time.Second,
 		PerActorPerMinute: 10000, PerSubnetPerMinute: 10000, PageSizeDefault: 50, PageSizeMax: 200,
 		ChainVerifyMaxLimit: 5000, AuditMaxWindow: 31 * 24 * time.Hour,
-	}}, nil, Deps{SessionManager: sessions, StepUp: step, AdminStore: q, AdminActions: actions, RBAC: q, LegalHold: holds, AdminLimiter: limiter, LedgerProofDB: pool})
+	}}, nil, Deps{SessionManager: sessions, DPoPValidator: f.browser.validator, StepUp: step, AdminStore: q, AdminActions: actions, RBAC: q, LegalHold: holds, AdminLimiter: limiter, LedgerProofDB: pool})
 	for _, role := range []string{"support", "moderator", "super_admin", "dpo", "ordinary"} {
 		user := f.user(t)
 		if role != "ordinary" {
@@ -117,7 +132,7 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 			}
 		}
 		w := httptest.NewRecorder()
-		sess, err := sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true})
+		sess, err := sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,12 +162,18 @@ func (f *adminIntegration) grant(t *testing.T, role string) string {
 	return grant
 }
 
-func (f *adminIntegration) request(role, method, path, body, grant string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(method, "https://identity.example/api/v1/admin"+path, strings.NewReader(body))
-	if cookie := f.cookies[role]; cookie != nil {
-		r.AddCookie(cookie)
+func (f *adminIntegration) request(t *testing.T, role, method, path, body, grant string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
 	}
+	r := httptest.NewRequest(method, "https://identity.example/api/v1/admin"+path, reader)
 	r.Header.Set("Origin", "https://identity.example")
+	f.browser.prepare(r)
+	if cookie := f.cookies[role]; cookie != nil {
+		f.browser.authorize(t, r, f.actors[role], cookie)
+	}
 	r.Header.Set("Idempotency-Key", uuid.NewString())
 	r.Header.Set(stepup.HeaderStepUpAuth, grant)
 	w := httptest.NewRecorder()
@@ -174,7 +195,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 			{"/ledger/verify", role == "dpo" || role == "super_admin"},
 			{"/legal-holds?account_ref=" + f.target.ID.String(), role == "dpo"},
 		} {
-			w := f.request(role, "GET", route.path, "", "")
+			w := f.request(t, role, "GET", route.path, "", "")
 			want := 403
 			if route.allowed {
 				want = 200
@@ -182,7 +203,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 			if w.Code != want {
 				t.Fatalf("%s %s: %d %s", role, route.path, w.Code, w.Body.String())
 			}
-			if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Referrer-Policy") != "no-referrer" {
+			if w.Header().Get("Cache-Control") != "private, no-store" || w.Header().Get("Referrer-Policy") != "no-referrer" {
 				t.Fatal("privacy headers absent")
 			}
 			if role == "support" && strings.Contains(route.path, "/users") {
@@ -195,7 +216,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 		}
 	}
 	grant := f.grant(t, "support")
-	w := f.request("support", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"banned","reason":"private"}`, grant)
+	w := f.request(t, "support", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"banned","reason":"private"}`, grant)
 	if w.Code != 403 {
 		t.Fatalf("unauthorized mutation: %d %s", w.Code, w.Body.String())
 	}
@@ -205,11 +226,11 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["support"].UserID), "support", true); err != nil {
 		t.Fatal(err)
 	}
-	if w := f.request("support", "GET", "/users", "", ""); w.Code != 403 {
+	if w := f.request(t, "support", "GET", "/users", "", ""); w.Code != 403 {
 		t.Fatalf("revoked role retained access: %d", w.Code)
 	}
 	for _, path := range []string{"/roles/assign", "/users/" + f.target.ID.String() + "/trigger-reset"} {
-		if w := f.request("super_admin", "POST", path, `{}`, ""); w.Code != 404 && w.Code != 405 {
+		if w := f.request(t, "super_admin", "POST", path, `{}`, ""); w.Code != 404 && w.Code != 405 {
 			t.Fatalf("out-of-scope route: %s %d %s", path, w.Code, w.Body.String())
 		}
 	}
@@ -236,6 +257,13 @@ func (tx rejectAuditTx) Exec(ctx context.Context, sql string, args ...any) (pgco
 
 func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
+	// A committed read renews once. Tentative reads and mutations whose audit
+	// commit fails must not call Touch at all, not merely fail to persist it.
+	control := f.request(t, "moderator", "GET", "/users/"+f.target.ID.String(), "", "")
+	if control.Code != http.StatusOK || f.sessionStore.touches.Load() != 1 {
+		t.Fatalf("committed read: status=%d touches=%d body=%s", control.Code, f.sessionStore.touches.Load(), control.Body.String())
+	}
+	touches := f.sessionStore.touches.Load()
 	actions, err := adminaction.New(rejectAuditBeginner{f.pool}, f.enc, "identity.audit.admin-test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -245,16 +273,22 @@ func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testin
 		{"GET", "/users/" + f.target.ID.String(), "", ""},
 		{"PATCH", "/users/" + f.target.ID.String() + "/status", `{"status":"banned","reason":"private case"}`, f.grant(t, "moderator")},
 	} {
-		w := f.request("moderator", call.method, call.path, call.body, call.grant)
+		w := f.request(t, "moderator", call.method, call.path, call.body, call.grant)
 		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), f.target.Email) {
 			t.Fatalf("audit failure disclosed/succeeded: %d %s", w.Code, w.Body.String())
+		}
+		if got := f.sessionStore.touches.Load(); got != touches {
+			t.Fatalf("failed audit renewed %s activity: touches=%d, want %d", call.method, got, touches)
 		}
 	}
 	// The ledger's independent read-only snapshot must not bypass the outer
 	// durable disclosure receipt, even for a no-content/uninitialized response.
-	w := f.request("dpo", "GET", "/ledger/verify", "", "")
+	w := f.request(t, "dpo", "GET", "/ledger/verify", "", "")
 	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), "through_seq") {
 		t.Fatalf("ledger proof escaped failed audit: %d %s", w.Code, w.Body.String())
+	}
+	if got := f.sessionStore.touches.Load(); got != touches {
+		t.Fatalf("failed ledger disclosure audit renewed activity: touches=%d, want %d", got, touches)
 	}
 	u, err := db.New(f.pool).GetUserByIDForAdmin(context.Background(), f.target.ID)
 	if err != nil {
@@ -273,14 +307,14 @@ func TestAdminModerationInvalidatesOtherInstanceAndEncryptsReasonIntegration(t *
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	_, err = other.IssueContext(context.Background(), w, session.IssueParams{UserID: f.target.ID.String(), AuthVersionSet: true})
+	_, err = other.IssueContext(context.Background(), w, session.IssueParams{UserID: f.target.ID.String(), AuthVersionSet: true, DPoPJKT: f.browser.jkt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(w.Result().Cookies()[0])
 	for _, status := range []string{"banned", "active"} {
-		w := f.request("moderator", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"`+status+`","reason":"sensitive-case-123"}`, f.grant(t, "moderator"))
+		w := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"`+status+`","reason":"sensitive-case-123"}`, f.grant(t, "moderator"))
 		if w.Code != 204 {
 			t.Fatalf("moderation: %d %s", w.Code, w.Body.String())
 		}
@@ -313,8 +347,8 @@ func TestAdminIndependentPreservationsAndReleasedReplayIntegration(t *testing.T)
 	body := `{"account_ref":"` + account.String() + `","reason":"sealed reason","requesting_authority":"case authority","expires_at":"2000-01-01T00:00:00Z"}`
 	send := func(key, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("POST", "https://identity.example/api/v1/admin/preservation-requests", strings.NewReader(body))
-		r.AddCookie(f.cookies["dpo"])
 		r.Header.Set("Origin", "https://identity.example")
+		f.browser.authorize(t, r, f.actors["dpo"], f.cookies["dpo"])
 		r.Header.Set("Idempotency-Key", key)
 		r.Header.Set(stepup.HeaderStepUpAuth, f.grant(t, "dpo"))
 		w := httptest.NewRecorder()
@@ -342,7 +376,7 @@ func TestAdminIndependentPreservationsAndReleasedReplayIntegration(t *testing.T)
 		t.Fatalf("independent request: %d %s", w.Code, w.Body.String())
 	}
 	for range 2 {
-		if w := f.request("dpo", "DELETE", "/legal-holds/"+holdID.String(), "", f.grant(t, "dpo")); w.Code != 204 {
+		if w := f.request(t, "dpo", "DELETE", "/legal-holds/"+holdID.String(), "", f.grant(t, "dpo")); w.Code != 204 {
 			t.Fatalf("release: %d %s", w.Code, w.Body.String())
 		}
 	}
@@ -364,7 +398,7 @@ func TestAdminUnsupportedMethodsAreAuditedIntegration(t *testing.T) {
 			if err := f.pool.QueryRow(context.Background(), "SELECT count(*) FROM event_outbox WHERE admin_action").Scan(&before); err != nil {
 				t.Fatal(err)
 			}
-			w := f.request("support", method, "/users", "", "")
+			w := f.request(t, "support", method, "/users", "", "")
 			if w.Code != http.StatusMethodNotAllowed {
 				t.Fatalf("unsupported method returned %d: %s", w.Code, w.Body.String())
 			}

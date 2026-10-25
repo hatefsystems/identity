@@ -83,10 +83,12 @@ message GetInternalUserInfoResponse {
   string user_id = 1;
   // Empty for suspended/banned users; deleting/deleted users are not found.
   string email = 2;
-  // Empty until an actual display-name field is implemented in storage.
+  // Optional shared profile name, at most 80 Unicode code points. Empty when
+  // unset or for suspended/banned users; deleting/deleted users are not found.
   string display_name = 3;
   UserStatus status = 4;
   // Revision of this profile snapshot; zero for accounts not yet captured by
-  // lifecycle events. ProtoJSON encodes this uint64 as a decimal string.
+  // lifecycle events. Read with email/display_name in the same database snapshot.
+  // ProtoJSON encodes this uint64 as an exact decimal string, not a JSON number.
   uint64 lifecycle_revision = 5;
 }

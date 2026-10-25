@@ -89,7 +89,7 @@ func newLifecycleDatabase(t *testing.T) lifecycleDatabase {
 	for _, entry := range entries {
 		// Later audit migrations are deliberately public-specific. Never apply
 		// them from this isolated fixture or touch another suite's tables.
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" {
+		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" && entry.Name() != "00017_profile_names.sql" {
 			continue
 		}
 		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())

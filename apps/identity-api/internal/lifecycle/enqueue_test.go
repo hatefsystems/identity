@@ -63,7 +63,7 @@ func TestEnqueueStatusTransitions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if row.Subject != tc.subject || event.EventType != tc.subject || event.UserId != id.String() ||
+			if event.SchemaVersion != lifecycle.SchemaVersion || row.Subject != tc.subject || event.EventType != tc.subject || event.UserId != id.String() ||
 				event.EventId != row.ID.String() || !row.LifecycleUserID.Valid || row.LifecycleUserID.UUID != id ||
 				row.LifecycleRevision == nil || *row.LifecycleRevision != 9 || event.GetRevision() != 9 {
 				t.Fatal("intent identity/revision differs from indexed metadata")
@@ -101,7 +101,7 @@ func TestEnqueueDeletionIsTerminalAndDoesNotUpdateRemovedUser(t *testing.T) {
 		t.Fatal("deletion must use the locked pre-delete revision without updating users")
 	}
 	event, err := lifecycle.UnmarshalEvent([]byte(store.rows[0].Payload))
-	if err != nil || event.EventType != lifecycle.SubjectDeleted || event.GetRevision() != 5 ||
+	if err != nil || event.SchemaVersion != lifecycle.SchemaVersion || event.EventType != lifecycle.SubjectDeleted || event.GetRevision() != 5 ||
 		event.UserId != id.String() || event.Status != nil || len(event.ChangedFields) != 0 {
 		t.Fatalf("invalid tombstone: %v", err)
 	}
@@ -132,5 +132,32 @@ func TestEnqueueFailuresAreRequiredAndSanitized(t *testing.T) {
 	}
 	if _, err := lifecycle.CreateUser(context.Background(), nil, db.CreateUserParams{Status: "active"}); !errors.Is(err, lifecycle.ErrInvalidEvent) {
 		t.Fatal("creation accepted without a caller-owned transaction")
+	}
+}
+
+func TestDisplayNameIntentAllocatesOnlyMetadataV2(t *testing.T) {
+	id, store := uuid.New(), &intentStore{revision: 1<<53 + 1}
+	revision, err := lifecycle.EnqueueDisplayNameChange(context.Background(), store, id, "active")
+	if err != nil || revision != 1<<53+2 || store.advances != 1 || len(store.rows) != 1 {
+		t.Fatalf("name change revision/intents mismatch: %v", err)
+	}
+	row := store.rows[0]
+	event, err := lifecycle.UnmarshalEvent([]byte(row.Payload))
+	if err != nil || event.SchemaVersion != 2 || event.EventType != lifecycle.SubjectUpdated || event.UserId != id.String() ||
+		event.GetRevision() != 1<<53+2 || row.LifecycleRevision == nil || *row.LifecycleRevision != revision ||
+		len(event.ChangedFields) != 1 || event.ChangedFields[0] != "display_name" || !event.OccurredAt.AsTime().Equal(row.CreatedAt.Time) {
+		t.Fatal("name update lost metadata-only v2 contract")
+	}
+	private := errors.New("private name in database error")
+	for _, store := range []*intentStore{{advance: private}, {insert: private}} {
+		if _, err := lifecycle.EnqueueDisplayNameChange(context.Background(), store, id, "active"); !errors.Is(err, lifecycle.ErrEnqueue) || strings.Contains(err.Error(), "private name") {
+			t.Fatal("v2 enqueue failure was hidden or disclosed")
+		}
+	}
+	for _, status := range []string{"suspended", "banned", "pending_verification", "pending_deletion", ""} {
+		store := &intentStore{}
+		if _, err := lifecycle.EnqueueDisplayNameChange(context.Background(), store, id, status); !errors.Is(err, lifecycle.ErrInvalidEvent) || store.advances != 0 {
+			t.Fatal("profile writer accepted ineligible status")
+		}
 	}
 }

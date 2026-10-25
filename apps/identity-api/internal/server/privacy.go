@@ -60,7 +60,7 @@ type privacyReclaimOptionsResponse struct {
 // cannot log in at all, which is the whole reason the reclaim ceremony exists.
 func (s *Server) registerPrivacyRoutes() {
 	s.router.Route("/api/v1/auth/deletion/reclaim", func(r chi.Router) {
-		r.Post("/options", s.handlePrivacyReclaimOptions())
+		r.With(s.webAuthnChallengeAdmission).Post("/options", s.handlePrivacyReclaimOptions())
 		r.Post("/", s.handlePrivacyReclaim())
 	})
 
@@ -73,10 +73,9 @@ func (s *Server) registerPrivacyRoutes() {
 		return
 	}
 
-	s.router.Route("/api/v1/users/me", func(r chi.Router) {
-		r.Use(guard.Handler)
-		r.With(stepGuard.Handler).Delete("/", s.handlePrivacyRequestDeletion())
-	})
+	// Do not mount a wildcard subrouter over the profile's GET/PATCH methods.
+	s.router.With(guard.Handler, stepGuard.Handler).Delete("/api/v1/users/me", s.handlePrivacyRequestDeletion())
+	s.router.With(guard.Handler, stepGuard.Handler).Delete("/api/v1/users/me/", s.handlePrivacyRequestDeletion())
 }
 
 // handlePrivacyRequestDeletion serves DELETE /api/v1/users/me.
@@ -85,11 +84,9 @@ func (s *Server) registerPrivacyRoutes() {
 // that retries after a dropped response cannot tell the difference and cannot use
 // the endpoint to probe prior account state.
 //
-// Note the residual authority this leaves: every stateful session and refresh-token
-// family is revoked synchronously, but an access token already issued to a
-// downstream client stays valid until it expires — at most the 10-minute
-// access-token TTL. There is no revocation epoch and no per-request status re-read
-// yet, so callers must not assume instantaneous cutoff across the ecosystem.
+// Live token/session validation enforces the account auth version after deletion.
+// Already admitted requests are not retroactively cancelled; downstream callers
+// must perform the documented live validation rather than signature-only checks.
 func (s *Server) handlePrivacyRequestDeletion() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.webauthnSessionUser(w, r)

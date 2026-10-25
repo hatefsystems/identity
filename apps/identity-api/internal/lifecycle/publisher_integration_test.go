@@ -22,6 +22,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	identityv1 "github.com/hatefsystems/identity/libs/schemas/gen/go/hatef/identity/v1"
 )
 
@@ -188,6 +189,61 @@ func TestLifecycleCommittedFourSubjectBroadcastIntegration(t *testing.T) {
 	}
 	if n := lifecycleCount(t, f, "SELECT COUNT(*) FROM event_outbox WHERE published_at IS NOT NULL AND attempts=1"); n != 4 {
 		t.Fatalf("acknowledged delivery bookkeeping count=%d", n)
+	}
+}
+
+func TestLifecycleMixedV1V2AndLegacyBroadcastIntegration(t *testing.T) {
+	f := newLifecycleDatabase(t)
+	b := newLifecycleBroker(f.ctx, t, 1024*1024)
+	u := lifecycleCreate(t, f)
+	svc, err := profile.New(f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := svc.Update(f.ctx, u.ID, u.AuthVersion, "Private shared name", "1"); err != nil || result.Profile.LifecycleRevision != "2" {
+		t.Fatalf("profile event transaction failed: %v", err)
+	}
+	lifecycleChange(t, f, u.ID, "suspended")
+	legacyUser, legacyEvent := uuid.New(), uuid.New()
+	lifecycleExec(t, f, `INSERT INTO event_outbox(id,subject,payload) VALUES ($1,$2,$3)`, legacyEvent, lifecycle.SubjectDeleted, `{"user_id":"`+legacyUser.String()+`"}`)
+	publisher := lifecyclePublisher(t, f.pool, b.js, b.opts.Name, 10)
+	lifecycleRun(f.ctx, t, publisher, 2)
+	lifecycleRun(f.ctx, t, publisher, 1)
+	lifecycleRun(f.ctx, t, publisher, 1)
+	lifecycleRun(f.ctx, t, publisher, 0)
+	consumer := lifecycleConsumer(f.ctx, t, b.stream, "mixed_replay")
+	events := lifecycleReceive(f.ctx, t, consumer, 4)
+	var revisions []uint64
+	var named *identityv1.UserLifecycleEvent
+	for _, event := range events {
+		if event.UserId == legacyUser.String() {
+			if event.SchemaVersion != 1 || event.Revision != nil || event.EventType != lifecycle.SubjectDeleted || event.EventId != legacyEvent.String() {
+				t.Fatal("legacy replay invented v2 or a revision")
+			}
+			continue
+		}
+		revisions = append(revisions, event.GetRevision())
+		if event.GetRevision() == 2 {
+			named = event
+			if event.SchemaVersion != 2 || event.EventType != lifecycle.SubjectUpdated || len(event.ChangedFields) != 1 || event.ChangedFields[0] != "display_name" {
+				t.Fatal("profile publication lost v2 changed-fields metadata")
+			}
+		} else if event.SchemaVersion != 1 {
+			t.Fatal("existing creation/suspension producer changed schema version")
+		}
+		if bytes.Contains(contractPayload(t, event), []byte("Private shared name")) || bytes.Contains(contractPayload(t, event), []byte(u.Email)) {
+			t.Fatal("profile/contact value entered durable broadcast")
+		}
+	}
+	if named == nil || len(revisions) != 3 || revisions[0] != 1 || revisions[1] != 2 || revisions[2] != 3 {
+		t.Fatal("mixed-version outbox publication lost per-account order")
+	}
+	// Independent late readers must be able to replay identical v1/v2/legacy rows.
+	late := lifecycleConsumer(f.ctx, t, b.stream, "late_mixed_replay")
+	for i, event := range lifecycleReceive(f.ctx, t, late, 4) {
+		if !proto.Equal(event, events[i]) {
+			t.Fatal("late mixed-version replay changed persisted metadata")
+		}
 	}
 }
 

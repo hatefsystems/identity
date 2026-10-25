@@ -25,6 +25,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 )
 
 // testNow is the fixed instant the ceremony fixtures start from, so challenge
@@ -175,6 +176,7 @@ type fakeCredentialStore struct {
 	lockAllErr error
 	// deleteErr fails DeleteWebauthnCredential.
 	deleteErr error
+	renameErr error
 	// deleteAffected overrides the rows-affected result of a deletion when
 	// non-nil (0 means the row vanished between the lock and the delete).
 	deleteAffected *int64
@@ -209,6 +211,7 @@ func (f *fakeCredentialStore) CreateWebauthnCredential(_ context.Context, arg db
 		BackupEligible:  arg.BackupEligible,
 		BackupState:     arg.BackupState,
 		Aaguid:          arg.Aaguid,
+		Name:            arg.Name,
 		CreatedAt:       pgtype.Timestamptz{Time: testNow, Valid: true},
 	}
 	if f.byUser == nil {
@@ -281,6 +284,22 @@ func (f *fakeCredentialStore) DeleteWebauthnCredential(_ context.Context, arg db
 		}
 	}
 	return 0, nil
+}
+
+func (f *fakeCredentialStore) RenameWebauthnCredential(_ context.Context, arg db.RenameWebauthnCredentialParams) (db.WebauthnCredential, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.renameErr != nil {
+		return db.WebauthnCredential{}, f.renameErr
+	}
+	for i, row := range f.byUser[arg.UserID] {
+		if bytes.Equal(row.ID, arg.ID) {
+			row.Name = arg.Name
+			f.byUser[arg.UserID][i] = row
+			return row, nil
+		}
+	}
+	return db.WebauthnCredential{}, pgx.ErrNoRows
 }
 
 func (f *fakeCredentialStore) UpdateWebauthnSignCount(_ context.Context, arg db.UpdateWebauthnSignCountParams) (int64, error) {
@@ -654,7 +673,11 @@ func (f *ceremonyFixture) setStatus(t *testing.T, status string) {
 func (f *ceremonyFixture) advance(d time.Duration) { *f.clock = f.clock.Add(d) }
 
 // ctx is a convenience for the many single-use contexts below.
-func (f *ceremonyFixture) ctx() context.Context { return context.Background() }
+func (f *ceremonyFixture) ctx() context.Context {
+	return dpop.WithProof(context.Background(), &dpop.Proof{JKT: testBrowserJKT})
+}
+
+const testBrowserJKT = "test-browser-dpop-thumbprint"
 
 // handle returns the user's currently persisted WebAuthn user handle.
 func (f *ceremonyFixture) handle(t *testing.T) []byte {
@@ -666,7 +689,7 @@ func (f *ceremonyFixture) handle(t *testing.T) []byte {
 func (f *ceremonyFixture) register(t *testing.T, auth *softAuthenticator) db.WebauthnCredential {
 	t.Helper()
 
-	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session")
+	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -747,7 +770,7 @@ func TestRegistrationThenLoginHappyPath(t *testing.T) {
 func TestBeginRegistrationOptions(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -801,12 +824,14 @@ func TestBeginRegistrationOptions(t *testing.T) {
 func TestBeginRegistrationStoresChallenge(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
 
-	pending, err := fx.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := fx.challenges.Take(fx.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowRegistration}, UserRef: fx.user.ID, SessionID: "test-session", DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("challenge was not stored under its own value: %v", err)
 	}
@@ -823,7 +848,7 @@ func TestBeginRegistrationStoresChallenge(t *testing.T) {
 
 func TestFinishRegistrationForeignSessionCannotBurnChallenge(t *testing.T) {
 	fx := newFixture(t)
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "session-a")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "session-a", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -892,7 +917,7 @@ func TestRecoveryRegistrationCreatesReplacementUsableForFreshLogin(t *testing.T)
 func TestBeginRegistrationDoesNotPersistHandle(t *testing.T) {
 	fx := newFixture(t)
 
-	if _, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session"); err != nil {
+	if _, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", ""); err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
 	if got := fx.handle(t); len(got) != 0 {
@@ -906,7 +931,7 @@ func TestBeginRegistrationDoesNotPersistHandle(t *testing.T) {
 func TestBeginRegistrationUnknownUser(t *testing.T) {
 	fx := newFixture(t)
 
-	if _, err := fx.svc.BeginRegistration(fx.ctx(), uuid.New(), "test-session"); !errors.Is(err, ErrUserNotFound) {
+	if _, err := fx.svc.BeginRegistration(fx.ctx(), uuid.New(), "test-session", ""); !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("error = %v, want ErrUserNotFound", err)
 	}
 }
@@ -918,7 +943,7 @@ func TestBeginRegistrationWrapsStoreFailures(t *testing.T) {
 		fx := newFixture(t)
 		fx.users.getByIDErr = errBoom
 
-		_, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+		_, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 		if !errors.Is(err, errBoom) {
 			t.Fatalf("error = %v, want it to wrap errBoom", err)
 		}
@@ -934,7 +959,7 @@ func TestBeginRegistrationWrapsStoreFailures(t *testing.T) {
 		fx := newFixture(t)
 		fx.creds.listErr = errBoom
 
-		_, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+		_, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 		if !errors.Is(err, errBoom) {
 			t.Fatalf("error = %v, want it to wrap errBoom", err)
 		}
@@ -951,7 +976,7 @@ func TestBeginRegistrationExcludesRegisteredCredentials(t *testing.T) {
 	fx := newFixture(t)
 	fx.register(t, fx.auth)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -970,11 +995,13 @@ func TestBeginRegistrationReusesPersistedHandle(t *testing.T) {
 	fx.register(t, fx.auth)
 	first := fx.handle(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
-	pending, err := fx.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := fx.challenges.Take(fx.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowRegistration}, UserRef: fx.user.ID, SessionID: "test-session", DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("Take: %v", err)
 	}
@@ -1012,7 +1039,7 @@ func TestFinishRegistrationForeignChallenge(t *testing.T) {
 	fx.users.byID[victim.ID] = victim
 	fx.users.byEmail[victim.Email] = victim.ID
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), victim.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), victim.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1031,7 +1058,7 @@ func TestFinishRegistrationForeignChallenge(t *testing.T) {
 func TestFinishRegistrationChallengeIsSingleUse(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1051,7 +1078,7 @@ func TestFinishRegistrationChallengeIsSingleUse(t *testing.T) {
 func TestFinishRegistrationExpiredChallenge(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1085,7 +1112,7 @@ func TestFinishRegistrationRejectsForgedCeremony(t *testing.T) {
 			fx := newFixture(t)
 			tc.mutate(fx.auth)
 
-			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 			if err != nil {
 				t.Fatalf("BeginRegistration: %v", err)
 			}
@@ -1137,7 +1164,7 @@ func TestFinishRegistrationConcurrentHandleWrite(t *testing.T) {
 	var none int64
 	fx.users.setHandleAffected = &none
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1178,7 +1205,7 @@ func TestFinishRegistrationWrapsStoreFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFixture(t)
 
-			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 			if err != nil {
 				t.Fatalf("BeginRegistration: %v", err)
 			}
@@ -1226,7 +1253,9 @@ func TestBeginLoginOptions(t *testing.T) {
 		t.Errorf("challenge = %d bytes, want at least 16", len(options.Response.Challenge))
 	}
 
-	pending, err := fx.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := fx.challenges.Take(fx.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowLoginNamed}, DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("challenge was not stored: %v", err)
 	}
@@ -1306,7 +1335,9 @@ func TestBeginLoginAnswersUnusableAccountsWithMock(t *testing.T) {
 				t.Errorf("decoy credential id = %d bytes, want %d", got, mockCredentialIDLen)
 			}
 
-			pending, err := fx.challenges.Take(challengeOf(options.Response.Challenge))
+			pending, err := fx.challenges.Take(fx.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+				Flows: []Flow{FlowLoginMock}, DPoPJKT: testBrowserJKT,
+			})
 			if err != nil {
 				t.Fatalf("mock challenge was not stored: %v", err)
 			}
@@ -1885,7 +1916,9 @@ func TestBeginDiscoverableLoginOptions(t *testing.T) {
 		t.Errorf("challenge = %d bytes, want at least 16", len(options.Response.Challenge))
 	}
 
-	pending, err := fx.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := fx.challenges.Take(fx.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowLoginDiscoverable}, DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("challenge was not stored: %v", err)
 	}
@@ -2091,7 +2124,7 @@ func TestFinishLoginRejectsRegistrationChallenge(t *testing.T) {
 	fx.auth.signCount = 1
 
 	// A registration challenge, submitted to the login verifier.
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -2133,7 +2166,7 @@ func TestFinishRegistrationRejectsLoginChallenge(t *testing.T) {
 func TestBeginRegistrationRequestsDiscoverableCredential(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session")
+	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -2165,7 +2198,7 @@ func TestBeginRegistrationHonoursResidentKeyConfig(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	options, err := svc.BeginRegistration(context.Background(), userID, "test-session")
+	options, err := svc.BeginRegistration(context.Background(), userID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}

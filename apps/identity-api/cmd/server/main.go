@@ -32,6 +32,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
@@ -65,6 +66,14 @@ func run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
+	webAuthnCfg, err := config.LoadWebAuthn(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	cfg.PortalOrigin, err = config.LoadPortal(cfg.Environment, oidcCfg.Issuer, webAuthnCfg.RPOrigins)
+	if err != nil {
+		return err
+	}
 
 	keyManager, err := buildKeyManager(oidcCfg, cfg.Environment, logger)
 	if err != nil {
@@ -76,7 +85,14 @@ func run(logger *slog.Logger) (runErr error) {
 		return err
 	}
 
-	webauthnService, pool, err := buildWebAuthnService(cfg.Environment, logger)
+	redisClient, err := buildRedisClient(cfg.Environment, logger)
+	if err != nil {
+		return err
+	}
+	if redisClient != nil {
+		defer func() { _ = redisClient.Close() }()
+	}
+	webauthnService, pool, err := buildWebAuthnService(cfg.Environment, webAuthnCfg, redisClient, logger)
 	if err != nil {
 		return err
 	}
@@ -84,15 +100,13 @@ func run(logger *slog.Logger) (runErr error) {
 		defer pool.Close()
 	}
 	var accounts session.AccountState
+	var profileService *profile.Service
 	if pool != nil {
 		accounts = session.NewDBAccountState(pool)
-	}
-	redisClient, err := buildRedisClient(cfg.Environment, logger)
-	if err != nil {
-		return err
-	}
-	if redisClient != nil {
-		defer func() { _ = redisClient.Close() }()
+		profileService, err = profile.New(pool)
+		if err != nil {
+			return err
+		}
 	}
 	if cfg.GRPC.Enabled && (pool == nil || redisClient == nil) {
 		return errors.New("main: enabled gRPC requires DATABASE_URL and REDIS_URL")
@@ -122,6 +136,13 @@ func run(logger *slog.Logger) (runErr error) {
 	dpopValidator, err := buildDPoPValidator(redisClient)
 	if err != nil {
 		return err
+	}
+	var webAuthnLimiter ratelimit.Limiter
+	if redisClient != nil {
+		webAuthnLimiter, err = ratelimit.NewRedisLimiter(redisClient)
+		if err != nil {
+			return err
+		}
 	}
 
 	// The SMS OTP service shares the WebAuthn database pool (it persists the
@@ -235,28 +256,30 @@ func run(logger *slog.Logger) (runErr error) {
 		AdminRevoke: func(ctx context.Context, userID string) error {
 			return errors.Join(sessionManager.RevokeAllForUser(ctx, userID), refreshTokenStore.RevokeAllForUser(ctx, userID))
 		},
-		GRPCReady:      grpcReady,
-		AdminStore:     adminDeps.AdminStore,
-		LedgerProofDB:  pool,
-		RBAC:           adminDeps.RBAC,
-		LegalHold:      adminDeps.LegalHold,
-		LegalWorkflow:  adminDeps.LegalWorkflow,
-		LegalReports:   adminDeps.LegalReports,
-		AdminLimiter:   adminDeps.AdminLimiter,
-		OIDC:           oidcCfg,
-		Keys:           keyManager,
-		Clients:        clientRegistry,
-		TokenService:   tokenService,
-		DPoPValidator:  dpopValidator,
-		SessionManager: sessionManager,
-		WebAuthn:       webauthnService,
-		MFA:            mfaService,
-		SMSOTP:         smsotpService,
-		Recovery:       recoveryService,
-		RecoveryFlow:   recoveryFlow,
-		StepUp:         stepupService,
-		Privacy:        privacyService,
-		AuditRecorder:  auditRecorder,
+		GRPCReady:       grpcReady,
+		AdminStore:      adminDeps.AdminStore,
+		LedgerProofDB:   pool,
+		RBAC:            adminDeps.RBAC,
+		LegalHold:       adminDeps.LegalHold,
+		LegalWorkflow:   adminDeps.LegalWorkflow,
+		LegalReports:    adminDeps.LegalReports,
+		AdminLimiter:    adminDeps.AdminLimiter,
+		OIDC:            oidcCfg,
+		Keys:            keyManager,
+		Clients:         clientRegistry,
+		TokenService:    tokenService,
+		DPoPValidator:   dpopValidator,
+		SessionManager:  sessionManager,
+		Profile:         profileService,
+		WebAuthn:        webauthnService,
+		WebAuthnLimiter: webAuthnLimiter,
+		MFA:             mfaService,
+		SMSOTP:          smsotpService,
+		Recovery:        recoveryService,
+		RecoveryFlow:    recoveryFlow,
+		StepUp:          stepupService,
+		Privacy:         privacyService,
+		AuditRecorder:   auditRecorder,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -491,11 +514,8 @@ const dbConnectTimeout = 10 * time.Second
 
 // buildWebAuthnService assembles the passkey ceremony service: the Relying Party
 // identity from the environment, the sqlc-generated queries as the user and
-// credential stores, and the in-memory challenge store (the MVP backing; it sits
-// behind the webauthn.ChallengeStore interface so a Redis-backed store — key
-// webauthn:challenge:{challenge} with the ceremony TTL per
-// docs/data-architecture.md §3.1 — can replace it cluster-wide without touching
-// the service).
+// credential stores, and shared Redis ceremony state. Memory state is limited
+// to isolated development without Redis; a Redis fault never falls back to it.
 //
 // Unlike the other subsystems this one needs durable storage: credentials and
 // the anonymised user handle live in PostgreSQL. When DATABASE_URL is unset the
@@ -507,7 +527,7 @@ const dbConnectTimeout = 10 * time.Second
 //
 // It returns the pool alongside the service so the caller owns its lifetime and
 // can close it on shutdown.
-func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Service, *pgxpool.Pool, error) {
+func buildWebAuthnService(environment string, wc config.WebAuthnConfig, redisClient *redis.Client, logger *slog.Logger) (*webauthn.Service, *pgxpool.Pool, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		if environment != "development" {
@@ -517,9 +537,15 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 		return nil, nil, nil
 	}
 
-	wc, err := config.LoadWebAuthn(environment)
-	if err != nil {
-		return nil, nil, err
+	var challenges webauthn.ChallengeStore = webauthn.NewMemoryChallengeStore()
+	if redisClient != nil {
+		shared, err := webauthn.NewRedisChallengeStore(redisClient)
+		if err != nil {
+			return nil, nil, err
+		}
+		challenges = shared
+	} else if environment != "development" {
+		return nil, nil, errors.New("main: shared Redis WebAuthn challenges are required outside development")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbConnectTimeout)
@@ -547,7 +573,7 @@ func buildWebAuthnService(environment string, logger *slog.Logger) (*webauthn.Se
 		ResidentKey:      wc.ResidentKey,
 		MockChallengeKey: wc.MockChallengeKey,
 		NamedLoginFloor:  wc.NamedLoginFloor,
-	}, queries, queries, webauthn.NewMemoryChallengeStore(), webauthn.WithTransacter(pool))
+	}, queries, queries, challenges, webauthn.WithTransacter(pool))
 
 	if err != nil {
 		pool.Close()

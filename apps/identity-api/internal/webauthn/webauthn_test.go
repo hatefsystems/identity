@@ -97,12 +97,17 @@ func TestNewFailsFast(t *testing.T) {
 		{
 			name:       "zero TTL",
 			mutate:     func(c *Config) { c.ChallengeTTL = 0 },
-			wantSubstr: "challenge TTL must be positive",
+			wantSubstr: "challenge TTL must be between",
 		},
 		{
 			name:       "negative TTL",
 			mutate:     func(c *Config) { c.ChallengeTTL = -time.Second },
-			wantSubstr: "challenge TTL must be positive",
+			wantSubstr: "challenge TTL must be between",
+		},
+		{
+			name:       "oversized TTL",
+			mutate:     func(c *Config) { c.ChallengeTTL = MaxChallengeTTL + time.Millisecond },
+			wantSubstr: "challenge TTL must be between",
 		},
 		{
 			// Without a key the decoys are computable by anyone, so the mock

@@ -75,7 +75,9 @@ func TestBeginReclaimAssertionTagsAndBindsTheChallenge(t *testing.T) {
 		t.Fatalf("BeginReclaimAssertion: %v", err)
 	}
 
-	pending, err := f.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := f.challenges.Take(f.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowReclaim}, UserRef: f.user.ID, SessionID: testRequestID, DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("Take: %v", err)
 	}
@@ -126,7 +128,7 @@ func TestBeginReclaimAssertionRejectsUnknownAccountAndEmptyRequestID(t *testing.
 		t.Errorf("BeginReclaimAssertion for an unknown account = %v, want ErrUserNotFound", err)
 	}
 	// An empty binding would make the challenge completable by anyone holding it,
-	// since TakeBound treats an empty session id as no binding at all.
+	// so both ceremony endpoints reject an empty request ID.
 	if _, err := f.svc.BeginReclaimAssertion(f.ctx(), f.user.ID, ""); err == nil {
 		t.Error("BeginReclaimAssertion with an empty request id = nil error, want error")
 	}
@@ -372,7 +374,7 @@ func TestOtherChallengesCannotSatisfyReclaim(t *testing.T) {
 			name: "registration challenge",
 			begin: func(t *testing.T, f *ceremonyFixture) (string, error) {
 				f.setStatus(t, "active")
-				options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, testRequestID)
+				options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, testRequestID, "")
 				if err != nil {
 					return "", err
 				}

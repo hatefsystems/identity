@@ -1,6 +1,9 @@
 package webauthn
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,8 +96,8 @@ func (f Flow) String() string {
 type PendingChallenge struct {
 	// Named ceremonies pin a version; usernameless ceremonies pin a global
 	// epoch so a ban/reactivation during the challenge cannot be overlooked.
-	AuthVersion int64
-	AuthEpoch   int64
+	AuthVersion int64 `json:"auth_version,string"`
+	AuthEpoch   int64 `json:"auth_epoch,string"`
 	// Session is the go-webauthn SessionData produced by BeginRegistration /
 	// BeginLogin and required verbatim by CreateCredential / ValidateLogin.
 	Session gowebauthn.SessionData
@@ -105,6 +108,11 @@ type PendingChallenge struct {
 	// SessionID binds authenticated ceremonies to the exact server-side
 	// session that started them. Login ceremonies leave it empty.
 	SessionID string
+	// DPoPJKT is the verified browser key at ceremony start. It is mandatory
+	// for login and checked before consuming state, never taken from the body.
+	DPoPJKT string
+	// Name is frozen at ordinary registration start, not supplied at verification.
+	Name string
 	// Flow records which ceremony issued this challenge; the matching Finish
 	// step rejects any other value.
 	Flow Flow
@@ -118,25 +126,125 @@ type PendingChallenge struct {
 // Finish, which lets the verifier locate the matching SessionData without a
 // separate flow identifier in the request body.
 //
-// Following the pattern of session.Store, this is an interface with an
-// in-memory implementation for the single-node MVP; a Redis-backed store
-// (key webauthn:challenge:{challenge}, short TTL per
-// docs/data-architecture.md §3.1) can replace it later without touching the
-// service. Implementations must be safe for concurrent use and must consume a
-// challenge on read (Take) so it can be used at most once.
+// Implementations must atomically check the expected binding before consuming
+// state. A failed binding check must not burn another ceremony. Redis is the
+// production authority; memory storage is only for isolated tests/development.
 type ChallengeStore interface {
-	// Save stores pc under the given challenge string.
-	Save(challenge string, pc PendingChallenge) error
-	// Take atomically returns and removes the pending challenge for the given
-	// challenge string. It reports ErrChallengeNotFound when the challenge is
-	// unknown or already consumed, and ErrChallengeExpired when it existed but
-	// its TTL had lapsed (the entry is reclaimed either way).
-	Take(challenge string) (PendingChallenge, error)
-	// TakeBound checks the expected flow, user, and initiating session while
-	// holding the store lock, and consumes the challenge only on an exact
-	// match. A foreign-session probe therefore cannot burn the legitimate
-	// caller's pending ceremony.
-	TakeBound(challenge string, flow Flow, userID uuid.UUID, sessionID string) (PendingChallenge, error)
+	// Save rejects collisions with live challenges instead of replacing them.
+	Save(ctx context.Context, challenge string, pc PendingChallenge) error
+	// Take has one winner for an exact binding match. Missing/expired state
+	// requires a new ceremony; dependency failures never fall back locally.
+	Take(ctx context.Context, challenge string, binding ChallengeBinding) (PendingChallenge, error)
+}
+
+// ChallengeBinding describes the authority of the completing request. Only the
+// login endpoint accepts multiple flows: the identity is then challenge-owned
+// (named login) or signature-resolved (discoverable), not caller-selected.
+// Every other flow requires an exact account and session/deletion-request ID.
+type ChallengeBinding struct {
+	Flows     []Flow
+	UserRef   uuid.UUID
+	SessionID string
+	DPoPJKT   string
+}
+
+// MaxChallengeTTL is the configured ceremony lifetime ceiling.
+const (
+	MaxChallengeTTL          = 15 * time.Minute
+	maxChallengeBytes        = 64 << 10
+	maxChallengeKeyBytes     = 256
+	maxChallengeBindingBytes = 256
+)
+
+func isLoginFlow(flow Flow) bool {
+	return flow == FlowLoginNamed || flow == FlowLoginDiscoverable || flow == FlowLoginMock
+}
+
+func (b ChallengeBinding) validate() error {
+	if len(b.Flows) == 0 || len(b.Flows) > 3 {
+		return ErrChallengeFlowMismatch
+	}
+	login := isLoginFlow(b.Flows[0])
+	for _, flow := range b.Flows {
+		if flow > FlowReclaim || isLoginFlow(flow) != login || (!login && len(b.Flows) != 1) {
+			return ErrChallengeFlowMismatch
+		}
+	}
+	if len(b.SessionID) > maxChallengeBindingBytes || len(b.DPoPJKT) > maxChallengeBindingBytes {
+		return ErrChallengeNotFound
+	}
+	if login {
+		if b.UserRef != uuid.Nil || b.SessionID != "" || strings.TrimSpace(b.DPoPJKT) == "" {
+			return ErrChallengeNotFound
+		}
+	} else if b.UserRef == uuid.Nil || b.SessionID == "" {
+		return ErrChallengeNotFound
+	}
+	return nil
+}
+
+func (b ChallengeBinding) matches(pc PendingChallenge) error {
+	found := false
+	for _, flow := range b.Flows {
+		found = found || flow == pc.Flow
+	}
+	if !found {
+		return ErrChallengeFlowMismatch
+	}
+	if (!isLoginFlow(pc.Flow) && pc.UserRef != b.UserRef) || pc.SessionID != b.SessionID || pc.DPoPJKT != b.DPoPJKT {
+		return ErrChallengeNotFound
+	}
+	return nil
+}
+
+func validatePendingChallenge(challenge string, pc PendingChallenge) error {
+	if challenge == "" || len(challenge) > maxChallengeKeyBytes || pc.Session.Challenge != challenge || pc.Flow > FlowReclaim ||
+		pc.Expires.IsZero() || pc.AuthVersion < 0 || pc.AuthEpoch < 0 ||
+		len(pc.SessionID) > maxChallengeBindingBytes || len(pc.DPoPJKT) > maxChallengeBindingBytes || len(pc.Name) > 320 {
+		return ErrInvalidChallenge
+	}
+	if isLoginFlow(pc.Flow) {
+		if pc.SessionID != "" || strings.TrimSpace(pc.DPoPJKT) == "" ||
+			(pc.Flow == FlowLoginNamed && pc.UserRef == uuid.Nil) ||
+			(pc.Flow != FlowLoginNamed && pc.UserRef != uuid.Nil) {
+			return ErrInvalidChallenge
+		}
+	} else if pc.UserRef == uuid.Nil || pc.SessionID == "" {
+		return ErrInvalidChallenge
+	}
+	if pc.Flow != FlowRegistration && pc.Name != "" {
+		return ErrInvalidChallenge
+	}
+	return nil
+}
+
+func encodePendingChallenge(challenge string, pc PendingChallenge, now time.Time) ([]byte, time.Duration, error) {
+	if err := validatePendingChallenge(challenge, pc); err != nil {
+		return nil, 0, err
+	}
+	ttl := pc.Expires.Sub(now)
+	if ttl < time.Millisecond {
+		return nil, 0, ErrChallengeExpired
+	}
+	if ttl > MaxChallengeTTL {
+		return nil, 0, ErrInvalidChallenge
+	}
+	data, err := json.Marshal(pc)
+	if err != nil || len(data) > maxChallengeBytes {
+		return nil, 0, ErrInvalidChallenge
+	}
+	return data, ttl, nil
+}
+
+func decodePendingChallenge(challenge string, data []byte) (PendingChallenge, error) {
+	var pc PendingChallenge
+	if len(data) == 0 || len(data) > maxChallengeBytes || json.Unmarshal(data, &pc) != nil {
+		return PendingChallenge{}, ErrChallengeStoreUnavailable
+	}
+	if validatePendingChallenge(challenge, pc) != nil {
+		return PendingChallenge{}, ErrChallengeStoreUnavailable
+	}
+	return pc, nil
 }
 
 // defaultMaxPendingChallenges bounds how many ceremonies the in-memory store
@@ -178,14 +286,34 @@ func NewMemoryChallengeStore() *MemoryChallengeStore {
 // entries whose TTL has already lapsed — usually enough, since challenges are
 // short-lived — and only if that frees nothing does it evict the entry closest
 // to expiring.
-func (m *MemoryChallengeStore) Save(challenge string, pc PendingChallenge) error {
+func (m *MemoryChallengeStore) Save(ctx context.Context, challenge string, pc PendingChallenge) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	data, _, err := encodePendingChallenge(challenge, pc, m.now())
+	if err != nil {
+		return err
+	}
+	// Detach slices/maps just as Redis serialization does. Callers cannot mutate
+	// a pending flow or its allowed credentials after a successful Save.
+	pc, err = decodePendingChallenge(challenge, data)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if previous, exists := m.byChallenge[challenge]; exists {
+		if m.now().Before(previous.Expires) {
+			return ErrChallengeConflict
+		}
+		delete(m.byChallenge, challenge)
+	}
 
 	if m.maxEntries > 0 && len(m.byChallenge) >= m.maxEntries {
-		if _, replacing := m.byChallenge[challenge]; !replacing {
-			m.evictLocked()
-		}
+		m.evictLocked()
 	}
 
 	m.byChallenge[challenge] = pc
@@ -198,7 +326,7 @@ func (m *MemoryChallengeStore) evictLocked() {
 
 	swept := false
 	for key, entry := range m.byChallenge {
-		if now.After(entry.Expires) {
+		if !now.Before(entry.Expires) {
 			delete(m.byChallenge, key)
 			swept = true
 		}
@@ -225,41 +353,30 @@ func (m *MemoryChallengeStore) evictLocked() {
 	}
 }
 
-// Take implements ChallengeStore. It removes the entry on every path (hit,
-// miss-after-expiry) so a challenge is single-use and lapsed entries are
-// reclaimed, mirroring Redis TTL + GETDEL semantics.
-func (m *MemoryChallengeStore) Take(challenge string) (PendingChallenge, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	pc, ok := m.byChallenge[challenge]
-	if !ok {
-		return PendingChallenge{}, ErrChallengeNotFound
-	}
-	delete(m.byChallenge, challenge)
-	if m.now().After(pc.Expires) {
-		return PendingChallenge{}, ErrChallengeExpired
-	}
-	return pc, nil
-}
-
-// TakeBound implements ChallengeStore. Binding mismatches intentionally leave
+// Take implements ChallengeStore. Binding mismatches intentionally leave
 // the challenge live; expiry is still terminal and reclaims the entry.
-func (m *MemoryChallengeStore) TakeBound(challenge string, flow Flow, userID uuid.UUID, sessionID string) (PendingChallenge, error) {
+func (m *MemoryChallengeStore) Take(ctx context.Context, challenge string, binding ChallengeBinding) (PendingChallenge, error) {
+	if err := ctx.Err(); err != nil {
+		return PendingChallenge{}, err
+	}
+	if err := binding.validate(); err != nil {
+		return PendingChallenge{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return PendingChallenge{}, err
+	}
 	pc, ok := m.byChallenge[challenge]
 	if !ok {
 		return PendingChallenge{}, ErrChallengeNotFound
 	}
-	if m.now().After(pc.Expires) {
+	if !m.now().Before(pc.Expires) {
 		delete(m.byChallenge, challenge)
 		return PendingChallenge{}, ErrChallengeExpired
 	}
-	if pc.Flow != flow {
-		return PendingChallenge{}, ErrChallengeFlowMismatch
-	}
-	if pc.UserRef != userID || sessionID == "" || pc.SessionID == "" || pc.SessionID != sessionID {
-		return PendingChallenge{}, ErrChallengeNotFound
+	if err := binding.matches(pc); err != nil {
+		return PendingChallenge{}, err
 	}
 	delete(m.byChallenge, challenge)
 	return pc, nil

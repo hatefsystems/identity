@@ -2,7 +2,6 @@ package webauthn
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -46,7 +45,9 @@ func TestBeginStepUpTagsTheChallengeAsStepUp(t *testing.T) {
 		t.Fatalf("BeginStepUp: %v", err)
 	}
 
-	pending, err := f.challenges.Take(challengeOf(options.Response.Challenge))
+	pending, err := f.challenges.Take(f.ctx(), challengeOf(options.Response.Challenge), ChallengeBinding{
+		Flows: []Flow{FlowStepUp}, UserRef: f.user.ID, SessionID: "test-session", DPoPJKT: testBrowserJKT,
+	})
 	if err != nil {
 		t.Fatalf("Take: %v", err)
 	}
@@ -369,7 +370,7 @@ func TestRegistrationChallengeCannotSatisfyStepUp(t *testing.T) {
 	f := newFixture(t)
 	f.register(t, f.auth)
 
-	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session")
+	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -566,5 +567,5 @@ func (f *ceremonyFixture) stepUp(t *testing.T, auth *softAuthenticator, presence
 	if presenceOnly {
 		body = auth.assertionPresenceOnly(challenge, handle)
 	}
-	return f.svc.FinishStepUp(context.Background(), f.user.ID, "test-session", body)
+	return f.svc.FinishStepUp(f.ctx(), f.user.ID, "test-session", body)
 }

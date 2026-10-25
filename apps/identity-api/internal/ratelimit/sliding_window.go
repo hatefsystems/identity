@@ -55,7 +55,6 @@ end`
 type scriptRunner interface {
 	EvalSha(ctx context.Context, sha1 string, keys []string, args ...any) *redis.Cmd
 	Eval(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd
-	ScriptLoad(ctx context.Context, script string) *redis.StringCmd
 }
 
 // RedisLimiter is a sliding-window Limiter backed by a Redis sorted set per key,
@@ -75,10 +74,12 @@ func NewRedisLimiter(client *redis.Client) (*RedisLimiter, error) {
 	if client == nil {
 		return nil, errors.New("ratelimit: redis client is required")
 	}
-	l := &RedisLimiter{client: client, now: time.Now}
-	if sha, err := client.ScriptLoad(context.Background(), slidingWindowLua).Result(); err == nil {
-		l.sha = sha
-	}
+	// The script digest depends only on its source, not Redis's cache lifetime.
+	// Keep it immutable so concurrent NOSCRIPT recovery cannot race on l.sha.
+	l := &RedisLimiter{client: client, sha: redis.NewScript(slidingWindowLua).Hash(), now: time.Now}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = client.ScriptLoad(ctx, slidingWindowLua).Err()
 	return l, nil
 }
 
@@ -118,7 +119,7 @@ func (l *RedisLimiter) Allow(ctx context.Context, key string, limit int, window 
 }
 
 // eval runs the script via EVALSHA and falls back to EVAL (reloading the script)
-// when the server reports NOSCRIPT, caching the returned SHA for next time.
+// when the server reports NOSCRIPT. EVAL itself restores the server-side cache.
 func (l *RedisLimiter) eval(ctx context.Context, key string, args []any) (any, error) {
 	keys := []string{key}
 
@@ -136,10 +137,6 @@ func (l *RedisLimiter) eval(ctx context.Context, key string, args []any) (any, e
 	res, err := l.client.Eval(ctx, slidingWindowLua, keys, args...).Result()
 	if err != nil {
 		return nil, err
-	}
-	// Best-effort refresh of the cached SHA for subsequent EVALSHA calls.
-	if sha, loadErr := l.client.ScriptLoad(ctx, slidingWindowLua).Result(); loadErr == nil {
-		l.sha = sha
 	}
 	return res, nil
 }

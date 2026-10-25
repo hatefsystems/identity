@@ -28,9 +28,18 @@ func newPendingChallenge(challenge string, userRef uuid.UUID, expires time.Time)
 			RelyingPartyID: "localhost",
 			UserID:         []byte{1, 2, 3, 4, 5, 6, 7, 8},
 		},
-		UserRef: userRef,
-		Expires: expires,
+		UserRef:   userRef,
+		SessionID: "test-session",
+		Expires:   expires,
 	}
+}
+
+func bindingFor(pc PendingChallenge) ChallengeBinding {
+	binding := ChallengeBinding{Flows: []Flow{pc.Flow}, UserRef: pc.UserRef, SessionID: pc.SessionID, DPoPJKT: pc.DPoPJKT}
+	if isLoginFlow(pc.Flow) {
+		binding.UserRef = uuid.Nil
+	}
+	return binding
 }
 
 func TestMemoryChallengeStoreSaveTakeRoundTrip(t *testing.T) {
@@ -39,11 +48,11 @@ func TestMemoryChallengeStoreSaveTakeRoundTrip(t *testing.T) {
 
 	userRef := uuid.New()
 	want := newPendingChallenge("chal-round-trip", userRef, now.Add(5*time.Minute))
-	if err := store.Save(want.Session.Challenge, want); err != nil {
+	if err := store.Save(t.Context(), want.Session.Challenge, want); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	got, err := store.Take("chal-round-trip")
+	got, err := store.Take(t.Context(), "chal-round-trip", bindingFor(want))
 	if err != nil {
 		t.Fatalf("Take: %v", err)
 	}
@@ -71,14 +80,14 @@ func TestMemoryChallengeStoreTakeIsSingleUse(t *testing.T) {
 	store := newFixedChallengeStore(&now)
 
 	pc := newPendingChallenge("chal-once", uuid.New(), now.Add(time.Minute))
-	if err := store.Save(pc.Session.Challenge, pc); err != nil {
+	if err := store.Save(t.Context(), pc.Session.Challenge, pc); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	if _, err := store.Take("chal-once"); err != nil {
+	if _, err := store.Take(t.Context(), "chal-once", bindingFor(pc)); err != nil {
 		t.Fatalf("first Take: %v", err)
 	}
-	if _, err := store.Take("chal-once"); !errors.Is(err, ErrChallengeNotFound) {
+	if _, err := store.Take(t.Context(), "chal-once", bindingFor(pc)); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("second Take error = %v, want %v", err, ErrChallengeNotFound)
 	}
 }
@@ -86,7 +95,8 @@ func TestMemoryChallengeStoreTakeIsSingleUse(t *testing.T) {
 func TestMemoryChallengeStoreTakeUnknown(t *testing.T) {
 	store := NewMemoryChallengeStore()
 
-	if _, err := store.Take("never-issued"); !errors.Is(err, ErrChallengeNotFound) {
+	binding := ChallengeBinding{Flows: []Flow{FlowRegistration}, UserRef: uuid.New(), SessionID: "test-session"}
+	if _, err := store.Take(t.Context(), "never-issued", binding); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("Take error = %v, want %v", err, ErrChallengeNotFound)
 	}
 }
@@ -96,31 +106,22 @@ func TestMemoryChallengeStoreTakeExpired(t *testing.T) {
 	store := newFixedChallengeStore(&now)
 
 	pc := newPendingChallenge("chal-expired", uuid.New(), now.Add(5*time.Minute))
-	if err := store.Save(pc.Session.Challenge, pc); err != nil {
+	if err := store.Save(t.Context(), pc.Session.Challenge, pc); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// Exactly at the expiry instant the challenge is still valid (After is
-	// strict), one nanosecond later it is not.
+	// Native TTL semantics: validity ends at, not after, the expiry instant.
 	now = pc.Expires
-	if err := store.Save(pc.Session.Challenge, pc); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-	if _, err := store.Take("chal-expired"); err != nil {
-		t.Fatalf("Take at expiry instant: %v", err)
-	}
-
-	if err := store.Save(pc.Session.Challenge, pc); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-	now = pc.Expires.Add(time.Nanosecond)
-	if _, err := store.Take("chal-expired"); !errors.Is(err, ErrChallengeExpired) {
+	if _, err := store.Take(t.Context(), "chal-expired", bindingFor(pc)); !errors.Is(err, ErrChallengeExpired) {
 		t.Fatalf("Take after expiry error = %v, want %v", err, ErrChallengeExpired)
 	}
 
 	// The lapsed entry is reclaimed, so a retry reports it as unknown.
-	if _, err := store.Take("chal-expired"); !errors.Is(err, ErrChallengeNotFound) {
+	if _, err := store.Take(t.Context(), "chal-expired", bindingFor(pc)); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("Take after expiry sweep error = %v, want %v", err, ErrChallengeNotFound)
+	}
+	if err := store.Save(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrChallengeExpired) {
+		t.Fatalf("Save of already-expired state: %v", err)
 	}
 }
 
@@ -130,7 +131,7 @@ func TestMemoryChallengeStoreTakeExpired(t *testing.T) {
 func TestMemoryChallengeStoreTakeIsAtomic(t *testing.T) {
 	store := NewMemoryChallengeStore()
 	pc := newPendingChallenge("chal-race", uuid.New(), time.Now().Add(time.Minute))
-	if err := store.Save(pc.Session.Challenge, pc); err != nil {
+	if err := store.Save(t.Context(), pc.Session.Challenge, pc); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -144,7 +145,7 @@ func TestMemoryChallengeStoreTakeIsAtomic(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			if _, err := store.Take("chal-race"); err == nil {
+			if _, err := store.Take(t.Context(), "chal-race", bindingFor(pc)); err == nil {
 				mu.Lock()
 				winners++
 				mu.Unlock()
@@ -164,17 +165,19 @@ func TestMemoryChallengeStoreIsolatesChallenges(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	store := newFixedChallengeStore(&now)
 
+	user := uuid.New()
+	binding := ChallengeBinding{Flows: []Flow{FlowRegistration}, UserRef: user, SessionID: "test-session"}
 	for _, c := range []string{"a", "b", "c"} {
-		if err := store.Save(c, newPendingChallenge(c, uuid.New(), now.Add(time.Minute))); err != nil {
+		if err := store.Save(t.Context(), c, newPendingChallenge(c, user, now.Add(time.Minute))); err != nil {
 			t.Fatalf("Save(%q): %v", c, err)
 		}
 	}
 
-	if _, err := store.Take("b"); err != nil {
+	if _, err := store.Take(t.Context(), "b", binding); err != nil {
 		t.Fatalf("Take(b): %v", err)
 	}
 	for _, c := range []string{"a", "c"} {
-		if _, err := store.Take(c); err != nil {
+		if _, err := store.Take(t.Context(), c, binding); err != nil {
 			t.Errorf("Take(%q) after unrelated Take: %v", c, err)
 		}
 	}

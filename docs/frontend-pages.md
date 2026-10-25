@@ -10,10 +10,10 @@ The routing is logically divided using Next.js Route Groups (e.g., `(auth)`, `(d
 
 ## 1. Authentication & Public Pages: `(auth)`
 
-These pages are accessible to unauthenticated users and define the entry points into the ecosystem. Task 7.2 implements six **UI-only** screens; their production submission actions are deliberately disabled. Recovery and email-verification screens remain planned.
+These pages are accessible to unauthenticated users. Task 7.2 supplied six public screens; Task 7.3 connects only their passkey entry points to the Go API for existing accounts. Password/signup/reset submissions remain deliberately disabled. Recovery-login and email-verification screens remain planned.
 
 - `/login` : Passkey-first login screen with an email/password alternative and links to registration and password reset.
-- `/login/webauthn` : Dedicated usernameless passkey screen explaining hardware keys, device PINs, and platform biometrics. It does not start a WebAuthn ceremony yet.
+- `/login/webauthn` : Live discoverable-passkey sign-in, started only by the explicit "Use a passkey" button. The device chooses an existing account; the portal does not ask for an email first.
 - `/login/recovery` : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
 - `/register` : Email, new password, and password-confirmation form. Account creation is not connected.
 - `/verify-totp` : Neutral six-digit authenticator-code form. This is not an active login challenge, enrollment confirmation, or Step-up session.
@@ -21,14 +21,14 @@ These pages are accessible to unauthenticated users and define the entry points 
 - `/reset-password` : New-password and confirmation form, with invalid/expired-link presentations. Real reset-link validation and password changes are not connected.
 - `/verify-email` : Email verification landing page.
 
-### Task 7.2 UI Boundary
+### Public Form Boundary (Tasks 7.2 and 7.3)
 
 - The six screens use the existing shadcn components exported by `@hatef/ui`, an English shared auth layout, and application-local field/status compositions. The light default, system font, and existing dark tokens are preserved; Tailwind explicitly retains the `dark` class so production builds do not remove its palette variables. There is no new theme switcher or localization framework.
-- `apps/web/app/(auth)/_components/screens.tsx` is the client boundary. Its public screens supply **no submission handler**. Each form shows "This form is not connected yet. Do not enter real credentials." and renders its submission button disabled in the initial HTML. Navigation, password visibility, and local blur validation remain usable. POST semantics and guarded submit handlers prevent credentials from becoming URL query strings; disabled buttons also prevent native submission before hydration or with JavaScript disabled.
+- `apps/web/app/(auth)/_components/screens.tsx` retains disconnected password/signup/reset/TOTP forms. Those forms show "This form is not connected yet. Do not enter real credentials." and render their submit buttons disabled in initial HTML. Navigation, password visibility and local blur validation remain usable. Passkey entry uses `app/_components/passkey-login.tsx`: a native `type="button"`, disabled before hydration and with JavaScript off. It does not allocate keys, fetch options or call `navigator.credentials` merely on page load.
 - Loading, success, cancellation, unsupported-passkey, rate-limit, and reset-link presentations are exercised through test-only handlers/props on the underlying form components. No public fixture route, magic credential, query parameter, or environment flag can simulate authentication or reset delivery. Reset forms default to an unverified link state; tests must explicitly provide a ready state and a handler to enable submission.
-- Form values stay in component state, not URLs, cookies, browser storage, telemetry, or logs. The UI neither calls an API nor invokes `navigator.credentials`, manages a session, follows OAuth continuation parameters, or redirects to a dashboard. Generic reset acknowledgements and credential errors do not disclose account existence.
+- Inactive form values stay in component state, not URLs, cookies, storage, telemetry or logs. Passkey sign-in uses real browser adapters, checks the authenticated profile after verification and only then enters the portal. Return paths are restricted to the fixed dashboard route allowlist; arbitrary redirects and OAuth continuations are unsupported. No public fixture route, magic account or test environment flag simulates login success.
 - Fields have visible labels, stable help/error associations, appropriate autocomplete, keyboard-operable password toggles, and at least 44px control targets. Local errors appear on blur; a test-enabled invalid submission focuses the first invalid field. Submission feedback is announced, duplicate submissions are blocked, and successful completion clears form values. A single text input preserves leading zeroes in TOTP codes, accepts whole-code paste, and requires exactly six ASCII digits without silently normalizing whitespace or non-ASCII digits. It never auto-submits or offers to resend an authenticator code.
-- Password checks intentionally cover presence and, for new passwords, matching confirmation only. Passwords are not trimmed, paste is not blocked, and the UI does not invent a length/complexity policy or claim backend enforcement. Account signup, password login/reset, email verification, browser-session/DPoP integration, and authoritative password policy require separate implementation. Existing backend TOTP enrollment and Step-up endpoints must not be repurposed as public login verification.
+- Password checks intentionally cover presence and, for new passwords, matching confirmation only. Passwords are not trimmed, paste is not blocked, and the UI does not invent a length/complexity policy or claim backend enforcement. Account signup, password login/reset, email verification and authoritative password policy remain separate work. Existing backend TOTP enrollment and Step-up endpoints are not public login verification.
 - Auth HTML remains dynamically rendered and private/no-store under Task 7.1's strict nonce CSP. Styling uses classes and local resources only; the CSP, root rendering boundary, and deployment model are unchanged. Automated unit and production-browser checks cover these UI contracts, including both palettes, keyboard focus, contrast, narrow/short viewport reflow, native TOTP paste, and JavaScript-disabled submission safety. Desktop/mobile screenshots were visually inspected. Manual screen-reader review has not been performed; these checks are not a claim of full assistive-technology or WCAG certification.
 
 ---
@@ -42,26 +42,16 @@ These routes handle the OpenID Connect (OIDC) Authorization Code flow when third
 
 ---
 
-## 3. User Dashboard & Privacy Settings: `(dashboard)`
+## 3. User Portal: `/dashboard`
 
-Protected routes. Requires a valid user session. This is the central hub for users to manage their Hatef identity.
+Task 7.3 implements four routes under `app/dashboard/layout.tsx`. The server renders only a non-sensitive shell. Cookie presence is not authorization, and Next.js cannot produce the browser-held DPoP proof. Private content mounts only after the real Go bootstrap succeeds; no profile, grant or recovery batch appears in SSR/Flight HTML.
 
-- `/dashboard` : Overview page. Shows a summary of account status, recent logins, and security health.
-- `/dashboard/profile` : Manage personal information (Name, Avatar, Contact info).
-- `/dashboard/security` : The core security center.
-  - Change Password.
-  - Setup/Manage **Multi-Factor Authentication (TOTP)**. Starting setup requires a fresh Step-up grant. Keep the returned `enrollment_id` in memory and submit it with the code from the same authenticated session; completion does not request a second grant. There is no general-purpose `/auth/mfa/verify-code` endpoint for probing whether an enabled TOTP is valid.
-  - Setup/Manage **WebAuthn Passkeys** (Register new YubiKey or Laptop Fingerprint). Ordinary registration consumes a fresh Step-up grant when options are generated; attestation must finish in the same session and does not request a second grant. Deleting the final passkey returns `409 {"error":"last_credential"}` even when TOTP is enabled because passkeys are the current browser login credential.
-  - Setup/Manage **Backup Recovery Methods**:
-    - Add/Verify **Phone Number** (Used for SMS Password Reset and Anti-Abuse verification for Hatef Mail). Sending a code consumes a fresh Step-up grant and returns a `verification_id`; verification submits only that ID plus the code from the same session, without accepting a replacement phone value or another grant.
-    - Add/Verify **Alternative Email** (Backup email for password recovery).
-    - Generate/View **Recovery Codes** (Backup Codes) for emergency account access.
-  - Disabling TOTP returns `409 {"error":"last_factor"}` if no passkey remains. Treat both factor-removal conflicts as actionable security guidance rather than generic failures.
-- `/dashboard/sessions` : View active sessions across devices (e.g., "Windows PC - Chrome", "iPhone - Safari"). Includes a button to "Revoke Session" remotely.
-- `/dashboard/privacy` : GDPR & Data Privacy center.
-  - View privacy policy consents.
-  - Download account data archive (Data Portability).
-  - **Delete Account**: Triggers the "Right to be Forgotten" soft-delete process. Requires re-authentication (WebAuthn/MFA) to confirm.
+- `/dashboard`: Truthful profile, passkey/recovery status and session summaries. No fabricated login history, security score or device geography.
+- `/dashboard/profile`: Repeated display-name saves with read-only primary email/status. Names are optional, single-line Unicode text, at most 80 code points after trimming outer whitespace; control/line-separator characters are rejected. Empty clears the name. Exact decimal lifecycle revisions support optimistic concurrency without JS-number rounding. A conflict refresh preserves the unsaved draft.
+- `/dashboard/security`: List/add/name/rename/remove passkeys and inspect the remaining recovery-code count. Names are user labels, not verified hardware models. A fresh step-up grant is needed for adding, renaming, removing or generating codes. Ordinary registration consumes its grant at options generation, freezes the name, and completes with the same session without a second grant. Final-passkey removal is disabled in the UI and independently rejected by the API with `409 last_credential`.
+- `/dashboard/sessions`: List current/other server-side browser sessions using public IDs and the server's `current` flag. Show bounded, escaped reported user-agent/IP metadata without asserting a physical device or location. Confirm individual remote revocation or current-session sign-out. A disappeared target prompts a list refresh, not a conclusion about another account. There is no bulk-revocation control.
+
+Avatar uploads, password changes, email/phone/backup-contact changes, TOTP enrollment, recovery-login UI, OAuth consent, privacy/deletion/export UI, admin panels and localization remain out of scope. Existing TOTP may satisfy step-up when advertised. No unavailable privacy/admin link is presented as a working portal feature. Existing backend privacy/security routes retain their independent requirements.
 
 ---
 
@@ -83,33 +73,35 @@ Protected by strict RBAC. Accessible only to users with `Support`, `Moderator`, 
 
 ## Layout Structure Details
 
-- `app/layout.tsx`: Request-time root document for fresh CSP nonces. Theme/Auth Context providers and DPoP key initialization remain planned.
+- `app/layout.tsx`: Request-time root document for fresh CSP nonces. Public page loads do not initialize an authentication key or start a ceremony.
 - `app/(auth)/layout.tsx`: Shared brand link, main landmark, and fluid-width card layout. Minimum viewport height and normal vertical scrolling keep forms usable on narrow or short screens.
-- `app/(dashboard)/layout.tsx`: Includes the main authenticated navigation sidebar (Profile, Security, Privacy, Sessions) and a top header.
+- `app/dashboard/layout.tsx`: Non-sensitive portal shell with Overview/Profile/Security/Sessions navigation. Its application-local provider bootstraps browser authority, associates data with the returned session snapshot, cancels stale work and clears private views on invalidation, hide/pagehide, sign-out or detected expiry.
 - `app/(admin)/layout.tsx`: A distinct layout (often with different color schemes or warning banners) to clearly indicate to the user that they are in an elevated, sensitive environment.
 
 ---
 
 ## 5. Security Hardening & Session Isolation (Next.js & Browser Client)
 
-To maintain absolute client-side security and resist advanced threat vectors (such as XSS, session hijacking, or credential leakage), the Next.js frontend implements several high-performance defensive controls:
+The portal combines server-side authority, browser-held signing keys, strict CSP and bounded transient state. These controls reduce risk; they do not make same-origin XSS harmless or certify full browser-memory erasure.
 
 ### 5.1 Cookie-Based Session Protection
 
-- **`__Host-` Secure Cookies:** All session tokens are delivered from the Go IdP using the **`__Host-`** cookie prefix. The Next.js middleware and client are configured so that these cookies are strictly:
-  - Bound to the exact host domain (no subdomains).
-  - Encrypted in transit via forced HTTPS (`Secure` flag).
-  - Hidden from any JavaScript access (`HttpOnly` flag).
-  - Kept in strict local context (`SameSite=Strict` flag) to completely neutralize Cross-Site Request Forgery (CSRF).
+- Go issues host-only `__Host-` cookies with `Path=/`, `Secure`, `HttpOnly` and `SameSite=Strict`. The browser adapter uses same-origin credentials and never reads the cookie or stores access/refresh tokens.
+- Every normal API request also needs a valid DPoP proof from the originally bound key. Exact Origin protects unsafe requests, including login/logout; authenticated mutations require the matching public session ID. Post-bootstrap reads include that ID too so a missed cross-tab notification cannot mix account data.
+- Session loss is distinct from a nonce challenge or failed factor check. Old unbound/restricted/revoked/expired cookies cannot bootstrap the portal. Missing/unusable key storage blocks access and requires fresh passkey login, never a weaker fallback.
+- Profile/session data are not authorization caches. Default authority is 24 hours absolute and two hours idle; only successfully authorized browser requests renew activity. The frontend does not poll to keep a session alive.
 
 ### 5.2 Client-Side Sender-Constrained Tokens (DPoP) & Strict-Nonce CSP
 
-The browser DPoP key generation and signing controls below remain planned; Task 7.1 implements the portal's CSP, not these identity flows.
+Task 7.3 implements adapters in `apps/web/app/_lib/portal`, on top of the unchanged strict Task 7.1 document CSP.
 
-- **Asymmetric WebCrypto Binding:** Upon initial load, `app/layout.tsx` triggers the generation of an ephemeral, cryptographically secure asymmetric keypair (ECDSA P-256) inside the browser via the standard **WebCrypto API**.
-- **IndexedDB Isolation:** The private key is persisted securely within the browser's origin-isolated `IndexedDB` with the `extractable: false` flag so that it cannot be read or stolen via XSS.
-- **DPoP Signatures:** For every outgoing fetch request to `/api/v1/*`, the frontend dynamically creates and signs a local proof-of-possession JWT (carrying target URI, HTTP method, and a server-provided cryptographic nonce), attaching it in the `DPoP` header.
-- **Strict-Nonce CSP (Task 7.1):** `apps/web/proxy.ts`, Next.js 16's middleware successor, generates a fresh 32-byte cryptographic nonce for each covered request. It replaces caller-supplied nonce/CSP values, forwards the policy and `x-nonce` to the renderer, and returns the same enforcing `Content-Security-Policy` header. Next.js uses the request policy to nonce its bootstrap and Flight scripts. This mitigates script/style injection; it does not replace safe rendering, authorization, or other XSS defenses. This task does not modify Go response policies.
+- **Asymmetric binding:** A user-triggered passkey login creates or opens a WebCrypto ECDSA P-256 key. Concurrent tabs transactionally select one active key and verify the persisted structured clone before use.
+- **Minimal IndexedDB state:** `hatef-portal-dpop` / `keys` / `active` holds only a non-exportable private `CryptoKey` and public JWK metadata. No private JWK, cookie, token, grant, proof, nonce, profile or recovery batch is persisted in IndexedDB/localStorage/sessionStorage. Non-exportability blocks private-key export, not same-origin XSS invoking signing operations.
+- **Proofs and requests:** Typed fetch uses same-origin cookies, no-store, bounded responses, abort signals and redirect rejection. Each API request gets a fresh signed JTI/method/canonical URL/time/public JWK and a request-local server nonce; cookie requests do not invent an access-token `ath`. Retry once only after explicit pre-handler `use_dpop_nonce`. Never automatically replay an uncertain mutation or authenticator response.
+- **Origin-preserving fetch:** The adapter uses `mode: 'cors'` with strictly validated same-origin URLs and `credentials: 'same-origin'`. This preserves the unsafe-request Origin under `referrerPolicy: 'no-referrer'`; it does not permit cross-origin APIs.
+- **Cross-tab state:** Broadcast invalidation notifications only, never credentials or profile data, and exclude the sending document. Cancel late work by abort/generation checks, clear old state and bootstrap the new session. Hidden/pagehide views are cleared; resume rechecks authority before redisplaying private information. Failed sign-out remains cleared with explicit reconciliation rather than automatically restoring private content.
+- **TOTP app switching:** Ordinary visibility suspension may retain only a non-secret pending action intent in memory. A fresh same-session bootstrap can restore a new confirmation/TOTP challenge; codes, grants, challenges, proofs and recovery batches are cleared, and an already transmitted mutation is never resumed automatically. Navigation, pagehide or session change discards the intent. Cancelled transmitted mutations report an uncertain outcome and offer an authenticated list refresh; late reads cannot overwrite a confirmed mutation.
+- **Strict-Nonce CSP (Task 7.1):** `apps/web/proxy.ts`, Next.js 16's middleware successor, generates a fresh 32-byte cryptographic nonce for each covered request. It replaces caller-supplied nonce/CSP values, forwards the policy and `x-nonce` to the renderer, and returns the same enforcing `Content-Security-Policy` header. Next.js uses the request policy to nonce its bootstrap and Flight scripts. This mitigates script/style injection; it does not replace safe rendering, authorization, or other XSS defenses. The document CSP does not cover Go API responses; Task 7.3 independently enforces their private/no-store/no-referrer policy.
 - **Rendering and caching:** The root layout waits for `connection()`. All portal HTML, including otherwise static-content pages and the application 404, is rendered on demand and is private/no-store. SSG, ISR, PPR, static export, and shared HTML caching are not supported with this per-request nonce contract. Fingerprinted JS/CSS assets remain publicly cacheable and immutable.
 - **Coverage:** Page routes, dotted/unknown URLs, and prefetch requests are protected, including future `/oauth2/authorize` and `/oauth2/error` screens. Backend `/api` paths, `/_next/static`, `/_next/image`, and the favicon are excluded. Upstream outage pages and framework responses produced before the proxy are outside this guarantee.
 - **Strict styles:** Use CSS classes or external stylesheets. A nonce does not authorize a `style` attribute. Application 404, ordinary-error and global-error components use classes; the global fallback supplies its own document and stylesheet. Any future authored `next/script` or inline style element must receive the current request's `x-nonce` rather than generate or cache another nonce.
@@ -138,23 +130,40 @@ upgrade-insecure-requests;
 
 ### 5.3 UX Step-up Authentication Trigger Flow
 
-To protect highly critical administrative or identity operations (such as Password Change, TOTP MFA disablement, Backup contact removal, or Account Deletion), the frontend enforces an inline Step-up verification pattern:
+The portal uses inline step-up for passkey management and recovery-code replacement. Other backend step-up-gated operations remain outside this UI:
 
-1. **Trigger Condition:** The user clicks on any sensitive action button in the Dashboard (e.g., _Remove Backup Phone_ or _Delete Account_). Alternatively, the flow is entered reactively: a sensitive request sent without a grant is answered with `403 {"error": "insufficient_user_authentication", "acr_values": "https://ref.hatef.ir/acr/stepup"}`, which is the signal to open the overlay. Note this is deliberately **not** a `401` — the session is still valid, so a `401` would send the user through a full re-login instead of this inline flow.
+1. **Trigger:** Adding/renaming/removing a passkey or replacing recovery codes pins the action and target before confirmation. Validate names locally first. `403 insufficient_user_authentication` means fresh step-up, not full login; `401 invalid_credentials` means a failed factor and stays in the dialog.
 2. **Step-up Overlay:** Instead of directing to a separate page, a secure, modal dialog (overlay) interrupts the flow. `POST /api/v1/auth/stepup/challenge` reports which factors the account can present (`methods`) plus the WebAuthn assertion options when a passkey is enrolled. Keep the returned challenge state in memory and complete it from the same authenticated session: the server binds the challenge to its exact user, session, and Step-up flow, and a mismatched session cannot consume the legitimate challenge. A `409 {"error": "no_stepup_factor"}` means the account has neither a passkey nor TOTP and must enrol one before sensitive operations become reachable.
 3. **MFA/Biometric Challenge:**
    - The dialog triggers a WebAuthn prompt utilizing platform authenticators (TouchID, FaceID, Windows Hello) with **`userVerification: "required"`** to confirm biometrics/PIN, OR requests the user's active TOTP token.
    - Recovery codes are **not** accepted here. They are a login bypass, so honouring one would let a stolen code authorise the very operations this gate protects — including regenerating the code batch itself.
 4. **Step-up Assertion:** Upon user confirmation, the frontend sends this assertion to `POST /api/v1/auth/stepup/verify`. A `403 {"error": "user_verification_required"}` means the authenticator only proved presence (a security key tapped without a PIN); the remedy is a PIN/biometric-capable device, or TOTP.
 5. **Short-Lived Authorization:** On success, the frontend receives a temporary **Step-up ACR token** (valid for 3-5 minutes) carrying the ACR claim `https://ref.hatef.ir/acr/stepup`.
-6. **Execution:** The frontend automatically executes the original sensitive request, embedding the Step-up ACR token in the **`X-Step-Up-Auth`** header (not `Authorization`, which continues to carry the session or access token) along with the required DPoP proof. Once executed, the state is cleared.
-7. **Single Use:** A grant authorises exactly one request. It is consumed on presentation, so a retry — including a retry after a client-side validation failure — requires a fresh challenge. It is also bound to the session that earned it, so it cannot be carried to another tab, device, or session.
+6. **Execution:** Send the in-memory grant once in `X-Step-Up-Auth`, alongside the bound cookie, DPoP proof and `X-Portal-Session`. `Authorization` is not used for portal cookies. Registration spends the grant at options generation, then completes with its bound pending state. Cancelled/uncertain operations discard the grant and reconcile only non-secret state where safe.
+7. **Dialog:** A class-styled native `<dialog>` provides a semantic heading/description, contained keyboard focus, Escape/Cancel, initiating-focus return and announced feedback. It does not introduce inline-style CSP exceptions. WebAuthn UV is offered first; existing TOTP is offered only when advertised. Recovery codes cannot satisfy step-up.
+8. **Single use:** A used grant cannot be replayed or moved to another session/key. A pre-handler nonce challenge is the only automatic retry, because it consumed neither grant nor handler state. Transport uncertainty instead requires a new explicit action and fresh verification.
 
 ### 5.4 Account-Harvesting Resistant Login UX & Discoverable Credentials
 
 To completely prevent user-enumeration (account harvesting) through timing side-channels, the platform implements two distinct defenses:
 
 - **Discoverable Credentials (Usernameless Passkeys) as Primary:** The primary login route relies on discoverable credentials. The user is prompted for biometrics directly without inputting an email first (`navigator.credentials.get` is called with an empty `allowCredentials` list). The authenticator resolves the user's registered identity locally and securely transfers the associated username/ID within the signed cryptographic assertion, completely eliminating the possibility of account harvesting.
-- **Mock Challenges for User-Named Fallbacks:** For legacy user-named credential flows, if an unregistered username/email is entered, the server returns a fully formed mock challenge. The frontend initiates `navigator.credentials.get` using this dummy credential ID, prompting the standard OS biometric dialog to preserve UX consistency. The backend introduces exact timing delays to match a successful credentials lookup, though discoverable credentials remain the recommended path due to browser-level key-lookup speed variances on local devices. (Note: Because modern browsers throw instant client-side exceptions when an `allowCredentials` list contains only dummy IDs, a client-side behavioral side-channel remains on user-named credentials. Therefore, discoverable credentials are the only fully secure WebAuthn authentication route).
+- **Legacy user-named fallback:** The backend retains decoy options and a timing floor for legacy clients, but the portal does not offer this flow. Browser credential lookup can behave differently for dummy IDs, so a uniform server response alone does not eliminate that client-side enumeration risk. The live portal starts discoverable ceremonies without naming an account.
 
 The Admin UI remains future work. Follow [API section 1.7](api-design.md#17-admin--moderation-api): body-based exact-email search and legal attribution; no identity query strings. Super Admin receives content-free verification only; Support never receives email, roles or hold details.
+
+### 5.5 One-Time Recovery Viewer
+
+Use `remaining`/`low` status for existing batches, never an old-plaintext GET. Generation explicitly warns that all prior codes become invalid and requires fresh step-up. Returned codes live only in the security view's memory. Copy and plaintext Download are deliberate actions with success/failure feedback and a private-storage warning; the filename contains no account identifier and temporary object URLs are promptly revoked. There is no auto-copy, auto-download, email or print workflow, and CSP is not weakened for exports.
+
+Clear the batch on Done, navigation/unmount, pagehide/history transitions, hiding the private view, local logout, detected session loss or five minutes after generation, bounded by absolute session expiry. Resume requires a fresh authority check; there is no background keepalive polling. Cancellation/navigation discards late responses. A lost generation response is an uncertain replacement: explain that old codes may already be invalid and require a new explicit generation with fresh step-up. Do not retrieve a cached response or silently regenerate.
+
+Clearing component state cannot erase a user's clipboard/download, browser snapshots or guarantee memory zeroization. The UI must not promise those effects.
+
+## 6. Portal Validation Boundary
+
+`web:test-portal-browser` runs `.github/scripts/web-portal.browser.mjs` against production Next.js, two real Go API processes and isolated PostgreSQL/Redis/JetStream through a single local HTTPS ingress. Test-only build-tagged fixtures supply random accounts and real virtual-authenticator credentials; there is no production bootstrap endpoint or magic account. `.github/scripts/web-csp.browser.mjs` remains the independent image/CSP and inactive-form regression suite, with only its passkey-specific boundary updated.
+
+The focused suite covers real login/profile/security/session operations, cross-replica ceremonies, concurrent IndexedDB key initialization/non-exportability, stale intents, one-time-code export/cleanup/uncertain responses, strict CSP/modal behavior, no-JavaScript private shells and light/dark narrow/desktop layout checks. Optional artifacts contain masked layout screenshots and metadata-only evidence, not browser traces or plaintext batches. Native hidden-tab/bfcache observation is reported separately from injected resume events; an unobserved native path remains a manual gate.
+
+Repository test execution is not deployment approval. Manual assistive-technology/platform-authenticator review, real deployed HTTPS ingress/log-redaction verification and compatible downstream lifecycle consumers remain release gates unless separately evidenced. Follow [portal cutover](devops-operations.md#user-portal-cutover-task-73); do not mark task acceptance or operator gates complete solely because tests exist.

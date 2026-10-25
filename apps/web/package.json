@@ -2,6 +2,21 @@
   "name": "web",
   "version": "0.0.1",
   "private": true,
+  "nx": {
+    "targets": {
+      "typecheck": {
+        "command": "tsc --noEmit --project apps/web/tsconfig.spec.json",
+        "dependsOn": [
+          "^build"
+        ],
+        "cache": true
+      },
+      "test-portal-browser": {
+        "command": "node .github/scripts/web-portal.browser.mjs",
+        "cache": false
+      }
+    }
+  },
   "dependencies": {
     "@hatef/ui": "*",
     "next": "~16.1.6",

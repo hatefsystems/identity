@@ -8,7 +8,7 @@ export default function PasskeyPage() {
     <AuthCard
       title="Sign in with a passkey"
       description="Use a passkey already saved on your device or security key."
-      footer={<AuthLink href="/login">Use email and password instead</AuthLink>}
+      footer={<AuthLink href="/login">Return to sign in</AuthLink>}
     >
       <PasskeyScreen />
     </AuthCard>

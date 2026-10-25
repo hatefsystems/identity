@@ -224,6 +224,7 @@ func (f *privacyFakeLimiter) Allow(_ context.Context, key string, _ int, _ time.
 
 type privacyFixture struct {
 	server   *Server
+	browser  *portalTestClient
 	store    *privacyFakeStore
 	notifier *privacyFakeNotifier
 	passkeys *privacyFakePasskeys
@@ -251,6 +252,7 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 	userID := uuid.New()
 	fx := &privacyFixture{
 		userID:   userID,
+		browser:  newPortalTestClient(t, testPortalOrigin),
 		store:    newPrivacyFakeStore(db.User{ID: userID, Email: "delete@example.com", Status: "active"}),
 		notifier: &privacyFakeNotifier{},
 		passkeys: &privacyFakePasskeys{},
@@ -260,7 +262,11 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 	var sessMgr *session.Manager
 	if !opts.noSession {
 		sessMgr = newRecoverySessionManager(t)
-		fx.sess, fx.cookie = issueRecoverySession(t, sessMgr, userID)
+		var cookies []*http.Cookie
+		fx.sess, cookies = fx.browser.issueSession(t, sessMgr, session.IssueParams{
+			UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+		})
+		fx.cookie = cookies[0]
 	}
 
 	if !opts.noStepUp {
@@ -280,11 +286,11 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 		privacySvc = svc
 	}
 
-	deps := Deps{Privacy: privacySvc, StepUp: fx.stepUp}
+	deps := Deps{Privacy: privacySvc, StepUp: fx.stepUp, DPoPValidator: fx.browser.validator, WebAuthnLimiter: fx.limiter}
 	if sessMgr != nil {
 		deps.SessionManager = sessMgr
 	}
-	fx.server = New(config.Config{Environment: "development"}, nil, deps)
+	fx.server = New(config.Config{Environment: "development", PortalOrigin: fx.browser.origin}, nil, deps)
 	return fx
 }
 
@@ -293,8 +299,9 @@ func (fx *privacyFixture) deleteMe(t *testing.T, withGrant bool) *httptest.Respo
 	t.Helper()
 
 	req := httptest.NewRequest(http.MethodDelete, privacyDeletePath, nil)
+	fx.browser.prepare(req)
 	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
+		fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	}
 	// A grant is bound to the session that earned it, so there is nothing to mint
 	// when the fixture has no session manager.
@@ -319,6 +326,7 @@ func (fx *privacyFixture) post(t *testing.T, path string, body any) *httptest.Re
 		reader = bytes.NewReader(raw)
 	}
 	req := httptest.NewRequest(http.MethodPost, path, reader)
+	fx.browser.prepare(req)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
@@ -412,11 +420,10 @@ func TestPrivacyDeleteRequiresSessionThenStepUp(t *testing.T) {
 
 	// No cookie: the session guard rejects first with a bare 401.
 	req := httptest.NewRequest(http.MethodDelete, privacyDeletePath, nil)
+	fx.browser.prepare(req)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("DELETE without a session = %d (%s), want 401", rec.Code, rec.Body.String())
-	}
+	requirePortalSessionRequired(t, rec)
 	if len(fx.store.requests) != 0 {
 		t.Fatal("an unauthenticated request created a deletion request")
 	}
@@ -446,8 +453,8 @@ func TestPrivacyDeleteReturns204AndDeactivates(t *testing.T) {
 	if rec.Body.Len() != 0 {
 		t.Errorf("204 carried a body: %q", rec.Body.String())
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store", got)
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Errorf("Cache-Control = %q, want private, no-store", got)
 	}
 	if fx.store.users[fx.userID].Status != "pending_deletion" {
 		t.Error("the account was not deactivated")
@@ -512,8 +519,8 @@ func TestPrivacyReclaimOptionsReturnsWebAuthnChallenge(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST reclaim/options = %d (%s), want 200", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store", got)
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Errorf("Cache-Control = %q, want private, no-store", got)
 	}
 
 	var body privacyReclaimOptionsResponse
@@ -817,6 +824,7 @@ func TestPrivacyReclaimRejectsMalformedJSON(t *testing.T) {
 
 	for _, path := range []string{privacyReclaimOptionsPath, privacyReclaimPath} {
 		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte("{")))
+		fx.browser.prepare(req)
 		rec := httptest.NewRecorder()
 		fx.server.Handler().ServeHTTP(rec, req)
 

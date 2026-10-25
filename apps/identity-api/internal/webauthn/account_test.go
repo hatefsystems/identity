@@ -111,7 +111,7 @@ func TestCeremonyCommitRechecksVersionAfterConcurrentReactivation(t *testing.T) 
 			f.register(t, f.auth)
 			epoch := &ceremonyEpoch{}
 			f.svc.accounts = epoch
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(f.ctx(), 5*time.Second)
 			defer cancel()
 			kind := session.KindAuthenticated
 			if flow == FlowRecoveryRegistration {
@@ -121,7 +121,7 @@ func TestCeremonyCommitRechecksVersionAfterConcurrentReactivation(t *testing.T) 
 			var finish func() error
 			switch flow {
 			case FlowRegistration, FlowRecoveryRegistration:
-				options, err := f.svc.beginRegistration(ctx, f.user.ID, "test-session", flow, flow == FlowRecoveryRegistration)
+				options, err := f.svc.beginRegistration(ctx, f.user.ID, "test-session", flow, flow == FlowRecoveryRegistration, "")
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -26,8 +26,10 @@ const (
 	SubjectUpdated   = "identity.user.updated"
 	SubjectSuspended = "identity.user.suspended"
 	SubjectDeleted   = "identity.user.deleted"
-	SchemaVersion    = 1
-	MaxMessageBytes  = 16 * 1024
+	// SchemaVersion remains the default for existing status/deletion producers.
+	SchemaVersion   = 1
+	SchemaVersionV2 = 2
+	MaxMessageBytes = 16 * 1024
 )
 
 // ErrInvalidEvent denotes an invalid envelope without exposing its contents.
@@ -37,12 +39,22 @@ var ErrInvalidEvent = errors.New("lifecycle: invalid event")
 // time. Revision must fit a positive PostgreSQL bigint, including for deletion.
 // The caller must persist the event in the same transaction as the mutation.
 func NewEvent(id, userID uuid.UUID, revision int64, subject, status string, changedFields []string, occurredAt time.Time) (*identityv1.UserLifecycleEvent, error) {
+	return newEvent(SchemaVersion, id, userID, revision, subject, status, changedFields, occurredAt)
+}
+
+// NewDisplayNameEvent constructs explicit v2 profile-update metadata, never a
+// name value; existing producers continue to use the strict v1 writer.
+func NewDisplayNameEvent(id, userID uuid.UUID, revision int64, status string, occurredAt time.Time) (*identityv1.UserLifecycleEvent, error) {
+	return newEvent(SchemaVersionV2, id, userID, revision, SubjectUpdated, status, []string{"display_name"}, occurredAt)
+}
+
+func newEvent(version uint32, id, userID uuid.UUID, revision int64, subject, status string, changedFields []string, occurredAt time.Time) (*identityv1.UserLifecycleEvent, error) {
 	if revision <= 0 {
 		return nil, fmt.Errorf("%w: revision must be positive", ErrInvalidEvent)
 	}
 	rev := uint64(revision)
 	event := &identityv1.UserLifecycleEvent{
-		SchemaVersion: SchemaVersion,
+		SchemaVersion: version,
 		EventId:       id.String(),
 		EventType:     subject,
 		UserId:        userID.String(),
@@ -110,7 +122,7 @@ func UnmarshalEvent(data []byte) (*identityv1.UserLifecycleEvent, error) {
 }
 
 func validateEvent(event *identityv1.UserLifecycleEvent) error {
-	if event == nil || event.SchemaVersion != SchemaVersion || len(event.ProtoReflect().GetUnknown()) != 0 {
+	if event == nil || (event.SchemaVersion != SchemaVersion && event.SchemaVersion != SchemaVersionV2) || len(event.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: unsupported schema", ErrInvalidEvent)
 	}
 	for _, raw := range []string{event.EventId, event.UserId} {
@@ -122,7 +134,7 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 	if event.OccurredAt.CheckValid() != nil || event.OccurredAt.AsTime().IsZero() || len(event.OccurredAt.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: invalid occurrence time", ErrInvalidEvent)
 	}
-	if event.Revision == nil && event.EventType != SubjectDeleted ||
+	if event.Revision == nil && (event.EventType != SubjectDeleted || event.SchemaVersion != SchemaVersion) ||
 		event.Revision != nil && (event.GetRevision() == 0 || event.GetRevision() > math.MaxInt64) {
 		return fmt.Errorf("%w: invalid revision", ErrInvalidEvent)
 	}
@@ -142,16 +154,22 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 	default:
 		return fmt.Errorf("%w: unknown status", ErrInvalidEvent)
 	}
-	if len(event.ChangedFields) == 0 || len(event.ChangedFields) > 2 {
+	maxFields := 2
+	if event.SchemaVersion == SchemaVersionV2 {
+		maxFields = 3
+	}
+	if len(event.ChangedFields) == 0 || len(event.ChangedFields) > maxFields {
 		return fmt.Errorf("%w: invalid changed fields", ErrInvalidEvent)
 	}
-	var changedStatus, changedEmail bool
+	var changedStatus, changedEmail, changedDisplayName bool
 	for _, field := range event.ChangedFields {
 		switch {
 		case field == "status" && !changedStatus:
 			changedStatus = true
 		case field == "email" && !changedEmail:
 			changedEmail = true
+		case field == "display_name" && event.SchemaVersion == SchemaVersionV2 && !changedDisplayName:
+			changedDisplayName = true
 		default:
 			return fmt.Errorf("%w: unknown or duplicate changed field", ErrInvalidEvent)
 		}
@@ -162,7 +180,7 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 			return fmt.Errorf("%w: invalid creation metadata", ErrInvalidEvent)
 		}
 	case SubjectSuspended:
-		if event.GetStatus() != identityv1.UserStatus_USER_STATUS_SUSPENDED || !changedStatus || changedEmail {
+		if event.GetStatus() != identityv1.UserStatus_USER_STATUS_SUSPENDED || !changedStatus || changedEmail || changedDisplayName {
 			return fmt.Errorf("%w: invalid suspension metadata", ErrInvalidEvent)
 		}
 	case SubjectUpdated:
@@ -212,7 +230,7 @@ func validEventJSON(data []byte, event *identityv1.UserLifecycleEvent) bool {
 		}
 		switch name {
 		case "schema_version":
-			if string(raw) != strconv.Itoa(SchemaVersion) {
+			if string(raw) != strconv.FormatUint(uint64(event.SchemaVersion), 10) {
 				return false
 			}
 		case "revision", "status", "occurred_at":

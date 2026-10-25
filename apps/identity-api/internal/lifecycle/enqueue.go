@@ -42,7 +42,7 @@ func CreateUser(ctx context.Context, tx pgx.Tx, arg db.CreateUserParams) (db.Use
 	if err != nil || revision != 1 {
 		return db.User{}, ErrEnqueue
 	}
-	if err := enqueue(ctx, q, user.ID, revision, SubjectCreated, user.Status, []string{"email", "status"}); err != nil {
+	if err := enqueue(ctx, q, user.ID, revision, SubjectCreated, user.Status, []string{"email", "status"}, SchemaVersion); err != nil {
 		return db.User{}, err
 	}
 	user.LifecycleRevision = revision
@@ -66,7 +66,24 @@ func EnqueueStatusChange(ctx context.Context, store Store, id uuid.UUID, before,
 	if err != nil {
 		return ErrEnqueue
 	}
-	return enqueue(ctx, store, id, revision, subject, after, []string{"status"})
+	return enqueue(ctx, store, id, revision, subject, after, []string{"status"}, SchemaVersion)
+}
+
+// EnqueueDisplayNameChange follows a real name update under the account row lock.
+// The caller handles no-ops and rolls back both the name and revision on failure.
+// Values are intentionally absent from this API and from the durable intent.
+func EnqueueDisplayNameChange(ctx context.Context, store Store, id uuid.UUID, status string) (int64, error) {
+	if store == nil || id == uuid.Nil || status != "active" {
+		return 0, ErrInvalidEvent
+	}
+	revision, err := store.AdvanceUserLifecycleRevision(ctx, id)
+	if err != nil {
+		return 0, ErrEnqueue
+	}
+	if err := enqueue(ctx, store, id, revision, SubjectUpdated, status, []string{"display_name"}, SchemaVersionV2); err != nil {
+		return 0, err
+	}
+	return revision, nil
 }
 
 // EnqueueDeletion runs only after an exactly-one-row, hold-checked DELETE in the
@@ -75,10 +92,10 @@ func EnqueueDeletion(ctx context.Context, store EventStore, id uuid.UUID, previo
 	if store == nil || previousRevision < 0 || previousRevision == math.MaxInt64 {
 		return ErrInvalidEvent
 	}
-	return enqueue(ctx, store, id, previousRevision+1, SubjectDeleted, "", nil)
+	return enqueue(ctx, store, id, previousRevision+1, SubjectDeleted, "", nil, SchemaVersion)
 }
 
-func enqueue(ctx context.Context, store EventStore, id uuid.UUID, revision int64, subject, status string, fields []string) error {
+func enqueue(ctx context.Context, store EventStore, id uuid.UUID, revision int64, subject, status string, fields []string, version uint32) error {
 	eventID, err := uuid.NewRandom()
 	if err != nil {
 		return ErrEnqueue
@@ -86,7 +103,7 @@ func enqueue(ctx context.Context, store EventStore, id uuid.UUID, revision int64
 	// PostgreSQL timestamps have microsecond precision. Persist the same instant
 	// in the envelope and indexed row so validation remains stable after reload.
 	at := time.Now().UTC().Truncate(time.Microsecond)
-	event, err := NewEvent(eventID, id, revision, subject, status, fields, at)
+	event, err := newEvent(version, eventID, id, revision, subject, status, fields, at)
 	if err != nil {
 		return err
 	}

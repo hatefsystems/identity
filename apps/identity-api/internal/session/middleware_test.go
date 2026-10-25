@@ -49,7 +49,7 @@ func TestSessionKindsAreMutuallyExclusive(t *testing.T) {
 	issue := func(kind Kind) *httptest.ResponseRecorder {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		if _, err := m.Issue(rec, IssueParams{UserID: "user-1", Kind: kind}); err != nil {
+		if _, err := m.Issue(rec, IssueParams{UserID: "user-1", Kind: kind, DPoPJKT: "expected-jkt"}); err != nil {
 			t.Fatalf("Issue(%q): %v", kind, err)
 		}
 		return rec
@@ -73,7 +73,9 @@ func TestSessionKindsAreMutuallyExclusive(t *testing.T) {
 			var ran bool
 			var seen Session
 			rec := httptest.NewRecorder()
-			tc.guard(okHandler(&ran, &seen)).ServeHTTP(rec, requestWithCookies(tc.cookie))
+			req := requestWithCookies(tc.cookie)
+			req = req.WithContext(dpop.WithProof(req.Context(), &dpop.Proof{JKT: "expected-jkt"}))
+			tc.guard(okHandler(&ran, &seen)).ServeHTTP(rec, req)
 			if rec.Code != tc.want {
 				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
 			}
@@ -112,7 +114,7 @@ func TestMiddlewareValidSessionInjectsContext(t *testing.T) {
 	guard := newGuard(t, m)
 
 	issueRec := httptest.NewRecorder()
-	issued, err := m.Issue(issueRec, IssueParams{UserID: "user-1", IP: "203.0.113.5"})
+	issued, err := m.Issue(issueRec, IssueParams{UserID: "user-1", IP: "203.0.113.5", DPoPJKT: "expected-jkt"})
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -120,7 +122,9 @@ func TestMiddlewareValidSessionInjectsContext(t *testing.T) {
 	var ran bool
 	var seen Session
 	rec := httptest.NewRecorder()
-	guard.Handler(okHandler(&ran, &seen)).ServeHTTP(rec, requestWithCookies(issueRec))
+	req := requestWithCookies(issueRec)
+	req = req.WithContext(dpop.WithProof(req.Context(), &dpop.Proof{JKT: "expected-jkt"}))
+	guard.Handler(okHandler(&ran, &seen)).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)

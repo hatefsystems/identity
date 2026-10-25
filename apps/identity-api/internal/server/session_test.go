@@ -18,7 +18,7 @@ import (
 // the in-memory store. It uses a non-__Host- cookie name with Secure=false so
 // the issued cookie is accepted over the plain-HTTP httptest transport (the
 // __Host-/Secure invariant is exercised in the session package's own tests).
-func newSessionTestServer(t *testing.T) (*Server, *session.Manager) {
+func newSessionTestServer(t *testing.T) (*Server, *session.Manager, *portalTestClient) {
 	t.Helper()
 
 	codec, err := session.NewCookieCodec(session.CookieConfig{
@@ -38,11 +38,14 @@ func newSessionTestServer(t *testing.T) (*Server, *session.Manager) {
 		t.Fatalf("NewManager: %v", err)
 	}
 
-	return New(testConfig(t), nil, Deps{SessionManager: mgr}), mgr
+	browser := newPortalTestClient(t, testPortalOrigin)
+	cfg := testConfig(t)
+	cfg.PortalOrigin = browser.origin
+	return New(cfg, nil, Deps{SessionManager: mgr, DPoPValidator: browser.validator}), mgr, browser
 }
 
-// issueSession mints a session via the manager and returns it together with the
-// cookies the browser would carry on subsequent requests.
+// issueSession is raw issuance: it preserves deliberately empty or foreign
+// bindings. Normal browser fixtures use portalTestClient.issueSession instead.
 func issueSession(t *testing.T, mgr *session.Manager, p session.IssueParams) (session.Session, []*http.Cookie) {
 	t.Helper()
 
@@ -67,11 +70,11 @@ func addCookies(req *http.Request, cookies []*http.Cookie) {
 }
 
 func TestLogoutReturns204(t *testing.T) {
-	srv, mgr := newSessionTestServer(t)
-	_, cookies := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+	srv, mgr, browser := newSessionTestServer(t)
+	current, cookies := browser.issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	addCookies(req, cookies)
+	browser.authorize(t, req, current, cookies...)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -81,9 +84,10 @@ func TestLogoutReturns204(t *testing.T) {
 }
 
 func TestLogoutWithoutCookieIsIdempotent(t *testing.T) {
-	srv, _ := newSessionTestServer(t)
+	srv, _, browser := newSessionTestServer(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	browser.prepare(req)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -93,28 +97,26 @@ func TestLogoutWithoutCookieIsIdempotent(t *testing.T) {
 }
 
 func TestListSessionsWithoutCookieUnauthorized(t *testing.T) {
-	srv, _ := newSessionTestServer(t)
+	srv, _, _ := newSessionTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me/sessions", nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
-	}
+	requirePortalSessionRequired(t, rec)
 	_, _ = io.Copy(io.Discard, rec.Body)
 }
 
 func TestListSessionsWithCookie(t *testing.T) {
-	srv, mgr := newSessionTestServer(t)
-	s, cookies := issueSession(t, mgr, session.IssueParams{
+	srv, mgr, browser := newSessionTestServer(t)
+	s, cookies := browser.issueSession(t, mgr, session.IssueParams{
 		UserID:    "user-1",
 		IP:        "203.0.113.7",
 		UserAgent: "test-agent/1.0",
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me/sessions", nil)
-	addCookies(req, cookies)
+	browser.authorize(t, req, s, cookies...)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -151,11 +153,11 @@ func TestListSessionsWithCookie(t *testing.T) {
 // TestListSessionsDoesNotLeakToken re-decodes the response as a generic map and
 // asserts no field carries the session token or its storage hash.
 func TestListSessionsDoesNotLeakToken(t *testing.T) {
-	srv, mgr := newSessionTestServer(t)
-	_, cookies := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+	srv, mgr, browser := newSessionTestServer(t)
+	current, cookies := browser.issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me/sessions", nil)
-	addCookies(req, cookies)
+	browser.authorize(t, req, current, cookies...)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -194,11 +196,11 @@ func TestListSessionsDoesNotLeakToken(t *testing.T) {
 }
 
 func TestRevokeOwnSessionReturns204(t *testing.T) {
-	srv, mgr := newSessionTestServer(t)
-	s, cookies := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+	srv, mgr, browser := newSessionTestServer(t)
+	s, cookies := browser.issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/sessions/"+s.ID, nil)
-	addCookies(req, cookies)
+	browser.authorize(t, req, s, cookies...)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -216,11 +218,11 @@ func TestRevokeOwnSessionReturns204(t *testing.T) {
 }
 
 func TestRevokeUnknownSessionReturns404(t *testing.T) {
-	srv, mgr := newSessionTestServer(t)
-	_, cookies := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+	srv, mgr, browser := newSessionTestServer(t)
+	current, cookies := browser.issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/sessions/does-not-exist", nil)
-	addCookies(req, cookies)
+	browser.authorize(t, req, current, cookies...)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -233,8 +235,8 @@ func TestRevokeUnknownSessionReturns404(t *testing.T) {
 func TestSessionHandlersPreserveRequestCancellation(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
-			srv, mgr := newSessionTestServer(t)
-			current, _ := issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
+			srv, mgr, browser := newSessionTestServer(t)
+			current, _ := browser.issueSession(t, mgr, session.IssueParams{UserID: "user-1"})
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			ctx = session.WithSession(ctx, current)
@@ -251,8 +253,12 @@ func TestSessionHandlersPreserveRequestCancellation(t *testing.T) {
 				handler = srv.handleRevokeSession()
 			}
 			handler.ServeHTTP(rec, req)
-			if rec.Code != http.StatusInternalServerError {
-				t.Fatalf("canceled %s returned %d, want existing backend-error response", method, rec.Code)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("canceled %s returned %d, want unavailable response", method, rec.Code)
+			}
+			var body sessionErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error != "temporarily_unavailable" {
+				t.Fatalf("canceled %s response = %s, err=%v", method, rec.Body.String(), err)
 			}
 			if _, err := mgr.LookupByID(t.Context(), current.UserID, current.ID); err != nil {
 				t.Fatalf("canceled handler revoked a session: %v", err)
@@ -265,9 +271,12 @@ func TestSessionHandlersPreserveRequestCancellation(t *testing.T) {
 // mounted when a session manager is configured: with an empty Deps the logout
 // route 404s (mirroring the OIDC-routes-absent-without-keys behavior).
 func TestSessionRoutesAbsentWithoutManager(t *testing.T) {
-	srv := New(testConfig(t), nil, Deps{})
+	cfg := testConfig(t)
+	cfg.PortalOrigin = testPortalOrigin
+	srv := New(cfg, nil, Deps{})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	req.Header.Set("Origin", cfg.PortalOrigin)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 

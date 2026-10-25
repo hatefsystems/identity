@@ -8,6 +8,8 @@ import RegistrationPage, { metadata as registrationMetadata } from '../app/(auth
 import ResetPasswordPage, { metadata as resetMetadata } from '../app/(auth)/reset-password/page';
 import TotpPage, { metadata as totpMetadata } from '../app/(auth)/verify-totp/page';
 
+jest.mock('next/navigation', () => ({ useRouter: () => ({ replace: jest.fn() }) }));
+
 const notice = 'This form is not connected yet. Do not enter real credentials.';
 const routes = [
   {
@@ -22,7 +24,6 @@ const routes = [
       ['Password', 'password', 'current-password'],
     ],
     links: [
-      ['Continue with a passkey', '/login/webauthn'],
       ['Forgot password?', '/forgot-password'],
       ['Create an account', '/register'],
     ],
@@ -49,7 +50,7 @@ const routes = [
     heading: 'Sign in with a passkey',
     action: 'Use a passkey',
     fields: [],
-    links: [['Use email and password instead', '/login']],
+    links: [['Return to sign in', '/login']],
   },
   {
     path: '/verify-totp',
@@ -130,13 +131,16 @@ describe('public auth routes', () => {
       }
       expect(screen.getAllByRole('link')).toHaveLength(links.length + 1);
       const submit = screen.getByRole<HTMLButtonElement>('button', { name: action });
-      expect(submit.type).toBe('submit');
-      expect(submit.disabled).toBe(true);
-      expect(
-        document.getElementById(submit.getAttribute('aria-describedby') ?? '')?.textContent
-      ).toContain(notice);
+      expect(submit.type).toBe(Page === PasskeyPage ? 'button' : 'submit');
+      expect(submit.disabled).toBe(Page !== PasskeyPage);
+      if (Page !== PasskeyPage)
+        expect(
+          document.getElementById(submit.getAttribute('aria-describedby') ?? '')?.textContent
+        ).toContain(notice);
       for (const button of screen.getAllByRole<HTMLButtonElement>('button')) {
-        expect(button.getAttribute('type')).toBe(button === submit ? 'submit' : 'button');
+        expect(button.getAttribute('type')).toBe(
+          button === submit && Page !== PasskeyPage ? 'submit' : 'button'
+        );
         if (button !== submit) expect(button.disabled).toBe(false);
       }
       for (const icon of container.querySelectorAll('svg'))
@@ -145,7 +149,7 @@ describe('public auth routes', () => {
     }
   );
 
-  it.each(routes)(
+  it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
     '$path is disconnected in the initial server HTML, before hydration or JavaScript',
     ({ Page }) => {
       const html = renderToStaticMarkup(
@@ -165,6 +169,20 @@ describe('public auth routes', () => {
       expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
     }
   );
+
+  it('server-renders a disabled non-submitting passkey button without initiating a ceremony', () => {
+    const html = renderToStaticMarkup(
+      <AuthLayout>
+        <PasskeyPage />
+      </AuthLayout>
+    );
+    const document = new DOMParser().parseFromString(html, 'text/html');
+    expect(document.forms).toHaveLength(0);
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="passkey-login"]');
+    expect(button?.disabled).toBe(true);
+    expect(button?.type).toBe('button');
+    expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
+  });
 });
 
 describe('disconnected route interaction', () => {
@@ -196,7 +214,7 @@ describe('disconnected route interaction', () => {
     jest.clearAllMocks();
   });
 
-  it.each(routes)(
+  it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
     '$path keeps the notice and prevents submission without network, WebAuthn, storage, or navigation',
     ({ Page, action, fields }) => {
       const requests = [
@@ -248,7 +266,7 @@ describe('disconnected route interaction', () => {
       expect(fireEvent.submit(form)).toBe(false);
       expect(submit.disabled).toBe(true);
       expect(form.textContent).toContain(notice);
-      expect(screen.getByRole('status').textContent).toBe('');
+      expect(form.querySelector('[role="status"]')?.textContent).toBe('');
       expect(screen.queryByRole('alert')).toBeNull();
       expect(window.location.href).toBe(initialUrl);
       for (const request of requests) expect(request).not.toHaveBeenCalled();

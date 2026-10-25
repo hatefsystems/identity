@@ -1,6 +1,7 @@
 import { Button } from '@hatef/ui';
 import { Fingerprint } from 'lucide-react';
 import Link from 'next/link';
+import type { ReactNode } from 'react';
 import { useAuthForm, type FormOutcome, type FormSubmit } from '../_lib/use-auth-form';
 import {
   validateEmail,
@@ -17,17 +18,25 @@ import {
 import { AuthLink } from './auth-card';
 import { AuthField, AuthForm } from './form-controls';
 
-export function LoginForm({ submit }: { submit?: FormSubmit<LoginValues> }) {
+export function LoginForm({
+  submit,
+  passkeyAction,
+}: {
+  submit?: FormSubmit<LoginValues>;
+  passkeyAction?: ReactNode;
+}) {
   const form = useAuthForm({ email: '', password: '' }, validateLogin, submit);
 
   return (
     <>
-      <Button asChild className="h-auto min-h-11 w-full whitespace-normal">
-        <Link href="/login/webauthn">
-          <Fingerprint aria-hidden="true" />
-          Continue with a passkey
-        </Link>
-      </Button>
+      {passkeyAction ?? (
+        <Button asChild className="h-auto min-h-11 w-full whitespace-normal">
+          <Link href="/login/webauthn">
+            <Fingerprint aria-hidden="true" />
+            Continue with a passkey
+          </Link>
+        </Button>
+      )}
       <div className="flex items-center gap-3 text-xs text-muted-foreground">
         <span aria-hidden="true" className="h-px flex-1 bg-border" />
         <span>or use your password</span>

@@ -25,6 +25,7 @@ import (
 
 	embedded "github.com/hatefsystems/identity/apps/identity-api/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	identityv1 "github.com/hatefsystems/identity/libs/schemas/gen/go/hatef/identity/v1"
 )
 
@@ -88,7 +89,7 @@ func integrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" {
+		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" && entry.Name() != "00017_profile_names.sql" {
 			continue
 		}
 		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
@@ -116,8 +117,8 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 	id, roleID := uuid.New(), "grpc-"+uuid.NewString()
 	email, permission := id.String()+"@grpc-integration.invalid", "grpc.objects.read."+uuid.NewString()
 	if _, err := pool.Exec(ctx, `INSERT INTO users
-		(id, email, status, password_hash, phone_encrypted, backup_email_encrypted, mfa_totp_secret_encrypted)
-		VALUES ($1,$2,'active',$3,$4,$4,$4)`, id, email, "must-not-disclose-password-hash", []byte("must-not-disclose-ciphertext")); err != nil {
+		(id, email, status, password_hash, phone_encrypted, backup_email_encrypted, mfa_totp_secret_encrypted, display_name)
+		VALUES ($1,$2,'active',$3,$4,$4,$4,'Private display name')`, id, email, "must-not-disclose-password-hash", []byte("must-not-disclose-ciphertext")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queries.CreateRole(ctx, db.CreateRoleParams{ID: roleID, Description: "gRPC integration fixture"}); err != nil {
@@ -199,8 +200,9 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 				want := &identityv1.GetInternalUserInfoResponse{UserId: id.String(), Status: tc.status, LifecycleRevision: wireRevision}
 				if tc.email {
 					want.Email = email
+					want.DisplayName = "Private display name"
 				}
-				if queryErr != nil || row.ID != id || row.Email != want.Email || row.LifecycleRevision != revision || !proto.Equal(response, want) {
+				if queryErr != nil || row.ID != id || row.Email != want.Email || row.DisplayName != want.DisplayName || row.LifecycleRevision != revision || !proto.Equal(response, want) {
 					t.Fatalf("SQL or RPC profile minimization failed: %v", queryErr)
 				}
 			}
@@ -258,4 +260,47 @@ func TestDPoPRealRedisIntegration(t *testing.T) {
 	}
 	response, err := clients[0].ValidateToken(rpcContext(t), req)
 	assertProofOutcome(t, response, err, identityv1.DpopOutcome_DPOP_OUTCOME_USE_NONCE)
+}
+
+func TestDisplayNameRevisionSnapshotDatabaseIntegration(t *testing.T) {
+	ctx, pool := integrationDatabase(t)
+	queries := db.New(pool)
+	u, err := queries.CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@grpc-integration.invalid", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base = int64(1<<53 + 1)
+	if _, err := pool.Exec(ctx, "UPDATE users SET display_name=$2,lifecycle_revision=$3 WHERE id=$1", u.ID, strconv.FormatInt(base, 10), base); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := profile.New(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t)
+	cfg.Queries = queries
+	client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
+	finished := make(chan error, 1)
+	go func() {
+		for revision := base; revision < base+20; revision++ {
+			if _, err := svc.Update(ctx, u.ID, u.AuthVersion, strconv.FormatInt(revision+1, 10), strconv.FormatInt(revision, 10)); err != nil {
+				finished <- err
+				return
+			}
+		}
+		finished <- nil
+	}()
+	for range 50 {
+		response, err := client.GetInternalUserInfo(ctx, &identityv1.GetInternalUserInfoRequest{UserId: u.ID.String()})
+		if err != nil || response == nil || response.DisplayName != strconv.FormatUint(response.LifecycleRevision, 10) || response.LifecycleRevision < uint64(base) {
+			t.Fatalf("concurrent gRPC name/revision snapshot tore: %v", err)
+		}
+	}
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.GetInternalUserInfo(ctx, &identityv1.GetInternalUserInfoRequest{UserId: u.ID.String()})
+	if err != nil || response.LifecycleRevision != uint64(base+20) || response.DisplayName != strconv.FormatInt(base+20, 10) {
+		t.Fatal("latest shared profile snapshot was not visible")
+	}
 }

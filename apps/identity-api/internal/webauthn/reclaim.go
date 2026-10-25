@@ -74,10 +74,11 @@ func (s *Service) BeginReclaimAssertion(ctx context.Context, userID uuid.UUID, r
 		return nil, fmt.Errorf("webauthn: begin reclaim assertion: %w", err)
 	}
 
-	if err := s.challenges.Save(session.Challenge, PendingChallenge{
+	if err := s.challenges.Save(ctx, session.Challenge, PendingChallenge{
 		Session:   *session,
 		UserRef:   user.ID,
 		SessionID: requestID,
+		DPoPJKT:   challengeDPoPJKT(ctx),
 		Flow:      FlowReclaim,
 		Expires:   s.now().Add(s.challengeTTL),
 	}); err != nil {
@@ -92,7 +93,7 @@ func (s *Service) BeginReclaimAssertion(ctx context.Context, userID uuid.UUID, r
 // credentials was presented for this exact deletion request; internal/privacy turns
 // that into the status change.
 //
-// TakeBound is what enforces the tag and the request binding while holding the
+// Take enforces the tag and the request binding atomically, so
 // store lock, so neither a login challenge nor another request's reclaim challenge
 // can be redeemed here, and a probe with the wrong request id cannot burn the
 // legitimate caller's pending ceremony.
@@ -114,8 +115,9 @@ func (s *Service) FinishReclaimAssertion(ctx context.Context, userID uuid.UUID, 
 		return fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
 
-	pending, err := s.challenges.TakeBound(
-		parsed.Response.CollectedClientData.Challenge, FlowReclaim, userID, requestID)
+	pending, err := s.challenges.Take(ctx, parsed.Response.CollectedClientData.Challenge, ChallengeBinding{
+		Flows: []Flow{FlowReclaim}, UserRef: userID, SessionID: requestID, DPoPJKT: challengeDPoPJKT(ctx),
+	})
 	if err != nil {
 		return err
 	}

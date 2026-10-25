@@ -166,6 +166,7 @@ func (e *mfaTestEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byte
 
 type mfaTestFixture struct {
 	server  *Server
+	browser *portalTestClient
 	store   *mfaFakeStore
 	user    *mfaTestUser
 	sess    session.Session
@@ -235,12 +236,14 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 		t.Fatalf("session.NewManager: %v", err)
 	}
 
-	// Pre-issue valid session
+	browser := newPortalTestClient(t, testPortalOrigin)
+	// Pre-issue a session bound to the fixture's real browser key.
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
 		UserID:    u.id.String(),
 		IP:        "127.0.0.1",
 		UserAgent: "test-agent",
+		DPoPJKT:   browser.jkt,
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)
@@ -264,14 +267,16 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 		)
 	}
 
-	srv := New(config.Config{Environment: "development"}, nil, Deps{
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 		SessionManager: sessMgr,
+		DPoPValidator:  browser.validator,
 		MFA:            mfaSvc,
 		StepUp:         stepUpSvc,
 	})
 
 	return &mfaTestFixture{
 		server:  srv,
+		browser: browser,
 		store:   store,
 		user:    u,
 		sess:    sess,
@@ -286,9 +291,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 
 	// 1. Generate Setup
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/generate", nil)
-	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
-	}
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, fx.grantHeader(t))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -296,7 +299,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("generate: expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
-	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+	if rec.Header().Get("Cache-Control") != "private, no-store" || rec.Header().Get("Pragma") != "no-cache" {
 		t.Fatalf("TOTP secret response is cacheable: Cache-Control=%q Pragma=%q", rec.Header().Get("Cache-Control"), rec.Header().Get("Pragma"))
 	}
 
@@ -311,9 +314,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 	// 2. Verify with invalid code
 	verifyBody, _ := json.Marshal(map[string]string{"enrollment_id": genResp.EnrollmentID, "code": "000000"})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", bytes.NewReader(verifyBody))
-	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
-	}
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec = httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
@@ -330,9 +331,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 
 	verifyBody, _ = json.Marshal(map[string]string{"enrollment_id": genResp.EnrollmentID, "code": validCode})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", bytes.NewReader(verifyBody))
-	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
-	}
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec = httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
@@ -348,9 +347,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 	// 4. The former public enabled-code oracle is absent.
 	verifyCodeBody, _ := json.Marshal(map[string]string{"code": validCode})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify-code", bytes.NewReader(verifyCodeBody))
-	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
-	}
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec = httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
@@ -362,9 +359,7 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 	// cookie and a fresh grant; the fixture is built with a step-up service for
 	// exactly this step.
 	req = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa", nil)
-	if fx.cookie != nil {
-		req.AddCookie(fx.cookie)
-	}
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, fx.grantHeader(t))
 	rec = httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -383,22 +378,24 @@ func TestMFARoutesRequireSession(t *testing.T) {
 
 	// Call without cookie
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/generate", nil)
+	fx.browser.prepare(req)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("unauthenticated generate: expected 401 Unauthorized, got %d", rec.Code)
-	}
+	requirePortalSessionRequired(t, rec)
 }
 
 func TestMFAGenerateRejectsSessionWithoutStepUp(t *testing.T) {
 	fx := setupMFATestFixtureWithStepUp(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/generate", nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("generate without step-up = %d, want 403", rec.Code)
+	}
+	if got := errorBody(t, rec); got != "insufficient_user_authentication" {
+		t.Fatalf("generate without step-up error = %q", got)
 	}
 	if len(fx.store.enrollments) != 0 {
 		t.Fatal("pending enrollment was created without step-up")
@@ -414,13 +411,12 @@ func TestMFADisableRequiresSessionBeforeStepUp(t *testing.T) {
 	fx := setupMFATestFixtureWithStepUp(t)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa", nil)
+	fx.browser.prepare(req)
 	req.Header.Set(stepup.HeaderStepUpAuth, fx.grantHeader(t))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 from the session guard, got %d (%s)", rec.Code, rec.Body.String())
-	}
+	requirePortalSessionRequired(t, rec)
 }
 
 // TestMFADisableRejectedWithoutGrant confirms a live session alone is not enough
@@ -429,12 +425,15 @@ func TestMFADisableRejectedWithoutGrant(t *testing.T) {
 	fx := setupMFATestFixtureWithStepUp(t)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa", nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := errorBody(t, rec); got != "insufficient_user_authentication" {
+		t.Fatalf("disable without step-up error = %q", got)
 	}
 	if fx.user.mfaOn {
 		// Belt and braces: a rejected request must not have run the handler.

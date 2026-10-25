@@ -127,6 +127,7 @@ const (
 
 type recoveryTestFixture struct {
 	server  *Server
+	browser *portalTestClient
 	store   *recoveryFakeStore
 	svc     *recovery.Service
 	flow    *recovery.FlowService
@@ -160,28 +161,6 @@ func newRecoverySessionManager(t *testing.T) *session.Manager {
 	return sessMgr
 }
 
-// issueRecoverySession mints a session for userID and returns it with its cookie.
-func issueRecoverySession(t *testing.T, sessMgr *session.Manager, userID uuid.UUID) (session.Session, *http.Cookie) {
-	t.Helper()
-
-	w := httptest.NewRecorder()
-	sess, err := sessMgr.Issue(w, session.IssueParams{
-		UserID:    userID.String(),
-		IP:        "127.0.0.1",
-		UserAgent: "test-agent",
-	})
-	if err != nil {
-		t.Fatalf("sessMgr.Issue: %v", err)
-	}
-	for _, c := range w.Result().Cookies() {
-		if c.Name == "session" {
-			return sess, c
-		}
-	}
-	t.Fatal("session cookie was not set")
-	return session.Session{}, nil
-}
-
 func setupRecoveryTestFixture(t *testing.T) *recoveryTestFixture {
 	t.Helper()
 
@@ -198,7 +177,10 @@ func setupRecoveryTestFixture(t *testing.T) *recoveryTestFixture {
 	}
 
 	sessMgr := newRecoverySessionManager(t)
-	sess, cookie := issueRecoverySession(t, sessMgr, userID)
+	browser := newPortalTestClient(t, testPortalOrigin)
+	sess, cookies := browser.issueSession(t, sessMgr, session.IssueParams{
+		UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+	})
 
 	// POST /generate is step-up gated, so the fixture always wires a step-up
 	// service; without one the route would not be mounted at all.
@@ -208,8 +190,9 @@ func setupRecoveryTestFixture(t *testing.T) *recoveryTestFixture {
 		&stepUpFakeTOTP{valid: "000000"},
 	)
 
-	srv := New(config.Config{Environment: "development"}, nil, Deps{
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 		SessionManager: sessMgr,
+		DPoPValidator:  browser.validator,
 		Recovery:       svc,
 		RecoveryFlow:   flow,
 		StepUp:         stepUpSvc,
@@ -217,11 +200,12 @@ func setupRecoveryTestFixture(t *testing.T) *recoveryTestFixture {
 
 	return &recoveryTestFixture{
 		server:  srv,
+		browser: browser,
 		store:   store,
 		svc:     svc,
 		flow:    flow,
 		userID:  userID,
-		cookie:  cookie,
+		cookie:  cookies[0],
 		sessMgr: sessMgr,
 		sess:    sess,
 		stepUp:  stepUpSvc,
@@ -234,16 +218,16 @@ func (fx *recoveryTestFixture) generate(t *testing.T) *httptest.ResponseRecorder
 	t.Helper()
 
 	req := httptest.NewRequest(http.MethodPost, recoveryGeneratePath, nil)
-	req.AddCookie(fx.cookie)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
 }
 
-// do issues a request against the fixture's router, attaching the session cookie
-// when one is supplied.
-func (fx *recoveryTestFixture) do(t *testing.T, method, path string, body []byte, cookie *http.Cookie) *httptest.ResponseRecorder {
+// do issues a request with explicitly selected session credentials. Anonymous
+// recovery requests receive only transport headers, never a session cookie.
+func (fx *recoveryTestFixture) do(t *testing.T, method, path string, body []byte, current session.Session, cookie *http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var reader io.Reader
@@ -251,8 +235,9 @@ func (fx *recoveryTestFixture) do(t *testing.T, method, path string, body []byte
 		reader = bytes.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
+	fx.browser.prepare(req)
 	if cookie != nil {
-		req.AddCookie(cookie)
+		fx.browser.authorize(t, req, current, cookie)
 	}
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -276,7 +261,7 @@ func (fx *recoveryTestFixture) startTransaction(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("marshal recovery start: %v", err)
 	}
-	rec := fx.do(t, http.MethodPost, "/api/v1/auth/recovery/start", body, nil)
+	rec := fx.do(t, http.MethodPost, "/api/v1/auth/recovery/start", body, session.Session{}, nil)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("recovery start = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -298,7 +283,8 @@ func (fx *recoveryTestFixture) verifyBody(t *testing.T, code string) []byte {
 // routes exist, rather than 500ing on a nil service.
 func TestRecoveryRoutesAbsentWithoutService(t *testing.T) {
 	sessMgr := newRecoverySessionManager(t)
-	srv := New(config.Config{Environment: "development"}, nil, Deps{SessionManager: sessMgr})
+	browser := newPortalTestClient(t, testPortalOrigin)
+	srv := New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{SessionManager: sessMgr, DPoPValidator: browser.validator})
 
 	for _, tc := range []struct {
 		method string
@@ -309,6 +295,7 @@ func TestRecoveryRoutesAbsentWithoutService(t *testing.T) {
 		{http.MethodPost, recoveryVerifyPath},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
+		browser.prepare(req)
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotFound {
@@ -328,10 +315,8 @@ func TestRecoveryRoutesRequireSession(t *testing.T) {
 		{http.MethodPost, recoveryGeneratePath, nil},
 		{http.MethodGet, recoveryStatusPath, nil},
 	} {
-		rec := fx.do(t, tc.method, tc.path, tc.body, nil)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("unauthenticated %s %s = %d, want 401", tc.method, tc.path, rec.Code)
-		}
+		rec := fx.do(t, tc.method, tc.path, tc.body, session.Session{}, nil)
+		requirePortalSessionRequired(t, rec)
 	}
 	if got := len(fx.store.codes[fx.userID]); got != 0 {
 		t.Errorf("unauthenticated requests minted %d codes, want 0", got)
@@ -356,12 +341,12 @@ func TestRecoveryStartIsOpaqueForKnownUnknownAndInactiveAccounts(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
-			rec := fx.do(t, http.MethodPost, "/api/v1/auth/recovery/start", body, nil)
+			rec := fx.do(t, http.MethodPost, "/api/v1/auth/recovery/start", body, session.Session{}, nil)
 			if rec.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want 202 (body: %s)", rec.Code, rec.Body.String())
 			}
-			if rec.Header().Get("Cache-Control") != "no-store" {
-				t.Fatalf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+			if rec.Header().Get("Cache-Control") != "private, no-store" {
+				t.Fatalf("Cache-Control = %q, want private, no-store", rec.Header().Get("Cache-Control"))
 			}
 			var response recoveryStartResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
@@ -385,7 +370,7 @@ func TestRestrictedRecoverySessionCannotAccessNormalOrHighRiskRoutes(t *testing.
 	if err := json.Unmarshal(batchRec.Body.Bytes(), &batch); err != nil {
 		t.Fatalf("unmarshal batch: %v", err)
 	}
-	verified := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, batch.Codes[0]), nil)
+	verified := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, batch.Codes[0]), session.Session{}, nil)
 	if verified.Code != http.StatusOK {
 		t.Fatalf("verify = %d, want 200 (body: %s)", verified.Code, verified.Body.String())
 	}
@@ -399,6 +384,12 @@ func TestRestrictedRecoverySessionCannotAccessNormalOrHighRiskRoutes(t *testing.
 	if restricted == nil {
 		t.Fatal("successful recovery did not issue a restricted-session cookie")
 	}
+	lookup := httptest.NewRequest(http.MethodGet, recoveryStatusPath, nil)
+	lookup.AddCookie(restricted)
+	restrictedSession, err := fx.sessMgr.Resolve(lookup)
+	if err != nil || restrictedSession.Kind != session.KindRecoveryEnrollment {
+		t.Fatalf("resolve restricted session: kind=%q err=%v", restrictedSession.Kind, err)
+	}
 
 	for _, tc := range []struct {
 		method string
@@ -407,10 +398,8 @@ func TestRestrictedRecoverySessionCannotAccessNormalOrHighRiskRoutes(t *testing.
 		{method: http.MethodGet, path: recoveryStatusPath},
 		{method: http.MethodPost, path: recoveryGeneratePath},
 	} {
-		rec := fx.do(t, tc.method, tc.path, nil, restricted)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("restricted %s %s = %d, want 401", tc.method, tc.path, rec.Code)
-		}
+		rec := fx.do(t, tc.method, tc.path, nil, restrictedSession, restricted)
+		requirePortalSessionRequired(t, rec)
 	}
 }
 
@@ -453,8 +442,8 @@ func TestRecoveryGenerateReturnsOneTimeBatch(t *testing.T) {
 
 	// One-time secrets must not be cacheable: a shared proxy cache or a
 	// back-button replay would otherwise resurface the whole batch.
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+	if got := rec.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Errorf("Cache-Control = %q, want %q", got, "private, no-store")
 	}
 	if got := rec.Header().Get("Pragma"); got != "no-cache" {
 		t.Errorf("Pragma = %q, want %q", got, "no-cache")
@@ -474,7 +463,7 @@ func TestRecoveryStatusTracksTheBatch(t *testing.T) {
 	fx := setupRecoveryTestFixture(t)
 
 	// No batch yet: zero remaining, and zero is at or below any threshold.
-	rec := fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.cookie)
+	rec := fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.sess, fx.cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status before generate = %d, want 200", rec.Code)
 	}
@@ -495,7 +484,7 @@ func TestRecoveryStatusTracksTheBatch(t *testing.T) {
 		t.Fatalf("unmarshal generate: %v", err)
 	}
 
-	rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.cookie)
+	rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.sess, fx.cookie)
 	var after recoveryStatusResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &after); err != nil {
 		t.Fatalf("unmarshal status: %v", err)
@@ -510,7 +499,7 @@ func TestRecoveryStatusTracksTheBatch(t *testing.T) {
 	// Spend codes down to the low-water mark and confirm the flag flips.
 	for len(fx.store.codes[fx.userID]) > 0 {
 		remaining := len(fx.store.codes[fx.userID])
-		rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.cookie)
+		rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.sess, fx.cookie)
 		var st recoveryStatusResponse
 		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 			t.Fatalf("unmarshal status: %v", err)
@@ -521,7 +510,7 @@ func TestRecoveryStatusTracksTheBatch(t *testing.T) {
 		fx.store.codes[fx.userID] = fx.store.codes[fx.userID][:remaining-1]
 	}
 
-	rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.cookie)
+	rec = fx.do(t, http.MethodGet, recoveryStatusPath, nil, fx.sess, fx.cookie)
 	var empty recoveryStatusResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil {
 		t.Fatalf("unmarshal status: %v", err)
@@ -541,7 +530,7 @@ func TestRecoveryVerifyConsumesCodeAndRejectsReplay(t *testing.T) {
 	}
 	code := gen.Codes[0]
 
-	rec := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, code), nil)
+	rec := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, code), session.Session{}, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("verify = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -558,7 +547,7 @@ func TestRecoveryVerifyConsumesCodeAndRejectsReplay(t *testing.T) {
 
 	// Replaying the very same code must fail: the row was physically deleted in
 	// the same transaction that matched it.
-	rec = fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, code), nil)
+	rec = fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, code), session.Session{}, nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("replayed verify = %d, want 401", rec.Code)
 	}
@@ -574,7 +563,7 @@ func TestRecoveryVerifyConsumesCodeAndRejectsReplay(t *testing.T) {
 	}
 
 	// A different, untouched code from the same batch still works.
-	rec = fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, gen.Codes[1]), nil)
+	rec = fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, gen.Codes[1]), session.Session{}, nil)
 	if rec.Code != http.StatusOK {
 		t.Errorf("verify of a second code = %d, want 200", rec.Code)
 	}
@@ -597,7 +586,7 @@ func TestRecoveryVerifyFailuresAreIndistinguishable(t *testing.T) {
 
 	// Spend one code so a replay is available as a distinct failure mode.
 	spent := gen.Codes[0]
-	if rec := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, spent), nil); rec.Code != http.StatusOK {
+	if rec := fx.do(t, http.MethodPost, recoveryVerifyPath, fx.verifyBody(t, spent), session.Session{}, nil); rec.Code != http.StatusOK {
 		t.Fatalf("priming verify = %d, want 200", rec.Code)
 	}
 
@@ -619,13 +608,13 @@ func TestRecoveryVerifyFailuresAreIndistinguishable(t *testing.T) {
 		{name: "separators only", body: fx.verifyBody(t, "----")},
 		{name: "empty JSON object", body: []byte(`{}`)},
 		{name: "absent body", body: nil},
-		{name: "whitespace body", body: []byte("   ")},
+		{name: "whitespace-padded empty object", body: []byte("   {}   ")},
 	}
 
 	var wantStatus int
 	var wantBody string
 	for i, tc := range cases {
-		rec := fx.do(t, http.MethodPost, recoveryVerifyPath, tc.body, fx.cookie)
+		rec := fx.do(t, http.MethodPost, recoveryVerifyPath, tc.body, fx.sess, fx.cookie)
 		if i == 0 {
 			wantStatus = rec.Code
 			wantBody = rec.Body.String()
@@ -656,26 +645,27 @@ func TestRecoveryVerifyFailuresAreIndistinguishable(t *testing.T) {
 func TestRecoveryVerifyMalformedJSONReturns400(t *testing.T) {
 	fx := setupRecoveryTestFixture(t)
 
-	rec := fx.do(t, http.MethodPost, recoveryVerifyPath, []byte(`{"code":`), fx.cookie)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("malformed JSON = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
-	}
-	var resp recoveryErrorResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal error response: %v", err)
-	}
-	if resp.Error != "invalid_request" {
-		t.Errorf("error = %q, want %q", resp.Error, "invalid_request")
+	for _, body := range []string{`{"code":`, "   "} {
+		rec := fx.do(t, http.MethodPost, recoveryVerifyPath, []byte(body), fx.sess, fx.cookie)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("malformed JSON = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+		}
+		var resp recoveryErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal error response: %v", err)
+		}
+		if resp.Error != "invalid_request" {
+			t.Errorf("error = %q, want %q", resp.Error, "invalid_request")
+		}
 	}
 }
 
 // --- Account status gate ----------------------------------------------------
 
-// TestRecoveryNonActiveAccountUnauthorized guards the loadUser status gate at the
-// HTTP boundary. Session validation never re-reads users.status, so without the
-// gate a user suspended after their session was issued could keep minting and
-// spending codes. The reply is the same opaque "unauthorized" used for a deleted
-// account: naming the suspension would make account state an oracle.
+// TestRecoveryNonActiveAccountUnauthorized isolates the service's status gate
+// behind a valid bound session. This fixture's in-memory session authority does
+// not read recoveryFakeStore, so these denials must come from the recovery
+// service, not a cookie or DPoP failure. Account-state details remain opaque.
 func TestRecoveryNonActiveAccountUnauthorized(t *testing.T) {
 	for _, status := range []string{"suspended", "pending_verification", "pending_deletion"} {
 		t.Run(status, func(t *testing.T) {
@@ -708,7 +698,7 @@ func TestRecoveryNonActiveAccountUnauthorized(t *testing.T) {
 				if tc.gated {
 					rec = fx.generate(t)
 				} else {
-					rec = fx.do(t, tc.method, tc.path, tc.body, fx.cookie)
+					rec = fx.do(t, tc.method, tc.path, tc.body, fx.sess, fx.cookie)
 				}
 				if rec.Code != http.StatusUnauthorized {
 					t.Errorf("%s for a %s account = %d, want 401 (body: %s)", tc.name, status, rec.Code, rec.Body.String())
@@ -779,7 +769,10 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	}
 
 	sessMgr := newRecoverySessionManager(t)
-	sess, cookie := issueRecoverySession(t, sessMgr, userID)
+	browser := newPortalTestClient(t, testPortalOrigin)
+	sess, cookies := browser.issueSession(t, sessMgr, session.IssueParams{
+		UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+	})
 
 	// A step-up service is wired so the gated routes participate in the mount,
 	// which is the arrangement most likely to expose a chi pattern conflict.
@@ -798,8 +791,9 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 				t.Fatalf("New() panicked with MFA and Recovery co-mounted on /api/v1/auth/mfa: %v", p)
 			}
 		}()
-		srv = New(config.Config{Environment: "development"}, nil, Deps{
+		srv = New(config.Config{Environment: "development", PortalOrigin: browser.origin}, nil, Deps{
 			SessionManager: sessMgr,
+			DPoPValidator:  browser.validator,
 			MFA:            mfaSvc,
 			Recovery:       recoverySvc,
 			RecoveryFlow:   recoveryFlow,
@@ -813,7 +807,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 			reader = bytes.NewReader(body)
 		}
 		req := httptest.NewRequest(method, path, reader)
-		req.AddCookie(cookie)
+		browser.authorize(t, req, sess, cookies...)
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
 		return rec
@@ -822,7 +816,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	// The MFA catch-all still serves its own paths: a TOTP setup secret comes
 	// back, which only the MFA handler can produce.
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/generate", nil)
-	req.AddCookie(cookie)
+	browser.authorize(t, req, sess, cookies...)
 	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, stepUpSvc, sess.UserID, sess.ID))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)

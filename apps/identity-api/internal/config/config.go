@@ -47,6 +47,9 @@ type Config struct {
 	// Environment identifies the deployment environment (e.g. "development",
 	// "production"). It is informational and used for readiness reporting.
 	Environment string
+	// PortalOrigin is the canonical first-party browser origin. Composition
+	// validates it against the issuer and WebAuthn origins before serving traffic.
+	PortalOrigin string
 	// TrustedProxyCIDRs contains the immediate reverse-proxy networks allowed to
 	// assert X-Forwarded-For. An empty slice is the secure default: all forwarding
 	// headers are ignored and the socket peer is treated as the client.
@@ -116,9 +119,20 @@ func LoadSession() (SessionConfig, error) {
 		return SessionConfig{}, fmt.Errorf(
 			"config: SESSION_IDLE_TTL %v must not exceed SESSION_ABSOLUTE_TTL %v", idleTTL, absoluteTTL)
 	}
+	name := getEnv("SESSION_COOKIE_NAME", defaultSessionCookieName)
+	environment := getEnv("APP_ENV", "development")
+	if !secure || !strings.HasPrefix(name, "__Host-") {
+		origin := getEnv(EnvPortalOrigin, getEnv(EnvOIDCIssuer, defaultDevIssuer))
+		if environment != "development" || !strings.HasPrefix(origin, "http://") {
+			return SessionConfig{}, fmt.Errorf("config: a Secure __Host- session cookie is required outside local HTTP development")
+		}
+		if _, err := canonicalPortalOrigin(origin, environment); err != nil {
+			return SessionConfig{}, err
+		}
+	}
 
 	return SessionConfig{
-		CookieName:   getEnv("SESSION_COOKIE_NAME", defaultSessionCookieName),
+		CookieName:   name,
 		CookieSecure: secure,
 		AbsoluteTTL:  absoluteTTL,
 		IdleTTL:      idleTTL,

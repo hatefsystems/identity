@@ -26,6 +26,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
@@ -71,12 +72,16 @@ type Deps struct {
 	// and the self-service session list/revoke routes
 	// (/api/v1/users/me/sessions). When nil, those routes are not mounted.
 	SessionManager *session.Manager
+	// Profile exposes the minimized shared account projection and revisioned edits.
+	Profile *profile.Service
 	// WebAuthn drives the passkey ceremonies at /api/v1/auth/webauthn. It
 	// requires a database, so when nil (no DATABASE_URL configured) those
 	// routes are not mounted. The enrolment subset additionally requires
 	// SessionManager, since a passkey may only be added to an account the
 	// caller already holds a live session for.
 	WebAuthn *webauthn.Service
+	// WebAuthnLimiter bounds anonymous ceremony allocation by trusted subnet.
+	WebAuthnLimiter ratelimit.Limiter
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
 	// at /api/v1/auth/mfa.
 	MFA *mfa.Service
@@ -227,6 +232,7 @@ func (s *Server) record(r *http.Request, e audit.Event) {
 func (s *Server) registerMiddleware() {
 	s.router.Use(middleware.RequestID)
 	s.router.Use(clientip.Middleware(s.cfg.TrustedProxyCIDRs))
+	s.router.Use(s.browserBoundary)
 	s.router.Use(middleware.Recoverer)
 }
 
@@ -245,6 +251,9 @@ func (s *Server) registerRoutes() {
 	// only mounted when a session manager has been provisioned.
 	if s.deps.SessionManager != nil {
 		s.registerSessionRoutes()
+	}
+	if s.deps.Profile != nil {
+		s.registerProfileRoutes()
 	}
 
 	// Passkey ceremony routes are only mounted when a WebAuthn service has
@@ -292,19 +301,12 @@ func (s *Server) registerRoutes() {
 // A false return means the caller must leave its routes unmounted rather than
 // expose them unguarded: without a session manager there is no way to
 // authenticate the caller at all. subsystem names the caller in the log line.
-func (s *Server) sessionGuard(subsystem string) (*session.RequireSession, bool) {
+func (s *Server) sessionGuard(subsystem string) (*browserSessionGuard, bool) {
 	if s.deps.SessionManager == nil {
 		s.logger.Warn(subsystem + ": no session manager configured; routes not mounted")
 		return nil, false
 	}
-	guard, err := session.NewRequireSession(s.deps.SessionManager)
-	if err != nil {
-		// Unreachable given the non-nil manager, but surface it rather than
-		// mounting unguarded routes.
-		s.logger.Error(subsystem+": failed to build RequireSession middleware", "error", err.Error())
-		return nil, false
-	}
-	return guard, true
+	return &browserSessionGuard{server: s}, true
 }
 
 // stepUpGuard builds the step-up enforcement middleware for the high-risk routes,

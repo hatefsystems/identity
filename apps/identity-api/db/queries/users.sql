@@ -41,6 +41,24 @@ SELECT * FROM users
 WHERE id = $1
   AND deleted_at IS NULL;
 
+-- name: GetUserProfile :one
+-- Minimal self-service snapshot; auth_version is checked but never disclosed.
+SELECT id, email, display_name, status, lifecycle_revision, auth_version
+FROM users WHERE id = $1 AND deleted_at IS NULL;
+
+-- name: GetUserProfileForUpdate :one
+-- Acquire the account advisory lock first, then recheck captured authority.
+SELECT id, email, display_name, status, lifecycle_revision, auth_version
+FROM users WHERE id = $1 AND deleted_at IS NULL
+FOR UPDATE;
+
+-- name: UpdateUserDisplayName :execrows
+-- Caller holds the account row and commits the revision/outbox in this transaction.
+UPDATE users SET display_name = $2, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL AND status = 'active'
+  AND auth_version = $3 AND lifecycle_revision = $4
+  AND display_name IS DISTINCT FROM $2;
+
 -- name: GetAccountAuthState :one
 SELECT status, deleted_at, auth_version, auth_epoch FROM users WHERE id = $1;
 

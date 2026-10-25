@@ -6,7 +6,7 @@ This document is an integration handbook for client applications and microservic
 
 ## 1. Public Clients Integration (OAuth 2.1 & OIDC)
 
-Public clients (such as the Next.js frontend or mobile applications) run in untrusted environments. They must communicate with the Hatef Identity Platform using OIDC/OAuth 2.1 mechanisms.
+Third-party public clients and mobile applications use the OIDC/OAuth 2.1 mechanisms below. The first-party Task 7.3 account portal instead manages a Go-issued browser session through the same-origin cookie/DPoP contract in section 1.3; it does not obtain access or refresh tokens for portal state.
 
 ### 1.1 Mandatory PKCE (S256)
 
@@ -46,7 +46,7 @@ Every public authorization flow must utilize the Authorization Code flow with Pr
 To prevent session hijacking via token theft, public clients must bind access and refresh tokens to an ephemeral client-side private key using **DPoP**.
 
 #### 1.2.1 Ephemeral Key Generation (Browser)
-Clients must generate an asymmetric ECDSA P-256 keypair via the WebCrypto API with the `extractable: false` attribute. This guarantees that malicious scripts (e.g., in the event of XSS) cannot read the private key.
+Clients generate an asymmetric ECDSA P-256 keypair via WebCrypto with `extractable: false`. This prevents API export of the private key, but same-origin malicious JavaScript may still invoke its signing operations. Non-exportability is not an XSS authorization boundary.
 
 ```javascript
 // Generate ECDSA P-256 keypair in IndexedDB
@@ -94,6 +94,69 @@ async function createDPoPProof(keyPair, httpMethod, requestUrl, nonce) {
 Public clients are incapable of maintaining secrets securely. Therefore:
 * Public clients must be registered with their client metadata parameter `token_endpoint_auth_method` set strictly to `"none"`.
 * Public clients do **not** use `private_key_jwt` for OIDC authentication. Only confidential back-end services are allowed to use `private_key_jwt`.
+
+### 1.3 First-Party Portal Sessions (Task 7.3)
+
+Use the application-local adapters in `apps/web/app/_lib/portal` for the portal,
+not the OAuth token sample above. The browser sees one canonical HTTPS origin:
+pages/static resources route to Next.js and `/api` routes directly to Go.
+`PORTAL_ORIGIN` must match the issuer origin and an allowed WebAuthn origin.
+There is no cross-origin API mode, BFF or cookie-only fallback.
+
+1. On a deliberate passkey sign-in action, create/open a non-exportable P-256
+   private `CryptoKey` and public JWK metadata in IndexedDB. Concurrent tabs select
+   the active record transactionally. Persist no other credential/profile material;
+   missing or unusable storage requires fresh login, not a weaker authentication mode.
+2. Sign `POST /api/v1/auth/webauthn/login/generate-options` and `/login/verify`
+   with the same key. The API freezes the verified thumbprint in pending state and
+   the issued normal session. Perform real binary WebAuthn option conversion and
+   credential serialization; cancellation/expiry is not successful authentication.
+3. Bootstrap `GET /api/v1/users/me` using that key and the HttpOnly cookie before
+   displaying private data. Keep the returned account/session snapshot transient.
+   Its `session.expires_at` is absolute; never invent or extend it client-side.
+4. Send `X-Portal-Session: <session.id>` on authenticated mutations and subsequent
+   reads. A supplied intent is checked even on GET. `409 session_changed` means
+   clear the old snapshot and re-bootstrap, not retry against a different account.
+5. Every proof has a fresh JTI, method, canonical origin plus escaped path, current
+   time and public JWK. Cookie requests have no access-token `ath`. Keep nonces
+   request-local: retry once only for explicit pre-handler `401 use_dpop_nonce`
+   plus `DPoP-Nonce`, generating a new proof/JTI. Do not retry uncertain mutations,
+   authenticator responses or spent grants after transport failure.
+6. Unsafe requests require the exact Origin and valid bounded JSON where a body
+    is sent. Fetch uses same-origin cookies, no-store, abort signals and no arbitrary
+    redirects. Its `mode: 'cors'` preserves the Origin header under `no-referrer`;
+    strict URL validation still forbids cross-origin API calls. Using
+    `mode: 'same-origin'` with that referrer policy can send `Origin: null` instead.
+    APIs themselves enforce private/no-store/no-referrer on all responses.
+7. Pin each sensitive action/target, obtain fresh UV/TOTP step-up when advertised,
+   and spend the in-memory grant through `X-Step-Up-Auth`. Registration consumes it
+   at options generation and finishes with the same session, without another grant.
+   Profile display-name edits need no step-up but require an exact decimal revision.
+8. Broadcast invalidation notices only. Clear private views and cancel late work
+    on account/session change, sign-out, hide/pagehide or detected loss; resume with
+    a new authority check. Do not send credentials/profile data between tabs or poll
+    in the background to keep sessions alive.
+
+An ordinary hidden-tab transition may retain a narrow non-secret TOTP action
+intent in component/provider memory so switching to an authenticator app is usable.
+Restore it only after the same public session ID is freshly verified, with a new
+explicit challenge/confirmation. Never retain a factor code, grant, challenge,
+proof, recovery batch or an in-flight mutation as resumable authority. Navigation,
+pagehide, account change and failed revalidation discard the intent. Notifications
+must not echo to their sender and undo a failed sign-out state; failed sign-out
+requires explicit reconciliation. Cancelled transmitted mutations are uncertain,
+not permission to replay them or restore an older list response.
+
+Distinguish `session_required` from `use_dpop_nonce`, `invalid_dpop_proof` and a
+login/step-up `invalid_credentials`. An incorrect TOTP stays in the dialog;
+`403 insufficient_user_authentication` requests new step-up, and
+`503 temporarily_unavailable` is not a cached authorization or a successful revoke.
+The recovery API returns a replacement plaintext batch once. Keep it only in view
+memory, support explicit Copy/Download, and clear it by navigation/session loss or
+five minutes (whichever bound applies first). A lost generation response may have
+invalidated the previous batch; only a new explicit generation can replace it.
+
+For full HTTP shapes and failure handling, see the [browser boundary](api-design.md#first-party-browser-boundary-task-73).
 
 ---
 
@@ -287,15 +350,15 @@ Send the exact raw access token, observed authorization scheme and expected audi
 | `InvalidArgument` / `PermissionDenied` | Correct the request or operator policy; neither is resolved by repeatedly submitting a user proof. |
 | `Canceled` / `DeadlineExceeded` | Preserve cancellation semantics. An ambiguous proof-consuming attempt must not be automatically replayed. |
 
-Browser logout, device revocation, idle expiry and absolute expiry end all linked user access/refresh authority. Validation and refresh do not count as browser activity. The existing `offline_access` scope name remains accepted, but does not extend that browser lifetime. Client-credentials tokens have no browser or user identity. Read-only permission/profile RPCs are independently workload-authorized queries: a returned profile is not an authorization decision. Profiles disclose email only for active/pending-verification accounts, omit it for suspended/banned accounts, and return NotFound for deleting/deleted accounts; display name is currently empty.
+Browser logout, individual session revocation, idle expiry and absolute expiry end all linked user access/refresh authority. Validation and refresh do not count as browser activity. The existing `offline_access` scope name remains accepted, but does not extend that browser lifetime. Client-credentials tokens have no browser or user identity. Read-only permission/profile RPCs are independently workload-authorized queries: a returned profile is not an authorization decision. Profiles disclose email and display name only for active/pending-verification accounts, omit both for suspended/banned accounts, and return NotFound for deleting/deleted accounts. Name and lifecycle revision come from the same snapshot.
 
-WebAuthn challenge and client-assertion replay stores remain separate single-process boundaries. Shared credential/RPC state does not claim complete multi-instance HTTP login readiness. See [API design](api-design.md#22-identityservice) for account freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifecycle/TTL details.
+Task 7.3 shares WebAuthn challenges, browser nonce/replay and bound-session state through Redis across API instances. Client-assertion replay remains a separate single-process boundary; portal readiness does not claim unrelated OAuth scaling. See [API design](api-design.md#22-identityservice) for account freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifecycle/TTL details.
 
 ## 4. User Lifecycle Consumption
 
 The [lifecycle contract](api-design.md#3-asynchronous-events-nats-jetstream) is metadata-only. Each service needs its own durable pull consumer on `IDENTITY_USERS`, subscribing to all four subjects with explicit acknowledgements. Do not share a durable between different microservices: that distributes work instead of synchronizing both services. Subscribers need explicitly granted broker credentials and independent gRPC grants to fetch allowed profile data.
 
-1. Validate the subject, schema, UUIDs, revision and bounded field set. ProtoJSON uint64 revisions are decimal strings; never round them through a JavaScript `number`. Unknown or malformed events require quarantine/alerting, not silent acknowledgement.
+1. Validate the subject, schema, UUIDs, revision and bounded field set. Keep v1 validation unchanged (`status`/`email` only), and explicitly support v2's added `display_name` field. Only display-name writes produce v2 in Task 7.3; existing producers and legacy tombstone adaptation remain v1. ProtoJSON uint64 revisions are decimal strings; never round them through a JavaScript `number`. Unknown versions/fields and malformed events require quarantine/alerting, not silent acknowledgement.
 2. Commit projection changes, idempotency information and the processing checkpoint together before acknowledging. A crashed consumer may receive the same event again, and publisher duplicates can outlive JetStream's two-minute deduplication window. Reject already-applied/older revisions even if the transport sequence is new.
 3. Treat a validated deletion as terminal for that UUID, including a supported revision-less legacy deletion. Scrub local Class A profile data without erasing independently protected legal/security evidence. Older created/updated messages must never resurrect it. Keep tombstone/revision protection while older replay/redelivery remains possible; policy-driven expiry requires a reconciled baseline.
 4. For other events, use the exact status to invalidate or disable the projection. Pending deletion is reversible, not permanent erasure. Fetch current allowed data through `GetInternalUserInfo` when needed; its `lifecycle_revision` must be at least the event revision. Apply the returned snapshot only if it has not been superseded locally. This RPC is not an authorization decision.
@@ -303,3 +366,11 @@ The [lifecycle contract](api-design.md#3-asynchronous-events-nats-jetstream) is 
 6. Persist the stream creation identity and contiguous processing checkpoint. Missing/recreated streams or consumers, expired history, and sequence gaps require reconciliation before treating the projection as authoritative. Starting at latest or acknowledging a truncated stream is not reconciliation. Handle out-of-order worker completion without advancing past an uncommitted gap.
 
 Limits retention is a finite replay buffer: acknowledgements do not delete history, and an indefinitely offline consumer has no delivery guarantee. Bootstrap for existing users and full reconciliation after a gap are deployment prerequisites; this task provides neither an enumeration/snapshot RPC nor production consumers. New consumers must establish an authoritative baseline and matching stream checkpoint before activation. The integration suite contains executable contract fixtures, not a downstream implementation.
+
+Deploy and validate dual-version readers/publishers and actual downstream consumers
+before enabling display-name writers. A `display_name` event contains no name value;
+fetch the allowed current gRPC snapshot and apply it only if its revision is not
+superseded. Preserve mixed v1/v2 replay and terminal legacy tombstones. During
+rollback, keep v2-capable publishing/consumption while v2 outbox or retained broker
+history exists; never run an old strict-v1 worker over those rows. Consumer code and
+deployment outside this repository remain explicit operator release gates.

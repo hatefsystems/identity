@@ -57,8 +57,8 @@ type IssueParams struct {
 	IP string
 	// UserAgent identifies the client device/browser.
 	UserAgent string
-	// DPoPJKT binds the session to a DPoP key thumbprint (RFC 9449). Leave
-	// empty for a bearer (non-sender-constrained) session.
+	// DPoPJKT binds the session to a DPoP key thumbprint (RFC 9449). Normal
+	// browser access rejects unbound sessions; a key is earned at fresh login.
 	DPoPJKT string
 	// Kind defaults to KindAuthenticated. Callers may request only the
 	// restricted KindRecoveryEnrollment variant for recovery flows.
@@ -180,12 +180,9 @@ func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p Iss
 	return s, nil
 }
 
-// Authenticate resolves the session bound to the request cookie and slides its
-// idle deadline forward (clamped to the absolute ceiling). It returns
-// ErrNoSession when no cookie is present and ErrSessionNotFound when the token
-// is unknown, revoked, or expired. The returned session reflects the refreshed
-// idle deadline.
-func (m *Manager) Authenticate(r *http.Request) (Session, error) {
+// Resolve checks the cookie and live account authority without renewing any
+// activity. HTTP gates must use it before checking the session kind and proof.
+func (m *Manager) Resolve(r *http.Request) (Session, error) {
 	if err := r.Context().Err(); err != nil {
 		return Session{}, err
 	}
@@ -214,7 +211,31 @@ func (m *Manager) Authenticate(r *http.Request) (Session, error) {
 		}
 	}
 
-	// Slide the idle window forward, clamped to the absolute ceiling.
+	return s, nil
+}
+
+// Authenticate is the combined lifecycle operation for trusted callers. Browser
+// middleware instead separates Resolve from renewal after route authorization.
+func (m *Manager) Authenticate(r *http.Request) (Session, error) {
+	s, err := m.Resolve(r)
+	if err != nil {
+		return Session{}, err
+	}
+	return m.renew(r, s)
+}
+
+func (m *Manager) renew(r *http.Request, s Session) (Session, error) {
+	if err := r.Context().Err(); err != nil {
+		return Session{}, err
+	}
+	token, err := m.cookie.Read(r)
+	if err != nil {
+		return Session{}, ErrNoSession
+	}
+	if expired(s, m.now()) {
+		return Session{}, ErrSessionNotFound
+	}
+	// The store independently refuses to resurrect a revoked or expired record.
 	now := m.now()
 	newIdle := now.Add(m.idleTTL)
 	if newIdle.After(s.AbsoluteExpiry) {
@@ -223,7 +244,7 @@ func (m *Manager) Authenticate(r *http.Request) (Session, error) {
 	if newIdle.Before(s.IdleExpiry) {
 		newIdle = s.IdleExpiry
 	}
-	if err := m.store.Touch(r.Context(), hash, newIdle); err != nil {
+	if err := m.store.Touch(r.Context(), HashToken(token), newIdle); err != nil {
 		// The session lapsed between Get and Touch; treat as not found.
 		return Session{}, err
 	}
@@ -271,12 +292,9 @@ func (m *Manager) ReleaseRecoveryEnrollment(ctx context.Context, userID, session
 // clears the client cookie and returns nil, so logout always succeeds.
 //
 // The returned Session is the one that was revoked, and the bool reports whether
-// anything actually was. Logout is an unauthenticated endpoint, so this is the
-// only place the caller can learn who logged out: there is no session in the
-// request context, and the store is keyed by token hash. Task 5.2 needs the
-// account to attribute auth.session.logged_out (mvp_audit_logs.actor_id is NOT
-// NULL), and needs the false case so an anonymous or already-expired POST cannot
-// append an unattributable row to the audit chain.
+// anything actually was. The HTTP boundary must authorize a live bound session
+// before calling this operation. The result attributes auth.session.logged_out
+// without recording anonymous/already-expired no-ops as account events.
 //
 // The lookup is not atomic with the delete. A concurrent expiry between the two
 // only causes a revoked-but-already-gone session to be reported as revoked, which
@@ -332,3 +350,6 @@ func (m *Manager) RevokeAllForUser(ctx context.Context, userID string) error {
 // CookieName reports the configured session cookie name, exposed for handlers
 // and tests that need to reference it.
 func (m *Manager) CookieName() string { return m.cookie.Name() }
+
+// ClearCookie removes browser state without making a claim about revocation.
+func (m *Manager) ClearCookie(w http.ResponseWriter) { m.cookie.Clear(w) }

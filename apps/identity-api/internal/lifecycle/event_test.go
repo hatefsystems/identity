@@ -24,6 +24,7 @@ const (
 	wireUserID  = "039e55cf-04e1-4453-a3a9-6967d6f16e8a"
 	wireUpdated = `{"schema_version":1,"event_id":"` + wireEventID + `","event_type":"identity.user.updated","user_id":"` + wireUserID + `","occurred_at":"2026-10-15T12:00:00.123456789Z","revision":"7","status":"USER_STATUS_ACTIVE","changed_fields":["status"]}`
 	wireDeleted = `{"schema_version":1,"event_id":"` + wireEventID + `","event_type":"identity.user.deleted","user_id":"` + wireUserID + `","occurred_at":"2026-10-15T12:00:00.123456789Z","revision":"7"}`
+	wireNamed   = `{"schema_version":2,"event_id":"` + wireEventID + `","event_type":"identity.user.updated","user_id":"` + wireUserID + `","occurred_at":"2026-10-15T12:00:00.123456789Z","revision":"7","status":"USER_STATUS_ACTIVE","changed_fields":["display_name"]}`
 )
 
 func wireTime() time.Time {
@@ -148,7 +149,7 @@ func TestNewEventRoundTripsEverySupportedTransition(t *testing.T) {
 }
 
 func TestEventGoldenProtoJSON(t *testing.T) {
-	for _, raw := range []string{wireUpdated, wireDeleted, strings.Replace(wireDeleted, `,"revision":"7"`, "", 1)} {
+	for _, raw := range []string{wireUpdated, wireDeleted, wireNamed, strings.Replace(wireDeleted, `,"revision":"7"`, "", 1)} {
 		event, err := lifecycle.UnmarshalEvent([]byte(raw))
 		if err != nil {
 			t.Fatal(err)
@@ -263,7 +264,8 @@ func TestMarshalEventRejectsInvalidMetadata(t *testing.T) {
 		change func(*identityv1.UserLifecycleEvent)
 	}{
 		{"zero schema", func(e *identityv1.UserLifecycleEvent) { e.SchemaVersion = 0 }},
-		{"unknown schema", func(e *identityv1.UserLifecycleEvent) { e.SchemaVersion = 2 }},
+		{"unknown schema", func(e *identityv1.UserLifecycleEvent) { e.SchemaVersion = 3 }},
+		{"v1 display name field", func(e *identityv1.UserLifecycleEvent) { e.ChangedFields = []string{"display_name"} }},
 		{"unknown protobuf field", func(e *identityv1.UserLifecycleEvent) { e.ProtoReflect().SetUnknown([]byte{0x48, 0x01}) }},
 		{"missing time", func(e *identityv1.UserLifecycleEvent) { e.OccurredAt = nil }},
 		{"zero time", func(e *identityv1.UserLifecycleEvent) { e.OccurredAt = timestamppb.New(time.Time{}) }},
@@ -379,7 +381,8 @@ func TestUnmarshalEventRejectsInvalidWire(t *testing.T) {
 		{"string", `"event"`}, {"truncated", wireUpdated[:len(wireUpdated)-1]}, {"trailing JSON", wireUpdated + "{}"},
 		{"invalid UTF8", appendField("\"email\":\"\xff\"")}, {"BOM", "\xef\xbb\xbf" + wireUpdated},
 		{"legacy payload at wrong boundary", `{"user_id":"` + wireUserID + `"}`},
-		{"unknown schema", replace(`"schema_version":1`, `"schema_version":2`)},
+		{"unknown schema", replace(`"schema_version":1`, `"schema_version":3`)},
+		{"v1 display name field", replace(`["status"]`, `["display_name"]`)},
 		{"missing schema", replace(`"schema_version":1,`, "")},
 		{"null schema", replace(`"schema_version":1`, `"schema_version":null`)},
 		{"quoted schema", replace(`"schema_version":1`, `"schema_version":"1"`)},
@@ -483,7 +486,7 @@ func TestUnmarshalEventMessageSizeBoundaryAndWhitespace(t *testing.T) {
 }
 
 func FuzzUnmarshalEvent(f *testing.F) {
-	for _, seed := range []string{wireUpdated, wireDeleted, strings.Replace(wireDeleted, `,"revision":"7"`, "", 1), "{}", "null",
+	for _, seed := range []string{wireUpdated, wireDeleted, wireNamed, strings.Replace(wireDeleted, `,"revision":"7"`, "", 1), "{}", "null",
 		`{"user_id":"` + wireUserID + `"}`, strings.Repeat("[", 32), strings.Repeat(" ", lifecycle.MaxMessageBytes+1)} {
 		f.Add([]byte(seed))
 	}
@@ -504,4 +507,90 @@ func FuzzUnmarshalEvent(f *testing.F) {
 			t.Fatalf("accepted event did not roundtrip: %v", err)
 		}
 	})
+}
+
+func TestDisplayNameV2ContractAndExactRevisions(t *testing.T) {
+	if lifecycle.SchemaVersion != 1 || lifecycle.SchemaVersionV2 != 2 {
+		t.Fatal("v1 writer default or explicit v2 version changed")
+	}
+	for _, revision := range []int64{1, 1<<53 + 1, math.MaxInt64} {
+		event, err := lifecycle.NewDisplayNameEvent(uuid.MustParse(wireEventID), uuid.MustParse(wireUserID), revision, "active", wireTime())
+		if err != nil || event.SchemaVersion != 2 || event.EventType != lifecycle.SubjectUpdated || len(event.ChangedFields) != 1 || event.ChangedFields[0] != "display_name" {
+			t.Fatalf("invalid v2 name event: %v", err)
+		}
+		encoded, err := lifecycle.MarshalEvent(event)
+		if err != nil || !strings.Contains(compactEventJSON(t, encoded), `"revision":"`+strconv.FormatInt(revision, 10)+`"`) {
+			t.Fatalf("v2 revision was not encoded exactly: %v", err)
+		}
+		decoded, err := lifecycle.UnmarshalEvent(encoded)
+		if err != nil || !proto.Equal(event, decoded) {
+			t.Fatalf("v2 metadata did not roundtrip: %v", err)
+		}
+	}
+	// The original constructor never opts an old producer into v2 implicitly.
+	if event, err := lifecycle.NewEvent(uuid.New(), uuid.New(), 1, lifecycle.SubjectUpdated, "active", []string{"display_name"}, wireTime()); event != nil || !errors.Is(err, lifecycle.ErrInvalidEvent) {
+		t.Fatal("v1 constructor began emitting display-name changes")
+	}
+	for _, fields := range [][]string{{"display_name"}, {"email", "display_name"}, {"status", "email", "display_name"}} {
+		event, err := lifecycle.UnmarshalEvent([]byte(wireNamed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		event.ChangedFields = fields
+		if _, err := lifecycle.MarshalEvent(event); err != nil {
+			t.Fatalf("v2 bounded field union rejected: %v", err)
+		}
+		event.SchemaVersion = 1
+		if _, err := lifecycle.MarshalEvent(event); !errors.Is(err, lifecycle.ErrInvalidEvent) {
+			t.Fatal("display_name loosened strict v1 field validation")
+		}
+	}
+}
+
+func TestDisplayNameV2RejectsUnknownAndAmbiguousMetadata(t *testing.T) {
+	for _, change := range []func(*identityv1.UserLifecycleEvent){
+		func(e *identityv1.UserLifecycleEvent) { e.SchemaVersion = 3 },
+		func(e *identityv1.UserLifecycleEvent) { e.ChangedFields = []string{"display_name", "display_name"} },
+		func(e *identityv1.UserLifecycleEvent) {
+			e.ChangedFields = []string{"status", "email", "display_name", "status"}
+		},
+		func(e *identityv1.UserLifecycleEvent) { e.ChangedFields = []string{"name"} },
+		func(e *identityv1.UserLifecycleEvent) { e.ChangedFields = []string{"Private name"} },
+		func(e *identityv1.UserLifecycleEvent) { e.ChangedFields = []string{"displayName"} },
+		func(e *identityv1.UserLifecycleEvent) { e.Revision = nil },
+		func(e *identityv1.UserLifecycleEvent) { e.Revision = proto.Uint64(0) },
+		func(e *identityv1.UserLifecycleEvent) { e.Status = nil },
+		func(e *identityv1.UserLifecycleEvent) { e.EventType = lifecycle.SubjectCreated },
+		func(e *identityv1.UserLifecycleEvent) {
+			e.EventType, e.Status, e.ChangedFields = lifecycle.SubjectSuspended, identityv1.UserStatus_USER_STATUS_SUSPENDED.Enum(), []string{"status", "display_name"}
+		},
+		func(e *identityv1.UserLifecycleEvent) {
+			e.EventType, e.Status, e.ChangedFields, e.Revision = lifecycle.SubjectDeleted, nil, nil, nil
+		},
+	} {
+		event, err := lifecycle.UnmarshalEvent([]byte(wireNamed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(event)
+		if encoded, err := lifecycle.MarshalEvent(event); encoded != nil || !errors.Is(err, lifecycle.ErrInvalidEvent) || strings.Contains(err.Error(), "Private name") {
+			t.Fatalf("v2 invalid metadata accepted/disclosed: %v", err)
+		}
+	}
+	for _, replacement := range [][2]string{
+		{`"schema_version":2`, `"schema_version":"2"`}, {`"schema_version":2`, `"schema_version":2.0`},
+		{`"schema_version":2`, `"schema_version":3`}, {`"revision":"7"`, `"revision":7`},
+		{`"revision":"7"`, `"revision":"07"`}, {`"revision":"7"`, `"revision":null`},
+		{`"revision":"7"`, `"revision":"7","revision":"7"`},
+		{`"changed_fields"`, `"changedFields"`}, {`["display_name"]`, `["display_name","display_name"]`},
+		{`["display_name"]`, `[]`}, {`["display_name"]`, `["name"]`},
+		{`"status":"USER_STATUS_ACTIVE"`, `"status":1`},
+		{`"changed_fields":["display_name"]`, `"changed_fields":["display_name"],"display_name":"Private name"`},
+		{`"changed_fields":["display_name"]`, `"changed_fields":["display_name"],"payload":{"display_name":"Private name"}`},
+	} {
+		raw := strings.Replace(wireNamed, replacement[0], replacement[1], 1)
+		if event, err := lifecycle.UnmarshalEvent([]byte(raw)); event != nil || !errors.Is(err, lifecycle.ErrInvalidEvent) || strings.Contains(err.Error(), "Private name") {
+			t.Fatalf("v2 invalid wire accepted/disclosed: %v", err)
+		}
+	}
 }

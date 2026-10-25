@@ -7,7 +7,7 @@ export default function LoginPage() {
   return (
     <AuthCard
       title="Sign in to Hatef"
-      description="Choose a passkey for a password-free sign-in, or use your email and password."
+      description="Sign in to an existing account with a passkey. Password sign-in is not available yet."
       footer={
         <>
           <span>New to Hatef?</span>
