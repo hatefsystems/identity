@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -17,6 +18,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
@@ -53,15 +55,15 @@ type Store interface {
 	// lookup in this package uses it: GetUserByID filters deleted_at IS NULL and
 	// would therefore be blind to exactly the accounts this flow operates on.
 	GetUserByIDForAdmin(ctx context.Context, id uuid.UUID) (db.User, error)
-	SoftDeleteUser(ctx context.Context, id uuid.UUID) (int64, error)
+	SoftDeleteUserIfAuthorized(ctx context.Context, arg db.SoftDeleteUserIfAuthorizedParams) (int64, error)
 	ReclaimUser(ctx context.Context, arg db.ReclaimUserParams) (int64, error)
 	CreateDeletionRequest(ctx context.Context, arg db.CreateDeletionRequestParams) (db.DeletionRequest, error)
 	GetActiveDeletionRequestByTokenHashForUpdate(ctx context.Context, tokenHash string) (db.DeletionRequest, error)
 	GetActiveDeletionRequestForUser(ctx context.Context, userID uuid.UUID) (db.DeletionRequest, error)
-	IncrementDeletionRequestFailedAttempts(ctx context.Context, id uuid.UUID) (int64, error)
-	MarkDeletionRequestNotified(ctx context.Context, id uuid.UUID) (int64, error)
-	ConsumeDeletionRequest(ctx context.Context, id uuid.UUID) (int64, error)
+	GetDeletionRequestForUpdate(ctx context.Context, id uuid.UUID) (db.DeletionRequest, error)
+	RecordDeletionRequestFailure(ctx context.Context, arg db.RecordDeletionRequestFailureParams) (db.DeletionRequest, error)
 	ExpireDeletionRequestsForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	CreateDeletionNotification(ctx context.Context, arg db.CreateDeletionNotificationParams) (int64, error)
 }
 
 // userLockingStore is implemented by the sqlc query set once bound to a
@@ -112,12 +114,10 @@ type ReplayGuard interface {
 	Remember(ctx context.Context, key string, expiresAt time.Time) (bool, error)
 }
 
-// Decryptor decrypts an envelope-encrypted PII payload. It is optional and used
-// only to recover the backup email so the deletion notice can reach a second
-// mailbox — which is what protects a user whose primary mailbox was taken over as
-// part of the takeover that triggered the deletion. Without it only the primary
-// address is notified.
-type Decryptor interface {
+// Cipher protects Class A delivery material and decrypts configured backup email.
+// The production implementation is the existing envelope.Encryptor.
+type Cipher interface {
+	Encrypt(ctx context.Context, plaintext []byte) ([]byte, error)
 	Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 }
 
@@ -135,9 +135,6 @@ type Config struct {
 	ReclaimPerSubnetPerHour  int
 	// DeletePerAccountPerDay bounds deletion requests per account (default 3).
 	DeletePerAccountPerDay int
-	// DeleteResendCooldown is the minimum interval between two notices for the
-	// same account (default 1h).
-	DeleteResendCooldown time.Duration
 }
 
 // Privacy default policy values, mirroring config.LoadPrivacy so a Service built
@@ -148,7 +145,6 @@ const (
 	defaultReclaimPerAccountPerHour = 10
 	defaultReclaimPerSubnetPerHour  = 20
 	defaultDeletePerAccountPerDay   = 3
-	defaultDeleteResendCooldown     = time.Hour
 )
 
 // Service orchestrates soft deactivation and the reclaim ceremony. Construct it
@@ -156,7 +152,7 @@ const (
 type Service struct {
 	store    Store
 	tx       Transacter
-	notifier Notifier
+	cipher   Cipher
 	recorder audit.Recorder
 	limiter  ratelimit.Limiter
 	sessions SessionRevoker
@@ -164,7 +160,6 @@ type Service struct {
 	passkeys PasskeyReclaimer
 	totp     TOTPReclaimer
 	guard    ReplayGuard
-	decrypt  Decryptor
 	logger   *slog.Logger
 
 	gracePeriod              time.Duration
@@ -172,7 +167,6 @@ type Service struct {
 	reclaimPerAccountPerHour int
 	reclaimPerSubnetPerHour  int
 	deletePerAccountPerDay   int
-	deleteResendCooldown     time.Duration
 
 	// now is injectable so cooldown and cutoff arithmetic is deterministic in
 	// tests.
@@ -225,12 +219,6 @@ func WithReplayGuard(g ReplayGuard) Option {
 	return func(s *Service) { s.guard = g }
 }
 
-// WithDecryptor attaches the envelope decryptor used to recover the backup email
-// for the deletion notice.
-func WithDecryptor(d Decryptor) Option {
-	return func(s *Service) { s.decrypt = d }
-}
-
 // WithLogger overrides the service logger.
 func WithLogger(l *slog.Logger) Option {
 	return func(s *Service) {
@@ -252,16 +240,11 @@ func WithClock(now func() time.Time) Option {
 
 // New constructs a Service, applying default policy for unset fields.
 //
-// The notifier is required, not optional. A deletion whose reclaim token cannot be
-// delivered has no recovery window, so there is no safe "deletion without
-// notification" mode to fall back to; wiring decides whether a real notifier
-// exists and leaves the routes unmounted when it does not.
-func New(cfg Config, store Store, notifier Notifier, recorder audit.Recorder, opts ...Option) (*Service, error) {
+// A nil cipher supports recovery-only operation during a new-deletion shutdown.
+// RequestDeletion fails closed without encryption; existing tokens still work.
+func New(cfg Config, store Store, cipher Cipher, recorder audit.Recorder, opts ...Option) (*Service, error) {
 	if store == nil {
 		return nil, errors.New("privacy: store is required")
-	}
-	if notifier == nil {
-		return nil, errors.New("privacy: notifier is required")
 	}
 	if recorder == nil {
 		return nil, errors.New("privacy: audit recorder is required")
@@ -269,7 +252,7 @@ func New(cfg Config, store Store, notifier Notifier, recorder audit.Recorder, op
 
 	s := &Service{
 		store:                    store,
-		notifier:                 notifier,
+		cipher:                   cipher,
 		recorder:                 recorder,
 		logger:                   slog.Default(),
 		gracePeriod:              cfg.GracePeriod,
@@ -277,7 +260,6 @@ func New(cfg Config, store Store, notifier Notifier, recorder audit.Recorder, op
 		reclaimPerAccountPerHour: cfg.ReclaimPerAccountPerHour,
 		reclaimPerSubnetPerHour:  cfg.ReclaimPerSubnetPerHour,
 		deletePerAccountPerDay:   cfg.DeletePerAccountPerDay,
-		deleteResendCooldown:     cfg.DeleteResendCooldown,
 		now:                      time.Now,
 	}
 
@@ -296,8 +278,8 @@ func New(cfg Config, store Store, notifier Notifier, recorder audit.Recorder, op
 	if s.deletePerAccountPerDay <= 0 {
 		s.deletePerAccountPerDay = defaultDeletePerAccountPerDay
 	}
-	if s.deleteResendCooldown <= 0 {
-		s.deleteResendCooldown = defaultDeleteResendCooldown
+	if s.reclaimMaxAttempts > math.MaxInt32 {
+		return nil, errors.New("privacy: reclaim attempt limit is too large")
 	}
 
 	for _, opt := range opts {
@@ -318,11 +300,11 @@ type DeletionResult struct {
 	// AlreadyPending reports that the account was already in pending_deletion, so
 	// this call was an idempotent repeat.
 	AlreadyPending bool
-	// TokenMinted reports that a fresh reclaim token was created (a first request,
-	// or a resend outside the cooldown).
+	// TokenMinted reports that this call created the original reclaim token.
 	TokenMinted bool
-	// Notified reports that the notifier accepted a message during this call.
-	Notified bool
+	// NotificationQueued means the durable notification intent exists. It says
+	// nothing about relay acceptance or inbox delivery.
+	NotificationQueued bool
 	// ExpiresAt is when the live reclaim token stops working, which is also when
 	// the purge worker becomes eligible to erase the account.
 	ExpiresAt time.Time
@@ -355,110 +337,90 @@ type ReclaimAttempt struct {
 // RequestDeletion performs the step-up-gated soft deactivation behind
 // DELETE /api/v1/users/me.
 //
-// It is idempotent: a repeat call on an account already in pending_deletion
-// succeeds without deactivating twice. Whether it also mints and re-sends a fresh
-// reclaim token is governed by the resend cooldown — a user who lost the first
-// mail can retry, but the endpoint cannot be turned into an email bomb.
-//
-// Revocation, notification, and auditing happen *after* the commit and are
-// deliberately non-fatal. The account is already suspended from every user-facing
-// service at that point, which is the fail-safe direction; rolling the deletion
-// back because a mail server hiccuped would leave a user who asked to be forgotten
-// fully active instead.
-func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, clientIP string) (DeletionResult, error) {
+// Concurrent requests admitted under the same authority coalesce onto one token
+// and notice set. Pending accounts cannot authenticate a later resend. Delivery
+// retries belong to the durable worker and never rotate tokens or deadlines.
+func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expectedAuthVersion int64, clientIP string) (DeletionResult, error) {
+	if s.cipher == nil {
+		return DeletionResult{}, ErrDeletionUnavailable
+	}
+	if userID == uuid.Nil {
+		return DeletionResult{}, ErrUserNotFound
+	}
+	if expectedAuthVersion < 0 || expectedAuthVersion > math.MaxInt64-2 {
+		return DeletionResult{}, ErrStaleAuthority
+	}
 	if err := s.checkDeleteRateLimit(ctx, userID); err != nil {
 		return DeletionResult{}, err
 	}
 
-	// Loaded before the transaction purely for the notification addresses; the
-	// authoritative state read is the locked row inside the transaction.
-	user, err := s.store.GetUserByIDForAdmin(ctx, userID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return DeletionResult{}, ErrUserNotFound
-		}
-		return DeletionResult{}, fmt.Errorf("privacy: load user: %w", err)
-	}
-
-	token, tokenHash, err := NewReclaimToken()
-	if err != nil {
-		return DeletionResult{}, err
-	}
-
-	var (
-		result  DeletionResult
-		request db.DeletionRequest
-	)
-	err = s.runInTx(ctx, func(store Store) error {
+	var result DeletionResult
+	err := s.runInTx(ctx, userID, func(store Store) error {
 		locked, lockErr := s.lockUser(ctx, store, userID)
 		if lockErr != nil {
 			return lockErr
 		}
 
-		affected, softErr := store.SoftDeleteUser(ctx, userID)
-		if softErr != nil {
-			return fmt.Errorf("privacy: soft delete user: %w", softErr)
-		}
-
-		deletedAt := locked.DeletedAt
-		if affected == 0 {
-			// Zero rows means deleted_at was already set: the account is already
-			// pending_deletion and this is an idempotent repeat.
-			result.AlreadyPending = true
-
+		if locked.Status == statusPendingDeletion && locked.DeletedAt.Valid && locked.AuthVersion == expectedAuthVersion+1 {
 			existing, getErr := store.GetActiveDeletionRequestForUser(ctx, userID)
-			switch {
-			case getErr == nil:
-				request = existing
-				result.ExpiresAt = existing.ExpiresAt.Time
-				if s.withinResendCooldown(existing) {
-					// A live, recently-notified request already exists. Do not
-					// mint, do not resend.
-					return nil
-				}
-			case errors.Is(getErr, pgx.ErrNoRows):
-				// No live request: the previous one lapsed or was retired. Mint a
-				// replacement so the account is still recoverable.
-			default:
+			if getErr != nil && !errors.Is(getErr, pgx.ErrNoRows) {
 				return fmt.Errorf("privacy: load active deletion request: %w", getErr)
 			}
-		} else {
-			if affected != 1 {
-				return errors.New("privacy: soft delete affected an unexpected row count")
+			if getErr != nil || existing.RequestedAuthVersion == nil || *existing.RequestedAuthVersion != expectedAuthVersion ||
+				!liveDeletionRequest(locked, existing, s.now(), s.gracePeriod, s.reclaimMaxAttempts) {
+				return ErrStaleAuthority
 			}
-			if err := lifecycle.EnqueueStatusChange(ctx, store, userID, locked.Status, statusPendingDeletion); err != nil {
-				return err
-			}
-			// Re-read inside the transaction so expires_at is derived from the
-			// database's own deleted_at. That is what makes the token expiry and
-			// the purge cutoff arithmetically inseparable rather than two clocks
-			// that happen to agree.
-			refreshed, readErr := store.GetUserByIDForAdmin(ctx, userID)
-			if readErr != nil {
-				return fmt.Errorf("privacy: reload user after soft delete: %w", readErr)
-			}
-			deletedAt = refreshed.DeletedAt
+			result = DeletionResult{AlreadyPending: true, NotificationQueued: true, ExpiresAt: existing.ExpiresAt.Time}
+			return nil
 		}
-
-		if !deletedAt.Valid {
-			// Unreachable: either the update set it or the guard proved it set.
-			return errors.New("privacy: account has no deleted_at after soft delete")
+		if locked.Status != "active" || locked.DeletedAt.Valid || locked.AuthVersion != expectedAuthVersion {
+			return ErrStaleAuthority
+		}
+		recipients, err := s.deletionRecipients(ctx, locked)
+		if err != nil {
+			return err
+		}
+		token, tokenHash, err := NewReclaimToken()
+		if err != nil {
+			return err
+		}
+		affected, err := store.SoftDeleteUserIfAuthorized(ctx, db.SoftDeleteUserIfAuthorizedParams{ID: userID, AuthVersion: expectedAuthVersion})
+		if err != nil {
+			return fmt.Errorf("privacy: soft delete user: %w", err)
+		}
+		if affected != 1 {
+			return ErrStaleAuthority
+		}
+		if err := lifecycle.EnqueueStatusChange(ctx, store, userID, locked.Status, statusPendingDeletion); err != nil {
+			return err
+		}
+		// The database's deletion timestamp is the one authoritative deadline.
+		refreshed, err := store.GetUserByIDForAdmin(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("privacy: reload deleted user: %w", err)
+		}
+		if !refreshed.DeletedAt.Valid {
+			return errors.New("privacy: account has no deletion timestamp")
 		}
 
 		if _, expErr := store.ExpireDeletionRequestsForUser(ctx, userID); expErr != nil {
 			return fmt.Errorf("privacy: invalidate outstanding deletion requests: %w", expErr)
 		}
 		created, createErr := store.CreateDeletionRequest(ctx, db.CreateDeletionRequestParams{
-			UserID:      userID,
-			TokenHash:   tokenHash,
-			RequestedIp: optionalString(clientIP),
-			ExpiresAt:   pgtype.Timestamptz{Time: deletedAt.Time.Add(s.gracePeriod), Valid: true},
+			UserID:               userID,
+			TokenHash:            tokenHash,
+			RequestedIp:          optionalString(clientIP),
+			ExpiresAt:            pgtype.Timestamptz{Time: refreshed.DeletedAt.Time.Add(s.gracePeriod), Valid: true},
+			RequestedAuthVersion: &expectedAuthVersion,
 		})
 		if createErr != nil {
 			return fmt.Errorf("privacy: create deletion request: %w", createErr)
 		}
-		request = created
+		if err := s.enqueueNotices(ctx, store, created, token, recipients); err != nil {
+			return err
+		}
 		result.TokenMinted = true
+		result.NotificationQueued = true
 		result.ExpiresAt = created.ExpiresAt.Time
 		return nil
 	})
@@ -468,10 +430,6 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, clientI
 
 	s.revokeEverything(ctx, userID)
 
-	if result.TokenMinted {
-		result.Notified = s.deliverNotice(ctx, user, request, token, result.ExpiresAt)
-	}
-
 	s.record(ctx, audit.Event{
 		EventType:     audit.EventDeletionRequested,
 		ActionStatus:  audit.StatusSuccess,
@@ -480,10 +438,10 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, clientI
 		ClientIP:      clientIP,
 		ActorSPIFFEID: "",
 		Payload: map[string]any{
-			"already_pending": result.AlreadyPending,
-			"token_minted":    result.TokenMinted,
-			"notified":        result.Notified,
-			"expires_at":      result.ExpiresAt.UTC().Format(time.RFC3339),
+			"already_pending":     result.AlreadyPending,
+			"token_minted":        result.TokenMinted,
+			"notification_queued": result.NotificationQueued,
+			"expires_at":          result.ExpiresAt.UTC().Format(time.RFC3339),
 		},
 	})
 
@@ -556,15 +514,31 @@ func (s *Service) Reclaim(ctx context.Context, token string, attempt ReclaimAtte
 		return ErrInvalidToken
 	}
 
-	cutoff := pgtype.Timestamptz{Time: s.now().Add(-s.gracePeriod), Valid: true}
-	err = s.runInTx(ctx, func(store Store) error {
+	err = s.runInTx(ctx, user.ID, func(store Store) error {
 		locked, lockErr := s.lockUser(ctx, store, user.ID)
 		if lockErr != nil {
+			if errors.Is(lockErr, ErrUserNotFound) {
+				return ErrInvalidToken
+			}
 			return lockErr
+		}
+		current, err := store.GetDeletionRequestForUpdate(ctx, request.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidToken
+		}
+		if err != nil {
+			return fmt.Errorf("privacy: lock reclaim request: %w", err)
+		}
+		// Do not capture this time before factor verification or either lock wait.
+		now := s.now()
+		if current.ID != request.ID || current.TokenHash != HashReclaimToken(token) ||
+			!current.ExpiresAt.Time.Equal(request.ExpiresAt.Time) ||
+			!liveDeletionRequest(locked, current, now, s.gracePeriod, s.reclaimMaxAttempts) {
+			return ErrInvalidToken
 		}
 		affected, reclaimErr := store.ReclaimUser(ctx, db.ReclaimUserParams{
 			ID:        user.ID,
-			DeletedAt: cutoff,
+			DeletedAt: pgtype.Timestamptz{Time: now.Add(-s.gracePeriod), Valid: true},
 		})
 		if reclaimErr != nil {
 			return fmt.Errorf("privacy: reclaim user: %w", reclaimErr)
@@ -610,7 +584,7 @@ func (s *Service) resolveReclaim(ctx context.Context, token, clientIP string) (d
 	if err := s.checkReclaimSubnetLimit(ctx, clientIP); err != nil {
 		return db.DeletionRequest{}, db.User{}, err
 	}
-	if token == "" {
+	if !validReclaimToken(token) {
 		return db.DeletionRequest{}, db.User{}, ErrInvalidToken
 	}
 
@@ -642,7 +616,7 @@ func (s *Service) resolveReclaim(ctx context.Context, token, clientIP string) (d
 		}
 		return db.DeletionRequest{}, db.User{}, fmt.Errorf("privacy: load user: %w", err)
 	}
-	if user.Status != statusPendingDeletion {
+	if !liveDeletionRequest(user, request, s.now(), s.gracePeriod, s.reclaimMaxAttempts) {
 		return db.DeletionRequest{}, db.User{}, ErrInvalidToken
 	}
 	return request, user, nil
@@ -726,15 +700,34 @@ func isFactorRejection(err error) bool {
 // answer with the opaque ErrInvalidToken, and turning a bookkeeping failure into a
 // different response would itself be an oracle.
 func (s *Service) recordFailedAttempt(ctx context.Context, request db.DeletionRequest, user db.User, method, clientIP string) {
-	exhausted := int(request.FailedAttempts)+1 >= s.reclaimMaxAttempts
-
-	if _, err := s.store.IncrementDeletionRequestFailedAttempts(ctx, request.ID); err != nil {
-		s.logger.Error("privacy: record failed reclaim attempt", slog.String("error", err.Error()))
-	}
-	if exhausted {
-		if _, err := s.store.ConsumeDeletionRequest(ctx, request.ID); err != nil {
-			s.logger.Error("privacy: retire exhausted deletion request", slog.String("error", err.Error()))
+	var updated db.DeletionRequest
+	err := s.runInTx(ctx, user.ID, func(store Store) error {
+		locked, err := s.lockUser(ctx, store, user.ID)
+		if err != nil {
+			return err
 		}
+		current, err := store.GetDeletionRequestForUpdate(ctx, request.ID)
+		if err != nil {
+			return err
+		}
+		if current.TokenHash != request.TokenHash || !current.ExpiresAt.Time.Equal(request.ExpiresAt.Time) ||
+			!liveDeletionRequest(locked, current, s.now(), s.gracePeriod, s.reclaimMaxAttempts) {
+			return ErrInvalidToken
+		}
+		updated, err = store.RecordDeletionRequestFailure(ctx, db.RecordDeletionRequestFailureParams{
+			ID: request.ID, UserID: user.ID, TokenHash: request.TokenHash,
+			MaxAttempts: int32(s.reclaimMaxAttempts), //nolint:gosec // Validated in New.
+		})
+		return err
+	})
+	if err != nil {
+		if !errors.Is(err, ErrInvalidToken) && !errors.Is(err, ErrUserNotFound) && !errors.Is(err, pgx.ErrNoRows) {
+			s.logger.Error("privacy: failed reclaim bookkeeping unavailable")
+		}
+		return
+	}
+	if method != FactorWebAuthn && method != FactorTOTP {
+		method = "unsupported"
 	}
 
 	s.record(ctx, audit.Event{
@@ -746,8 +739,8 @@ func (s *Service) recordFailedAttempt(ctx context.Context, request db.DeletionRe
 		Payload: map[string]any{
 			"factor":     method,
 			"request_id": request.ID.String(),
-			"attempts":   int(request.FailedAttempts) + 1,
-			"exhausted":  exhausted,
+			"attempts":   int(updated.FailedAttempts),
+			"exhausted":  updated.ConsumedAt.Valid,
 		},
 	})
 }
@@ -792,81 +785,6 @@ func (s *Service) revokeEverything(ctx context.Context, userID uuid.UUID) {
 	}
 }
 
-// deliverNotice sends the reclaim token and stamps notified_at on success. It
-// reports whether the notifier accepted the message.
-//
-// notified_at is only stamped on success, so a failed send leaves the resend
-// cooldown unarmed and the user's next request retries the delivery instead of
-// silently doing nothing.
-func (s *Service) deliverNotice(
-	ctx context.Context,
-	user db.User,
-	request db.DeletionRequest,
-	token string,
-	expiresAt time.Time,
-) bool {
-	notice := DeletionNotice{
-		PrimaryEmail: user.Email,
-		BackupEmail:  s.backupEmail(ctx, user),
-		ReclaimToken: token,
-		ExpiresAt:    expiresAt,
-	}
-	if err := s.notifier.NotifyDeletionRequested(ctx, notice); err != nil {
-		s.logger.Error("privacy: deliver deletion notice",
-			slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
-		s.record(ctx, audit.Event{
-			EventType:    audit.EventDeletionRequested,
-			ActionStatus: audit.StatusFailure,
-			ActorID:      user.ID,
-			SubjectID:    &user.ID,
-			Payload:      map[string]any{"stage": "notify"},
-		})
-		return false
-	}
-	if _, err := s.store.MarkDeletionRequestNotified(ctx, request.ID); err != nil {
-		// The message went out; only the bookkeeping failed. The worst case is a
-		// duplicate notice on the next request, which is preferable to reporting a
-		// failed deletion.
-		s.logger.Error("privacy: stamp deletion notice delivery",
-			slog.String("error", err.Error()))
-	}
-	return true
-}
-
-// backupEmail decrypts the account's backup address when a decryptor is
-// configured. A decryption failure is logged and treated as "no backup address":
-// losing the second delivery channel is strictly better than failing a deletion
-// the user asked for.
-func (s *Service) backupEmail(ctx context.Context, user db.User) *string {
-	if s.decrypt == nil || len(user.BackupEmailEncrypted) == 0 {
-		return nil
-	}
-	plaintext, err := s.decrypt.Decrypt(ctx, user.BackupEmailEncrypted)
-	if err != nil {
-		s.logger.Error("privacy: decrypt backup email for deletion notice",
-			slog.String("user_id", user.ID.String()), slog.String("error", err.Error()))
-		return nil
-	}
-	value := string(plaintext)
-	if value == "" {
-		return nil
-	}
-	return &value
-}
-
-// withinResendCooldown reports whether request was notified recently enough that a
-// repeat deletion request must not mint and re-send a replacement token.
-//
-// A request that has never been notified is never inside the cooldown: the point
-// of the cooldown is to bound *delivered* mail, so an undelivered notice should be
-// retried immediately.
-func (s *Service) withinResendCooldown(request db.DeletionRequest) bool {
-	if !request.NotifiedAt.Valid {
-		return false
-	}
-	return s.now().Sub(request.NotifiedAt.Time) < s.deleteResendCooldown
-}
-
 // record persists an audit event, logging (never propagating) a transport failure.
 // An audit transport being down is a monitoring problem; refusing to complete a
 // deletion because of it would be a compliance failure.
@@ -884,7 +802,7 @@ func (s *Service) record(ctx context.Context, e audit.Event) {
 // configured, or directly against s.store otherwise. The commit/rollback
 // bookkeeping mirrors recovery.Service.runInTx so the atomicity guarantee is
 // identical across the codebase.
-func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error {
+func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(store Store) error) error {
 	if s.tx == nil {
 		return fn(s.store)
 	}
@@ -896,10 +814,18 @@ func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback(ctx)
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = tx.Rollback(rollbackCtx)
 		}
 	}()
 
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return fmt.Errorf("privacy: set transaction isolation: %w", err)
+	}
+	if err := pglock.LockAccount(ctx, tx, userID); err != nil {
+		return fmt.Errorf("privacy: lock account: %w", err)
+	}
 	txStore := db.New(tx)
 	if err := fn(txStore); err != nil {
 		return err
@@ -934,6 +860,19 @@ func (s *Service) lockUser(ctx context.Context, store Store, userID uuid.UUID) (
 		return db.User{}, fmt.Errorf("privacy: lock user: %w", err)
 	}
 	return user, nil
+}
+
+// Legacy requests have no captured version but keep the original expiry contract.
+// A hold never changes this predicate or extends recovery eligibility.
+func liveDeletionRequest(user db.User, request db.DeletionRequest, now time.Time, grace time.Duration, maxAttempts int) bool {
+	if user.ID != request.UserID || user.Status != statusPendingDeletion || !user.DeletedAt.Valid ||
+		request.ConsumedAt.Valid || !request.ExpiresAt.Valid || !request.ExpiresAt.Time.After(now) ||
+		request.FailedAttempts < 0 || int(request.FailedAttempts) >= maxAttempts ||
+		!request.ExpiresAt.Time.Equal(user.DeletedAt.Time.Add(grace)) {
+		return false
+	}
+	version := request.RequestedAuthVersion
+	return version == nil || (*version >= 0 && *version < math.MaxInt64 && user.AuthVersion == *version+1)
 }
 
 // checkDeleteRateLimit enforces the per-account daily bound on deletion requests.

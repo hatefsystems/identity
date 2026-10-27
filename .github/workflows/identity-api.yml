@@ -109,8 +109,8 @@ jobs:
       - name: Build lifecycle broadcast publisher
         run: npm exec -- nx run identity-api:build-lifecycle-publisher --skipNxCache
 
-      - name: Build compatible signer and purge workers
-        run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge -p identity-api --skipNxCache
+      - name: Build compatible signer, deletion and purge workers
+        run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge,build-deletion-notifier -p identity-api --skipNxCache
 
       - name: Build non-root runtime image
         env:
@@ -383,8 +383,8 @@ jobs:
       - name: Validate test-only fixture safety
         run: npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
 
-      - name: Build production API and excluded browser fixture command
-        run: npm exec -- nx run-many -t build,build-portal-fixture -p identity-api --skipNxCache
+      - name: Build production API, deletion notifier and excluded browser fixture
+        run: npm exec -- nx run-many -t build,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache
 
       - name: Build production portal
         run: npm exec -- nx run web:build --skipNxCache

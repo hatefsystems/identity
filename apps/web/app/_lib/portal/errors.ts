@@ -26,7 +26,7 @@ export function isSessionLoss(error: unknown): boolean {
   );
 }
 
-export function errorMessage(error: unknown): string {
+export function errorMessage(error: unknown, method?: 'webauthn'): string {
   if (error instanceof PortalError) {
     if (error.uncertain)
       return 'The response was lost. The action may already have completed. Refresh the saved state before trying a new action.';
@@ -40,14 +40,22 @@ export function errorMessage(error: unknown): string {
       case 'authenticator_security':
         return 'The passkey could not be used on this origin. Check the secure site address and try again.';
       case 'invalid_credentials':
-        return 'Verification failed or expired. Use a current authenticator code or start a new passkey verification.';
+        return method === 'webauthn'
+          ? 'Verification failed or expired. Start a new passkey verification with a device PIN or biometrics.'
+          : 'Verification failed or expired. Use a current authenticator code or start a new passkey verification.';
       case 'challenge_invalid':
       case 'verification_failed':
         return 'The passkey ceremony expired or could not be verified. Start again with fresh verification.';
       case 'user_verification_required':
-        return 'Use a passkey with a device PIN or biometric verification, or your enrolled authenticator app.';
+        return method === 'webauthn'
+          ? 'This action requires a passkey with a device PIN or biometric verification.'
+          : 'Use a passkey with a device PIN or biometric verification, or your enrolled authenticator app.';
       case 'no_stepup_factor':
-        return 'No supported verification factor is available for this account.';
+        return method === 'webauthn'
+          ? 'This action requires a passkey with a device PIN or biometric verification. No suitable passkey verification is available. You can manage your passkeys in Security.'
+          : 'No supported verification factor is available for this account.';
+      case 'deletion_disabled':
+        return 'Account deletion is currently unavailable.';
       case 'insufficient_user_authentication':
       case 'grant_expired':
         return 'Fresh verification is required. Start the action again.';

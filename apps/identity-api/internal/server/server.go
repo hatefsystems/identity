@@ -108,18 +108,10 @@ type Deps struct {
 	// be reachable without the gate, so an absent service fails closed
 	// (404/route-absent) rather than open.
 	StepUp *stepup.Service
-	// Privacy drives the GDPR "Right to be Forgotten" routes: the step-up-gated
-	// DELETE /api/v1/users/me and the anonymous reclaim ceremony at
-	// /api/v1/auth/deletion/reclaim. It requires a database and, crucially, a
-	// notifier that can actually deliver the reclaim token.
-	//
-	// When nil, those routes are not mounted. That is the fail-closed half of the
-	// notification contract: accepting a deletion whose reclaim token cannot be
-	// delivered would leave the user with no 30-day recovery window at all, which
-	// is strictly worse than refusing the request. Wiring therefore leaves this
-	// nil (and warns) rather than substituting a stand-in notifier outside
-	// development. See internal/privacy's package doc.
+	// Privacy serves anonymous recovery even when new deletion requests are off.
 	Privacy *privacy.Service
+	// PrivacyDeletionEnabled is the default-off rollout gate for new requests.
+	PrivacyDeletionEnabled bool
 	// AuditRecorder receives the security-relevant events raised by the handlers
 	// (Task 5.2). It is the publishing half of the audit pipeline: a handler hands
 	// off an unchained Event and returns, while a separate signing worker owns the

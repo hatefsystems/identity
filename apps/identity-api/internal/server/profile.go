@@ -29,6 +29,7 @@ type profileResponse struct {
 	DisplayName       string                 `json:"display_name"`
 	Status            string                 `json:"status"`
 	LifecycleRevision string                 `json:"lifecycle_revision"`
+	DeletionEnabled   bool                   `json:"deletion_enabled"`
 	Session           profileSessionResponse `json:"session"`
 }
 
@@ -64,11 +65,13 @@ func profileSession(w http.ResponseWriter, r *http.Request) (session.Session, uu
 	return sess, id, true
 }
 
-func writeProfile(w http.ResponseWriter, p profile.Profile, sess session.Session) {
+func (s *Server) writeProfile(w http.ResponseWriter, p profile.Profile, sess session.Session) {
 	writeJSON(w, http.StatusOK, profileResponse{
 		ID: p.ID, Email: p.Email, DisplayName: p.DisplayName, Status: p.Status,
 		LifecycleRevision: p.LifecycleRevision,
-		Session:           profileSessionResponse{ID: sess.ID, ExpiresAt: sess.AbsoluteExpiry.UTC()},
+		DeletionEnabled: s.deps.PrivacyDeletionEnabled && s.deps.Privacy != nil &&
+			s.deps.StepUp != nil && s.deps.SessionManager != nil && s.deps.DPoPValidator != nil,
+		Session: profileSessionResponse{ID: sess.ID, ExpiresAt: sess.AbsoluteExpiry.UTC()},
 	})
 }
 
@@ -83,7 +86,7 @@ func (s *Server) handleProfileGet() http.HandlerFunc {
 			writeProfileError(w, err)
 			return
 		}
-		writeProfile(w, p, sess)
+		s.writeProfile(w, p, sess)
 	}
 }
 
@@ -112,7 +115,7 @@ func (s *Server) handleProfileUpdate() http.HandlerFunc {
 				Payload: map[string]any{"changed_fields": []string{"display_name"}, "lifecycle_revision": result.Profile.LifecycleRevision},
 			})
 		}
-		writeProfile(w, result.Profile, sess)
+		s.writeProfile(w, result.Profile, sess)
 	}
 }
 

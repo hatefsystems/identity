@@ -31,6 +31,20 @@ const (
 	testSessionID   = "browser-session-1"
 )
 
+func TestTokenFormLimitRejectsBeforeAuthorityWork(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/oauth2/token", strings.NewReader(strings.Repeat("a", (10<<20)+1)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	new(Server).handleToken().ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("oversized form status = %d, want 400", response.Code)
+	}
+	var body tokenErrorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body.Error != token.ErrCodeInvalidRequest {
+		t.Fatalf("unexpected bounded-form response: %v", err)
+	}
+}
+
 // fakeClientAuth is a ClientAuthenticator stand-in for client_credentials
 // tests until Task 3.4 lands private_key_jwt.
 type fakeClientAuth struct {

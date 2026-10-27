@@ -4,12 +4,12 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { browserFailure, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { anonymousReclaim, browserFailure, portalRoute, startPortalHarness } from './portal-harness.mjs';
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
 
-const routes = ['/dashboard', '/dashboard/profile', '/dashboard/security', '/dashboard/sessions'];
+const routes = ['/dashboard', '/dashboard/profile', '/dashboard/security', '/dashboard/sessions', '/dashboard/privacy', '/recover-account'];
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 
 function observe(context, harness) {
@@ -20,6 +20,7 @@ function observe(context, harness) {
     keys: new Set(),
     nonceChallenges: 0,
     downloads: 0,
+    anonymous: 0,
   };
   context.on('page', (page) => {
     page.on('pageerror', () => state.failures.push('Uncaught portal runtime error'));
@@ -92,7 +93,14 @@ function observe(context, harness) {
             assert.match(headers['www-authenticate'] || '', /use_dpop_nonce/);
             state.nonceChallenges++;
           }
-          if (response.ok() && url.pathname !== '/api/v1/auth/logout') {
+          if (anonymousReclaim(url.pathname, response.request().method())) {
+            const requestHeaders = await response.request().allHeaders();
+            for (const header of ['cookie', 'authorization', 'dpop', 'x-portal-session', 'x-step-up-auth', 'referer'])
+              assert(!requestHeaders[header], 'Anonymous recovery transmitted browser authority');
+            assert.equal(requestHeaders.origin, harness.origin);
+            assert(!headers['set-cookie'], 'Recovery issued a session cookie');
+            state.anonymous++;
+          } else if (response.ok() && url.pathname !== '/api/v1/auth/logout') {
             assert(response.request().headers().dpop, 'Successful portal API request without DPoP');
           }
         })().catch(() =>
@@ -114,6 +122,13 @@ async function newContext(browser, harness) {
     globalThis.__portalCsp = [];
     globalThis.__portalObjectURLs = new Set();
     globalThis.__portalPageShows = [];
+    globalThis.__portalBroadcasts = [];
+    const post = BroadcastChannel.prototype.postMessage;
+    BroadcastChannel.prototype.postMessage = function (value) {
+      if (this.name === 'hatef-portal-session')
+        globalThis.__portalBroadcasts.push(value === 'invalidate' ? 'invalidate' : 'unexpected');
+      return Reflect.apply(post, this, [value]);
+    };
     document.addEventListener('securitypolicyviolation', (event) => {
       globalThis.__portalCsp.push(event.effectiveDirective);
     });
@@ -176,9 +191,11 @@ async function signIn(page, origin, path = '/login/webauthn') {
 
 // This independent boundary probe signs with the actual persisted CryptoKey.
 // User flows above/below still use the production adapter and real authenticators.
-async function api(page, path, { method = 'GET', body, sessionID } = {}) {
+async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } = {}) {
+  assert(stepUpToken === undefined || (typeof stepUpToken === 'string' && stepUpToken.length > 0 &&
+    stepUpToken.length <= 8192 && !/[\r\n]/.test(stepUpToken)), 'Invalid bounded step-up probe');
   return page.evaluate(
-    async ({ path, method, body, sessionID }) => {
+    async ({ path, method, body, sessionID, stepUpToken }) => {
       const database = await new Promise((resolve, reject) => {
         const open = indexedDB.open('hatef-portal-dpop');
         open.onsuccess = () => resolve(open.result);
@@ -221,6 +238,7 @@ async function api(page, path, { method = 'GET', body, sessionID } = {}) {
           headers: {
             DPoP: `${unsigned}.${encode(signature)}`,
             ...(sessionID ? { 'X-Portal-Session': sessionID } : {}),
+            ...(stepUpToken ? { 'X-Step-Up-Auth': stepUpToken } : {}),
             ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -239,7 +257,7 @@ async function api(page, path, { method = 'GET', body, sessionID } = {}) {
       }
       throw new Error('Test boundary probe exhausted its single nonce retry');
     },
-    { path, method, body, sessionID }
+    { path, method, body, sessionID, stepUpToken }
   );
 }
 
@@ -307,7 +325,7 @@ async function keyStorage(page) {
   });
 }
 
-async function clean(page, observed) {
+async function clean(page, observed, keyless = false) {
   await Promise.all(observed.pending);
   assert.deepEqual(observed.failures, [], 'Portal runtime, privacy or proof regression');
   assert.deepEqual(
@@ -331,7 +349,12 @@ async function clean(page, observed) {
     0,
     'Inline application style'
   );
-  const storage = await keyStorage(page);
+  assert(!(await page.evaluate(() => globalThis.__portalBroadcasts)).includes('unexpected'),
+    'Portal broadcast non-neutral data');
+  const storage = keyless ? await page.evaluate(async () => {
+    if ((await indexedDB.databases()).length !== 0) throw new Error('Recovery created a browser key');
+    return { localEmpty: localStorage.length === 0, sessionEmpty: sessionStorage.length === 0 };
+  }) : await keyStorage(page);
   assert(
     storage.localEmpty && storage.sessionEmpty,
     'Portal stored string credentials or account data'
@@ -694,7 +717,7 @@ async function noJavaScript(browser, authenticated, harness, evidence) {
   }
 }
 
-async function appearance(page, evidence) {
+async function appearance(page, evidence, scope = 'portal') {
   for (const dark of [false, true]) {
     await page.evaluate((dark) => document.documentElement.classList.toggle('dark', dark), dark);
     for (const viewport of [
@@ -709,7 +732,10 @@ async function appearance(page, evidence) {
           failures.push('horizontal overflow');
         for (const control of document.querySelectorAll('main button, main input, nav a')) {
           if (!control.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
-          const rect = control.getBoundingClientRect();
+          // A checkbox's associated, clickable label is its larger touch target.
+          const target = control.matches('input[type="checkbox"]') && control.labels?.length
+            ? control.labels[0] : control;
+          const rect = target.getBoundingClientRect();
           if (rect.width < 44 || rect.height < 44) failures.push('control below 44px');
           if (rect.left < -1 || rect.right > innerWidth + 1)
             failures.push('control outside viewport');
@@ -721,12 +747,12 @@ async function appearance(page, evidence) {
         [],
         `Portal ${dark ? 'dark' : 'light'} ${viewport.width}px reflow`
       );
-      evidence.viewports.push(`${dark ? 'dark' : 'light'}-${viewport.width}x${viewport.height}`);
+      evidence.viewports.push(`${scope}-${dark ? 'dark' : 'light'}-${viewport.width}x${viewport.height}`);
       if (process.env.PORTAL_BROWSER_ARTIFACT_DIR) {
         const directory = resolve(process.env.PORTAL_BROWSER_ARTIFACT_DIR);
         await mkdir(directory, { recursive: true });
         await page.screenshot({
-          path: resolve(directory, `portal-${dark ? 'dark' : 'light'}-${viewport.width}.png`),
+          path: resolve(directory, `${scope}-${dark ? 'dark' : 'light'}-${viewport.width}.png`),
           fullPage: true,
           // Artifacts demonstrate layout, not a persistent account-data export.
           mask: [
@@ -788,10 +814,11 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
     { times: 1 }
   );
   const created = operationResponse(page, '/api/v1/auth/webauthn/register/verify', 'POST');
+  const createdBody = harness.captureJSON('/api/v1/auth/webauthn/register/verify', 'POST', 201);
   await stepUp(page, () => add.click());
   const createResponse = await created;
   assert.equal(createResponse.status(), 201);
-  const key = await createResponse.json();
+  const key = await createdBody;
   assert(key.name === passkeyName, 'Registration did not preserve the pending name');
   const row = page.locator(`[data-key-id="${key.id}"]`);
   await row.waitFor({ state: 'visible' });
@@ -822,11 +849,9 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
 }
 
 async function generateCodes(page, harness) {
-  const generated = operationResponse(page, '/api/v1/auth/recovery-codes/generate', 'POST');
+  const generated = harness.captureJSON('/api/v1/auth/recovery-codes/generate', 'POST', 200);
   await stepUp(page, () => page.getByRole('button', { name: /generate.*recovery codes/i }).click());
-  const response = await generated;
-  assert.equal(response.status(), 200);
-  const batch = await response.json();
+  const batch = await generated;
   assert(Array.isArray(batch.codes) && batch.codes.length === batch.count && batch.count === 10);
   harness.secrets.push(...batch.codes);
   const viewer = page.getByTestId('recovery-viewer');
@@ -1043,6 +1068,474 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
   );
 }
 
+async function currentCredential(authenticator, credentialID) {
+  const { credentials } = await authenticator.cdp.send('WebAuthn.getCredentials', {
+    authenticatorId: authenticator.authenticatorId,
+  });
+  const credential = credentials.find((value) => value.credentialId === credentialID);
+  assert(credential, 'Missing current fixture credential');
+  return credential;
+}
+
+async function deletionPolicy(page, harness, fixture, authenticator, evidence) {
+  const profile = (await api(page, '/api/v1/users/me')).body;
+  assert.equal(profile.deletion_enabled, true, 'Production fixture did not enable deletion');
+  for (const path of ['/api/v1/users/me', '/api/v1/users/me/']) {
+    const denied = await api(page, path, { method: 'DELETE', sessionID: profile.session.id });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error, 'insufficient_user_authentication');
+  }
+  const challenge = await api(page, '/api/v1/auth/stepup/challenge', {
+    method: 'POST', sessionID: profile.session.id, body: {},
+  });
+  assert(challenge.body.methods.includes('totp'), 'Fixture did not advertise real TOTP');
+  let factor = harness.fixture('totp-code', { user_id: fixture.user_id });
+  const grant = await api(page, '/api/v1/auth/stepup/verify', {
+    method: 'POST', sessionID: profile.session.id, body: { method: 'totp', code: factor.code },
+  });
+  factor = undefined;
+  assert.equal(grant.status, 200, 'Valid TOTP verification did not mint a real grant');
+  harness.secrets.push(grant.body.token);
+  const claims = JSON.parse(Buffer.from(grant.body.token.split('.')[1], 'base64url').toString());
+  assert.deepEqual(claims.amr, ['otp']);
+  const denied = await api(page, '/api/v1/users/me', {
+    method: 'DELETE', sessionID: profile.session.id, stepUpToken: grant.body.token,
+  });
+  assert.equal(denied.status, 403, 'A real TOTP grant authorized account deletion');
+  assert.equal(denied.body.error, 'insufficient_user_authentication');
+  const consumed = await api(page, '/api/v1/auth/recovery-codes/generate', {
+    method: 'POST', sessionID: profile.session.id, stepUpToken: grant.body.token, body: {},
+  });
+  assert.equal(consumed.status, 403, 'Wrong-method deletion grant remained reusable');
+  grant.body.token = '';
+  assert.equal((await api(page, '/api/v1/users/me')).status, 200);
+
+  await navigate(page, harness.origin, 'Privacy', '/dashboard/privacy');
+  await appearance(page, evidence, 'privacy');
+  const acknowledgement = page.getByRole('checkbox', { name: /I understand the account-deletion consequences/ });
+  const remove = page.getByRole('button', { name: 'Delete my account', exact: true });
+  assert(await remove.isDisabled(), 'Deletion did not require acknowledgement');
+  await acknowledgement.focus();
+  await page.keyboard.press('Space');
+  await remove.click();
+  const dialog = page.getByRole('dialog', { name: 'Confirm account deletion', exact: true });
+  await dialog.waitFor({ state: 'visible' });
+  for (let index = 0; index < 8; index++) {
+    assert(await dialog.evaluate((element) => element.contains(document.activeElement)),
+      'Deletion modal focus escaped');
+    await page.keyboard.press('Tab');
+  }
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  assert(await remove.isDisabled(), 'Cancelling deletion retained acknowledgement');
+
+  await acknowledgement.check();
+  await authenticator.cdp.send('WebAuthn.setResponseOverrideBits', {
+    authenticatorId: authenticator.authenticatorId, isBadUV: true,
+  });
+  try {
+    const refused = operationResponse(page, '/api/v1/auth/stepup/verify', 'POST');
+    const refusedBody = harness.captureJSON('/api/v1/auth/stepup/verify', 'POST', 403);
+    await stepUp(page, () => remove.click());
+    const response = await refused;
+    assert.equal(response.status(), 403, 'Presence-only authenticator was not rejected');
+    assert.equal((await refusedBody).error, 'user_verification_required');
+    await dialog.getByRole('alert').waitFor({ state: 'visible' });
+    assert.equal(await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).count(), 0);
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  } finally {
+    await authenticator.cdp.send('WebAuthn.setResponseOverrideBits', {
+      authenticatorId: authenticator.authenticatorId,
+    });
+  }
+  const unchanged = harness.fixture('deletion-state', { user_id: fixture.user_id });
+  assert.equal(unchanged.status, 'active');
+  assert.equal(unchanged.requests, 0, 'Cancelled or non-UV authorization changed the account');
+  evidence.checks.push(
+    'deletion aliases reject missing grants; real valid TOTP grant is denied and consumed without session loss; acknowledgement, keyboard cancellation/focus containment, real UP-only assertion refusal, no TOTP deletion fallback'
+  );
+}
+
+async function deleteWithOutcome(page, harness, authenticator, mode) {
+  const key = (await keyStorage(page)).publicKey;
+  const broadcasts = await page.evaluate(() => globalThis.__portalBroadcasts.length);
+  let requests = 0;
+  let nonces = 0;
+  let logouts = 0;
+  let commits = 0;
+  let interceptionFailed = false;
+  const interceptions = [];
+  const request = (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/v1/users/me' && request.method() === 'DELETE') requests++;
+    if (path === '/api/v1/auth/logout') logouts++;
+  };
+  const response = (response) => {
+    if (new URL(response.url()).pathname === '/api/v1/users/me' &&
+      response.request().method() === 'DELETE' && response.headers()['dpop-nonce']) nonces++;
+  };
+  page.on('request', request);
+  page.on('response', response);
+  const cdp = authenticator.cdp;
+  const intercept = (event) => {
+    interceptions.push((async () => {
+      try {
+        if (event.request.method !== 'DELETE' || event.responseStatusCode !== 204) {
+          await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+          return;
+        }
+        commits++;
+        if (mode === 'post-send-abort') {
+          // The real API has committed. Backgrounding must abort the caller,
+          // clear private views, and retain only an unconfirmed terminal result.
+          await page.evaluate(() => {
+            globalThis.__privacyVisibility = {
+              visibilityState: Object.getOwnPropertyDescriptor(document, 'visibilityState'),
+              hidden: Object.getOwnPropertyDescriptor(document, 'hidden'),
+            };
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+            Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+            document.dispatchEvent(new Event('visibilitychange'));
+          });
+          // Cancellation can retire the interception before this release.
+          await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Aborted' }).catch(() => {});
+        } else {
+          await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' });
+        }
+      } catch {
+        interceptionFailed = true;
+        await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' }).catch(() => {});
+      }
+    })());
+  };
+  if (mode !== 'confirmed') {
+    cdp.on('Fetch.requestPaused', intercept);
+    await cdp.send('Fetch.enable', {
+      patterns: [{ urlPattern: `${harness.origin}/api/v1/users/me`, requestStage: 'Response' }],
+    });
+  }
+  try {
+    const confirmed = mode === 'confirmed' ? operationResponse(page, '/api/v1/users/me', 'DELETE') : null;
+    await page.getByRole('checkbox', { name: /I understand the account-deletion consequences/ }).check();
+    await stepUp(page, () => page.getByRole('button', { name: 'Delete my account', exact: true })
+      .evaluate((button) => { button.click(); button.click(); }));
+    if (confirmed) {
+      assert.equal((await confirmed).status(), 204);
+      commits++;
+    }
+    const outcome = page.getByTestId('deletion-outcome');
+    await outcome.waitFor({ state: 'visible' });
+    assert.equal(await outcome.getAttribute('data-outcome'), mode === 'confirmed' ? 'confirmed' : 'unconfirmed');
+    await Promise.all(interceptions);
+    assert.equal(interceptionFailed, false, 'Deletion response interception failed');
+    if (mode === 'post-send-abort') {
+      await page.evaluate(() => {
+        for (const [name, descriptor] of Object.entries(globalThis.__privacyVisibility)) {
+          if (descriptor) Object.defineProperty(document, name, descriptor);
+          else delete document[name];
+        }
+        delete globalThis.__privacyVisibility;
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+    }
+    await page.waitForFunction(() => document.activeElement ===
+      document.querySelector('[data-testid="deletion-outcome"] h1'));
+    assert(await outcome.getByRole('status').isVisible(), 'Deletion outcome was not announced');
+    assert.equal(await page.getByTestId('portal-ready').count(), 0);
+    assert.equal(await page.getByTestId('stepup-dialog').count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.__portalBroadcasts.length) - broadcasts, 1,
+      'Deletion broadcast was not exactly once');
+    assert.equal(logouts, 0, 'Deletion issued a redundant logout');
+    assert.equal(commits, 1, 'Duplicate clicks or uncertainty repeated deletion');
+    assert.equal(requests - nonces, 1, 'Deletion was replayed without an explicit nonce challenge');
+    assert((await keyStorage(page)).publicKey === key, 'Deletion removed the shared browser key');
+    if (mode === 'confirmed') {
+      assert(!(await page.context().cookies(harness.origin)).some((cookie) => cookie.name === '__Host-session'),
+        'Confirmed deletion retained its session cookie');
+    }
+  } finally {
+    if (mode !== 'confirmed') {
+      await cdp.send('Fetch.disable').catch(() => {});
+      cdp.off('Fetch.requestPaused', intercept);
+      await Promise.all(interceptions);
+    }
+    page.off('request', request);
+    page.off('response', response);
+  }
+}
+
+async function openReclaimLink(page, harness, path) {
+  // An email opens a fresh document. Hash-only navigation on an already open
+  // recovery page deliberately clears authority and is not a new page load.
+  await page.goto('about:blank');
+  return visit(page, harness.origin, path);
+}
+
+async function reclaimFromMail(browser, harness, fixture, notice, credential, evidence, contexts, totpOnly = false, loseSuccess = false) {
+  const { context, observed } = await newContext(browser, harness);
+  contexts.push(context);
+  const page = await context.newPage();
+  const authenticator = credential ? await addAuthenticator(page, credential) : null;
+  let optionsCalls = 0;
+  let completions = 0;
+  page.on('request', (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/v1/auth/deletion/reclaim/options') optionsCalls++;
+    if (path === '/api/v1/auth/deletion/reclaim/') completions++;
+  });
+  for (const fragment of ['', '#token=invalid', `#token=${notice.token}&token=${notice.token}`]) {
+    await openReclaimLink(page, harness, `/recover-account${fragment}`);
+    await page.waitForURL(harness.origin + '/recover-account');
+    const start = page.getByRole('button', { name: 'Start account recovery', exact: true });
+    await page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
+    assert(await start.isDisabled(), 'Missing or duplicate token enabled recovery');
+  }
+  await openReclaimLink(page, harness, notice.link.slice(harness.origin.length));
+  await page.waitForURL(harness.origin + '/recover-account');
+  await page.getByRole('button', { name: 'Start account recovery', exact: true }).waitFor();
+  await page.reload({ waitUntil: 'load' });
+  await page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
+  assert(await page.getByRole('button', { name: 'Start account recovery', exact: true }).isDisabled(),
+    'Reload restored an emailed bearer token');
+  await openReclaimLink(page, harness, notice.link.slice(harness.origin.length));
+  await page.waitForURL(harness.origin + '/recover-account');
+  assert.equal(optionsCalls, 0, 'Opening an email link automatically requested options');
+  assert.equal(completions, 0, 'Opening an email link automatically redeemed it');
+  await clean(page, observed, true);
+  assert.equal((await context.cookies(harness.origin)).length, 0);
+  const start = async () => {
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) =>
+      button.textContent.trim() === 'Start account recovery' && !button.disabled));
+    const prepared = operationResponse(page, '/api/v1/auth/deletion/reclaim/options', 'POST');
+    const preparedBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/options', 'POST', 200);
+    await page.getByRole('button', { name: 'Start account recovery', exact: true })
+      .evaluate((button) => { button.click(); button.click(); });
+    const result = await prepared;
+    assert.equal(result.status(), 200);
+    const selected = await preparedBody;
+    assert.equal(selected.factor, totpOnly ? 'totp' : 'webauthn');
+    if (!totpOnly) assert.equal(selected.webauthn.publicKey.userVerification, 'required');
+  };
+  await start();
+  assert.equal(optionsCalls, 1, 'Duplicate start clicks allocated two ceremonies');
+  if (totpOnly) {
+    assert.equal(await page.getByRole('button', { name: 'Recover with a passkey', exact: true }).count(), 0);
+    const input = page.getByLabel('Authenticator code', { exact: true });
+    await input.waitFor();
+    assert.equal(await input.getAttribute('type'), 'text');
+    assert.equal(await input.getAttribute('inputmode'), 'numeric');
+    await input.fill('004219');
+    assert.equal(await input.inputValue(), '004219', 'Whole-code entry lost a leading zero');
+    const resume = await hidePortal(page, context, evidence);
+    await resume();
+    await page.getByRole('button', { name: 'Start account recovery', exact: true }).waitFor();
+    assert.equal(optionsCalls, 1, 'Background resume automatically retried recovery');
+    assert.equal(await input.count(), 0, 'Backgrounding kept the TOTP form');
+    await start();
+    assert.equal(await input.inputValue(), '', 'Entered TOTP survived backgrounding');
+    await input.fill('123');
+    await page.getByRole('button', { name: 'Recover account', exact: true }).click();
+    assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    assert.equal(completions, 0, 'Invalid TOTP length was submitted');
+    const pattern = '**/api/v1/auth/deletion/reclaim/';
+    const invalid = async (route) => route.continue({
+      postData: JSON.stringify({ ...route.request().postDataJSON(), code: 'invalid-factor' }),
+    });
+    await page.route(pattern, invalid);
+    const rejected = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === '/api/v1/auth/deletion/reclaim/' && response.status() === 401);
+    const rejectedBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/', 'POST', 401);
+    await input.fill('000000');
+    await page.getByRole('button', { name: 'Recover account', exact: true }).click();
+    assert.equal((await rejected).status(), 401);
+    assert.equal((await rejectedBody).error, 'invalid_token');
+    await page.unroute(pattern, invalid);
+    await page.getByRole('alert').filter({
+      hasText: /The recovery link or verification could not be accepted/,
+    }).waitFor({ state: 'visible' });
+    await start();
+    await appearance(page, evidence, 'reclaim');
+    let factor = harness.fixture('reclaim-totp-code', { user_id: fixture.user_id });
+    await input.fill(factor.code);
+    factor = undefined;
+  } else {
+    assert.equal(await page.getByLabel('Authenticator code', { exact: true }).count(), 0,
+      'Recovery ignored the server-selected factor');
+  }
+  let lost = 0;
+  let interceptionFailed = false;
+  const interceptions = [];
+  const cdp = authenticator?.cdp;
+  const loseResponse = (event) => {
+    interceptions.push((async () => {
+      try {
+        if (event.responseStatusCode === 204) {
+          lost++;
+          await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' });
+        } else await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+      } catch {
+        interceptionFailed = true;
+        await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' }).catch(() => {});
+      }
+    })());
+  };
+  if (loseSuccess) {
+    cdp.on('Fetch.requestPaused', loseResponse);
+    await cdp.send('Fetch.enable', {
+      patterns: [{ urlPattern: `${harness.origin}/api/v1/auth/deletion/reclaim/`, requestStage: 'Response' }],
+    });
+  }
+  const outcome = page.getByTestId('reclaim-outcome');
+  try {
+    const completed = loseSuccess ? null : operationResponse(page, '/api/v1/auth/deletion/reclaim/', 'POST');
+    await page.getByRole('button', { name: totpOnly ? 'Recover account' : 'Recover with a passkey', exact: true }).click();
+    if (completed) assert.equal((await completed).status(), 204);
+    await outcome.waitFor({ state: 'visible' });
+    await Promise.all(interceptions);
+    assert.equal(interceptionFailed, false, 'Recovery response interception failed');
+    assert.equal(lost, loseSuccess ? 1 : 0);
+  } finally {
+    if (loseSuccess) {
+      await cdp.send('Fetch.disable').catch(() => {});
+      cdp.off('Fetch.requestPaused', loseResponse);
+      await Promise.all(interceptions);
+    }
+  }
+  assert.equal(await outcome.getAttribute('data-outcome'), loseSuccess ? 'unconfirmed' : 'confirmed');
+  await page.waitForFunction(() => document.activeElement === document.querySelector('[data-testid="reclaim-outcome"] h2'));
+  assert(await outcome.getByRole('status').isVisible(), 'Recovery result was not announced');
+  const login = outcome.getByRole('link', { name: 'Sign in to your account', exact: true });
+  if (loseSuccess) assert.equal(await login.count(), 0, 'Unconfirmed recovery promised a successful sign-in');
+  else assert.equal(await login.getAttribute('href'), '/login');
+  assert.equal(page.url(), harness.origin + '/recover-account', 'Recovery signed in automatically');
+  assert.equal((await context.cookies(harness.origin)).length, 0, 'Recovery issued session state');
+  assert.equal(await page.getByLabel('Authenticator code', { exact: true }).count(), 0);
+  await clean(page, observed, true);
+  assert.equal(completions, totpOnly ? 2 : 1, 'Recovery silently replayed a factor');
+  assert(observed.anonymous >= (loseSuccess ? 1 : 2), 'Anonymous transport was not observed');
+  assert(await page.evaluate((secrets) => !secrets.some((secret) =>
+    document.documentElement.outerHTML.includes(secret) || JSON.stringify(history.state).includes(secret)),
+  [notice.token, notice.link]), 'Recovery token entered DOM or history state');
+  return { context, page, observed, authenticator };
+}
+
+async function deletionLifecycle(browser, harness, evidence, contexts) {
+  const fixture = harness.fixture('seed', { credentials: 2, totp: true });
+  let current = await newContext(browser, harness);
+  contexts.push(current.context);
+  current.page = await current.context.newPage();
+  current.authenticator = await addAuthenticator(current.page, fixture.credentials[0]);
+  await signIn(current.page, harness.origin);
+  const tab = await current.context.newPage();
+  await visit(tab, harness.origin, '/dashboard/privacy');
+  await tab.getByTestId('portal-ready').waitFor({ state: 'visible' });
+  const remote = await newContext(browser, harness);
+  contexts.push(remote.context);
+  const remotePage = await remote.context.newPage();
+  await addAuthenticator(remotePage, fixture.credentials[1]);
+  await signIn(remotePage, harness.origin);
+  const remoteCookies = await remote.context.cookies(harness.origin);
+  harness.secrets.push(...remoteCookies.map((cookie) => cookie.value));
+  await current.page.bringToFront();
+  await current.page.getByTestId('portal-ready').waitFor({ state: 'visible' });
+  await deletionPolicy(current.page, harness, fixture, current.authenticator, evidence);
+  const original = harness.fixture('deletion-state', { user_id: fixture.user_id });
+  const oldAuthority = [{ page: remotePage, context: remote.context, cookies: remoteCookies }];
+  await harness.stopNotifier();
+  harness.mail.rejectNext(fixture.email);
+  for (const [index, mode] of ['confirmed', 'lost-response', 'post-send-abort'].entries()) {
+    const { page, context, authenticator, observed } = current;
+    if (index > 0) {
+      await signIn(page, harness.origin);
+      await navigate(page, harness.origin, 'Privacy', '/dashboard/privacy');
+    }
+    const oldCookies = await context.cookies(harness.origin);
+    harness.secrets.push(...oldCookies.map((cookie) => cookie.value));
+    const siblingBroadcasts = index === 0 ? await tab.evaluate(() => globalThis.__portalBroadcasts.length) : 0;
+    await deleteWithOutcome(page, harness, authenticator, mode);
+    assert(!(await page.locator('body').innerText()).includes(fixture.email), 'Deletion left private account data visible');
+    const pending = harness.fixture('deletion-state', { user_id: fixture.user_id });
+    assert.equal(pending.status, 'pending_deletion');
+    assert.equal(pending.requests, index + 1);
+    assert.equal(pending.notifications, index + 1, 'Duplicate deletion enqueued duplicate notices');
+    assert.equal(Date.parse(pending.expires_at) - Date.parse(pending.deleted_at), 720 * 3600 * 1000);
+    assert(BigInt(pending.auth_version) > BigInt(original.auth_version));
+    if (index === 0) {
+      assert.equal(pending.accepted, 0, 'Stopped worker somehow accepted mail');
+      assert.equal(pending.payloads, 1, 'Committed deletion lost its durable encrypted mail');
+      harness.startNotifier();
+      await tab.getByTestId('portal-ready').waitFor({ state: 'hidden' });
+      assert.equal(await tab.evaluate(() => globalThis.__portalBroadcasts.length), siblingBroadcasts,
+        'Sibling tab echoed a deletion invalidation');
+    }
+    const notice = await harness.mail.waitFor(fixture.email, index + 1);
+    assert.equal(Date.parse(notice.expires_at), Date.parse(pending.expires_at), 'Mail changed the persisted recovery deadline');
+    const stable = await harness.waitForNoticeCleanup(fixture.user_id, index + 1);
+    assert.equal(stable.attempts, index + 2, 'Worker did not persist each actual relay attempt');
+    assert.equal(stable.deleted_at, pending.deleted_at, 'Delivery retry reset deletion time');
+    assert.equal(stable.expires_at, pending.expires_at, 'Delivery retry reset recovery expiry');
+    const attempts = harness.mail.messages.filter((message) => message.recipient === fixture.email && message.message_id === notice.message_id);
+    assert.equal(attempts.length, index === 0 ? 2 : 1);
+    assert(attempts.every((attempt) => attempt.token === notice.token && attempt.expires_at === notice.expires_at));
+
+    await context.addCookies(oldCookies);
+    assert.equal((await api(page, '/api/v1/users/me')).status, 401, 'Old bound session survived deletion');
+    await context.clearCookies();
+    await remote.context.addCookies(remoteCookies);
+    assert.equal((await api(remotePage, '/api/v1/users/me')).status, 401, 'Independent session survived deletion');
+    assert.equal(await page.getByTestId('deletion-outcome').getAttribute('data-outcome'),
+      mode === 'confirmed' ? 'confirmed' : 'unconfirmed', 'A later 401 invented a confirmed deletion');
+    await clean(page, observed);
+    const credential = await currentCredential(authenticator, fixture.credentials[0].credentialId);
+    const totpOnly = index === 2;
+    if (totpOnly) assert.equal(harness.fixture('reclaim-totp-only', { user_id: fixture.user_id }).totp_only, true);
+    const recovered = await reclaimFromMail(browser, harness, fixture, notice, totpOnly ? null : credential,
+      evidence, contexts, totpOnly, index === 1);
+    const restored = harness.fixture('deletion-state', { user_id: fixture.user_id });
+    assert.equal(restored.status, 'active');
+    assert.equal(restored.deleted_at, null);
+    assert(BigInt(restored.auth_version) > BigInt(pending.auth_version), 'Recovery revived old authority');
+    oldAuthority.push({ page, context, cookies: oldCookies });
+    for (const old of oldAuthority) {
+      await old.context.addCookies(old.cookies);
+      assert.equal((await api(old.page, '/api/v1/users/me')).status, 401,
+        'Pre-deletion browser authority revived after recovery');
+      await old.context.clearCookies();
+    }
+    current = recovered;
+  }
+  assert(harness.mail.evidence.authenticated >= 4 && harness.mail.evidence.temporary === 1 && harness.mail.evidence.accepted === 3,
+    'Real authenticated SMTP retry/drain path was not exercised');
+  // A used link follows the same opaque API failure, never a success inferred
+  // from the account's active status. Loading it still performs no redemption.
+  const last = harness.mail.messages.filter((message) => message.accepted).at(-1);
+  await openReclaimLink(current.page, harness, last.link.slice(harness.origin.length));
+  await current.page.waitForURL(harness.origin + '/recover-account');
+  const invalid = current.page.waitForResponse((response) =>
+    new URL(response.url()).pathname === '/api/v1/auth/deletion/reclaim/options' && response.status() === 401);
+  const invalidBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/options', 'POST', 401);
+  await current.page.getByRole('button', { name: 'Start account recovery', exact: true }).click();
+  assert.equal((await invalid).status(), 401);
+  assert.equal((await invalidBody).error, 'invalid_token');
+  await current.page.getByRole('alert').filter({
+    hasText: /The recovery link or verification could not be accepted/,
+  }).waitFor({ state: 'visible' });
+  assert.equal(await current.page.getByTestId('reclaim-outcome').count(), 0);
+  await current.page.clock.install({ time: new Date() });
+  await openReclaimLink(current.page, harness, last.link.slice(harness.origin.length));
+  await current.page.waitForURL(harness.origin + '/recover-account');
+  await current.page.clock.fastForward(300_001);
+  await current.page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
+  assert(await current.page.getByRole('button', { name: 'Start account recovery', exact: true }).isDisabled(),
+    'Recovery token survived its five-minute memory bound');
+  await clean(current.page, current.observed, true);
+  evidence.checks.push(
+    'real UV deletion 204, worker-stopped durable enqueue and restart, verified/authenticated SMTP temporary retry with identical token/message identity/deadline; cookie clear, exactly-once neutral peer invalidation, old and independent sessions revoked before and after recovery',
+    'real committed deletion with lost success and post-send background abort stays unconfirmed, clears private state, preserves browser key, never logs out or automatically replays; later 401 is not proof of success',
+    'captured-mail keyless anonymous UV and TOTP recovery across replicas, fragment scrub and reload/five-minute cleanup, malformed/duplicate/used links, no auto-redemption, no cookies/DPoP/session issuance, lost real recovery success stays unconfirmed without factor replay, TOTP leading-zero entry and app-switch clearing with explicit fresh options, real invalid-factor rejection, focused outcome announcements and mobile light/dark nonce-CSP checks'
+  );
+}
+
 export async function validatePortal(harness) {
   const browser = await chromium.launch({
     channel: 'chromium',
@@ -1068,11 +1561,39 @@ export async function validatePortal(harness) {
     await recoveryLifecycle(browser, harness, evidence, contexts);
     checkpoint = 'uncertain-recovery';
     await uncertainRecovery(browser, harness, evidence, contexts);
+    checkpoint = 'deletion-reclaim';
+    // The legacy scenarios legitimately consume the production per-subnet login
+    // budget. Isolate this account lifecycle instead of disabling rate limits.
+    const privacyHarness = await startPortalHarness();
+    const privacyContexts = [];
+    let privacyBrowser;
+    try {
+      privacyBrowser = await chromium.launch({
+        channel: 'chromium',
+        args: [`--ignore-certificate-errors-spki-list=${privacyHarness.tlsSPKI}`],
+      });
+      await deletionLifecycle(privacyBrowser, privacyHarness, evidence, privacyContexts);
+      for (const [key, counts] of privacyHarness.routeEvidence) {
+        const prior = harness.routeEvidence.get(key) || [0, 0];
+        harness.routeEvidence.set(key, [prior[0] + counts[0], prior[1] + counts[1]]);
+      }
+      for (const key of Object.keys(harness.originEvidence)) {
+        harness.originEvidence[key] += privacyHarness.originEvidence[key];
+      }
+    } catch (error) {
+      privacyHarness.diagnostics();
+      throw error;
+    } finally {
+      for (const context of privacyContexts) await context.close();
+      await privacyBrowser?.close();
+      await privacyHarness.close();
+    }
     checkpoint = 'final-evidence';
     for (const [start, finish] of [
       ['/api/v1/auth/webauthn/login/generate-options', '/api/v1/auth/webauthn/login/verify'],
       ['/api/v1/auth/webauthn/register/generate-options', '/api/v1/auth/webauthn/register/verify'],
       ['/api/v1/auth/stepup/challenge', '/api/v1/auth/stepup/verify'],
+      ['/api/v1/auth/deletion/reclaim/options', '/api/v1/auth/deletion/reclaim/'],
     ]) {
       assert(
         (harness.routeEvidence.get(`POST ${start}`)?.[0] || 0) > 0,
@@ -1084,15 +1605,17 @@ export async function validatePortal(harness) {
       );
     }
     evidence.checks.push(
-      'login, registration, and UV step-up started on API A and finished on API B using real Redis'
+      'login, registration, UV step-up, and anonymous reclaim started on API A and finished on API B using real Redis'
     );
     assert(harness.originEvidence.unsafe > 0, 'No unsafe browser requests reached the HTTPS ingress');
     assert.equal(harness.originEvidence.mismatched, 0, 'A browser mutation suppressed or changed its Origin');
     assert.equal(harness.originEvidence.referrers, 0, 'A browser mutation disclosed a Referer');
-    evidence.checks.push('HTTPS ingress observed exact Origin and no Referer on unsafe DPoP requests');
+    assert(harness.originEvidence.anonymous > 0, 'No anonymous recovery reached the ingress');
+    evidence.checks.push('HTTPS ingress observed exact Origin and no Referer on unsafe DPoP and anonymous reclaim requests');
     evidence.manualGates = [
       'Assistive-technology review and platform authenticator UX',
       'Real deployed HTTPS ingress, log redaction, and downstream v1/v2 consumer rollout',
+      'Independent mailbox access, SMTP sender/provider policy, bounce handling, governance-approved retention copy, and physical authenticator/assistive-technology review before deletion enablement',
       ...(!evidence.nativeBfcacheRestoreObserved
         ? ['Native bfcache restore not observed; history/pagehide cleanup was tested']
         : []),

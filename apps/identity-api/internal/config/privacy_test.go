@@ -20,6 +20,7 @@ import (
 func clearPrivacyEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
+		EnvGDPRDeletionEnabled,
 		EnvGDPRGracePeriod,
 		EnvGDPRPurgeBatchSize,
 		EnvGDPRPurgeDryRun,
@@ -27,7 +28,6 @@ func clearPrivacyEnv(t *testing.T) {
 		EnvGDPRReclaimPerAccountPerHour,
 		EnvGDPRReclaimPerSubnetPerHour,
 		EnvGDPRDeletePerAccountPerDay,
-		EnvGDPRDeleteResendCooldown,
 	} {
 		t.Setenv(k, "")
 	}
@@ -54,6 +54,9 @@ func TestLoadPrivacyDefaults(t *testing.T) {
 	if cfg.PurgeDryRun {
 		t.Error("PurgeDryRun = true, want false by default (a dry-run default would silently never purge)")
 	}
+	if cfg.DeletionEnabled {
+		t.Error("new deletion requests must be disabled by default")
+	}
 	if cfg.ReclaimMaxAttempts != defaultGDPRReclaimMaxAttempts {
 		t.Errorf("ReclaimMaxAttempts = %d, want %d", cfg.ReclaimMaxAttempts, defaultGDPRReclaimMaxAttempts)
 	}
@@ -69,10 +72,6 @@ func TestLoadPrivacyDefaults(t *testing.T) {
 		t.Errorf("DeletePerAccountPerDay = %d, want %d",
 			cfg.DeletePerAccountPerDay, defaultGDPRDeletePerAccountPerDay)
 	}
-	if cfg.DeleteResendCooldown != defaultGDPRDeleteResendCooldown {
-		t.Errorf("DeleteResendCooldown = %v, want %v",
-			cfg.DeleteResendCooldown, defaultGDPRDeleteResendCooldown)
-	}
 }
 
 func TestLoadPrivacyOverrides(t *testing.T) {
@@ -84,9 +83,8 @@ func TestLoadPrivacyOverrides(t *testing.T) {
 	t.Setenv(EnvGDPRReclaimPerAccountPerHour, "4")
 	t.Setenv(EnvGDPRReclaimPerSubnetPerHour, "9")
 	t.Setenv(EnvGDPRDeletePerAccountPerDay, "1")
-	t.Setenv(EnvGDPRDeleteResendCooldown, "15m")
 
-	cfg, err := LoadPrivacy("production")
+	cfg, err := LoadPrivacy("development")
 	if err != nil {
 		t.Fatalf("LoadPrivacy: %v", err)
 	}
@@ -111,9 +109,6 @@ func TestLoadPrivacyOverrides(t *testing.T) {
 	if cfg.DeletePerAccountPerDay != 1 {
 		t.Errorf("DeletePerAccountPerDay = %d, want 1", cfg.DeletePerAccountPerDay)
 	}
-	if cfg.DeleteResendCooldown != 15*time.Minute {
-		t.Errorf("DeleteResendCooldown = %v, want 15m", cfg.DeleteResendCooldown)
-	}
 }
 
 // TestLoadPrivacyGracePeriodFloor pins the boundary pair around the floor: exactly
@@ -126,7 +121,7 @@ func TestLoadPrivacyGracePeriodFloor(t *testing.T) {
 		clearPrivacyEnv(t)
 		t.Setenv(EnvGDPRGracePeriod, MinGDPRGracePeriod.String())
 
-		cfg, err := LoadPrivacy("production")
+		cfg, err := LoadPrivacy("development")
 		if err != nil {
 			t.Fatalf("LoadPrivacy at the floor: %v", err)
 		}
@@ -158,12 +153,11 @@ func TestLoadPrivacyMalformedValues(t *testing.T) {
 		{"BatchSizeZero", EnvGDPRPurgeBatchSize, "0"},
 		{"BatchSizeNegative", EnvGDPRPurgeBatchSize, "-5"},
 		{"DryRunNotABool", EnvGDPRPurgeDryRun, "yes"},
+		{"DeletionEnabledNotABool", EnvGDPRDeletionEnabled, "yes"},
 		{"MaxAttemptsZero", EnvGDPRReclaimMaxAttempts, "0"},
 		{"ReclaimPerAccountNegative", EnvGDPRReclaimPerAccountPerHour, "-1"},
 		{"ReclaimPerSubnetNotAnInt", EnvGDPRReclaimPerSubnetPerHour, "lots"},
 		{"DeletePerDayZero", EnvGDPRDeletePerAccountPerDay, "0"},
-		{"ResendCooldownZero", EnvGDPRDeleteResendCooldown, "0s"},
-		{"ResendCooldownNotADuration", EnvGDPRDeleteResendCooldown, "soon"},
 	}
 
 	for _, tc := range cases {
@@ -193,7 +187,7 @@ func TestLoadPrivacyConfigDrivesService(t *testing.T) {
 	t.Setenv(EnvGDPRPurgeBatchSize, "11")
 	t.Setenv(EnvGDPRReclaimMaxAttempts, "2")
 
-	cfg, err := LoadPrivacy("production")
+	cfg, err := LoadPrivacy("development")
 	if err != nil {
 		t.Fatalf("LoadPrivacy: %v", err)
 	}
@@ -207,8 +201,7 @@ func TestLoadPrivacyConfigDrivesService(t *testing.T) {
 		ReclaimPerAccountPerHour: cfg.ReclaimPerAccountPerHour,
 		ReclaimPerSubnetPerHour:  cfg.ReclaimPerSubnetPerHour,
 		DeletePerAccountPerDay:   cfg.DeletePerAccountPerDay,
-		DeleteResendCooldown:     cfg.DeleteResendCooldown,
-	}, queries, privacy.NewLogNotifier(nil), recorder)
+	}, queries, nil, recorder)
 	if err != nil {
 		t.Fatalf("privacy.New rejected the loaded config: %v", err)
 	}
@@ -226,6 +219,30 @@ func TestLoadPrivacyConfigDrivesService(t *testing.T) {
 		DryRun:      cfg.PurgeDryRun,
 	}, queries, opener, recorder); err != nil {
 		t.Fatalf("privacy.NewPurger rejected the loaded config: %v", err)
+	}
+}
+
+func TestLoadPrivacyRequiresProductionThirtyDays(t *testing.T) {
+	for _, environment := range []string{"production", "staging", ""} {
+		for _, duration := range []string{"24h", "719h59m59s", "720h", "721h"} {
+			t.Run(environment+"/"+duration, func(t *testing.T) {
+				clearPrivacyEnv(t)
+				t.Setenv(EnvGDPRGracePeriod, duration)
+				_, err := LoadPrivacy(environment)
+				if (err == nil) != (duration == "720h") {
+					t.Fatalf("LoadPrivacy(%q) with %s: %v", environment, duration, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadPrivacyExplicitDeletionEnablement(t *testing.T) {
+	clearPrivacyEnv(t)
+	t.Setenv(EnvGDPRDeletionEnabled, "true")
+	cfg, err := LoadPrivacy("production")
+	if err != nil || !cfg.DeletionEnabled {
+		t.Fatalf("explicit enablement = %v, error = %v", cfg.DeletionEnabled, err)
 	}
 }
 

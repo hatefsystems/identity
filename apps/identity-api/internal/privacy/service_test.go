@@ -1,27 +1,34 @@
 package privacy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
-// testClock is a manually advanced clock shared by the service and its fakes so
-// cooldown and cutoff arithmetic is exact rather than wall-clock dependent.
 type testClock struct{ t time.Time }
 
 func (c *testClock) now() time.Time          { return c.t }
 func (c *testClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
-// harness bundles a Service with every fake the tests inspect.
 type harness struct {
 	svc      *Service
 	store    *fakeStore
+	cipher   Cipher
 	notifier *fakeNotifier
 	recorder *fakeRecorder
 	sessions *fakeRevoker
@@ -33,882 +40,544 @@ type harness struct {
 	clock    *testClock
 }
 
-// newHarness builds a Service with no Transacter: these are unit tests, so runInTx
-// executes directly against the fake store. The atomicity claims that need a real
-// transaction are covered in integration_test.go.
+// Real transaction/lock behavior is tested in the integration suite. These
+// sequential fakes reproduce the SQL guards, including auth-version advancement.
 func newHarness(t *testing.T, cfg Config, extra ...Option) *harness {
 	t.Helper()
-
 	clock := &testClock{t: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)}
-	h := &harness{
-		store:    newFakeStore(clock.now),
-		notifier: &fakeNotifier{},
-		recorder: &fakeRecorder{},
-		sessions: &fakeRevoker{},
-		tokens:   &fakeRevoker{},
-		limiter:  newFakeLimiter(),
-		passkeys: &fakePasskeys{},
-		totp:     &fakeTOTP{accept: "123456"},
-		guard:    newFakeGuard(),
-		clock:    clock,
-	}
-
-	opts := append([]Option{
-		WithSessionRevoker(h.sessions),
-		WithTokenRevoker(h.tokens),
-		WithRateLimiter(h.limiter),
-		WithPasskeyReclaimer(h.passkeys),
-		WithTOTPReclaimer(h.totp),
-		WithReplayGuard(h.guard),
-		WithLogger(discardLogger()),
-		WithClock(clock.now),
-	}, extra...)
-
-	svc, err := New(cfg, h.store, h.notifier, h.recorder, opts...)
+	h := &harness{store: newFakeStore(clock.now), cipher: newTestCipher(t), notifier: &fakeNotifier{},
+		recorder: &fakeRecorder{}, sessions: &fakeRevoker{}, tokens: &fakeRevoker{}, limiter: newFakeLimiter(),
+		passkeys: &fakePasskeys{}, totp: &fakeTOTP{accept: "123456"}, guard: newFakeGuard(), clock: clock}
+	opts := append([]Option{WithSessionRevoker(h.sessions), WithTokenRevoker(h.tokens),
+		WithRateLimiter(h.limiter), WithPasskeyReclaimer(h.passkeys), WithTOTPReclaimer(h.totp),
+		WithReplayGuard(h.guard), WithLogger(discardLogger()), WithClock(clock.now)}, extra...)
+	var err error
+	h.svc, err = New(cfg, h.store, h.cipher, h.recorder, opts...)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	h.svc = svc
 	return h
 }
 
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
-
-func TestNewRequiresCollaborators(t *testing.T) {
-	store := newFakeStore(time.Now)
-	notifier := &fakeNotifier{}
-	recorder := &fakeRecorder{}
-
-	if _, err := New(Config{}, nil, notifier, recorder); err == nil {
-		t.Error("New with a nil store = nil error, want error")
+func (h *harness) queuedNotice(t *testing.T) DeletionNotice {
+	t.Helper()
+	if len(h.store.notificationIDs) == 0 {
+		t.Fatal("no queued notice")
 	}
-	// The notifier is required rather than optional: a deletion whose reclaim token
-	// cannot be delivered has no recovery window, so there is no safe fallback mode.
-	if _, err := New(Config{}, store, nil, recorder); err == nil {
-		t.Error("New with a nil notifier = nil error, want error")
-	}
-	if _, err := New(Config{}, store, notifier, nil); err == nil {
-		t.Error("New with a nil recorder = nil error, want error")
-	}
-}
-
-func TestNewAppliesDefaults(t *testing.T) {
-	h := newHarness(t, Config{})
-	if got := h.svc.GracePeriod(); got != defaultGracePeriod {
-		t.Errorf("GracePeriod = %v, want the %v default", got, defaultGracePeriod)
-	}
-	if h.svc.reclaimMaxAttempts != defaultReclaimMaxAttempts {
-		t.Errorf("reclaimMaxAttempts = %d, want %d", h.svc.reclaimMaxAttempts, defaultReclaimMaxAttempts)
-	}
-	if h.svc.deleteResendCooldown != defaultDeleteResendCooldown {
-		t.Errorf("deleteResendCooldown = %v, want %v", h.svc.deleteResendCooldown, defaultDeleteResendCooldown)
-	}
-}
-
-func TestDeletionResendsDoNotRepeatLifecycleTransition(t *testing.T) {
-	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("metadata-only@test.local")
-	for i := 0; i < 3; i++ {
-		if _, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10"); err != nil {
-			t.Fatal(err)
-		}
-		h.clock.advance(10 * time.Minute)
-	}
-	if len(h.store.intents) != 1 || h.store.user(user.ID).LifecycleRevision != 1 {
-		t.Fatal("a deletion resend advanced the lifecycle revision")
-	}
-	event, err := lifecycle.UnmarshalEvent([]byte(h.store.intents[0].Payload))
-	if err != nil || event.EventType != lifecycle.SubjectUpdated || event.GetRevision() != 1 || event.UserId != user.ID.String() {
-		t.Fatalf("invalid reversible deactivation: %v", err)
-	}
-}
-
-func TestDeletionOutboxFailurePreventsSuccessAndNotification(t *testing.T) {
-	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("metadata-only@test.local")
-	h.store.lifecycleErr = errors.New("injected outbox error")
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10"); !errors.Is(err, lifecycle.ErrEnqueue) {
-		t.Fatalf("durable intent failure hidden: %v", err)
-	}
-	if h.notifier.count() != 0 || len(h.store.intents) != 0 || len(h.store.requests) != 0 {
-		t.Fatal("failed lifecycle write produced a success side effect")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// RequestDeletion
-// ---------------------------------------------------------------------------
-
-func TestRequestDeletionDeactivatesRevokesAndNotifies(t *testing.T) {
-	h := newHarness(t, Config{GracePeriod: 720 * time.Hour})
-	user := h.store.addActiveUser("delete-me@test.local")
-
-	result, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10")
-	if err != nil {
-		t.Fatalf("RequestDeletion: %v", err)
-	}
-
-	if result.AlreadyPending {
-		t.Error("AlreadyPending = true on a first request")
-	}
-	if !result.TokenMinted {
-		t.Error("TokenMinted = false on a first request")
-	}
-	if !result.Notified {
-		t.Error("Notified = false, want the notice to have been delivered")
-	}
-
-	stored := h.store.user(user.ID)
-	if stored.Status != "pending_deletion" {
-		t.Errorf("status = %q, want pending_deletion", stored.Status)
-	}
-	if !stored.DeletedAt.Valid {
-		t.Error("deleted_at was not stamped")
-	}
-
-	// The token expiry must be derived from deleted_at, so it and the purge cutoff
-	// cannot disagree.
-	wantExpiry := stored.DeletedAt.Time.Add(720 * time.Hour)
-	if !result.ExpiresAt.Equal(wantExpiry) {
-		t.Errorf("ExpiresAt = %v, want deleted_at + grace period = %v", result.ExpiresAt, wantExpiry)
-	}
-
-	if h.sessions.count() != 1 {
-		t.Errorf("session revocations = %d, want 1", h.sessions.count())
-	}
-	if h.tokens.count() != 1 {
-		t.Errorf("refresh-token revocations = %d, want 1", h.tokens.count())
-	}
-	if h.notifier.count() != 1 {
-		t.Errorf("notices = %d, want 1", h.notifier.count())
-	}
-	if got := h.recorder.countOf(audit.EventDeletionRequested, audit.StatusSuccess); got != 1 {
-		t.Errorf("%s success events = %d, want 1", audit.EventDeletionRequested, got)
-	}
-
-	// The plaintext token must reach the notice and only the hash the store.
-	notice, ok := h.notifier.last()
+	row := h.store.notifications[h.store.notificationIDs[len(h.store.notificationIDs)-1]]
+	request, ok := h.store.requestByID(row.RequestID)
 	if !ok {
-		t.Fatal("no notice recorded")
+		t.Fatal("queued request missing")
 	}
-	if notice.ReclaimToken == "" {
-		t.Fatal("notice carries no reclaim token")
-	}
-	if notice.PrimaryEmail != user.Email {
-		t.Errorf("notice PrimaryEmail = %q, want %q", notice.PrimaryEmail, user.Email)
-	}
-	request, err := h.store.GetActiveDeletionRequestByTokenHashForUpdate(
-		context.Background(), HashReclaimToken(notice.ReclaimToken))
+	plaintext, err := h.cipher.Decrypt(t.Context(), row.PayloadEncrypted)
 	if err != nil {
-		t.Fatalf("the minted token does not resolve its request: %v", err)
+		t.Fatal(err)
 	}
-	if request.TokenHash == notice.ReclaimToken {
-		t.Error("the store holds the plaintext token, not its hash")
-	}
-	if !request.NotifiedAt.Valid {
-		t.Error("notified_at was not stamped after a successful send")
-	}
-}
-
-// TestRequestDeletionIsIdempotentWithinCooldown is the anti-email-bomb property: a
-// repeat request succeeds, does not deactivate twice, and does not mint or resend.
-func TestRequestDeletionIsIdempotentWithinCooldown(t *testing.T) {
-	h := newHarness(t, Config{GracePeriod: 720 * time.Hour, DeleteResendCooldown: time.Hour})
-	user := h.store.addActiveUser("idempotent@test.local")
-
-	first, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10")
+	defer clear(plaintext)
+	notice, err := decodeNotificationPayload(plaintext, row, request)
 	if err != nil {
-		t.Fatalf("first RequestDeletion: %v", err)
+		t.Fatal(err)
 	}
-	firstDeletedAt := h.store.user(user.ID).DeletedAt.Time
-
-	h.clock.advance(30 * time.Minute) // inside the 1h cooldown
-
-	second, err := h.svc.RequestDeletion(context.Background(), user.ID, "203.0.113.10")
-	if err != nil {
-		t.Fatalf("second RequestDeletion: %v", err)
-	}
-
-	if !second.AlreadyPending {
-		t.Error("AlreadyPending = false on a repeat request")
-	}
-	if second.TokenMinted {
-		t.Error("TokenMinted = true inside the resend cooldown; that is an email bomb")
-	}
-	if second.Notified {
-		t.Error("Notified = true inside the resend cooldown")
-	}
-	if h.notifier.count() != 1 {
-		t.Errorf("notices = %d, want 1 (the repeat must not resend)", h.notifier.count())
-	}
-	if !second.ExpiresAt.Equal(first.ExpiresAt) {
-		t.Errorf("ExpiresAt moved on a repeat: %v then %v", first.ExpiresAt, second.ExpiresAt)
-	}
-	// deleted_at must not be re-stamped, or the grace window would slide forward
-	// every time the endpoint was called.
-	if got := h.store.user(user.ID).DeletedAt.Time; !got.Equal(firstDeletedAt) {
-		t.Errorf("deleted_at moved on a repeat: %v then %v", firstDeletedAt, got)
-	}
+	return notice
 }
 
-// TestRequestDeletionResendsAfterCooldown covers the other half: a user who lost the
-// first mail can get a replacement, and the superseded token stops working.
-func TestRequestDeletionResendsAfterCooldown(t *testing.T) {
-	h := newHarness(t, Config{GracePeriod: 720 * time.Hour, DeleteResendCooldown: time.Hour})
-	user := h.store.addActiveUser("resend@test.local")
-
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("first RequestDeletion: %v", err)
-	}
-	firstNotice, _ := h.notifier.last()
-
-	h.clock.advance(2 * time.Hour) // outside the cooldown
-
-	second, err := h.svc.RequestDeletion(context.Background(), user.ID, "")
-	if err != nil {
-		t.Fatalf("second RequestDeletion: %v", err)
-	}
-	if !second.AlreadyPending {
-		t.Error("AlreadyPending = false on a repeat request")
-	}
-	if !second.TokenMinted {
-		t.Error("TokenMinted = false outside the cooldown; a user who lost the mail cannot recover")
-	}
-	if h.notifier.count() != 2 {
-		t.Errorf("notices = %d, want 2", h.notifier.count())
-	}
-
-	secondNotice, _ := h.notifier.last()
-	if secondNotice.ReclaimToken == firstNotice.ReclaimToken {
-		t.Error("the resend reused the previous token instead of minting a fresh one")
-	}
-	// Only the newest token may be live.
-	if _, err := h.store.GetActiveDeletionRequestByTokenHashForUpdate(
-		context.Background(), HashReclaimToken(firstNotice.ReclaimToken)); err == nil {
-		t.Error("the superseded token is still active")
-	}
-
-	// The grace window must still be measured from the original deactivation, not
-	// extended by the resend — otherwise repeated requests would postpone erasure
-	// indefinitely.
-	deletedAt := h.store.user(user.ID).DeletedAt.Time
-	if !second.ExpiresAt.Equal(deletedAt.Add(720 * time.Hour)) {
-		t.Errorf("ExpiresAt = %v, want the original deleted_at + grace period = %v",
-			second.ExpiresAt, deletedAt.Add(720*time.Hour))
-	}
-}
-
-// TestRequestDeletionSurvivesNotifierFailure pins the fail-safe direction: the
-// deletion commits even when the mail fails, and the cooldown stays unarmed so the
-// next call retries delivery.
-func TestRequestDeletionSurvivesNotifierFailure(t *testing.T) {
-	h := newHarness(t, Config{GracePeriod: 720 * time.Hour, DeleteResendCooldown: time.Hour})
-	user := h.store.addActiveUser("nomail@test.local")
-	h.notifier.err = errBoom
-
-	result, err := h.svc.RequestDeletion(context.Background(), user.ID, "")
-	if err != nil {
-		t.Fatalf("RequestDeletion must not fail because the notifier did: %v", err)
-	}
-	if result.Notified {
-		t.Error("Notified = true after a failed send")
-	}
-	if h.store.user(user.ID).Status != "pending_deletion" {
-		t.Error("the deletion was rolled back by a notifier failure")
-	}
-	if got := h.recorder.countOf(audit.EventDeletionRequested, audit.StatusFailure); got == 0 {
-		t.Error("a failed notification was not audited")
-	}
-	if h.store.notifiedCalls != 0 {
-		t.Error("notified_at was stamped despite the send failing; the cooldown would suppress the retry")
-	}
-
-	// An unarmed cooldown means the immediate next call retries the send.
-	h.notifier.err = nil
-	second, err := h.svc.RequestDeletion(context.Background(), user.ID, "")
-	if err != nil {
-		t.Fatalf("retry RequestDeletion: %v", err)
-	}
-	if !second.Notified {
-		t.Error("the retry did not attempt delivery even though no notice was ever delivered")
-	}
-}
-
-// TestRequestDeletionSurvivesRevokerFailure: revocation failures are audited but
-// must not undo a committed deletion.
-func TestRequestDeletionSurvivesRevokerFailure(t *testing.T) {
-	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("norevoke@test.local")
-	h.sessions.err = errBoom
-	h.tokens.err = errBoom
-
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("RequestDeletion must not fail because revocation did: %v", err)
-	}
-	if h.store.user(user.ID).Status != "pending_deletion" {
-		t.Error("the deletion was rolled back by a revocation failure")
-	}
-	if got := h.recorder.countOf(audit.EventDeletionRequested, audit.StatusFailure); got != 2 {
-		t.Errorf("revocation failure events = %d, want 2 (sessions and refresh tokens)", got)
-	}
-}
-
-func TestRevocationUsesBoundedCleanupContext(t *testing.T) {
-	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("cleanup@test.local")
-	type requestKey struct{}
-	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), requestKey{}, "request-value"))
-	cancel()
-	var cleanupContexts []context.Context
-	for _, revoker := range []*fakeRevoker{h.sessions, h.tokens} {
-		revoker.onRevoke = func(cleanup context.Context, userID string) {
-			if err := cleanup.Err(); err != nil {
-				t.Errorf("request cancellation reached post-commit cleanup: %v", err)
-			}
-			if userID != user.ID.String() || cleanup.Value(requestKey{}) != "request-value" {
-				t.Error("cleanup lost the account or request context values")
-			}
-			deadline, ok := cleanup.Deadline()
-			if remaining := time.Until(deadline); !ok || remaining <= 0 || remaining > 5*time.Second {
-				t.Errorf("cleanup deadline = %v (present=%v), want a live five-second bound", deadline, ok)
-			}
-			cleanupContexts = append(cleanupContexts, cleanup)
-		}
-	}
-	h.svc.revokeEverything(ctx, user.ID)
-	if h.sessions.count() != 1 || h.tokens.count() != 1 || len(cleanupContexts) != 2 {
-		t.Fatal("canceled request did not attempt both revocations")
-	}
-	if cleanupContexts[0] != cleanupContexts[1] {
-		t.Fatal("revocations did not share the bounded cleanup context")
-	}
-	for _, cleanup := range cleanupContexts {
-		if !errors.Is(cleanup.Err(), context.Canceled) {
-			t.Error("cleanup context was not canceled after revocation finished")
-		}
-	}
-}
-
-func TestRequestDeletionUnknownUser(t *testing.T) {
-	h := newHarness(t, Config{})
-	if _, err := h.svc.RequestDeletion(context.Background(), h.store.addActiveUser("x@test.local").ID, ""); err != nil {
-		t.Fatalf("sanity RequestDeletion: %v", err)
-	}
-	if _, err := h.svc.RequestDeletion(context.Background(), newUUID(), ""); !errors.Is(err, ErrUserNotFound) {
-		t.Errorf("RequestDeletion for an unknown user = %v, want ErrUserNotFound", err)
-	}
-}
-
-func TestRequestDeletionRateLimited(t *testing.T) {
-	h := newHarness(t, Config{DeletePerAccountPerDay: 3})
-	user := h.store.addActiveUser("throttled@test.local")
-	h.limiter.deny[deleteAccountRateKey(user.ID)] = true
-
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("RequestDeletion = %v, want ErrRateLimited", err)
-	}
-	// Nothing may happen once the limit is saturated.
-	if h.store.user(user.ID).Status != "active" {
-		t.Error("a rate-limited request still deactivated the account")
-	}
-	if h.notifier.count() != 0 {
-		t.Error("a rate-limited request still sent a notice")
-	}
-
-	calls := h.limiter.keys()
-	if len(calls) != 1 || calls[0] != deleteAccountRateKey(user.ID) {
-		t.Errorf("limiter calls = %v, want exactly the per-account key", calls)
-	}
-	if h.limiter.calls[0].window != 24*time.Hour {
-		t.Errorf("delete limit window = %v, want 24h", h.limiter.calls[0].window)
-	}
-	if h.limiter.calls[0].limit != 3 {
-		t.Errorf("delete limit = %d, want the configured 3", h.limiter.calls[0].limit)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReclaimOptions
-// ---------------------------------------------------------------------------
-
-// requestDeletionAndToken drives a deletion and returns the plaintext reclaim token
-// the user would have received.
 func requestDeletionAndToken(t *testing.T, h *harness, email string) (string, string) {
 	t.Helper()
 	user := h.store.addActiveUser(email)
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("RequestDeletion: %v", err)
+	if _, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, ""); err != nil {
+		t.Fatal(err)
 	}
-	notice, ok := h.notifier.last()
-	if !ok {
-		t.Fatal("no notice recorded")
-	}
-	return notice.ReclaimToken, user.ID.String()
+	return h.queuedNotice(t).ReclaimToken, user.ID.String()
 }
 
-func TestReclaimOptionsPrefersWebAuthn(t *testing.T) {
-	h := newHarness(t, Config{})
-	token, _ := requestDeletionAndToken(t, h, "passkey@test.local")
-
-	challenge, err := h.svc.ReclaimOptions(context.Background(), token, "203.0.113.10")
+func TestNewAndRecoveryOnly(t *testing.T) {
+	store, cipher, recorder := newFakeStore(time.Now), newTestCipher(t), &fakeRecorder{}
+	if _, err := New(Config{}, nil, cipher, recorder); err == nil {
+		t.Fatal("nil store accepted")
+	}
+	if _, err := New(Config{}, store, cipher, nil); err == nil {
+		t.Fatal("nil recorder accepted")
+	}
+	if _, err := New(Config{ReclaimMaxAttempts: math.MaxInt32 + 1}, store, cipher, recorder); err == nil {
+		t.Fatal("overflowing attempt limit accepted")
+	}
+	recoveryOnly, err := New(Config{}, store, nil, recorder)
 	if err != nil {
-		t.Fatalf("ReclaimOptions: %v", err)
+		t.Fatal(err)
 	}
-	if challenge.Factor != FactorWebAuthn {
-		t.Errorf("Factor = %q, want %q", challenge.Factor, FactorWebAuthn)
+	u := store.addActiveUser("disabled@example.test")
+	if _, err := recoveryOnly.RequestDeletion(t.Context(), u.ID, u.AuthVersion, ""); !errors.Is(err, ErrDeletionUnavailable) || store.user(u.ID).Status != "active" {
+		t.Fatal("recovery-only service did not fail closed")
 	}
-	if challenge.WebAuthn == nil {
-		t.Error("WebAuthn options are nil for the webauthn factor")
+	h := newHarness(t, Config{})
+	if h.svc.GracePeriod() != defaultGracePeriod || h.svc.reclaimMaxAttempts != defaultReclaimMaxAttempts {
+		t.Fatal("policy defaults changed")
+	}
+	token, _ := requestDeletionAndToken(t, h, "recovery-only@example.test")
+	h.svc.cipher = nil
+	if _, err := h.svc.ReclaimOptions(t.Context(), token, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
+		t.Fatal("disabling new deletion stranded existing recovery", err)
 	}
 }
 
-// TestReclaimOptionsFallsBackToTOTP covers the passkey-less account: the WebAuthn
-// ceremony reports "no credentials", which must not fail the request.
-func TestReclaimOptionsFallsBackToTOTP(t *testing.T) {
+func TestDeletionQueuesEncryptedNoticeAndRevokes(t *testing.T) {
 	h := newHarness(t, Config{})
-	h.passkeys.beginErr = webauthn.ErrNoCredentials
-
-	user := h.store.addActiveUser("totp@test.local")
-	u := h.store.user(user.ID)
-	u.IsMfaEnabled = true
-	h.store.users[user.ID] = u
-
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("RequestDeletion: %v", err)
+	user := h.store.addActiveUser("delete-me@example.test")
+	result, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, "203.0.113.10")
+	if err != nil || result.AlreadyPending || !result.TokenMinted || !result.NotificationQueued {
+		t.Fatalf("deletion outcome: %+v, %v", result, err)
 	}
-	notice, _ := h.notifier.last()
-
-	challenge, err := h.svc.ReclaimOptions(context.Background(), notice.ReclaimToken, "")
-	if err != nil {
-		t.Fatalf("ReclaimOptions: %v", err)
+	stored := h.store.user(user.ID)
+	if stored.Status != statusPendingDeletion || stored.AuthVersion != user.AuthVersion+1 || !stored.DeletedAt.Valid ||
+		!result.ExpiresAt.Equal(stored.DeletedAt.Time.Add(defaultGracePeriod)) {
+		t.Fatal("deletion state, version, or original deadline incorrect")
 	}
-	if challenge.Factor != FactorTOTP {
-		t.Errorf("Factor = %q, want %q", challenge.Factor, FactorTOTP)
+	if h.sessions.count() != 1 || h.tokens.count() != 1 || h.notifier.count() != 0 || len(h.store.notifications) != 1 {
+		t.Fatal("deletion did not revoke and queue without synchronous delivery")
 	}
-	if challenge.WebAuthn != nil {
-		t.Error("WebAuthn options are set for the totp factor")
+	notice := h.queuedNotice(t)
+	request := h.store.requests[0]
+	if notice.DeliveryID == uuid.Nil || notice.PrimaryEmail != user.Email || notice.BackupEmail != nil ||
+		!validReclaimToken(notice.ReclaimToken) || HashReclaimToken(notice.ReclaimToken) != request.TokenHash || request.NotifiedAt.Valid {
+		t.Fatal("queued token/recipient binding incorrect or falsely reported sent")
 	}
-}
-
-// TestReclaimOptionsNoFactorIsOpaque is the factor-inventory guard: an account with
-// neither a passkey nor TOTP must look exactly like an invalid token.
-func TestReclaimOptionsNoFactorIsOpaque(t *testing.T) {
-	h := newHarness(t, Config{})
-	h.passkeys.beginErr = webauthn.ErrNoCredentials
-	// IsMfaEnabled stays false, so no factor is available.
-	token, _ := requestDeletionAndToken(t, h, "nofactor@test.local")
-
-	_, err := h.svc.ReclaimOptions(context.Background(), token, "")
-	if !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("ReclaimOptions with no factor = %v, want ErrInvalidToken", err)
-	}
-}
-
-// TestReclaimOptionsDoesNotConsume: a user who abandons the ceremony halfway must be
-// able to restart it, so listing the factor must leave the token usable.
-func TestReclaimOptionsDoesNotConsume(t *testing.T) {
-	h := newHarness(t, Config{})
-	token, _ := requestDeletionAndToken(t, h, "abandon@test.local")
-
-	for i := 0; i < 3; i++ {
-		if _, err := h.svc.ReclaimOptions(context.Background(), token, ""); err != nil {
-			t.Fatalf("ReclaimOptions call %d: %v", i+1, err)
+	row := h.store.notifications[notice.DeliveryID]
+	for _, secret := range []string{user.Email, notice.ReclaimToken} {
+		if bytes.Contains(row.PayloadEncrypted, []byte(secret)) {
+			t.Fatal("notification material was persisted unencrypted")
+		}
+		encoded, err := json.Marshal(h.recorder.events)
+		if err != nil || bytes.Contains(encoded, []byte(secret)) {
+			t.Fatal("notification secret entered audit")
 		}
 	}
-	if err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
-		t.Fatalf("Reclaim after repeated options calls: %v", err)
+	if len(h.store.intents) != 1 || stored.LifecycleRevision != 1 {
+		t.Fatal("reversible lifecycle event missing")
+	}
+	event, err := lifecycle.UnmarshalEvent([]byte(h.store.intents[0].Payload))
+	if err != nil || event.EventType != lifecycle.SubjectUpdated || event.GetRevision() != 1 || event.UserId != user.ID.String() {
+		t.Fatal("invalid lifecycle event", err)
 	}
 }
 
-// TestReclaimTokenFailuresAreIndistinguishable pins the no-oracle property across
-// every token failure mode.
-func TestReclaimTokenFailuresAreIndistinguishable(t *testing.T) {
-	cases := []struct {
-		name  string
-		setup func(t *testing.T, h *harness) string
-	}{
-		{
-			name:  "Empty",
-			setup: func(*testing.T, *harness) string { return "" },
-		},
-		{
-			name: "Unknown",
-			setup: func(t *testing.T, _ *harness) string {
-				token, _, err := NewReclaimToken()
-				if err != nil {
-					t.Fatalf("NewReclaimToken: %v", err)
-				}
-				return token
-			},
-		},
-		{
-			name: "Expired",
-			setup: func(t *testing.T, h *harness) string {
-				token, _ := requestDeletionAndToken(t, h, "expired@test.local")
-				h.clock.advance(2 * defaultGracePeriod)
-				return token
-			},
-		},
-		{
-			name: "Consumed",
-			setup: func(t *testing.T, h *harness) string {
-				token, _ := requestDeletionAndToken(t, h, "consumed@test.local")
-				if _, err := h.store.ExpireDeletionRequestsForUser(
-					context.Background(), h.store.requests[0].UserID); err != nil {
-					t.Fatalf("ExpireDeletionRequestsForUser: %v", err)
-				}
-				return token
-			},
-		},
-		{
-			name: "AccountNoLongerPendingDeletion",
-			setup: func(t *testing.T, h *harness) string {
-				token, id := requestDeletionAndToken(t, h, "reactivated@test.local")
-				uid := mustParseUUID(t, id)
-				u := h.store.user(uid)
-				u.Status = "active"
-				h.store.users[uid] = u
-				return token
-			},
-		},
+func TestDeletionCoalescesWithoutRotationOrDeadlineReset(t *testing.T) {
+	h := newHarness(t, Config{})
+	token, id := requestDeletionAndToken(t, h, "duplicate@example.test")
+	userID := mustParseUUID(t, id)
+	first := h.store.user(userID)
+	firstRequest := h.store.requests[0]
+	for _, advance := range []time.Duration{0, 30 * time.Minute, 2 * time.Hour} {
+		h.clock.advance(advance)
+		result, err := h.svc.RequestDeletion(t.Context(), userID, 0, "")
+		if err != nil || !result.AlreadyPending || result.TokenMinted || !result.NotificationQueued || !result.ExpiresAt.Equal(firstRequest.ExpiresAt.Time) {
+			t.Fatalf("duplicate did not coalesce: %+v, %v", result, err)
+		}
 	}
+	if len(h.store.requests) != 1 || len(h.store.notifications) != 1 || len(h.store.intents) != 1 ||
+		h.queuedNotice(t).ReclaimToken != token || !h.store.user(userID).DeletedAt.Time.Equal(first.DeletedAt.Time) {
+		t.Fatal("duplicate rotated token, re-enqueued, or moved deletion deadline")
+	}
+	if _, err := h.store.ConsumeDeletionRequest(t.Context(), firstRequest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.RequestDeletion(t.Context(), userID, 0, ""); !errors.Is(err, ErrStaleAuthority) || len(h.store.requests) != 1 {
+		t.Fatal("retired token was replaced by an admitted duplicate")
+	}
+}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+func TestDeletionRejectsStaleAuthority(t *testing.T) {
+	for _, change := range []string{"version", "suspended", "banned", "deleted", "negative", "overflow"} {
+		t.Run(change, func(t *testing.T) {
 			h := newHarness(t, Config{})
-			token := tc.setup(t, h)
-
-			if _, err := h.svc.ReclaimOptions(context.Background(), token, ""); !errors.Is(err, ErrInvalidToken) {
-				t.Errorf("ReclaimOptions = %v, want ErrInvalidToken", err)
+			u := h.store.addActiveUser("authority@example.test")
+			expected := u.AuthVersion
+			switch change {
+			case "version":
+				u.AuthVersion++
+			case "suspended", "banned":
+				u.Status = change
+			case "deleted":
+				u.DeletedAt = ts(h.clock.now())
+			case "negative":
+				expected = -1
+			case "overflow":
+				expected = math.MaxInt64
 			}
-			err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn})
-			if !errors.Is(err, ErrInvalidToken) {
-				t.Errorf("Reclaim = %v, want ErrInvalidToken", err)
+			h.store.users[u.ID] = u
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, expected, ""); !errors.Is(err, ErrStaleAuthority) {
+				t.Fatal("stale admission accepted", err)
+			}
+			if len(h.store.requests)+len(h.store.notifications)+len(h.store.intents)+h.sessions.count() != 0 {
+				t.Fatal("stale admission produced side effects")
 			}
 		})
 	}
 }
 
-// TestReclaimRateLimitsSubnetFirst asserts the ordering that stops a saturated
-// shared proxy from consuming a targeted account's budget, and that a saturated
-// subnet window short-circuits before any database lookup.
+func TestDeletionRecipientsAndFailures(t *testing.T) {
+	for _, backup := range []string{"other@example.test", "PRIMARY@example.test", "primary@example.test", "primary@EXAMPLE.test", "", "bad\r\naddress@example.test", "backup@localhost", "backup@[127.0.0.1]", strings.Repeat("a", 65) + "@example.test"} {
+		t.Run(backup, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			u := h.store.addActiveUser("primary@example.test")
+			var err error
+			u.BackupEmailEncrypted, err = h.cipher.Encrypt(t.Context(), []byte(backup))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.store.users[u.ID] = u
+			_, err = h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, "")
+			if !validNotificationAddress(backup) {
+				if err == nil || h.store.user(u.ID).Status != "active" {
+					t.Fatal("invalid configured backup was silently omitted")
+				}
+				return
+			}
+			want := 2
+			if backup == "primary@example.test" || backup == "primary@EXAMPLE.test" {
+				want = 1
+			}
+			if err != nil || len(h.store.notifications) != want {
+				t.Fatal("server-selected recipient count incorrect", err)
+			}
+		})
+	}
+	t.Run("backup decryption", func(t *testing.T) {
+		h := newHarness(t, Config{})
+		u := h.store.addActiveUser("backup-fault@example.test")
+		u.BackupEmailEncrypted = []byte("unavailable envelope")
+		h.store.users[u.ID] = u
+		if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err == nil || h.store.user(u.ID).Status != "active" {
+			t.Fatal("backup decryption failure was ignored")
+		}
+	})
+	for _, stage := range []string{"encryption", "queue", "lifecycle"} {
+		t.Run(stage, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			u := h.store.addActiveUser("fault@example.test")
+			switch stage {
+			case "encryption":
+				h.svc.cipher = failingCipher{Cipher: h.cipher, encryptErr: errBoom}
+			case "queue":
+				h.store.enqueueErr = errBoom
+			case "lifecycle":
+				h.store.lifecycleErr = errBoom
+			}
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err == nil {
+				t.Fatal("persistence fault accepted")
+			}
+			if h.sessions.count()+h.tokens.count()+len(h.store.notifications) != 0 || h.recorder.countOf(audit.EventDeletionRequested, audit.StatusSuccess) != 0 {
+				t.Fatal("precommit fault produced success effects")
+			}
+		})
+	}
+}
+
+func TestDeletionRejectsRecipientsUnsupportedBySMTPBeforeMutation(t *testing.T) {
+	for _, address := range []string{"user@localhost", "user@127.0.0.1", "user@[127.0.0.1]", "\"user\"@example.test", strings.Repeat("a", 65) + "@example.test"} {
+		t.Run(address, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			u := h.store.addActiveUser(address)
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, ""); err == nil {
+				t.Fatal("undeliverable recipient accepted")
+			}
+			if h.store.user(u.ID).Status != "active" || h.store.user(u.ID).AuthVersion != u.AuthVersion || len(h.store.requests)+len(h.store.notifications)+len(h.store.intents) != 0 {
+				t.Fatal("unsupported recipient mutated deletion state")
+			}
+		})
+	}
+}
+
+func TestDeletionUnknownRateLimitedAndRevokerFailure(t *testing.T) {
+	h := newHarness(t, Config{DeletePerAccountPerDay: 3})
+	if _, err := h.svc.RequestDeletion(t.Context(), newUUID(), 0, ""); !errors.Is(err, ErrUserNotFound) {
+		t.Fatal(err)
+	}
+	u := h.store.addActiveUser("limited@example.test")
+	h.limiter.deny[deleteAccountRateKey(u.ID)] = true
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); !errors.Is(err, ErrRateLimited) || h.store.user(u.ID).Status != "active" {
+		t.Fatal("rate limit changed account", err)
+	}
+	call := h.limiter.calls[len(h.limiter.calls)-1]
+	if call.window != 24*time.Hour || call.limit != 3 {
+		t.Fatal("deletion rate policy changed")
+	}
+	delete(h.limiter.deny, deleteAccountRateKey(u.ID))
+	h.sessions.err, h.tokens.err = errBoom, errBoom
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err != nil || h.store.user(u.ID).Status != statusPendingDeletion {
+		t.Fatal("postcommit revoker failure reported failed deletion", err)
+	}
+	if h.recorder.countOf(audit.EventDeletionRequested, audit.StatusFailure) != 2 {
+		t.Fatal("cleanup failures were not audited")
+	}
+}
+
+func TestRevocationUsesBoundedCleanupContext(t *testing.T) {
+	h := newHarness(t, Config{})
+	u := h.store.addActiveUser("cleanup@example.test")
+	type requestKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), requestKey{}, "request-value"))
+	cancel()
+	var contexts []context.Context
+	for _, revoker := range []*fakeRevoker{h.sessions, h.tokens} {
+		revoker.onRevoke = func(cleanup context.Context, userID string) {
+			deadline, ok := cleanup.Deadline()
+			if cleanup.Err() != nil || userID != u.ID.String() || cleanup.Value(requestKey{}) != "request-value" ||
+				!ok || time.Until(deadline) <= 0 || time.Until(deadline) > 5*time.Second {
+				t.Error("cleanup lost context values or bounded independent lifetime")
+			}
+			contexts = append(contexts, cleanup)
+		}
+	}
+	h.svc.revokeEverything(ctx, u.ID)
+	if len(contexts) != 2 || contexts[0] != contexts[1] || !errors.Is(contexts[0].Err(), context.Canceled) {
+		t.Fatal("cleanup contexts were not shared and canceled")
+	}
+}
+
+func TestReclaimOptionsFactorPolicyAndRequestBinding(t *testing.T) {
+	for _, factor := range []string{FactorWebAuthn, FactorTOTP, "none"} {
+		t.Run(factor, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			token, id := requestDeletionAndToken(t, h, "factors@example.test")
+			uid := mustParseUUID(t, id)
+			if factor != FactorWebAuthn {
+				h.passkeys.beginErr = webauthn.ErrNoCredentials
+				u := h.store.user(uid)
+				u.IsMfaEnabled = factor == FactorTOTP
+				h.store.users[uid] = u
+			}
+			for range 2 {
+				challenge, err := h.svc.ReclaimOptions(t.Context(), token, "")
+				if factor == "none" {
+					if !errors.Is(err, ErrInvalidToken) {
+						t.Fatal("factor inventory disclosed", err)
+					}
+					return
+				}
+				if err != nil || challenge.Factor != factor || (challenge.WebAuthn != nil) != (factor == FactorWebAuthn) {
+					t.Fatal("wrong factor offered", err)
+				}
+			}
+			if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: factor, Code: "123456"}); err != nil {
+				t.Fatal(err)
+			}
+			if factor == FactorWebAuthn && h.passkeys.beginCalls[0] != h.passkeys.finishCalls[0] {
+				t.Fatal("ceremony not bound to exact request")
+			}
+			if h.store.user(uid).Status != "active" || h.store.user(uid).AuthVersion != 2 || h.store.user(uid).DeletedAt.Valid {
+				t.Fatal("reclaim did not advance authority and restore state")
+			}
+			if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: factor}); !errors.Is(err, ErrInvalidToken) {
+				t.Fatal("reclaim token was reusable")
+			}
+		})
+	}
+}
+
+func TestReclaimTokenFailuresAreOpaque(t *testing.T) {
+	for _, mode := range []string{"empty", "malformed", "unknown", "expired", "consumed", "status", "deletion_time", "version", "attempts"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			token, id := requestDeletionAndToken(t, h, "opaque@example.test")
+			uid := mustParseUUID(t, id)
+			u := h.store.user(uid)
+			switch mode {
+			case "empty":
+				token = ""
+			case "malformed":
+				token += "="
+			case "unknown":
+				token, _, _ = NewReclaimToken()
+			case "expired":
+				h.clock.advance(defaultGracePeriod)
+			case "consumed":
+				h.store.requests[0].ConsumedAt = ts(h.clock.now())
+			case "status":
+				u.Status = "suspended"
+			case "deletion_time":
+				u.DeletedAt = ts(u.DeletedAt.Time.Add(time.Second))
+			case "version":
+				u.AuthVersion++
+			case "attempts":
+				h.store.requests[0].FailedAttempts = defaultReclaimMaxAttempts
+			}
+			h.store.users[uid] = u
+			if _, err := h.svc.ReclaimOptions(t.Context(), token, ""); !errors.Is(err, ErrInvalidToken) {
+				t.Fatal("options error was not opaque", err)
+			}
+			if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) || h.passkeys.finishCallCount() != 0 {
+				t.Fatal("invalid token reached factor verification", err)
+			}
+		})
+	}
+}
+
+func TestReclaimChecksExactRequestAfterFactorAndLockWait(t *testing.T) {
+	for _, race := range []string{"consume", "attempt_cap", "replace", "hash", "expiry", "status", "deadline_during_lock"} {
+		t.Run(race, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			token, id := requestDeletionAndToken(t, h, "inflight@example.test")
+			uid := mustParseUUID(t, id)
+			h.passkeys.onFinish = func() {
+				switch race {
+				case "consume":
+					h.store.requests[0].ConsumedAt = ts(h.clock.now())
+				case "attempt_cap":
+					r := h.store.requests[0]
+					for range defaultReclaimMaxAttempts {
+						if _, err := h.store.RecordDeletionRequestFailure(t.Context(), db.RecordDeletionRequestFailureParams{ID: r.ID, UserID: r.UserID, TokenHash: r.TokenHash, MaxAttempts: defaultReclaimMaxAttempts}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case "replace":
+					h.store.requests[0].ID = uuid.New()
+				case "hash":
+					h.store.requests[0].TokenHash = HashReclaimToken("another-token")
+				case "expiry":
+					h.store.requests[0].ExpiresAt = ts(h.store.requests[0].ExpiresAt.Time.Add(time.Second))
+				case "status":
+					u := h.store.user(uid)
+					u.Status = "banned"
+					h.store.users[uid] = u
+				case "deadline_during_lock":
+					h.store.onLockRequest = func() { h.clock.advance(defaultGracePeriod) }
+				}
+			}
+			if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
+				t.Fatal("stale in-flight factor restored account", err)
+			}
+			if h.store.user(uid).Status == "active" || h.recorder.countOf(audit.EventDeletionReclaimed, audit.StatusSuccess) != 0 {
+				t.Fatal("invalidated request reported restoration")
+			}
+		})
+	}
+}
+
+func TestReclaimAttemptCapIsAtomicAndAuditsActualCount(t *testing.T) {
+	h := newHarness(t, Config{ReclaimMaxAttempts: 3})
+	token, _ := requestDeletionAndToken(t, h, "attempts@example.test")
+	h.passkeys.finishErr = webauthn.ErrVerification
+	for i := 1; i <= 3; i++ {
+		if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
+			t.Fatal(err)
+		}
+		r := h.store.requests[0]
+		event, ok := h.recorder.lastOf(audit.EventDeletionReclaimFailed)
+		if r.FailedAttempts != int32(i) || r.ConsumedAt.Valid != (i == 3) || !ok || event.Payload["attempts"] != i || event.Payload["exhausted"] != (i == 3) {
+			t.Fatal("attempt count/retirement/audit inconsistent")
+		}
+	}
+	h.passkeys.finishErr = nil
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
+		t.Fatal("correct factor revived exhausted request")
+	}
+}
+
+func TestReclaimFailedAttemptAndInfrastructure(t *testing.T) {
+	h := newHarness(t, Config{})
+	token, _ := requestDeletionAndToken(t, h, "retry-factor@example.test")
+	h.passkeys.finishErr = webauthn.ErrVerification
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) || h.store.requests[0].ConsumedAt.Valid {
+		t.Fatal("one rejected factor destroyed recovery", err)
+	}
+	h.passkeys.finishErr = errBoom
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, errBoom) || h.store.requests[0].FailedAttempts != 1 {
+		t.Fatal("infrastructure error spent attempts", err)
+	}
+	h.passkeys.finishErr = nil
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReclaimTOTPReplayAndGuardFailure(t *testing.T) {
+	h := newHarness(t, Config{})
+	token, id := requestDeletionAndToken(t, h, "totp@example.test")
+	uid := mustParseUUID(t, id)
+	h.guard.err = errBoom
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); err == nil || errors.Is(err, ErrInvalidToken) || h.store.incrementCalls != 0 {
+		t.Fatal("replay infrastructure spent attempts", err)
+	}
+	h.guard.err = nil
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); err != nil {
+		t.Fatal(err)
+	}
+	u := h.store.user(uid)
+	if _, err := h.svc.RequestDeletion(t.Context(), uid, u.AuthVersion, ""); err != nil {
+		t.Fatal(err)
+	}
+	attempts := h.totp.attemptCount()
+	if err := h.svc.Reclaim(t.Context(), h.queuedNotice(t).ReclaimToken, ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); !errors.Is(err, ErrInvalidToken) || h.totp.attemptCount() != attempts {
+		t.Fatal("replayed TOTP reached verifier", err)
+	}
+}
+
 func TestReclaimRateLimitsSubnetFirst(t *testing.T) {
 	h := newHarness(t, Config{ReclaimPerAccountPerHour: 4, ReclaimPerSubnetPerHour: 9})
-	token, id := requestDeletionAndToken(t, h, "ratelimit@test.local")
-	userID := mustParseUUID(t, id)
-
-	// Reset the recorded calls from RequestDeletion.
+	token, id := requestDeletionAndToken(t, h, "rates@example.test")
+	uid := mustParseUUID(t, id)
 	h.limiter.calls = nil
-
-	if _, err := h.svc.ReclaimOptions(context.Background(), token, "203.0.113.10"); err != nil {
-		t.Fatalf("ReclaimOptions: %v", err)
+	if _, err := h.svc.ReclaimOptions(t.Context(), token, "203.0.113.10"); err != nil {
+		t.Fatal(err)
 	}
 	keys := h.limiter.keys()
-	if len(keys) != 2 {
-		t.Fatalf("limiter calls = %v, want the subnet then the account window", keys)
+	if len(keys) != 2 || keys[0] != reclaimSubnetRateKey("203.0.113.0/24") || keys[1] != reclaimAccountRateKey(uid) || h.limiter.calls[0].limit != 9 || h.limiter.calls[1].limit != 4 {
+		t.Fatal("rate limit order or policy changed")
 	}
-	if got, want := keys[0], reclaimSubnetRateKey("203.0.113.0/24"); got != want {
-		t.Errorf("first limiter key = %q, want the subnet key %q", got, want)
-	}
-	if got, want := keys[1], reclaimAccountRateKey(userID); got != want {
-		t.Errorf("second limiter key = %q, want the account key %q", got, want)
-	}
-	if h.limiter.calls[0].limit != 9 {
-		t.Errorf("subnet limit = %d, want the configured 9", h.limiter.calls[0].limit)
-	}
-	if h.limiter.calls[1].limit != 4 {
-		t.Errorf("account limit = %d, want the configured 4", h.limiter.calls[1].limit)
-	}
-
-	// A saturated subnet must be refused before the token is even looked up.
 	h.limiter.calls = nil
-	h.limiter.deny[reclaimSubnetRateKey("203.0.113.0/24")] = true
-	if _, err := h.svc.ReclaimOptions(context.Background(), token, "203.0.113.10"); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("ReclaimOptions = %v, want ErrRateLimited", err)
+	h.limiter.deny[keys[0]] = true
+	if _, err := h.svc.ReclaimOptions(t.Context(), token, "203.0.113.10"); !errors.Is(err, ErrRateLimited) || len(h.limiter.calls) != 1 {
+		t.Fatal("saturated subnet consumed account budget", err)
 	}
-	if got := h.limiter.keys(); len(got) != 1 {
-		t.Errorf("limiter calls after a saturated subnet = %v, want only the subnet key", got)
-	}
-
-	// A saturated account window is also ErrRateLimited, not the opaque token error:
-	// throttling is not a credential failure and the caller can usefully back off.
-	h.limiter.calls = nil
-	delete(h.limiter.deny, reclaimSubnetRateKey("203.0.113.0/24"))
-	h.limiter.deny[reclaimAccountRateKey(userID)] = true
-	if err := h.svc.Reclaim(context.Background(), token,
-		ReclaimAttempt{Method: FactorWebAuthn, ClientIP: "203.0.113.10"}); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("Reclaim = %v, want ErrRateLimited", err)
-	}
-	if h.passkeys.finishCallCount() != 0 {
-		t.Error("a rate-limited reclaim still verified the factor")
+	delete(h.limiter.deny, keys[0])
+	h.limiter.deny[keys[1]] = true
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrRateLimited) || h.passkeys.finishCallCount() != 0 {
+		t.Fatal("account rate limit did not stop verification", err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Reclaim
-// ---------------------------------------------------------------------------
-
-func TestReclaimRestoresAccountAndRetiresTokens(t *testing.T) {
-	h := newHarness(t, Config{GracePeriod: 720 * time.Hour})
-	token, id := requestDeletionAndToken(t, h, "reclaim@test.local")
-	userID := mustParseUUID(t, id)
-
-	if err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
-		t.Fatalf("Reclaim: %v", err)
-	}
-
-	restored := h.store.user(userID)
-	if restored.Status != "active" {
-		t.Errorf("status = %q, want active", restored.Status)
-	}
-	if restored.DeletedAt.Valid {
-		t.Error("deleted_at was not cleared")
-	}
-	// A reclaimed account must not be reclaimable again with the same token.
-	if err := h.svc.Reclaim(context.Background(), token,
-		ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
-		t.Errorf("second Reclaim = %v, want ErrInvalidToken", err)
-	}
-	if got := h.recorder.countOf(audit.EventDeletionReclaimed, audit.StatusSuccess); got != 1 {
-		t.Errorf("%s events = %d, want 1", audit.EventDeletionReclaimed, got)
-	}
-}
-
-func TestReclaimWithTOTP(t *testing.T) {
+func TestReclaimUnsupportedFactorAuditAndBookkeepingFailure(t *testing.T) {
 	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("totp-reclaim@test.local")
-	u := h.store.user(user.ID)
-	u.IsMfaEnabled = true
-	h.store.users[user.ID] = u
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("RequestDeletion: %v", err)
+	token, _ := requestDeletionAndToken(t, h, "audit@example.test")
+	secret := "private-address@example.test"
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: secret}); !errors.Is(err, ErrInvalidToken) {
+		t.Fatal(err)
 	}
-	notice, _ := h.notifier.last()
-
-	if err := h.svc.Reclaim(context.Background(), notice.ReclaimToken,
-		ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); err != nil {
-		t.Fatalf("Reclaim with TOTP: %v", err)
+	event, _ := h.recorder.lastOf(audit.EventDeletionReclaimFailed)
+	if event.Payload["factor"] != "unsupported" {
+		t.Fatal("untrusted factor value entered audit")
 	}
-	if h.store.user(user.ID).Status != "active" {
-		t.Error("the account was not restored")
+	h.store.incrementErr = errBoom
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: "password"}); !errors.Is(err, ErrInvalidToken) || h.recorder.countOf(audit.EventDeletionReclaimFailed, audit.StatusFailure) != 1 {
+		t.Fatal("failed bookkeeping invented an audited attempt count", err)
 	}
 }
 
-// TestReclaimTOTPPasscodeIsSingleUse: the guard is claimed before validation, so one
-// passcode cannot be replayed across its whole ±1-step acceptance window.
-func TestReclaimTOTPPasscodeIsSingleUse(t *testing.T) {
+func TestLegacyRequestStillRecoversWithoutQueueOrCapturedVersion(t *testing.T) {
 	h := newHarness(t, Config{})
-	user := h.store.addActiveUser("replay@test.local")
-	u := h.store.user(user.ID)
-	u.IsMfaEnabled = true
-	h.store.users[user.ID] = u
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("RequestDeletion: %v", err)
-	}
-	notice, _ := h.notifier.last()
-
-	if err := h.svc.Reclaim(context.Background(), notice.ReclaimToken,
-		ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); err != nil {
-		t.Fatalf("first Reclaim: %v", err)
-	}
-
-	// Deactivate again and replay the same passcode: the guard must reject it before
-	// the verifier is consulted.
-	h.clock.advance(2 * time.Hour)
-	if _, err := h.svc.RequestDeletion(context.Background(), user.ID, ""); err != nil {
-		t.Fatalf("second RequestDeletion: %v", err)
-	}
-	second, _ := h.notifier.last()
-
-	attemptsBefore := h.totp.attemptCount()
-	if err := h.svc.Reclaim(context.Background(), second.ReclaimToken,
-		ReclaimAttempt{Method: FactorTOTP, Code: "123456"}); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("replayed passcode = %v, want ErrInvalidToken", err)
-	}
-	if h.totp.attemptCount() != attemptsBefore {
-		t.Error("the replayed passcode reached the verifier; the guard must claim before validating")
-	}
-	if h.store.user(user.ID).Status != "pending_deletion" {
-		t.Error("a replayed passcode reclaimed the account")
+	token, _ := requestDeletionAndToken(t, h, "legacy@example.test")
+	h.store.requests[0].RequestedAuthVersion = nil
+	h.store.notifications = nil
+	h.svc.cipher = nil
+	if err := h.svc.Reclaim(t.Context(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
+		t.Fatal("legacy hash-only request stranded", err)
 	}
 }
 
-// TestReclaimWrongFactorDoesNotConsumeToken is the load-bearing trade-off: a
-// mistyped code must not destroy the account's only recovery path.
-func TestReclaimWrongFactorDoesNotConsumeToken(t *testing.T) {
-	h := newHarness(t, Config{ReclaimMaxAttempts: 5})
-	token, id := requestDeletionAndToken(t, h, "wrongfactor@test.local")
-	userID := mustParseUUID(t, id)
-	h.passkeys.finishErr = webauthn.ErrVerification
-
-	err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn})
-	if !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("Reclaim with a wrong factor = %v, want ErrInvalidToken", err)
-	}
-
-	if h.store.consumeCalls != 0 {
-		t.Error("a wrong factor consumed the reclaim token")
-	}
-	request, err := h.store.GetActiveDeletionRequestByTokenHashForUpdate(
-		context.Background(), HashReclaimToken(token))
-	if err != nil {
-		t.Fatalf("the token stopped working after a wrong factor: %v", err)
-	}
-	if request.FailedAttempts != 1 {
-		t.Errorf("failed_attempts = %d, want 1", request.FailedAttempts)
-	}
-	if got := h.recorder.countOf(audit.EventDeletionReclaimFailed, audit.StatusFailure); got != 1 {
-		t.Errorf("%s events = %d, want 1", audit.EventDeletionReclaimFailed, got)
-	}
-
-	// The same token must still be able to succeed once the right factor arrives.
-	h.passkeys.finishErr = nil
-	if err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
-		t.Fatalf("Reclaim after a failed attempt: %v", err)
-	}
-	if h.store.user(userID).Status != "active" {
-		t.Error("the account was not restored")
-	}
-}
-
-// TestReclaimAttemptCapRetiresRequest: the cap, not single use, is what bounds abuse.
-func TestReclaimAttemptCapRetiresRequest(t *testing.T) {
-	const maxAttempts = 3
-	h := newHarness(t, Config{ReclaimMaxAttempts: maxAttempts})
-	token, _ := requestDeletionAndToken(t, h, "capped@test.local")
-	h.passkeys.finishErr = webauthn.ErrVerification
-	requestID := h.store.requests[0].ID
-
-	for i := 1; i <= maxAttempts; i++ {
-		if err := h.svc.Reclaim(context.Background(), token,
-			ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
-			t.Fatalf("attempt %d = %v, want ErrInvalidToken", i, err)
-		}
-		// The token must survive every attempt *before* the cap, or the cap is
-		// meaningless.
-		_, lookupErr := h.store.GetActiveDeletionRequestByTokenHashForUpdate(
-			context.Background(), HashReclaimToken(token))
-		stillActive := lookupErr == nil
-		if i < maxAttempts && !stillActive {
-			t.Fatalf("the token was retired at attempt %d, before the cap of %d", i, maxAttempts)
-		}
-		if i == maxAttempts && stillActive {
-			t.Fatalf("the token survived attempt %d, which reaches the cap of %d", i, maxAttempts)
-		}
-	}
-
-	// The row is retired by consumption, not by expiry: the grace window is still
-	// open, so only consumed_at can be what makes it unusable.
-	row, ok := h.store.requestByID(requestID)
-	if !ok {
-		t.Fatal("the deletion request row disappeared")
-	}
-	if !row.ConsumedAt.Valid {
-		t.Error("the exhausted request was not consumed")
-	}
-	if int(row.FailedAttempts) != maxAttempts {
-		t.Errorf("failed_attempts = %d, want %d", row.FailedAttempts, maxAttempts)
-	}
-
-	// Even a correct factor cannot revive a retired request.
-	h.passkeys.finishErr = nil
-	if err := h.svc.Reclaim(context.Background(), token,
-		ReclaimAttempt{Method: FactorWebAuthn}); !errors.Is(err, ErrInvalidToken) {
-		t.Errorf("Reclaim on a retired request = %v, want ErrInvalidToken", err)
-	}
-
-	last, ok := h.recorder.lastOf(audit.EventDeletionReclaimFailed)
-	if !ok {
-		t.Fatal("no reclaim_failed event recorded")
-	}
-	if exhausted, _ := last.Payload["exhausted"].(bool); !exhausted {
-		t.Errorf("the capping attempt was not audited as exhausted: %v", last.Payload)
-	}
-}
-
-// TestReclaimInfrastructureFaultDoesNotBurnAttempts: a database or Redis outage must
-// not eat a user's recovery attempts.
-func TestReclaimInfrastructureFaultDoesNotBurnAttempts(t *testing.T) {
-	h := newHarness(t, Config{ReclaimMaxAttempts: 5})
-	token, _ := requestDeletionAndToken(t, h, "outage@test.local")
-	h.guard.err = errBoom
-
-	user := h.store.requests[0].UserID
-	u := h.store.user(user)
-	u.IsMfaEnabled = true
-	h.store.users[user] = u
-
-	err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorTOTP, Code: "123456"})
-	if err == nil {
-		t.Fatal("Reclaim with a broken replay guard = nil error, want an error")
-	}
-	if errors.Is(err, ErrInvalidToken) {
-		t.Error("an infrastructure fault was reported as an invalid token")
-	}
-	if h.store.incrementCalls != 0 {
-		t.Error("an infrastructure fault was charged to the attempt budget")
-	}
-}
-
-// TestReclaimUnsupportedFactorIsOpaque: naming a factor the service cannot verify
-// must not distinguish itself from a wrong code.
-func TestReclaimUnsupportedFactorIsOpaque(t *testing.T) {
+func TestMissingDeletedAtCannotReclaim(t *testing.T) {
 	h := newHarness(t, Config{})
-	token, _ := requestDeletionAndToken(t, h, "badfactor@test.local")
-
-	for _, method := range []string{"", "password", "recovery_code", "sms"} {
-		err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: method})
-		if !errors.Is(err, ErrInvalidToken) {
-			t.Errorf("Reclaim with factor %q = %v, want ErrInvalidToken", method, err)
-		}
+	token, id := requestDeletionAndToken(t, h, "missing-timestamp@example.test")
+	uid := mustParseUUID(t, id)
+	u := h.store.user(uid)
+	u.DeletedAt = pgtype.Timestamptz{}
+	h.store.users[uid] = u
+	if _, err := h.svc.ReclaimOptions(t.Context(), token, ""); !errors.Is(err, ErrInvalidToken) {
+		t.Fatal(err)
 	}
-}
-
-// TestReclaimBindsCeremonyToRequest: the WebAuthn ceremony must be bound to the
-// deletion request, so an assertion obtained for one request cannot complete
-// another.
-func TestReclaimBindsCeremonyToRequest(t *testing.T) {
-	h := newHarness(t, Config{})
-	token, _ := requestDeletionAndToken(t, h, "bound@test.local")
-
-	if _, err := h.svc.ReclaimOptions(context.Background(), token, ""); err != nil {
-		t.Fatalf("ReclaimOptions: %v", err)
-	}
-	if err := h.svc.Reclaim(context.Background(), token, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
-		t.Fatalf("Reclaim: %v", err)
-	}
-
-	requestID := h.store.requests[0].ID.String()
-	if len(h.passkeys.beginCalls) != 1 || h.passkeys.beginCalls[0] != requestID {
-		t.Errorf("begin binding = %v, want [%s]", h.passkeys.beginCalls, requestID)
-	}
-	if len(h.passkeys.finishCalls) != 1 || h.passkeys.finishCalls[0] != requestID {
-		t.Errorf("finish binding = %v, want [%s]", h.passkeys.finishCalls, requestID)
-	}
-}
-
-// TestWithinResendCooldown covers the cooldown predicate directly, including the
-// "never notified is never inside the cooldown" rule.
-func TestWithinResendCooldown(t *testing.T) {
-	h := newHarness(t, Config{DeleteResendCooldown: time.Hour})
-	base := h.clock.now()
-
-	if h.svc.withinResendCooldown(dbRequestNotifiedAt(nil)) {
-		t.Error("a never-notified request is inside the cooldown; a failed send would never be retried")
-	}
-	inside := base.Add(-30 * time.Minute)
-	if !h.svc.withinResendCooldown(dbRequestNotifiedAt(&inside)) {
-		t.Error("a 30m-old notice is not inside the 1h cooldown")
-	}
-	// Exactly at the boundary the cooldown has elapsed (strict <).
-	boundary := base.Add(-time.Hour)
-	if h.svc.withinResendCooldown(dbRequestNotifiedAt(&boundary)) {
-		t.Error("a notice exactly one cooldown old is still inside the cooldown")
-	}
-	outside := base.Add(-2 * time.Hour)
-	if h.svc.withinResendCooldown(dbRequestNotifiedAt(&outside)) {
-		t.Error("a 2h-old notice is inside the 1h cooldown")
+	if _, err := h.store.GetActiveDeletionRequestByTokenHashForUpdate(t.Context(), HashReclaimToken(token)); errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal("test did not retain the apparently live request")
 	}
 }

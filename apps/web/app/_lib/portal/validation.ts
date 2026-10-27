@@ -59,6 +59,7 @@ export function safeReturnPath(value: string | null): string {
     '/dashboard/profile',
     '/dashboard/security',
     '/dashboard/sessions',
+    '/dashboard/privacy',
   ].includes(value ?? '')
     ? (value as string)
     : '/dashboard';

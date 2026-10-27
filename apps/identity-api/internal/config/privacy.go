@@ -16,14 +16,15 @@ import (
 // account that no longer exists; a token expiring early would silently shorten
 // the recovery window the user was promised).
 type PrivacyConfig struct {
+	// DeletionEnabled permits new requests only after mailbox and delivery rollout
+	// gates are satisfied. Recovery and notification draining remain independent.
+	DeletionEnabled bool
 	// GracePeriod is the recovery window between soft deactivation and physical
 	// erasure (default 720h = 30 days). Every document describing it says 30 days
 	// (docs/architecture.md "Grace Period & Soft Deletes",
 	// docs/compliance-and-data-governance.md §4), and it is simultaneously the
-	// purge cutoff and the reclaim-token lifetime. Values below
-	// MinGDPRGracePeriod are rejected: a shorter window is a weaker user
-	// protection, and below a day the notification email could plausibly not even
-	// be read in time.
+	// purge cutoff and the reclaim-token lifetime. Production is fixed at 720h;
+	// development/test may shorten it down to MinGDPRGracePeriod.
 	GracePeriod time.Duration
 
 	// PurgeBatchSize bounds how many subjects one worker run considers (default
@@ -51,16 +52,11 @@ type PrivacyConfig struct {
 	// DELETE /api/v1/users/me (default 3). The endpoint is idempotent, so this is
 	// an abuse bound rather than a correctness one.
 	DeletePerAccountPerDay int
-	// DeleteResendCooldown is the minimum interval between two deletion notices
-	// for the same account (default 1h). A repeated request inside the cooldown
-	// succeeds and does nothing; outside it, a fresh token is minted and re-sent
-	// so a user who lost the first mail can still recover. Without the cooldown
-	// the idempotent endpoint would be an email bomb.
-	DeleteResendCooldown time.Duration
 }
 
 // Environment variable names for the GDPR/privacy configuration.
 const (
+	EnvGDPRDeletionEnabled          = "GDPR_DELETION_ENABLED"
 	EnvGDPRGracePeriod              = "GDPR_GRACE_PERIOD"
 	EnvGDPRPurgeBatchSize           = "GDPR_PURGE_BATCH_SIZE"
 	EnvGDPRPurgeDryRun              = "GDPR_PURGE_DRY_RUN"
@@ -68,7 +64,6 @@ const (
 	EnvGDPRReclaimPerAccountPerHour = "GDPR_RECLAIM_PER_ACCOUNT_PER_HOUR"
 	EnvGDPRReclaimPerSubnetPerHour  = "GDPR_RECLAIM_PER_SUBNET_PER_HOUR"
 	EnvGDPRDeletePerAccountPerDay   = "GDPR_DELETE_PER_ACCOUNT_PER_DAY"
-	EnvGDPRDeleteResendCooldown     = "GDPR_DELETE_RESEND_COOLDOWN"
 )
 
 // GDPR/privacy default policy values (docs/architecture.md "Grace Period & Soft
@@ -87,18 +82,14 @@ const (
 	defaultGDPRReclaimPerAccountPerHour = 10
 	defaultGDPRReclaimPerSubnetPerHour  = 20
 	defaultGDPRDeletePerAccountPerDay   = 3
-	defaultGDPRDeleteResendCooldown     = time.Hour
 )
 
 // LoadPrivacy builds a PrivacyConfig from environment variables, applying the
 // documented defaults for every unset tunable and failing fast on a malformed
 // value or a grace window below the mandated floor.
 //
-// environment is accepted for symmetry with LoadStepUp/LoadOIDC and to keep the
-// call site uniform in cmd/server; no tunable here is currently environment
-// dependent, because a shorter grace period in staging would exercise a different
-// retention policy than the one production runs.
-func LoadPrivacy(_ string) (PrivacyConfig, error) {
+// Outside development/test, the recovery window is exactly the published 30 days.
+func LoadPrivacy(environment string) (PrivacyConfig, error) {
 	cfg := PrivacyConfig{
 		GracePeriod:              defaultGDPRGracePeriod,
 		PurgeBatchSize:           defaultGDPRPurgeBatchSize,
@@ -107,10 +98,12 @@ func LoadPrivacy(_ string) (PrivacyConfig, error) {
 		ReclaimPerAccountPerHour: defaultGDPRReclaimPerAccountPerHour,
 		ReclaimPerSubnetPerHour:  defaultGDPRReclaimPerSubnetPerHour,
 		DeletePerAccountPerDay:   defaultGDPRDeletePerAccountPerDay,
-		DeleteResendCooldown:     defaultGDPRDeleteResendCooldown,
 	}
 
 	var err error
+	if cfg.DeletionEnabled, err = getEnvBool(EnvGDPRDeletionEnabled, false); err != nil {
+		return PrivacyConfig{}, err
+	}
 	// getEnvDuration already rejects a non-positive value, so only the floor is
 	// checked here.
 	if cfg.GracePeriod, err = getEnvDuration(EnvGDPRGracePeriod, defaultGDPRGracePeriod); err != nil {
@@ -120,6 +113,9 @@ func LoadPrivacy(_ string) (PrivacyConfig, error) {
 		return PrivacyConfig{}, fmt.Errorf(
 			"config: %s %v is below the %v minimum recovery window",
 			EnvGDPRGracePeriod, cfg.GracePeriod, MinGDPRGracePeriod)
+	}
+	if environment != "development" && environment != "test" && cfg.GracePeriod != defaultGDPRGracePeriod {
+		return PrivacyConfig{}, fmt.Errorf("config: %s must be 720h outside development/test", EnvGDPRGracePeriod)
 	}
 	if cfg.PurgeBatchSize, err = getEnvPositiveInt(
 		EnvGDPRPurgeBatchSize, defaultGDPRPurgeBatchSize); err != nil {
@@ -144,10 +140,5 @@ func LoadPrivacy(_ string) (PrivacyConfig, error) {
 		EnvGDPRDeletePerAccountPerDay, defaultGDPRDeletePerAccountPerDay); err != nil {
 		return PrivacyConfig{}, err
 	}
-	if cfg.DeleteResendCooldown, err = getEnvDuration(
-		EnvGDPRDeleteResendCooldown, defaultGDPRDeleteResendCooldown); err != nil {
-		return PrivacyConfig{}, err
-	}
-
 	return cfg, nil
 }

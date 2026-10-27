@@ -87,9 +87,11 @@ When a limit applies, the corresponding data is placed under Legal Hold (Section
 
 Deletion is a staged, reversible-then-permanent process:
 
-1. **Request:** User initiates deletion (requires step-up authentication). Account status becomes `pending_deletion`; all sessions and refresh tokens are revoked immediately. An alert is sent to primary and backup email.
-2. **Grace window (30 days):** A user-facing recovery period. The legitimate user can log in (with MFA/WebAuthn + step-up) and cancel the deletion. This window exists to defend against accidental or attacker-triggered (ATO) deletion.
-3. **Hard-delete:** After 30 days, a Cron job permanently purges Class A data for that account across all tables in an ACID transaction, and emits the deletion event so downstream services scrub their PII.
+1. **Request:** Fresh WebAuthn UV step-up is required; TOTP cannot authorize deletion. The transaction rechecks authority, sets `pending_deletion`, advances the auth version, and persists the hashed reclaim request plus encrypted per-recipient notification intents. Sessions/refresh families are revoked, and a separate authenticated TLS SMTP worker retries primary/configured-backup notices without changing the token or deadline.
+2. **Grace window (30 days):** Pending accounts cannot log in. Cancellation uses the separate anonymous email-token plus WebAuthn UV/TOTP ceremony, followed by fresh normal login. Production uses exactly 720 hours from the original request. Retries and holds do not extend recovery access. Neither relay acknowledgement nor HTTP `204` proves inbox delivery.
+3. **Hard-delete:** After the window, the existing worker checks current eligibility and holds before erasing Class A data in a per-subject ACID transaction and committing the terminal lifecycle event. Downstream consumers apply their own data policies; this is not a promise that every service's content or backup disappears at the deadline.
+
+The notification outbox is operational Class A data, separate from lifecycle metadata and the security ledger. Recipient/token payloads are envelope encrypted and identity-bound. They become eligible for cleanup after relay acceptance, request invalidation or expiry; cleanup retains held/undecidable subjects without extending token validity. Hard deletion cascades these rows. Approve this payload-retention policy, truthful public retention wording, provider terms and incident escalation before enablement. At least one configured mailbox must remain accessible independently of the deactivated IdP; this task adds no contact-enrollment or weaker recovery bypass.
 
 The 30-day window is a **user-recovery** mechanism only. It is **not** a legal-retention period and is **independent** of Legal Hold (Section 6) and security-ledger retention (Section 7).
 

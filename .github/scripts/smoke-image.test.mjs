@@ -57,7 +57,7 @@ test('maintenance smoke requires structured ERROR logging and exit one', () => {
 test('all packaged entrypoints are covered by the production-configuration smoke', () => {
   assert.deepEqual(maintenanceEntrypoints, [
     'identity-api', 'audit-signer', 'purge-worker', 'migrate', 'security-ledger-purge',
-    'admin-audit-publisher', 'lifecycle-publisher', 'admin-legal',
+    'admin-audit-publisher', 'lifecycle-publisher', 'deletion-notifier', 'admin-legal',
   ]);
 });
 

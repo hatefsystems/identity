@@ -16,39 +16,34 @@
 //
 // Two properties are worth stating up front because they are easy to break:
 //
-// Residual access-token authority. Sessions and refresh tokens are revoked
-// synchronously at soft-delete, but an already-issued access token stays valid
-// until it expires — currently at most the 10-minute access-token TTL. There is no
-// revocation epoch and no per-request status re-read; closing that window is a
-// separate task (introspection or a per-user epoch). The bound is documented on
-// the endpoint so clients do not assume instantaneous cutoff.
+// Account authority. Deletion advances the durable auth_version; live validation
+// rejects previously issued authority even if bounded Redis cleanup fails.
 //
-// Fail-closed notification. A deletion whose reclaim token cannot be delivered has
-// no recovery window at all, so the deletion routes are only mounted when a real
-// Notifier is configured. Outside development, an absent notifier leaves the routes
-// unmounted (404) rather than accepting requests it cannot make recoverable.
+// Fail-closed notification. New requests atomically enqueue encrypted delivery
+// intent. Disabling new requests does not disable recovery or worker delivery.
 package privacy
 
 import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // DeletionNotice is the message content for a "your account is scheduled for
-// deletion" notification. It carries the plaintext reclaim token, which exists
-// only in this value and the outbound message: the database holds only its
-// SHA-256 hash.
+// deletion" notification. The token and address are decrypted only for delivery;
+// neither they nor a transport error containing them may enter diagnostics.
 type DeletionNotice struct {
-	// PrimaryEmail is the account's primary address.
+	// DeliveryID is the stable per-recipient message identity, including retries.
+	DeliveryID uuid.UUID
+	// PrimaryEmail is the sole recipient of this worker delivery (primary or backup).
 	PrimaryEmail string
-	// BackupEmail is the verified backup address when one is set. Notifying both
-	// is what protects a user whose primary mailbox was taken over as part of the
-	// account takeover that triggered the deletion (docs/architecture.md
-	// "Account Reclamation").
+	// BackupEmail is retained in the transport shape, but queue deliveries always
+	// leave it nil. A configured backup has its own delivery ID and independent row.
 	BackupEmail *string
-	// ReclaimToken is the plaintext single-use token the user presents to the
-	// reclaim endpoints. Never persist or log it.
+	// ReclaimToken is the plaintext single-use token. Never persist it unencrypted
+	// or log it. Worker calls always leave BackupEmail nil.
 	ReclaimToken string
 	// ExpiresAt is when the token stops working, which is exactly when the purge
 	// worker becomes eligible to erase the account.
@@ -60,10 +55,9 @@ type DeletionNotice struct {
 //
 // Implementations must not log the reclaim token or the recipient addresses.
 type Notifier interface {
-	// NotifyDeletionRequested delivers the notice. Returning an error does not
-	// roll back the deletion — the account is already suspended from all
-	// services, which is the fail-safe direction — but it does leave notified_at
-	// unset so the next request inside the cooldown can retry the send.
+	// NotifyDeletionRequested returns nil only after positive relay acceptance,
+	// not inbox delivery. An error with Permanent() bool may stop automatic retry;
+	// other failures retry the same delivery while the request remains live.
 	NotifyDeletionRequested(ctx context.Context, notice DeletionNotice) error
 
 	// IsDevelopmentOnly reports whether this implementation is a stand-in that

@@ -40,6 +40,8 @@ func (s *Server) handleToken() http.HandlerFunc {
 			})
 			return
 		}
+		// Retain net/http's existing 10 MiB form limit explicitly at the boundary.
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 		if err := r.ParseForm(); err != nil {
 			writeJSON(w, http.StatusBadRequest, tokenErrorResponse{
 				Error:            token.ErrCodeInvalidRequest,

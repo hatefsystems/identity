@@ -13,6 +13,12 @@
       },
       "test-portal-browser": {
         "command": "node .github/scripts/web-portal.browser.mjs",
+        "dependsOn": [
+          "build",
+          { "projects": ["identity-api"], "target": "build" },
+          { "projects": ["identity-api"], "target": "build-portal-fixture" },
+          { "projects": ["identity-api"], "target": "build-deletion-notifier" }
+        ],
         "cache": false
       }
     }

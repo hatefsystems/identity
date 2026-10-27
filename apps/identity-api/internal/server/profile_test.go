@@ -21,8 +21,10 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 )
 
 type profileHandlerRow struct {
@@ -120,13 +122,16 @@ func TestProfileHTTPMinimalSnapshotAndRevision(t *testing.T) {
 		t.Fatalf("profile snapshot mismatch: status=%d err=%v", w.Code, err)
 	}
 	var raw map[string]json.RawMessage
-	if json.Unmarshal(w.Body.Bytes(), &raw) != nil || len(raw) != 6 {
+	if json.Unmarshal(w.Body.Bytes(), &raw) != nil || len(raw) != 7 {
 		t.Fatal("profile exposed extra fields")
 	}
-	for _, key := range []string{"id", "email", "display_name", "status", "lifecycle_revision", "session"} {
+	for _, key := range []string{"id", "email", "display_name", "status", "lifecycle_revision", "session", "deletion_enabled"} {
 		if _, ok := raw[key]; !ok {
 			t.Fatalf("missing projection field %s", key)
 		}
+	}
+	if result.DeletionEnabled {
+		t.Fatal("deletion capability must default to disabled")
 	}
 	for _, secret := range []string{"auth_version", "auth_epoch", "DPoP", "bound-jkt", "password", "mfa", "role", "legal"} {
 		if strings.Contains(w.Body.String(), secret) {
@@ -135,6 +140,37 @@ func TestProfileHTTPMinimalSnapshotAndRevision(t *testing.T) {
 	}
 	if w.Header().Get("Cache-Control") != "private, no-store" || w.Header().Get("Referrer-Policy") != "no-referrer" {
 		t.Fatal("profile response omitted privacy policy")
+	}
+}
+
+func TestProfileDeletionCapabilityRequiresExplicitConfiguredGate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(*Deps)
+		want   bool
+	}{
+		{"enabled", func(*Deps) {}, true},
+		{"switch off", func(d *Deps) { d.PrivacyDeletionEnabled = false }, false},
+		{"privacy unavailable", func(d *Deps) { d.Privacy = nil }, false},
+		{"stepup unavailable", func(d *Deps) { d.StepUp = nil }, false},
+		{"sessions unavailable", func(d *Deps) { d.SessionManager = nil }, false},
+		{"proof unavailable", func(d *Deps) { d.DPoPValidator = nil }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, sess := profileHandlerFixture(t)
+			s.deps.PrivacyDeletionEnabled = true
+			s.deps.Privacy = new(privacy.Service)
+			s.deps.StepUp = new(stepup.Service)
+			s.deps.SessionManager = new(session.Manager)
+			s.deps.DPoPValidator = new(dpop.Validator)
+			tc.remove(&s.deps)
+			w := httptest.NewRecorder()
+			s.handleProfileGet().ServeHTTP(w, profileHandlerRequest(sess, http.MethodGet, ""))
+			var result profileResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || w.Code != http.StatusOK || result.DeletionEnabled != tc.want {
+				t.Fatalf("deletion capability=%v status=%d error=%v", result.DeletionEnabled, w.Code, err)
+			}
+		})
 	}
 }
 

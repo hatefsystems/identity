@@ -12,6 +12,7 @@
 #   audit-signer    audit chain signer worker
 #   admin-audit-publisher  acknowledged administrative/maintenance outbox publisher
 #   lifecycle-publisher  metadata-only lifecycle broadcast and scoped cleanup
+#   deletion-notifier  encrypted per-recipient SMTP delivery and scoped cleanup
 #   admin-legal     policy installation and restricted legal metadata maintenance
 #   purge-worker    Class A GDPR erasure worker (host cron/systemd)
 #   security-ledger-purge  Class B retention worker (host cron/systemd)
@@ -33,6 +34,7 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
 # Build stage
 # ---------------------------------------------------------------------------
 FROM golang:${GO_VERSION}-alpine AS builder
+ARG GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
 
@@ -69,7 +71,7 @@ RUN go build -trimpath -ldflags='-s -w' -o /out/ ./cmd/...
 RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
     && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
     && test -x /out/security-ledger-purge && test -x /out/admin-legal \
-    && test -x /out/lifecycle-publisher
+    && test -x /out/lifecycle-publisher && test -x /out/deletion-notifier
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -95,6 +97,7 @@ COPY --from=builder /out/migrate /usr/local/bin/migrate
 COPY --from=builder /out/audit-signer /usr/local/bin/audit-signer
 COPY --from=builder /out/admin-audit-publisher /usr/local/bin/admin-audit-publisher
 COPY --from=builder /out/lifecycle-publisher /usr/local/bin/lifecycle-publisher
+COPY --from=builder /out/deletion-notifier /usr/local/bin/deletion-notifier
 COPY --from=builder /out/security-ledger-purge /usr/local/bin/security-ledger-purge
 COPY --from=builder /out/admin-legal /usr/local/bin/admin-legal
 

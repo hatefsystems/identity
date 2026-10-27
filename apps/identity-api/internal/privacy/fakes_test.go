@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 )
@@ -41,11 +43,13 @@ func ts(t time.Time) pgtype.Timestamptz {
 // Those guards are what the idempotency and race behaviour rest on, so a fake that
 // ignored them would validate nothing.
 type fakeStore struct {
-	mu       sync.Mutex
-	users    map[uuid.UUID]db.User
-	requests []db.DeletionRequest
-	intents  []db.InsertLifecycleEventParams
-	now      func() time.Time
+	mu              sync.Mutex
+	users           map[uuid.UUID]db.User
+	requests        []db.DeletionRequest
+	intents         []db.InsertLifecycleEventParams
+	notifications   map[uuid.UUID]db.DeletionNotification
+	notificationIDs []uuid.UUID
+	now             func() time.Time
 
 	// Injectable faults, per method, so the "infrastructure error must not be
 	// charged to the attempt budget" paths are reachable.
@@ -55,15 +59,16 @@ type fakeStore struct {
 	incrementErr     error
 	lookupErr        error
 	lifecycleErr     error
+	enqueueErr       error
+	onLockRequest    func()
 
 	// Call counters for the assertions that care about *not* being called.
 	incrementCalls int
 	consumeCalls   int
-	notifiedCalls  int
 }
 
 func newFakeStore(now func() time.Time) *fakeStore {
-	return &fakeStore{users: make(map[uuid.UUID]db.User), now: now}
+	return &fakeStore{users: make(map[uuid.UUID]db.User), notifications: make(map[uuid.UUID]db.DeletionNotification), now: now}
 }
 
 // addActiveUser inserts an active account and returns it.
@@ -107,19 +112,20 @@ func (f *fakeStore) GetUserByIDForAdmin(_ context.Context, id uuid.UUID) (db.Use
 	return u, nil
 }
 
-func (f *fakeStore) SoftDeleteUser(_ context.Context, id uuid.UUID) (int64, error) {
+func (f *fakeStore) SoftDeleteUserIfAuthorized(_ context.Context, arg db.SoftDeleteUserIfAuthorizedParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.softDeleteErr != nil {
 		return 0, f.softDeleteErr
 	}
-	u, ok := f.users[id]
-	if !ok || u.DeletedAt.Valid {
+	u, ok := f.users[arg.ID]
+	if !ok || u.DeletedAt.Valid || u.Status != "active" || u.AuthVersion != arg.AuthVersion {
 		return 0, nil
 	}
 	u.Status = "pending_deletion"
+	u.AuthVersion++
 	u.DeletedAt = ts(f.now())
-	f.users[id] = u
+	f.users[arg.ID] = u
 	return 1, nil
 }
 
@@ -152,11 +158,11 @@ func (f *fakeStore) ReclaimUser(_ context.Context, arg db.ReclaimUserParams) (in
 	if !ok || u.Status != "pending_deletion" || !u.DeletedAt.Valid {
 		return 0, nil
 	}
-	// Mirrors `deleted_at >= $2`.
-	if u.DeletedAt.Time.Before(arg.DeletedAt.Time) {
+	if !u.DeletedAt.Time.After(arg.DeletedAt.Time) {
 		return 0, nil
 	}
 	u.Status = "active"
+	u.AuthVersion++
 	u.DeletedAt = pgtype.Timestamptz{}
 	f.users[arg.ID] = u
 	return 1, nil
@@ -169,12 +175,13 @@ func (f *fakeStore) CreateDeletionRequest(_ context.Context, arg db.CreateDeleti
 		return db.DeletionRequest{}, f.createRequestErr
 	}
 	row := db.DeletionRequest{
-		ID:          uuid.New(),
-		UserID:      arg.UserID,
-		TokenHash:   arg.TokenHash,
-		RequestedIp: arg.RequestedIp,
-		ExpiresAt:   arg.ExpiresAt,
-		CreatedAt:   ts(f.now()),
+		ID:                   uuid.New(),
+		UserID:               arg.UserID,
+		TokenHash:            arg.TokenHash,
+		RequestedIp:          arg.RequestedIp,
+		ExpiresAt:            arg.ExpiresAt,
+		CreatedAt:            ts(f.now()),
+		RequestedAuthVersion: arg.RequestedAuthVersion,
 	}
 	f.requests = append(f.requests, row)
 	return row, nil
@@ -212,33 +219,52 @@ func (f *fakeStore) GetActiveDeletionRequestForUser(_ context.Context, userID uu
 	return db.DeletionRequest{}, pgx.ErrNoRows
 }
 
-func (f *fakeStore) IncrementDeletionRequestFailedAttempts(_ context.Context, id uuid.UUID) (int64, error) {
+func (f *fakeStore) GetDeletionRequestForUpdate(_ context.Context, id uuid.UUID) (db.DeletionRequest, error) {
+	if f.onLockRequest != nil {
+		f.onLockRequest()
+	}
+	if row, ok := f.requestByID(id); ok {
+		return row, nil
+	}
+	return db.DeletionRequest{}, pgx.ErrNoRows
+}
+
+func (f *fakeStore) RecordDeletionRequestFailure(_ context.Context, arg db.RecordDeletionRequestFailureParams) (db.DeletionRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.incrementCalls++
 	if f.incrementErr != nil {
-		return 0, f.incrementErr
+		return db.DeletionRequest{}, f.incrementErr
 	}
 	for i, r := range f.requests {
-		if r.ID == id && !r.ConsumedAt.Valid {
+		if r.ID == arg.ID && r.UserID == arg.UserID && r.TokenHash == arg.TokenHash && f.activeLocked(r) && r.FailedAttempts < arg.MaxAttempts {
 			f.requests[i].FailedAttempts++
-			return 1, nil
+			if f.requests[i].FailedAttempts >= arg.MaxAttempts {
+				f.requests[i].ConsumedAt = ts(f.now())
+			}
+			return f.requests[i], nil
 		}
 	}
-	return 0, nil
+	return db.DeletionRequest{}, pgx.ErrNoRows
 }
 
-func (f *fakeStore) MarkDeletionRequestNotified(_ context.Context, id uuid.UUID) (int64, error) {
+func (f *fakeStore) CreateDeletionNotification(_ context.Context, arg db.CreateDeletionNotificationParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.notifiedCalls++
-	for i, r := range f.requests {
-		if r.ID == id {
-			f.requests[i].NotifiedAt = ts(f.now())
-			return 1, nil
+	if f.enqueueErr != nil {
+		return 0, f.enqueueErr
+	}
+	for _, n := range f.notifications {
+		if n.RequestID == arg.RequestID && n.RecipientRole == arg.RecipientRole {
+			return 0, nil
 		}
 	}
-	return 0, nil
+	f.notifications[arg.ID] = db.DeletionNotification{
+		ID: arg.ID, UserID: arg.UserID, RequestID: arg.RequestID, RecipientRole: arg.RecipientRole,
+		PayloadEncrypted: arg.PayloadEncrypted, ExpiresAt: arg.ExpiresAt, CreatedAt: ts(f.now()), NextAttemptAt: ts(f.now()),
+	}
+	f.notificationIDs = append(f.notificationIDs, arg.ID)
+	return 1, nil
 }
 
 func (f *fakeStore) ConsumeDeletionRequest(_ context.Context, id uuid.UUID) (int64, error) {
@@ -420,6 +446,7 @@ type fakePasskeys struct {
 	beginCalls  []string // request ids
 	finishErr   error
 	finishCalls []string // request ids
+	onFinish    func()
 }
 
 func (f *fakePasskeys) BeginReclaimAssertion(_ context.Context, _ uuid.UUID, requestID string) (*protocol.CredentialAssertion, error) {
@@ -434,9 +461,13 @@ func (f *fakePasskeys) BeginReclaimAssertion(_ context.Context, _ uuid.UUID, req
 
 func (f *fakePasskeys) FinishReclaimAssertion(_ context.Context, _ uuid.UUID, requestID string, _ []byte) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.finishCalls = append(f.finishCalls, requestID)
-	return f.finishErr
+	err, fn := f.finishErr, f.onFinish
+	f.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return err
 }
 
 func (f *fakePasskeys) finishCallCount() int {
@@ -516,12 +547,35 @@ func mustParseUUID(t *testing.T, s string) uuid.UUID {
 	return id
 }
 
-// dbRequestNotifiedAt builds a bare request row carrying only notified_at, for
-// exercising the cooldown predicate directly.
-func dbRequestNotifiedAt(at *time.Time) db.DeletionRequest {
-	row := db.DeletionRequest{ID: uuid.New()}
-	if at != nil {
-		row.NotifiedAt = ts(*at)
+func newTestCipher(t *testing.T) Cipher {
+	t.Helper()
+	provider, err := kms.NewMockProvider(make([]byte, kms.KEKSize), 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return row
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cipher
+}
+
+type failingCipher struct {
+	Cipher
+	encryptErr error
+	decryptErr error
+}
+
+func (c failingCipher) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
+	if c.encryptErr != nil {
+		return nil, c.encryptErr
+	}
+	return c.Cipher.Encrypt(ctx, p)
+}
+
+func (c failingCipher) Decrypt(ctx context.Context, p []byte) ([]byte, error) {
+	if c.decryptErr != nil {
+		return nil, c.decryptErr
+	}
+	return c.Cipher.Decrypt(ctx, p)
 }

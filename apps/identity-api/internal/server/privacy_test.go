@@ -18,6 +18,8 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -37,10 +39,12 @@ const (
 // own behaviour is covered in internal/privacy; here only routing, middleware order,
 // and status/response shapes are exercised.
 type privacyFakeStore struct {
-	users    map[uuid.UUID]db.User
-	requests []db.DeletionRequest
-	intents  []db.InsertLifecycleEventParams
-	now      func() time.Time
+	users         map[uuid.UUID]db.User
+	requests      []db.DeletionRequest
+	intents       []db.InsertLifecycleEventParams
+	notifications []db.CreateDeletionNotificationParams
+	beforeRead    func()
+	now           func() time.Time
 }
 
 func newPrivacyFakeStore(users ...db.User) *privacyFakeStore {
@@ -52,6 +56,10 @@ func newPrivacyFakeStore(users ...db.User) *privacyFakeStore {
 }
 
 func (f *privacyFakeStore) GetUserByIDForAdmin(_ context.Context, id uuid.UUID) (db.User, error) {
+	if hook := f.beforeRead; hook != nil {
+		f.beforeRead = nil
+		hook()
+	}
 	u, ok := f.users[id]
 	if !ok {
 		return db.User{}, pgx.ErrNoRows
@@ -59,16 +67,38 @@ func (f *privacyFakeStore) GetUserByIDForAdmin(_ context.Context, id uuid.UUID) 
 	return u, nil
 }
 
-func (f *privacyFakeStore) SoftDeleteUser(_ context.Context, id uuid.UUID) (int64, error) {
-	u, ok := f.users[id]
-	if !ok || u.DeletedAt.Valid {
+func (f *privacyFakeStore) SoftDeleteUserIfAuthorized(_ context.Context, arg db.SoftDeleteUserIfAuthorizedParams) (int64, error) {
+	u, ok := f.users[arg.ID]
+	if !ok || u.DeletedAt.Valid || u.Status != "active" || u.AuthVersion != arg.AuthVersion {
 		return 0, nil
 	}
 	u.Status = "pending_deletion"
+	u.AuthVersion++
 	u.DeletedAt = pgtype.Timestamptz{Time: f.now(), Valid: true}
-	f.users[id] = u
+	f.users[arg.ID] = u
 	return 1, nil
 }
+
+func (f *privacyFakeStore) Validate(_ context.Context, userID string, version int64) error {
+	id, err := uuid.Parse(userID)
+	if err != nil {
+		return session.ErrAccountIneligible
+	}
+	u, ok := f.users[id]
+	if !ok || u.Status != "active" || u.DeletedAt.Valid || u.AuthVersion != version {
+		return session.ErrAccountIneligible
+	}
+	return nil
+}
+
+func (f *privacyFakeStore) WithActive(ctx context.Context, id string, version int64, fn func() error) error {
+	if err := f.Validate(ctx, id, version); err != nil {
+		return err
+	}
+	return fn()
+}
+
+func (*privacyFakeStore) Epoch(context.Context) (int64, error) { return 1, nil }
 
 func (f *privacyFakeStore) AdvanceUserLifecycleRevision(_ context.Context, id uuid.UUID) (int64, error) {
 	u, ok := f.users[id]
@@ -91,6 +121,7 @@ func (f *privacyFakeStore) ReclaimUser(_ context.Context, arg db.ReclaimUserPara
 		return 0, nil
 	}
 	u.Status = "active"
+	u.AuthVersion++
 	u.DeletedAt = pgtype.Timestamptz{}
 	f.users[arg.ID] = u
 	return 1, nil
@@ -98,11 +129,12 @@ func (f *privacyFakeStore) ReclaimUser(_ context.Context, arg db.ReclaimUserPara
 
 func (f *privacyFakeStore) CreateDeletionRequest(_ context.Context, arg db.CreateDeletionRequestParams) (db.DeletionRequest, error) {
 	row := db.DeletionRequest{
-		ID:        uuid.New(),
-		UserID:    arg.UserID,
-		TokenHash: arg.TokenHash,
-		ExpiresAt: arg.ExpiresAt,
-		CreatedAt: pgtype.Timestamptz{Time: f.now(), Valid: true},
+		ID:                   uuid.New(),
+		UserID:               arg.UserID,
+		TokenHash:            arg.TokenHash,
+		ExpiresAt:            arg.ExpiresAt,
+		CreatedAt:            pgtype.Timestamptz{Time: f.now(), Valid: true},
+		RequestedAuthVersion: arg.RequestedAuthVersion,
 	}
 	f.requests = append(f.requests, row)
 	return row, nil
@@ -130,34 +162,36 @@ func (f *privacyFakeStore) GetActiveDeletionRequestForUser(_ context.Context, us
 	return db.DeletionRequest{}, pgx.ErrNoRows
 }
 
-func (f *privacyFakeStore) IncrementDeletionRequestFailedAttempts(_ context.Context, id uuid.UUID) (int64, error) {
-	for i, r := range f.requests {
+func (f *privacyFakeStore) GetDeletionRequestForUpdate(_ context.Context, id uuid.UUID) (db.DeletionRequest, error) {
+	for _, r := range f.requests {
 		if r.ID == id {
+			return r, nil
+		}
+	}
+	return db.DeletionRequest{}, pgx.ErrNoRows
+}
+
+func (f *privacyFakeStore) RecordDeletionRequestFailure(_ context.Context, arg db.RecordDeletionRequestFailureParams) (db.DeletionRequest, error) {
+	for i, r := range f.requests {
+		if r.ID == arg.ID && r.UserID == arg.UserID && r.TokenHash == arg.TokenHash && f.active(r) && r.FailedAttempts < arg.MaxAttempts {
 			f.requests[i].FailedAttempts++
-			return 1, nil
+			if f.requests[i].FailedAttempts >= arg.MaxAttempts {
+				f.requests[i].ConsumedAt = pgtype.Timestamptz{Time: f.now(), Valid: true}
+			}
+			return f.requests[i], nil
 		}
 	}
-	return 0, nil
+	return db.DeletionRequest{}, pgx.ErrNoRows
 }
 
-func (f *privacyFakeStore) MarkDeletionRequestNotified(_ context.Context, id uuid.UUID) (int64, error) {
-	for i, r := range f.requests {
-		if r.ID == id {
-			f.requests[i].NotifiedAt = pgtype.Timestamptz{Time: f.now(), Valid: true}
-			return 1, nil
+func (f *privacyFakeStore) CreateDeletionNotification(_ context.Context, arg db.CreateDeletionNotificationParams) (int64, error) {
+	for _, row := range f.notifications {
+		if row.RequestID == arg.RequestID && row.RecipientRole == arg.RecipientRole {
+			return 0, nil
 		}
 	}
-	return 0, nil
-}
-
-func (f *privacyFakeStore) ConsumeDeletionRequest(_ context.Context, id uuid.UUID) (int64, error) {
-	for i, r := range f.requests {
-		if r.ID == id && !r.ConsumedAt.Valid {
-			f.requests[i].ConsumedAt = pgtype.Timestamptz{Time: f.now(), Valid: true}
-			return 1, nil
-		}
-	}
-	return 0, nil
+	f.notifications = append(f.notifications, arg)
+	return 1, nil
 }
 
 func (f *privacyFakeStore) ExpireDeletionRequestsForUser(_ context.Context, userID uuid.UUID) (int64, error) {
@@ -170,23 +204,6 @@ func (f *privacyFakeStore) ExpireDeletionRequestsForUser(_ context.Context, user
 	}
 	return n, nil
 }
-
-// privacyFakeNotifier keeps the plaintext token so a test can drive the reclaim
-// endpoints with the value a real user would read from their mail.
-type privacyFakeNotifier struct {
-	notices []privacy.DeletionNotice
-	err     error
-}
-
-func (f *privacyFakeNotifier) NotifyDeletionRequested(_ context.Context, notice privacy.DeletionNotice) error {
-	if f.err != nil {
-		return f.err
-	}
-	f.notices = append(f.notices, notice)
-	return nil
-}
-
-func (f *privacyFakeNotifier) IsDevelopmentOnly() bool { return false }
 
 // privacyFakePasskeys scripts the reclaim ceremony outcome.
 type privacyFakePasskeys struct {
@@ -226,13 +243,19 @@ type privacyFixture struct {
 	server   *Server
 	browser  *portalTestClient
 	store    *privacyFakeStore
-	notifier *privacyFakeNotifier
+	cipher   privacy.Cipher
 	passkeys *privacyFakePasskeys
 	limiter  *privacyFakeLimiter
 	stepUp   *stepup.Service
 	sess     session.Session
 	cookie   *http.Cookie
 	userID   uuid.UUID
+}
+
+type privacyUnavailableActivityStore struct{ session.Store }
+
+func (*privacyUnavailableActivityStore) Touch(context.Context, string, time.Time) error {
+	return session.ErrStoreUnavailable
 }
 
 // privacyOptions carries the mounting matrix knobs.
@@ -243,28 +266,52 @@ type privacyOptions struct {
 	// noSession omits the session manager.
 	noSession bool
 	// noPrivacy omits the privacy service entirely.
-	noPrivacy bool
+	noPrivacy           bool
+	deletionDisabled    bool
+	activityUnavailable bool
 }
 
 func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 	t.Helper()
 
 	userID := uuid.New()
+	provider, err := kms.NewMockProvider(bytes.Repeat([]byte{7}, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fx := &privacyFixture{
 		userID:   userID,
 		browser:  newPortalTestClient(t, testPortalOrigin),
 		store:    newPrivacyFakeStore(db.User{ID: userID, Email: "delete@example.com", Status: "active"}),
-		notifier: &privacyFakeNotifier{},
+		cipher:   cipher,
 		passkeys: &privacyFakePasskeys{},
 		limiter:  &privacyFakeLimiter{deny: make(map[string]bool)},
 	}
 
 	var sessMgr *session.Manager
 	if !opts.noSession {
-		sessMgr = newRecoverySessionManager(t)
+		codec, err := session.NewCookieCodec(session.CookieConfig{Name: "__Host-session", Secure: true, TTL: 24 * time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sessionStore session.Store = session.NewMemoryStore()
+		if opts.activityUnavailable {
+			sessionStore = &privacyUnavailableActivityStore{Store: sessionStore}
+		}
+		sessMgr, err = session.NewManager(sessionStore, codec, session.ManagerConfig{
+			AccountState: fx.store, AbsoluteTTL: 24 * time.Hour, IdleTTL: 2 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		var cookies []*http.Cookie
 		fx.sess, cookies = fx.browser.issueSession(t, sessMgr, session.IssueParams{
 			UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+			AuthVersion: 0, AuthVersionSet: true,
 		})
 		fx.cookie = cookies[0]
 	}
@@ -275,10 +322,12 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 
 	var privacySvc *privacy.Service
 	if !opts.noPrivacy {
+		privacyOpts := []privacy.Option{privacy.WithPasskeyReclaimer(fx.passkeys), privacy.WithRateLimiter(fx.limiter)}
+		if sessMgr != nil {
+			privacyOpts = append(privacyOpts, privacy.WithSessionRevoker(sessMgr))
+		}
 		svc, err := privacy.New(privacy.Config{GracePeriod: 720 * time.Hour},
-			fx.store, fx.notifier, audit.NewLogRecorder(nil),
-			privacy.WithPasskeyReclaimer(fx.passkeys),
-			privacy.WithRateLimiter(fx.limiter),
+			fx.store, fx.cipher, audit.NewLogRecorder(nil), privacyOpts...,
 		)
 		if err != nil {
 			t.Fatalf("privacy.New: %v", err)
@@ -286,7 +335,7 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 		privacySvc = svc
 	}
 
-	deps := Deps{Privacy: privacySvc, StepUp: fx.stepUp, DPoPValidator: fx.browser.validator, WebAuthnLimiter: fx.limiter}
+	deps := Deps{Privacy: privacySvc, PrivacyDeletionEnabled: !opts.deletionDisabled, StepUp: fx.stepUp, DPoPValidator: fx.browser.validator, WebAuthnLimiter: fx.limiter}
 	if sessMgr != nil {
 		deps.SessionManager = sessMgr
 	}
@@ -306,11 +355,23 @@ func (fx *privacyFixture) deleteMe(t *testing.T, withGrant bool) *httptest.Respo
 	// A grant is bound to the session that earned it, so there is nothing to mint
 	// when the fixture has no session manager.
 	if withGrant && fx.stepUp != nil && fx.sess.ID != "" {
-		req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, fx.stepUp, fx.userID.String(), fx.sess.ID))
+		req.Header.Set(stepup.HeaderStepUpAuth, fx.grant(t, []string{"hwk", "user"}))
 	}
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
+}
+
+func (fx *privacyFixture) grant(t *testing.T, amr []string) string {
+	t.Helper()
+	compact, _, err := fx.stepUp.Mint(stepup.MintParams{
+		UserID: fx.userID.String(), SessionID: fx.sess.ID, AMR: amr,
+		AuthVersion: fx.sess.AuthVersion, AuthVersionSet: true, DPoPJKT: fx.sess.DPoPJKT,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compact
 }
 
 // post sends an anonymous JSON body to one of the reclaim endpoints.
@@ -332,17 +393,28 @@ func (fx *privacyFixture) post(t *testing.T, path string, body any) *httptest.Re
 	return rec
 }
 
-// requestDeletionToken drives a successful deletion and returns the emailed token.
+// requestDeletionToken decrypts the queued notice as the separate worker would.
 func (fx *privacyFixture) requestDeletionToken(t *testing.T) string {
 	t.Helper()
 
 	if rec := fx.deleteMe(t, true); rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE /users/me = %d (%s), want 204", rec.Code, rec.Body.String())
 	}
-	if len(fx.notifier.notices) == 0 {
-		t.Fatal("no deletion notice was delivered")
+	if len(fx.store.notifications) == 0 {
+		t.Fatal("no deletion notice was queued")
 	}
-	return fx.notifier.notices[len(fx.notifier.notices)-1].ReclaimToken
+	plaintext, err := fx.cipher.Decrypt(t.Context(), fx.store.notifications[0].PayloadEncrypted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(plaintext)
+	var notice struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(plaintext, &notice); err != nil || notice.Token == "" {
+		t.Fatal("queued notice does not contain a reclaim token")
+	}
+	return notice.Token
 }
 
 // errorBody decodes the {"error": "..."} envelope.
@@ -373,6 +445,12 @@ func TestPrivacyRoutesMountingMatrix(t *testing.T) {
 			opts:           privacyOptions{},
 			wantDelete:     http.StatusNoContent,
 			wantReclaimOut: http.StatusUnauthorized, // anonymous, no token supplied
+		},
+		{
+			name:           "new requests disabled but recovery retained",
+			opts:           privacyOptions{deletionDisabled: true},
+			wantDelete:     http.StatusNotFound,
+			wantReclaimOut: http.StatusUnauthorized,
 		},
 		{
 			name:           "no step-up service leaves the gated route unmounted",
@@ -459,25 +537,83 @@ func TestPrivacyDeleteReturns204AndDeactivates(t *testing.T) {
 	if fx.store.users[fx.userID].Status != "pending_deletion" {
 		t.Error("the account was not deactivated")
 	}
-	if len(fx.notifier.notices) != 1 {
-		t.Errorf("notices = %d, want 1", len(fx.notifier.notices))
+	if len(fx.store.notifications) != 1 {
+		t.Errorf("queued notices = %d, want 1", len(fx.store.notifications))
+	}
+	cleared := false
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == fx.cookie.Name && cookie.Value == "" && cookie.MaxAge < 0 && cookie.Secure && cookie.HttpOnly && cookie.Path == "/" {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("deletion did not clear the hardened session cookie")
 	}
 }
 
-// TestPrivacyDeleteIsIdempotent: a client retrying after a dropped response gets the
-// same 204 and cannot use the difference to probe prior account state.
-func TestPrivacyDeleteIsIdempotent(t *testing.T) {
+func TestPrivacyDeleteRevokesFurtherRequests(t *testing.T) {
 	fx := newPrivacyFixture(t, privacyOptions{})
 
 	first := fx.deleteMe(t, true)
 	second := fx.deleteMe(t, true)
 
-	if first.Code != http.StatusNoContent || second.Code != http.StatusNoContent {
-		t.Fatalf("statuses = %d then %d, want 204 both", first.Code, second.Code)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("first deletion = %d, want 204", first.Code)
 	}
-	if first.Body.String() != second.Body.String() {
-		t.Errorf("bodies differ between a first and a repeat request: %q vs %q",
-			first.Body.String(), second.Body.String())
+	requirePortalSessionRequired(t, second)
+	if len(fx.store.notifications) != 1 || len(fx.store.requests) != 1 {
+		t.Fatal("revoked request created another token or notice")
+	}
+}
+
+func TestPrivacyDeleteCommitSurvivesActivityRenewalFailure(t *testing.T) {
+	fx := newPrivacyFixture(t, privacyOptions{activityUnavailable: true})
+	rec := fx.deleteMe(t, true)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("post-commit activity failure = %d, want 503", rec.Code)
+	}
+	if fx.store.users[fx.userID].Status != "pending_deletion" || len(fx.store.requests) != 1 || len(fx.store.notifications) != 1 {
+		t.Fatal("response renewal failure undid committed deletion or notification intent")
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != fx.cookie.Name || cookies[0].Value != "" || cookies[0].MaxAge >= 0 {
+		t.Fatal("response wrapper lost the committed deletion's cookie clearing")
+	}
+	requirePortalSessionRequired(t, fx.deleteMe(t, true))
+}
+
+func TestPrivacyDeleteRejectsNonUVGrantsOnBothAliases(t *testing.T) {
+	for _, path := range []string{"/api/v1/users/me", "/api/v1/users/me/"} {
+		for _, amr := range [][]string{{"otp"}, {"hwk"}, {"user"}, nil} {
+			fx := newPrivacyFixture(t, privacyOptions{})
+			req := httptest.NewRequest(http.MethodDelete, path, nil)
+			fx.browser.prepare(req)
+			fx.browser.authorize(t, req, fx.sess, fx.cookie)
+			req.Header.Set(stepup.HeaderStepUpAuth, fx.grant(t, amr))
+			rec := httptest.NewRecorder()
+			fx.server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || errorBody(t, rec) != "insufficient_user_authentication" {
+				t.Fatalf("%s accepted non-UV grant %v: %d", path, amr, rec.Code)
+			}
+			if fx.store.users[fx.userID].Status != "active" || len(fx.store.requests) != 0 || len(fx.store.notifications) != 0 {
+				t.Fatal("rejected grant affected the account")
+			}
+		}
+	}
+}
+
+func TestPrivacyDeleteRechecksAuthorityAfterAdmission(t *testing.T) {
+	fx := newPrivacyFixture(t, privacyOptions{})
+	fx.store.beforeRead = func() {
+		user := fx.store.users[fx.userID]
+		user.Status = "banned"
+		user.AuthVersion++
+		fx.store.users[fx.userID] = user
+	}
+	rec := fx.deleteMe(t, true)
+	requirePortalSessionRequired(t, rec)
+	if fx.store.users[fx.userID].Status != "banned" || len(fx.store.requests) != 0 || len(fx.store.notifications) != 0 {
+		t.Fatal("deletion overwrote the concurrent restriction")
 	}
 }
 
@@ -504,9 +640,7 @@ func TestPrivacyDeleteUnauthorizedWhenSessionOutlivedAccount(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("DELETE = %d (%s), want 401", rec.Code, rec.Body.String())
 	}
-	if got := errorBody(t, rec); got != "unauthorized" {
-		t.Errorf("error = %q, want unauthorized", got)
-	}
+	requirePortalSessionRequired(t, rec)
 }
 
 // --- Reclaim endpoints ------------------------------------------------------
@@ -554,10 +688,8 @@ func TestPrivacyReclaimSucceedsAndReturns204(t *testing.T) {
 		t.Error("the account was not restored")
 	}
 	// The response must carry no session: the user has to log in normally.
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "session" && c.Value != "" {
-			t.Error("the reclaim response issued a session cookie")
-		}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("the reclaim response issued a cookie")
 	}
 }
 

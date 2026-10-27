@@ -184,6 +184,61 @@ describe('bounded same-origin portal transport', () => {
 });
 
 describe('bound session intent and one-use mutations', () => {
+  it('sends deletion with the current session and single-use grant, retrying only the pre-handler nonce once', async () => {
+    const fetcher = jest
+      .fn()
+      .mockResolvedValueOnce(json({ ...profile(), deletion_enabled: true }))
+      .mockResolvedValueOnce(nonceResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const api = client(fetcher);
+    await api.bootstrap();
+    const grant = new StepUpGrant(
+      { token: 'deletion-grant', token_type: 'StepUp', expires_in: 60 },
+      'session-id',
+      Date.now(),
+      Date.now() + 60000
+    );
+    const sent = jest.fn();
+    await api.deleteAccount(grant, new AbortController().signal, sent);
+    expect(sent).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    for (const [url, options] of fetcher.mock.calls.slice(1)) {
+      expect(url).toBe(`${origin}/api/v1/users/me`);
+      expect(options).toMatchObject({
+        method: 'DELETE',
+        credentials: 'same-origin',
+        redirect: 'error',
+      });
+      expect(options.body).toBeUndefined();
+      const headers = new Headers(options.headers);
+      expect(headers.get('X-Portal-Session')).toBe('session-id');
+      expect(headers.get('X-Step-Up-Auth')).toBe('deletion-grant');
+      expect(headers.has('DPoP')).toBe(true);
+    }
+    expect(() => grant.take('session-id')).toThrow('grant_expired');
+  });
+
+  it.each([403, 503])('never replays a deletion after a %i response', async (status) => {
+    const fetcher = jest
+      .fn()
+      .mockResolvedValueOnce(json(profile()))
+      .mockResolvedValueOnce(json({ error: 'insufficient_user_authentication' }, status));
+    const api = client(fetcher);
+    await api.bootstrap();
+    const grant = new StepUpGrant(
+      { token: 'deletion-grant', token_type: 'StepUp', expires_in: 60 },
+      'session-id',
+      Date.now(),
+      Date.now() + 60000
+    );
+    await expect(api.deleteAccount(grant, new AbortController().signal)).rejects.toMatchObject({
+      status,
+      uncertain: status >= 500,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(() => grant.take('session-id')).toThrow('grant_expired');
+  });
+
   it('reports initial transmission once per logical request, not while preparing a proof or on its nonce retry', async () => {
     const sent = jest.fn();
     const fetcher = jest

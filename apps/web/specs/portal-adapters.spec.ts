@@ -136,6 +136,7 @@ describe('portal validation and transient authority', () => {
 
   it('allows only fixed portal return paths', () => {
     expect(safeReturnPath('/dashboard/security')).toBe('/dashboard/security');
+    expect(safeReturnPath('/dashboard/privacy')).toBe('/dashboard/privacy');
     for (const value of [
       null,
       'https://evil.test',
@@ -144,6 +145,8 @@ describe('portal validation and transient authority', () => {
       '/dashboard/../login',
       '/oauth2/authorize',
       '/dashboard#hash',
+      '/dashboard/privacy?token=secret',
+      '/dashboard/privacy/',
       '\\evil.test',
     ])
       expect(safeReturnPath(value)).toBe('/dashboard');
@@ -159,6 +162,13 @@ describe('portal validation and transient authority', () => {
       session: { id: 'session-id', expires_at: '2030-01-01T00:00:00Z' },
     };
     expect(profileResponse(value).lifecycle_revision).toBe('9223372036854775807');
+    expect(profileResponse(value).deletion_enabled).toBe(false);
+    for (const enabled of [true, false])
+      expect(profileResponse({ ...value, deletion_enabled: enabled }).deletion_enabled).toBe(
+        enabled
+      );
+    for (const invalid of [null, 'true', 1, {}, []])
+      expect(() => profileResponse({ ...value, deletion_enabled: invalid })).toThrow();
     for (const revision of [123, '01', '-1', '9223372036854775808', '+1'])
       expect(() => profileResponse({ ...value, lifecycle_revision: revision })).toThrow();
   });

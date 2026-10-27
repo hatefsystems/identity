@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -68,6 +69,19 @@ func (rs *RequireStepUp) Handler(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(WithGrant(r.Context(), grant)))
 	})
+}
+
+// WebAuthnUV requires a verified passkey grant after normal single-use validation.
+// A valid grant with the wrong method is spent, but the session remains usable.
+func (rs *RequireStepUp) WebAuthnUV(next http.Handler) http.Handler {
+	return rs.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		grant, ok := GrantFromContext(r.Context())
+		if !ok || !slices.Contains(grant.AMR, "hwk") || !slices.Contains(grant.AMR, "user") {
+			rs.writeChallenge(w, r, ErrInvalidGrant)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 // writeChallenge emits the insufficient-authentication challenge.

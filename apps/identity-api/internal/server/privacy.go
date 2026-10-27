@@ -64,6 +64,9 @@ func (s *Server) registerPrivacyRoutes() {
 		r.Post("/", s.handlePrivacyReclaim())
 	})
 
+	if !s.deps.PrivacyDeletionEnabled {
+		return
+	}
 	guard, hasSession := s.sessionGuard("privacy")
 	if !hasSession {
 		return
@@ -74,8 +77,8 @@ func (s *Server) registerPrivacyRoutes() {
 	}
 
 	// Do not mount a wildcard subrouter over the profile's GET/PATCH methods.
-	s.router.With(guard.Handler, stepGuard.Handler).Delete("/api/v1/users/me", s.handlePrivacyRequestDeletion())
-	s.router.With(guard.Handler, stepGuard.Handler).Delete("/api/v1/users/me/", s.handlePrivacyRequestDeletion())
+	s.router.With(guard.Handler, stepGuard.WebAuthnUV).Delete("/api/v1/users/me", s.handlePrivacyRequestDeletion())
+	s.router.With(guard.Handler, stepGuard.WebAuthnUV).Delete("/api/v1/users/me/", s.handlePrivacyRequestDeletion())
 }
 
 // handlePrivacyRequestDeletion serves DELETE /api/v1/users/me.
@@ -89,18 +92,23 @@ func (s *Server) registerPrivacyRoutes() {
 // must perform the documented live validation rather than signature-only checks.
 func (s *Server) handlePrivacyRequestDeletion() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := s.webauthnSessionUser(w, r)
+		sess, userID, ok := profileSession(w, r)
 		if !ok {
 			return
 		}
 
-		if _, err := s.deps.Privacy.RequestDeletion(r.Context(), userID, clientip.FromRequest(r)); err != nil {
+		if _, err := s.deps.Privacy.RequestDeletion(r.Context(), userID, sess.AuthVersion, clientip.FromRequest(r)); err != nil {
 			switch {
 			case errors.Is(err, privacy.ErrRateLimited):
 				writeJSON(w, http.StatusTooManyRequests, privacyErrorResponse{Error: "rate_limited"})
 			case errors.Is(err, privacy.ErrUserNotFound):
 				// The session outlived its account.
 				writeJSON(w, http.StatusUnauthorized, privacyErrorResponse{Error: "unauthorized"})
+			case errors.Is(err, privacy.ErrStaleAuthority):
+				w.Header().Set("WWW-Authenticate", "Cookie")
+				writeJSON(w, http.StatusUnauthorized, privacyErrorResponse{Error: "session_required"})
+			case errors.Is(err, privacy.ErrDeletionUnavailable):
+				writeJSON(w, http.StatusServiceUnavailable, privacyErrorResponse{Error: "temporarily_unavailable"})
 			default:
 				s.logger.Error("privacy: deletion request failed", "error", err.Error())
 				writeJSON(w, http.StatusInternalServerError, privacyErrorResponse{Error: "server_error"})
@@ -108,6 +116,7 @@ func (s *Server) handlePrivacyRequestDeletion() http.HandlerFunc {
 			return
 		}
 
+		s.deps.SessionManager.ClearCookie(w)
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusNoContent)
 	}

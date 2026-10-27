@@ -105,13 +105,13 @@ func run(ctx context.Context, operation string, limit int, policyFile string, dr
 	if operation == "backfill" {
 		n, err := holds.Backfill(ctx, pool, limit)
 		if err == nil {
-			slog.Info("legal backfill batch committed", "records", n)
+			slog.Info("legal backfill batch committed", slog.Int("records", n)) //nolint:gosec // G706: a typed integer count cannot inject log text.
 		}
 		return err
 	}
 	n, err := holds.CleanupReleased(ctx, pool, limit)
 	if err == nil {
-		slog.Info("legal cleanup batch committed", "records", n)
+		slog.Info("legal cleanup batch committed", slog.Int64("records", n)) //nolint:gosec // G706: a typed integer count cannot inject log text.
 	}
 	return err
 }

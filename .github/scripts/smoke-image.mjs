@@ -26,6 +26,7 @@ export const maintenanceEntrypoints = [
   'security-ledger-purge',
   'admin-audit-publisher',
   'lifecycle-publisher',
+  'deletion-notifier',
   'admin-legal',
 ];
 

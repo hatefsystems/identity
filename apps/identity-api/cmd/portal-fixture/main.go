@@ -80,8 +80,13 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 1 || (args[0] != "tls" && args[0] != "migrate" && args[0] != "seed" && args[0] != "totp-code" && args[0] != "expire-session" && args[0] != "consume-code") {
-		return errors.New("expected tls, migrate, seed, totp-code, expire-session, or consume-code")
+	if len(args) != 1 {
+		return errors.New("expected one fixture action")
+	}
+	switch args[0] {
+	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
+	default:
+		return errors.New("unsupported fixture action")
 	}
 	runID := os.Getenv("PORTAL_FIXTURE_RUN_ID")
 	if os.Getenv("PORTAL_FIXTURE_ALLOW") != "1" || !runIDPattern.MatchString(runID) || os.Getenv("APP_ENV") == "production" {
@@ -158,6 +163,9 @@ func run(args []string) error {
 	if args[0] == "seed" {
 		return seed(ctx, pool, runID, input.Credentials, input.TOTP)
 	}
+	if args[0] == "notifier-role" {
+		return notifierRole(ctx, pool, runID, dsn)
+	}
 	userID, err := uuid.Parse(input.UserID)
 	if err != nil || userID == uuid.Nil {
 		return errors.New("invalid fixture subject")
@@ -166,12 +174,62 @@ func run(args []string) error {
 	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND email LIKE $2)`, userID, "%@"+runID+".example.test").Scan(&owned); err != nil || !owned {
 		return errors.New("subject does not belong to this fixture run")
 	}
-	if args[0] == "totp-code" {
-		user, err := db.New(pool).GetUserByID(ctx, userID)
+	if args[0] == "deletion-state" {
+		var state struct {
+			Status        string     `json:"status"`
+			AuthVersion   string     `json:"auth_version"`
+			DeletedAt     *time.Time `json:"deleted_at"`
+			ExpiresAt     *time.Time `json:"expires_at"`
+			Requests      int        `json:"requests"`
+			Notifications int        `json:"notifications"`
+			Accepted      int        `json:"accepted"`
+			Attempts      int        `json:"attempts"`
+			Payloads      int        `json:"payloads"`
+		}
+		if err := pool.QueryRow(ctx, `SELECT status, auth_version::text, deleted_at,
+			(SELECT max(expires_at) FROM deletion_requests WHERE user_id=$1),
+			(SELECT count(*) FROM deletion_requests WHERE user_id=$1),
+			(SELECT count(*) FROM deletion_notifications WHERE user_id=$1),
+			(SELECT count(*) FROM deletion_notifications WHERE user_id=$1 AND accepted_at IS NOT NULL),
+			(SELECT coalesce(sum(attempts),0) FROM deletion_notifications WHERE user_id=$1),
+			(SELECT count(*) FROM deletion_notifications WHERE user_id=$1 AND payload_encrypted IS NOT NULL)
+			FROM users WHERE id=$1`, userID).Scan(&state.Status, &state.AuthVersion, &state.DeletedAt, &state.ExpiresAt,
+			&state.Requests, &state.Notifications, &state.Accepted, &state.Attempts, &state.Payloads); err != nil {
+			return errors.New("cannot inspect owned deletion state")
+		}
+		return json.NewEncoder(os.Stdout).Encode(state)
+	}
+	if args[0] == "reclaim-totp-only" {
+		// Model an already-pending TOTP-only/legacy account without weakening
+		// production enrollment, deletion authorization, or factor selection.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return errors.New("cannot lock pending fixture account")
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		user, err := db.New(tx).GetUserForUpdateIncludingDeleted(ctx, userID)
+		if err != nil {
+			return errors.New("cannot load pending fixture account")
+		}
+		if _, err := currentTOTPCode(ctx, user, runID, time.Now(), true); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM webauthn_credentials WHERE user_id=$1`, userID); err != nil {
+			return errors.New("cannot prepare pending TOTP-only fixture")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return errors.New("cannot commit pending TOTP-only fixture")
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]bool{"totp_only": true})
+	}
+	if args[0] == "totp-code" || args[0] == "reclaim-totp-code" {
+		// The admin read includes deleted accounts; the explicit fixture policy
+		// below still keeps active-code and pending-code actions disjoint.
+		user, err := db.New(pool).GetUserByIDForAdmin(ctx, userID)
 		if err != nil {
 			return errors.New("cannot load fixture TOTP account")
 		}
-		output, err := currentTOTPCode(ctx, user, runID, time.Now())
+		output, err := currentTOTPCode(ctx, user, runID, time.Now(), args[0] == "reclaim-totp-code")
 		if err != nil {
 			return err
 		}
@@ -335,12 +393,17 @@ func newTOTPSecret(ctx context.Context) ([]byte, error) {
 	return ciphertext, nil
 }
 
-func currentTOTPCode(ctx context.Context, user db.User, runID string, now time.Time) (totpCode, error) {
-	if !runIDPattern.MatchString(runID) || user.ID == uuid.Nil || !strings.HasSuffix(user.Email, "@"+runID+".example.test") || user.DeletedAt.Valid {
+func currentTOTPCode(ctx context.Context, user db.User, runID string, now time.Time, reclaim bool) (totpCode, error) {
+	if !runIDPattern.MatchString(runID) || user.ID == uuid.Nil || !strings.HasSuffix(user.Email, "@"+runID+".example.test") {
 		return totpCode{}, errors.New("subject does not belong to this fixture run")
 	}
-	if user.Status != "active" || !user.IsMfaEnabled || len(user.MfaTotpSecretEncrypted) == 0 {
-		return totpCode{}, errors.New("fixture account has no active TOTP factor")
+	eligible := user.Status == "active" && !user.DeletedAt.Valid
+	if reclaim {
+		eligible = user.Status == "pending_deletion" && user.DeletedAt.Valid &&
+			!now.Before(user.DeletedAt.Time) && now.Before(user.DeletedAt.Time.Add(720*time.Hour))
+	}
+	if !eligible || !user.IsMfaEnabled || len(user.MfaTotpSecretEncrypted) == 0 {
+		return totpCode{}, errors.New("fixture account has no eligible TOTP factor")
 	}
 	enc, err := fixtureEncryptor()
 	if err != nil {
@@ -445,6 +508,24 @@ func seed(ctx context.Context, pool interface {
 }
 
 func localCertificate() (map[string]string, error) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, errors.New("cannot generate local TLS CA")
+	}
+	caSerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, errors.New("cannot generate local CA serial")
+	}
+	ca := &x509.Certificate{
+		SerialNumber: caSerial, Subject: pkix.Name{CommonName: "Portal fixture CA"},
+		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign, IsCA: true, BasicConstraintsValid: true,
+		MaxPathLen: 0, MaxPathLenZero: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, ca, ca, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, errors.New("cannot create local TLS CA")
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, errors.New("cannot generate local TLS key")
@@ -460,7 +541,7 @@ func localCertificate() (map[string]string, error) {
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, certificate, ca, &key.PublicKey, caKey)
 	if err != nil {
 		return nil, errors.New("cannot create local TLS certificate")
 	}
@@ -469,7 +550,49 @@ func localCertificate() (map[string]string, error) {
 		return nil, errors.New("cannot encode local TLS private key")
 	}
 	return map[string]string{
+		"ca":   strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))),
 		"cert": strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))),
 		"key":  strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKey}))),
 	}, nil
+}
+
+func notifierRole(ctx context.Context, pool *pgxpool.Pool, runID, dsn string) error {
+	if !runIDPattern.MatchString(runID) || validateDatabase(dsn, runID) != nil {
+		return errors.New("invalid notifier database boundary")
+	}
+	password := make([]byte, 32)
+	if _, err := rand.Read(password); err != nil {
+		return errors.New("cannot generate notifier credential")
+	}
+	secret := base64.RawURLEncoding.EncodeToString(password)
+	clear(password)
+	role := "portal_notice_" + runID
+	identifier := pgx.Identifier{role}.Sanitize()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return errors.New("cannot provision notifier role")
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The random base64url password contains no SQL metacharacters. This role
+	// can read only the authority/hold columns needed for delivery. The worker
+	// serializes through the shared advisory lock without user/request writes.
+	for _, statement := range []string{
+		"CREATE ROLE " + identifier + " LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD '" + secret + "'",
+		"GRANT USAGE ON SCHEMA public TO " + identifier,
+		"GRANT SELECT (id, status, auth_version, deleted_at) ON users TO " + identifier,
+		"GRANT SELECT (id, user_id, token_hash, expires_at, consumed_at, failed_attempts, requested_auth_version) ON deletion_requests TO " + identifier,
+		"GRANT SELECT (account_ref, is_active) ON legal_holds TO " + identifier,
+		"GRANT SELECT ON deletion_notifications TO " + identifier,
+		"GRANT UPDATE (payload_encrypted, lease_token, lease_until, attempts, next_attempt_at, accepted_at, failed_at, last_error_code) ON deletion_notifications TO " + identifier,
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return errors.New("cannot provision notifier privileges")
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return errors.New("cannot commit notifier privileges")
+	}
+	endpoint, _ := url.Parse(dsn)
+	endpoint.User = url.UserPassword(role, secret)
+	return json.NewEncoder(os.Stdout).Encode(map[string]string{"database_url": endpoint.String()})
 }

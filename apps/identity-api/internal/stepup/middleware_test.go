@@ -3,6 +3,7 @@ package stepup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -64,6 +65,72 @@ func TestRequireStepUpAcceptsAValidGrant(t *testing.T) {
 	}
 	if !reached {
 		t.Fatal("the wrapped handler was not reached")
+	}
+}
+
+func TestRequireWebAuthnUVMethods(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		amr  []string
+		want int
+	}{
+		{"verified passkey", []string{"hwk", "user"}, http.StatusNoContent},
+		{"unordered verified passkey", []string{"user", "hwk"}, http.StatusNoContent},
+		{"totp", []string{"otp"}, http.StatusForbidden},
+		{"presence only", []string{"hwk"}, http.StatusForbidden},
+		{"verification without key", []string{"user"}, http.StatusForbidden},
+		{"missing method", nil, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _ := newTestService(t)
+			sess := testSession()
+			compact, _, err := svc.Mint(MintParams{UserID: sess.UserID, SessionID: sess.ID, AMR: tc.amr})
+			if err != nil {
+				t.Fatal(err)
+			}
+			guard, err := NewRequireStepUp(svc, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			reached := false
+			handler := guard.WebAuthnUV(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				reached = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me", nil)
+			req.Header.Set(HeaderStepUpAuth, compact)
+			req = req.WithContext(session.WithSession(req.Context(), sess))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want || reached != (tc.want == http.StatusNoContent) {
+				t.Fatalf("status=%d reached=%v, want %d", rec.Code, reached, tc.want)
+			}
+			if tc.want == http.StatusForbidden {
+				var body challengeResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Error != "insufficient_user_authentication" || body.ACRValues != ACRStepUp {
+					t.Fatalf("unexpected challenge: %+v", body)
+				}
+			}
+			if _, err := svc.Validate(context.Background(), compact, sess); !errors.Is(err, ErrGrantConsumed) {
+				t.Fatalf("grant was not spent: %v", err)
+			}
+		})
+	}
+}
+
+func TestGenericStepUpStillAcceptsTOTP(t *testing.T) {
+	svc, _ := newTestService(t)
+	sess := testSession()
+	compact, _, err := svc.Mint(MintParams{UserID: sess.UserID, SessionID: sess.ID, AMR: amrTOTP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, reached := serveWithSession(t, svc, &sess, compact)
+	if rec.Code != http.StatusNoContent || !reached {
+		t.Fatalf("generic TOTP grant rejected: %d", rec.Code)
 	}
 }
 

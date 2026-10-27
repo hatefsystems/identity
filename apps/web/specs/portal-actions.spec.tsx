@@ -17,6 +17,7 @@ const profile: Profile = {
   email: 'person@example.test',
   display_name: 'Original',
   status: 'active',
+  deletion_enabled: false,
   lifecycle_revision: '9007199254740993',
   session: { id: 'session-id', expires_at: '2030-01-01T00:00:00Z' },
 };
@@ -77,15 +78,14 @@ beforeAll(() => {
 });
 beforeEach(() => {
   jest.resetAllMocks();
-  jest
-    .mocked(usePortal)
-    .mockReturnValue({
-      profile,
-      client: api as unknown as PortalClient,
-      updateProfile,
-      signOut,
-      rememberStepUp: jest.fn(),
-    });
+  jest.mocked(usePortal).mockReturnValue({
+    profile,
+    client: api as unknown as PortalClient,
+    updateProfile,
+    signOut,
+    deleteAccount: jest.fn(),
+    rememberStepUp: jest.fn(),
+  });
   api.assertSession.mockReturnValue(profile);
   api.bootstrap.mockResolvedValue(profile);
   api.keys.mockResolvedValue([firstKey, secondKey]);
@@ -314,6 +314,75 @@ describe('native verification dialog', () => {
     await screen.findByRole('button', { name: 'Verify with a passkey' });
     expect(screen.queryByRole('button', { name: 'Use authenticator code' })).toBeNull();
   });
+
+  it('restricts WebAuthn-only actions even when TOTP is advertised or requested as a resume method', async () => {
+    const authorized = jest.fn().mockResolvedValue(undefined);
+    render(
+      <StepUpDialog
+        title="Delete account"
+        description="Deletion requires UV"
+        mode="webauthn-only"
+        resumeMethod="totp"
+        onCancel={jest.fn()}
+        onAuthorized={authorized}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
+    const verify = await screen.findByRole('button', { name: 'Verify with a passkey' });
+    expect(screen.queryByRole('button', { name: 'Use authenticator code' })).toBeNull();
+    expect(screen.queryByLabelText('Authenticator code')).toBeNull();
+    expect(screen.queryByText(/pending action was restored/)).toBeNull();
+    fireEvent.click(verify);
+    await waitFor(() => expect(authorized).toHaveBeenCalledTimes(1));
+    expect(usePasskey).toHaveBeenCalledWith(
+      { publicKey: { challenge: 'AA' } },
+      expect.any(AbortSignal),
+      false,
+      true
+    );
+    expect(api.stepUpVerify.mock.calls[0][0].method).toBe('webauthn');
+  });
+
+  it('fails closed when only TOTP is available for a WebAuthn-only action', async () => {
+    api.stepUpChallenge.mockResolvedValueOnce({ methods: ['totp'] });
+    render(
+      <StepUpDialog
+        title="Delete account"
+        description="Deletion requires UV"
+        mode="webauthn-only"
+        onCancel={jest.fn()}
+        onAuthorized={jest.fn()}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
+    const message = (await screen.findByRole('alert')).textContent;
+    expect(message).toContain('requires a passkey');
+    expect(message).not.toMatch(/authenticator app|authenticator code|TOTP/);
+    expect(screen.queryByLabelText('Authenticator code')).toBeNull();
+    expect(api.stepUpVerify).not.toHaveBeenCalled();
+  });
+
+  it.each(['user_verification_required', 'invalid_credentials'])(
+    'does not recommend TOTP for a WebAuthn-only %s failure',
+    async (code) => {
+      api.stepUpVerify.mockRejectedValueOnce(new PortalError(code, 401));
+      const authorized = jest.fn();
+      render(
+        <StepUpDialog
+          title="Delete account"
+          description="Deletion requires UV"
+          mode="webauthn-only"
+          onCancel={jest.fn()}
+          onAuthorized={authorized}
+        />
+      );
+      await verifyPasskey();
+      const message = (await screen.findByRole('alert')).textContent;
+      expect(message).toContain('passkey');
+      expect(message).not.toMatch(/authenticator app|authenticator code|TOTP/);
+      expect(authorized).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe('passkey and session management', () => {

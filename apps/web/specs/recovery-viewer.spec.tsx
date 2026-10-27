@@ -53,6 +53,7 @@ beforeEach(() => {
     email: 'private@example.test',
     display_name: 'Account',
     status: 'active',
+    deletion_enabled: false,
     lifecycle_revision: '1',
     session: { id: 'session-id', expires_at: new Date(Date.now() + 3600000).toISOString() },
   };
@@ -61,6 +62,7 @@ beforeEach(() => {
     client: api as unknown as PortalClient,
     updateProfile: jest.fn(),
     signOut: jest.fn(),
+    deleteAccount: jest.fn(),
     rememberStepUp: jest.fn(),
   });
   api.assertSession.mockImplementation(() => profile);

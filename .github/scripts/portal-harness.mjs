@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, randomBytes, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
-import { access, copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer } from 'node:net';
@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { startMailSink } from './portal-mail-sink.mjs';
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const backend = resolve(workspace, 'apps/identity-api');
@@ -21,11 +22,21 @@ export function portalRoute(path) {
 }
 
 export function replicaFor(path, sequence) {
-  // Explicitly cross processes for all three portal WebAuthn flows, including
+  // Explicitly cross processes for portal and anonymous recovery ceremonies, including
   // nonce retries. Round-robin alone could put every successful retry on B.
+  if (path === '/api/v1/auth/deletion/reclaim/options') return 0;
+  if (path === '/api/v1/auth/deletion/reclaim' || path === '/api/v1/auth/deletion/reclaim/') return 1;
   if (path.endsWith('/generate-options') || path.endsWith('/stepup/challenge')) return 0;
   if (path.endsWith('/verify')) return 1;
   return sequence % 2;
+}
+
+export function anonymousReclaim(path, method) {
+  return method === 'POST' && [
+    '/api/v1/auth/deletion/reclaim/options',
+    '/api/v1/auth/deletion/reclaim',
+    '/api/v1/auth/deletion/reclaim/',
+  ].includes(path);
 }
 
 export function secretEnvironmentValues(environment) {
@@ -39,7 +50,14 @@ export function secretEnvironmentValues(environment) {
 export function fixtureSecretValues(value) {
   if (!value || typeof value !== 'object') return [];
   return Object.entries(value).flatMap(([key, item]) => {
-    if (/^(?:code|secret|totp_secret|otpauth_url|privateKey|key|user_id|email)$/i.test(key)) {
+    if (key === 'database_url' && typeof item === 'string') {
+      try {
+        return [item, decodeURIComponent(new URL(item).password)].filter(Boolean);
+      } catch {
+        return [item];
+      }
+    }
+    if (/^(?:code|secret|totp_secret|otpauth_url|privateKey|key|user_id|email|backup_email|recipient|token|reclaim_token|link|recovery_url|database_url|password)$/i.test(key)) {
       return typeof item === 'string' && item ? [item] : [];
     }
     if (key === 'codes' && Array.isArray(item)) {
@@ -125,13 +143,15 @@ function cleanEnvironment() {
 export async function startPortalHarness() {
   let apiBinary = resolve(backend, 'bin/identity-api');
   let fixtureBinary = resolve(backend, 'bin/portal-fixture');
+  let notifierBinary = resolve(backend, 'bin/deletion-notifier');
   await Promise.all([
     access(apiBinary),
     access(fixtureBinary),
+    access(notifierBinary),
     access(resolve(workspace, 'apps/web/.next/BUILD_ID')),
   ]).catch(() => {
     throw new Error(
-      'Build web, identity-api, and identity-api:build-portal-fixture before this suite'
+      'Build web, identity-api, identity-api:build-portal-fixture, and identity-api:build-deletion-notifier before this suite'
     );
   });
 
@@ -141,6 +161,7 @@ export async function startPortalHarness() {
   const password = randomBytes(24).toString('hex');
   const cleanup = [];
   const children = [];
+  const responseCounts = new Map();
   const secrets = [password];
   let closed = false;
   const close = async () => {
@@ -155,8 +176,9 @@ export async function startPortalHarness() {
     }
   };
   const diagnostics = () => {
+    console.error('Public API response counts:', redactFixtureSecrets(JSON.stringify(Object.fromEntries(responseCounts)), secrets));
     for (const { label, output } of children) {
-      const redacted = redactFixtureSecrets(output.join(''), secrets).slice(-16_384);
+      const redacted = redactFixtureSecrets(output.join(''), secrets).slice(label === 'Deletion notifier' ? -4096 : -16_384);
       // No browser traces, request dumps, fixture stdout, or recovery batches.
       console.error(`${label} process diagnostics:\n${redacted}`);
     }
@@ -200,9 +222,11 @@ export async function startPortalHarness() {
       cleanup.push(() => rm(temporary, { recursive: true, force: true }));
       const apiExecutable = resolve(temporary, 'identity-api.exe');
       const fixtureExecutable = resolve(temporary, 'portal-fixture.exe');
-      await Promise.all([copyFile(apiBinary, apiExecutable), copyFile(fixtureBinary, fixtureExecutable)]);
+      const notifierExecutable = resolve(temporary, 'deletion-notifier.exe');
+      await Promise.all([copyFile(apiBinary, apiExecutable), copyFile(fixtureBinary, fixtureExecutable), copyFile(notifierBinary, notifierExecutable)]);
       apiBinary = apiExecutable;
       fixtureBinary = fixtureExecutable;
+      notifierBinary = notifierExecutable;
     }
     docker(['network', 'create', '--label', 'ldp.task=7.3', name]);
     cleanup.push(() => docker(['network', 'rm', name], true));
@@ -320,6 +344,14 @@ export async function startPortalHarness() {
       secrets.push(...fixtureSecretValues(value));
       return value;
     };
+    const waitForNoticeCleanup = async (userID, accepted) => {
+      let state;
+      await waitFor(() => {
+        state = fixture('deletion-state', { user_id: userID });
+        return state.accepted === accepted && state.payloads === 0;
+      }, 'relay acceptance bookkeeping and ciphertext cleanup', 15_000);
+      return state;
+    };
     fixture('migrate');
     const tls = fixture('tls');
     secrets.push(tls.key);
@@ -330,7 +362,42 @@ export async function startPortalHarness() {
     const nextPort = await freePort();
     let sequence = 0;
     const routeEvidence = new Map();
-    const originEvidence = { unsafe: 0, mismatched: 0, referrers: 0 };
+    const originEvidence = { unsafe: 0, anonymous: 0, mismatched: 0, referrers: 0 };
+    const captures = new Map();
+    // Observe the real upstream body before Chromium discards a completed,
+    // cancelled fetch. Nothing is replayed, changed, or written to an artifact.
+    const captureJSON = (path, method, status) => {
+      const key = `${method} ${path}`;
+      assert([
+        'POST /api/v1/auth/recovery-codes/generate',
+        'POST /api/v1/auth/webauthn/register/verify',
+        'POST /api/v1/auth/stepup/verify',
+        'POST /api/v1/auth/deletion/reclaim/options',
+        'POST /api/v1/auth/deletion/reclaim/',
+      ].includes(key), 'Unsupported response capture');
+      assert(!captures.has(key), 'Response capture already armed');
+      let timer;
+      let finish;
+      let settled = false;
+      const promise = new Promise((resolve, reject) => {
+        finish = (error, value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          captures.delete(key);
+          if (error) reject(new Error('Bounded upstream response capture failed'));
+          else resolve(value);
+        };
+      });
+      void promise.catch(() => {});
+      timer = setTimeout(() => finish(true), 20_000);
+      timer.unref();
+      captures.set(key, { status, finish });
+      return promise;
+    };
+    cleanup.push(() => {
+      for (const capture of captures.values()) capture.finish(true);
+    });
     let origin;
     const ingress = httpsServer({ ...tls, minVersion: 'TLSv1.2' }, (request, response) => {
       if (!origin || request.headers.host !== new URL(origin).host) {
@@ -339,8 +406,9 @@ export async function startPortalHarness() {
       }
       const path = new URL(request.url, origin).pathname;
       const api = path === '/api' || path.startsWith('/api/');
-      if (api && request.headers.dpop && !['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+      if (api && (request.headers.dpop || anonymousReclaim(path, request.method)) && !['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
         originEvidence.unsafe++;
+        if (anonymousReclaim(path, request.method)) originEvidence.anonymous++;
         if (request.headers.origin !== origin) originEvidence.mismatched++;
         if (request.headers.referer) originEvidence.referrers++;
       }
@@ -361,6 +429,34 @@ export async function startPortalHarness() {
           timeout: 15_000,
         },
         (result) => {
+          if (api) {
+            const summary = `${request.method} ${portalRoute(path)} ${result.statusCode}`;
+            responseCounts.set(summary, (responseCounts.get(summary) || 0) + 1);
+          }
+          const key = `${request.method} ${path}`;
+          const capture = captures.get(key);
+          if (capture && result.statusCode === capture.status) {
+            const chunks = [];
+            let size = 0;
+            let failed = false;
+            result.on('data', (chunk) => {
+              size += chunk.length;
+              if (size > 256 * 1024) failed = true;
+              if (!failed) chunks.push(chunk);
+            });
+            result.once('error', () => capture.finish(true));
+            result.once('aborted', () => capture.finish(true));
+            result.once('end', () => {
+              try {
+                assert(!failed && /^application\/json\b/i.test(result.headers['content-type'] || ''));
+                capture.finish(false, JSON.parse(Buffer.concat(chunks).toString('utf8')));
+              } catch {
+                capture.finish(true);
+              } finally {
+                chunks.length = 0;
+              }
+            });
+          }
           if (api && result.statusCode >= 200 && result.statusCode < 300) {
             const key = `${request.method} ${portalRoute(path)}`;
             const hits = routeEvidence.get(key) || [0, 0];
@@ -391,6 +487,56 @@ export async function startPortalHarness() {
     );
     origin = `https://localhost:${ingress.address().port}`;
     assertLocalOrigin(origin);
+    const mailParent = resolve(tmpdir(), 'kilo');
+    await mkdir(mailParent, { recursive: true });
+    const temporary = await mkdtemp(resolve(mailParent, 'portal-browser-mail-'));
+    cleanup.push(() => rm(temporary, { recursive: true, force: true }));
+    const caBundle = resolve(temporary, 'ca.pem');
+    // Only the ephemeral public CA is written. Mail, bearer tokens, credentials,
+    // private TLS keys, and browser traces never become filesystem artifacts.
+    await writeFile(caBundle, tls.ca, { mode: 0o600 });
+    const smtpUsername = randomBytes(24).toString('hex');
+    const smtpPassword = randomBytes(32).toString('hex');
+    const smtpFrom = `notices@${runID}.example.test`;
+    secrets.push(smtpUsername, smtpPassword);
+    const mail = await startMailSink({
+      ...tls, username: smtpUsername, password: smtpPassword, from: smtpFrom,
+      runID, origin, onSecrets: (values) => secrets.push(...values),
+    });
+    cleanup.push(() => mail.close());
+    const workerDatabase = fixture('notifier-role');
+    const notifierEnvironment = {
+      ...storeEnv,
+      DATABASE_URL: '',
+      APP_ENV: 'production',
+      DELETION_NOTIFIER_DATABASE_URL: workerDatabase.database_url,
+      DELETION_SMTP_HOST: '127.0.0.1',
+      DELETION_SMTP_PORT: String(mail.port),
+      DELETION_SMTP_TLS_MODE: 'implicit',
+      DELETION_SMTP_USERNAME: smtpUsername,
+      DELETION_SMTP_PASSWORD: smtpPassword,
+      DELETION_SMTP_FROM: smtpFrom,
+      DELETION_SMTP_PUBLIC_ORIGIN: origin,
+      DELETION_SMTP_CA_BUNDLE: caBundle,
+      DELETION_SMTP_TIMEOUT: '2s',
+      DELETION_NOTIFIER_POLL_INTERVAL: '1s',
+      DELETION_NOTIFIER_RETRY_BASE: '1s',
+      DELETION_NOTIFIER_RETRY_MAX: '2s',
+      GDPR_GRACE_PERIOD: '720h',
+    };
+    secrets.push(...secretEnvironmentValues(notifierEnvironment));
+    let notifier;
+    const startNotifier = () => {
+      assert(!notifier || notifier.exitCode !== null || notifier.signalCode !== null,
+        'A notifier process is already running');
+      notifier = start('Deletion notifier', notifierBinary, ['run'], notifierEnvironment, backend);
+    };
+    const stopNotifier = async () => {
+      if (!notifier || notifier.exitCode !== null || notifier.signalCode !== null) return;
+      const exited = once(notifier, 'exit');
+      notifier.kill('SIGTERM');
+      await Promise.race([exited, delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Notifier did not stop'); })]);
+    };
     const signingKey = () =>
       generateKeyPairSync('ec', { namedCurve: 'P-256' })
         .privateKey.export({ type: 'pkcs8', format: 'pem' })
@@ -427,6 +573,8 @@ export async function startPortalHarness() {
       ADMIN_ENABLED: 'false',
       LEGAL_WORKFLOW_ENABLED: 'false',
       GRPC_ENABLED: 'false',
+      GDPR_DELETION_ENABLED: 'true',
+      GDPR_GRACE_PERIOD: '720h',
     };
     secrets.push(...secretEnvironmentValues(apiEnvironment));
     for (const [index, port] of apiPorts.entries()) {
@@ -438,6 +586,7 @@ export async function startPortalHarness() {
         backend
       );
     }
+    startNotifier();
     start(
       'Next production',
       process.execPath,
@@ -474,7 +623,7 @@ export async function startPortalHarness() {
         }
       }, label);
     }
-    return { origin, tlsSPKI, fixture, routeEvidence, originEvidence, close, diagnostics, secrets };
+    return { origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, routeEvidence, originEvidence, close, diagnostics, secrets };
   } catch (error) {
     diagnostics();
     await close();

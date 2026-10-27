@@ -115,6 +115,8 @@ type integrationEnv struct {
 	queries  *db.Queries
 	svc      *Service
 	purger   *Purger
+	worker   *NotificationWorker
+	cipher   Cipher
 	notifier *fakeNotifier
 	recorder *fakeRecorder
 	sessions *fakeRevoker
@@ -136,9 +138,10 @@ func newIntegrationEnv(t *testing.T, pool *pgxpool.Pool) *integrationEnv {
 		sessions: &fakeRevoker{},
 		tokens:   &fakeRevoker{},
 		passkeys: &fakePasskeys{},
+		cipher:   newTestCipher(t),
 	}
 
-	svc, err := New(Config{GracePeriod: testGracePeriod}, env.queries, env.notifier, env.recorder,
+	svc, err := New(Config{GracePeriod: testGracePeriod}, env.queries, env.cipher, env.recorder,
 		WithTransacter(pool),
 		WithSessionRevoker(env.sessions),
 		WithTokenRevoker(env.tokens),
@@ -149,6 +152,11 @@ func newIntegrationEnv(t *testing.T, pool *pgxpool.Pool) *integrationEnv {
 		t.Fatalf("New: %v", err)
 	}
 	env.svc = svc
+	env.worker, err = NewNotificationWorker(NotificationConfig{GracePeriod: testGracePeriod, Concurrency: 1},
+		env.queries, pool, env.cipher, env.notifier, env.recorder, WithNotificationLogger(discardLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	opener, err := NewPgSubjectTxOpener(pool)
 	if err != nil {
@@ -168,6 +176,18 @@ func newIntegrationEnv(t *testing.T, pool *pgxpool.Pool) *integrationEnv {
 	}
 	env.purger = purger
 	return env
+}
+
+func (env *integrationEnv) deliveredNotice(ctx context.Context, t *testing.T) DeletionNotice {
+	t.Helper()
+	if _, err := env.worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notice, ok := env.notifier.last()
+	if !ok {
+		t.Fatal("notification worker did not deliver queued intent")
+	}
+	return notice
 }
 
 // createTestUser inserts an active account with a full set of child rows, so a purge
@@ -353,12 +373,12 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 	outboxBefore := countRows(ctx, t, pool,
 		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String())
 
-	result, err := env.svc.RequestDeletion(ctx, user.ID, "203.0.113.10")
+	result, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "203.0.113.10")
 	if err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
-	if !result.TokenMinted || !result.Notified {
-		t.Fatalf("RequestDeletion result = %+v, want a minted and delivered token", result)
+	if !result.TokenMinted || !result.NotificationQueued || env.notifier.count() != 0 {
+		t.Fatalf("RequestDeletion result = %+v, want a minted and queued token", result)
 	}
 
 	stored, err := env.queries.GetUserByIDForAdmin(ctx, user.ID)
@@ -412,6 +432,7 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 		{"user_roles", "SELECT COUNT(*) FROM user_roles WHERE user_id = $1"},
 		{"mfa_totp_enrollments", "SELECT COUNT(*) FROM mfa_totp_enrollments WHERE user_id = $1"},
 		{"deletion_requests", "SELECT COUNT(*) FROM deletion_requests WHERE user_id = $1"},
+		{"deletion_notifications", "SELECT COUNT(*) FROM deletion_notifications WHERE user_id = $1"},
 	} {
 		if got := countRows(ctx, t, pool, tc.query, user.ID); got != 0 {
 			t.Errorf("%s rows = %d after purge, want 0 (the FK cascade did not fire)", tc.table, got)
@@ -511,7 +532,7 @@ func TestIntegrationLegalHoldBlocksPurge(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "purge-hold@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	backdateDeletion(ctx, t, pool, user.ID, 2*testGracePeriod)
@@ -625,13 +646,10 @@ func TestIntegrationReclaimInsideWindow(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "reclaim-inside@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
-	notice, ok := env.notifier.last()
-	if !ok {
-		t.Fatal("no notice delivered")
-	}
+	notice := env.deliveredNotice(ctx, t)
 
 	if err := env.svc.Reclaim(ctx, notice.ReclaimToken, ReclaimAttempt{Method: FactorWebAuthn}); err != nil {
 		t.Fatalf("Reclaim: %v", err)
@@ -676,10 +694,10 @@ func TestIntegrationReclaimPastWindowIsRefused(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "reclaim-expired@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
-	notice, _ := env.notifier.last()
+	notice := env.deliveredNotice(ctx, t)
 
 	backdateDeletion(ctx, t, pool, user.ID, 2*testGracePeriod)
 
@@ -714,10 +732,10 @@ func TestIntegrationIdentifierIsReservedDuringGraceWindow(t *testing.T) {
 
 	const email = "squatted@privacy.test"
 	user := createTestUser(ctx, t, pool, email)
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
-	notice, _ := env.notifier.last()
+	notice := env.deliveredNotice(ctx, t)
 
 	// The squatter's registration attempt must be rejected by the index, and this is
 	// exactly the 23505 a registration endpoint has to render as a clean 409.
@@ -765,10 +783,10 @@ func TestIntegrationConcurrentReclaimVersusPurge(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "race@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
-	notice, _ := env.notifier.last()
+	notice := env.deliveredNotice(ctx, t)
 
 	// Place the subject just past the cutoff while leaving the reclaim token live, so
 	// both operations are simultaneously eligible. This is the genuine race: the

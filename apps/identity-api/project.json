@@ -33,6 +33,25 @@
       "dependsOn": ["sqlc-generate"],
       "cache": true
     },
+    "build-deletion-notifier": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go build -o bin/deletion-notifier ./cmd/deletion-notifier"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "outputs": ["{projectRoot}/bin/deletion-notifier"],
+      "cache": true
+    },
+    "deletion-notifier": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go run ./cmd/deletion-notifier"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
     "build-audit-signer": {
       "executor": "nx:run-commands",
       "options": {
@@ -65,7 +84,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "apps/identity-api",
-        "command": "go test -count=1 ./internal/config ./internal/profile ./internal/session ./internal/server ./internal/webauthn ./internal/recovery ./internal/stepup ./internal/oidc/dpop ./internal/oidc/token ./internal/lifecycle ./internal/identitygrpc"
+        "command": "go test -count=1 ./internal/config ./internal/profile ./internal/privacy ./internal/privacy/smtp ./cmd/deletion-notifier ./internal/session ./internal/server ./internal/webauthn ./internal/recovery ./internal/stepup ./internal/oidc/dpop ./internal/oidc/token ./internal/lifecycle ./internal/identitygrpc"
       },
       "dependsOn": ["sqlc-generate"],
       "cache": false
@@ -83,7 +102,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "apps/identity-api",
-        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/profile','./internal/session','./internal/server','./internal/webauthn','./internal/recovery','./internal/stepup','./internal/oidc/dpop','./internal/oidc/token','./internal/lifecycle','./internal/identitygrpc'], {stdio:'inherit',env:{...process.env,REQUIRE_PORTAL_INTEGRATION:'1',REQUIRE_PROFILE_INTEGRATION:'1',REQUIRE_GRPC_INTEGRATION:'1',REQUIRE_LIFECYCLE_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/profile','./internal/privacy','./internal/session','./internal/server','./internal/webauthn','./internal/recovery','./internal/stepup','./internal/oidc/dpop','./internal/oidc/token','./internal/lifecycle','./internal/identitygrpc'], {stdio:'inherit',env:{...process.env,REQUIRE_PORTAL_INTEGRATION:'1',REQUIRE_PROFILE_INTEGRATION:'1',REQUIRE_GRPC_INTEGRATION:'1',REQUIRE_LIFECYCLE_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
       "cache": false,

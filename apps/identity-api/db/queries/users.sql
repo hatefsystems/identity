@@ -245,6 +245,19 @@ SET status = 'pending_deletion',
 WHERE id = $1
   AND deleted_at IS NULL;
 
+-- name: SoftDeleteUserIfAuthorized :execrows
+-- The service holds the account lock and rechecks the admitted authority. Keep
+-- the predicates here as defense in depth, not an alternative to that lock.
+UPDATE users
+SET status = 'pending_deletion',
+    auth_version = auth_version + 1,
+    deleted_at = clock_timestamp(),
+    updated_at = NOW()
+WHERE id = $1
+  AND status = 'active'
+  AND deleted_at IS NULL
+  AND auth_version = $2;
+
 -- name: ReclaimUser :execrows
 -- Cancels a pending deletion within the 30-day grace window after the user
 -- re-authenticates with MFA/WebAuthn + Step-up (architecture.md "Account
@@ -256,7 +269,7 @@ SET status = 'active',
     updated_at = NOW()
 WHERE id = $1
   AND status = 'pending_deletion'
-  AND deleted_at >= $2;
+  AND deleted_at > $2;
 
 -- name: ListUsersDueForHardDelete :many
 -- Feeds the GDPR hard-delete cron worker (Task 5.1). cutoff is

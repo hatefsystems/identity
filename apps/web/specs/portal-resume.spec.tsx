@@ -24,6 +24,7 @@ const profile = (): Profile => ({
   email: 'private@example.test',
   display_name: 'Private profile',
   status: 'active',
+  deletion_enabled: false,
   lifecycle_revision: '1',
   session: { id: 'session-id', expires_at: new Date(Date.now() + 3600000).toISOString() },
 });
@@ -58,12 +59,10 @@ function makeClient() {
     assertSession: jest.fn(),
     keys: jest.fn().mockResolvedValue([key, { ...key, id: 'second-key', name: 'Backup' }]),
     recoveryStatus: jest.fn().mockResolvedValue({ remaining: 2, low: true }),
-    stepUpChallenge: jest
-      .fn()
-      .mockResolvedValue({
-        methods: ['webauthn', 'totp'],
-        webauthn: { publicKey: { challenge: 'AA' } },
-      }),
+    stepUpChallenge: jest.fn().mockResolvedValue({
+      methods: ['webauthn', 'totp'],
+      webauthn: { publicKey: { challenge: 'AA' } },
+    }),
     stepUpVerify: jest.fn(),
     renameKey: jest.fn(),
     registerOptions: jest.fn(),

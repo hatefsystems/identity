@@ -25,6 +25,7 @@ const profile = (): Profile => ({
   email: 'private@example.test',
   display_name: 'Private account',
   status: 'active',
+  deletion_enabled: false,
   lifecycle_revision: '7',
   session: { id: 'session-id', expires_at: new Date(Date.now() + 60000).toISOString() },
 });

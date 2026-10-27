@@ -19,6 +19,7 @@ export function StepUpDialog({
   actionError,
   intent,
   resumeMethod,
+  mode = 'default',
 }: {
   title: string;
   description: ReactNode;
@@ -27,10 +28,14 @@ export function StepUpDialog({
   actionError?: (error: unknown) => string;
   intent?: StepUpIntent;
   resumeMethod?: 'totp';
+  mode?: 'default' | 'webauthn-only';
 }) {
   const { client, rememberStepUp } = usePortal();
+  const webauthnOnly = mode === 'webauthn-only';
   const [challenge, setChallenge] = useState<StepUpChallenge | null>(null);
-  const [method, setMethod] = useState<'webauthn' | 'totp'>(resumeMethod ?? 'webauthn');
+  const [method, setMethod] = useState<'webauthn' | 'totp'>(
+    webauthnOnly ? 'webauthn' : (resumeMethod ?? 'webauthn')
+  );
   const [pending, setPending] = useState('');
   const [error, setError] = useState('');
   const [code, setCode] = useState('');
@@ -69,7 +74,7 @@ export function StepUpDialog({
     const suspend = () => {
       // A submitted verification/action is never resumable. Only waiting for a
       // TOTP code may preserve intent; the code and all authority are discarded.
-      if (intent && method === 'totp' && !busy.current) rememberStepUp(intent);
+      if (!webauthnOnly && intent && method === 'totp' && !busy.current) rememberStepUp(intent);
       authority.current?.clear();
       authority.current = null;
       lifetime.current?.abort();
@@ -80,7 +85,7 @@ export function StepUpDialog({
     };
     window.addEventListener(sensitiveSuspendEvent, suspend);
     return () => window.removeEventListener(sensitiveSuspendEvent, suspend);
-  }, [intent, method, rememberStepUp]);
+  }, [intent, method, rememberStepUp, webauthnOnly]);
   useEffect(() => {
     if (method === 'totp' && challenge) input.current?.focus();
   }, [method, challenge]);
@@ -103,16 +108,19 @@ export function StepUpDialog({
     try {
       const value = await client.stepUpChallenge(signal);
       throwIfAborted(signal);
+      if (webauthnOnly && !value.methods.includes('webauthn'))
+        throw new PortalError('no_stepup_factor');
       setChallenge(value);
       setMethod((current) =>
-        current === 'totp' && value.methods.includes('totp')
+        !webauthnOnly && current === 'totp' && value.methods.includes('totp')
           ? 'totp'
           : value.methods.includes('webauthn')
             ? 'webauthn'
             : 'totp'
       );
     } catch (failure) {
-      if (!signal.aborted && !isAborted(failure)) setError(errorMessage(failure));
+      if (!signal.aborted && !isAborted(failure))
+        setError(errorMessage(failure, webauthnOnly ? 'webauthn' : undefined));
     } finally {
       busy.current = false;
       if (!signal.aborted) setPending('');
@@ -121,6 +129,7 @@ export function StepUpDialog({
 
   async function verify() {
     if (busy.current || !challenge || !lifetime.current) return;
+    if (webauthnOnly && method !== 'webauthn') return;
     if (method === 'totp' && !/^[0-9]{6}$/.test(code)) {
       setCodeError('Enter the six-digit code from your authenticator app.');
       input.current?.focus();
@@ -158,7 +167,11 @@ export function StepUpDialog({
       onCancel();
     } catch (failure) {
       if (!signal.aborted && !isAborted(failure)) {
-        setError(performingAction && actionError ? actionError(failure) : errorMessage(failure));
+        setError(
+          performingAction && actionError
+            ? actionError(failure)
+            : errorMessage(failure, webauthnOnly ? 'webauthn' : undefined)
+        );
         setCode('');
         // A failed TOTP verification is not a lost session. It may be retried
         // with a new code; any minted/used grant and WebAuthn ceremony are spent.
@@ -181,7 +194,7 @@ export function StepUpDialog({
   return (
     <NativeDialog title={title} description={description} onCancel={cancel} testId="stepup-dialog">
       <Feedback error={error} status={pending} />
-      {resumeMethod === 'totp' && (
+      {!webauthnOnly && resumeMethod === 'totp' && (
         <p className="text-sm text-muted-foreground">
           Your pending action was restored after checking the same session. Start fresh
           verification; no previous code or grant was retained.
@@ -257,7 +270,7 @@ export function StepUpDialog({
               </Button>
             </form>
           )}
-          {challenge.methods.includes('totp') && method !== 'totp' && (
+          {!webauthnOnly && challenge.methods.includes('totp') && method !== 'totp' && (
             <Button
               type="button"
               variant="outline"

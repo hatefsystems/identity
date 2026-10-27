@@ -130,18 +130,19 @@ From the workspace root, with npm dependencies, Go 1.26.5+ and Docker available:
 ```bash
 npm exec -- nx run identity-api:test-portal --skipNxCache
 npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
-npm exec -- nx run-many -t build,build-portal-fixture -p identity-api --skipNxCache
+npm exec -- nx run-many -t build,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache
 npm exec -- nx run web:build --skipNxCache
 npm exec -- playwright install --with-deps chromium
 npm exec -- nx run web:test-portal-browser --skipNxCache
 ```
 
-`web:test-portal-browser` owns unique disposable PostgreSQL/Redis/JetStream
-containers, ephemeral loopback ports and fresh volumes. It starts two real
-production-configured Go API processes, production Next.js and a local HTTPS
-ingress; Chromium trusts only that run's ephemeral certificate SPKI. Ceremony
-starts use API A and completions use B, including nonce retries. It does not use
-development cookie/CSP exceptions or inherited database/secrets configuration.
+`web:test-portal-browser` owns disposable PostgreSQL/Redis/JetStream containers,
+loopback ports and fresh volumes. Each stack starts two real production-configured
+Go APIs, Next.js and HTTPS ingress; Chromium trusts only its ephemeral certificate
+SPKI. Deletion/reclaim uses a separate stack with the real notifier and an owned
+authenticated TLS SMTP sink, so earlier scenarios cannot exhaust its production
+subnet limit. Ceremony starts use A and completions B, including anonymous reclaim.
+No development cookie/CSP exceptions or inherited database/secrets are used.
 
 `cmd/portal-fixture` is included only with `-tags=portalfixture` and is absent from
 normal builds/runtime images. It refuses unarmed/production invocations,
@@ -175,6 +176,100 @@ clock advancement are not a claim of native platform coverage. Missing native
 coverage, manual assistive-technology/authenticator review, real-ingress checks and
 downstream-consumer validation remain explicit release gates. Record actual test
 results before task completion; adding these commands does not establish a pass.
+
+## Right to Be Forgotten (Task 7.4)
+
+The live routes are `/dashboard/privacy` and anonymous `/recover-account`.
+`GDPR_DELETION_ENABLED=false` is the default. Enablement is an operator decision,
+not proof supplied by a checkbox or SMTP acknowledgement. Recovery and draining
+accepted notices must remain available when new deletion requests are switched off.
+
+1. Apply additive, forward-only `00018_deletion_notifications.sql` before new API
+   writers/workers. Verify API privileges for transactional request/outbox insertion.
+   Inventory any legacy pending requests without encrypted delivery intent; hashes
+   cannot reconstruct their tokens. Reconcile them through an approved procedure,
+   preserving the original deadline, before enabling new requests.
+2. Deploy recovery UI/API first, then `deletion-notifier run` under the existing
+   Compose/host service supervision. The API image contains this non-root entrypoint;
+   `once` is a bounded drain for diagnostics, not a replacement for supervision.
+   The API never needs SMTP credentials and does not synchronously send mail.
+3. Inject `DELETION_NOTIFIER_DATABASE_URL`, `DELETION_SMTP_HOST`,
+   `DELETION_SMTP_USERNAME`, `DELETION_SMTP_PASSWORD`, `DELETION_SMTP_FROM`, and
+   `DELETION_SMTP_PUBLIC_ORIGIN` using existing secret management. Use the canonical
+   portal origin, not a request Host or redirect parameter. Both required STARTTLS
+   and implicit TLS verify certificates/hostnames; an optional `CA_BUNDLE` extends
+   trust for a private relay, never disables it. Defaults and bounds are in
+   `.env.example` and `internal/config/deletion_notifier.go`.
+4. Keep API/worker envelope keys and necessary versions available for pending/held
+   payloads. The current environment-backed KMS provider is not an external KMS
+   integration. Production API, purge and notification policy must use `720h`;
+   email retries, holds and hold release never restart the recovery clock.
+5. Confirm that at least one configured recipient remains accessible without this
+   IdP after deactivation. Approve sender identity, SPF/DKIM/DMARC, provider terms
+   and message retention, public privacy wording, the encrypted payload cleanup
+   policy and existing ledger/audit retention gaps. Contact enrollment, another
+   recovery channel and an email-only bypass are not supplied by this task.
+6. Rehearse actual delivery and keyless recovery through deployed HTTPS ingress,
+   including operator mail access after deactivation. Then enable new requests.
+   Preserve exact Origin/proof/session-intent headers and no-store/no-referrer;
+   redact tokens, full links, message bodies, addresses and SMTP replies in every
+   proxy, log shipper, APM and mail-system diagnostic.
+
+### Restricted Delivery Role
+
+Use a separate runtime login inheriting a role like the following, provisioned by
+an operator. Never reuse the API/schema-owner login. Account/request reads are one
+minimal snapshot under the shared advisory lock, so the worker needs no write
+permission on account IDs, status, credentials or reclaim authority.
+
+```sql
+CREATE ROLE identity_deletion_delivery NOLOGIN;
+GRANT USAGE ON SCHEMA public TO identity_deletion_delivery;
+GRANT SELECT (id, status, auth_version, deleted_at)
+  ON users TO identity_deletion_delivery;
+GRANT SELECT (id, user_id, token_hash, expires_at, consumed_at,
+  failed_attempts, requested_auth_version)
+  ON deletion_requests TO identity_deletion_delivery;
+GRANT SELECT (account_ref, is_active)
+  ON legal_holds TO identity_deletion_delivery;
+GRANT SELECT ON deletion_notifications TO identity_deletion_delivery;
+GRANT UPDATE (payload_encrypted, lease_token, lease_until, attempts,
+  next_attempt_at, accepted_at, failed_at, last_error_code)
+  ON deletion_notifications TO identity_deletion_delivery;
+```
+
+Provision the login and membership through secret management; the SQL intentionally
+contains no password. Integration tests verify delivery/cleanup with these grants
+while contact/IP reads and account/request mutation are denied.
+
+### Delivery and Rollback
+
+Track worker availability, oldest due age, retries, permanent failures, leases and
+bounces. Structured logs and minimal queue columns support alerts; SMTP acceptance
+is not inbox delivery. A lost acknowledgement can duplicate a message with the same
+ID/token/deadline. Repair relay failures and explicitly requeue only still-valid
+work; never mint a replacement token or extend expiry as an automatic retry.
+
+Successful/invalid/expired delivery payloads become cleanup candidates. Cleanup
+takes the shared subject lock and preserves active/unknown holds. Held data is not
+permission to deliver an expired or cancelled token. Ciphertext is never published
+through lifecycle events or ordinary audit payloads. This is the scheduled-deletion
+notice, not a final-erasure email or proof that downstream content/backups vanished.
+
+Rollback first disables new requests, while keeping recovery, the compatible worker,
+required encryption keys and additive schema. Do not restore revoked authority,
+remove already-issued recovery routes, drop pending intent, or weaken UV/DPoP gates.
+
+Local automated acceptance passed on 2026-10-27: full backend unit/race/vet, clean
+standard lint, SQL generation/vet, real PostgreSQL/Redis/JetStream security/admin/
+lifecycle/portal suites, 271 web and 17 UI tests, 102 CI/harness checks, production
+API/worker/web builds and non-root smoke/CSP checks. HTTPS tests exercised real UV
+versus TOTP denial, worker stop/restart and SMTP retry/cleanup, revoked old authority,
+lost DELETE/reclaim responses, keyless UV/TOTP reclaim, six no-JavaScript routes and
+eighteen viewports. Native bfcache/hidden-tab transitions were not observed; injected
+events/history checks do not close those or manual assistive-technology/authenticator
+and deployed-ingress gates. Dependency installation also reported existing npm audit
+findings; no dependency upgrades or audit-policy changes were made in this task.
 
 ## 1. Kubernetes Deployment & Networking
 

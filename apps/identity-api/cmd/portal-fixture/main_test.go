@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redis/go-redis/v9"
 
@@ -121,10 +122,26 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 	if cert.VerifyHostname("localhost") != nil || cert.VerifyHostname("127.0.0.1") != nil || cert.VerifyHostname("example.com") == nil || cert.NotAfter.Sub(cert.NotBefore).Minutes() > 62 {
 		t.Fatal("certificate escaped local test boundary")
 	}
+	caBlock, _ := pem.Decode([]byte(material["ca"]))
+	if caBlock == nil {
+		t.Fatal("missing local CA certificate")
+	}
+	ca, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil || !ca.IsCA || ca.KeyUsage&x509.KeyUsageCertSign == 0 || cert.IsCA || cert.CheckSignatureFrom(ca) != nil {
+		t.Fatal("expected separate CA and locally signed server certificate")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: "127.0.0.1"}); err != nil {
+		t.Fatal("production SMTP trust verification rejected the fixture chain")
+	}
+	if len(material) != 3 {
+		t.Fatal("fixture must not export the CA private key")
+	}
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {
@@ -236,7 +253,7 @@ func TestFixtureSeedTOTPIsOptInAndTransactional(t *testing.T) {
 				t.Fatal("seed output must retain its existing contract without TOTP material")
 			}
 			if input.TOTP {
-				if _, err := currentTOTPCode(context.Background(), tx.user, fixtureRunID, time.Now()); err != nil {
+				if _, err := currentTOTPCode(context.Background(), tx.user, fixtureRunID, time.Now(), false); err != nil {
 					t.Fatal("seeded TOTP ciphertext is not usable")
 				}
 			} else if len(tx.user.MfaTotpSecretEncrypted) != 0 {
@@ -281,7 +298,7 @@ func TestFixtureTOTPMatchesProductionMFAAndCrossReplicaReplay(t *testing.T) {
 	}
 	defer clear(secret)
 	now := time.Now()
-	code, err := currentTOTPCode(ctx, user, fixtureRunID, now)
+	code, err := currentTOTPCode(ctx, user, fixtureRunID, now, false)
 	if err != nil || !totp.ValidateCode(string(secret), code.Code, now, 0) {
 		t.Fatal("fixture code must match the real TOTP engine")
 	}
@@ -294,7 +311,7 @@ func TestFixtureTOTPMatchesProductionMFAAndCrossReplicaReplay(t *testing.T) {
 	if code.ExpiresAt != boundary {
 		t.Fatal("incorrect current-step boundary")
 	}
-	next, err := currentTOTPCode(ctx, user, fixtureRunID, boundary)
+	next, err := currentTOTPCode(ctx, user, fixtureRunID, boundary, false)
 	if err != nil || next.ExpiresAt != boundary.Add(30*time.Second) || !totp.ValidateCode(string(secret), next.Code, boundary, 0) {
 		t.Fatal("fixture must follow the real clock without rotating or resetting the secret")
 	}
@@ -335,7 +352,7 @@ func TestFixtureTOTPMatchesProductionMFAAndCrossReplicaReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal("cannot create production step-up service")
 		}
-		again, err := currentTOTPCode(ctx, user, fixtureRunID, now)
+		again, err := currentTOTPCode(ctx, user, fixtureRunID, now, false)
 		if err != nil || again != code {
 			t.Fatal("code retrieval changed the factor or consumed replay state")
 		}
@@ -371,9 +388,58 @@ func TestFixtureTOTPRefusesForeignInactiveMissingAndCorruptFactors(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			user := db.User{ID: uuid.New(), Email: "portal@" + fixtureRunID + ".example.test", Status: "active", IsMfaEnabled: true, MfaTotpSecretEncrypted: bytes.Clone(ciphertext)}
 			mutate(t, &user)
-			output, err := currentTOTPCode(context.Background(), user, fixtureRunID, time.Now())
+			output, err := currentTOTPCode(context.Background(), user, fixtureRunID, time.Now(), false)
 			if err == nil || output != (totpCode{}) || strings.Contains(err.Error(), "private") {
 				t.Fatal("invalid fixture factor must fail without a code or private diagnostic")
+			}
+		})
+	}
+}
+
+func TestFixturePendingTOTPIsExplicitOwnedAndWithinOriginalWindow(t *testing.T) {
+	fixtureKEK(t)
+	ctx := context.Background()
+	ciphertext, err := newTOTPSecret(ctx)
+	if err != nil {
+		t.Fatal("cannot create pending fixture factor")
+	}
+	now := time.Now()
+	user := db.User{
+		ID: uuid.New(), Email: "pending@" + fixtureRunID + ".example.test", Status: "pending_deletion",
+		DeletedAt:    pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
+		IsMfaEnabled: true, MfaTotpSecretEncrypted: ciphertext,
+	}
+	code, err := currentTOTPCode(ctx, user, fixtureRunID, now, true)
+	if err != nil || len(code.Code) != 6 {
+		t.Fatal("owned pending fixture cannot obtain a recovery code")
+	}
+	if _, err := currentTOTPCode(ctx, user, fixtureRunID, now, false); err == nil {
+		t.Fatal("ordinary TOTP action accepted a deleted account")
+	}
+	enc, err := fixtureEncryptor()
+	if err != nil {
+		t.Fatal("cannot load fixture decryptor")
+	}
+	secret, err := enc.Decrypt(ctx, ciphertext)
+	if err != nil || !totp.ValidateCode(string(secret), code.Code, now, 0) {
+		t.Fatal("pending fixture code diverges from production TOTP")
+	}
+	clear(secret)
+	for name, mutate := range map[string]func(*db.User){
+		"active":    func(u *db.User) { u.Status = "active"; u.DeletedAt.Valid = false },
+		"suspended": func(u *db.User) { u.Status = "suspended" },
+		"foreign":   func(u *db.User) { u.Email = "foreign@another.example.test" },
+		"no-date":   func(u *db.User) { u.DeletedAt.Valid = false },
+		"future":    func(u *db.User) { u.DeletedAt.Time = now.Add(time.Second) },
+		"deadline":  func(u *db.User) { u.DeletedAt.Time = now.Add(-720 * time.Hour) },
+		"expired":   func(u *db.User) { u.DeletedAt.Time = now.Add(-721 * time.Hour) },
+		"disabled":  func(u *db.User) { u.IsMfaEnabled = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := user
+			mutate(&copy)
+			if output, err := currentTOTPCode(ctx, copy, fixtureRunID, now, true); err == nil || output != (totpCode{}) {
+				t.Fatal("ineligible account yielded a pending recovery code")
 			}
 		})
 	}

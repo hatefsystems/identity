@@ -3,6 +3,11 @@ package privacy
 import "errors"
 
 var (
+	// ErrDeletionUnavailable leaves recovery available while new requests are off.
+	ErrDeletionUnavailable = errors.New("privacy: deletion notification encryption unavailable")
+	// ErrStaleAuthority refuses authority invalidated since request admission.
+	ErrStaleAuthority = errors.New("privacy: account authority changed")
+
 	// ErrInvalidToken is the single failure surfaced for every reclaim problem:
 	// an unknown token, an expired one, a consumed one, a wrong factor, a missing
 	// account, or an account that holds no verifiable factor at all.

@@ -15,6 +15,7 @@ export type Profile = {
   email: string;
   display_name: string;
   status: string;
+  deletion_enabled: boolean;
   lifecycle_revision: string;
   session: { id: string; expires_at: string };
 };
@@ -32,6 +33,8 @@ export function profileResponse(value: unknown): Profile {
     email: text(profile.email, 320),
     display_name: name,
     status: text(profile.status, 64),
+    deletion_enabled:
+      profile.deletion_enabled === undefined ? false : boolean(profile.deletion_enabled),
     lifecycle_revision: revision,
     session: { id: identifier(session.id), expires_at: timestamp(session.expires_at) },
   };

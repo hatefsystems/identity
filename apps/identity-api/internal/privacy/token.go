@@ -23,9 +23,8 @@ const reclaimTokenByteLen = 32
 // the deletion request.
 //
 // The plaintext is returned to the caller for delivery in the notification email
-// and is never persisted; only hash reaches the database, so a database dump
-// cannot be replayed against the reclaim endpoints. Mirrors session.NewToken /
-// session.HashToken.
+// and persisted only inside the encrypted notification envelope. The request
+// lookup holds only its hash. Mirrors session.NewToken / session.HashToken.
 //
 // The hash is hex-encoded SHA-256, which is always exactly 64 characters and so
 // fits deletion_requests.token_hash VARCHAR(64) — the same convention as
@@ -51,4 +50,12 @@ func NewReclaimToken() (token string, hash string, err error) {
 func HashReclaimToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func validReclaimToken(token string) bool {
+	if len(token) != base64.RawURLEncoding.EncodedLen(reclaimTokenByteLen) {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(token)
+	return err == nil && len(raw) == reclaimTokenByteLen && base64.RawURLEncoding.EncodeToString(raw) == token
 }

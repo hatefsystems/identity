@@ -6,9 +6,9 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { PortalClient } from '../../_lib/portal/client';
-import type { Profile } from '../../_lib/portal/contracts';
+import type { Profile, StepUpGrant } from '../../_lib/portal/contracts';
 import type { StepUpIntent } from '../../_lib/portal/action-intent';
-import { errorMessage, isAborted, PortalError } from '../../_lib/portal/errors';
+import { errorMessage, isAborted, PortalError, throwIfAborted } from '../../_lib/portal/errors';
 import {
   clearSensitiveViews,
   invalidateOtherTabs,
@@ -27,8 +27,10 @@ type PortalState = {
 type PortalContextValue = PortalState & {
   updateProfile: (profile: Profile) => void;
   signOut: (currentID?: string) => Promise<void>;
+  deleteAccount: (grant: StepUpGrant, signal: AbortSignal) => Promise<void>;
   rememberStepUp: (intent: StepUpIntent) => void;
 };
+type DeletionOutcome = 'confirmed' | 'unconfirmed';
 const PortalContext = createContext<PortalContextValue | null>(null);
 
 export function usePortal(): PortalContextValue {
@@ -42,6 +44,11 @@ export function PortalProvider({ children }: { children: ReactNode }) {
   const [phase, setPhase] = useState<'checking' | 'ready' | 'failed' | 'signing-out'>('checking');
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
+  const [deletionOutcome, setDeletionOutcome] = useState<DeletionOutcome | null>(null);
+  const terminal = useRef<DeletionOutcome | null>(null);
+  const deleting = useRef<{ sent: boolean; interrupt: () => void } | null>(null);
+  const alive = useRef(false);
+  const outcomeHeading = useRef<HTMLHeadingElement>(null);
   const active = useRef<PortalClient | null>(null);
   const signingOut = useRef(false);
   const requireReconciliation = useRef(false);
@@ -56,10 +63,11 @@ export function PortalProvider({ children }: { children: ReactNode }) {
     clearSensitiveViews();
     active.current?.dispose();
     active.current = null;
-    setState(null);
+    if (alive.current) setState(null);
   }
 
   function checkSession() {
+    if (terminal.current) return;
     requireReconciliation.current = false;
     clear();
     setError('');
@@ -68,12 +76,28 @@ export function PortalProvider({ children }: { children: ReactNode }) {
   }
 
   useEffect(() => {
-    if (document.visibilityState === 'hidden') return;
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      deleting.current?.interrupt();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (deletionOutcome) outcomeHeading.current?.focus();
+  }, [deletionOutcome]);
+
+  useEffect(() => {
+    if (document.visibilityState === 'hidden' || requireReconciliation.current) return;
     const client = new PortalClient();
     active.current = client;
     let expiry: ReturnType<typeof setTimeout> | undefined;
     function lost(failure: PortalError) {
       if (active.current !== client) return;
+      if (deleting.current?.sent) {
+        deleting.current.interrupt();
+        return;
+      }
       const hadSession = Boolean(client.profile);
       suspended.current = null;
       clearSensitiveViews();
@@ -124,6 +148,11 @@ export function PortalProvider({ children }: { children: ReactNode }) {
       setState((value) => (value?.resumedAction ? { ...value, resumedAction: undefined } : value));
     }
     function invalidate() {
+      if (terminal.current) return;
+      if (deleting.current?.sent) {
+        deleting.current.interrupt();
+        return;
+      }
       discardIntent();
       clearSensitiveViews();
       active.current?.dispose();
@@ -141,6 +170,10 @@ export function PortalProvider({ children }: { children: ReactNode }) {
     function visibility() {
       if (requireReconciliation.current || signingOut.current) return;
       if (document.visibilityState === 'hidden') {
+        if (deleting.current?.sent) {
+          deleting.current.interrupt();
+          return;
+        }
         if (wasHidden.current) return;
         wasHidden.current = true;
         // Capture only a non-authoritative session marker before children clear
@@ -181,7 +214,7 @@ export function PortalProvider({ children }: { children: ReactNode }) {
 
   async function signOut(currentID?: string) {
     const client = active.current;
-    if (!client || signingOut.current) return;
+    if (!client || signingOut.current || deleting.current || terminal.current) return;
     signingOut.current = true;
     requireReconciliation.current = true;
     suspended.current = null;
@@ -206,6 +239,60 @@ export function PortalProvider({ children }: { children: ReactNode }) {
       invalidateOtherTabs();
     } finally {
       signingOut.current = false;
+    }
+  }
+
+  async function deleteAccount(grant: StepUpGrant, signal: AbortSignal) {
+    const client = active.current;
+    if (!client || signingOut.current || deleting.current || terminal.current) {
+      grant.clear();
+      throw new PortalError('session_changed', 409);
+    }
+    const operation = { sent: false, interrupt: () => settle('unconfirmed') };
+    function settle(outcome: DeletionOutcome) {
+      if (terminal.current || (outcome === 'unconfirmed' && !operation.sent)) return;
+      terminal.current = outcome;
+      requireReconciliation.current = true;
+      deleting.current = null;
+      grant.clear();
+      clear();
+      if (alive.current) {
+        setError('');
+        setDeletionOutcome(outcome);
+      }
+      // This outcome has no account identifiers or authority. Keep it outside
+      // authenticated children, and never issue logout or delete the shared key.
+      invalidateOtherTabs();
+    }
+    try {
+      throwIfAborted(signal);
+      if (!client.assertSession().deletion_enabled) throw new PortalError('deletion_disabled');
+      deleting.current = operation;
+      signal.addEventListener('abort', operation.interrupt, { once: true });
+      await client.deleteAccount(grant, signal, () => {
+        throwIfAborted(signal);
+        operation.sent = true;
+      });
+      if (signal.aborted || active.current !== client) settle('unconfirmed');
+      else settle('confirmed');
+    } catch (failure) {
+      if (terminal.current) return;
+      if (
+        operation.sent &&
+        (signal.aborted ||
+          isAborted(failure) ||
+          !(failure instanceof PortalError) ||
+          failure.uncertain ||
+          failure.status >= 500)
+      ) {
+        settle('unconfirmed');
+        return;
+      }
+      throw failure;
+    } finally {
+      grant.clear();
+      signal.removeEventListener('abort', operation.interrupt);
+      if (deleting.current === operation) deleting.current = null;
     }
   }
 
@@ -246,6 +333,7 @@ export function PortalProvider({ children }: { children: ReactNode }) {
     ['/dashboard/profile', 'Profile'],
     ['/dashboard/security', 'Security'],
     ['/dashboard/sessions', 'Sessions'],
+    ['/dashboard/privacy', 'Privacy'],
   ];
   return (
     <div className="min-h-svh bg-muted/20">
@@ -270,7 +358,7 @@ export function PortalProvider({ children }: { children: ReactNode }) {
               Hatef <span className="font-normal text-muted-foreground">Identity</span>
             </span>
           </Link>
-          {phase === 'ready' && (
+          {phase === 'ready' && !deletionOutcome && (
             <Button
               type="button"
               variant="outline"
@@ -282,12 +370,17 @@ export function PortalProvider({ children }: { children: ReactNode }) {
           )}
         </div>
       </header>
-      <div className="mx-auto grid max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[12rem_minmax(0,1fr)] lg:gap-10 lg:py-10">
-        <nav aria-label="Account navigation" className="min-w-0">
+      <div
+        className={cn(
+          'mx-auto grid max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:gap-10 lg:py-10',
+          !deletionOutcome && 'lg:grid-cols-[12rem_minmax(0,1fr)]'
+        )}
+      >
+        <nav aria-label="Account navigation" className="min-w-0" hidden={Boolean(deletionOutcome)}>
           <p className="mb-3 px-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
             Your account
           </p>
-          <ul className="grid grid-cols-2 gap-1 sm:grid-cols-4 lg:grid-cols-1">
+          <ul className="grid grid-cols-2 gap-1 sm:grid-cols-5 lg:grid-cols-1">
             {navigation.map(([href, label]) => (
               <li key={href}>
                 <Link
@@ -309,8 +402,57 @@ export function PortalProvider({ children }: { children: ReactNode }) {
           </ul>
         </nav>
         <main id="portal-content" tabIndex={-1} className="min-w-0 space-y-6 focus:outline-none">
-          {phase === 'ready' && state ? (
-            <PortalContext value={{ ...state, updateProfile, signOut, rememberStepUp }}>
+          {deletionOutcome ? (
+            <section
+              data-testid="deletion-outcome"
+              data-outcome={deletionOutcome}
+              className="mx-auto max-w-2xl space-y-5 rounded-xl border bg-card p-6 sm:p-8"
+            >
+              <h1
+                ref={outcomeHeading}
+                tabIndex={-1}
+                className="text-2xl font-semibold tracking-tight focus:outline-none"
+              >
+                {deletionOutcome === 'confirmed'
+                  ? 'Account deletion requested'
+                  : 'Deletion outcome unconfirmed'}
+              </h1>
+              <Feedback
+                status={
+                  deletionOutcome === 'confirmed'
+                    ? 'Your identity account has been deactivated and deletion is scheduled. Your identity sessions have been revoked.'
+                    : 'The request was sent, but its outcome could not be confirmed. Your account may already be deactivated. The request has not been retried.'
+                }
+              />
+              {deletionOutcome === 'confirmed' ? (
+                <p className="text-sm leading-relaxed">
+                  A recovery notification is queued for your primary email and any configured backup
+                  email. Queued mail does not confirm inbox delivery. To cancel deletion, open the
+                  recovery link in that email and complete verification within the original 30-day
+                  recovery window. The email contains the exact deadline.
+                </p>
+              ) : (
+                <p className="text-sm leading-relaxed">
+                  Private data has been cleared from this view. Check your primary and configured
+                  backup mailboxes for a recovery message. If it arrives, use its recovery link
+                  before the deadline in the email. This page cannot confirm an account change or
+                  email delivery; a missing message or a failed sign-in is not proof of the outcome.
+                </p>
+              )}
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Recovery requires the emailed link and strong verification, not a current session.
+                Recovery does not restore old sessions. Data subject to lawful preservation,
+                separately retained security records, backups, and downstream services may follow
+                different retention schedules.
+              </p>
+              <Link href="/" className={linkClass}>
+                Return home
+              </Link>
+            </section>
+          ) : phase === 'ready' && state ? (
+            <PortalContext
+              value={{ ...state, updateProfile, signOut, deleteAccount, rememberStepUp }}
+            >
               <div data-testid="portal-ready" className="space-y-6">
                 {state.revalidated && (
                   <p role="status" className="text-sm text-muted-foreground">
