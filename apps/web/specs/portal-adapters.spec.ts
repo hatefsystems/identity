@@ -169,7 +169,7 @@ describe('portal validation and transient authority', () => {
       );
     for (const invalid of [null, 'true', 1, {}, []])
       expect(() => profileResponse({ ...value, deletion_enabled: invalid })).toThrow();
-    for (const revision of [123, '01', '-1', '9223372036854775808', '+1'])
+    for (const revision of [123, '01', '-1', '9223372036854775808', '+1', '1\n', '1\r'])
       expect(() => profileResponse({ ...value, lifecycle_revision: revision })).toThrow();
   });
 

@@ -3,9 +3,12 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -34,7 +37,7 @@ func (s *Server) handleAdminListUsers() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if r.URL.Query().Has("email") {
+		if !validAdminQuery(r, "limit", "offset", "status") {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -74,7 +77,7 @@ func (s *Server) handleAdminListUsers() http.HandlerFunc {
 				items[i].Email = nil
 			}
 		}
-		fields := []string{"id", "status", "mfa_enabled", "created_at", "updated_at", "deleted_at"}
+		fields := []string{"id", "status", "mfa_enabled", "created_at", "updated_at", "deleted_at", "lifecycle_revision"}
 		if includePII {
 			fields = append(fields, "email")
 		}
@@ -115,7 +118,7 @@ func (s *Server) handleAdminLookupUser() http.HandlerFunc {
 		var req struct {
 			Email string `json:"email"`
 		}
-		if r.URL.RawQuery != "" {
+		if !validAdminQuery(r) {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -138,7 +141,7 @@ func (s *Server) handleAdminLookupUser() http.HandlerFunc {
 		if err == nil {
 			items = append(items, newAdminUserResponse(user, true))
 		}
-		adminaction.SetEvent(r.Context(), audit.Event{EventType: "admin.users.looked_up", Payload: map[string]any{"result_count": len(items), "selected_fields": []string{"id", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at"}}})
+		adminaction.SetEvent(r.Context(), audit.Event{EventType: "admin.users.looked_up", Payload: map[string]any{"result_count": len(items), "selected_fields": []string{"id", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "lifecycle_revision"}}})
 		s.writeAdminJSON(w, http.StatusOK, adminPage[adminUserResponse]{Items: items, Total: int64(len(items)), Limit: 1})
 	}
 }
@@ -147,6 +150,10 @@ func (s *Server) handleAdminGetUser() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		actor, ok := s.adminActor(w, r)
 		if !ok {
+			return
+		}
+		if !validAdminQuery(r) {
+			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
 		userID, ok := s.adminPathUUID(w, r, "user_id")
@@ -168,7 +175,7 @@ func (s *Server) handleAdminGetUser() http.HandlerFunc {
 			return
 		}
 		// Role membership and hold existence are not ordinary account metadata.
-		fields := []string{"id", "status", "mfa_enabled", "created_at", "updated_at", "deleted_at"}
+		fields := []string{"id", "status", "mfa_enabled", "created_at", "updated_at", "deleted_at", "lifecycle_revision"}
 		if includePII {
 			fields = append(fields, "email")
 		}
@@ -178,8 +185,37 @@ func (s *Server) handleAdminGetUser() http.HandlerFunc {
 }
 
 type adminUpdateStatusRequest struct {
-	Status string `json:"status"`
-	Reason string `json:"reason"`
+	Status           string `json:"status"`
+	Reason           string `json:"reason"`
+	ExpectedRevision string `json:"expected_revision"`
+}
+
+func decodeAdminStatusUpdate(r *http.Request) (adminUpdateStatusRequest, int64, error) {
+	invalid := errors.New("admin: invalid status request")
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 64*1024))
+	if err != nil || !utf8.Valid(raw) || !json.Valid(raw) || !uniqueJSONFields(raw) {
+		return adminUpdateStatusRequest{}, 0, invalid
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || len(fields) != 3 {
+		return adminUpdateStatusRequest{}, 0, invalid
+	}
+	for _, name := range []string{"status", "reason", "expected_revision"} {
+		value := fields[name]
+		if len(value) < 2 || value[0] != '"' || !validNameJSONString(value) {
+			return adminUpdateStatusRequest{}, 0, invalid
+		}
+	}
+	var result adminUpdateStatusRequest
+	if json.Unmarshal(raw, &result) != nil {
+		return adminUpdateStatusRequest{}, 0, invalid
+	}
+	revision, err := strconv.ParseInt(result.ExpectedRevision, 10, 64)
+	result.Reason = strings.TrimSpace(result.Reason)
+	if err != nil || revision < 0 || strconv.FormatInt(revision, 10) != result.ExpectedRevision || result.Reason == "" || len(result.Reason) > 2000 {
+		return adminUpdateStatusRequest{}, 0, invalid
+	}
+	return result, revision, nil
 }
 
 func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
@@ -192,13 +228,12 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		var req adminUpdateStatusRequest
-		if err := decodeJSONBody(r, &req); err != nil {
+		if !validAdminQuery(r) {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		reason := strings.TrimSpace(req.Reason)
-		if reason == "" || len(reason) > 2000 {
+		req, expectedRevision, err := decodeAdminStatusUpdate(r)
+		if err != nil {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -250,6 +285,10 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 			s.writeAdminError(w, http.StatusForbidden, "forbidden")
 			return
 		}
+		if existing.LifecycleRevision != expectedRevision {
+			s.writeAdminError(w, http.StatusConflict, "account_conflict")
+			return
+		}
 		updated, err := op.Queries.ModerateUserStatus(r.Context(), db.ModerateUserStatusParams{ID: userID, Status: req.Status})
 		if err != nil {
 			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
@@ -264,7 +303,7 @@ func (s *Server) handleAdminUpdateUserStatus() http.HandlerFunc {
 		}
 		if err := adminaction.SetDetails(r.Context(), struct {
 			Reason string `json:"reason"`
-		}{Reason: reason}); err != nil {
+		}{Reason: req.Reason}); err != nil {
 			s.writeAdminError(w, http.StatusServiceUnavailable, "audit_unavailable")
 			return
 		}

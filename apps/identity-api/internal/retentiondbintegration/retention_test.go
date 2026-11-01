@@ -215,14 +215,6 @@ func mustExec(t *testing.T, ctx context.Context, conn executor, sql string, args
 	}
 }
 
-func assertSQLState(t *testing.T, err error, state string) {
-	t.Helper()
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != state {
-		t.Fatalf("error = %v, want SQLSTATE %s", err, state)
-	}
-}
-
 // assertRefused requires the statement to have been rejected, and reports which
 // statement slipped through rather than only the SQLSTATE.
 //

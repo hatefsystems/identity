@@ -2,12 +2,28 @@ export class PortalError extends Error {
   constructor(
     readonly code: string,
     readonly status = 0,
-    readonly uncertain = false
+    readonly uncertain = false,
+    readonly retryAfterSeconds?: number
   ) {
     // Do not retain response bodies, credential material, or identity-bearing URLs.
     super(code);
     this.name = 'PortalError';
   }
+}
+
+// Feedback only: never schedule a retry, keepalive, or replay from this header.
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (value === null || value.length > 80 || value.trim() !== value) return undefined;
+  if (/^[0-9]{1,10}$/.test(value)) return Math.min(Number(value), 3600);
+  if (
+    !/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(
+      value
+    )
+  )
+    return undefined;
+  const deadline = Date.parse(value);
+  if (!Number.isFinite(deadline) || new Date(deadline).toUTCString() !== value) return undefined;
+  return Math.min(3600, Math.max(0, Math.ceil((deadline - now) / 1000)));
 }
 
 export function isSessionLoss(error: unknown): boolean {
@@ -62,10 +78,17 @@ export function errorMessage(error: unknown, method?: 'webauthn'): string {
       case 'last_credential':
         return 'Your last passkey cannot be removed. Add another passkey first.';
       case 'credential_not_found':
+      case 'user_not_found':
       case 'not_found':
         return 'This item is no longer available. Refresh the list to see its current state.';
       case 'profile_conflict':
         return 'The saved profile changed. Refresh the saved profile, review your draft, then save again.';
+      case 'account_conflict':
+        return 'The account changed. Read its current state and review it before starting a new action with fresh verification.';
+      case 'account_not_moderatable':
+        return 'This account is not eligible for a status change.';
+      case 'forbidden':
+        return 'You do not have permission for this operation. Your normal account session is still available.';
       case 'session_changed':
         return 'The browser session changed. Private data has been cleared. Verify the current session before continuing.';
       case 'unauthorized':
@@ -75,13 +98,25 @@ export function errorMessage(error: unknown, method?: 'webauthn'): string {
       case 'invalid_dpop_proof':
         return 'Your session is no longer available. Sign in again to continue.';
       case 'rate_limited':
-        return 'Too many attempts. Please try again later.';
+        return error.retryAfterSeconds
+          ? `Too many attempts. Wait ${error.retryAfterSeconds} seconds before trying again.`
+          : 'Too many attempts. Please try again later.';
       case 'use_dpop_nonce':
         return 'The secure request could not be authorized. Start a new action to try again.';
       case 'network_error':
         return 'The service could not be reached. Check your connection and try again.';
       case 'temporarily_unavailable':
         return 'The service is temporarily unavailable. Your session could not be verified. Please try again later.';
+      case 'audit_unavailable':
+      case 'service_unavailable':
+      case 'rate_limit_unavailable':
+        return 'The administrative service is unavailable. No result can be shown. Please try again later.';
+      case 'invalid_response':
+        return 'The service returned an invalid or oversized response. No result can be trusted.';
+      case 'unknown_seq':
+        return 'The requested verification boundary is no longer available. Start a new run.';
+      case 'missing_head':
+        return 'Verification state is unavailable. This is not evidence of an intact or empty chain.';
     }
     if (error.status === 429) return 'Too many attempts. Please try again later.';
   }

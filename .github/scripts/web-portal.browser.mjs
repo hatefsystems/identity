@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { anonymousReclaim, browserFailure, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { anonymousReclaim, browserFailure, guardBrowserFailures, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
@@ -38,7 +38,14 @@ function observe(context, harness) {
       const url = new URL(request.url());
       if (url.origin !== harness.origin) state.failures.push('Unexpected third-party request');
       if (
-        harness.secrets.some((secret) => secret && url.href.includes(encodeURIComponent(secret)))
+        harness.secrets.some((secret) => {
+          if (!secret || !url.href.includes(encodeURIComponent(secret))) return false;
+          // Public references belong in typed paths, never query strings. They
+          // still require redaction in diagnostics and persisted evidence.
+          return !harness.routeReferences?.has(secret) ||
+            !portalRoute(url.pathname).includes('{id}') ||
+            url.search.includes(encodeURIComponent(secret)) || url.hash.includes(encodeURIComponent(secret));
+        })
       ) {
         state.failures.push('Fixture secret appeared in a request URL');
       }
@@ -219,7 +226,7 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } 
       for (let attempt = 0; attempt < 2; attempt++) {
         const claims = {
           htm: method,
-          htu: location.origin + path,
+          htu: new URL(path, location.origin).origin + new URL(path, location.origin).pathname,
           iat: Math.floor(Date.now() / 1000),
           jti: crypto.randomUUID(),
           ...(nonce ? { nonce } : {}),
@@ -233,6 +240,8 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } 
         const response = await fetch(path, {
           method,
           credentials: 'same-origin',
+          mode: 'cors',
+          referrerPolicy: 'no-referrer',
           cache: 'no-store',
           redirect: 'error',
           headers: {
@@ -272,12 +281,19 @@ async function keyStorage(page) {
       open.onsuccess = () => resolve(open.result);
       open.onerror = () => reject(new Error('Cannot inspect browser key storage'));
     });
-    const values = await new Promise((resolve, reject) => {
-      const read = database.transaction('keys', 'readonly').objectStore('keys').getAll();
-      read.onsuccess = () => resolve(read.result);
-      read.onerror = () => reject(new Error('Cannot inspect browser key record'));
-    });
-    database.close();
+    let values;
+    try {
+      if (Array.from(database.objectStoreNames).join(',') !== 'keys') {
+        throw new Error('Unexpected persistent portal object store');
+      }
+      values = await new Promise((resolve, reject) => {
+        const read = database.transaction('keys', 'readonly').objectStore('keys').getAll();
+        read.onsuccess = () => resolve(read.result);
+        read.onerror = () => reject(new Error('Cannot inspect browser key record'));
+      });
+    } finally {
+      database.close();
+    }
     const value = values[0];
     if (values.length !== 1 || Object.keys(value).sort().join(',') !== 'privateKey,publicJwk') {
       throw new Error('Portal persists more than its single key and public metadata');
@@ -388,7 +404,7 @@ async function stepUp(page, trigger) {
   await dialog.getByRole('button', { name: 'Verify with a passkey', exact: true }).click();
 }
 
-async function hidePortal(page, context, evidence) {
+async function hidePortal(page, context, evidence, readyID = 'portal-ready') {
   const cover = await context.newPage();
   await cover.bringToFront();
   const nativeHidden = await page.evaluate(() => document.visibilityState === 'hidden');
@@ -406,7 +422,7 @@ async function hidePortal(page, context, evidence) {
       document.dispatchEvent(new Event('visibilitychange'));
     });
   }
-  await page.getByTestId('portal-ready').waitFor({ state: 'hidden' });
+  await page.getByTestId(readyID).waitFor({ state: 'hidden' });
   return async () => {
     await page.bringToFront();
     if (!nativeHidden) {
@@ -1584,9 +1600,11 @@ export async function validatePortal(harness) {
       privacyHarness.diagnostics();
       throw error;
     } finally {
-      for (const context of privacyContexts) await context.close();
-      await privacyBrowser?.close();
-      await privacyHarness.close();
+      await portalCleanup([
+        privacyHarness.close,
+        () => privacyBrowser?.close(),
+        ...privacyContexts.map((context) => () => context.close()),
+      ])();
     }
     checkpoint = 'final-evidence';
     for (const [start, finish] of [
@@ -1625,32 +1643,62 @@ export async function validatePortal(harness) {
           ]
         : []),
     ];
-    if (process.env.PORTAL_BROWSER_ARTIFACT_DIR) {
-      const directory = resolve(process.env.PORTAL_BROWSER_ARTIFACT_DIR);
-      await mkdir(directory, { recursive: true });
-      await writeFile(
-        resolve(directory, 'portal-evidence.json'),
-        JSON.stringify(evidence, null, 2) + '\n'
-      );
-    }
-    console.log(JSON.stringify(evidence, null, 2));
-    console.log('Focused real-API production portal browser checks passed');
+    return evidence;
   } finally {
-    for (const context of contexts) await context.close();
-    await browser.close();
+    await portalCleanup([
+      () => browser.close(),
+      ...contexts.map((context) => () => context.close()),
+    ])();
+  }
+}
+
+export { addAuthenticator, api, clean, hidePortal, keyStorage, newContext, operationResponse, signIn, visit };
+
+export async function runPortalBrowser({
+  directory = process.env.PORTAL_BROWSER_ARTIFACT_DIR,
+  start = startPortalHarness, validate = validatePortal, guard = guardBrowserFailures,
+} = {}) {
+  checkpoint = 'startup';
+  const evidenceFile = directory ? resolve(directory, 'portal-evidence.json') : null;
+  if (evidenceFile) {
+    await mkdir(resolve(directory), { recursive: true });
+    await rm(evidenceFile, { force: true });
+  }
+  let harness, releaseFailureGuard;
+  let interrupted = false;
+  const close = portalCleanup([async () => {
+    if (harness) assert.equal((await harness.close())?.completed, true,
+      'Disposable portal harness teardown was not affirmatively completed');
+  }]);
+  try {
+    harness = await start();
+    releaseFailureGuard = guard(async () => { interrupted = true; await close(); });
+    const evidence = await validate(harness);
+    await close();
+    assert(!interrupted && !process.exitCode, 'Portal browser run was interrupted');
+    const report = { ...evidence, status: 'passed', exitStatus: 0, teardown: 'completed' };
+    const text = JSON.stringify(report, null, 2) + '\n';
+    assert(!harness.secrets.some((value) => value &&
+      (text.includes(value) || text.includes(JSON.stringify(value).slice(1, -1)))),
+    'Private fixture data entered saved portal evidence');
+    if (evidenceFile) await writeFile(evidenceFile, text, { flag: 'wx', mode: 0o600 });
+    assert(!interrupted && !process.exitCode, 'Portal browser run was interrupted');
+    return report;
+  } catch (error) {
+    if (evidenceFile) await rm(evidenceFile, { force: true });
+    harness?.diagnostics();
+    throw error;
+  } finally {
+    try { await close(); } finally { releaseFailureGuard?.(); }
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  let harness;
   try {
-    harness = await startPortalHarness();
-    await validatePortal(harness);
+    console.log(JSON.stringify(await runPortalBrowser(), null, 2));
+    console.log('Focused real-API production portal browser checks and teardown passed');
   } catch (error) {
-    harness?.diagnostics();
     console.error(browserFailure(error, checkpoint));
     process.exitCode = 1;
-  } finally {
-    await harness?.close();
   }
 }

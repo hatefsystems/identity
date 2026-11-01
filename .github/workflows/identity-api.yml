@@ -410,9 +410,63 @@ jobs:
           retention-days: 7
           overwrite: true
 
+  admin-browser:
+    name: Real API admin browser acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+
+      - name: Set up npm 11 and workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm --version
+          npm ci
+
+      - name: Validate excluded fixture safety
+        run: npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
+
+      - name: Install Chromium virtual authenticator support
+        run: npm exec -- playwright install --with-deps chromium
+
+      # The uncached target builds production Next/API/signer/publisher binaries,
+      # then owns fresh services and an explicit test-only governance fixture.
+      - name: Run real API admin browser suite
+        env:
+          ADMIN_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/admin-browser-evidence
+        run: npm exec -- nx run web:test-admin-browser --skipNxCache
+
+      - name: Upload sanitized admin evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: admin-browser-evidence
+          path: ${{ runner.temp }}/admin-browser-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
   publish:
     name: Publish release images
-    needs: [quality, security-db, frontend, portal-browser]
+    needs: [quality, security-db, frontend, portal-browser, admin-browser]
     if: >-
       github.repository == 'hatefsystems/identity' &&
       github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

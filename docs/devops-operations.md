@@ -177,6 +177,36 @@ coverage, manual assistive-technology/authenticator review, real-ingress checks 
 downstream-consumer validation remain explicit release gates. Record actual test
 results before task completion; adding these commands does not establish a pass.
 
+## Admin Control Panel (Task 7.5)
+
+The admin panel uses the same canonical HTTPS origin, secure cookie, DPoP key, session intent and strict document CSP as the account portal. It does not enable `ADMIN_ENABLED`, install production governance, or introduce a BFF/CORS exception. Coordinate deployment of the panel, API and all admin REST clients with old admin ingress closed and in-flight requests drained. Before reopening ingress, **every API replica** must enforce mandatory canonical-string `expected_revision` and support string-valued account revisions and audit/verifier sequence/cursor fields. Retire incompatible callers and pending forms; do not add numeric or revision-optional fallbacks. No new schema migration or cryptographic format is needed. Lifecycle v1/v2 downstream readiness remains an independent rollout requirement.
+
+Rollback must proceed in this order:
+
+1. Close admin ingress.
+2. Disable/remove the dashboard Admin entry.
+3. Coordinate API/UI rollback while incompatible admin traffic remains closed. Reopening still requires every API replica and caller to satisfy the contract above and the existing production gates.
+
+Retain database state, audit/outbox intent and approved retention/cleanup throughout rollback. Do not downgrade storage, discard accepted intent or rewrite hashes; keep canonical-v2-compatible signer/verifier binaries. The panel rollback does not change grants, retention policy or legal workflows.
+
+The required uncached browser gate owns fresh PostgreSQL 16, Redis 7 and NATS 2.10 services, production-built Next/API binaries, two API replicas, a real signer and admin publisher, and HTTPS ingress. Its excluded `portalfixture` command installs a **fixture-only** governance baseline and canonical-v2 genesis heads before starting the signer. Admin mode explicitly uses `APP_ENV=test` and `LEGAL_WORKFLOW_ENABLED=false`; it retains all production cookie, Origin, DPoP, step-up, live-RBAC, audit and CSP enforcement. Approved fixture durations are not production retention defaults. No fixture HTTP routes or production fixture binaries are added.
+
+```bash
+npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
+npm exec -- nx run web:test-admin-browser --skipNxCache
+node .github/scripts/portal-harness.mjs --integration
+```
+
+The browser target builds its API/web/fixture/signer/publisher/notifier dependencies. The integration orchestrator runs `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-lifecycle-integration`, and `test-portal-integration` through Nx, serially on its disposable services; missing configuration or skipped tests fail the run. Never point reset-schema suites at development or deployed databases. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+
+CI requires the separate `admin-browser` job before image publication in addition to the existing quality, security, frontend and portal-browser jobs. For acceptance, set `ADMIN_BROWSER_ARTIFACT_DIR` to a fresh run-specific directory under `/tmp/kilo` for masked desktop/320px light/dark screenshots and sanitized `admin-evidence.json`. Do not retain raw traces, storage snapshots, fixture credentials, proofs, grants, account identifiers or audit bodies. Diagnostic output is restricted to route templates, counts, static failure categories and sanitized scenario labels; require confirmed cleanup of all run-owned services.
+
+Local Task 7.5 completion may be recorded in `tasks.md` only after all required automated gates pass. Record the date, tested worktree, exact commands and final exit statuses, fresh sanitized evidence and successful teardown. Existing JSON, partial runs or test source alone are not passing evidence. Until then, leave Task 7.5 uncompleted; this runbook does not assert a pass. After successful validation, reconcile only Task 7.5's local status and leave unrelated task statuses and production enablement unchanged.
+
+Native hidden-tab and bfcache restoration, physical-authenticator behavior, and screen-reader/manual accessibility review remain separate gates until directly evidenced. Injected events/history tests, virtual authenticators and headless layout/keyboard assertions do not close those gates. Record remaining manual gates explicitly alongside any future local automated completion.
+
+Before production enablement, validate exact forwarding and no-referrer/private-no-store behavior through the deployed ingress for both `/admin/*` pages and `/api/v1/admin/*` APIs. Suppress or template account identifiers and exclude query strings, lookup bodies, status reasons, audit payloads, cookies, proofs, grants and referrers from proxy/APM/error logs; absence in a local harness is not operational evidence. Keep `ADMIN_ENABLED=false` unless existing governance approval, credentials/grants, outbox delivery and publisher/signer health, approved retention cleanup and exact-origin gates are satisfied. Review production threat-model assumptions independently; do not enable legal workflows to ship the panel. Production/governance and Task 5.3/5.4/5.5 deployment gates remain open independently of local Task 7.5 automated acceptance.
+
 ## Right to Be Forgotten (Task 7.4)
 
 The live routes are `/dashboard/privacy` and anonymous `/recover-account`.
@@ -286,6 +316,7 @@ Below is the production-ready Nginx configuration file (`/etc/nginx/sites-availa
 ```nginx
 # http{} scope: constant route template, never request URI/query/referrer/headers.
 log_format admin_safe '$request_method /api/v1/admin/* $status $request_time';
+log_format admin_page_safe '$request_method /admin/* $status $request_time';
 log_format portal_api_safe '$request_method /api/* $status $request_time';
 server {
     listen 443 ssl http2;
@@ -308,7 +339,20 @@ server {
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
 
-    # 1. Route for public UI, dashboard, admin panel, and OAuth authorize/error screens (Next.js)
+    # Admin documents also contain sensitive route references; never log raw URLs.
+    location ^~ /admin {
+        access_log /var/log/nginx/admin-page-access.log admin_page_safe;
+        error_log /dev/null crit;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 1. Route for public UI, dashboard, and OAuth authorize/error screens (Next.js)
     location ~ ^/(login|register|forgot-password|reset-password|verify-email|dashboard|admin|_next|static) {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
@@ -342,11 +386,17 @@ server {
         access_log /var/log/nginx/admin-access.log admin_safe;
         # Nginx error records can embed raw URLs; use sanitized API diagnostics.
         error_log /dev/null crit;
+        proxy_cache off;
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Origin $http_origin;
+        proxy_set_header DPoP $http_dpop;
+        proxy_set_header X-Portal-Session $http_x_portal_session;
+        proxy_set_header X-Step-Up-Auth $http_x_step_up_auth;
     }
 
     # First-party browser API: no BFF, shared cache, request-URI or body logging.

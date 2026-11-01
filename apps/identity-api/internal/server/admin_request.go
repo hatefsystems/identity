@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -21,6 +23,19 @@ import (
 )
 
 const adminResponseLimit = 4 * 1024 * 1024
+
+func validAdminQuery(r *http.Request, allowed ...string) bool {
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil || (len(allowed) == 0 && (r.URL.RawQuery != "" || r.URL.ForceQuery)) {
+		return false
+	}
+	for key, values := range values {
+		if len(values) != 1 || !slices.Contains(allowed, key) {
+			return false
+		}
+	}
+	return true
+}
 
 // No headers or bytes reach the client until the durable audit transaction
 // commits. This deliberately does not implement Flusher or Hijacker.

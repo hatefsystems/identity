@@ -3,6 +3,7 @@ package ledgerproof
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -230,6 +231,61 @@ func TestVerifyRejectsHeadMismatch(t *testing.T) {
 	if result.FailureReason == nil || *result.FailureReason != "head_mismatch" {
 		t.Errorf("failure reason = %v, want head_mismatch", result.FailureReason)
 	}
+	if result.Complete || result.Checked != 3 || result.FirstSeq == nil || *result.FirstSeq != 1 || result.LastSeq == nil || *result.LastSeq != 3 || result.BrokenAtSeq == nil || *result.BrokenAtSeq != 3 || result.NextAfterSeq == nil || *result.NextAfterSeq != 3 {
+		t.Fatalf("head mismatch lost the visited range or retained cursor: %+v", result)
+	}
+	last, err := audit.DecodeDigest(src.nodes[2].ChainHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LastHash != last.Hex() || result.ExpectedHash == nil || *result.ExpectedHash != last.Hex() || result.StoredHash == nil || *result.StoredHash != audit.LedgerGenesis().Hex() {
+		t.Fatal("head mismatch did not preserve both compared digests")
+	}
+	if _, ok := result.NextParams(Params{Chain: ChainLedger}); ok {
+		t.Fatal("a retained head-mismatch cursor permitted continuation")
+	}
+}
+
+func TestVerifyReportsUncheckableRecords(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		reason  string
+		mutate  func(*fakeSource)
+		checked int
+		visited *int64
+		broken  *int64
+	}{
+		{"invalid_leaf_hash", func(src *fakeSource) { src.nodes[0].LeafHash = []byte{1} }, 0, nil, ptr(int64(1))},
+		{"invalid_chain_hash", func(src *fakeSource) { src.nodes[0].ChainHash = []byte{1} }, 0, nil, ptr(int64(1))},
+		{"record_not_serializable", func(src *fakeSource) {
+			src.nodes[0].Recompute = func() (audit.Digest, error) { return audit.Digest{}, audit.ErrFieldTooLarge }
+		}, 1, ptr(int64(1)), ptr(int64(1))},
+		{"no_stored_records", func(src *fakeSource) { src.nodes = nil }, 0, nil, nil},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			t.Parallel()
+			src := buildChain(t, 3)
+			tc.mutate(src)
+			params := Params{Chain: ChainLedger, Limit: 10}
+			result, err := Verify(context.Background(), src, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := Result{
+				Chain: "ledger", ThroughSeq: 3, SeedSource: "genesis",
+				SeedHash: audit.LedgerGenesis().Hex(), LastHash: audit.LedgerGenesis().Hex(), lastDigest: audit.LedgerGenesis(),
+				Checked: tc.checked, FirstSeq: tc.visited, LastSeq: tc.visited,
+				BrokenAtSeq: tc.broken, FailureReason: &tc.reason,
+			}
+			if !reflect.DeepEqual(result, want) {
+				t.Fatalf("failure changed checked/nullable coordinates or hashes: got %+v, want %+v", result, want)
+			}
+			if _, ok := result.NextParams(params); ok {
+				t.Fatal("uncheckable records permitted continuation")
+			}
+		})
+	}
 }
 
 // TestVerifyDomainSeparation proves a ledger chain cannot be verified as an audit
@@ -370,6 +426,9 @@ func TestVerifyEmptyChain(t *testing.T) {
 	}
 	if !result.Verified || !result.Complete {
 		t.Errorf("an empty initialized chain should verify complete, got verified=%v complete=%v", result.Verified, result.Complete)
+	}
+	if result.Checked != 0 || result.ErasedChecked != 0 || result.AfterSeq != 0 || result.ThroughSeq != 0 || result.FirstSeq != nil || result.LastSeq != nil || result.BrokenAtSeq != nil || result.NextAfterSeq != nil || result.FailureReason != nil {
+		t.Fatalf("empty chain manufactured checked coordinates or failure evidence: %+v", result)
 	}
 }
 

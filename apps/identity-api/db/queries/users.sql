@@ -316,7 +316,8 @@ WHERE (sqlc.narg('status')::varchar IS NULL OR status = sqlc.narg('status')::var
 -- A single statement gives the bounded safe projection and count one snapshot,
 -- including requests whose offset is beyond the last result.
 WITH matching AS MATERIALIZED (
-    SELECT id, email, status, is_mfa_enabled, created_at, updated_at, deleted_at
+    SELECT id, email, status, is_mfa_enabled, created_at, updated_at, deleted_at,
+           lifecycle_revision::text AS lifecycle_revision
     FROM users
     WHERE (sqlc.narg('status')::varchar IS NULL OR status = sqlc.narg('status')::varchar)
 ), page AS (

@@ -24,7 +24,7 @@ export function profileResponse(value: unknown): Profile {
   const profile = record(value);
   const session = record(profile.session);
   const revision = text(profile.lifecycle_revision, 19);
-  if (!/^(0|[1-9][0-9]*)$/.test(revision) || BigInt(revision) > 9223372036854775807n)
+  if (revision.trim() !== revision || !/^(0|[1-9][0-9]*)$/.test(revision) || BigInt(revision) > 9223372036854775807n)
     throw new PortalError('invalid_response');
   const name = text(profile.display_name, 160);
   if (normalizeName(name) !== name) throw new PortalError('invalid_response');
@@ -142,7 +142,7 @@ export class StepUpGrant {
     if (!this.#token || /\s/.test(this.#token)) throw new PortalError('invalid_response');
     this.deadline = Math.min(requestedAt + integer(item.expires_in, 600) * 1000, sessionDeadline);
   }
-  private readonly deadline: number;
+  readonly deadline: number;
 
   take(sessionID: string): string {
     const token = this.#token;

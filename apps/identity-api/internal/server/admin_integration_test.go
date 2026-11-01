@@ -24,6 +24,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
@@ -216,7 +217,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 		}
 	}
 	grant := f.grant(t, "support")
-	w := f.request(t, "support", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"banned","reason":"private"}`, grant)
+	w := f.request(t, "support", "PATCH", "/users/"+f.target.ID.String()+"/status", adminStatusBody(t, "banned", "private", 0), grant)
 	if w.Code != 403 {
 		t.Fatalf("unauthorized mutation: %d %s", w.Code, w.Body.String())
 	}
@@ -236,6 +237,10 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 	}
 }
 
+type adminIntegrationBeginFunc func(context.Context) (pgx.Tx, error)
+
+func (f adminIntegrationBeginFunc) Begin(ctx context.Context) (pgx.Tx, error) { return f(ctx) }
+
 type rejectAuditBeginner struct{ pool *pgxpool.Pool }
 
 func (b rejectAuditBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -246,11 +251,14 @@ func (b rejectAuditBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 	return rejectAuditTx{Tx: tx}, nil
 }
 
-type rejectAuditTx struct{ pgx.Tx }
+type rejectAuditTx struct {
+	pgx.Tx
+	reject func(context.Context, pgx.Tx, []any) bool
+}
 
 func (tx rejectAuditTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if strings.Contains(sql, "INSERT INTO event_outbox") {
-		return pgconn.CommandTag{}, errors.New("injected outbox failure")
+	if strings.Contains(sql, "-- name: InsertAdminActionOutbox :exec") && (tx.reject == nil || tx.reject(ctx, tx.Tx, args)) {
+		return pgconn.CommandTag{}, errors.New("injected admin audit outbox failure")
 	}
 	return tx.Tx.Exec(ctx, sql, args...)
 }
@@ -264,14 +272,71 @@ func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testin
 		t.Fatalf("committed read: status=%d touches=%d body=%s", control.Code, f.sessionStore.touches.Load(), control.Body.String())
 	}
 	touches := f.sessionStore.touches.Load()
-	actions, err := adminaction.New(rejectAuditBeginner{f.pool}, f.enc, "identity.audit.admin-test", time.Hour)
+	counts := func() [4]int64 {
+		t.Helper()
+		var result [4]int64
+		if err := f.pool.QueryRow(t.Context(), `SELECT
+			(SELECT count(*) FROM event_outbox WHERE lifecycle_user_id=$1 AND NOT admin_action),
+			(SELECT count(*) FROM admin_action_contexts WHERE account_ref=$1),
+			(SELECT count(*) FROM event_outbox WHERE admin_action AND payload::jsonb->>'actor_id'=$2 AND payload::jsonb->>'action_status'='success'),
+			(SELECT count(*) FROM event_outbox WHERE admin_action AND payload::jsonb->>'actor_id'=$2 AND payload::jsonb->>'action_status'='failure')`,
+			f.target.ID, f.actors["moderator"].UserID).Scan(&result[0], &result[1], &result[2], &result[3]); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	before := counts()
+	var rejected int
+	var mutationID uuid.UUID
+	beginner := adminIntegrationBeginFunc(func(ctx context.Context) (pgx.Tx, error) {
+		tx, err := f.pool.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return rejectAuditTx{Tx: tx, reject: func(ctx context.Context, tx pgx.Tx, args []any) bool {
+			var event audit.Envelope
+			if err := json.Unmarshal([]byte(args[2].(string)), &event); err != nil {
+				t.Fatal(err)
+			}
+			var metadata struct {
+				HTTPStatus int `json:"http_status"`
+			}
+			if err := json.Unmarshal([]byte(event.Payload), &metadata); err != nil {
+				t.Fatal(err)
+			}
+			// A separate failure receipt may commit; only tentative successful
+			// responses encounter this injected disclosure/commit outage.
+			if event.ActionStatus == audit.StatusFailure && metadata.HTTPStatus >= 400 {
+				return false
+			}
+			rejected++
+			if event.EventType == audit.EventAdminUserStatusChanged {
+				mutationID = event.EventID
+				user, err := db.New(tx).GetUserByIDForAdmin(ctx, f.target.ID)
+				if err != nil || user.Status != "banned" || user.AuthVersion != f.target.AuthVersion+1 || user.AuthEpoch <= f.target.AuthEpoch || user.LifecycleRevision != f.target.LifecycleRevision+1 {
+					t.Fatalf("audit injection did not reach the mutated account: %v", err)
+				}
+				var events int64
+				if err := tx.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE lifecycle_user_id=$1 AND NOT admin_action", f.target.ID).Scan(&events); err != nil || events != before[0]+1 {
+					t.Fatalf("audit injection preceded the lifecycle insert: events=%d err=%v", events, err)
+				}
+				var encrypted []byte
+				if err := tx.QueryRow(ctx, "SELECT details_encrypted FROM admin_action_contexts WHERE action_id=$1 AND account_ref=$2", mutationID, f.target.ID).Scan(&encrypted); err != nil || len(encrypted) == 0 || bytes.Contains(encrypted, []byte("private case")) {
+					t.Fatalf("audit injection preceded encrypted context storage: %v", err)
+				}
+			}
+			return true
+		}}, nil
+	})
+	actions, err := adminaction.New(beginner, f.enc, "identity.audit.admin-test", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.srv.deps.AdminActions = actions
 	for _, call := range []struct{ method, path, body, grant string }{
+		{"GET", "/capabilities", "", ""},
 		{"GET", "/users/" + f.target.ID.String(), "", ""},
-		{"PATCH", "/users/" + f.target.ID.String() + "/status", `{"status":"banned","reason":"private case"}`, f.grant(t, "moderator")},
+		{"PATCH", "/users/" + f.target.ID.String() + "/status", adminStatusBody(t, "banned", "private case", 0), f.grant(t, "moderator")},
 	} {
 		w := f.request(t, "moderator", call.method, call.path, call.body, call.grant)
 		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), f.target.Email) {
@@ -294,8 +359,36 @@ func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Status != "active" || u.AuthVersion != f.target.AuthVersion {
+	if u.Status != f.target.Status || u.AuthVersion != f.target.AuthVersion || u.AuthEpoch != f.target.AuthEpoch || u.LifecycleRevision != f.target.LifecycleRevision {
 		t.Fatal("failed audit committed moderation")
+	}
+	if rejected != 4 || mutationID == uuid.Nil {
+		t.Fatalf("wrong audit failure boundary: rejected=%d mutation reached=%v", rejected, mutationID != uuid.Nil)
+	}
+	after := counts()
+	for i, label := range []string{"lifecycle events", "encrypted context", "success audit intents"} {
+		if after[i] != before[i] {
+			t.Errorf("failed audit committed %s: before=%d after=%d", label, before[i], after[i])
+		}
+	}
+	var remnants int64
+	if err := f.pool.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM admin_action_contexts WHERE action_id=$1) +
+		(SELECT count(*) FROM event_outbox WHERE id=$1)`, mutationID).Scan(&remnants); err != nil || remnants != 0 {
+		t.Fatalf("failed moderation retained operation context or intent: count=%d err=%v", remnants, err)
+	}
+	denied := f.request(t, "moderator", http.MethodPatch, "/users/"+f.target.ID.String()+"/status", `{"status":"banned","reason":"missing revision"}`, f.grant(t, "moderator"))
+	if denied.Code != http.StatusBadRequest {
+		t.Fatalf("separate failure audit was unavailable: %d %s", denied.Code, denied.Body.String())
+	}
+	withFailure := counts()
+	if withFailure[3] != after[3]+1 {
+		t.Fatal("a rejected request did not commit its separate failure audit")
+	}
+	for i := range 3 {
+		if withFailure[i] != before[i] {
+			t.Fatal("failure auditing committed business state or a success intent")
+		}
 	}
 }
 
@@ -313,8 +406,8 @@ func TestAdminModerationInvalidatesOtherInstanceAndEncryptsReasonIntegration(t *
 	}
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(w.Result().Cookies()[0])
-	for _, status := range []string{"banned", "active"} {
-		w := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status", `{"status":"`+status+`","reason":"sensitive-case-123"}`, f.grant(t, "moderator"))
+	for revision, status := range []string{"banned", "active"} {
+		w := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status", adminStatusBody(t, status, "sensitive-case-123", int64(revision)), f.grant(t, "moderator"))
 		if w.Code != 204 {
 			t.Fatalf("moderation: %d %s", w.Code, w.Body.String())
 		}

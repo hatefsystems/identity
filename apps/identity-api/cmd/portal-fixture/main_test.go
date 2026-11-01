@@ -141,7 +141,7 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {
@@ -154,6 +154,35 @@ func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
 				t.Fatal("production fixture accepted")
 			}
 		})
+	}
+}
+
+func TestAdminFixtureRequiresExplicitNonproductionMode(t *testing.T) {
+	t.Setenv("PORTAL_FIXTURE_ALLOW", "1")
+	t.Setenv("PORTAL_FIXTURE_RUN_ID", fixtureRunID)
+	t.Setenv("APP_ENV", "test")
+	t.Setenv("PORTAL_FIXTURE_ADMIN", "0")
+	if run([]string{"admin-policy"}) == nil {
+		t.Fatal("admin fixture accepted without explicit mode")
+	}
+	t.Setenv("PORTAL_FIXTURE_ADMIN", "1")
+	t.Setenv("APP_ENV", "development")
+	if run([]string{"admin-policy"}) == nil {
+		t.Fatal("admin fixture accepted outside explicit test environment")
+	}
+	if policy := fixturePolicy(); !policy.Fixture || policy.Workflow != nil {
+		t.Fatal("browser fixture masquerades as production governance or enables legal workflows")
+	}
+	for _, role := range []string{"ordinary", "support", "moderator", "dpo", "super_admin", "combined"} {
+		if _, err := fixtureRoles(role); err != nil {
+			t.Fatal("documented fixture role missing")
+		}
+	}
+	if _, err := fixtureRoles("admin"); err == nil {
+		t.Fatal("unrecognized privilege alias accepted")
+	}
+	if _, _, err := fixtureStatus("deleted"); err == nil {
+		t.Fatal("unknown lifecycle state accepted")
 	}
 }
 

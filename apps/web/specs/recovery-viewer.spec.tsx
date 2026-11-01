@@ -1,13 +1,13 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { RecoveryPanel } from '../app/dashboard/_components/recovery-panel';
-import { usePortal } from '../app/dashboard/_components/portal-provider';
+import { usePortal } from '../app/_components/portal-provider';
 import { PortalClient } from '../app/_lib/portal/client';
 import { StepUpGrant, type Profile, type RecoveryBatch } from '../app/_lib/portal/contracts';
 import { PortalError } from '../app/_lib/portal/errors';
 import { sensitiveClearEvent } from '../app/_lib/portal/invalidation';
 import { usePasskey } from '../app/_lib/portal/webauthn';
 
-jest.mock('../app/dashboard/_components/portal-provider', () => ({ usePortal: jest.fn() }));
+jest.mock('../app/_components/portal-provider', () => ({ usePortal: jest.fn() }));
 jest.mock('../app/_lib/portal/webauthn', () => ({ usePasskey: jest.fn() }));
 
 const codes = ['ABCDE-FGHJK-MNPQR-STVWX-YZ012-34567-89', '12345-6789A-BCDEF-GHJKM-NPQRS-TVWXY-Z0'];
@@ -64,6 +64,8 @@ beforeEach(() => {
     signOut: jest.fn(),
     deleteAccount: jest.fn(),
     rememberStepUp: jest.fn(),
+    reportPermissionLoss: jest.fn(),
+    reportModerationInterruption: jest.fn(),
   });
   api.assertSession.mockImplementation(() => profile);
   api.recoveryStatus.mockResolvedValue({ remaining: 2, low: true });

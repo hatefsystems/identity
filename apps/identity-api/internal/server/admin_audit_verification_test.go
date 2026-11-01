@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +114,9 @@ func verifyRequest(t *testing.T, chain ledgerproof.Chain, src *verifySource, que
 		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 			t.Fatalf("decode response: %v (%s)", err, w.Body.String())
 		}
+		if response.CanonicalVersion != 2 {
+			t.Fatalf("verifier omitted or changed its canonical format version: %d", response.CanonicalVersion)
+		}
 	}
 	return w, response, op
 }
@@ -198,6 +203,100 @@ func TestAdminVerifyReportsTampering(t *testing.T) {
 	}
 	if op.Event.ActionStatus != audit.StatusFailure {
 		t.Errorf("audit status = %q, want failure so alerting fires", op.Event.ActionStatus)
+	}
+}
+
+func TestAdminVerifyFailureCoordinates(t *testing.T) {
+	for _, tc := range []struct {
+		reason                    string
+		mutate                    func(*verifySource)
+		checked                   int
+		first, last, broken, next string
+		auditStatus               string
+	}{
+		{"invalid_leaf_hash", func(src *verifySource) { src.nodes[0].LeafHash = []byte{1} }, 0, "null", "null", `"2"`, "null", audit.StatusFailure},
+		{"invalid_chain_hash", func(src *verifySource) { src.nodes[0].ChainHash = []byte{1} }, 0, "null", "null", `"2"`, "null", audit.StatusFailure},
+		{"record_not_serializable", func(src *verifySource) {
+			src.nodes[0].Recompute = func() (audit.Digest, error) { return audit.Digest{}, errors.New("private-serialization-detail") }
+		}, 1, `"2"`, `"2"`, `"2"`, "null", audit.StatusFailure},
+		{"no_stored_records", func(src *verifySource) { src.nodes = nil }, 0, "null", "null", "null", "null", audit.StatusSuccess},
+		{"head_mismatch", func(src *verifySource) { src.head.Hash = audit.Genesis().Bytes() }, 2, `"2"`, `"8"`, `"8"`, `"8"`, audit.StatusFailure},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			src := buildAuditSource(t, 2, 8)
+			tc.mutate(src)
+			w, resp, op := verifyRequest(t, ledgerproof.ChainAudit, src, "")
+			if w.Code != http.StatusOK || resp.Verified || resp.Complete || resp.FailureReason == nil || *resp.FailureReason != tc.reason {
+				t.Fatalf("integrity failure was not reportable as HTTP 200: %s", w.Body.String())
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range map[string]string{
+				"after_seq": `"0"`, "through_seq": `"8"`, "checked": strconv.Itoa(tc.checked),
+				"first_seq": tc.first, "last_seq": tc.last, "broken_at_seq": tc.broken, "next_after_seq": tc.next,
+			} {
+				if string(fields[field]) != want {
+					t.Errorf("%s = %s, want %s", field, fields[field], want)
+				}
+			}
+			if resp.SeedSource != "genesis" || resp.SeedHash != audit.Genesis().Hex() || resp.Scope != auditVerifyScope {
+				t.Fatal("failure changed the reported seed or verification scope")
+			}
+			if tc.reason == "head_mismatch" {
+				last, err := audit.DecodeDigest(src.nodes[1].ChainHash)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.LastHash != last.Hex() || resp.ExpectedHash == nil || *resp.ExpectedHash != last.Hex() || resp.StoredHash == nil || *resp.StoredHash != audit.Genesis().Hex() {
+					t.Fatal("head mismatch lost its terminal digest or compared hashes")
+				}
+			} else if resp.LastHash != resp.SeedHash || string(fields["expected_hash"]) != "null" || string(fields["stored_hash"]) != "null" {
+				t.Fatal("uncheckable records manufactured digest evidence")
+			}
+			if op.Event.EventType != audit.EventAdminChainVerified || op.Event.ActionStatus != tc.auditStatus || op.Event.Payload["failure_reason"] != tc.reason || op.Event.Payload["checked"] != tc.checked || op.Event.Payload["after_seq"] != int64(0) || op.Event.Payload["through_seq"] != int64(8) {
+				t.Fatal("verification failure audit status or numeric metadata changed")
+			}
+			encoded, err := json.Marshal(op.Event.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(w.Body.String(), "private-serialization-detail") || strings.Contains(string(encoded), "private-serialization-detail") {
+				t.Fatal("serialization error details escaped the content-free proof contract")
+			}
+		})
+	}
+}
+
+func TestAdminVerifyEmptyChainsHaveNullableCoordinates(t *testing.T) {
+	for _, chain := range []ledgerproof.Chain{ledgerproof.ChainAudit, ledgerproof.ChainLedger} {
+		t.Run(string(chain), func(t *testing.T) {
+			src := &verifySource{chain: chain, head: ledgerproof.Head{Hash: chain.Genesis().Bytes()}}
+			w, resp, op := verifyRequest(t, chain, src, "")
+			if w.Code != http.StatusOK || !resp.Verified || !resp.Complete || resp.Checked != 0 || resp.ErasedChecked != 0 || resp.FailureReason != nil || resp.SeedHash != chain.Genesis().Hex() || resp.LastHash != resp.SeedHash {
+				t.Fatalf("empty chain contract changed: %s", w.Body.String())
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range map[string]string{
+				"after_seq": `"0"`, "through_seq": `"0"`, "checked": "0",
+				"first_seq": "null", "last_seq": "null", "broken_at_seq": "null", "next_after_seq": "null",
+				"expected_hash": "null", "stored_hash": "null",
+			} {
+				if string(fields[field]) != want {
+					t.Errorf("%s = %s, want %s", field, fields[field], want)
+				}
+			}
+			if chain == ledgerproof.ChainLedger && string(fields["erased_checked"]) != "0" {
+				t.Fatal("empty ledger omitted its numeric erasure count")
+			}
+			if op.Event.ActionStatus != audit.StatusSuccess {
+				t.Fatal("empty initialized chain was audited as an integrity failure")
+			}
+		})
 	}
 }
 

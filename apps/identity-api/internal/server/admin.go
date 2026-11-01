@@ -111,25 +111,27 @@ type adminPage[T any] struct {
 // holding only admin.users.read, rather than present-and-empty (which would
 // still confirm the field exists and invite a client to depend on it).
 type adminUserResponse struct {
-	ID           uuid.UUID  `json:"id"`
-	Email        *string    `json:"email,omitempty"`
-	Status       string     `json:"status"`
-	IsMFAEnabled bool       `json:"is_mfa_enabled"`
-	CreatedAt    *time.Time `json:"created_at"`
-	UpdatedAt    *time.Time `json:"updated_at"`
-	DeletedAt    *time.Time `json:"deleted_at"`
+	ID                uuid.UUID  `json:"id"`
+	Email             *string    `json:"email,omitempty"`
+	Status            string     `json:"status"`
+	IsMFAEnabled      bool       `json:"is_mfa_enabled"`
+	CreatedAt         *time.Time `json:"created_at"`
+	UpdatedAt         *time.Time `json:"updated_at"`
+	DeletedAt         *time.Time `json:"deleted_at"`
+	LifecycleRevision int64      `json:"lifecycle_revision,string"`
 }
 
 // newAdminUserResponse projects a db.User onto the safe DTO. includePII gates
 // the email address, which is the only Class A field exposed here at all.
 func newAdminUserResponse(u db.User, includePII bool) adminUserResponse {
 	resp := adminUserResponse{
-		ID:           u.ID,
-		Status:       u.Status,
-		IsMFAEnabled: u.IsMfaEnabled,
-		CreatedAt:    timePtr(u.CreatedAt),
-		UpdatedAt:    timePtr(u.UpdatedAt),
-		DeletedAt:    timePtr(u.DeletedAt),
+		ID:                u.ID,
+		Status:            u.Status,
+		IsMFAEnabled:      u.IsMfaEnabled,
+		CreatedAt:         timePtr(u.CreatedAt),
+		UpdatedAt:         timePtr(u.UpdatedAt),
+		DeletedAt:         timePtr(u.DeletedAt),
+		LifecycleRevision: u.LifecycleRevision,
 	}
 	if includePII {
 		email := u.Email
@@ -140,10 +142,8 @@ func newAdminUserResponse(u db.User, includePII bool) adminUserResponse {
 
 // adminAuditLogResponse is the audit-row DTO.
 //
-// UserID is a *uuid.UUID rendered as an explicit null rather than omitted. NULL
-// in mvp_audit_logs.user_id is not "unknown": it means the subject was purged
-// under ON DELETE SET NULL, which is a meaningful, deliberate fact for a DPO
-// reading the log. Omitting the key would erase that distinction.
+// UserID is an explicit nullable subject reference. Its absence does not disclose
+// why no subject reference is stored; clients must not infer an erasure reason.
 type adminAuditLogResponse struct {
 	ID              uuid.UUID  `json:"id"`
 	UserID          *uuid.UUID `json:"user_id"`
@@ -157,37 +157,36 @@ type adminAuditLogResponse struct {
 	Timestamp       *time.Time `json:"timestamp"`
 	SHA256LeafHash  string     `json:"sha256_leaf_hash"`
 	SHA256ChainHash string     `json:"sha256_chain_hash"`
-	Seq             int64      `json:"seq"`
+	Seq             int64      `json:"seq,string"`
 }
 
 // adminChainVerifyResponse reports one chain-verification pass.
 type adminChainVerifyResponse struct {
-	FailureReason *string `json:"failure_reason,omitempty"`
-	Chain         string  `json:"chain"`
-	AfterSeq      int64   `json:"after_seq"`
-	ThroughSeq    int64   `json:"through_seq"`
-	SeedHash      string  `json:"seed_hash"`
-	SeedSource    string  `json:"seed_source"`
-	Scope         string  `json:"scope"`
-	LastHash      string  `json:"last_hash"`
-	Complete      bool    `json:"complete"`
+	CanonicalVersion int     `json:"canonical_version"`
+	FailureReason    *string `json:"failure_reason,omitempty"`
+	Chain            string  `json:"chain"`
+	AfterSeq         int64   `json:"after_seq,string"`
+	ThroughSeq       int64   `json:"through_seq,string"`
+	SeedHash         string  `json:"seed_hash"`
+	SeedSource       string  `json:"seed_source"`
+	Scope            string  `json:"scope"`
+	LastHash         string  `json:"last_hash"`
+	Complete         bool    `json:"complete"`
 	// Verified is false as soon as any row's recomputed digest differs.
 	Verified bool `json:"verified"`
-	// Checked counts rows actually recomputed in this call.
+	// Checked counts visited chain nodes, including authorized erased payloads.
 	Checked  int    `json:"checked"`
-	FirstSeq *int64 `json:"first_seq"`
-	LastSeq  *int64 `json:"last_seq"`
+	FirstSeq *int64 `json:"first_seq,string"`
+	LastSeq  *int64 `json:"last_seq,string"`
 	// BrokenAtSeq is the seq of the first mismatching row, or null.
-	BrokenAtSeq *int64 `json:"broken_at_seq"`
+	BrokenAtSeq *int64 `json:"broken_at_seq,string"`
 	// ExpectedHash and StoredHash are populated only on a break, so an operator
 	// can see the divergence without re-running anything.
 	ExpectedHash *string `json:"expected_hash"`
 	StoredHash   *string `json:"stored_hash"`
-	// NextAfterSeq is the cursor for the next page, or null when the scan
-	// reached the end of the chain. Null is how a caller knows a
-	// genesis-to-head verification is actually complete rather than merely
-	// clean so far.
-	NextAfterSeq *int64 `json:"next_after_seq"`
+	// Complete is authoritative; the verifier can still return a cursor on its
+	// final page. Clients must not continue a completed run.
+	NextAfterSeq *int64 `json:"next_after_seq,string"`
 }
 
 // adminLedgerVerifyResponse adds the erasure accounting that only the ledger

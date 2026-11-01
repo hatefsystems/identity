@@ -80,6 +80,7 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 				break
 			}
 			clean, valid = enum(value,
+				"GET /api/v1/admin/capabilities",
 				"GET /api/v1/admin/users", "GET /api/v1/admin/users/{user_id}",
 				"POST /api/v1/admin/users/lookup", "PATCH /api/v1/admin/users/{user_id}/status",
 				"GET /api/v1/admin/audit-logs", "GET /api/v1/admin/audit-logs/verify", "GET /api/v1/admin/ledger/verify",
@@ -180,7 +181,7 @@ func sanitizedEvent(event audit.Event, actionID uuid.UUID) (audit.Event, error) 
 				// "seq" replaced "chain_hash" in a disclosure: the payload row no
 				// longer carries a digest, and seq is what an authority needs to
 				// request an inclusion proof for a disclosed event.
-				_, ok := enum(field, "id", "account_ref", "event_type", "occurred_at", "retain_until", "seq", "client_ip", "ip_subnet", "user_agent", "client_id", "scope", "device_fingerprint", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "timestamp", "is_mfa_enabled")
+				_, ok := enum(field, "id", "account_ref", "event_type", "occurred_at", "retain_until", "seq", "client_ip", "ip_subnet", "user_agent", "client_id", "scope", "device_fingerprint", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "timestamp", "is_mfa_enabled", "lifecycle_revision")
 				valid = valid && ok
 			}
 			clean = append([]string{}, fields...)

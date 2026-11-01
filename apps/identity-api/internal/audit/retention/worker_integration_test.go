@@ -32,7 +32,7 @@ import (
 // session default (repeatable read, Pacific/Honolulu), so nothing here passes
 // because of an accidentally privileged connection or a convenient timezone.
 
-func expired(t *testing.T, f *workerFixture, account uuid.UUID, ago time.Duration) audit.LedgerRecord {
+func expired(t *testing.T, account uuid.UUID, ago time.Duration) audit.LedgerRecord {
 	t.Helper()
 	return workerLedgerRecord(account, time.Now().UTC().Add(-ago))
 }
@@ -44,8 +44,8 @@ func TestWorkerErasesPayloadAndKeepsChainVerifiable(t *testing.T) {
 	f := newWorkerFixture(t)
 	account := uuid.New()
 	seeded := f.seed(t,
-		expired(t, f, account, 40*24*time.Hour),
-		expired(t, f, account, 39*24*time.Hour),
+		expired(t, account, 40*24*time.Hour),
+		expired(t, account, 39*24*time.Hour),
 		workerLedgerRecord(account, time.Now().UTC().Add(365*24*time.Hour)), // retained
 	)
 	headBefore := f.chainHead(t)
@@ -86,8 +86,8 @@ func TestWorkerRecordsErasureSpanAndReceipt(t *testing.T) {
 	f := newWorkerFixture(t)
 	account := uuid.New()
 	seeded := f.seed(t,
-		expired(t, f, account, 40*24*time.Hour),
-		expired(t, f, account, 39*24*time.Hour),
+		expired(t, account, 40*24*time.Hour),
+		expired(t, account, 39*24*time.Hour),
 	)
 
 	if stats := f.run(t, 10, 100, false); stats.Deleted != 2 {
@@ -162,8 +162,8 @@ func TestWorkerHoldOutranksRetention(t *testing.T) {
 	f := newWorkerFixture(t)
 	held, free := uuid.New(), uuid.New()
 	f.seed(t,
-		expired(t, f, held, 400*24*time.Hour),
-		expired(t, f, free, 400*24*time.Hour),
+		expired(t, held, 400*24*time.Hour),
+		expired(t, free, 400*24*time.Hour),
 	)
 	workerExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
 VALUES($1,'integration','court','legal claims',$2)`, held, uuid.New())
@@ -189,7 +189,7 @@ VALUES($1,'integration','court','legal claims',$2)`, held, uuid.New())
 func TestWorkerHoldAppliedAfterListingStillBlocks(t *testing.T) {
 	f := newWorkerFixture(t)
 	account := uuid.New()
-	f.seed(t, expired(t, f, account, 400*24*time.Hour))
+	f.seed(t, expired(t, account, 400*24*time.Hour))
 
 	boundary := f.boundary(t)
 	candidates, err := f.store.Candidates(f.ctx, boundary, Candidate{}, 10)
@@ -224,7 +224,7 @@ VALUES($1,'late hold','court','legal claims',$2)`, account, uuid.New())
 func TestWorkerDryRunChangesNothing(t *testing.T) {
 	f := newWorkerFixture(t)
 	account := uuid.New()
-	f.seed(t, expired(t, f, account, 400*24*time.Hour))
+	f.seed(t, expired(t, account, 400*24*time.Hour))
 	headBefore := f.chainHead(t)
 
 	stats := f.run(t, 10, 100, true)
@@ -244,7 +244,7 @@ func TestWorkerDryRunChangesNothing(t *testing.T) {
 func TestWorkerCannotTouchChainTable(t *testing.T) {
 	f := newWorkerFixture(t)
 	account := uuid.New()
-	seeded := f.seed(t, expired(t, f, account, 400*24*time.Hour))
+	seeded := f.seed(t, expired(t, account, 400*24*time.Hour))
 
 	for name, query := range map[string]string{
 		"delete node":    "DELETE FROM public.security_ledger_chain WHERE seq=$1",
@@ -355,7 +355,7 @@ func TestWorkerRetentionSubjectMustBeProvisioned(t *testing.T) {
 // a head it cannot reconcile with the chain table.
 func TestWorkerBoundaryRejectsInconsistentHead(t *testing.T) {
 	f := newWorkerFixture(t)
-	f.seed(t, expired(t, f, uuid.New(), 400*24*time.Hour))
+	f.seed(t, expired(t, uuid.New(), 400*24*time.Hour))
 
 	// Rewind the head behind the chain. Erasing under this state would let a purge
 	// decide eligibility against history the head does not cover.

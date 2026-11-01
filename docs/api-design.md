@@ -143,9 +143,10 @@ Admin routes require an active, non-deleted account, a normal DPoP-bound browser
 
 | Route under `/api/v1/admin` | Seeded role | Contract |
 |---|---|---|
-| `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
+| `GET /capabilities` | Any Task 7.5 permission | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes. No role catalogue, PII, or legal-workflow flags. Durably audited before disclosure. |
+| `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary with canonical-string `lifecycle_revision` from the status snapshot; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
 | `POST /users/lookup` | Moderator | Exact normalized email in JSON `{email}`. Legacy `GET /users?email=...` is rejected. |
-| `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason}`; active/suspended/banned only, no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. |
+| `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason, expected_revision}` with an exact decimal-string revision. Active/suspended/banned only; no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. Stale pins return `409 account_conflict` under the existing account locks, before status/auth/lifecycle writes. |
 | `GET /audit-logs` | DPO | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes. |
 | `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin | Content-free verification; no actors, network data, payloads or account data. |
 | `POST /legal-holds` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional advisory `review_at`; UUID `Idempotency-Key` header. |
@@ -154,51 +155,27 @@ Admin routes require an active, non-deleted account, a normal DPoP-bound browser
 | `POST /preservation-requests` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`; optional advisory `expires_at`; UUID `Idempotency-Key`. Atomically records a hold and observed evidence presence even without a live account. |
 | `POST /legal-inquiry/lookup` | DPO + step-up | JSON identifier/type (`email` only), authority/case context, time bounds, optional fields and cursor. Requires a verified signer fixture before mounting. No GET alias. |
 
-Offset lists use `{items,total,limit,offset}` with default 50 and maximum 200. Lists and counts share a statement snapshot; empty items are `[]`. Attribution uses `{items,next_cursor,coverage}`, a fixed high-water bound, and a fresh retention/hold check on every page. Empty results mean no matching **indexed, eligible records in that scope**, not proof of no activity. Default fields are record/account references, event type, timestamps and hash; network/client/device fields require explicit selection and case purpose. Phone attribution returns `400 unsupported_identifier_type`.
+The capability response is `{capabilities,limits}`. Its booleans are `users_read`, `users_pii`, `users_lookup`, `users_status_write`, `audit_logs_read`, `audit_chain_verify`, and `ledger_verify`. Limits are positive numeric `page_size_default`, `page_size_max`, `audit_max_window_seconds` (which can include fractional seconds), and `chain_verify_max_limit`. Lookup requires both account-read and PII permission; status writing also requires available step-up handling. Combined grants expose their union. No Task 7.5 access is `403`, an unmounted surface is `404`, and audit/storage failure withholds capabilities with an unavailable response. Capabilities guide presentation only; each operation rechecks live authority.
+
+User/hold offset lists use `{items,total,limit,offset}` with default 50 and maximum 200. Lists and counts share a statement snapshot; empty items are `[]`. Account list/detail/lookup revisions are canonical nonnegative decimal strings. Audit logs instead use `{items,limit,has_more,next_before_seq}` and descending `before_seq` keyset pages without a total count. Audit `seq` and `next_before_seq` are decimal strings too, preserving exact values through `9223372036854775807`. Nullable audit `user_id` means only that no linked reference is present, not proof of any particular erasure reason. Attribution uses `{items,next_cursor,coverage}`, a fixed high-water bound, and a fresh retention/hold check on every page. Empty attribution means no matching **indexed, eligible records in that scope**, not proof of no activity. Phone attribution remains `400 unsupported_identifier_type`.
+
+User-list GET accepts only `limit`, `offset`, and `status`; audit-list GET only `start_time`, `end_time`, `event_type`, `limit`, and `before_seq`; verifier GET only `after_seq`, `through_seq`, `predecessor_hash`, and `limit`. Repeated or unknown keys are `400`. Capabilities/detail GET has no query keys. Email lookup and moderation are body-only. Moderation rejects missing/null/numeric/noncanonical/overflow revisions, unknown or duplicate fields, malformed UTF-8/JSON and trailing input. Trim the reason, then require 1..2000 UTF-8 bytes. A matching revision remains required for API-only same-status behavior; the panel presents only actual transitions.
 
 Independent requests may protect the same account. New requests return 201; matching retries return 200 with `replayed=true` and current state. Reusing a key with different inputs returns 409. Replaying a released request cannot reactivate it. Advisory dates never release a hold. Release resumes original retention clocks; preservation neither restores purged data nor creates an immutable snapshot.
 
 Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together. Audit storage failure returns `503 audit_unavailable`; an unavailable store cannot guarantee durable recording of that rejected attempt. An acknowledged outbox worker delivers Class C intent to the signer. Ordinary security-event recording retains its existing best-effort transport.
 
-Verification defaults to a 1,000-step page (maximum 5,000), captures `through_seq`, and resumes with `after_seq`, that fixed bound, and optional `predecessor_hash`. It reports the seed, checked range, completion, next cursor and first mismatch. Valid sequence allocation gaps are allowed. Class C `/audit-logs/verify` behavior is unchanged. Hashes in a filtered audit list do not form a contiguous-chain proof.
+Canonical-v2 verification defaults to a 1,000-node page (maximum 5,000). Start at `after_seq="0"` without an upper bound, capture the returned inclusive `through_seq`, and keep it fixed. Continue explicitly with the prior `next_after_seq` and `last_hash` as `predecessor_hash`. Valid sequence allocation gaps are allowed. Each request uses one bounded read-only REPEATABLE READ snapshot, separate from the durable administrative audit transaction that still withholds response bytes until commit. Hashes in a filtered audit list do not establish contiguous-chain proof.
 
-`/ledger/verify` reads the durable head, surviving rows and compact erased-span
-checkpoints in one bounded read-only REPEATABLE READ snapshot per request. That
-snapshot is separate from the administrative audit transaction; the response is
-still withheld until durable disclosure intent commits. Authorization and the
-content-free response boundary are unchanged. No route grants retention DELETE
-or exposes erased metadata.
+Responses include `chain`, `canonical_version: 2`, `seed_source`, `seed_hash`, `scope`, page counts, `verified`, `complete`, positions, and failure metadata. Hashes are 64-character lowercase SHA-256 hex. Every sequence coordinate (`after_seq`, `through_seq`, nullable `first_seq`, `last_seq`, `broken_at_seq`, and `next_after_seq`) is a canonical decimal string; counts and limits stay numeric. `complete` is authoritative even if a cursor is present. A clean partial page is not a complete-run result.
 
-| Ledger response field | Meaning |
-|---|---|
-| `checked` | Retained records whose canonical bodies were recomputed, not erased rows. |
-| `purged_count`, `purged_spans` | Authorized erased rows and checkpoint spans traversed on this page. |
-| `proof_steps` | Bounded live-record plus checkpoint work; the page limit applies to both kinds. |
-| `seed_source` | May be `checkpoint_boundary` when the exact historical boundary digest remains available. |
-| `restart_required` | The requested exact historical boundary was erased inside a compacted span and is unavailable. |
-| `scope` | Declares database-relative retained-segment verification; erased bodies are not recomputed and ingestion completeness/independent authenticity are not proved. |
+The API returns explanatory scope text, which the panel validates and displays without inventing shorter scope aliases. Audit scope is relative to its seed and does not claim complete ingestion, tail-truncation detection or independent historical authenticity. Ledger scope is database-relative chain and retained-payload verification, with erased payloads authorized by erasure records rather than recomputed. An unseeded stored-predecessor start proves only local consistency. `checked` counts visited nodes, including nodes with authorized erased payloads; ledger `erased_checked` is a subset, never added to it. Authorized erasure is not erased-content verification. An initialized empty chain reports zero checked records and is not proof that no activity occurred; a missing head is an error. Missing payloads without erasure authorization, invalid leaf/chain data, predecessor mismatch, and head mismatch stop the run without success.
 
-A legitimate prefix/interior/tail purge is traversed through authorized
-checkpoint transitions rather than treated as missing evidence corruption. If
-no retained bodies are checked, including a fully purged ledger, the result is
-`verified=false`, `failure_reason=no_retained_records`; proof traversal may still
-be complete or return a next cursor. It is neither successful content verification
-nor a tampering alarm, and is audited as a non-tamper outcome.
+Canonical v2 retains separate chain nodes and verifies available payload leaf digests. The erased-span checkpoint protocol, `purged_count`, `proof_steps`, and checkpoint restart rules belong to the retired format and are not current fields. There is no browser-side rehash or claim of independent historical authenticity. A privileged coherent database rewrite remains undetectable without external anchoring, which is explicitly deferred.
 
-Continuation never silently moves `through_seq` or approximates an interior
-digest. Exact retained/checkpoint boundaries remain usable. If compaction makes
-a requested boundary unavailable, the content-free result has
-`failure_reason=retention_boundary_unavailable`, `restart_required=true`,
-`verified=false`, `complete=false` and no next cursor. Restart a fresh verification
-from genesis without the stale boundary/high-water parameters. Unknown supplied
-sequence boundaries that are not explained by retention remain invalid requests.
+The panel, API, and other admin REST clients must cut over together under closed old admin ingress, with in-flight requests drained and incompatible callers/open forms retired. Before reopening ingress, **every API replica** must enforce mandatory canonical-string `expected_revision` and support string-valued account revisions and audit/verification sequence/cursor fields; all clients must use that contract. There is no numeric or revision-optional fallback. This administrative wire change requires no schema migration or new cryptographic format: internal Go `int64` values, signed canonical bytes, digest rules, lifecycle protobuf/v2 contracts, and durable audit records are unchanged.
 
-`missing_head`, `head_mismatch`, `invalid_checkpoint`, `checkpoint_overlap`,
-`checkpoint_link_mismatch` and `missing_proof` indicate invalid proof state;
-`hash_mismatch` and supplied `predecessor_mismatch` remain failures. None yields
-`verified=true`. The durable head detects inconsistent tail/sequence state, but
-checkpoints and Class C receipts do not independently defeat a privileged coherent
-database rewrite or backup rollback. External anchoring is explicitly deferred.
+Rollback first closes admin ingress, then disables/removes the panel entry, then coordinates API/UI rollback while incompatible admin traffic remains closed. Retain database state, audit/outbox intent and approved retention/cleanup; never downgrade storage or rewrite hashes. The same every-replica contract requirement applies before reopening after rollback. Production enablement and governance approval remain separate from local Task 7.5 acceptance; follow the [admin panel rollout gates](devops-operations.md#admin-control-panel-task-75).
 
 HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate credentials across instances. `ValidateToken` applies the live account/version gate; offline JWT consumers still retain at most the configured ten-minute token lifetime. Reactivation does not revive old credentials or prevent re-registration.
 

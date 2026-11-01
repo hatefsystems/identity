@@ -54,6 +54,9 @@ type request struct {
 	UserID      string `json:"user_id,omitempty"`
 	SessionID   string `json:"session_id,omitempty"`
 	Code        string `json:"code,omitempty"`
+	Role        string `json:"role,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Scenario    string `json:"scenario,omitempty"`
 }
 
 type totpCode struct {
@@ -85,12 +88,16 @@ func run(args []string) error {
 	}
 	switch args[0] {
 	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
+	case "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
 	default:
 		return errors.New("unsupported fixture action")
 	}
 	runID := os.Getenv("PORTAL_FIXTURE_RUN_ID")
 	if os.Getenv("PORTAL_FIXTURE_ALLOW") != "1" || !runIDPattern.MatchString(runID) || os.Getenv("APP_ENV") == "production" {
 		return errors.New("explicit disposable-fixture configuration is required")
+	}
+	if strings.HasPrefix(args[0], "admin-") && (os.Getenv("PORTAL_FIXTURE_ADMIN") != "1" || os.Getenv("APP_ENV") != "test") {
+		return errors.New("explicit test-only administrative fixture mode is required")
 	}
 	var input request
 	decoder := json.NewDecoder(io.LimitReader(os.Stdin, 8193))
@@ -160,6 +167,13 @@ func run(args []string) error {
 		return errors.New("cannot open disposable PostgreSQL")
 	}
 	defer pool.Close()
+	if strings.HasPrefix(args[0], "admin-") {
+		output, err := adminFixture(ctx, pool, runID, args[0], input)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(output)
+	}
 	if args[0] == "seed" {
 		return seed(ctx, pool, runID, input.Credentials, input.TOTP)
 	}
@@ -264,12 +278,33 @@ func run(args []string) error {
 		return errors.New("cannot resolve fixture session record")
 	}
 	pipe := client.TxPipeline()
-	pipe.PExpire(ctx, "identity:session:v1:token:"+hash, time.Millisecond)
+	recordKey := "identity:session:v1:token:" + hash
+	pipe.PExpire(ctx, recordKey, time.Millisecond)
 	pipe.PExpire(ctx, idKey, time.Millisecond)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return errors.New("cannot expire fixture session")
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]bool{"expiring": true})
+	// Observe native expiration before releasing the browser. An immediate
+	// authenticated lookup could otherwise renew this deliberately tiny TTL.
+	expiry, stop := context.WithTimeout(ctx, time.Second)
+	defer stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		remaining, err := client.Exists(expiry, recordKey, idKey).Result()
+		if err != nil {
+			return errors.New("cannot observe fixture session expiration")
+		}
+		if remaining == 0 {
+			break
+		}
+		select {
+		case <-expiry.Done():
+			return errors.New("fixture session did not expire")
+		case <-tick.C:
+		}
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]bool{"expired": true})
 }
 
 func validSessionHash(value string) bool {
@@ -450,61 +485,73 @@ func newCredential(handle []byte) (credential, []byte, []byte, error) {
 	}, id, cose, nil
 }
 
+type fixtureAccount struct {
+	UserID      string       `json:"user_id"`
+	Email       string       `json:"email"`
+	Credentials []credential `json:"credentials"`
+}
+
 func seed(ctx context.Context, pool interface {
 	Begin(context.Context) (pgx.Tx, error)
 }, runID string, count int, enableTOTP bool) error {
+	account, err := seedAccount(ctx, pool, runID, count, enableTOTP)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(account)
+}
+
+func seedAccount(ctx context.Context, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, runID string, count int, enableTOTP bool) (fixtureAccount, error) {
 	if count == 0 {
 		count = 1
 	}
 	if count < 1 || count > 2 {
-		return errors.New("fixture credential count must be one or two")
+		return fixtureAccount{}, errors.New("fixture credential count must be one or two")
 	}
 	handle := make([]byte, 8)
 	if _, err := rand.Read(handle); err != nil {
-		return errors.New("cannot generate fixture handle")
+		return fixtureAccount{}, errors.New("cannot generate fixture handle")
 	}
 	userID := uuid.New()
 	email := "portal-" + userID.String() + "@" + runID + ".example.test"
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return errors.New("cannot begin fixture transaction")
+		return fixtureAccount{}, errors.New("cannot begin fixture transaction")
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	// An intentionally non-JavaScript-safe revision tests decimal-string handling.
 	if _, err := tx.Exec(ctx, `INSERT INTO users (id,email,webauthn_user_handle,display_name,lifecycle_revision) VALUES ($1,$2,$3,'',9007199254740993)`, userID, email, handle); err != nil {
-		return errors.New("cannot insert fixture account (apply portal migration first)")
+		return fixtureAccount{}, errors.New("cannot insert fixture account (apply portal migration first)")
 	}
 	credentials := make([]credential, 0, count)
 	for i := range count {
 		cred, id, cose, err := newCredential(handle)
 		if err != nil {
-			return err
+			return fixtureAccount{}, err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO webauthn_credentials (id,user_id,public_key,attestation_type,user_present,user_verified,aaguid,name) VALUES ($1,$2,$3,'none',true,true,$4,$5)`, id, userID, cose, uuid.Nil, fmt.Sprintf("Fixture passkey %d", i+1)); err != nil {
-			return errors.New("cannot insert fixture public credential")
+			return fixtureAccount{}, errors.New("cannot insert fixture public credential")
 		}
 		credentials = append(credentials, cred)
 	}
 	if enableTOTP {
 		ciphertext, err := newTOTPSecret(ctx)
 		if err != nil {
-			return err
+			return fixtureAccount{}, err
 		}
 		affected, err := db.New(tx).CompleteMfaTotpEnrollment(ctx, db.CompleteMfaTotpEnrollmentParams{
 			ID: userID, MfaTotpSecretEncrypted: ciphertext,
 		})
 		if err != nil || affected != 1 {
-			return errors.New("cannot enable fixture TOTP factor")
+			return fixtureAccount{}, errors.New("cannot enable fixture TOTP factor")
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return errors.New("cannot commit fixture account")
+		return fixtureAccount{}, errors.New("cannot commit fixture account")
 	}
-	return json.NewEncoder(os.Stdout).Encode(struct {
-		UserID      string       `json:"user_id"`
-		Email       string       `json:"email"`
-		Credentials []credential `json:"credentials"`
-	}{userID.String(), email, credentials})
+	return fixtureAccount{userID.String(), email, credentials}, nil
 }
 
 func localCertificate() (map[string]string, error) {

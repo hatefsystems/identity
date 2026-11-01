@@ -29,9 +29,11 @@ func newRedisFixture(t *testing.T) *redisFixture {
 	f.server.SetTime(f.now)
 	stores := []*RedisStore{}
 	for range 2 {
+		// Concurrent miniredis Lua calls need headroom under the race detector.
+		// Cancellation and deadline propagation use explicit contexts below.
 		client := redis.NewClient(&redis.Options{
 			Addr: f.server.Addr(), MaxRetries: -1, ContextTimeoutEnabled: true,
-			DialTimeout: 100 * time.Millisecond, ReadTimeout: 100 * time.Millisecond, WriteTimeout: 100 * time.Millisecond,
+			DialTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
 		})
 		t.Cleanup(func() { _ = client.Close() })
 		store, err := NewRedisStore(client)

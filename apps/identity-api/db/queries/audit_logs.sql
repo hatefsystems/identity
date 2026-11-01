@@ -179,5 +179,5 @@ SELECT (SELECT COUNT(*) FROM page) > sqlc.arg('page_limit')::int AS has_more,
            'action_status', action_status, 'client_ip', client_ip,
            'user_agent', user_agent, 'payload', payload, 'timestamp', timestamp,
            'sha256_leaf_hash', encode(leaf_hash, 'hex'),
-           'sha256_chain_hash', encode(chain_hash, 'hex'), 'seq', seq
+            'sha256_chain_hash', encode(chain_hash, 'hex'), 'seq', seq::text
        ) ORDER BY seq DESC) FROM bounded), '[]'::jsonb)::jsonb AS items;

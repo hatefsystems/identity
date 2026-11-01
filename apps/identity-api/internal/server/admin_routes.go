@@ -64,22 +64,23 @@ func (s *Server) registerAdminRoutes() {
 
 	// mount registers one route behind its permission guard, and behind the
 	// step-up guard when stepUp is true.
-	mount := func(r chi.Router, method, pattern, permission string, stepUp bool, h http.HandlerFunc) {
+	mount := func(r chi.Router, method, pattern, permission string, stepUp bool, h http.HandlerFunc) bool {
 		permHandler, ok := perm(permission)
 		if !ok {
-			return
+			return false
 		}
 		if stepUp {
 			if !hasStepUp {
 				s.logger.Warn("admin: step-up unavailable; gated route not mounted",
 					slog.String("method", method),
 					slog.String("pattern", pattern))
-				return
+				return false
 			}
 			r.With(permHandler, stepGuard.Handler).Method(method, pattern, h)
-			return
+			return true
 		}
 		r.With(permHandler).Method(method, pattern, h)
+		return true
 	}
 
 	s.router.Route("/api/v1/admin", func(r chi.Router) {
@@ -88,15 +89,18 @@ func (s *Server) registerAdminRoutes() {
 		r.Use(s.adminActorContext)
 
 		// --- Accounts ---
-		mount(r, http.MethodGet, "/users", permAdminUsersRead, false, s.handleAdminListUsers())
-		mount(r, http.MethodGet, "/users/{user_id}", permAdminUsersRead, false, s.handleAdminGetUser())
-		mount(r, http.MethodPost, "/users/lookup", permAdminUsersRead, false, s.handleAdminLookupUser())
-		mount(r, http.MethodPatch, "/users/{user_id}/status", permAdminUsersStatusWrit, true, s.handleAdminUpdateUserStatus())
+		var available adminCapabilities
+		listUsers := mount(r, http.MethodGet, "/users", permAdminUsersRead, false, s.handleAdminListUsers())
+		getUser := mount(r, http.MethodGet, "/users/{user_id}", permAdminUsersRead, false, s.handleAdminGetUser())
+		available.UsersRead = listUsers && getUser
+		available.UsersLookup = mount(r, http.MethodPost, "/users/lookup", permAdminUsersRead, false, s.handleAdminLookupUser())
+		available.UsersStatusWrite = mount(r, http.MethodPatch, "/users/{user_id}/status", permAdminUsersStatusWrit, true, s.handleAdminUpdateUserStatus())
 
 		// --- Audit ---
-		mount(r, http.MethodGet, "/audit-logs", permAdminAuditLogsRead, false, s.handleAdminListAuditLogs())
-		mount(r, http.MethodGet, "/audit-logs/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyAuditChain())
-		mount(r, http.MethodGet, "/ledger/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyLedgerChain())
+		available.AuditLogsRead = mount(r, http.MethodGet, "/audit-logs", permAdminAuditLogsRead, false, s.handleAdminListAuditLogs())
+		available.AuditChainVerify = mount(r, http.MethodGet, "/audit-logs/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyAuditChain())
+		available.LedgerVerify = mount(r, http.MethodGet, "/ledger/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyLedgerChain())
+		r.Get("/capabilities", s.handleAdminCapabilities(available))
 
 		// --- Legal (DPO only) ---
 		//

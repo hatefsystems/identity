@@ -4,7 +4,6 @@ package retention
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"net/url"
@@ -285,69 +284,6 @@ func (f *workerFixture) assertState(t *testing.T, ledger, erasures, receipts int
 	}{{"security_event_ledger", ledger}, {"security_ledger_erasures", erasures}, {"event_outbox", receipts}} {
 		if got := f.count(t, "SELECT count(*) FROM public."+check.table); got != check.want {
 			t.Errorf("%s rows=%d, want %d", check.table, got, check.want)
-		}
-	}
-}
-
-func (f *workerFixture) hold(t *testing.T, conn workerExecutor, account uuid.UUID) uuid.UUID {
-	t.Helper()
-	id := uuid.New()
-	workerExec(t, f.ctx, conn, `INSERT INTO public.legal_holds
- (id,account_ref,reason,requesting_authority,legal_basis,applied_by,review_at)
- VALUES($1,$2,'private case narrative','fixture authority','legal obligation',$3,now()-interval '10 years')`, id, account, uuid.New())
-	return id
-}
-
-type workerPurgeResult struct {
-	batch BatchResult
-	err   error
-}
-
-func (f *workerFixture) purgeAsync(b Boundary, candidates []Candidate) <-chan workerPurgeResult {
-	done := make(chan workerPurgeResult, 1)
-	go func() {
-		result, err := f.store.Purge(f.ctx, b, candidates, false)
-		done <- workerPurgeResult{result, err}
-	}()
-	return done
-}
-
-func awaitWorkerPurge(t *testing.T, done <-chan workerPurgeResult) workerPurgeResult {
-	t.Helper()
-	select {
-	case result := <-done:
-		return result
-	case <-time.After(10 * time.Second):
-		t.Fatal("worker did not finish after lock release")
-		return workerPurgeResult{}
-	}
-}
-
-// pg_blocking_pids identifies the exact blocker, while pg_locks proves there is
-// a real ungranted lock request. The ticker only bounds observation frequency;
-// elapsed time is never used as evidence that a race reached its synchronization point.
-func (f *workerFixture) waitBlocked(t *testing.T, blocker uint32, waiterApp string) uint32 {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(f.ctx, 1500*time.Millisecond)
-	defer cancel()
-	tick := time.NewTicker(5 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		var pid uint32
-		err := f.admin.QueryRow(ctx, `SELECT a.pid FROM pg_stat_activity a
- WHERE a.datname=current_database() AND a.application_name=$1
- AND $2::integer=ANY(pg_blocking_pids(a.pid))
- AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND NOT l.granted) LIMIT 1`, waiterApp, blocker).Scan(&pid)
-		if err == nil {
-			return pid
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			t.Fatalf("observe PostgreSQL lock wait: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("expected PostgreSQL lock wait was not observed")
-		case <-tick.C:
 		}
 	}
 }

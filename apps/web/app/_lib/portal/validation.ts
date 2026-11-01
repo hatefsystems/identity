@@ -54,12 +54,18 @@ export function list<T>(value: unknown, decode: (item: unknown) => T, max = 1000
 }
 
 export function safeReturnPath(value: string | null): string {
+  // Never carry a target identifier or its filters through an expired login.
+  if (value?.startsWith('/admin/users/')) return '/admin/users';
   return [
     '/dashboard',
     '/dashboard/profile',
     '/dashboard/security',
     '/dashboard/sessions',
     '/dashboard/privacy',
+    '/admin',
+    '/admin/users',
+    '/admin/audit-logs',
+    '/admin/integrity',
   ].includes(value ?? '')
     ? (value as string)
     : '/dashboard';

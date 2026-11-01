@@ -1,5 +1,5 @@
 import { browserKey, signProof, type BrowserKey } from './dpop';
-import { isSessionLoss, PortalError, throwIfAborted } from './errors';
+import { isSessionLoss, parseRetryAfter, PortalError, throwIfAborted } from './errors';
 import {
   passkeyResponse,
   profileResponse,
@@ -15,6 +15,7 @@ import { emptyResponse, readResponse } from './json-response';
 
 type RequestOptions = {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  query?: Readonly<Record<string, string | number | undefined>>;
   body?: unknown;
   signal?: AbortSignal;
   anonymous?: boolean;
@@ -22,6 +23,13 @@ type RequestOptions = {
   onSend?: () => void;
 };
 type Decoder<T> = (value: unknown) => T;
+
+const adminQueryKeys: Readonly<Record<string, readonly string[]>> = {
+  '/api/v1/admin/users': ['limit', 'offset', 'status'],
+  '/api/v1/admin/audit-logs': ['start_time', 'end_time', 'event_type', 'limit', 'before_seq'],
+  '/api/v1/admin/audit-logs/verify': ['after_seq', 'through_seq', 'predecessor_hash', 'limit'],
+  '/api/v1/admin/ledger/verify': ['after_seq', 'through_seq', 'predecessor_hash', 'limit'],
+};
 
 export class PortalClient {
   #lifetime = new AbortController();
@@ -64,15 +72,51 @@ export class PortalClient {
   async request<T>(path: string, decode: Decoder<T>, options: RequestOptions = {}): Promise<T> {
     const method = options.method ?? 'GET';
     const mutation = method !== 'GET';
-    const url = new URL(path, this.origin);
     if (
-      !/^\/api\/v1\/[A-Za-z0-9/_-]+$/.test(path) ||
-      url.origin !== this.origin ||
-      url.pathname !== path ||
-      url.search ||
-      url.hash
+      typeof path !== 'string' ||
+      !/^\/api\/v1\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(path) ||
+      !['GET', 'POST', 'PATCH', 'DELETE'].includes(method) ||
+      (!mutation && options.body !== undefined)
     )
       throw new PortalError('invalid_request');
+    const url = new URL(path, this.origin);
+    if (url.origin !== this.origin || url.pathname !== path || url.search || url.hash)
+      throw new PortalError('invalid_request');
+    if (options.query !== undefined) {
+      const allowed = Object.hasOwn(adminQueryKeys, path) ? adminQueryKeys[path] : undefined;
+      const query = options.query;
+      if (
+        mutation ||
+        !allowed ||
+        !query ||
+        (Object.getPrototypeOf(query) !== Object.prototype && Object.getPrototypeOf(query) !== null)
+      )
+        throw new PortalError('invalid_request');
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(query)) {
+        if (!allowed.includes(key)) throw new PortalError('invalid_request');
+        if (value === undefined) continue;
+        if (
+          (typeof value !== 'string' && typeof value !== 'number') ||
+          (typeof value === 'number' && (!Number.isSafeInteger(value) || value < 0)) ||
+          (key.endsWith('_seq') &&
+            (typeof value !== 'string' ||
+              !/^(0|[1-9][0-9]{0,18})$/.test(value) ||
+              value.trim() !== value ||
+              (value.length === 19 && value > '9223372036854775807'))) ||
+          String(value).length > 128 ||
+          /[\p{Cc}\p{Cs}]/u.test(String(value))
+        )
+          throw new PortalError('invalid_request');
+        params.set(key, String(value));
+      }
+      url.search = params.toString();
+    }
+    // The browser fetches the full query, but the server binds DPoP to htu
+    // without query/fragment. No caller can widen another route's body budget.
+    const proofURL = `${url.origin}${url.pathname}`;
+    const responseLimit =
+      method === 'GET' && path === '/api/v1/admin/audit-logs' ? 4 * 1024 * 1024 : undefined;
     const snapshot = options.anonymous ? this.#profile : this.assertSession();
     throwIfAborted(options.signal);
     throwIfAborted(this.#lifetime.signal);
@@ -100,7 +144,7 @@ export class PortalClient {
       for (let attempt = 0; attempt < 2; attempt++) {
         const key = await this.getKey();
         throwIfAborted(controller.signal);
-        headers.set('DPoP', await signProof(key, method, url.href, nonce));
+        headers.set('DPoP', await signProof(key, method, proofURL, nonce));
         throwIfAborted(controller.signal);
         if (!sent) options.onSend?.();
         sent = true;
@@ -117,33 +161,44 @@ export class PortalClient {
           referrerPolicy: 'no-referrer',
           signal: controller.signal,
         });
-        if (response.redirected || (response.url && response.url !== url.href))
+        if (response.redirected || (response.url && response.url !== url.href)) {
+          await response.body?.cancel().catch(() => undefined);
           throw new PortalError('invalid_response');
-        const value = await readResponse(response, controller.signal);
+        }
+        const value = await readResponse(response, controller.signal, responseLimit);
         throwIfAborted(controller.signal);
         if (response.ok) {
           if (snapshot && this.#profile?.session.id !== snapshot.session.id)
             throw new PortalError('session_changed', 409);
           return decode(value);
         }
+        const errorCode = record(value).error;
         const code =
-          typeof record(value).error === 'string' &&
-          /^[a-z_]{1,80}$/.test(record(value).error as string)
-            ? (record(value).error as string)
+          typeof errorCode === 'string' &&
+          /^[a-z_]{1,80}$/.test(errorCode) &&
+          errorCode.trim() === errorCode
+            ? errorCode
             : 'request_failed';
         const challenge = response.headers.get('DPoP-Nonce');
         if (
           attempt === 0 &&
           response.status === 401 &&
           code === 'use_dpop_nonce' &&
-          /\bDPoP\s+error="use_dpop_nonce"/i.test(response.headers.get('WWW-Authenticate') ?? '') &&
+          /^DPoP[ \t]+error="use_dpop_nonce"$/i.test(
+            response.headers.get('WWW-Authenticate') ?? ''
+          ) &&
           challenge &&
           /^[A-Za-z0-9._~-]{1,1024}$/.test(challenge)
         ) {
           nonce = challenge;
           continue;
         }
-        throw new PortalError(code, response.status, mutation && response.status >= 500);
+        throw new PortalError(
+          code,
+          response.status,
+          mutation && response.status >= 500,
+          parseRetryAfter(response.headers.get('Retry-After'))
+        );
       }
       throw new PortalError('use_dpop_nonce', 401);
     } catch (failure) {
@@ -154,13 +209,16 @@ export class PortalClient {
           : new PortalError('network_error', response?.status ?? 0, sent && mutation);
       // An unreadable success body is also an uncertain mutation, not a reason
       // to replay an authenticator response or silently replace recovery codes.
-      const reported =
-        error.code === 'invalid_response' &&
-        sent &&
-        mutation &&
-        (!response || response.status < 400 || response.status >= 500)
-          ? new PortalError(error.code, response?.status ?? 0, true)
-          : error;
+      const reported = new PortalError(
+        error.code,
+        error.status || response?.status || 0,
+        error.uncertain ||
+          (error.code === 'invalid_response' &&
+            sent &&
+            mutation &&
+            (!response || response.status < 400 || response.status >= 500)),
+        error.retryAfterSeconds ?? parseRetryAfter(response?.headers.get('Retry-After') ?? null)
+      );
       if (isSessionLoss(reported)) this.onSessionLoss?.(reported);
       throw reported;
     } finally {

@@ -3,24 +3,45 @@ import { PortalError, throwIfAborted } from './errors';
 export const emptyResponse = (value: unknown): void => {
   if (value !== undefined) throw new PortalError('invalid_response');
 };
-const responseLimit = 256 * 1024;
+const defaultResponseLimit = 256 * 1024;
 
-export async function readResponse(response: Response, signal: AbortSignal): Promise<unknown> {
-  if (response.status === 204) return undefined;
+export async function readResponse(
+  response: Response,
+  signal: AbortSignal,
+  responseLimit = defaultResponseLimit
+): Promise<unknown> {
+  if (signal.aborted) await response.body?.cancel().catch(() => undefined);
+  throwIfAborted(signal);
   const length = response.headers.get('Content-Length');
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > responseLimit)) {
-    await response.body?.cancel();
+    await response.body?.cancel().catch(() => undefined);
     throw new PortalError('invalid_response');
   }
+  const empty = response.status === 204;
+  if (empty) {
+    if (length !== null && Number(length) !== 0) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new PortalError('invalid_response');
+    }
+    if (!response.body) return undefined;
+  }
   if (
-    !/^application\/json(?:\s*;|$)/i.test(response.headers.get('Content-Type') ?? '') ||
+    (!empty && !/^application\/json(?:\s*;|$)/i.test(response.headers.get('Content-Type') ?? '')) ||
     !response.body
   ) {
-    await response.body?.cancel();
+    await response.body?.cancel().catch(() => undefined);
     throw new PortalError('invalid_response');
   }
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
+  const abort = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener('abort', abort, { once: true });
+  // Bound retained memory as well as bytes, even if a response arrives in many
+  // tiny chunks. The caller chooses only the default or audit-list ceiling.
+  // Chromium can expose an empty stream for 204. Verify zero bytes rather than
+  // assuming Response.body is null; any non-empty chunk is still rejected.
+  const bytes = new Uint8Array(empty ? 0 : responseLimit);
   let size = 0;
   try {
     for (;;) {
@@ -28,20 +49,21 @@ export async function readResponse(response: Response, signal: AbortSignal): Pro
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > responseLimit) {
-        await reader.cancel();
+      if (size > bytes.byteLength) {
+        await reader.cancel().catch(() => undefined);
         throw new PortalError('invalid_response');
       }
-      chunks.push(value);
+      bytes.set(value, size - value.byteLength);
     }
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.length;
+    throwIfAborted(signal);
+    if (empty) return undefined;
+    try {
+      return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)));
+    } catch {
+      throw new PortalError('invalid_response');
     }
-    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } finally {
+    signal.removeEventListener('abort', abort);
     reader.releaseLock();
   }
 }

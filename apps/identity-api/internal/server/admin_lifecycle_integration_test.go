@@ -24,6 +24,7 @@ func TestAdminLifecycleTransitionsIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	ctx := context.Background()
 	previousAuth := f.target.AuthVersion
+	previousRevision := f.target.LifecycleRevision
 	for i, tc := range []struct {
 		status   string
 		revision int64
@@ -35,7 +36,7 @@ func TestAdminLifecycleTransitionsIntegration(t *testing.T) {
 		{"active", 3, lifecycle.SubjectUpdated},
 	} {
 		response := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
-			`{"status":"`+tc.status+`","reason":"restricted lifecycle test reason"}`, f.grant(t, "moderator"))
+			adminStatusBody(t, tc.status, "restricted lifecycle test reason", previousRevision), f.grant(t, "moderator"))
 		if response.Code != http.StatusNoContent {
 			t.Fatalf("moderation %d: status %d", i, response.Code)
 		}
@@ -44,6 +45,7 @@ func TestAdminLifecycleTransitionsIntegration(t *testing.T) {
 			t.Fatalf("lifecycle/security revision mismatch after transition %d: %v", i, err)
 		}
 		previousAuth = user.AuthVersion
+		previousRevision = user.LifecycleRevision
 		var count int64
 		if err := f.pool.QueryRow(ctx, "SELECT COUNT(*) FROM event_outbox WHERE lifecycle_user_id=$1 AND NOT admin_action", user.ID).Scan(&count); err != nil || count != tc.revision {
 			t.Fatalf("same-state moderation emitted a lifecycle event: %d, %v", count, err)
@@ -86,7 +88,7 @@ func TestLifecycleFailureRollsBackModerationIntegration(t *testing.T) {
 	}
 	f.srv.deps.AdminActions = actions
 	response := f.request(t, "moderator", "PATCH", "/users/"+f.target.ID.String()+"/status",
-		`{"status":"suspended","reason":"must not commit"}`, f.grant(t, "moderator"))
+		adminStatusBody(t, "suspended", "must not commit", 0), f.grant(t, "moderator"))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("missing lifecycle intent returned success: %d", response.Code)
 	}

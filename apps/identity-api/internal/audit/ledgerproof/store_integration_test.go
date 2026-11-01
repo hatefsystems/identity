@@ -5,6 +5,7 @@ package ledgerproof_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -71,11 +72,12 @@ func proofFixture(t *testing.T) (context.Context, *pgxpool.Pool) {
 	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
 	cfg.ConnConfig.RuntimeParams["timezone"] = "Pacific/Honolulu"
 
-	dsnForMigrate := strings.Replace(dsn, "/identity?", "/"+name+"?", 1)
-	if dsnForMigrate == dsn {
-		t.Fatalf("could not derive a migration DSN for %s", name)
+	migrationURL, err := url.Parse(dsn)
+	if err != nil || (migrationURL.Scheme != "postgres" && migrationURL.Scheme != "postgresql") {
+		t.Fatal("a PostgreSQL URL is required for the disposable proof database")
 	}
-	sqldb, err := migrate.Open(ctx, dsnForMigrate)
+	migrationURL.Path, migrationURL.RawPath = "/"+name, ""
+	sqldb, err := migrate.Open(ctx, migrationURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}

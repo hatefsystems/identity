@@ -3,13 +3,13 @@ import { ProfileEditor } from '../app/dashboard/_components/profile-editor';
 import { PasskeysPanel } from '../app/dashboard/_components/passkeys-panel';
 import { SessionsView } from '../app/dashboard/_components/sessions-view';
 import { StepUpDialog } from '../app/dashboard/_components/step-up-dialog';
-import { usePortal } from '../app/dashboard/_components/portal-provider';
+import { usePortal } from '../app/_components/portal-provider';
 import { StepUpGrant, type Profile } from '../app/_lib/portal/contracts';
 import { PortalClient } from '../app/_lib/portal/client';
 import { PortalError } from '../app/_lib/portal/errors';
 import { usePasskey } from '../app/_lib/portal/webauthn';
 
-jest.mock('../app/dashboard/_components/portal-provider', () => ({ usePortal: jest.fn() }));
+jest.mock('../app/_components/portal-provider', () => ({ usePortal: jest.fn() }));
 jest.mock('../app/_lib/portal/webauthn', () => ({ usePasskey: jest.fn() }));
 
 const profile: Profile = {
@@ -85,6 +85,8 @@ beforeEach(() => {
     signOut,
     deleteAccount: jest.fn(),
     rememberStepUp: jest.fn(),
+    reportPermissionLoss: jest.fn(),
+    reportModerationInterruption: jest.fn(),
   });
   api.assertSession.mockReturnValue(profile);
   api.bootstrap.mockResolvedValue(profile);
@@ -107,7 +109,8 @@ beforeEach(() => {
 
 async function verifyPasskey() {
   fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
-  fireEvent.click(await screen.findByRole('button', { name: 'Verify with a passkey' }));
+  const verify = await screen.findByRole('button', { name: 'Verify with a passkey' });
+  await act(async () => fireEvent.click(verify));
 }
 
 describe('repeated profile edits and conflicts', () => {

@@ -3,4 +3,7 @@ export type PasskeyAction =
 
 // Deliberately excludes profile snapshots, codes, challenges and authorization.
 // Names here are proposed mutation parameters, not a cached credential listing.
-export type StepUpIntent = { kind: 'passkey'; action: PasskeyAction } | { kind: 'recovery' };
+export type StepUpIntent =
+  | { kind: 'passkey'; action: PasskeyAction }
+  | { kind: 'recovery' }
+  | { kind: 'moderation'; status: 'active' | 'suspended' | 'banned' };

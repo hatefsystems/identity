@@ -142,6 +142,23 @@ func TestUnsupportedHTTPMethodsCanBeAuditedWithoutRawURLs(t *testing.T) {
 	}
 }
 
+func TestAdminPanelMetadataAllowlist(t *testing.T) {
+	for _, operation := range []string{"GET /api/v1/admin/capabilities", "GET /api/v1/admin/users", "GET /api/v1/admin/users/{user_id}"} {
+		event := testEvent()
+		event.Payload = map[string]any{"operation": operation, "selected_fields": []string{"id", "status", "lifecycle_revision"}, "reason": "must not persist", "roles": []string{"dpo"}}
+		clean, err := sanitizedEvent(event, uuid.New())
+		if err != nil || clean.Payload["operation"] != operation {
+			t.Fatalf("panel metadata cannot be durably audited: %v", err)
+		}
+		if _, exists := clean.Payload["reason"]; exists {
+			t.Fatal("narrative was copied to durable metadata")
+		}
+		if _, exists := clean.Payload["roles"]; exists {
+			t.Fatal("role catalog was copied to capability metadata")
+		}
+	}
+}
+
 func TestSetEventPreservesRequestDefaults(t *testing.T) {
 	actor := uuid.New()
 	op := &Operation{Event: audit.Event{ActorID: actor, ActorSPIFFEID: audit.APIActorSPIFFEID, ClientIP: "192.0.2.1", UserAgent: "test-agent", Payload: map[string]any{"http_status": 200}}}

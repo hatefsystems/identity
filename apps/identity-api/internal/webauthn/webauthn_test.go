@@ -166,14 +166,14 @@ func TestNewFailsFast(t *testing.T) {
 	}
 }
 
-// TestNewRejectsUnusableRelyingParty proves a library-level rejection (an origin
-// that is not a valid URL) is surfaced at construction, wrapped with context.
+// A malformed RP ID exercises the library-level rejection deterministically;
+// the library intentionally permits literal non-URL origin strings.
 func TestNewRejectsUnusableRelyingParty(t *testing.T) {
 	cfg := testConfig()
-	cfg.RPOrigins = []string{"not a url"}
+	cfg.RPID = "https://invalid.example/path"
 
 	if _, err := New(cfg, &fakeUserStore{}, &fakeCredentialStore{}, NewMemoryChallengeStore()); err == nil {
-		t.Skip("go-webauthn accepts this origin; nothing to assert")
+		t.Fatal("accepted an RP ID that is not a domain")
 	} else if !strings.Contains(err.Error(), "webauthn: build relying party") {
 		t.Errorf("error = %q, want it to wrap with %q", err.Error(), "webauthn: build relying party")
 	}

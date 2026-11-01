@@ -34,6 +34,10 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 		if !ok {
 			return
 		}
+		if !validAdminQuery(r, "start_time", "end_time", "event_type", "limit", "before_seq") {
+			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
 
 		startRaw := r.URL.Query().Get("start_time")
 		endRaw := r.URL.Query().Get("end_time")
@@ -135,7 +139,7 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 			// append-only table that grows without bound is not worth an O(n) scan
 			// on every page view.
 			HasMore       bool  `json:"has_more"`
-			NextBeforeSeq int64 `json:"next_before_seq"`
+			NextBeforeSeq int64 `json:"next_before_seq,string"`
 		}{items, limit, page.HasMore, page.NextBeforeSeq})
 	}
 }
@@ -152,6 +156,9 @@ type chainVerifyParams struct {
 // parseChainVerifyParams requires continuations to retain the original upper
 // watermark. A supplied predecessor digest is optional, not a trusted checkpoint.
 func (s *Server) parseChainVerifyParams(r *http.Request) (chainVerifyParams, error) {
+	if !validAdminQuery(r, "after_seq", "through_seq", "predecessor_hash", "limit") {
+		return chainVerifyParams{}, errors.New("invalid verification query")
+	}
 	afterSeq, err := parseInt64Param(r, "after_seq", 0)
 	if err != nil {
 		return chainVerifyParams{}, err
@@ -213,11 +220,13 @@ type chainVerifier func(context.Context, ledgerproof.Params) (ledgerproof.Result
 func (s *Server) snapshotVerifier() chainVerifier {
 	return func(ctx context.Context, p ledgerproof.Params) (ledgerproof.Result, error) {
 		if s.deps.LedgerProofDB == nil {
-			return ledgerproof.Result{}, errors.New("verification database unavailable")
+			return ledgerproof.Result{}, errVerificationUnavailable
 		}
 		return ledgerproof.VerifySnapshot(ctx, s.deps.LedgerProofDB, p)
 	}
 }
+
+var errVerificationUnavailable = errors.New("verification database unavailable")
 
 // handleAdminVerifyLedgerChain serves GET /api/v1/admin/ledger/verify.
 func (s *Server) handleAdminVerifyLedgerChain() http.HandlerFunc {
@@ -273,6 +282,8 @@ func (s *Server) runChainVerification(w http.ResponseWriter, r *http.Request, ch
 			s.writeAdminError(w, http.StatusBadRequest, "unknown_seq")
 		case errors.Is(err, ledgerproof.ErrMissingHead):
 			s.writeAdminError(w, http.StatusBadRequest, "missing_head")
+		case errors.Is(err, errVerificationUnavailable):
+			s.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		default:
 			s.logger.Error("admin: chain verification failed", "chain", string(chain))
 			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
@@ -285,7 +296,8 @@ func (s *Server) runChainVerification(w http.ResponseWriter, r *http.Request, ch
 		scope, scopeCode = ledgerVerifyScope, ledgerVerifyScopeCode
 	}
 	base := adminChainVerifyResponse{
-		FailureReason: result.FailureReason, Chain: result.Chain,
+		CanonicalVersion: 2,
+		FailureReason:    result.FailureReason, Chain: result.Chain,
 		AfterSeq: result.AfterSeq, ThroughSeq: result.ThroughSeq,
 		SeedHash: result.SeedHash, SeedSource: result.SeedSource, Scope: scope,
 		LastHash: result.LastHash, Complete: result.Complete, Verified: result.Verified,

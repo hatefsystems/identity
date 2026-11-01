@@ -11,13 +11,31 @@ The implementation remains opt-in. This document describes the current runtime a
 5. Obtain approved numeric `ADMIN_CONTEXT_RETENTION` and `ADMIN_LEGAL_RELEASED_RETENTION` durations and approval for opaque replay tombstones. There are no policy defaults. Schedule `admin-audit-publisher --cleanup-contexts` and `admin-legal --operation=cleanup` with separate maintenance credentials. Both use hold-aware deletion; released holds resume original clocks. Neither command deletes ledger evidence.
 6. Run the signer and `admin-audit-publisher` on the same configured audit subject. Publication requires JetStream acknowledgement; delivered metadata is never inferred from an in-memory queue. Signer event-ID deduplication covers redelivery after uncertain acknowledgements. The deletion-event outbox consumer is separate work.
 7. Run `npm exec -- nx run identity-api:admin-legal -- --operation=lookup-probe` against the deployed signer. It creates a credential-free synthetic account, publishes a legacy envelope without a producer index, checks the signer's stored index, deletes only that synthetic account, and verifies attribution again. It prints `ADMIN_LOOKUP_FIXTURE_ID`. A timeout leaves the identified synthetic account for diagnosis; rerun/clean it only after resolving the signer. Never substitute a real person's identifier. Inject the printed fixture ID into the API. A missing/mismatched fixture fails startup; omission explicitly disables lookup. Repeat after signer/key deployment changes and keep the existing pepper pinned. This probe is not a chain trust anchor.
-8. Configure exact HTTPS `ADMIN_ALLOWED_ORIGINS`, Redis actor/subnet limits and timeouts. Set `ADMIN_ENABLED=true` only after authenticated smoke tests and ingress logging validation. Startup requires DB, Redis, encryption, audit delivery configuration and approved retention. Readiness probes dependencies; missing step-up leaves mutations and attribution unmounted. The Admin UI is not implemented here.
+8. Configure exact HTTPS `ADMIN_ALLOWED_ORIGINS`, Redis actor/subnet limits and timeouts. Set `ADMIN_ENABLED=true` only after authenticated smoke tests and ingress logging validation. Startup requires DB, Redis, encryption, audit delivery configuration and approved retention. Readiness probes dependencies; missing step-up leaves mutations and attribution unmounted. The Task 7.5 panel has its own acceptance and rollout gates below.
 
 ## Operator role provisioning
 
 Use `npm exec -- nx run identity-api:admin-roles -- --user-id=<uuid> --role=<role>`; add `--revoke` for revocation. Roles are `super_admin`, `moderator`, `support`, `dpo`. A grant requires an active account with an enrolled passkey or enabled MFA. Revocation works for inactive targets too. Changes serialize with moderation and commit the encrypted target reference plus durable audit intent in one transaction; retries are audited no-ops.
 
 Run from an authenticated, MFA-protected operator environment with separately scoped `DATABASE_URL`. Its trusted launcher supplies `ADMIN_OPERATOR_ID` and `ADMIN_OPERATOR_SPIFFE_ID` from the authenticated identity. These environment values are **attribution, not authentication**; arbitrary callers must not control the launcher or database credentials. Provisioning approval remains an organizational control. No HTTP route assigns roles, no unaudited one-row bootstrap is documented, and no two-person HTTP workflow is claimed.
+
+## Admin Control Panel (Task 7.5)
+
+The panel is within the existing Next app at `/admin`, `/admin/users`, `/admin/users/[id]`, `/admin/audit-logs`, and `/admin/integrity`. It does not enable production admin access, alter approved retention, or add password-reset, role-management, bulk, deletion, hold, attribution or legal-workflow controls. The neutral dashboard entry performs no admin discovery until visited.
+
+Session bootstrap precedes a durably audited capability read. Support gets safe account metadata; Moderator adds PII, exact body-only lookup and status changes; DPO gets audit search and both verifiers; Super Admin gets only the two content-free verifiers. Combined grants expose their union. The fixed capability response is presentation metadata, not authority: every operation checks current primary-database permissions, and every disclosure remains behind the durable-audit boundary. A denied admin capability must not sign out a valid ordinary account session.
+
+Moderation is an explicit fresh-read, verification, reason and confirmation sequence. List/detail/lookup revisions and `expected_revision` are canonical decimal strings. The API compares the pin under existing account locks before status, auth-version, revision or success-intent writes. A conflict requires rereading, reviewing and reverifying; never retry with a silently substituted revision. The panel requires a trimmed 1..2000-byte UTF-8 reason after verification for suspension, ban and reactivation. Grants expire at the earlier grant/session deadline and are never retained after the confirmation lifetime.
+
+Suspension and ban are long-lived until explicit restoration. They are not erasure, do not block re-registration, and cannot retract an already admitted request or shorten an offline consumer's token lifetime. Reactivation never restores old credentials. If delivery may have occurred, show only an unconfirmed outcome and an explicit current-state read. A matching current status does not prove which request changed it. Never replay a moderation write automatically.
+
+Audit queries use explicit UTC windows, initially at most the last 24 hours, with bounded keyset pages and no total. Payload details are inert text. Verification is explicitly paged from genesis with a captured immutable `through_seq`, prior cursor and prior hash. Coordinates remain exact decimal strings through the full nonnegative signed-64-bit range. The API's `complete` flag is authoritative; partial or stopped progress is not full-run success. The panel displays the API's exact explanatory scope: audit segments are relative to their seed, while ledger links and retained payloads are database-relative. An erased node counts within `checked`; `erased_checked` is a subset. Database-relative erasure continuity is not erased-content verification. Initialized-empty and missing-head states are distinct; neither proves that no historical activity occurred. No complete-ingestion guarantee, external anchoring or resistance to a coherent privileged database rewrite is claimed.
+
+The API, panel, and other admin REST clients require a coordinated cutover for mandatory moderation revisions and string-valued account revisions and audit/verification coordinates. Close old admin ingress and drain in-flight requests while replacing incompatible callers and open forms. Before reopening, **every API replica** must enforce mandatory canonical-string `expected_revision` and support the string coordinate contracts, and all callers must be compatible. Do not add numeric or revision-optional fallbacks. Task 7.5 changes the administrative wire contract, not the schema or canonical format.
+
+Rollback must first close admin ingress, then disable/remove the panel entry, then coordinate API/UI rollback with incompatible admin traffic still closed. Retain database state, audit/outbox intent and approved retention/cleanup; do not downgrade storage or rewrite hashes. Reopening after rollback requires the same every-replica contract gate. Existing lifecycle v1/v2 consumer-first rollout requirements remain separate.
+
+Keep `ADMIN_ENABLED=false` unless existing DPO/Legal governance approval, credentials/non-owner database grants, signer/publisher supervision and outbox delivery, approved retention cleanup, exact-origin and ingress/APM-redaction gates are satisfied. Do not enable legal workflows to ship the panel. Local Task 7.5 completion is conditional on all required automated checks passing with dated, worktree-specific evidence, not on fixture governance. Unobserved native hidden-tab/bfcache restoration, physical-authenticator and screen-reader/manual accessibility checks remain separate gates, as do production threat-model review and the existing Task 5.3/5.4/5.5 deployment gates. Local acceptance is not production approval.
 
 ## Database privilege separation
 
@@ -39,7 +57,7 @@ Repository migrations do not create deployment login roles. Database grant/RLS p
 
 Every successful privileged response is buffered until audit intent commits. `503 audit_unavailable` withholds disclosure and rolls back business changes. If the store itself is down, durable recording of the rejection cannot be guaranteed. Alert on sanitized `admin audit storage unavailable` / `admin durable audit failed` diagnostics. Page on publisher backlog growth/age, increasing attempts, delivery deferrals, signer reseed failures, missing-index capture, and key/backfill failures. The publisher emits `pending`, `attempts`, and `oldest_age_seconds`; deployment must connect these signals to its monitoring system and choose operational thresholds.
 
-Never capture admin query strings, bodies, cookies, step-up headers or referrers in proxy/APM traces. Use static route templates; this also covers rejected legacy GET lookup requests. The MVP Nginx example in the deployment guide includes an admin-specific log format and suppresses unsanitized Nginx error records on this surface. For the Traefik successor, disable access/debug/tracing capture on the dedicated admin router unless its collector demonstrably emits only allowlisted method, router/template, status and duration fields. Validate with synthetic sensitive values before enabling intake; documentation is not evidence that deployed collectors are configured.
+Never capture admin query strings, bodies, cookies, DPoP proofs, step-up headers or referrers in proxy/APM traces. Use static route templates for both `/admin` pages and `/api/v1/admin`, including rejected URLs and lookup requests; template account identifiers rather than logging raw paths. The MVP Nginx example in the deployment guide uses an admin-specific log format and suppresses unsanitized error records. For the Traefik successor, disable access/debug/tracing capture unless its collector demonstrably emits only allowlisted method, template, status and duration. Verify synthetic sensitive values are absent from ingress, API, worker and artifact output. Local route-template tests do not establish deployed collector compliance.
 
 ## Automated validation
 
@@ -212,7 +230,7 @@ claim that production provisioning, verification or deployment has passed.
   this worker. There is no fallback to API `DATABASE_URL`. Use the non-owner,
   non-superuser login `identity_ledger_purge`, never a migration/database owner,
   API/signer account or the local Compose owner's example credential.
-- There is no routine-owner role under canonical format v2. `advance_chain_head`
+- There is no purge-routine owner under canonical format v2. `advance_chain_head`
   is SECURITY DEFINER and deployed owned by the schema owner; re-owning it to a
   dedicated NOLOGIN role (see First-Time Provisioning) is optional hardening. No
   runtime login may inherit, or `SET ROLE` to, whichever role ends up owning it.
@@ -334,7 +352,7 @@ the chain rows are the only surviving record of what was already erased.
 ### First-Time Provisioning SQL
 
 Run the following in an authenticated `psql` operator session connected to the
-target database after `00011`, with the signer drained and the schedule disabled.
+target database after `00015`, with the signer drained and the schedule disabled.
 The operator must be authorized to create roles and transfer function ownership;
 these are not runtime privileges. Replace the three uppercase role placeholders
 with existing, separately provisioned deployment logins. The new owner/worker
@@ -686,20 +704,20 @@ above are not evidence that these new gates have passed.
 
 ### Rollback and Restore Gates
 
-Disable the schedule and revoke purge EXECUTE first, then stop/wait for in-flight
-work and assess committed/uncertain outcomes. Preserve both heads, the chain
-tables, the erasure index, holds, settings and outbox intent. Revocation alone
-does not cancel a statement already executing; confirm the worker has stopped
-before declaring purge disabled.
+Disable the schedule and follow the existing [emergency disablement](#routine-authority-contract)
+for payload `DELETE` and erasure-index `INSERT`, then stop/wait for in-flight work
+and assess committed/uncertain outcomes. Canonical v2 has no purge routine or
+purge `EXECUTE` grant to revoke. Preserve both heads, the chain tables, the erasure
+index, holds, settings and outbox intent. Revocation alone does not cancel a
+statement already executing; confirm the worker has stopped before declaring
+purge disabled.
 
-Never revert to a signer or verifier unaware of canonical format v2: those
-binaries write and read a `chain_hash` column that no longer exists, so the
-failure is a hard error rather than a silent divergence — but the reverse
-direction is worse, since a v1 verifier walked payloads directly and would report
-every lawfully erased span as tampering. Treat initialized proof state and
-erasure as forward-only; repair with a compatible release. Migration `00015`
-refuses Down unconditionally, including against a seemingly empty database, and
-`00011` does the same.
+Keep signer and verifier binaries compatible with canonical-v2 storage throughout
+rollback. Pre-v2 binaries expect the retired payload/`chain_hash` layout and are
+not a recovery path. Treat initialized proof state and erasure as forward-only;
+repair with a compatible release, never downgrade storage or rewrite stored
+hashes. Migration `00015` refuses Down unconditionally, including against a
+seemingly empty database, and `00011` does the same.
 
 Restore the chain tables, both heads, the erasure index, holds and outbox from one
 consistent backup, validate before reopening ingestion or purge, reconcile
