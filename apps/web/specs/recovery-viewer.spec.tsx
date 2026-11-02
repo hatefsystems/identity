@@ -66,6 +66,7 @@ beforeEach(() => {
     rememberStepUp: jest.fn(),
     reportPermissionLoss: jest.fn(),
     reportModerationInterruption: jest.fn(),
+    reportLegalInterruption: jest.fn(),
   });
   api.assertSession.mockImplementation(() => profile);
   api.recoveryStatus.mockResolvedValue({ remaining: 2, low: true });

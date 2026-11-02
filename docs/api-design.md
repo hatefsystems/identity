@@ -143,27 +143,144 @@ Admin routes require an active, non-deleted account, a normal DPoP-bound browser
 
 | Route under `/api/v1/admin` | Seeded role | Contract |
 |---|---|---|
-| `GET /capabilities` | Any Task 7.5 permission | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes. No role catalogue, PII, or legal-workflow flags. Durably audited before disclosure. |
+| `GET /capabilities` | Any permitted, mounted section 1.7 operation | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes, including legal-only grants. No role catalogue, personal data, or section 1.8 workflow flags in the response. Durably audited before disclosure. |
 | `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary with canonical-string `lifecycle_revision` from the status snapshot; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
 | `POST /users/lookup` | Moderator | Exact normalized email in JSON `{email}`. Legacy `GET /users?email=...` is rejected. |
 | `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason, expected_revision}` with an exact decimal-string revision. Active/suspended/banned only; no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. Stale pins return `409 account_conflict` under the existing account locks, before status/auth/lifecycle writes. |
 | `GET /audit-logs` | DPO | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes. |
 | `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin | Content-free verification; no actors, network data, payloads or account data. |
 | `POST /legal-holds` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional advisory `review_at`; UUID `Idempotency-Key` header. |
-| `GET /legal-holds` | DPO | Optional `account_ref`; `status=active|released|all`; true snapshot total. |
+| `GET /legal-holds` | DPO | Optional `account_ref`; `status=active\|released\|all`; true snapshot total. |
 | `DELETE /legal-holds/{hold_id}` | DPO + step-up | Releases only that request; 204 for release or already released, 404 for unknown ID. |
 | `POST /preservation-requests` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`; optional advisory `expires_at`; UUID `Idempotency-Key`. Atomically records a hold and observed evidence presence even without a live account. |
 | `POST /legal-inquiry/lookup` | DPO + step-up | JSON identifier/type (`email` only), authority/case context, time bounds, optional fields and cursor. Requires a verified signer fixture before mounting. No GET alias. |
 
-The capability response is `{capabilities,limits}`. Its booleans are `users_read`, `users_pii`, `users_lookup`, `users_status_write`, `audit_logs_read`, `audit_chain_verify`, and `ledger_verify`. Limits are positive numeric `page_size_default`, `page_size_max`, `audit_max_window_seconds` (which can include fractional seconds), and `chain_verify_max_limit`. Lookup requires both account-read and PII permission; status writing also requires available step-up handling. Combined grants expose their union. No Task 7.5 access is `403`, an unmounted surface is `404`, and audit/storage failure withholds capabilities with an unavailable response. Capabilities guide presentation only; each operation rechecks live authority.
+#### Capabilities and Shared Limits
 
-User/hold offset lists use `{items,total,limit,offset}` with default 50 and maximum 200. Lists and counts share a statement snapshot; empty items are `[]`. Account list/detail/lookup revisions are canonical nonnegative decimal strings. Audit logs instead use `{items,limit,has_more,next_before_seq}` and descending `before_seq` keyset pages without a total count. Audit `seq` and `next_before_seq` are decimal strings too, preserving exact values through `9223372036854775807`. Nullable audit `user_id` means only that no linked reference is present, not proof of any particular erasure reason. Attribution uses `{items,next_cursor,coverage}`, a fixed high-water bound, and a fresh retention/hold check on every page. Empty attribution means no matching **indexed, eligible records in that scope**, not proof of no activity. Phone attribution remains `400 unsupported_identifier_type`.
+The capability response is `{capabilities,limits}`. Its existing booleans are `users_read`, `users_pii`, `users_lookup`, `users_status_write`, `audit_logs_read`, `audit_chain_verify`, and `ledger_verify`. Task 7.6 adds exactly these five booleans; each is true only with the existing permission **and** the corresponding mounted operation:
 
-User-list GET accepts only `limit`, `offset`, and `status`; audit-list GET only `start_time`, `end_time`, `event_type`, `limit`, and `before_seq`; verifier GET only `after_seq`, `through_seq`, `predecessor_hash`, and `limit`. Repeated or unknown keys are `400`. Capabilities/detail GET has no query keys. Email lookup and moderation are body-only. Moderation rejects missing/null/numeric/noncanonical/overflow revisions, unknown or duplicate fields, malformed UTF-8/JSON and trailing input. Trim the reason, then require 1..2000 UTF-8 bytes. A matching revision remains required for API-only same-status behavior; the panel presents only actual transitions.
+| Capability | Permission | Operation | Fresh step-up |
+|---|---|---|---|
+| `legal_holds_read` | `legal.holds.read` | `GET /legal-holds` | No |
+| `legal_holds_apply` | `legal.holds.write` | `POST /legal-holds` | Yes |
+| `legal_holds_release` | `legal.holds.write` | `DELETE /legal-holds/{hold_id}` | Yes |
+| `preservation_requests_create` | `legal.holds.write` | `POST /preservation-requests` | Yes |
+| `legal_inquiry_lookup` | `legal.inquiry.lookup` | `POST /legal-inquiry/lookup` | Every page |
 
-Independent requests may protect the same account. New requests return 201; matching retries return 200 with `replayed=true` and current state. Reusing a key with different inputs returns 409. Replaying a released request cannot reactivate it. Advisory dates never release a hold. Release resumes original retention clocks; preservation neither restores purged data nor creates an immutable snapshot.
+The three write flags are separate mount capabilities, not new permissions. Seeded grants are unchanged: DPO has the legal permissions; Support, Moderator and Super Admin do not gain them. Account lookup still requires both account-read and PII permission. Combined grants expose their union. Missing step-up leaves eligible reads available but gated operations unmounted. Attribution additionally requires the verified signer fixture; hold/preservation management does not require an indexer. A false flag does not distinguish missing permission from missing deployment prerequisites. When no permitted operation is available, capability discovery yields `403 forbidden`; an unmounted surface is unavailable, not an empty result. Capability/storage failure withholds the response. Capabilities guide presentation only, never replace live authorization, and denial must not sign out an otherwise valid ordinary session.
 
-Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together. Audit storage failure returns `503 audit_unavailable`; an unavailable store cannot guarantee durable recording of that rejected attempt. An acknowledged outbox worker delivers Class C intent to the signer. Ordinary security-event recording retains its existing best-effort transport.
+Limits remain numeric, with no new legal-only limit keys:
+
+| Limit | Effective contract |
+|---|---|
+| `page_size_default` | Configured integer default, 50 by default, within `1..page_size_max`. |
+| `page_size_max` | Configured integer ceiling, 200 by default, within `1..200`. |
+| `audit_max_window_seconds` | Positive configured window, at most 2678400 seconds (31 days). Applies to **both** audit search and legal attribution, including smaller/fractional durations; do not round it up. |
+| `chain_verify_max_limit` | Existing integer verification ceiling, 5000 by default and at most 5000. |
+
+The legal browser workspace caps page size at `min(page_size_max, 50)` and defaults to `min(page_size_default, that cap)`. This is a presentation/disclosure bound, not a change to server pagination.
+
+User/hold offset lists use `{items,total,limit,offset}` with effective configured defaults/caps above. Lists and counts share a statement snapshot; empty items are `[]`. Account list/detail/lookup revisions are canonical nonnegative decimal strings. Audit logs instead use `{items,limit,has_more,next_before_seq}` and descending `before_seq` keyset pages without a total count. Audit `seq` and `next_before_seq` are decimal strings too, preserving exact values through `9223372036854775807`. Nullable audit `user_id` means only that no linked reference is present, not proof of any particular erasure reason. Legal attribution has its separate contract below.
+
+User-list GET accepts only `limit`, `offset`, and `status`; audit-list GET only `start_time`, `end_time`, `event_type`, `limit`, and `before_seq`; verifier GET only `after_seq`, `through_seq`, `predecessor_hash`, and `limit`. Repeated/unknown keys and malformed query escaping are `400`. Capabilities/detail GET has no query keys. Email lookup and moderation are body-only. Moderation rejects missing/null/numeric/noncanonical/overflow revisions, unknown or duplicate fields, malformed UTF-8/JSON and trailing input. Trim the reason, then require 1..2000 UTF-8 bytes. A matching revision remains required for API-only same-status behavior; the panel presents only actual transitions.
+
+#### Legal Holds and Preservation (Task 7.6)
+
+Legal subjects are the original `account_ref` UUID (`users.id`, retained independently after deletion), not a `user_id` alias or a live-account resolver. Each create requires exactly one nonzero UUID `Idempotency-Key` header supplied from the controlled external intake record. The browser uses canonical lowercase hyphenated, nonzero UUIDs for subjects, holds and keys; it never synthesizes a request key. Actor references come from the authenticated session, never the body.
+
+Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); unknown/duplicate fields, malformed input and trailing documents are rejected. The shared browser boundary additionally has a 64-KiB ceiling. All legal POSTs and release reject query strings, including a bare `?`. Release sends no body or idempotency header. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
+
+| Operation | JSON request | Success |
+|---|---|---|
+| `POST /legal-holds` | Required strings `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional string `review_at`. | `201` with a `LegalHold` for new creation; `200` with `replayed=true` for the matching request's **current** state. |
+| `POST /preservation-requests` | Required strings `account_ref`, `reason`, `requesting_authority`; optional string `expires_at`. No client-supplied `legal_basis`. | `201` new / `200` replay with `{hold,replayed,account_present,ledger_evidence_present,observed_at,note}`. `hold` is a `LegalHold`; the three following flags are booleans. |
+| `DELETE /legal-holds/{hold_id}` | Path is the nonzero UUID of exactly one request. | Empty `204` for released **or already released**; `404 hold_not_found` for an unknown request. |
+
+Reason is nonblank and at most **4096 UTF-8 bytes**; authority and normal-hold legal basis are each nonblank and at most **255 UTF-8 bytes**. The service checks the supplied byte lengths before trimming outer whitespace, then stores/compares trimmed values. This is not moderation's 2000-byte rule. The server fixes preservation legal basis to `preservation_request`, request kind to `preservation`, and maps `expires_at` to the hold's `review_at`.
+
+Optional dates may be omitted/empty and may be in the past. The API date parser accepts RFC3339 or Unix-second **strings**, normalizes to UTC and supports years 1..9999; stored hold dates are truncated to microseconds. The browser sends RFC3339 UTC strings with explicit `Z` only, at stable microsecond-or-coarser precision. Freeze and externally record the exact normalized payload before sending, including omission versus a supplied date.
+
+The exact `LegalHold` projection is:
+
+| Fields | JSON type / meaning |
+|---|---|
+| `id`, `account_ref`, `applied_by` | UUID strings: request, original subject and opaque applying actor. |
+| `request_kind` | `legal_hold` or `preservation`. |
+| `reason`, `requesting_authority`, `legal_basis` | Optional strings, omitted when restricted details have been purged. Omission is not evidence that the original values were empty. |
+| `is_active`, `details_purged`, `replayed` | Booleans. List projections have `replayed=false`; the normal create response sets it for replay. |
+| `applied_at`, `review_at`, `released_at` | RFC3339 UTC timestamp strings or `null`; clients must handle nullable dates. |
+| `released_by` | Opaque actor UUID string or `null`. |
+
+`GET /legal-holds` accepts exactly `account_ref`, `status`, `limit`, `offset`. Its strict raw-query parser rejects malformed escaping and duplicate/unknown keys. Omit `account_ref` only for an intentional all-subject query; present-but-empty, invalid or zero UUIDs are `400 invalid_request`, never a widened query. `status` is `active|released|all`, defaulting to `active` when omitted/empty. `limit`/`offset` use nonnegative signed-32-bit decimal parsing: omitted/empty/zero limit uses the configured default, an in-range integer above the configured max is clamped, and omitted/empty offset is zero. Negative, noninteger or overflowing values fail. Response is `200 {items: LegalHold[],total,limit,offset}` with numeric count/effective bounds, ordered by `applied_at DESC, id DESC`. One statement supplies the page and total, not a stable inventory across multiple requests. Both kinds appear; no request-kind filter is supported.
+
+On preservation responses, **top-level `replayed` is authoritative**, not `hold.replayed`. Presence flags are fresh observations under the subject lock, including on replay: `account_present` includes soft-deleted rows; `ledger_evidence_present` can include unindexed or expired payloads. A valid hold can exist with both false. `observed_at` is a UTC timestamp and `note` is exactly:
+
+```text
+preservation does not restore purged data; ingestion may still be pending; account and ledger presence are observations, not completeness guarantees; expires_at is advisory only
+```
+
+Idempotency is scoped to **`(account_ref, request_kind, key)`**, not actor or a globally unique operation ID. Reusing a key for another subject/kind creates an independent request. Within the same tuple, changed normalized details/date or a cleaned narrative tombstone yields `409 idempotency_conflict`. Matching replay returns current state, including a released hold; it never reactivates it. There is no finite replay expiry in the inherited tombstone protocol. After an uncertain send, explicitly reconfirm the original tuple and normalized payload from external intake, with a fresh grant. Never retry automatically, substitute a new key, or infer which request created a hold from a list alone.
+
+Any independent active hold overrides erasure eligibility until **explicit release**. `review_at` and preservation `expires_at` are advisory, never automatic expiry. Release removes only that request and resumes original retention clocks when no other hold protects the subject, potentially allowing the next purge immediately. It never resets clocks, extends account recovery, restores erased data or creates an immutable evidence snapshot. A `204` cannot prove this caller changed the state; an absent list row is not API `404`. Lookup and creation are separate transactions, so a lookup page is not a promise all evidence survived until the hold committed. Section 1.8 case/disclosure approval is not required for preservation, and investigative access is not permission to transfer data externally.
+
+#### Legal Attribution (Task 7.6)
+
+`POST /legal-inquiry/lookup` accepts exactly these fields and consumes fresh step-up on **every page**:
+
+| Field | Request contract |
+|---|---|
+| `identifier_type` | Required string, exactly `email`; all other values return `400 unsupported_identifier_type`. |
+| `identifier` | Required nonblank bare-email string, at most 320 UTF-8 bytes before trim; no display-name address. |
+| `requesting_authority`, `case_reference` | Required nonblank strings, each at most 255 UTF-8 bytes before trim. |
+| `purpose` | Required nonblank string, at most 4096 UTF-8 bytes before trim. |
+| `start_time`, `end_time` | Required nonzero timestamps as strings; API accepts RFC3339 or Unix seconds, within years 1..9999. Require `start <= end` and span no greater than the effective `audit_max_window_seconds`. SQL bounds are inclusive after conversion to microsecond precision. The browser requires explicit RFC3339 UTC (`Z`) bounds. |
+| `limit` | Optional signed-32-bit JSON integer; omitted/zero uses `page_size_default`. Effective value must be `1..page_size_max` (at most 200). Unlike the GET list, an excessive limit is **rejected**, not clamped. |
+| `fields` | Optional array of at most six distinct exact names: `client_ip`, `ip_subnet`, `user_agent`, `device_fingerprint`, `client_id`, `scope`. Unknown/duplicate names fail. Omission/empty array gives core fields only; the panel initially sends `[]`. |
+| `cursor` | Optional opaque string, at most 4096 bytes, returned by the prior page. Omit for the first page. Invalid, tampered or scope-mismatched cursors return `400 invalid_request`. |
+
+The server computes HMAC-SHA256 over `lowercase(NFKC(trim(identifier)))` with its configured pepper. The browser validates syntax/length but performs no hashing or provider-specific email normalization. Phone/backup-email lookup, profile resolution and search-as-you-type are not provided.
+
+Window validation and cursor scope use the parsed UTC instants, while the shared database timestamp conversion truncates query bounds to microseconds. Use microsecond-or-coarser inputs to avoid that sub-microsecond selection difference; a client must withhold an out-of-scope result rather than silently widen the submitted interval.
+
+The exact success envelope is `200 {items,next_cursor?,coverage}`. `items` is always an array; `next_cursor` is omitted when there is no continuation. Each item has only core `id`, `account_ref`, `event_type`, `timestamp`, `retain_until`, `seq`, plus explicitly selected optional fields that are present. IDs are UUID strings, `event_type` and optional fields are strings, and the two dates are UTC timestamp strings or `null` in the DTO. `id` is the event UUID from `security_ledger_chain.event_id`. Unselected fields are not disclosed; missing selected values do not prove the metadata never existed. No raw email/phone, blind index/pepper version, credentials, full audit payload, action content or chain hash is returned.
+
+`seq` and `coverage.through_seq` are **canonical nonnegative decimal JSON strings**, from `"0"` through `"9223372036854775807"`, never JSON numbers, signs or zero-padded alternatives. They remain exact above JavaScript's `9007199254740991` safe-integer limit. Internal `int64`, stored hashes, signed canonical bytes and opaque cursor encoding are unchanged. Sequence position is not verified inclusion proof; the integrity API remains separate.
+
+`coverage` contains exactly `through_seq`, UTC `observed_at`, UTC `eligibility_checked_at`, and string `note`. The first page captures a fixed inclusive chain high-water bound and observation time, retained across pages; each page rechecks current retention/holds and reports a fresh eligibility time. Items advance in ascending sequence order within that bound and the inclusive event-time query. Later ingestion above the bound is excluded; releasing a hold can remove expired matches from later pages. There is no total or complete-history flag. Display the full note:
+
+```text
+matching indexed retained records only; ingestion may be pending; unindexed or purged history is not covered; separate account references do not establish one person
+```
+
+The encrypted cursor binds normalized identity, actor, UTC bounds, trimmed authority/case/purpose and sorted fields. It has **no implemented age TTL** and is not session-bound; it does not bind page size. The browser nonetheless freezes all fields **including limit** through a run and clears cursors on session/scope changes. Never decode a cursor, invent an expiry countdown or silently remove a rejected cursor to restart. Advance explicitly with the unchanged request plus cursor and a fresh grant; retain only the current bounded page, with no fetch-all, polling, export or previous-page cache.
+
+Class B is **pseudonymized personal data**, not anonymous or non-PII. The entered email is transient sensitive input, not returned evidence. Empty/final results mean no matching indexed, currently eligible records in that scope, not no activity, no account or verified real-world identity. Multiple original references remain separate subjects; do not select the first automatically or merge them. Coverage does not establish that every historical pepper generation is searchable.
+
+#### Legal Failures and Auditing
+
+Legal and shared errors use the JSON `error` code (with the existing step-up challenge fields where applicable):
+
+| Outcome | Meaning / required handling |
+|---|---|
+| `400 invalid_request` | Invalid body, UUID/key, byte/date/page/field bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. Legal JSON above 32 KiB fails here; above the shared 64-KiB boundary can instead return `413 invalid_request`. |
+| `415 invalid_content_type` | Missing, duplicated or unsupported media type/charset for a nonempty body. |
+| `400 unsupported_identifier_type` | Only email attribution is supported. |
+| `401 use_dpop_nonce` | Explicit pre-handler challenge permits one retry with a fresh proof and the **same** body/key/grant; no handler/grant has been consumed. |
+| `401 session_required`, `401 invalid_dpop_proof`, `409 session_changed` | Clear private state and rebootstrap/re-authenticate through the shared session boundary; never infer write success. |
+| `401 invalid_credentials` during step-up | Factor failure, not ordinary-session loss. |
+| `403 insufficient_user_authentication` | Fresh single-use verification required. Never reuse an old grant. |
+| `403 forbidden` / `forbidden_origin` | Live permission or exact-Origin admission denied. Clear the privileged view/recheck capabilities for permission loss, without signing out a valid ordinary session. |
+| `404 hold_not_found` | Release target does not exist. Routing/unmounted-service errors are not this observation or proof of no historical record. |
+| `409 idempotency_conflict` | Reconcile the original tuple/payload externally; never replace its key or reactivate it. |
+| `429 rate_limited` | Bounded `Retry-After` feedback only; no automatic challenge/request scheduling. |
+| `503 legal_unavailable`, `audit_unavailable`, `service_unavailable`, `rate_limit_unavailable`, `temporarily_unavailable` | Dependencies/audit unavailable; withhold results and reconcile transmitted writes as unconfirmed where commit is uncertain. |
+| `500 response_too_large`, `500 server_error`, lost/malformed/oversized/interrupted responses | Do not accept partial results or promise rollback. Explicit smaller-scope recovery for reads; original-tuple recovery for creates. |
+
+Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together; pre-commit audit failure withholds disclosure and rolls back changes. An unavailable store cannot guarantee durable recording of a rejected attempt. **A write can commit before session-activity renewal fails with `503 temporarily_unavailable`** or its response is lost. A transmitted write without a valid success response remains unconfirmed, never an automatic replay or claimed rollback. Confirmed writes remain confirmed if a later list refresh fails; a lost lookup is no accepted result, not "no match" or an uncertain business mutation.
+
+The API buffers at most 4 MiB. Browser 4-MiB response exceptions are exactly `GET /audit-logs`, `GET /legal-holds`, and `POST /legal-inquiry/lookup`; other calls retain 256 KiB. Both declared and streamed bytes are checked, and legal JSON is validated against 32 KiB before spending a grant. Never silently truncate rows or optional fields to fit. Baseline admin audit still contains personal data, including actor/network metadata, linkable action/hold references, timestamps and response digests; narrative minimization is not anonymization. An acknowledged outbox worker delivers Class C intent to the signer. Ordinary security-event recording retains its existing best-effort transport.
+
+#### Audit and Integrity
 
 Canonical-v2 verification defaults to a 1,000-node page (maximum 5,000). Start at `after_seq="0"` without an upper bound, capture the returned inclusive `through_seq`, and keep it fixed. Continue explicitly with the prior `next_after_seq` and `last_hash` as `predecessor_hash`. Valid sequence allocation gaps are allowed. Each request uses one bounded read-only REPEATABLE READ snapshot, separate from the durable administrative audit transaction that still withholds response bytes until commit. Hashes in a filtered audit list do not establish contiguous-chain proof.
 
@@ -173,9 +290,9 @@ The API returns explanatory scope text, which the panel validates and displays w
 
 Canonical v2 retains separate chain nodes and verifies available payload leaf digests. The erased-span checkpoint protocol, `purged_count`, `proof_steps`, and checkpoint restart rules belong to the retired format and are not current fields. There is no browser-side rehash or claim of independent historical authenticity. A privileged coherent database rewrite remains undetectable without external anchoring, which is explicitly deferred.
 
-The panel, API, and other admin REST clients must cut over together under closed old admin ingress, with in-flight requests drained and incompatible callers/open forms retired. Before reopening ingress, **every API replica** must enforce mandatory canonical-string `expected_revision` and support string-valued account revisions and audit/verification sequence/cursor fields; all clients must use that contract. There is no numeric or revision-optional fallback. This administrative wire change requires no schema migration or new cryptographic format: internal Go `int64` values, signed canonical bytes, digest rules, lifecycle protobuf/v2 contracts, and durable audit records are unchanged.
+The panel, API, and other admin REST clients (including attribution callers) must cut over together under closed affected old admin ingress, with in-flight requests drained and incompatible callers/open forms retired. Before reopening ingress, **every API replica** must enforce mandatory canonical-string `expected_revision` and support string-valued account revisions, audit/verification coordinates and legal `seq`/`coverage.through_seq`; all clients must use that contract. There is no numeric or revision-optional fallback. This administrative wire change requires no schema migration or new cryptographic format: internal Go `int64` values, signed canonical bytes, digest rules, opaque lookup cursor encoding, lifecycle protobuf/v2 contracts and durable audit records are unchanged. Verify the actual deployed-signer `admin-legal --operation=lookup-probe` on the current schema/keys before exposing attribution; no fixture bypass is permitted. Omitting its fixture keeps lookup unavailable while hold/preservation may remain independently usable.
 
-Rollback first closes admin ingress, then disables/removes the panel entry, then coordinates API/UI rollback while incompatible admin traffic remains closed. Retain database state, audit/outbox intent and approved retention/cleanup; never downgrade storage or rewrite hashes. The same every-replica contract requirement applies before reopening after rollback. Production enablement and governance approval remain separate from local Task 7.5 acceptance; follow the [admin panel rollout gates](devops-operations.md#admin-control-panel-task-75).
+Rollback first closes affected admin ingress, then disables/removes the new UI entries, then coordinates compatible API/UI rollback while incompatible traffic remains closed. Retain holds, encrypted contexts, request tombstones, accepted audit/outbox intent and approved retention/cleanup; never downgrade storage, reset policy clocks or rewrite chain data. Reopening requires compatible callers on every replica and verified current prerequisites. Production enablement/governance and unobserved manual gates remain separate from local Task 7.5/7.6 acceptance; follow the [admin rollout gates](devops-operations.md#admin-control-panel-task-75) and [legal panel rollout](devops-operations.md#dpolegal-panel-task-76). Section 1.8 workflows, production approvals and Task 5.3/5.4/5.5 statuses are not changed by this contract.
 
 HTTP role assignment and trigger-reset are unmounted. Use the controlled [admin operations procedure](admin-operations.md) for provisioning. Ban/suspension invalidate credentials across instances. `ValidateToken` applies the live account/version gate; offline JWT consumers still retain at most the configured ten-minute token lifetime. Reactivation does not revive old credentials or prevent re-registration.
 

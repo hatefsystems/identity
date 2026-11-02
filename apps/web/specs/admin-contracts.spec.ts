@@ -77,6 +77,11 @@ const capabilities = {
     audit_logs_read: false,
     audit_chain_verify: false,
     ledger_verify: false,
+    legal_holds_read: false,
+    legal_holds_apply: false,
+    legal_holds_release: false,
+    preservation_requests_create: false,
+    legal_inquiry_lookup: false,
   },
   limits,
 };
@@ -348,7 +353,7 @@ describe('exact bounded admin DTOs', () => {
   });
 
   it('returns only fixed admin destinations and strips every expired detail identifier', () => {
-    for (const path of ['/admin', '/admin/users', '/admin/audit-logs', '/admin/integrity'])
+    for (const path of ['/admin', '/admin/users', '/admin/audit-logs', '/admin/integrity', '/admin/legal'])
       expect(safeReturnPath(path)).toBe(path);
     for (const path of [
       `/admin/users/${id}`,

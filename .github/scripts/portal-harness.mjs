@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, generateKeyPairSync, randomBytes, X509Certificate } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
 import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
@@ -14,6 +14,109 @@ import { startMailSink } from './portal-mail-sink.mjs';
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const backend = resolve(workspace, 'apps/identity-api');
+const canonicalUUID = (value) => typeof value === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value) &&
+  value !== '00000000-0000-0000-0000-000000000000';
+
+export function legalIdempotencyKey(path, method, value) {
+  if (value === undefined) return;
+  assert(method === 'POST' && ['/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests'].includes(path) &&
+    canonicalUUID(value), 'Invalid scoped legal operation key');
+  return value;
+}
+
+export function legalReferenceRequest(request, secret, harness) {
+  try {
+    const url = new URL(request.url());
+    if (url.origin !== harness.origin || url.hash || request.isNavigationRequest?.() || !canonicalUUID(secret)) return false;
+    if (request.method() === 'DELETE' && harness.legalReferences?.holds.has(secret))
+      return url.pathname === `/api/v1/admin/legal-holds/${secret}` && !url.href.includes('?');
+    if (request.method() !== 'GET' || url.pathname !== '/api/v1/admin/legal-holds' ||
+        !harness.legalReferences?.accounts.has(secret)) return false;
+    if (url.searchParams.get('account_ref') !== secret) return false;
+    // Only the explicitly typed filter may carry a reference. Never generalize
+    // the exception to other queries, document navigation, or diagnostic paths.
+    const seen = new Set();
+    for (const [key, value] of url.searchParams) {
+      if (seen.has(key) || !['account_ref', 'status', 'limit', 'offset'].includes(key)) return false;
+      seen.add(key);
+      if (key !== 'account_ref' && value.includes(secret)) return false;
+      if (key === 'status' && !['active', 'released', 'all'].includes(value)) return false;
+      if ((key === 'limit' || key === 'offset') && (!/^(0|[1-9][0-9]*)$/.test(value) ||
+          Number(value) > 2147483647 || (key === 'limit' && value === '0'))) return false;
+    }
+    decodeURIComponent(url.search);
+    return true;
+  } catch { return false; }
+}
+
+export function legalCoordinateRequest(request, value, harness) {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,18})$/.test(value) ||
+      BigInt(value) > 9223372036854775807n || !harness.legalSecrets?.has(value) ||
+      request.method() !== 'GET' || request.isNavigationRequest?.() !== false) return false;
+  try {
+    const url = new URL(request.url());
+    if (url.origin !== harness.origin || url.username || url.password || url.hash) return false;
+    const logs = url.pathname === '/api/v1/admin/audit-logs';
+    if (!logs && !['/api/v1/admin/audit-logs/verify', '/api/v1/admin/ledger/verify'].includes(url.pathname)) return false;
+    const coordinates = logs ? ['before_seq'] : ['after_seq', 'through_seq'];
+    const keys = logs ? ['before_seq', 'start_time', 'end_time', 'event_type', 'limit']
+      : ['after_seq', 'through_seq', 'predecessor_hash', 'limit'];
+    let matched = false;
+    for (const [key, item] of url.searchParams) {
+      if (!keys.includes(key) || url.searchParams.getAll(key).length !== 1 || key.includes(value)) return false;
+      if (item.includes(value)) {
+        if (!coordinates.includes(key) || item !== value) return false;
+        matched = true;
+      }
+    }
+    decodeURIComponent(url.search);
+    return matched;
+  } catch { return false; }
+}
+
+export function portalResponseBudget(path, method) {
+  return (method === 'GET' && ['/api/v1/admin/audit-logs', '/api/v1/admin/legal-holds'].includes(path)) ||
+    (method === 'POST' && path === '/api/v1/admin/legal-inquiry/lookup') ? 4 * 1024 * 1024 : 256 * 1024;
+}
+
+export function capturePortalJSON(response, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let failed = false;
+    const fail = () => {
+      failed = true;
+      chunks.length = 0;
+      reject(new Error('Bounded upstream response capture failed'));
+    };
+    const declared = response.headers['content-length'];
+    if (declared !== undefined && (!/^\d+$/.test(declared) || BigInt(declared) > BigInt(limit))) fail();
+    response.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) fail();
+      if (!failed) chunks.push(chunk);
+    });
+    response.once('error', fail);
+    response.once('aborted', fail);
+    response.once('end', () => {
+      if (failed) return;
+      try {
+        assert(/^application\/json\b/i.test(response.headers['content-type'] || ''));
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch { fail(); }
+      finally { chunks.length = 0; }
+    });
+  });
+}
+
+export function lookupProbeFixture(result) {
+  assert(!result.error && result.status === 0 && typeof result.stdout === 'string' &&
+    Buffer.byteLength(result.stdout) <= 64 * 1024, 'Real signer lookup probe failed; private diagnostics suppressed');
+  const matches = [...result.stdout.matchAll(/^ADMIN_LOOKUP_FIXTURE_ID=([^\r\n]+)\r?$/gm)];
+  assert(matches.length === 1 && canonicalUUID(matches[0][1]), 'Real signer lookup probe returned no unique canonical fixture');
+  return matches[0][1];
+}
 
 export function portalRoute(path) {
   // Never echo arbitrary paths: identifiers can also occupy an unknown route,
@@ -25,12 +128,13 @@ export function portalRoute(path) {
     [/^\/api\/v1\/users\/me\/sessions\/[^/]+$/, '/api/v1/users/me/sessions/{id}'],
     [/^\/api\/v1\/admin\/users\/[^/]+\/status\/?$/, '/api/v1/admin/users/{id}/status'],
     [/^\/api\/v1\/admin\/users\/(?!lookup\/?$)[^/]+\/?$/, '/api/v1/admin/users/{id}'],
+    [/^\/api\/v1\/admin\/legal-holds\/[^/]+\/?$/, '/api/v1/admin/legal-holds/{hold_id}'],
     [/^\/admin\/users\/[^/]+\/?$/, '/admin/users/{id}'],
   ]) {
     if (pattern.test(pathname)) return template;
   }
-  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify)|users\/me(?:\/(?:sessions|profile|deletion))?|auth\/(?:logout|session|stepup\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
-      /^\/(?:admin(?:\/(?:users|audit-logs|integrity))?|dashboard(?:\/(?:profile|security|sessions|privacy))?|login(?:\/webauthn)?|recover-account)$/.test(pathname)) return pathname;
+  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify|legal-holds|preservation-requests|legal-inquiry\/lookup)|users\/me(?:\/(?:sessions|profile|deletion))?|auth\/(?:logout|session|stepup\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
+      /^\/(?:admin(?:\/(?:users|audit-logs|integrity|legal))?|dashboard(?:\/(?:profile|security|sessions|privacy))?|login(?:\/webauthn)?|recover-account)$/.test(pathname)) return pathname;
   return '[redacted-route]';
 }
 
@@ -52,6 +156,28 @@ export function anonymousReclaim(path, method) {
   ].includes(path);
 }
 
+export function privateLogSummary(text, secrets) {
+  const contains = (source, value) => source.includes(value) || source.includes(encodeURIComponent(value)) ||
+    source.includes(JSON.stringify(value).slice(1, -1));
+  const matches = [...new Set(secrets)].filter((value) => typeof value === 'string' && value && contains(text, value));
+  const kinds = {};
+  for (const value of matches) {
+    const kind = /^[0-9]+$/.test(value) ? 'numeric' : canonicalUUID(value) ? 'reference'
+      : /^[^\s@]+@[^\s@]+$/.test(value) ? 'identity' : 'text';
+    kinds[kind] = (kinds[kind] ?? 0) + 1;
+  }
+  const fields = new Set();
+  const known = ['time', 'timestamp', 'level', 'msg', 'message', 'error', 'seq', 'sequence', 'last_seq',
+    'through_seq', 'head_seq', 'checkpoint', 'count', 'request_id', 'account_ref', 'user_id', 'subject', 'path', 'url', 'method', 'status'];
+  for (const line of text.split('\n')) {
+    try {
+      const record = JSON.parse(line);
+      for (const key of known) if (record && key in record && matches.some((value) => contains(JSON.stringify(record[key]) ?? '', value))) fields.add(key);
+    } catch { /* Only fixed field labels are diagnostic; raw lines are never returned. */ }
+  }
+  return { matches: matches.length, kinds, fields: [...fields].sort() };
+}
+
 export function secretEnvironmentValues(environment) {
   return Object.entries(environment)
     .filter(
@@ -70,7 +196,7 @@ export function fixtureSecretValues(value) {
         return [item];
       }
     }
-    if (/(?:^id$|_id$|^account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|^database_url$|^password$|reason|narrative|payload)/i.test(key)) {
+    if (/(?:^id$|_id$|(?:^|_)account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|^database_url$|^password$|reason|narrative|payload|^identifier$|^requesting_authority$|^legal_basis$|^case_reference$|^purpose$|cursor$|^seq$|^through_seq$|^client_ip$|^ip_subnet$|^user_agent$|^device_fingerprint$)/i.test(key)) {
       if (item && typeof item === 'object') return [JSON.stringify(item), ...fixtureSecretValues(item)];
       return typeof item === 'string' && item ? [item] : [];
     }
@@ -118,6 +244,9 @@ export function failureCategories(output) {
     ['admin-window-config', /admin window must/],
     ['admin-origin-config', /admin origins require HTTPS/],
     ['durable-head', /invalid durable ledger state|read .* chain head|read .* head: no rows/i],
+    ['legal-fixture-signing', /real signer did not index owned legal evidence|owned legal signing interrupted|cannot inspect real owned legal signing/],
+    ['legal-fixture-subject', /cannot (?:create|remove signed|prepare soft-deleted) owned legal subject|cannot prepare soft-deleted legal subject/],
+    ['legal-fixture-publication', /owned legal publication was not acknowledged|cannot connect owned legal producer/],
   ]) if (pattern.test(output)) categories.push(category);
   for (const setting of ['APP_ENV', 'PORT', 'PORTAL_ORIGIN', 'GRPC_PORT', 'AUDIT_BATCH_SIZE', 'AUDIT_FLUSH_INTERVAL', 'AUDIT_ACK_WAIT', 'AUDIT_SUBJECT', 'NATS_URL', 'SECURITY_LEDGER_RETENTION', 'ADMIN_GOVERNANCE_POLICY_ID', 'ADMIN_ALLOWED_ORIGINS', 'ADMIN_PAGE_SIZE_DEFAULT', 'ADMIN_PAGE_SIZE_MAX', 'ADMIN_CHAIN_VERIFY_MAX_LIMIT']) {
     if (new RegExp(`(^|[^A-Z0-9_])${setting}($|[^A-Z0-9_])`).test(output)) categories.push(`setting-${setting}`);
@@ -344,15 +473,16 @@ export async function startPortalHarness({ admin = false } = {}) {
   let notifierBinary = resolve(backend, 'bin/deletion-notifier');
   let signerBinary = resolve(backend, 'bin/audit-signer');
   let publisherBinary = resolve(backend, 'bin/admin-audit-publisher');
+  let legalBinary = resolve(backend, 'bin/admin-legal');
   await Promise.all([
     access(apiBinary),
     access(fixtureBinary),
     access(notifierBinary),
-    ...(admin ? [access(signerBinary), access(publisherBinary)] : []),
+    ...(admin ? [access(signerBinary), access(publisherBinary), access(legalBinary)] : []),
     access(resolve(workspace, 'apps/web/.next/BUILD_ID')),
   ]).catch(() => {
     throw new Error(
-      'Build web, identity-api, fixture, deletion-notifier, and (for admin mode) audit-signer/admin-audit-publisher before this suite'
+      'Build web, identity-api, fixture, deletion-notifier, and (for admin mode) audit-signer/admin-audit-publisher/admin-legal before this suite'
     );
   });
 
@@ -361,6 +491,15 @@ export async function startPortalHarness({ admin = false } = {}) {
   const responseCounts = new Map();
   const secrets = [];
   const routeReferences = new Set();
+  const legalReferences = { accounts: new Set(), holds: new Set() };
+  const legalSecrets = new Set();
+  const rememberLegal = (value) => {
+    const values = fixtureSecretValues(value);
+    if (value?.metadata) values.push(...Object.values(value.metadata));
+    for (const item of value?.items || []) if (typeof item.scope === 'string') values.push(item.scope);
+    for (const item of values) legalSecrets.add(item);
+    secrets.push(...values);
+  };
   const close = portalCleanup(cleanup);
   const diagnostics = () => {
     console.error('Public API response counts:', redactFixtureSecrets(JSON.stringify(Object.fromEntries(responseCounts)), secrets));
@@ -416,13 +555,15 @@ export async function startPortalHarness({ admin = false } = {}) {
       const notifierExecutable = resolve(temporary, 'deletion-notifier.exe');
       const signerExecutable = resolve(temporary, 'audit-signer.exe');
       const publisherExecutable = resolve(temporary, 'admin-audit-publisher.exe');
+      const legalExecutable = resolve(temporary, 'admin-legal.exe');
       await Promise.all([copyFile(apiBinary, apiExecutable), copyFile(fixtureBinary, fixtureExecutable), copyFile(notifierBinary, notifierExecutable),
-        ...(admin ? [copyFile(signerBinary, signerExecutable), copyFile(publisherBinary, publisherExecutable)] : [])]);
+        ...(admin ? [copyFile(signerBinary, signerExecutable), copyFile(publisherBinary, publisherExecutable), copyFile(legalBinary, legalExecutable)] : [])]);
       apiBinary = apiExecutable;
       fixtureBinary = fixtureExecutable;
       notifierBinary = notifierExecutable;
       signerBinary = signerExecutable;
       publisherBinary = publisherExecutable;
+      legalBinary = legalExecutable;
     }
     const services = await startPortalServices();
     cleanup.push(services.close);
@@ -432,6 +573,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       AUDIT_STREAM_NAME: `PORTAL_BROWSER_AUDIT_${runID}`,
       ENVELOPE_MASTER_KEK: randomBytes(32).toString('base64'),
       ENVELOPE_MASTER_KEK_VERSION: '1',
+      ENVELOPE_BLIND_INDEX_PEPPER: randomBytes(32).toString('base64'),
     };
     secrets.push(...secretEnvironmentValues(storeEnv));
     secrets.push(...fixtureSecretValues({ database_url: storeEnv.DATABASE_URL }));
@@ -454,6 +596,9 @@ export async function startPortalHarness({ admin = false } = {}) {
         maxBuffer: 128 * 1024,
         windowsHide: true,
       });
+      if (result.error || result.status !== 0) console.error(JSON.stringify({
+        process: 'Owned portal fixture', exit: result.status, categories: failureCategories(result.stderr),
+      }));
       assert(!result.error && result.status === 0,
         `Test-only fixture ${action} failed: ${result.error?.code || `exit ${result.status}`}`);
       let value;
@@ -464,6 +609,18 @@ export async function startPortalHarness({ admin = false } = {}) {
       }
       secrets.push(...fixtureSecretValues(value));
       for (const reference of fixtureRouteReferences(value)) routeReferences.add(reference);
+      if (action.startsWith('admin-legal-')) {
+        rememberLegal(value);
+        const remember = (object) => {
+          if (!object || typeof object !== 'object') return;
+          for (const [key, item] of Object.entries(object)) {
+            if (/(?:^|_)account_ref$/.test(key) && canonicalUUID(item)) legalReferences.accounts.add(item);
+            else if (key === 'hold_id' && canonicalUUID(item)) legalReferences.holds.add(item);
+            else remember(item);
+          }
+        };
+        remember(value);
+      }
       return value;
     };
     const waitForNoticeCleanup = async (userID, accepted) => {
@@ -485,16 +642,18 @@ export async function startPortalHarness({ admin = false } = {}) {
     const nextPort = await freePort();
     let sequence = 0;
     const routeEvidence = new Map();
-    const originEvidence = { unsafe: 0, anonymous: 0, mismatched: 0, referrers: 0, admin: 0 };
+    const originEvidence = { unsafe: 0, anonymous: 0, mismatched: 0, referrers: 0, admin: 0, legal: 0 };
     const captures = new Map();
     // Observe the real upstream body before Chromium discards a completed,
     // cancelled fetch. Nothing is replayed, changed, or written to an artifact.
     const captureJSON = (path, method, status) => {
       const key = `${method} ${path}`;
       const adminRead = admin && ((method === 'GET' && [
-        '/api/v1/admin/users', '/api/v1/admin/audit-logs', '/api/v1/admin/audit-logs/verify', '/api/v1/admin/ledger/verify',
+        '/api/v1/admin/users', '/api/v1/admin/audit-logs', '/api/v1/admin/audit-logs/verify', '/api/v1/admin/ledger/verify', '/api/v1/admin/legal-holds',
       ].includes(path)) || (method === 'GET' && /^\/api\/v1\/admin\/users\/[0-9a-f-]{36}$/.test(path)) ||
-        (method === 'POST' && path === '/api/v1/admin/users/lookup'));
+        (method === 'POST' && ['/api/v1/admin/users/lookup', '/api/v1/admin/legal-inquiry/lookup',
+          '/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests'].includes(path)) ||
+        (method === 'DELETE' && /^\/api\/v1\/admin\/legal-holds\/[0-9a-f-]{36}$/.test(path) && status === 503));
       assert(adminRead || [
         'POST /api/v1/auth/recovery-codes/generate',
         'POST /api/v1/auth/webauthn/register/verify',
@@ -519,7 +678,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       void promise.catch(() => {});
       timer = setTimeout(() => finish(true), 20_000);
       timer.unref();
-      captures.set(key, { status, finish, limit: path === '/api/v1/admin/audit-logs' ? 4 * 1024 * 1024 : 256 * 1024 });
+      captures.set(key, { status, finish, limit: portalResponseBudget(path, method) });
       return promise;
     };
     cleanup.push(() => {
@@ -535,6 +694,8 @@ export async function startPortalHarness({ admin = false } = {}) {
       const api = path === '/api' || path.startsWith('/api/');
       if (path.startsWith('/api/v1/admin/') && request.headers.dpop) {
         originEvidence.admin++;
+        if (/^\/api\/v1\/admin\/(?:legal-holds(?:\/[^/]+)?|preservation-requests|legal-inquiry\/lookup)$/.test(path))
+          originEvidence.legal++;
         // Chromium omits Origin on same-origin GETs. When present it must be
         // exact; unsafe requests below always require it, matching the real API.
         if (request.headers.origin && request.headers.origin !== origin) originEvidence.mismatched++;
@@ -570,26 +731,15 @@ export async function startPortalHarness({ admin = false } = {}) {
           const key = `${request.method} ${path}`;
           const capture = captures.get(key);
           if (capture && result.statusCode === capture.status) {
-            const chunks = [];
-            let size = 0;
-            let failed = false;
-            result.on('data', (chunk) => {
-              size += chunk.length;
-              if (size > capture.limit) failed = true;
-              if (!failed) chunks.push(chunk);
-            });
-            result.once('error', () => capture.finish(true));
-            result.once('aborted', () => capture.finish(true));
-            result.once('end', () => {
-              try {
-                assert(!failed && /^application\/json\b/i.test(result.headers['content-type'] || ''));
-                capture.finish(false, JSON.parse(Buffer.concat(chunks).toString('utf8')));
-              } catch {
-                capture.finish(true);
-              } finally {
-                chunks.length = 0;
+            void capturePortalJSON(result, capture.limit).then((value) => {
+              if (['/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests', '/api/v1/admin/legal-inquiry/lookup'].includes(path))
+                rememberLegal(value);
+              if (path === '/api/v1/admin/legal-holds' || path === '/api/v1/admin/preservation-requests') {
+                for (const hold of value.items || [value.hold || value])
+                  if (canonicalUUID(hold.id)) legalReferences.holds.add(hold.id);
               }
-            });
+              capture.finish(false, value);
+            }, () => capture.finish(true));
           }
           if (api && result.statusCode >= 200 && result.statusCode < 300) {
             const key = `${request.method} ${portalRoute(path)}`;
@@ -701,7 +851,6 @@ export async function startPortalHarness({ admin = false } = {}) {
       SMS_GATEWAY_API_KEY: randomBytes(32).toString('hex'),
       SESSION_COOKIE_NAME: '__Host-session',
       SESSION_COOKIE_SECURE: 'true',
-      ENVELOPE_BLIND_INDEX_PEPPER: randomBytes(32).toString('base64'),
       SESSION_ABSOLUTE_TTL: '2h',
       SESSION_IDLE_TTL: '30m',
       TRUSTED_PROXY_CIDRS: '127.0.0.1/32',
@@ -719,20 +868,45 @@ export async function startPortalHarness({ admin = false } = {}) {
       } : {}),
     };
     secrets.push(...secretEnvironmentValues(apiEnvironment));
+    let lookupFixture;
+    let signer;
     if (admin) {
       const auditEnvironment = { ...apiEnvironment, PORT: '8080', AUDIT_BATCH_SIZE: '20', AUDIT_FLUSH_INTERVAL: '1s' };
-      start('Audit signer', signerBinary, [], auditEnvironment, backend);
+      signer = start('Audit signer', signerBinary, [], auditEnvironment, backend);
       start('Admin audit publisher', publisherBinary, [], auditEnvironment, backend);
+      // stdout includes a synthetic identity and fixture ID. Parse in bounded
+      // process-local memory, never send it to child diagnostics or artifacts.
+      lookupFixture = lookupProbeFixture(spawnSync(legalBinary, ['--operation=lookup-probe'], {
+        cwd: backend, env: { ...cleanEnvironment(), ...auditEnvironment }, encoding: 'utf8',
+        timeout: 60_000, maxBuffer: 64 * 1024, windowsHide: true,
+      }));
+      secrets.push(lookupFixture);
+      const verification = fixture('admin-legal-probe', { fixture_id: lookupFixture });
+      assert(verification.verified && verification.account_deleted && verification.missing_rejected &&
+        verification.wrong_rejected && verification.mismatched_key_rejected, 'Real lookup prerequisite checks failed');
+      apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture;
+      // The production binary must fail closed with a mismatching fixture, not
+      // merely return false from a fake LookupEnabled dependency.
+      const rejected = spawnSync(apiBinary, [], {
+        cwd: backend, env: { ...cleanEnvironment(), ...apiEnvironment, PORT: String(apiPorts[0]), ADMIN_LOOKUP_FIXTURE_ID: randomUUID() },
+        encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, windowsHide: true,
+      });
+      assert(!rejected.error && rejected.status !== null && rejected.status !== 0,
+        'API accepted an unverified signer fixture or failed to stop');
     }
-    for (const [index, port] of apiPorts.entries()) {
-      start(
-        `API replica ${index + 1}`,
-        apiBinary,
-        [],
-        { ...apiEnvironment, PORT: String(port) },
-        backend
-      );
-    }
+    const apiChildren = [];
+    const startAPIs = () => {
+      for (const [index, port] of apiPorts.entries()) {
+        apiChildren[index] = start(
+          `API replica ${index + 1}`,
+          apiBinary,
+          [],
+          { ...apiEnvironment, PORT: String(port) },
+          backend
+        );
+      }
+    };
+    startAPIs();
     startNotifier();
     start(
       'Next production',
@@ -770,7 +944,46 @@ export async function startPortalHarness({ admin = false } = {}) {
         }
       }, label);
     }
-    const assertHealthy = () => assert(children.every(({ child }) => child.exitCode === null && child.signalCode === null), 'A supervised portal process exited');
+    const retired = new Set();
+    const assertHealthy = () => assert(children.every(({ child }) => retired.has(child) ||
+      (child.exitCode === null && child.signalCode === null)), 'A supervised portal process exited');
+    const stopSignerForDestructiveFixtures = async () => {
+      assert(admin && signer && !retired.has(signer), 'No live owned signer to retire');
+      assertHealthy();
+      const exited = once(signer, 'exit');
+      assert(signer.kill('SIGTERM'), 'Owned signer did not accept graceful shutdown');
+      const [code, signal] = await Promise.race([exited,
+        delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Owned signer did not stop'); })]);
+      assert(code === 0 && signal === null, 'Owned signer did not exit cleanly');
+      retired.add(signer);
+    };
+    const setLegalLookup = async (enabled) => {
+      assert(admin && typeof enabled === 'boolean' && canonicalUUID(lookupFixture), 'Invalid owned legal startup scenario');
+      for (const child of apiChildren) {
+        retired.add(child);
+        const exited = once(child, 'exit');
+        child.kill('SIGTERM');
+        await Promise.race([exited, delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Owned API did not stop'); })]);
+      }
+      if (enabled) apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture;
+      else delete apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID;
+      startAPIs();
+      for (const port of apiPorts) await waitFor(async () => {
+        assertHealthy();
+        try {
+          const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1000), redirect: 'error' });
+          await response.arrayBuffer();
+          return response.ok;
+        } catch { return false; }
+      }, 'owned legal API configuration');
+    };
+    const assertPrivateLogs = () => {
+      for (const { label, output } of children) {
+        const summary = privateLogSummary(output.join(''), secrets);
+        if (summary.matches) console.error(JSON.stringify({ check: 'supervised-log-privacy', process: label, ...summary }));
+        assert(summary.matches === 0, 'Private fixture material entered supervised process logs');
+      }
+    };
     const waitForAdminDelivery = async () => {
       assert(admin, 'Admin delivery requires explicit harness mode');
       let state;
@@ -781,7 +994,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       }, 'real admin outbox delivery and canonical-v2 signing', 30_000);
       return state;
     };
-    return { runID, origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, waitForAdminDelivery, assertHealthy, routeEvidence, originEvidence, close, diagnostics, secrets, routeReferences };
+    return { runID, origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, waitForAdminDelivery, assertHealthy, assertPrivateLogs, setLegalLookup, stopSignerForDestructiveFixtures, routeEvidence, originEvidence, close, diagnostics, secrets, routeReferences, legalReferences, legalSecrets };
   } catch (error) {
     try { diagnostics(); } finally { await close(); }
     throw error;

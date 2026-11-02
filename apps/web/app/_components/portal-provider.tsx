@@ -17,7 +17,7 @@ import { PortalClient } from '../_lib/portal/client';
 import { AdminClient } from '../_lib/admin/client';
 import type { AdminCapabilities } from '../_lib/admin/contracts';
 import type { Profile, StepUpGrant } from '../_lib/portal/contracts';
-import type { StepUpIntent } from '../_lib/portal/action-intent';
+import type { LegalOperation, StepUpIntent } from '../_lib/portal/action-intent';
 import { errorMessage, isAborted, PortalError, throwIfAborted } from '../_lib/portal/errors';
 import { safeReturnPath } from '../_lib/portal/validation';
 import {
@@ -45,6 +45,7 @@ type PortalContextValue = Omit<PortalState, 'route'> & {
   rememberStepUp: (intent: StepUpIntent) => void;
   reportPermissionLoss: () => void;
   reportModerationInterruption: () => void;
+  reportLegalInterruption: (operation: LegalOperation) => void;
 };
 type DeletionOutcome = 'confirmed' | 'unconfirmed';
 const PortalContext = createContext<PortalContextValue | null>(null);
@@ -70,6 +71,7 @@ export function PortalProvider({
   const [attempt, setAttempt] = useState(0);
   const [deletionOutcome, setDeletionOutcome] = useState<DeletionOutcome | null>(null);
   const [moderationInterrupted, setModerationInterrupted] = useState(false);
+  const [legalInterrupted, setLegalInterrupted] = useState<LegalOperation | null>(null);
   const terminal = useRef<DeletionOutcome | null>(null);
   const deleting = useRef<{ sent: boolean; interrupt: () => void } | null>(null);
   const alive = useRef(false);
@@ -396,6 +398,9 @@ export function PortalProvider({
     if (intent.kind === 'recovery') pending.action = { kind: 'recovery' };
     else if (intent.kind === 'moderation') {
       if (admin) pending.action = { kind: 'moderation', status: intent.status };
+    } else if (intent.kind === 'legal') {
+      if (admin && pathname === '/admin/legal')
+        pending.action = { kind: 'legal', operation: intent.operation };
     } else {
       const target = intent.action;
       pending.action = {
@@ -425,6 +430,10 @@ export function PortalProvider({
     if (alive.current) setModerationInterrupted(true);
   }, []);
 
+  const reportLegalInterruption = useCallback((operation: LegalOperation) => {
+    if (alive.current) setLegalInterrupted(operation);
+  }, []);
+
   const permissions = ready ? state?.capabilities?.capabilities : undefined;
   const navigation = admin
     ? [
@@ -433,6 +442,13 @@ export function PortalProvider({
         ...(permissions?.audit_logs_read ? [['/admin/audit-logs', 'Audit logs']] : []),
         ...(permissions?.audit_chain_verify || permissions?.ledger_verify
           ? [['/admin/integrity', 'Integrity']]
+          : []),
+        ...(permissions?.legal_holds_read ||
+        permissions?.legal_holds_apply ||
+        permissions?.legal_holds_release ||
+        permissions?.preservation_requests_create ||
+        permissions?.legal_inquiry_lookup
+          ? [['/admin/legal', 'DPO and Legal']]
           : []),
       ]
     : [
@@ -538,6 +554,19 @@ export function PortalProvider({
           {admin && moderationInterrupted && (
             <Feedback status="Outcome unconfirmed; the action was not retried. Read current account state explicitly before starting another action. A matching status proves only current state, not that the interrupted action succeeded." />
           )}
+          {admin && legalInterrupted && (
+            <div data-testid="legal-interruption">
+              <Feedback
+                status={
+                  legalInterrupted === 'lookup'
+                    ? 'Attribution was interrupted. No result was accepted; this does not mean no match. Private query data was cleared. Start a new inquiry with fresh verification; nothing was retried.'
+                    : legalInterrupted === 'release'
+                      ? 'Legal release outcome unconfirmed; the request was not retried. Private data was cleared. Read Legal Holds explicitly and select the original request again. A current released state does not prove who released it.'
+                      : 'Legal creation outcome unconfirmed; the request was not retried. Private data was cleared. Reenter the exact original target, kind, operation UUID, and normalized inputs from controlled external intake, then verify afresh. Do not replace the operation UUID or infer rollback.'
+                }
+              />
+            </div>
+          )}
           {deletionOutcome ? (
             <section
               data-testid="deletion-outcome"
@@ -595,6 +624,7 @@ export function PortalProvider({
                 rememberStepUp,
                 reportPermissionLoss,
                 reportModerationInterruption,
+                reportLegalInterruption,
                 moderationInterrupted,
               }}
             >
@@ -604,8 +634,9 @@ export function PortalProvider({
               >
                 {state.revalidated && (
                   <p role="status" className="text-sm text-muted-foreground">
-                    Your session was checked again. If a change was interrupted, it may have
-                    completed; review the saved state before trying again.
+                    {admin && pathname === '/admin/legal'
+                      ? 'Your session and administrative access were checked again. Legal inputs and results were cleared. An interrupted write may have committed; recover only from the original external intake record with fresh verification.'
+                      : 'Your session was checked again. If a change was interrupted, it may have completed; review the saved state before trying again.'}
                   </p>
                 )}
                 {children}

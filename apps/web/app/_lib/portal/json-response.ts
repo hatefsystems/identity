@@ -38,7 +38,7 @@ export async function readResponse(
   };
   signal.addEventListener('abort', abort, { once: true });
   // Bound retained memory as well as bytes, even if a response arrives in many
-  // tiny chunks. The caller chooses only the default or audit-list ceiling.
+  // tiny chunks. The client selects the ceiling only for exact allowlisted routes.
   // Chromium can expose an empty stream for 204. Verify zero bytes rather than
   // assuming Response.body is null; any non-empty chunk is still rejected.
   const bytes = new Uint8Array(empty ? 0 : responseLimit);

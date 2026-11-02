@@ -63,6 +63,10 @@ function deferred<T>() {
 }
 
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+    configurable: true,
+    value: jest.fn(),
+  });
   Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
     configurable: true,
     value: function (this: HTMLDialogElement) {
@@ -87,6 +91,7 @@ beforeEach(() => {
     rememberStepUp: jest.fn(),
     reportPermissionLoss: jest.fn(),
     reportModerationInterruption: jest.fn(),
+    reportLegalInterruption: jest.fn(),
   });
   api.assertSession.mockReturnValue(profile);
   api.bootstrap.mockResolvedValue(profile);

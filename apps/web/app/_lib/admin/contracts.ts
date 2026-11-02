@@ -26,6 +26,11 @@ export type AdminCapabilities = {
     audit_logs_read: boolean;
     audit_chain_verify: boolean;
     ledger_verify: boolean;
+    legal_holds_read: boolean;
+    legal_holds_apply: boolean;
+    legal_holds_release: boolean;
+    preservation_requests_create: boolean;
+    legal_inquiry_lookup: boolean;
   };
   limits: AdminLimits;
 };
@@ -144,6 +149,11 @@ export function capabilitiesResponse(value: unknown): AdminCapabilities {
       audit_logs_read: boolean(flags.audit_logs_read),
       audit_chain_verify: boolean(flags.audit_chain_verify),
       ledger_verify: boolean(flags.ledger_verify),
+      legal_holds_read: boolean(flags.legal_holds_read),
+      legal_holds_apply: boolean(flags.legal_holds_apply),
+      legal_holds_release: boolean(flags.legal_holds_release),
+      preservation_requests_create: boolean(flags.preservation_requests_create),
+      legal_inquiry_lookup: boolean(flags.legal_inquiry_lookup),
     },
     limits: {
       page_size_default: positiveInteger(limits.page_size_default, 200),

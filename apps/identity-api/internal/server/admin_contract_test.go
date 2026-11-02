@@ -15,6 +15,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
 
@@ -92,6 +93,8 @@ func TestAdminCoordinatesEncodeOnlyAsExactDecimalStrings(t *testing.T) {
 	for _, value := range []any{
 		adminUserResponse{LifecycleRevision: last},
 		adminAuditLogResponse{Seq: last},
+		adminLedgerEventResponse{Seq: last},
+		legalhold.Coverage{ThroughSeq: last},
 		adminChainVerifyResponse{AfterSeq: 9007199254740993, ThroughSeq: last, FirstSeq: &last, LastSeq: &last, BrokenAtSeq: &last, NextAfterSeq: &last},
 	} {
 		encoded, err := json.Marshal(value)
@@ -119,9 +122,43 @@ func TestAdminCoordinatesEncodeOnlyAsExactDecimalStrings(t *testing.T) {
 	if json.Unmarshal([]byte(`{"seq":1}`), &row) == nil {
 		t.Fatal("numeric audit projection fallback accepted")
 	}
+	var legalRow adminLedgerEventResponse
+	if json.Unmarshal([]byte(`{"seq":1}`), &legalRow) == nil {
+		t.Fatal("numeric legal projection fallback accepted")
+	}
+	var coverage legalhold.Coverage
+	if json.Unmarshal([]byte(`{"through_seq":1}`), &coverage) == nil {
+		t.Fatal("numeric legal coverage fallback accepted")
+	}
 	encoded, err := json.Marshal(adminChainVerifyResponse{})
 	if err != nil || !strings.Contains(string(encoded), `"after_seq":"0"`) || !strings.Contains(string(encoded), `"first_seq":null`) {
 		t.Fatal("zero/null coordinate semantics changed")
+	}
+}
+
+func TestAdminLegalCoordinatesPreserveSigned64BitPrecision(t *testing.T) {
+	for _, seq := range []int64{0, 1, 9007199254740991, 9007199254740992, 9007199254740993, math.MaxInt64 - 1, math.MaxInt64} {
+		t.Run(strconv.FormatInt(seq, 10), func(t *testing.T) {
+			row := newAdminLedgerEvent(db.LookupLegalAttributionRow{Seq: seq}, nil)
+			encoded, err := json.Marshal(struct {
+				Item     adminLedgerEventResponse `json:"item"`
+				Coverage legalhold.Coverage       `json:"coverage"`
+			}{row, legalhold.Coverage{ThroughSeq: seq}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				Item     map[string]json.RawMessage `json:"item"`
+				Coverage map[string]json.RawMessage `json:"coverage"`
+			}
+			if err := json.Unmarshal(encoded, &result); err != nil {
+				t.Fatal(err)
+			}
+			want := strconv.Quote(strconv.FormatInt(seq, 10))
+			if string(result.Item["seq"]) != want || string(result.Coverage["through_seq"]) != want {
+				t.Fatalf("legal coordinate lost precision: %s", encoded)
+			}
+		})
 	}
 }
 

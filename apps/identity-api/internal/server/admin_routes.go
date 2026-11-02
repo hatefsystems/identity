@@ -100,23 +100,19 @@ func (s *Server) registerAdminRoutes() {
 		available.AuditLogsRead = mount(r, http.MethodGet, "/audit-logs", permAdminAuditLogsRead, false, s.handleAdminListAuditLogs())
 		available.AuditChainVerify = mount(r, http.MethodGet, "/audit-logs/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyAuditChain())
 		available.LedgerVerify = mount(r, http.MethodGet, "/ledger/verify", permAdminAuditLogsVerify, false, s.handleAdminVerifyLedgerChain())
-		r.Get("/capabilities", s.handleAdminCapabilities(available))
 
 		// --- Legal (DPO only) ---
 		//
-		// Mounted only when the legal-hold service exists. Per its constructor
-		// contract that additionally means a blind-index pepper was configured:
-		// an attribution lookup run with a missing or wrong pepper answers "no
-		// records found" to a legal authority, which is indistinguishable from a
-		// truthful negative and is the worst outcome this endpoint has. An
-		// absent route produces an honest 404 instead.
+		// Hold management is independent of indexing. Attribution additionally
+		// requires a verified signer fixture: a missing or mismatched lookup key
+		// must never produce a misleading empty result.
 		if s.deps.LegalHold != nil {
-			mount(r, http.MethodPost, "/legal-holds", permLegalHoldsWrite, true, s.handleAdminApplyLegalHold())
-			mount(r, http.MethodGet, "/legal-holds", permLegalHoldsRead, false, s.handleAdminListLegalHolds())
-			mount(r, http.MethodDelete, "/legal-holds/{hold_id}", permLegalHoldsWrite, true, s.handleAdminReleaseLegalHold())
-			mount(r, http.MethodPost, "/preservation-requests", permLegalHoldsWrite, true, s.handleAdminPreservationRequest())
+			available.LegalHoldsApply = mount(r, http.MethodPost, "/legal-holds", permLegalHoldsWrite, true, s.handleAdminApplyLegalHold())
+			available.LegalHoldsRead = mount(r, http.MethodGet, "/legal-holds", permLegalHoldsRead, false, s.handleAdminListLegalHolds())
+			available.LegalHoldsRelease = mount(r, http.MethodDelete, "/legal-holds/{hold_id}", permLegalHoldsWrite, true, s.handleAdminReleaseLegalHold())
+			available.PreservationRequestsCreate = mount(r, http.MethodPost, "/preservation-requests", permLegalHoldsWrite, true, s.handleAdminPreservationRequest())
 			if s.deps.LegalHold.LookupEnabled() {
-				mount(r, http.MethodPost, "/legal-inquiry/lookup", permLegalInquiryLookup, true, s.handleAdminLegalInquiryLookup())
+				available.LegalInquiryLookup = mount(r, http.MethodPost, "/legal-inquiry/lookup", permLegalInquiryLookup, true, s.handleAdminLegalInquiryLookup())
 			}
 		} else {
 			s.logger.Warn("admin: no legal hold service configured; legal routes not mounted")
@@ -141,5 +137,7 @@ func (s *Server) registerAdminRoutes() {
 			mount(r, http.MethodPost, "/legal-transparency/reports/{report_id}/approve", legalreport.PermissionApprove, true, s.handleLegalReport("approve"))
 			mount(r, http.MethodPost, "/legal-transparency/reports/{report_id}/download", legalreport.PermissionRead, true, s.handleLegalReport("download"))
 		}
+		// The handler captures this value only after all advertised routes mount.
+		r.Get("/capabilities", s.handleAdminCapabilities(available))
 	})
 }

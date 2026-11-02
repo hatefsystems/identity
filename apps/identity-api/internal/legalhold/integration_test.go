@@ -3,6 +3,7 @@
 package legalhold
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -15,12 +16,82 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
+
+func TestLegalLookupFixtureCanonicalV2Integration(t *testing.T) {
+	f := newLegalIntegration(t)
+	q := db.New(f.pool)
+	wrongKey, err := blindindex.New(bytes.Repeat([]byte{0x73}, 32), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, client, event string
+		indexed, valid      bool
+	}{
+		{"synthetic probe", LookupFixtureClient, audit.EventLoginSucceeded, true, true},
+		{"wrong marker", "not-a-lookup-probe", audit.EventLoginSucceeded, true, false},
+		{"missing marker", "", audit.EventLoginSucceeded, true, false},
+		{"wrong event", LookupFixtureClient, audit.EventSessionLoggedOut, true, false},
+		{"unindexed", LookupFixtureClient, audit.EventLoginSucceeded, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := uuid.New()
+			u, err := q.CreateUser(f.ctx, db.CreateUserParams{Email: LookupFixtureEmail(id), Status: "active"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), "DELETE FROM users WHERE id=$1", u.ID) })
+			var index, client *string
+			if tc.indexed {
+				value := f.svc.indexer.Compute(u.Email)
+				index = &value
+			}
+			if tc.client != "" {
+				client = &tc.client
+			}
+			at := audit.NormalizeChainTime(f.svc.now())
+			retain := at.Add(time.Hour)
+			leaf, err := audit.LeafLedger(audit.LedgerRecord{ID: id.String(), AccountRef: u.ID.String(), IdentityBlindIndex: index,
+				EventType: tc.event, ClientID: client, Timestamp: at, RetainUntil: retain})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := q.InsertSecurityEventWithChain(f.ctx, db.InsertSecurityEventWithChainParams{
+				EventID: id, LeafHash: leaf.Bytes(), ChainHash: audit.ChainLedger(audit.LedgerGenesis(), leaf).Bytes(),
+				AccountRef: u.ID, IdentityBlindIndex: index, EventType: tc.event, ClientID: client,
+				Timestamp: timestamptz(at), RetainUntil: timestamptz(retain),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, deleted := range []bool{false, true} {
+				if deleted {
+					if _, err := f.pool.Exec(f.ctx, "DELETE FROM users WHERE id=$1", u.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err := VerifyLookupFixture(f.ctx, f.pool, f.svc.indexer, id)
+				if (err == nil) != tc.valid || (err != nil && !errors.Is(err, ErrUnavailable)) {
+					t.Fatalf("canonical-v2 fixture binding after deletion=%v: %v", deleted, err)
+				}
+				for _, check := range []struct {
+					key BlindIndexer
+					id  uuid.UUID
+				}{{wrongKey, id}, {f.svc.indexer, uuid.New()}, {f.svc.indexer, u.ID}} {
+					if err := VerifyLookupFixture(f.ctx, f.pool, check.key, check.id); !errors.Is(err, ErrUnavailable) {
+						t.Fatal("wrong key, missing fixture, or account UUID verified as a signer event")
+					}
+				}
+			}
+		})
+	}
+}
 
 type legalIntegration struct {
 	ctx     context.Context
@@ -492,8 +563,24 @@ func TestLegalMaintenanceHoldPrecedenceAndTombstoneIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.svc.now = func() time.Time { return time.Now().Add(48 * time.Hour) }
-	if n, err := f.svc.CleanupReleased(f.ctx, f.pool, 1000); err != nil || n != 0 {
-		t.Fatalf("independent active hold must preserve released narrative: %d %v", n, err)
+	if _, err := f.svc.CleanupReleased(f.ctx, f.pool, 1000); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup scans all subjects, including requests retained by earlier fixtures.
+	// Assert preservation for these two owned requests, not a global cleanup count.
+	ctx, op = f.operation(t, 0)
+	preserved, err := f.svc.List(ctx, ListRequest{AccountRef: uuid.NullUUID{UUID: account, Valid: true}, Status: "all", Limit: 2})
+	if err != nil || preserved.Total != 2 || len(preserved.Holds) != 2 {
+		t.Fatalf("independent requests after cleanup: %+v %v", preserved, err)
+	}
+	for _, current := range preserved.Holds {
+		if current.DetailsPurged || current.Details.Reason != req.Reason ||
+			current.Record.IsActive != (current.Record.ID == other.Hold.Record.ID) {
+			t.Fatal("independent active hold did not preserve both requests and their narratives")
+		}
+	}
+	if err := op.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 	for _, released := range []bool{false, true} {
 		if released {
@@ -528,15 +615,15 @@ AND NOT EXISTS (SELECT 1 FROM legal_holds h WHERE h.account_ref=l.account_ref AN
 			t.Fatal(err)
 		}
 	}
-	if n, err := f.svc.CleanupReleased(f.ctx, f.pool, 1000); err != nil || n != 2 {
-		t.Fatalf("cleanup after all releases: %d %v", n, err)
+	if _, err := f.svc.CleanupReleased(f.ctx, f.pool, 1000); err != nil {
+		t.Fatalf("cleanup after all releases: %v", err)
 	}
 	ctx, op = f.operation(t, 0)
 	if _, err := f.svc.Apply(ctx, req); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("cleaned-up request recreated protection: %v", err)
 	}
-	list, err := f.svc.List(ctx, ListRequest{AccountRef: uuid.NullUUID{UUID: account, Valid: true}, Status: "released", Limit: 1})
-	if err != nil || list.Total != 2 || len(list.Holds) != 1 || !list.Holds[0].DetailsPurged {
+	list, err := f.svc.List(ctx, ListRequest{AccountRef: uuid.NullUUID{UUID: account, Valid: true}, Status: "released", Limit: 2})
+	if err != nil || list.Total != 2 || len(list.Holds) != 2 || !list.Holds[0].DetailsPurged || !list.Holds[1].DetailsPurged {
 		t.Fatalf("tombstone list: %+v %v", list, err)
 	}
 	if err := op.Rollback(ctx); err != nil {

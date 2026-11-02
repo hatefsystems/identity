@@ -64,7 +64,7 @@ export function StepUpDialog({
       authority.current?.clear();
       authority.current = null;
       lifetime.current?.abort();
-      if (input.current) input.current.value = '';
+      clearCodeInput(input.current);
       setCode('');
       setChallenge(null);
       close.current();
@@ -85,7 +85,7 @@ export function StepUpDialog({
       authority.current?.clear();
       authority.current = null;
       lifetime.current?.abort();
-      if (input.current) input.current.value = '';
+      clearCodeInput(input.current);
       setCode('');
       setChallenge(null);
       close.current();
@@ -94,14 +94,16 @@ export function StepUpDialog({
     return () => window.removeEventListener(sensitiveSuspendEvent, suspend);
   }, [intent, method, rememberStepUp, webauthnOnly]);
   useEffect(() => {
-    if (method === 'totp' && challenge) input.current?.focus();
+    const field = input.current;
+    if (method === 'totp' && challenge) field?.focus();
+    return () => clearCodeInput(field);
   }, [method, challenge]);
 
   function cancel() {
     authority.current?.clear();
     authority.current = null;
     lifetime.current?.abort();
-    if (input.current) input.current.value = '';
+    clearCodeInput(input.current);
     setCode('');
     onCancel();
   }
@@ -164,6 +166,7 @@ export function StepUpDialog({
       throwIfAborted(signal);
       grant = await client.stepUpVerify(proof, signal);
       authority.current = grant;
+      clearCodeInput(input.current);
       setCode('');
       throwIfAborted(signal);
       client.assertSession();
@@ -181,6 +184,7 @@ export function StepUpDialog({
             ? actionError(failure)
             : errorMessage(failure, webauthnOnly ? 'webauthn' : undefined)
         );
+        clearCodeInput(input.current);
         setCode('');
         // A failed TOTP verification is not a lost session. It may be retried
         // with a new code; any minted/used grant and WebAuthn ceremony are spent.
@@ -313,4 +317,10 @@ export function StepUpDialog({
       </Button>
     </NativeDialog>
   );
+}
+
+function clearCodeInput(input: HTMLInputElement | null) {
+  if (!input) return;
+  input.defaultValue = '';
+  input.value = '';
 }

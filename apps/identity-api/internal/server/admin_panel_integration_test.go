@@ -35,7 +35,7 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 	for role, want := range map[string]adminCapabilities{
 		"support":     {UsersRead: true},
 		"moderator":   {UsersRead: true, UsersPII: true, UsersLookup: true, UsersStatusWrite: true},
-		"dpo":         {AuditLogsRead: true, AuditChainVerify: true, LedgerVerify: true},
+		"dpo":         {AuditLogsRead: true, AuditChainVerify: true, LedgerVerify: true, LegalHoldsRead: true, LegalHoldsApply: true, LegalHoldsRelease: true, PreservationRequestsCreate: true},
 		"super_admin": {AuditChainVerify: true, LedgerVerify: true},
 	} {
 		response := f.request(t, role, http.MethodGet, "/capabilities", "", "")
@@ -46,7 +46,7 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 		if body.Limits.PageSizeDefault != 50 || body.Limits.PageSizeMax != 200 || body.Limits.AuditMaxWindowSeconds != (31*24*time.Hour).Seconds() || body.Limits.ChainVerifyMaxLimit != 5000 {
 			t.Fatal("capabilities did not expose effective limits")
 		}
-		for _, disallowed := range []string{"email", "roles", "legal", "auth_version", "password", "grants", f.actors[role].UserID} {
+		for _, disallowed := range []string{"email", "roles", "auth_version", "password", "grants", f.actors[role].UserID} {
 			if strings.Contains(response.Body.String(), disallowed) {
 				t.Fatalf("capability response disclosed %s", disallowed)
 			}
@@ -61,15 +61,19 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 	}
 	response := f.request(t, "moderator", http.MethodGet, "/capabilities", "", "")
 	var combined adminCapabilitiesResponse
-	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &combined) != nil || combined.Capabilities != (adminCapabilities{true, true, true, true, true, true, true}) {
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &combined) != nil || combined.Capabilities != (adminCapabilities{
+		UsersRead: true, UsersPII: true, UsersLookup: true, UsersStatusWrite: true, AuditLogsRead: true, AuditChainVerify: true, LedgerVerify: true,
+		LegalHoldsRead: true, LegalHoldsApply: true, LegalHoldsRelease: true, PreservationRequestsCreate: true,
+	}) {
 		t.Fatal("combined grants did not expose their union")
 	}
 	deps := f.srv.deps
 	deps.StepUp = nil
 	f.srv = New(f.srv.cfg, nil, deps)
 	response = f.request(t, "moderator", http.MethodGet, "/capabilities", "", "")
-	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &combined) != nil || combined.Capabilities.UsersStatusWrite || !combined.Capabilities.UsersRead {
-		t.Fatal("missing step-up did not suppress only status writing")
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &combined) != nil || combined.Capabilities.UsersStatusWrite || !combined.Capabilities.UsersRead ||
+		!combined.Capabilities.LegalHoldsRead || combined.Capabilities.LegalHoldsApply || combined.Capabilities.LegalHoldsRelease || combined.Capabilities.PreservationRequestsCreate || combined.Capabilities.LegalInquiryLookup {
+		t.Fatal("missing step-up did not suppress only gated operations")
 	}
 	if response := f.request(t, "moderator", http.MethodPatch, "/users/"+f.target.ID.String()+"/status", adminStatusBody(t, "banned", "reason", 0), ""); response.Code != http.StatusNotFound {
 		t.Fatalf("status route mounted without step-up: %d", response.Code)

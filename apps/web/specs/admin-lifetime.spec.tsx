@@ -52,6 +52,11 @@ const permissions = (): AdminCapabilities => ({
     audit_logs_read: false,
     audit_chain_verify: false,
     ledger_verify: false,
+    legal_holds_read: false,
+    legal_holds_apply: false,
+    legal_holds_release: false,
+    preservation_requests_create: false,
+    legal_inquiry_lookup: false,
   },
   limits: {
     page_size_default: 20,
@@ -307,6 +312,11 @@ it('verification-only capabilities show integrity without fetching accounts or p
       audit_logs_read: false,
       audit_chain_verify: true,
       ledger_verify: true,
+      legal_holds_read: false,
+      legal_holds_apply: false,
+      legal_holds_release: false,
+      preservation_requests_create: false,
+      legal_inquiry_lookup: false,
     },
   });
   mockPathname = '/admin';

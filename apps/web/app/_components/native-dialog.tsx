@@ -49,9 +49,12 @@ export function NativeDialog({
     ) {
       event.preventDefault();
       last.focus();
+      last.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     } else if (!event.shiftKey && document.activeElement === last) {
       event.preventDefault();
       first.focus();
+      // Refocusing the sole control after responsive reflow does not scroll it.
+      first.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     }
   }
 

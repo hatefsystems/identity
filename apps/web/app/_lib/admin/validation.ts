@@ -40,6 +40,13 @@ export function uuid(value: unknown): string {
   return result;
 }
 
+export function nonzeroUUID(value: unknown): string {
+  const result = uuid(value);
+  if (result === '00000000-0000-0000-0000-000000000000')
+    throw new PortalError('invalid_response');
+  return result;
+}
+
 export function adminTimestamp(value: unknown): string {
   const result = text(value, 64);
   if (

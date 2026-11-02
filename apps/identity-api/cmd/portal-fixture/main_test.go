@@ -141,7 +141,7 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {
@@ -183,6 +183,55 @@ func TestAdminFixtureRequiresExplicitNonproductionMode(t *testing.T) {
 	}
 	if _, _, err := fixtureStatus("deleted"); err == nil {
 		t.Fatal("unknown lifecycle state accepted")
+	}
+}
+
+func TestLegalFixtureReferencesRemainRunOwnedAfterDeletion(t *testing.T) {
+	seen := map[uuid.UUID]bool{}
+	for _, kind := range []string{"deleted", "current", "absent"} {
+		id, err := legalFixtureReference(fixtureRunID, kind)
+		if err != nil || id == uuid.Nil || seen[id] {
+			t.Fatal("legal fixture references must be distinct, nonzero and deterministic")
+		}
+		seen[id] = true
+		again, _ := legalFixtureReference(fixtureRunID, kind)
+		owned, err := ownedLegalReference(fixtureRunID, id.String())
+		if again != id || err != nil || owned != id {
+			t.Fatal("known legal reference cannot be recovered without a live account")
+		}
+		if _, err := ownedLegalReference(strings.Repeat("a", 32), id.String()); err == nil {
+			t.Fatal("another fixture run can mutate a deleted subject")
+		}
+	}
+	for _, raw := range []string{"", uuid.Nil.String(), uuid.NewString(), "PRIVATE-IDENTITY", "{" + uuid.NewString() + "}"} {
+		if _, err := ownedLegalReference(fixtureRunID, raw); err == nil || strings.Contains(err.Error(), raw) && raw != "" {
+			t.Fatal("foreign legal reference was admitted or echoed")
+		}
+	}
+	for _, input := range [][2]string{{"", "deleted"}, {fixtureRunID, "unknown"}, {"../private", "absent"}} {
+		if _, err := legalFixtureReference(input[0], input[1]); err == nil {
+			t.Fatal("invalid legal fixture namespace accepted")
+		}
+	}
+}
+
+func TestLegalFixtureMetadataContainsOnlySupportedSyntheticDisclosures(t *testing.T) {
+	metadata := legalFixtureMetadata(fixtureRunID)
+	if len(metadata) != 6 {
+		t.Fatal("legal fixture must exercise exactly the six supported opt-in fields")
+	}
+	for _, key := range []string{"client_ip", "ip_subnet", "user_agent", "device_fingerprint", "client_id", "scope"} {
+		if metadata[key] == "" {
+			t.Fatal("missing legal disclosure fixture")
+		}
+	}
+	if !strings.Contains(metadata["client_id"], fixtureRunID) || !strings.Contains(metadata["user_agent"], "<img") {
+		t.Fatal("legal fixture must keep run ownership and exercise inert telemetry rendering")
+	}
+	for _, key := range []string{"email", "identity_blind_index", "blind_index_version", "payload"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatal("fixture exposed a forbidden attribution field")
+		}
 	}
 }
 

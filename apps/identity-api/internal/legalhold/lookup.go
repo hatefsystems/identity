@@ -32,7 +32,7 @@ type LookupRequest struct {
 
 // Coverage describes the observed indexing boundary without promising completeness.
 type Coverage struct {
-	ThroughSeq           int64     `json:"through_seq"`
+	ThroughSeq           int64     `json:"through_seq,string"`
 	ObservedAt           time.Time `json:"observed_at"`
 	EligibilityCheckedAt time.Time `json:"eligibility_checked_at"`
 	Note                 string    `json:"note"`

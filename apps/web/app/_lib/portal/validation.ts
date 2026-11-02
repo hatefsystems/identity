@@ -66,6 +66,7 @@ export function safeReturnPath(value: string | null): string {
     '/admin/users',
     '/admin/audit-logs',
     '/admin/integrity',
+    '/admin/legal',
   ].includes(value ?? '')
     ? (value as string)
     : '/dashboard';

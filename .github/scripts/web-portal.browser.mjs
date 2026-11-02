@@ -4,7 +4,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { anonymousReclaim, browserFailure, guardBrowserFailures, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { anonymousReclaim, browserFailure, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
@@ -40,6 +40,7 @@ function observe(context, harness) {
       if (
         harness.secrets.some((secret) => {
           if (!secret || !url.href.includes(encodeURIComponent(secret))) return false;
+          if (legalReferenceRequest(request, secret, harness) || legalCoordinateRequest(request, secret, harness)) return false;
           // Public references belong in typed paths, never query strings. They
           // still require redaction in diagnostics and persisted evidence.
           return !harness.routeReferences?.has(secret) ||
@@ -198,11 +199,12 @@ async function signIn(page, origin, path = '/login/webauthn') {
 
 // This independent boundary probe signs with the actual persisted CryptoKey.
 // User flows above/below still use the production adapter and real authenticators.
-async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } = {}) {
+async function api(page, path, { method = 'GET', body, sessionID, stepUpToken, idempotencyKey } = {}) {
+  legalIdempotencyKey(path, method, idempotencyKey);
   assert(stepUpToken === undefined || (typeof stepUpToken === 'string' && stepUpToken.length > 0 &&
     stepUpToken.length <= 8192 && !/[\r\n]/.test(stepUpToken)), 'Invalid bounded step-up probe');
   return page.evaluate(
-    async ({ path, method, body, sessionID, stepUpToken }) => {
+    async ({ path, method, body, sessionID, stepUpToken, idempotencyKey }) => {
       const database = await new Promise((resolve, reject) => {
         const open = indexedDB.open('hatef-portal-dpop');
         open.onsuccess = () => resolve(open.result);
@@ -248,6 +250,7 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } 
             DPoP: `${unsigned}.${encode(signature)}`,
             ...(sessionID ? { 'X-Portal-Session': sessionID } : {}),
             ...(stepUpToken ? { 'X-Step-Up-Auth': stepUpToken } : {}),
+            ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
             ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -266,7 +269,7 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken } 
       }
       throw new Error('Test boundary probe exhausted its single nonce retry');
     },
-    { path, method, body, sessionID, stepUpToken }
+    { path, method, body, sessionID, stepUpToken, idempotencyKey }
   );
 }
 
@@ -343,6 +346,25 @@ async function keyStorage(page) {
 
 async function clean(page, observed, keyless = false) {
   await Promise.all(observed.pending);
+  if (observed.failures.length) {
+    const labels = new Map([
+      ['Uncaught portal runtime error', 'runtime'],
+      ['Hydration or CSP console error', 'hydration-csp'],
+      ['Fixture identity or credential appeared in console output', 'console-data'],
+      ['Unexpected third-party request', 'third-party'],
+      ['Fixture secret appeared in a request URL', 'url-data'],
+      ['Private legal data escaped its exact API request boundary', 'legal-boundary'],
+      ['Controlled admin private marker escaped its permitted request body', 'admin-marker'],
+    ]);
+    const counts = {};
+    for (const failure of observed.failures) {
+      const code = labels.get(failure) ?? (typeof failure === 'string' && failure.startsWith('Invalid or reused outgoing browser proof for ')
+        ? 'proof' : typeof failure === 'string' && failure.startsWith('API privacy/auth response policy failed for ')
+          ? 'response-policy' : 'other');
+      counts[code] = (counts[code] ?? 0) + 1;
+    }
+    console.error(JSON.stringify({ check: 'portal-observers', counts }));
+  }
   assert.deepEqual(observed.failures, [], 'Portal runtime, privacy or proof regression');
   assert.deepEqual(
     await page.evaluate(() => globalThis.__portalCsp),

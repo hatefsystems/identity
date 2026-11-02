@@ -3,9 +3,11 @@ package legalhold
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -211,11 +213,12 @@ func TestIndependentHoldsAndIdempotentReplay(t *testing.T) {
 }
 
 func TestPreservePostDeletionAndAdvisoryExpiry(t *testing.T) {
-	for _, evidence := range []bool{false, true} {
-		t.Run(fmt.Sprint(evidence), func(t *testing.T) {
+	for _, presence := range []struct{ account, evidence bool }{{false, false}, {false, true}, {true, false}, {true, true}} {
+		t.Run(fmt.Sprint(presence), func(t *testing.T) {
 			s, store := testService(t)
+			store.accountPresent = presence.account
 			req := validApply()
-			if evidence {
+			if presence.evidence {
 				store.events = []db.LookupLegalAttributionRow{{AccountRef: req.AccountRef}}
 			}
 			res, err := s.Preserve(context.Background(), PreserveRequest{AccountRef: req.AccountRef, AppliedBy: req.AppliedBy,
@@ -223,7 +226,7 @@ func TestPreservePostDeletionAndAdvisoryExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.AccountPresent || res.LedgerEvidencePresent != evidence || !res.Hold.Record.IsActive || res.ObservedAt.IsZero() {
+			if res.AccountPresent != presence.account || res.LedgerEvidencePresent != presence.evidence || !res.Hold.Record.IsActive || res.ObservedAt.IsZero() {
 				t.Fatal("incorrect presence or expiry")
 			}
 		})
@@ -265,6 +268,36 @@ func TestValidationAndReadiness(t *testing.T) {
 	}
 	if _, _, err := s.queries(adminaction.WithContext(ctx, &adminaction.Operation{})); err == nil {
 		t.Fatal("broken tx context accepted")
+	}
+}
+
+func TestLegalInputByteBoundsBeforeNormalization(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		set  func(*ApplyRequest, string)
+		max  int
+	}{
+		{"reason", func(r *ApplyRequest, value string) { r.Reason = value }, MaxReasonBytes},
+		{"authority", func(r *ApplyRequest, value string) { r.RequestingAuthority = value }, MaxContextBytes},
+		{"basis", func(r *ApplyRequest, value string) { r.LegalBasis = value }, MaxContextBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			atLimit := strings.Repeat("\u00e9", tc.max/2) + strings.Repeat("x", tc.max%2)
+			r := validApply()
+			tc.set(&r, atLimit)
+			if _, err := s.Apply(ctx, r); err != nil {
+				t.Fatalf("rejected exact UTF-8 byte bound: %v", err)
+			}
+			for _, value := range []string{"", " \t\n ", atLimit + "x", " " + atLimit} {
+				r := validApply()
+				tc.set(&r, value)
+				if _, err := s.Apply(ctx, r); !errors.Is(err, ErrInvalidRequest) {
+					t.Fatalf("accepted blank/over-limit input before trim: %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -400,5 +433,66 @@ func TestLookupValidationAndPrivateErrors(t *testing.T) {
 	store.err = nil
 	if _, err := s.Lookup(context.Background(), req); !errors.Is(err, ErrUnavailable) {
 		t.Fatal("unverified pepper enabled")
+	}
+}
+
+func TestLookupBoundsAndEffectiveFractionalWindow(t *testing.T) {
+	s, _, req := lookupFixture(t)
+	WithMaxQueryWindow(1500 * time.Millisecond)(s)
+	req.StartTime = req.EndTime.Add(-1500 * time.Millisecond)
+	req.Identifier = strings.Repeat("x", 320-len("@example.test")) + "@example.test"
+	req.RequestingAuthority = strings.Repeat("a", MaxContextBytes)
+	req.CaseReference = strings.Repeat("\u00e9", 127) + "x"
+	req.Purpose = strings.Repeat("\u00e9", MaxReasonBytes/2)
+	if _, err := s.Lookup(context.Background(), req); err != nil {
+		t.Fatalf("rejected exact byte/time bounds: %v", err)
+	}
+	for _, mutate := range []func(*LookupRequest){
+		func(r *LookupRequest) { r.StartTime = r.StartTime.Add(-time.Nanosecond) },
+		func(r *LookupRequest) { r.Identifier = " " + r.Identifier },
+		func(r *LookupRequest) { r.Identifier = "Alice <alice@example.test>" },
+		func(r *LookupRequest) { r.RequestingAuthority += " " },
+		func(r *LookupRequest) { r.CaseReference += "x" },
+		func(r *LookupRequest) { r.Purpose += "x" },
+		func(r *LookupRequest) { r.Cursor = strings.Repeat("a", 4097) },
+		func(r *LookupRequest) { r.Fields = []string{"id"} },
+		func(r *LookupRequest) { r.Limit = -1 },
+	} {
+		changed := req
+		mutate(&changed)
+		if _, err := s.Lookup(context.Background(), changed); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("accepted out-of-bound lookup scope: %v", err)
+		}
+	}
+}
+
+func TestLookupCursorRetainsExactInternalCoordinates(t *testing.T) {
+	s, store, req := lookupFixture(t)
+	seqs := []int64{9007199254740993, math.MaxInt64 - 2, math.MaxInt64 - 1, math.MaxInt64}
+	for i := range store.events {
+		store.events[i].Seq = seqs[i]
+	}
+	first, err := s.Lookup(context.Background(), req)
+	if err != nil || first.Coverage.ThroughSeq != math.MaxInt64 || first.NextCursor == "" {
+		t.Fatalf("high-position lookup: %v", err)
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(first.NextCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := s.encryptor.Decrypt(context.Background(), encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(plain)
+	var cursor map[string]json.RawMessage
+	if err := json.Unmarshal(plain, &cursor); err != nil || string(cursor["after"]) != "9223372036854775805" || string(cursor["through"]) != "9223372036854775807" {
+		t.Fatal("wire coordinate change altered numeric encrypted cursor encoding")
+	}
+	req.Cursor = first.NextCursor
+	last, err := s.Lookup(context.Background(), req)
+	if err != nil || len(last.Events) != 2 || last.Events[0].Seq != seqs[2] || last.Events[1].Seq != seqs[3] || last.NextCursor != "" ||
+		last.Coverage.ThroughSeq != first.Coverage.ThroughSeq || !last.Coverage.ObservedAt.Equal(first.Coverage.ObservedAt) {
+		t.Fatalf("high-position continuation lost exact signed-64-bit scope: %v", err)
 	}
 }

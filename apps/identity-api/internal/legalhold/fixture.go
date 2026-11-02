@@ -23,7 +23,7 @@ type FixtureReader interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// VerifyLookupFixture checks the configured lookup key against a legacy-envelope
+// VerifyLookupFixture checks the configured lookup key against a synthetic
 // probe indexed by the deployed signer. Pin the signer/producer/lookup pepper;
 // re-run the probe after key or signer deployment changes. It is not a trust
 // anchor for historical chain integrity or a completeness assertion.
@@ -32,8 +32,9 @@ func VerifyLookupFixture(ctx context.Context, reader FixtureReader, indexer Blin
 		return ErrUnavailable
 	}
 	var index string
-	err := reader.QueryRow(ctx, `SELECT identity_blind_index FROM security_event_ledger
-		WHERE id=$1 AND client_id=$2 AND event_type=$3 AND identity_blind_index IS NOT NULL`,
+	err := reader.QueryRow(ctx, `SELECT l.identity_blind_index FROM security_ledger_chain c
+		JOIN security_event_ledger l ON l.seq=c.seq
+		WHERE c.event_id=$1 AND l.client_id=$2 AND l.event_type=$3 AND l.identity_blind_index IS NOT NULL`,
 		id, LookupFixtureClient, audit.EventLoginSucceeded).Scan(&index)
 	if err != nil || subtle.ConstantTimeCompare([]byte(index), []byte(indexer.Compute(LookupFixtureEmail(id)))) != 1 {
 		return ErrUnavailable

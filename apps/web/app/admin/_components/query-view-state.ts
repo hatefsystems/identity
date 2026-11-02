@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type FocusEvent } from 'react';
 import { PortalError } from '../../_lib/portal/errors';
 import { sensitiveClearEvent, sensitiveSuspendEvent } from '../../_lib/portal/invalidation';
 
@@ -107,7 +107,11 @@ export function queryFailureMessage(failure: unknown): string {
 export const querySelectClass =
   'min-h-11 w-full min-w-0 max-w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50';
 export const queryTableFrameClass =
-  'min-w-0 max-w-full overflow-x-auto rounded-lg border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
+  'min-w-0 max-w-full scroll-m-2 overflow-x-auto rounded-lg border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
+
+export function revealQueryFocus(event: FocusEvent<HTMLDivElement>) {
+  event.target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
 export const queryCellClass = 'px-3 py-2 text-left align-top text-sm';
 export const queryHeadClass = 'px-3 py-3 text-left text-xs font-semibold text-muted-foreground';
 export const queryClearedMessage =

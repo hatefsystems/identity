@@ -121,7 +121,7 @@ CREATE TABLE mvp_audit_logs (
     action_status VARCHAR(50) NOT NULL,
     client_ip VARCHAR(50) NOT NULL,
     user_agent TEXT NOT NULL,
-    payload TEXT NOT NULL, -- Serialized JSON representation (masked of PII)
+    payload TEXT NOT NULL, -- Minimized JSON; audit records still contain personal data
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     chain_hash VARCHAR(64) NOT NULL -- Chained Cryptographic hash for auditing integrity
 );
@@ -130,7 +130,7 @@ CREATE INDEX idx_mvp_audit_logs_event_type ON mvp_audit_logs(event_type);
 CREATE INDEX idx_mvp_audit_logs_timestamp ON mvp_audit_logs(timestamp DESC);
 
 -- 7. Security Event Ledger (Class B - Minimal, Persistent, Survives Account Deletion)
--- Purpose: retain the minimum non-PII metadata needed to attribute an abusive or
+-- Purpose: retain minimal pseudonymized personal data to attribute an abusive or
 -- security-relevant action AFTER an account is hard-deleted (e.g., a court inquiry
 -- arriving at day 60 about an action taken before a day-30 deletion).
 -- CRITICAL: rows here are decoupled from users(id). There is NO foreign key that would
@@ -138,7 +138,7 @@ CREATE INDEX idx_mvp_audit_logs_timestamp ON mvp_audit_logs(timestamp DESC);
 CREATE TABLE security_event_ledger (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     account_ref UUID NOT NULL,               -- Stable identity reference; survives hard-delete (NO FK to users)
-    identity_blind_index VARCHAR(64) NULL,   -- SHA-256(email/phone + pepper); enables attribution without raw PII
+    identity_blind_index VARCHAR(64) NULL,   -- HMAC-SHA256(normalized identity, keyed by pepper); no raw email/phone
     event_type VARCHAR(100) NOT NULL,        -- e.g., 'auth.login', 'token.issued', 'security.rtr_breach'
     client_ip VARCHAR(50) NULL,
     ip_subnet VARCHAR(50) NULL,              -- /24 (IPv4) or /48 (IPv6) grouping
@@ -157,8 +157,8 @@ CREATE INDEX idx_security_ledger_account_ref ON security_event_ledger(account_re
 CREATE INDEX idx_security_ledger_retain_until ON security_event_ledger(retain_until);
 CREATE INDEX idx_security_ledger_event_type ON security_event_ledger(event_type);
 
--- 8. Legal Holds (Precedence Lock over ALL retention timers)
--- An active hold overrides the 30-day grace window AND the security-ledger retention.
+-- 8. Legal Holds (Precedence Lock over erasure eligibility)
+-- An active hold defers Class A/Class B erasure, never the account recovery deadline.
 -- Holds > retention. A hold has no predefined duration; it stays until explicitly released.
 CREATE TABLE legal_holds (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -180,10 +180,11 @@ CREATE INDEX idx_legal_holds_active ON legal_holds(account_ref) WHERE is_active 
 
 ### 1.1.1 Persistence & Deletion Rules for Ledger and Holds
 
-- **`security_event_ledger` is intentionally NOT linked to `users(id)`.** Unlike `mvp_audit_logs` (whose `user_id` is `ON DELETE SET NULL` and whose `payload` is PII-masked), the ledger keeps a stable `account_ref` and an `identity_blind_index` so an action remains attributable after the account row is physically deleted - within the bounded `retain_until` window.
-- **Purge of the ledger** is driven solely by `retain_until` (scheduled job), never by account deletion.
+- **`security_event_ledger` is intentionally NOT linked to `users(id)`.** The ledger keeps the original `account_ref` and an `identity_blind_index` after account deletion, subject to its own retention/holds. This is **pseudonymized personal data**, not anonymous or non-PII. The nullable Class C `user_id` link and minimized payload do not anonymize `mvp_audit_logs`: baseline administrative audit retains actor/network metadata, linkable action/hold references, timestamps and response digests, which are personal data too.
+- **Purge of the ledger** is driven by `retain_until` and active holds (scheduled job), never by account deletion alone.
 - **Legal Hold precedence:** Before any purge - the 30-day hard-delete Cron on `users`, or the ledger purge job - the worker MUST check `legal_holds` for an active row matching the `account_ref`. If one exists, the purge is skipped and the skip is recorded in the audit log.
-- **No raw PII in the ledger.** Only the blind index is stored; raw email/phone stay in Class A and are erased on hard-delete.
+- **No raw email/phone identifiers in Class B.** Exact identity lookup uses the keyed blind index; Class A contacts follow their own deletion policy. Stable references, IP/subnet, user-agent and device/client metadata remain personal data. Removing raw identifiers is minimization, not anonymity.
+- **Independent requests and original clocks:** `review_at` and preservation `expires_at` are advisory, never automatic release. Releasing one request cannot release another. Once no hold protects the subject, original retention clocks resume, potentially making data eligible immediately; no recovery extension, clock reset, restoration of purged data or immutable evidence snapshot is created.
 
 ### 1.1.2 Retention Proof and Durable Head (Task 5.4)
 
@@ -376,7 +377,9 @@ Each encrypted record has a composite structure serialized into a binary payload
 
 To prevent $O(N)$ full-table decryptions when performing user queries by phone number or backup email, the database stores a secure cryptographic blind index:
 
-$$\text{blind\_index} = \text{SHA-256}(\text{PII} \ + \ \text{secret\_pepper})$$
+$$\text{blind\_index} = \text{HMAC-SHA256}_{\text{secret\_pepper}}(\text{lowercase}(\text{NFKC}(\text{trim}(\text{identity}))))$$
+
+This is the existing server-side keyed construction, not plain concatenation or anonymous data. Legal email attribution uses the same normalization; callers must not introduce provider-specific normalization or send the digest/pepper material to the browser. This documentation does not add phone attribution or historical multi-pepper search.
 
 - **Uniqueness & Indexing:** Blind indexes are stored in separate database columns (`phone_blind_index`, `backup_email_blind_index`) and indexed via B-tree. This enables $O(1)$ fast lookups without revealing plain text.
 - **Salt/Pepper Management:** The secret pepper is retrieved dynamically at application bootstrap from Infisical and kept strictly in memory. Non-exact queries (such as wildcards or substring matches) on PII columns are prohibited to ensure data minimization.
@@ -491,7 +494,7 @@ CREATE TABLE audit_logs (
     action_status Enum('success' = 1, 'failed' = 2),
     client_ip String,
     user_agent String,
-    payload String,               -- Serialized JSON representation (masked of PII)
+    payload String,               -- Minimized JSON; audit records still contain personal data
     timestamp DateTime64(6, 'UTC') DEFAULT now64(),
     
     -- Chained Cryptographic hash for auditing integrity
@@ -536,6 +539,16 @@ for actual tombstone fields and pending retention approval.
 
 ### Task 5.3 inherited boundary
 
-Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+Legal requests are independent encrypted rows, unique by `(account_ref, request_kind, idempotency_key)`, not actor or globally unique operation ID. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but **is still personal data**. Baseline section 1.7 auditing retains actor/network metadata, action/hold IDs, timestamps and response digests; section 1.8's narrower workflow projection must not be generalized to it.
+
+Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
 
 Task 5.4 adds separately credentialed ledger retention and retained-segment proof under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External trust anchors are explicitly deferred; phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE, maintenance EXECUTE or trigger-bypass privileges.
+
+### Task 7.6 Legal Disclosure Boundary
+
+The panel changes no schema, signed canonical bytes, stored hashes, retention policy or cleanup. Canonical-v2 attribution joins event UUIDs from `security_ledger_chain.event_id` to retained payload by `seq`. The real signer fixture check must use that same layout before attribution is exposed. Legal JSON `seq` and `coverage.through_seq` are canonical nonnegative decimal strings through `9223372036854775807`; internal `int64` and opaque cursor encoding remain unchanged. Coordinate all callers/replicas without a numeric fallback.
+
+Lookup discloses only core event/reference/time/sequence metadata plus explicitly selected supported fields. It never returns the raw identity, blind index/version, full audit payload or action content. Each page retains the original high-water/observation and rechecks current retention/holds; empty results do not establish no historical activity, one real-world person or complete historical pepper coverage. Preservation presence flags observe current account/payload existence, including soft-deleted/unindexed/expired rows, not completeness. A lookup and a later hold are separate transactions.
+
+The external controlled intake record must retain the exact normalized create tuple for explicit recovery; the browser stores no durable drafts, identifiers, cursors or operation keys. Deploying or rolling back the panel never drops holds, contexts, tombstones, accepted audit/outbox intent or chain data and never resets policy clocks. Baseline audit/narrative/replay/ledger policy approval, privacy notices and ROPA/DPIA/DSAR duties remain operator gates; this boundary does not close Task 5.3/5.4/5.5 or add a Class C purge policy.

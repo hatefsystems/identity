@@ -57,6 +57,10 @@ type request struct {
 	Role        string `json:"role,omitempty"`
 	Status      string `json:"status,omitempty"`
 	Scenario    string `json:"scenario,omitempty"`
+	FixtureID   string `json:"fixture_id,omitempty"`
+	AccountRef  string `json:"account_ref,omitempty"`
+	OperationID string `json:"operation_id,omitempty"`
+	RequestKind string `json:"request_kind,omitempty"`
 }
 
 type totpCode struct {
@@ -89,6 +93,7 @@ func run(args []string) error {
 	switch args[0] {
 	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
 	case "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
+	case "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup":
 	default:
 		return errors.New("unsupported fixture action")
 	}
@@ -168,6 +173,13 @@ func run(args []string) error {
 	}
 	defer pool.Close()
 	if strings.HasPrefix(args[0], "admin-") {
+		if strings.HasPrefix(args[0], "admin-legal-") {
+			output, err := legalFixture(ctx, pool, runID, args[0], input)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(output)
+		}
 		output, err := adminFixture(ctx, pool, runID, args[0], input)
 		if err != nil {
 			return err

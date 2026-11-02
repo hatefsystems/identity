@@ -29,7 +29,8 @@
           { "projects": ["identity-api"], "target": "build-portal-fixture" },
           { "projects": ["identity-api"], "target": "build-deletion-notifier" },
           { "projects": ["identity-api"], "target": "build-audit-signer" },
-          { "projects": ["identity-api"], "target": "build-admin-audit-publisher" }
+          { "projects": ["identity-api"], "target": "build-admin-audit-publisher" },
+          { "projects": ["identity-api"], "target": "build-admin-legal" }
         ],
         "cache": false
       }

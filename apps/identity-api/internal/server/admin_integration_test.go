@@ -51,11 +51,15 @@ type adminIntegration struct {
 
 type adminCountingSessionStore struct {
 	session.Store
-	touches atomic.Int64
+	touches  atomic.Int64
+	touchErr error
 }
 
 func (s *adminCountingSessionStore) Touch(ctx context.Context, hash string, expiry time.Time) error {
 	s.touches.Add(1)
+	if s.touchErr != nil {
+		return s.touchErr
+	}
 	return s.Store.Touch(ctx, hash, expiry)
 }
 
@@ -165,6 +169,11 @@ func (f *adminIntegration) grant(t *testing.T, role string) string {
 
 func (f *adminIntegration) request(t *testing.T, role, method, path, body, grant string) *httptest.ResponseRecorder {
 	t.Helper()
+	return f.requestWithKey(t, role, method, path, body, grant, uuid.NewString())
+}
+
+func (f *adminIntegration) requestWithKey(t *testing.T, role, method, path, body, grant, key string) *httptest.ResponseRecorder {
+	t.Helper()
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
@@ -175,7 +184,9 @@ func (f *adminIntegration) request(t *testing.T, role, method, path, body, grant
 	if cookie := f.cookies[role]; cookie != nil {
 		f.browser.authorize(t, r, f.actors[role], cookie)
 	}
-	r.Header.Set("Idempotency-Key", uuid.NewString())
+	if key != "" {
+		r.Header.Set("Idempotency-Key", key)
+	}
 	r.Header.Set(stepup.HeaderStepUpAuth, grant)
 	w := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(w, r)

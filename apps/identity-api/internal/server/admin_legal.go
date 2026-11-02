@@ -55,7 +55,7 @@ type adminApplyLegalHoldRequest struct {
 // Legal endpoints additionally reject all query parameters on body-based paths,
 // so a caller cannot accidentally place an identifier or narrative in a URL.
 func decodeLegalBody(w http.ResponseWriter, r *http.Request, dst any) error {
-	if r.URL.RawQuery != "" {
+	if !validAdminQuery(r) {
 		return legalhold.ErrInvalidRequest
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
@@ -137,11 +137,9 @@ func (s *Server) handleAdminListLegalHolds() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		for key, values := range r.URL.Query() {
-			if (key != "account_ref" && key != "status" && key != "limit" && key != "offset") || len(values) != 1 {
-				s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
-				return
-			}
+		if !validAdminQuery(r, "account_ref", "status", "limit", "offset") {
+			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+			return
 		}
 		limit, offset, err := s.parsePagination(r)
 		if err != nil {
@@ -149,15 +147,16 @@ func (s *Server) handleAdminListLegalHolds() http.HandlerFunc {
 			return
 		}
 		var account uuid.NullUUID
-		if raw := r.URL.Query().Get("account_ref"); raw != "" {
-			id, err := uuid.Parse(raw)
+		query := r.URL.Query()
+		if query.Has("account_ref") {
+			id, err := uuid.Parse(query.Get("account_ref"))
 			if err != nil || id == uuid.Nil {
 				s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
 				return
 			}
 			account = uuid.NullUUID{UUID: id, Valid: true}
 		}
-		status := r.URL.Query().Get("status")
+		status := query.Get("status")
 		if status == "" {
 			status = "active"
 		}
@@ -188,7 +187,7 @@ func (s *Server) handleAdminReleaseLegalHold() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if r.URL.RawQuery != "" {
+		if !validAdminQuery(r) {
 			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
 			return
 		}
@@ -299,7 +298,7 @@ type adminLedgerEventResponse struct {
 	DeviceFingerprint *string    `json:"device_fingerprint,omitempty"`
 	ClientID          *string    `json:"client_id,omitempty"`
 	Scope             *string    `json:"scope,omitempty"`
-	Seq               int64      `json:"seq"`
+	Seq               int64      `json:"seq,string"`
 }
 
 // newAdminLedgerEvent projects one disclosure row.

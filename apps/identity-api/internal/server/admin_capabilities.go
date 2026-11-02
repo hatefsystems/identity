@@ -9,13 +9,18 @@ import (
 )
 
 type adminCapabilities struct {
-	UsersRead        bool `json:"users_read"`
-	UsersPII         bool `json:"users_pii"`
-	UsersLookup      bool `json:"users_lookup"`
-	UsersStatusWrite bool `json:"users_status_write"`
-	AuditLogsRead    bool `json:"audit_logs_read"`
-	AuditChainVerify bool `json:"audit_chain_verify"`
-	LedgerVerify     bool `json:"ledger_verify"`
+	UsersRead                  bool `json:"users_read"`
+	UsersPII                   bool `json:"users_pii"`
+	UsersLookup                bool `json:"users_lookup"`
+	UsersStatusWrite           bool `json:"users_status_write"`
+	AuditLogsRead              bool `json:"audit_logs_read"`
+	AuditChainVerify           bool `json:"audit_chain_verify"`
+	LedgerVerify               bool `json:"ledger_verify"`
+	LegalHoldsRead             bool `json:"legal_holds_read"`
+	LegalHoldsApply            bool `json:"legal_holds_apply"`
+	LegalHoldsRelease          bool `json:"legal_holds_release"`
+	PreservationRequestsCreate bool `json:"preservation_requests_create"`
+	LegalInquiryLookup         bool `json:"legal_inquiry_lookup"`
 }
 
 type adminCapabilitiesResponse struct {
@@ -45,10 +50,11 @@ func (s *Server) handleAdminCapabilities(available adminCapabilities) http.Handl
 		}
 		// Resolve a fixed set on the primary transaction, never a cache or role
 		// label. This is presentation metadata, not authority for later requests.
-		grants := make(map[string]bool, 5)
+		grants := make(map[string]bool, 8)
 		for _, permission := range []string{
 			permAdminUsersRead, permAdminUsersReadPII, permAdminUsersStatusWrit,
 			permAdminAuditLogsRead, permAdminAuditLogsVerify,
+			permLegalHoldsRead, permLegalHoldsWrite, permLegalInquiryLookup,
 		} {
 			allowed, err := op.Queries.UserHasPermission(r.Context(), db.UserHasPermissionParams{
 				UserID: actor, PermissionID: permission,
@@ -60,15 +66,21 @@ func (s *Server) handleAdminCapabilities(available adminCapabilities) http.Handl
 			grants[permission] = allowed
 		}
 		caps := adminCapabilities{
-			UsersRead:        available.UsersRead && grants[permAdminUsersRead],
-			UsersStatusWrite: available.UsersStatusWrite && grants[permAdminUsersStatusWrit],
-			AuditLogsRead:    available.AuditLogsRead && grants[permAdminAuditLogsRead],
-			AuditChainVerify: available.AuditChainVerify && grants[permAdminAuditLogsVerify],
-			LedgerVerify:     available.LedgerVerify && grants[permAdminAuditLogsVerify],
+			UsersRead:                  available.UsersRead && grants[permAdminUsersRead],
+			UsersStatusWrite:           available.UsersStatusWrite && grants[permAdminUsersStatusWrit],
+			AuditLogsRead:              available.AuditLogsRead && grants[permAdminAuditLogsRead],
+			AuditChainVerify:           available.AuditChainVerify && grants[permAdminAuditLogsVerify],
+			LedgerVerify:               available.LedgerVerify && grants[permAdminAuditLogsVerify],
+			LegalHoldsRead:             available.LegalHoldsRead && grants[permLegalHoldsRead],
+			LegalHoldsApply:            available.LegalHoldsApply && grants[permLegalHoldsWrite],
+			LegalHoldsRelease:          available.LegalHoldsRelease && grants[permLegalHoldsWrite],
+			PreservationRequestsCreate: available.PreservationRequestsCreate && grants[permLegalHoldsWrite],
+			LegalInquiryLookup:         available.LegalInquiryLookup && grants[permLegalInquiryLookup],
 		}
 		caps.UsersPII = caps.UsersRead && grants[permAdminUsersReadPII]
 		caps.UsersLookup = available.UsersLookup && caps.UsersPII
-		if !caps.UsersRead && !caps.UsersStatusWrite && !caps.AuditLogsRead && !caps.AuditChainVerify && !caps.LedgerVerify {
+		if !caps.UsersRead && !caps.UsersStatusWrite && !caps.AuditLogsRead && !caps.AuditChainVerify && !caps.LedgerVerify &&
+			!caps.LegalHoldsRead && !caps.LegalHoldsApply && !caps.LegalHoldsRelease && !caps.PreservationRequestsCreate && !caps.LegalInquiryLookup {
 			s.writeAdminError(w, http.StatusForbidden, "forbidden")
 			return
 		}

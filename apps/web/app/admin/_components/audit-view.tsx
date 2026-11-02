@@ -27,6 +27,7 @@ import {
   queryFailureMessage,
   queryHeadClass,
   queryTableFrameClass,
+  revealQueryFocus,
   useQueryViewWork,
 } from './query-view-state';
 import { QueryUtcTime } from './query-view-time';
@@ -309,6 +310,7 @@ function AuditQuery({
             aria-label="Audit results, horizontally scrollable"
             tabIndex={0}
             className={queryTableFrameClass}
+            onFocus={revealQueryFocus}
           >
             <table className="w-full min-w-[36rem] border-collapse">
               <caption className="sr-only">

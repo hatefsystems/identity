@@ -42,6 +42,11 @@ const noFlags: AdminCapabilities['capabilities'] = {
   audit_logs_read: false,
   audit_chain_verify: false,
   ledger_verify: false,
+  legal_holds_read: false,
+  legal_holds_apply: false,
+  legal_holds_release: false,
+  preservation_requests_create: false,
+  legal_inquiry_lookup: false,
 };
 const allFlags: AdminCapabilities['capabilities'] = {
   users_read: true,
@@ -51,6 +56,11 @@ const allFlags: AdminCapabilities['capabilities'] = {
   audit_logs_read: true,
   audit_chain_verify: true,
   ledger_verify: true,
+  legal_holds_read: false,
+  legal_holds_apply: false,
+  legal_holds_release: false,
+  preservation_requests_create: false,
+  legal_inquiry_lookup: false,
 };
 const profile: Profile = {
   id: '00000000-0000-4000-8000-000000000099',
@@ -94,6 +104,7 @@ function context(flags = allFlags, effectiveLimits = limits, currentProfile = pr
     deleteAccount: jest.fn(),
     rememberStepUp: jest.fn(),
     reportModerationInterruption: jest.fn(),
+    reportLegalInterruption: jest.fn(),
   });
 }
 function account(index: number, overrides: Partial<AdminUser> = {}): AdminUser {
@@ -189,6 +200,10 @@ const encoderDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'TextEncod
 let visibility: PropertyDescriptor | undefined;
 
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+    configurable: true,
+    value: jest.fn(),
+  });
   Object.defineProperty(globalThis, 'TextEncoder', { configurable: true, value: TextEncoder });
   Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
     configurable: true,
@@ -562,6 +577,11 @@ describe('UTC audit query and bounded keyset navigation', () => {
     expect(screen.queryByText(row.payload)).toBeNull();
     expect(screen.queryByText(row.client_ip)).toBeNull();
     expect(screen.queryByText(row.actor_id)).toBeNull();
+    const frame = screen.getByRole('region', { name: 'Audit results, horizontally scrollable' });
+    jest.mocked(frame.scrollIntoView).mockClear();
+    frame.focus();
+    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
+    expect(frame.className).toContain('scroll-m-2');
     open.focus();
     fireEvent.click(open);
     const dialog = screen.getByRole('dialog', { name: 'Audit record details' });

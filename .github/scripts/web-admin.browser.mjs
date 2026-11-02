@@ -1,21 +1,141 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readlink, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { browserFailure, guardBrowserFailures, startPortalHarness } from './portal-harness.mjs';
+import { browserFailure, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalRoute, startPortalHarness } from './portal-harness.mjs';
 import {
   addAuthenticator, api, clean, hidePortal, newContext, operationResponse as waitForOperation, signIn, visit,
 } from './web-portal.browser.mjs';
 
 let checkpoint = 'startup';
-const routes = ['/admin', '/admin/users', '/admin/audit-logs', '/admin/integrity'];
+const routes = ['/admin', '/admin/users', '/admin/audit-logs', '/admin/integrity', '/admin/legal'];
 const script = fileURLToPath(import.meta.url);
 const workspace = resolve(dirname(script), '../..');
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const statusRoute = /^\/api\/v1\/admin\/users\/[^/]+\/status\/?$/;
+const legalCreate = ['/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests'];
+const legalLookup = '/api/v1/admin/legal-inquiry/lookup';
+const legalRelease = /^\/api\/v1\/admin\/legal-holds\/[0-9a-f-]{36}$/;
+
+export function observeLegalWrites(cdp, origin) {
+  const attempts = [];
+  let reconciliation = false;
+  let invalid = false;
+  const outgoing = ({ requestId, request }) => {
+    try {
+      const url = new URL(request.url);
+      const createCandidate = request.method === 'POST' && legalCreate.some((path) => url.pathname === path || url.pathname === path + '/');
+      const releaseCandidate = request.method === 'DELETE' && /^\/api\/v1\/admin\/legal-holds\/[^/]+\/?$/.test(url.pathname);
+      if (!createCandidate && !releaseCandidate) return;
+      const headers = new Headers(request.headers);
+      const claims = JSON.parse(Buffer.from((headers.get('DPoP') || '').split('.')[1], 'base64url').toString());
+      assert(url.origin === origin && !url.search && !url.hash && typeof requestId === 'string');
+      const key = headers.get('Idempotency-Key');
+      if (request.method === 'POST') {
+        legalIdempotencyKey(url.pathname, request.method, key);
+        assert(typeof request.postData === 'string');
+      } else assert(legalRelease.test(url.pathname) && key === null && !request.postData);
+      assert(claims.nonce === undefined || typeof claims.nonce === 'string');
+      attempts.push({
+        id: requestId, reconciliation, status: null, challenge: null,
+        followsChallenge: attempts.length === 1 && attempts[0].status === 401 && attempts[0].challenge !== null,
+        nonce: claims.nonce === undefined ? null : digest(claims.nonce),
+        logicalRequest: digest(JSON.stringify([request.method, request.url, request.postData || '', key,
+          headers.get('X-Portal-Session'), headers.get('X-Step-Up-Auth')])),
+      });
+    } catch { invalid = true; }
+  };
+  cdp.on('Network.requestWillBeSent', outgoing);
+  return {
+    get count() { assert(!invalid, 'Legal write observation failed'); return attempts.length; },
+    response(event, body = '') {
+      const attempt = attempts.find(({ id }) => id === event.networkId);
+      assert(attempt && attempt.status === null, 'Unmatched or repeated legal write response');
+      attempt.status = event.responseStatusCode;
+      const headers = new Headers();
+      for (const { name, value } of event.responseHeaders || []) headers.append(name, value);
+      const nonce = headers.get('DPoP-Nonce');
+      if (attempt.status === 401 && nonce && /^[A-Za-z0-9._~-]{1,1024}$/.test(nonce) &&
+          /^DPoP[ \t]+error="use_dpop_nonce"$/i.test(headers.get('WWW-Authenticate') || '')) {
+        assert(Buffer.byteLength(body) <= 4096, 'Oversized legal nonce challenge');
+        if (JSON.parse(body)?.error === 'use_dpop_nonce') attempt.challenge = digest(nonce);
+      }
+    },
+    reconcile() { reconciliation = true; },
+    assertLostResponse(status) {
+      assert(!invalid && [201, 204].includes(status), 'Invalid lost legal write observation');
+      assert(attempts.length === 1 || attempts.length === 2, 'Unexpected outgoing legal write, including a failed replay');
+      assert(attempts.every((attempt) => !attempt.reconciliation), 'Legal state reconciliation transmitted a write');
+      if (attempts.length === 2) {
+        const [first, retry] = attempts;
+        assert(first.status === 401 && first.challenge && first.nonce === null && retry.followsChallenge &&
+          retry.nonce === first.challenge && retry.logicalRequest === first.logicalRequest,
+        'Legal nonce retry changed the body, key, scope or grant');
+      }
+      assert(attempts.at(-1).status === status && !attempts.at(-1).challenge, 'Expected one deliberately lost real legal success');
+      return { outgoingLegalWrites: attempts.length, preHandlerNonceRetries: attempts.length - 1, reconciliationWrites: 0 };
+    },
+    close() { cdp.off('Network.requestWillBeSent', outgoing); attempts.length = 0; },
+  };
+}
+
+export function observeLegalPrivacy(context, harness, markers, failures) {
+  harness.secrets.push(...Object.values(markers));
+  for (const value of Object.values(markers)) harness.legalSecrets.add(value);
+  context.on('request', (request) => {
+    try {
+      const url = new URL(request.url());
+      const headers = new Headers(request.headers());
+      const contains = (text) => [...harness.legalSecrets].some((value) => value &&
+        (text.includes(value) || text.includes(encodeURIComponent(value)) || text.includes(JSON.stringify(value).slice(1, -1))));
+      for (const value of harness.legalSecrets) {
+        if (value && (url.href.includes(value) || url.href.includes(encodeURIComponent(value)))) {
+          // Existing Task 7.5 independently reads the same ledger coordinates.
+          // This is not a legal-result navigation or a new arbitrary query rule.
+          const existingReference = harness.routeReferences?.has(value) && url.origin === harness.origin &&
+            portalRoute(url.pathname).includes('{id}') && !url.search && !url.hash;
+          assert(legalReferenceRequest(request, value, harness) || legalCoordinateRequest(request, value, harness) || existingReference);
+        }
+      }
+      if (url.origin === harness.origin && url.pathname.startsWith('/api/')) {
+        const legalGrant = headers.get('x-step-up-auth');
+        if (legalGrant) assert(!url.search && !url.hash && (
+          (request.method() === 'POST' && [...legalCreate, legalLookup].includes(url.pathname)) ||
+          (request.method() === 'DELETE' && legalRelease.test(url.pathname)) ||
+          (request.method() === 'PATCH' && statusRoute.test(url.pathname))
+        ), 'A step-up grant escaped a required admin operation');
+        for (const name of ['dpop', 'x-step-up-auth']) {
+          const value = headers.get(name);
+          if (value) { harness.secrets.push(value); harness.legalSecrets.add(value); }
+        }
+        for (const name of ['cookie', 'dpop', 'x-portal-session', 'x-step-up-auth']) headers.delete(name);
+        const key = headers.get('Idempotency-Key');
+        if (key !== null) {
+          legalIdempotencyKey(url.pathname + url.search + url.hash, request.method(), key);
+          harness.secrets.push(key);
+          harness.legalSecrets.add(key);
+          headers.delete('Idempotency-Key');
+        }
+      }
+      assert(!contains(JSON.stringify([...headers])));
+      const body = request.postData() || '';
+      if (!contains(body)) return;
+      assert(url.origin === harness.origin && !url.search && !url.hash && request.method() === 'POST');
+      const allowed = legalCreate.includes(url.pathname)
+        ? ['account_ref', 'reason', 'requesting_authority', ...(url.pathname.endsWith('/legal-holds') ? ['legal_basis', 'review_at'] : ['expires_at'])]
+        : url.pathname === legalLookup ? ['identifier', 'requesting_authority', 'case_reference', 'purpose', 'cursor'] : [];
+      assert(allowed.length > 0);
+      const rest = JSON.parse(body);
+      for (const key of allowed) delete rest[key];
+      assert(!contains(JSON.stringify(rest)));
+      assert(!Object.entries(markers).some(([key, value]) => key.endsWith('Draft') && body.includes(value)),
+        'An unsent legal draft was transmitted');
+    } catch { failures.push('Private legal data escaped its exact API request boundary'); }
+  });
+}
 
 export function observeStatusPatches(cdp, origin) {
   const attempts = [];
@@ -376,7 +496,9 @@ async function layout(page, name, evidence, artifactDirectory) {
         assert(stops > 0, 'Admin modal has no keyboard controls');
         for (let index = 0; index < stops; index++) {
           await page.keyboard.press('Tab');
-          assert.deepEqual(await page.evaluate(adminAppearance, { focusedOnly: true }), [], 'Admin modal keyboard focus regressed');
+          const failures = await page.evaluate(adminAppearance, { focusedOnly: true });
+          if (failures.length) console.error(JSON.stringify({ check: 'admin-modal-focus', viewport, dark, failures }));
+          assert.deepEqual(failures, [], 'Admin modal keyboard focus regressed');
         }
       } else {
         const controls = page.locator('table tbody a[href]:visible, table tbody button:enabled:visible');
@@ -387,7 +509,9 @@ async function layout(page, name, evidence, artifactDirectory) {
           })), 'Admin table lacks semantic column headers');
           await controls.first().focus();
           await page.keyboard.press('Shift+Tab');
-          assert.deepEqual(await page.evaluate(adminAppearance, { focusedOnly: true }), [], 'Admin table entry focus regressed');
+          const entryFailures = await page.evaluate(adminAppearance, { focusedOnly: true });
+          if (entryFailures.length) console.error(JSON.stringify({ check: 'admin-table-entry-focus', viewport, dark, failures: entryFailures }));
+          assert.deepEqual(entryFailures, [], 'Admin table entry focus regressed');
           for (let index = 0; index < await controls.count(); index++) {
             await page.keyboard.press('Tab');
             assert(await controls.nth(index).evaluate((element) => element === document.activeElement), 'Admin table keyboard order regressed');
@@ -402,7 +526,7 @@ async function layout(page, name, evidence, artifactDirectory) {
           path: resolve(artifactDirectory, `${name}-${viewport.width}x${viewport.height}-${dark ? 'dark' : 'light'}.png`),
           fullPage: true,
           animations: 'disabled',
-          mask: [page.locator('tbody, main dd, main .font-mono, input, textarea')],
+          mask: [page.locator('tbody, main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')],
         });
       }
       evidence.layouts++;
@@ -443,11 +567,597 @@ async function queryFault(page, path, action, response) {
   } finally { clearTimeout(timer); await page.unroute(pattern, intercept); }
 }
 
+async function validateLegal(harness, actors, evidence, artifactDirectory, markers) {
+  const fixture = harness.fixture('admin-legal-seed');
+  assert.equal(fixture.canonical_version, 2);
+  const { deleted_account_ref: deleted, current_account_ref: current, absent_account_ref: absent } = fixture;
+  const dpo = actors.dpo;
+  const second = actors.legal_operator;
+  const combined = actors.combined;
+  const grants = new Set();
+  const verificationTimes = new Map();
+  let verificationCount = 0;
+  const holdsPath = legalCreate[0];
+  const preservePath = legalCreate[1];
+  const fields = { client_ip: 'Client IP', ip_subnet: 'IP subnet', user_agent: 'User agent',
+    device_fingerprint: 'Device fingerprint', client_id: 'Client ID', scope: 'Scope' };
+  const hold = { account_ref: deleted, reason: markers.reason, requesting_authority: markers.requesting_authority,
+    legal_basis: markers.legal_basis, review_at: '2020-01-01T00:00:00.000Z' };
+  const preserve = (account) => ({ account_ref: account, reason: markers.reason,
+    requesting_authority: markers.requesting_authority, expires_at: hold.review_at });
+  const inquiry = { identifier_type: 'email', identifier: fixture.email, requesting_authority: markers.requesting_authority,
+    case_reference: markers.case_reference, purpose: markers.purpose, start_time: fixture.start_time,
+    end_time: fixture.end_time, limit: 20, fields: [] };
+  const recordedOperation = randomUUID();
+  const state = (account, key, kind = 'legal_hold') => harness.fixture('admin-legal-state', {
+    account_ref: account, ...(key ? { operation_id: key, request_kind: kind } : {}),
+  });
+  const response = async (page, path, method, status) => {
+    const body = status === 204 ? null : harness.captureJSON(path, method, status);
+    const result = await waitForOperation(page, path, method);
+    assert.equal(result.status(), status, 'Unexpected legal API outcome');
+    const grant = result.request().headers()['x-step-up-auth'];
+    if (method !== 'GET') {
+      assert(typeof grant === 'string' && !grants.has(digest(grant)), 'A UI legal operation reused a step-up grant');
+      grants.add(digest(grant));
+    }
+    return { response: result, body: body && await body };
+  };
+  const section = async (actor, name) => {
+    if (new URL(actor.page.url()).pathname !== '/admin/legal') await open(actor.page, harness, '/admin/legal');
+    else {
+      await actor.page.bringToFront();
+      await actor.page.getByTestId('admin-ready').waitFor();
+    }
+    const button = actor.page.getByRole('button', { name, exact: true });
+    await button.click();
+    assert.equal(await button.getAttribute('aria-pressed'), 'true');
+    assert.equal(new URL(actor.page.url()).search + new URL(actor.page.url()).hash, '');
+  };
+  const verify = async (actor, button, { method = 'passkey' } = {}) => {
+    const times = verificationTimes.get(actor) || [];
+    assert(times.length < 20 && verificationCount < 30, 'Legal scenarios exceed the unchanged production step-up budget');
+    if (times.length >= 5) {
+      const wait = times.at(-5) + 61_000 - Date.now();
+      if (wait > 0) {
+        const requests = harness.originEvidence.legal;
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        assert.equal(harness.originEvidence.legal, requests, 'Idle legal views polled or retried during a real rate window');
+      }
+    }
+    const { page } = actor;
+    await button.click();
+    const dialog = page.getByTestId('stepup-dialog');
+    await dialog.waitFor({ state: 'visible' });
+    assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
+    assert.equal(await dialog.getByLabel('Email for attribution', { exact: true }).count(), 0);
+    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
+    const captured = harness.captureJSON('/api/v1/auth/stepup/verify', 'POST', 200);
+    times.push(Date.now());
+    verificationTimes.set(actor, times);
+    verificationCount++;
+    if (method === 'totp') {
+      await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
+      await dialog.getByLabel('Authenticator code', { exact: true }).fill(harness.fixture('totp-code', { user_id: actor.fixture.user_id }).code);
+      await dialog.getByRole('button', { name: 'Verify code', exact: true }).click();
+    } else await dialog.getByRole('button', { name: 'Verify with a passkey', exact: true }).click();
+    const grant = await captured;
+    assert(typeof grant.token === 'string' && grant.token.length > 0, 'Missing real verification grant');
+    harness.secrets.push(grant.token);
+    harness.legalSecrets.add(grant.token);
+    await dialog.locator('[data-legal-private]').waitFor({ state: 'visible' });
+    return { dialog, token: grant.token };
+  };
+  const fillCreate = async (dialog, payload, key, pinned = false) => {
+    const target = dialog.getByLabel('Original account reference', { exact: true });
+    if (pinned) {
+      assert.equal(await target.inputValue(), payload.account_ref);
+      assert(await target.isDisabled(), 'Selected attribution reference was not pinned');
+    } else await target.fill(payload.account_ref);
+    const operation = dialog.getByLabel('Operation UUID', { exact: true });
+    assert.equal(await operation.inputValue(), '', 'A legal operation UUID was generated or recovered in the browser');
+    await operation.fill(key);
+    await dialog.getByLabel('Reason', { exact: true }).fill(`  ${payload.reason}  `);
+    await dialog.getByLabel('Requesting authority', { exact: true }).fill(payload.requesting_authority);
+    if ('legal_basis' in payload) await dialog.getByLabel('Legal basis', { exact: true }).fill(payload.legal_basis);
+    await dialog.getByLabel('legal_basis' in payload ? 'Review at (UTC)' : 'Expires at (UTC)', { exact: true })
+      .fill(payload.review_at || payload.expires_at || '');
+    const detached = await dialog.locator('input:not([type=checkbox]), textarea').elementHandles();
+    try {
+      await dialog.getByRole('button', { name: 'Review request', exact: true }).click();
+      assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
+      assert((await Promise.all(detached.map((control) => control.evaluate((element) =>
+        element.value === '' && element.defaultValue === '' &&
+        (element instanceof HTMLTextAreaElement ? element.textContent === '' : !element.getAttribute('value')))))).every(Boolean),
+      'Reviewing legal inputs retained a detached live or default value');
+    } finally { await Promise.all(detached.map((control) => control.dispose())); }
+  };
+  const confirm = async (dialog, label, double = false) => {
+    await dialog.getByRole('checkbox', { name: /^I reviewed / }).check();
+    const button = dialog.getByRole('button', { name: label, exact: true });
+    if (double) await button.evaluate((element) => { element.click(); element.click(); });
+    else await button.click();
+  };
+  const create = async (actor, payload, key, { replay = false, method, pinned = false, double = false, status = replay ? 200 : 201 } = {}) => {
+    const kind = 'legal_basis' in payload ? 'hold' : 'preservation';
+    if (!pinned) await section(actor, kind === 'hold' ? 'Legal Holds' : 'Preservation');
+    const { dialog } = await verify(actor, actor.page.getByRole('button', {
+      name: kind === 'hold' ? 'Apply Legal Hold' : 'Record preservation', exact: true,
+    }), { method });
+    await fillCreate(dialog, payload, key, pinned);
+    const received = response(actor.page, kind === 'hold' ? holdsPath : preservePath, 'POST', status);
+    await confirm(dialog, kind === 'hold' ? 'Confirm Legal Hold' : 'Confirm preservation', double);
+    const result = await received;
+    assert.equal(result.response.request().headers()['idempotency-key'], key);
+    assert.deepEqual(result.response.request().postDataJSON(), payload, 'Legal create changed the recorded normalized tuple');
+    if (status < 300) {
+      const outcome = actor.page.getByTestId('legal-outcome');
+      await outcome.waitFor({ state: 'visible' });
+      assert.equal(await outcome.getAttribute('data-outcome'), replay ? 'replayed' : 'confirmed');
+      assert.equal(result.body.replayed, replay);
+    }
+    return result.body;
+  };
+  const readHolds = async (actor, account, limit = 20) => {
+    await section(actor, 'Legal Holds');
+    const form = actor.page.getByRole('form', { name: 'Read Legal Holds', exact: true });
+    if (account === undefined) await form.getByRole('checkbox', { name: 'All original references', exact: true }).check();
+    else {
+      await form.getByRole('checkbox', { name: 'All original references', exact: true }).uncheck();
+      await form.getByLabel('Original account reference', { exact: true }).fill(account);
+    }
+    await form.getByLabel('Hold status', { exact: true }).selectOption('all');
+    await form.getByLabel('Page size', { exact: true }).fill(String(limit));
+    const received = response(actor.page, holdsPath, 'GET', 200);
+    await form.getByRole('button', { name: 'Read Legal Holds', exact: true }).click();
+    const result = await received;
+    assert.equal(new URL(result.response.url()).searchParams.get('account_ref'), account ?? null);
+    if (result.body.items.length) await actor.page.getByTestId('legal-hold-row').first().waitFor();
+    return result.body;
+  };
+  const prepareRelease = async (actor, account, id) => {
+    await readHolds(actor, account);
+    const row = actor.page.getByTestId('legal-hold-row').filter({ hasText: id });
+    const { dialog } = await verify(actor, row.getByRole('button', { name: 'Release request', exact: true }));
+    assert((await dialog.textContent()).includes(id), 'Release did not pin the immutable request UUID');
+    assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
+    return dialog;
+  };
+  const release = async (actor, account, id, status = 204) => {
+    const dialog = await prepareRelease(actor, account, id);
+    const received = response(actor.page, `${holdsPath}/${id}`, 'DELETE', status);
+    await confirm(dialog, 'Confirm release');
+    const result = await received;
+    assert(!result.response.request().postData() && !result.response.request().headers()['idempotency-key']);
+    if (status === 204) await actor.page.getByTestId('legal-outcome').waitFor();
+    return result;
+  };
+  const prepareLookup = async (actor, query = inquiry) => {
+    await section(actor, 'Attribution');
+    const verified = await verify(actor, actor.page.getByRole('button', { name: 'Start attribution inquiry', exact: true }));
+    for (const [key, label] of Object.entries(fields)) {
+      const checkbox = verified.dialog.getByRole('checkbox', { name: label, exact: true });
+      assert(!(await checkbox.isChecked()), 'Disclosure opt-in was restored or enabled by default');
+      if (query.fields.includes(key)) await checkbox.check();
+    }
+    for (const [key, label] of [['identifier', 'Email for attribution'], ['requesting_authority', 'Requesting authority'],
+      ['case_reference', 'Case reference'], ['purpose', 'Inquiry purpose'], ['start_time', 'Start time (UTC)'], ['end_time', 'End time (UTC)'], ['limit', 'Page size']])
+      await verified.dialog.getByLabel(label, { exact: true }).fill(String(query[key]));
+    await verified.dialog.getByRole('button', { name: 'Review request', exact: true }).click();
+    return verified;
+  };
+  const lookup = async (actor, query = inquiry, status = 200) => {
+    const { dialog } = await prepareLookup(actor, query);
+    const received = response(actor.page, legalLookup, 'POST', status);
+    await confirm(dialog, 'Confirm lookup');
+    const result = await received;
+    const submitted = result.response.request().postDataJSON();
+    assert.deepEqual({ ...submitted, fields: [...submitted.fields].sort() }, { ...query, fields: [...query.fields].sort() });
+    if (status === 200) await actor.page.getByTestId('legal-coverage').waitFor();
+    return result;
+  };
+  const lostWrite = async (actor, path, status, send, reconcile) => {
+    const cdp = actor.authenticator.cdp;
+    const observer = observeLegalWrites(cdp, harness.origin);
+    const pending = [];
+    let failed = false;
+    let committed = 0;
+    const paused = (event) => pending.push((async () => {
+      try {
+        if (!['POST', 'DELETE'].includes(event.request.method)) {
+          await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+          return;
+        }
+        let body = '';
+        if (event.responseStatusCode === 401) {
+          const result = await cdp.send('Fetch.getResponseBody', { requestId: event.requestId });
+          assert(result.body.length <= 8192);
+          body = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf8') : result.body;
+        }
+        observer.response(event, body);
+        if (event.responseStatusCode === status) {
+          committed++;
+          await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' });
+        } else await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+      } catch {
+        failed = true;
+        await cdp.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'Failed' }).catch(() => {});
+      }
+    })());
+    cdp.on('Fetch.requestPaused', paused);
+    try {
+      await cdp.send('Fetch.enable', { patterns: [{ urlPattern: harness.origin + path, requestStage: 'Response' }] });
+      await send();
+      await actor.page.getByTestId('legal-outcome').waitFor();
+      assert.equal(await actor.page.getByTestId('legal-outcome').getAttribute('data-outcome'), 'unconfirmed');
+      await Promise.all(pending);
+      assert(!failed && committed === 1, 'Lost legal response interception did not capture one real committed success');
+      observer.assertLostResponse(status);
+      observer.reconcile();
+      await reconcile();
+      await Promise.all(pending);
+      assert(!failed && committed === 1);
+      return observer.assertLostResponse(status);
+    } finally {
+      try { await cdp.send('Fetch.disable'); await Promise.all(pending); }
+      finally { cdp.off('Fetch.requestPaused', paused); observer.close(); }
+    }
+  };
+
+  checkpoint = 'legal-access';
+  for (const role of ['support', 'moderator', 'super_admin']) {
+    const actor = actors[role];
+    await open(actor.page, harness, '/admin/legal');
+    await actor.page.getByRole('main').getByRole('alert').filter({ hasText: /No legal operation/ }).waitFor();
+    assert.equal(await actor.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).count(), 0);
+    const sessionID = (await api(actor.page, '/api/v1/users/me')).body.session.id;
+    for (const [path, options] of [
+      [holdsPath, {}], [holdsPath, { method: 'POST', body: hold, idempotencyKey: recordedOperation }],
+      [preservePath, { method: 'POST', body: preserve(deleted), idempotencyKey: recordedOperation }],
+      [legalLookup, { method: 'POST', body: inquiry }],
+    ]) assert.equal((await api(actor.page, path, { ...options, sessionID })).status, 403);
+    assert.equal((await api(actor.page, '/api/v1/users/me')).status, 200, 'Legal denial signed out an ordinary valid session');
+  }
+  await open(dpo.page, harness, '/admin/legal');
+  const before = harness.originEvidence.legal;
+  const holdForm = dpo.page.getByRole('form', { name: 'Read Legal Holds', exact: true });
+  await holdForm.getByLabel('Original account reference', { exact: true }).fill('invalid');
+  await holdForm.getByRole('button', { name: 'Read Legal Holds', exact: true }).click();
+  await holdForm.getByRole('alert').waitFor();
+  assert.equal(harness.originEvidence.legal, before, 'Invalid legal reference became an unfiltered request');
+  for (const query of ['account_ref=', 'account_ref=%zz', 'limit=1&limit=2', 'email=not-an-identity'])
+    assert.equal((await api(dpo.page, `${holdsPath}?${query}`)).status, 400);
+  const sessionID = (await api(dpo.page, '/api/v1/users/me')).body.session.id;
+  assert.equal((await api(dpo.page, holdsPath, { method: 'POST', body: hold, sessionID, idempotencyKey: recordedOperation })).status, 403);
+  assert.equal((await api(dpo.page, holdsPath)).status, 200, 'Eligible legal read incorrectly required step-up');
+  assert.equal(state(deleted).eligible_records, 0);
+  evidence.checks.push('DPO legal admission; direct-route and all legal operation denials for Support/Moderator/Super-Admin without ordinary-session logout; strict empty/malformed filters and fresh-step-up boundary');
+
+  checkpoint = 'legal-independent-requests';
+  const created = await create(dpo, hold, recordedOperation, { double: true });
+  assert.equal(state(deleted).total, 1);
+  const replayed = await create(dpo, hold, recordedOperation, { replay: true });
+  assert.equal(replayed.id, created.id);
+  await create(dpo, { ...hold, reason: `${markers.reason} changed input` }, recordedOperation, { status: 409 });
+  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: /original operation conflicts/ }).waitFor();
+  assert.equal(state(deleted).total, 1, 'Changed-input conflict silently replaced the original request');
+  const preservation = await create(dpo, preserve(deleted), recordedOperation, { method: 'totp' });
+  assert.notEqual(preservation.hold.id, created.id);
+  assert(!preservation.account_present && preservation.ledger_evidence_present);
+  assert((await dpo.page.getByTestId('legal-outcome').textContent()).includes(preservation.note));
+  const preservedReplay = await create(dpo, preserve(deleted), recordedOperation, { replay: true });
+  assert(preservedReplay.replayed && !preservedReplay.hold.replayed, 'Top-level preservation replay must be authoritative');
+  const currentPreservation = await create(dpo, preserve(current), recordedOperation);
+  assert(currentPreservation.account_present && currentPreservation.ledger_evidence_present);
+  assert.notEqual(currentPreservation.hold.id, preservation.hold.id, 'A reused UUID incorrectly merged distinct account references');
+  const absentPreservation = await create(dpo, preserve(absent), randomUUID());
+  assert(!absentPreservation.account_present && !absentPreservation.ledger_evidence_present && absentPreservation.hold.is_active);
+  const all = await readHolds(dpo, undefined, 2);
+  assert.equal(all.limit, 2);
+  assert.equal(all.items.length, 2);
+  assert(all.total >= 4);
+  assert(!(await dpo.page.getByRole('main').textContent()).includes(markers.reason), 'Restricted narrative opened without an explicit detail action');
+  const page = await readHolds(dpo, deleted, 1);
+  assert.equal(page.total, 2);
+  assert.equal(page.items.length, 1);
+  const nextRead = response(dpo.page, holdsPath, 'GET', 200);
+  await dpo.page.getByRole('button', { name: 'Next hold page', exact: true }).click();
+  assert.equal((await nextRead).body.offset, 1);
+  await layout(dpo.page, 'legal-holds', evidence, artifactDirectory);
+  await dpo.page.getByTestId('legal-hold-row').first().getByRole('button', { name: 'View restricted details', exact: true }).click();
+  const details = dpo.page.getByTestId('legal-hold-details');
+  await details.waitFor();
+  assert((await details.textContent()).includes(markers.reason));
+  assert.equal(await details.locator('img, script, iframe, a[href]').count(), 0);
+  await layout(dpo.page, 'legal-narrative', evidence, artifactDirectory);
+  await dpo.page.keyboard.press('Escape');
+  await release(dpo, deleted, created.id);
+  assert.equal(state(deleted).active, 1, 'Release removed another independent preservation request');
+  const releasedReplay = await create(dpo, hold, recordedOperation, { replay: true });
+  assert(!releasedReplay.is_active && releasedReplay.id === created.id && state(deleted).active === 1);
+  for (const role of ['support', 'moderator', 'super_admin']) assert.equal((await api(actors[role].page, `${holdsPath}/${created.id}`, { method: 'DELETE',
+    sessionID: (await api(actors[role].page, '/api/v1/users/me')).body.session.id })).status, 403);
+  evidence.checks.push('both legal create forms with externally recorded UUIDs, native UV/TOTP, synchronous double-submit protection, independent target/kind scopes, authoritative replay including released state, advisory past dates and preservation presence observations');
+
+  checkpoint = 'legal-attribution';
+  const core = await lookup(dpo);
+  assert.equal(core.body.items.length, 4);
+  assert.deepEqual([...new Set(core.body.items.map((row) => row.account_ref))].sort(), [deleted, current].sort());
+  const coreFields = ['id', 'account_ref', 'event_type', 'timestamp', 'retain_until', 'seq'].sort();
+  assert(core.body.items.every((row) => JSON.stringify(Object.keys(row).sort()) === JSON.stringify(coreFields) &&
+    typeof row.seq === 'string' && BigInt(row.seq) > BigInt(Number.MAX_SAFE_INTEGER)));
+  assert(typeof core.body.coverage.through_seq === 'string' && BigInt(core.body.coverage.through_seq) > BigInt(Number.MAX_SAFE_INTEGER));
+  assert(!JSON.stringify(core.body).includes(fixture.email));
+  for (const key of ['identity_blind_index', 'blind_index_version', 'payload', 'chain_hash', 'email', 'phone'])
+    assert(!JSON.stringify(core.body).includes(`"${key}"`), 'Forbidden attribution projection escaped the real API');
+  assert.equal((await api(dpo.page, legalLookup, { method: 'POST', sessionID,
+    stepUpToken: core.response.request().headers()['x-step-up-auth'], body: inquiry })).status, 403, 'A consumed lookup grant was reusable');
+  await dpo.page.getByTestId('legal-result-row').filter({ hasText: deleted }).first()
+    .getByRole('button', { name: 'Select reference', exact: true }).click();
+  assert.equal(await dpo.page.getByTestId('legal-selected-reference').count(), 1);
+  const inline = await create(dpo, hold, randomUUID(), { pinned: true });
+  assert.equal(inline.account_ref, deleted);
+  assert(!state(deleted).account_present);
+  const scopedQuery = { ...inquiry, limit: 1, fields: Object.keys(fields) };
+  const first = await lookup(dpo, scopedQuery);
+  assert.equal(first.body.items.length, 1);
+  assert(first.body.next_cursor && first.body.items[0].account_ref === deleted);
+  for (const key of Object.keys(fields)) assert.equal(first.body.items[0][key], fixture.metadata[key]);
+  assert.equal(await dpo.page.evaluate(() => Boolean(globalThis.__legalPayloadExecuted)), false);
+  await layout(dpo.page, 'legal-attribution', evidence, artifactDirectory);
+  // A different operator acts through the existing independent signed probe,
+  // without activating another tab and correctly clearing this inquiry page.
+  const remoteSession = (await api(combined.page, '/api/v1/users/me')).body.session.id;
+  const challenge = await api(combined.page, '/api/v1/auth/stepup/challenge', { method: 'POST', sessionID: remoteSession, body: {} });
+  assert.equal(challenge.status, 200);
+  assert(challenge.body.methods.includes('totp'));
+  const remoteGrant = await api(combined.page, '/api/v1/auth/stepup/verify', {
+    method: 'POST', sessionID: remoteSession, body: { method: 'totp', code: harness.fixture('totp-code', { user_id: combined.fixture.user_id }).code },
+  });
+  assert.equal(remoteGrant.status, 200);
+  verificationCount++;
+  verificationTimes.set(combined, [Date.now()]);
+  harness.secrets.push(remoteGrant.body.token);
+  harness.legalSecrets.add(remoteGrant.body.token);
+  const released = await api(combined.page, `${holdsPath}/${currentPreservation.hold.id}`, {
+    method: 'DELETE', sessionID: remoteSession, stepUpToken: remoteGrant.body.token,
+  });
+  assert.equal(released.status, 204);
+  remoteGrant.body.token = '';
+  assert.equal(state(current).eligible_records, 0, 'Released expired evidence stayed eligible');
+  const appended = harness.fixture('admin-legal-append', { account_ref: deleted });
+  assert(BigInt(appended.through_seq) > BigInt(first.body.coverage.through_seq));
+  const nextButton = dpo.page.getByRole('button', { name: 'Next attribution page', exact: true });
+  await nextButton.waitFor();
+  const { dialog: nextDialog } = await verify(dpo, nextButton);
+  const continued = response(dpo.page, legalLookup, 'POST', 200);
+  await confirm(nextDialog, 'Confirm lookup');
+  const continuation = await continued;
+  assert.deepEqual(continuation.response.request().postDataJSON(), { ...first.response.request().postDataJSON(), cursor: first.body.next_cursor });
+  assert.equal(continuation.body.coverage.through_seq, first.body.coverage.through_seq);
+  assert.equal(continuation.body.coverage.observed_at, first.body.coverage.observed_at);
+  assert(Date.parse(continuation.body.coverage.eligibility_checked_at) >= Date.parse(first.body.coverage.eligibility_checked_at));
+  assert.equal(continuation.body.items.length, 1);
+  assert.equal(continuation.body.items[0].account_ref, deleted);
+  assert(BigInt(continuation.body.items[0].seq) > BigInt(first.body.items[0].seq));
+  assert(!continuation.body.next_cursor, 'Release or the captured high-water was ignored on the next page');
+  assert((await dpo.page.getByTestId('legal-coverage').textContent()).includes(continuation.body.coverage.note));
+  evidence.checks.push('post-deletion inline reference selection without profile lookup, separate historical references, opt-in-only inert metadata, exact decimal sequences above JS safe max, one-use fresh verification per page, frozen scope/high-water and current hold eligibility after real release and later signer ingestion');
+
+  checkpoint = 'legal-audit-rollback';
+  await section(second, 'Legal Holds');
+  let verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  const failedKey = randomUUID();
+  await fillCreate(verified.dialog, { ...hold, account_ref: current }, failedKey);
+  const beforeFailure = state(current);
+  harness.fixture('admin-audit-failure', { scenario: 'on' });
+  try {
+    const failed = response(second.page, holdsPath, 'POST', 503);
+    await confirm(verified.dialog, 'Confirm Legal Hold');
+    assert.equal((await failed).body.error, 'audit_unavailable');
+    await second.page.getByTestId('legal-outcome').waitFor();
+    assert.equal(await second.page.getByTestId('legal-outcome').getAttribute('data-outcome'), 'unconfirmed');
+    assert.deepEqual(state(current), beforeFailure, 'Failed durable audit committed a legal create');
+  } finally { harness.fixture('admin-audit-failure', { scenario: 'off' }); }
+  verified = { dialog: await prepareRelease(second, deleted, preservation.hold.id) };
+  harness.fixture('admin-audit-failure', { scenario: 'on' });
+  try {
+    const failed = response(second.page, `${holdsPath}/${preservation.hold.id}`, 'DELETE', 503);
+    await confirm(verified.dialog, 'Confirm release');
+    assert.equal((await failed).body.error, 'audit_unavailable');
+    assert(state(deleted, recordedOperation, 'preservation').is_active, 'Failed durable audit committed a release');
+  } finally { harness.fixture('admin-audit-failure', { scenario: 'off' }); }
+  verified = await prepareLookup(second);
+  harness.fixture('admin-audit-failure', { scenario: 'on' });
+  try {
+    const failed = response(second.page, legalLookup, 'POST', 503);
+    await confirm(verified.dialog, 'Confirm lookup');
+    const body = (await failed).body;
+    assert.deepEqual(body, { error: 'audit_unavailable' }, 'Failed durable audit disclosed legal records');
+    assert.equal(await second.page.getByTestId('legal-result-row').count(), 0);
+  } finally { harness.fixture('admin-audit-failure', { scenario: 'off' }); }
+  evidence.checks.push('real PostgreSQL admin-outbox rejection rolls back legal create/release and withholds attribution bytes; UI keeps transmitted write outcome unconfirmed rather than claiming rollback');
+
+  checkpoint = 'legal-lost-writes';
+  const lostKey = randomUUID();
+  const lostPayload = { ...hold, account_ref: current };
+  await section(dpo, 'Legal Holds');
+  verified = await verify(dpo, dpo.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  await fillCreate(verified.dialog, lostPayload, lostKey);
+  let lostID;
+  evidence.legalLostCreate = await lostWrite(dpo, holdsPath, 201,
+    () => confirm(verified.dialog, 'Confirm Legal Hold'), async () => {
+      const committed = state(current, lostKey);
+      assert(committed.is_active && committed.active === 1);
+      lostID = committed.hold_id;
+      await readHolds(dpo, current);
+      assert.equal(await dpo.page.getByTestId('legal-outcome').getAttribute('data-outcome'), 'unconfirmed', 'A list inferred which uncertain operation committed');
+    });
+  const recovered = await create(dpo, lostPayload, lostKey, { replay: true });
+  assert.equal(recovered.id, lostID);
+  verified = { dialog: await prepareRelease(dpo, current, lostID) };
+  evidence.legalLostRelease = await lostWrite(dpo, `${holdsPath}/${lostID}`, 204,
+    () => confirm(verified.dialog, 'Confirm release'), async () => {
+      assert(!state(current, lostKey).is_active);
+      await readHolds(dpo, current);
+      assert.equal(await dpo.page.getByTestId('legal-outcome').getAttribute('data-outcome'), 'unconfirmed');
+    });
+  harness.fixture('admin-legal-cleanup', { account_ref: current });
+  await create(dpo, lostPayload, lostKey, { status: 409 });
+  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: /original operation conflicts/ }).waitFor();
+  assert(state(current).purged > 0 && state(current).active === 0);
+  await readHolds(dpo, current);
+  for (const failure of [
+    { status: 200, body: '{"items":' },
+    { status: 200, body: JSON.stringify({ padding: 'x'.repeat(4 * 1024 * 1024) }) },
+    { status: 429, headers: { 'Retry-After': '2' }, body: '{"error":"rate_limit_exceeded"}' },
+    { status: 503, body: '{"error":"audit_unavailable"}' },
+  ]) {
+    await queryFault(dpo.page, holdsPath, () => dpo.page.getByRole('button', { name: 'Read Legal Holds', exact: true }).click(), failure);
+    assert.equal(await dpo.page.getByTestId('legal-hold-row').count(), 0);
+  }
+  evidence.checks.push('real committed-but-lost create and release responses with every outgoing attempt observed through read-only reconciliation; explicit same-tuple fresh-grant recovery, no automatic/fresh-key replay, cleaned narrative tombstone conflict without recreation');
+
+  checkpoint = 'legal-privacy';
+  await section(second, 'Legal Holds');
+  const unsent = observeLegalWrites(second.authenticator.cdp, harness.origin);
+  try {
+    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+    const input = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    const draftKey = randomUUID();
+    harness.secrets.push(draftKey);
+    harness.legalSecrets.add(draftKey);
+    await verified.dialog.getByLabel('Original account reference', { exact: true }).fill(deleted);
+    await verified.dialog.getByLabel('Operation UUID', { exact: true }).fill(draftKey);
+    await verified.dialog.getByLabel('Requesting authority', { exact: true }).fill(markers.requesting_authority);
+    await verified.dialog.getByLabel('Legal basis', { exact: true }).fill(markers.legal_basis);
+    await input.fill('\u00e9'.repeat(2049));
+    await verified.dialog.getByRole('button', { name: 'Review request', exact: true }).click();
+    await verified.dialog.getByRole('alert').waitFor();
+    assert.equal(unsent.count, 0, 'Oversized UTF-8 legal narrative reached a write');
+    await input.fill(markers.cancelledDraft);
+    await second.page.keyboard.press('Escape');
+    await verified.dialog.waitFor({ state: 'hidden' });
+    assert(await input.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
+      'Legal cancellation left detached narrative input');
+    await input.dispose();
+    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+    const expired = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    await expired.fill(markers.expiredDraft);
+    await second.page.getByRole('main').getByRole('alert').filter({ hasText: /Verification expired/ }).waitFor({ timeout: 30_000 });
+    assert(await expired.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
+      'Grant expiry left a detached legal narrative');
+    await expired.dispose();
+    await second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).click();
+    let dialog = second.page.getByTestId('stepup-dialog');
+    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
+    await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
+    await dialog.getByLabel('Authenticator code', { exact: true }).fill('123');
+    const resume = await hidePortal(second.page, second.context, evidence, 'admin-ready');
+    await resume();
+    await second.page.getByTestId('admin-ready').waitFor();
+    dialog = second.page.getByTestId('stepup-dialog');
+    await dialog.waitFor();
+    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
+    assert.equal(await dialog.getByLabel('Authenticator code', { exact: true }).inputValue(), '');
+    await second.page.keyboard.press('Escape');
+    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+    const hidden = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    await hidden.fill(markers.backgroundDraft);
+    const returnToPage = await hidePortal(second.page, second.context, evidence, 'admin-ready');
+    await returnToPage();
+    await second.page.getByTestId('admin-ready').waitFor();
+    assert(await hidden.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
+      'Hiding legal workflow left detached sensitive input');
+    await hidden.dispose();
+    assert.equal(await second.page.getByTestId('stepup-dialog').count(), 0);
+    assert.equal(unsent.count, 0);
+  } finally { unsent.close(); }
+
+  // Delay a real successful disclosure at Chromium's response boundary; never
+  // fetch/replay it through a second HTTP stack or save its body in an artifact.
+  const cdp = second.authenticator.cdp;
+  verified = await prepareLookup(second);
+  const arrived = deferred();
+  let pausedID;
+  const pause = (event) => {
+    if (event.request.method === 'POST' && event.responseStatusCode === 200) {
+      pausedID = event.requestId;
+      arrived.resolve(true);
+    } else void cdp.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => arrived.resolve(false));
+  };
+  cdp.on('Fetch.requestPaused', pause);
+  const lateTimer = setTimeout(() => arrived.resolve(false), 15_000);
+  try {
+    await cdp.send('Fetch.enable', { patterns: [{ urlPattern: harness.origin + legalLookup, requestStage: 'Response' }] });
+    await confirm(verified.dialog, 'Confirm lookup');
+    assert(await arrived.promise, 'Expected a real paused legal disclosure');
+    const resume = await hidePortal(second.page, second.context, evidence, 'admin-ready');
+    assert.equal(await second.page.getByTestId('legal-result-row').count(), 0);
+    await cdp.send('Fetch.continueRequest', { requestId: pausedID }).catch(() => {});
+    await resume();
+    await second.page.getByTestId('admin-ready').waitFor();
+    assert.equal(await second.page.getByTestId('legal-result-row').count(), 0);
+    assert.equal(await second.page.getByTestId('legal-coverage').count(), 0);
+  } finally { clearTimeout(lateTimer); cdp.off('Fetch.requestPaused', pause); await cdp.send('Fetch.disable'); }
+  await section(dpo, 'Preservation');
+  assert.equal(await dpo.page.getByTestId('legal-result-row').count(), 0);
+  await section(dpo, 'Attribution');
+  assert.equal(await dpo.page.getByTestId('legal-selected-reference').count(), 0);
+  assert.equal(await dpo.page.getByTestId('legal-coverage').count(), 0);
+  const noScript = await dpo.context.browser().newContext({ javaScriptEnabled: false, serviceWorkers: 'block' });
+  try {
+    await noScript.addCookies(await dpo.context.cookies(harness.origin));
+    const document = await noScript.newPage();
+    const shell = await visit(document, harness.origin, '/admin/legal');
+    const html = await shell.text();
+    assert(![...harness.legalSecrets].some((value) => html.includes(value)), 'Legal private material was server-rendered');
+    assert.equal(await document.locator('form, input, textarea, table, [data-legal-private]').count(), 0);
+  } finally { await noScript.close(); }
+  for (const actor of [dpo, second, combined])
+    await assertAdminPrivacy(actor.page, actor.observed, { ...markers, ...Object.fromEntries([...harness.legalSecrets].map((value, index) => [index, value])) });
+  evidence.checks.push('legal narrative/row/coverage screenshot masks, inert text, desktop/320px light/dark keyboard dialog checks, empty SSR/no-JavaScript shell, no legal URL/history/storage/console/telemetry copies, cancellation/grant-expiry/hide detached-input clearing, TOTP intent-only resume, section clearing and ignored late real disclosure');
+
+  checkpoint = 'legal-revocation';
+  await section(combined, 'Legal Holds');
+  verified = await verify(combined, combined.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  await fillCreate(verified.dialog, hold, randomUUID());
+  harness.fixture('admin-revoke', { user_id: combined.fixture.user_id, role: 'dpo' });
+  const denied = response(combined.page, holdsPath, 'POST', 403);
+  await confirm(verified.dialog, 'Confirm Legal Hold');
+  assert.equal((await denied).body.error, 'forbidden');
+  await combined.page.getByTestId('stepup-dialog').waitFor({ state: 'hidden' });
+  assert.equal((await api(combined.page, '/api/v1/users/me')).status, 200);
+  await open(combined.page, harness, '/admin/legal');
+  assert.equal(await combined.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).count(), 0);
+
+  await section(second, 'Legal Holds');
+  verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  const expiring = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+  await expiring.fill(markers.sessionDraft);
+  const active = (await api(second.page, '/api/v1/users/me')).body.session.id;
+  harness.fixture('expire-session', { user_id: second.fixture.user_id, session_id: active });
+  await visit(second.page, harness.origin, '/admin/legal');
+  await second.page.getByTestId('admin-ready').waitFor({ state: 'hidden' });
+  // Navigation destroys the old execution context; privacy of detached controls
+  // within one context is checked above, and the replacement shell is inspected.
+  await expiring.dispose();
+  assert.equal(await second.page.getByLabel('Reason', { exact: true }).count(), 0);
+  assert.equal(await second.page.getByTestId('legal-outcome').count(), 0);
+  assert.equal(await second.page.getByRole('link', { name: 'Sign in with a passkey', exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Flegal');
+  evidence.legalVerifications = verificationCount;
+  evidence.checks.push('live legal capability revocation after fresh verification clears privileged controls without normal logout; real legal-session expiry drops pending input and returns only the fixed legal path');
+}
+
 export async function validateAdmin(harness, { artifactDirectory } = {}) {
   const evidence = { checks: [], layouts: 0, nativeHiddenTabObserved: false, nativeBfcacheRestoreObserved: false };
   const markerID = randomBytes(16).toString('hex');
   const markers = Object.fromEntries(['reason', 'cancelledDraft', 'backgroundDraft', 'expiredDraft']
     .map((kind) => [kind, `admin-private-${kind}-${markerID}`]));
+  const legalMarkers = Object.fromEntries(['reason', 'requesting_authority', 'legal_basis', 'case_reference', 'purpose',
+    'cancelledDraft', 'backgroundDraft', 'expiredDraft', 'sessionDraft']
+    .map((kind) => [kind, `legal-private-${kind}-${markerID}`]));
+  legalMarkers.reason = `<img src=x onerror=globalThis.__legalPayloadExecuted=true> ${legalMarkers.reason}`;
   const browser = await chromium.launch({ channel: 'chromium', args: [`--ignore-certificate-errors-spki-list=${harness.tlsSPKI}`] });
   const contexts = [];
   const actors = {};
@@ -466,11 +1176,12 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
   }
   try {
     checkpoint = 'admin-bootstrap';
-    for (const role of ['ordinary', 'support', 'moderator', 'dpo', 'super_admin', 'combined']) {
-      const fixture = harness.fixture('admin-seed', { role });
+    for (const role of ['ordinary', 'support', 'moderator', 'dpo', 'super_admin', 'combined', 'legal_operator']) {
+      const fixture = harness.fixture('admin-seed', { role: role === 'legal_operator' ? 'dpo' : role });
       const { context, observed } = await newContext(browser, harness);
       contexts.push(context);
       observeAdminMarkers(context, harness, markers, observed.failures);
+      observeLegalPrivacy(context, harness, legalMarkers, observed.failures);
       const page = await context.newPage();
       const authenticator = await addAuthenticator(page, fixture.credentials[0]);
       await authenticator.cdp.send('Network.enable', { maxPostDataSize: 64 * 1024 });
@@ -504,9 +1215,12 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       assert.equal(access.audit_logs_read, ['dpo', 'combined'].includes(role));
       assert.equal(access.audit_chain_verify, ['dpo', 'super_admin', 'combined'].includes(role));
       assert.equal(access.ledger_verify, access.audit_chain_verify);
+      for (const flag of ['legal_holds_read', 'legal_holds_apply', 'legal_holds_release', 'preservation_requests_create', 'legal_inquiry_lookup'])
+        assert.equal(access[flag], ['dpo', 'combined'].includes(role));
       assert.equal(caps.body.limits.chain_verify_max_limit, 5);
       if (!access.users_read) assert.equal(await page.getByRole('link', { name: 'Accounts', exact: true }).count(), 0);
       if (!access.audit_logs_read) assert.equal(await page.getByRole('link', { name: 'Audit logs', exact: true }).count(), 0);
+      if (!access.legal_holds_read) assert.equal(await page.locator('a[href="/admin/legal"]').count(), 0);
     }
     await visit(ordinary, harness.origin, '/admin');
     await ordinary.getByRole('main').getByRole('alert').waitFor({ state: 'visible' });
@@ -535,6 +1249,9 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     await cookieOnly.close();
     evidence.checks.push('all admin documents have nonce CSP and non-sensitive no-JavaScript shells; cookies without DPoP fail');
 
+    await validateLegal(harness, actors, evidence, artifactDirectory, legalMarkers);
+    harness.assertPrivateLogs();
+
     checkpoint = 'admin-directory';
     await open(support, harness, '/admin/users');
     assert.equal(await support.getByLabel('Exact email', { exact: true }).count(), 0);
@@ -547,7 +1264,10 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(await support.getByRole('columnheader', { name: 'Email', exact: true }).count(), 0);
     const next = operationResponse(support, '/api/v1/admin/users', 'GET');
     await support.getByRole('button', { name: 'Next page', exact: true }).click();
-    assert.equal((await (await next).json()).offset, 5);
+    const nextAccounts = await (await next).json();
+    assert.equal(nextAccounts.offset, 5);
+    for (const account of nextAccounts.items)
+      await support.getByRole('link', { name: `View account ${account.id}`, exact: true }).waitFor();
     await layout(support, 'accounts', evidence, artifactDirectory);
     const skip = support.getByRole('link', { name: 'Skip to admin content', exact: true });
     await skip.focus();
@@ -813,7 +1533,11 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(olderQuery.get('before_seq'), first.next_before_seq);
     for (const key of ['start_time', 'end_time', 'event_type', 'limit'])
       assert.equal(olderQuery.get(key), new URL(firstResponse.url()).searchParams.get(key));
-    assert((await olderResponse.json()).items.every((row) => BigInt(row.seq) < BigInt(first.next_before_seq)));
+    const olderBody = await olderResponse.json();
+    assert(olderBody.items.every((row) => BigInt(row.seq) < BigInt(first.next_before_seq)));
+    // An upstream capture finishes before React accepts and renders that page.
+    for (const row of olderBody.items)
+      await dpo.getByRole('button', { name: `View details for sequence ${row.seq}`, exact: true }).waitFor();
     await layout(dpo, 'audit', evidence, artifactDirectory);
     evidence.checks.push('real signed audit list exceeds 256KiB within its 4MiB budget, exact high-int64 keyset pages, UTC frozen filters, inert payload dialog');
 
@@ -904,7 +1628,24 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     evidence.checks.push('real cross-tab logout removes the admin view and broadcasts only the neutral invalidation marker');
 
     checkpoint = 'admin-ledger-states';
+    // Omission is an explicit deployment/mounting test, not a fake verified
+    // fixture. Restart before destructive integrity cases so readiness does not
+    // depend on the synthetic row those existing cases intentionally erase.
+    await harness.setLegalLookup(false);
+    await open(dpo, harness, '/admin/legal');
+    const withoutLookup = (await api(dpo, '/api/v1/admin/capabilities')).body.capabilities;
+    assert(withoutLookup.legal_holds_read && withoutLookup.legal_holds_apply && withoutLookup.legal_holds_release &&
+      withoutLookup.preservation_requests_create && !withoutLookup.legal_inquiry_lookup);
+    assert.equal(await dpo.getByRole('button', { name: 'Attribution', exact: true }).count(), 0);
+    assert.equal((await api(dpo, legalLookup, { method: 'POST', body: {},
+      sessionID: (await api(dpo, '/api/v1/users/me')).body.session.id })).status, 404);
+    evidence.checks.push('real signer/operator lookup probe before both API replicas, missing/wrong/key-mismatch rejection and explicit fixture-omitted replica restart keeps holds independent while attribution is unmounted');
     await harness.waitForAdminDelivery();
+    harness.assertPrivateLogs();
+    // These cases deliberately remove signed data and the durable head. Stop
+    // the real signer only after delivery, rather than race its fail-closed poll.
+    await harness.stopSignerForDestructiveFixtures();
+    evidence.checks.push('real signer delivery completes before a verified clean signer retirement for isolated destructive ledger fixtures; all other supervised processes remain health-checked');
     harness.fixture('admin-tamper', { scenario: 'ledger-payload-absent' });
     await open(dpo, harness, '/admin/integrity');
     await dpo.getByLabel('Chain', { exact: true }).selectOption('ledger');
@@ -952,6 +1693,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(harness.originEvidence.mismatched, 0);
     assert.equal(harness.originEvidence.referrers, 0);
     harness.assertHealthy();
+    harness.assertPrivateLogs();
     evidence.checks.push('fresh queryless-htu DPoP proofs, strict cookies/CSP, exact unsafe Origin; controlled reason/draft/payload markers absent from console, URLs, headers, telemetry bodies, history and persistent private state');
     evidence.checks.push('headless light/dark 44px pointer targets including checkbox labels, text/focus contrast, modal/table keyboard traversal and 320x256 zoom-equivalent reflow; not native zoom or assistive-technology certification');
     evidence.manualGates = [

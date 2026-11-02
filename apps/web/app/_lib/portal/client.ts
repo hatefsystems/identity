@@ -12,6 +12,7 @@ import {
 } from './contracts';
 import { identifier, list, normalizeName, record } from './validation';
 import { emptyResponse, readResponse } from './json-response';
+import { nonzeroUUID } from '../admin/validation';
 
 type RequestOptions = {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
@@ -21,14 +22,16 @@ type RequestOptions = {
   anonymous?: boolean;
   grant?: StepUpGrant;
   onSend?: () => void;
+  idempotencyKey?: string;
 };
-type Decoder<T> = (value: unknown) => T;
+type Decoder<T> = (value: unknown, status: number) => T;
 
 const adminQueryKeys: Readonly<Record<string, readonly string[]>> = {
   '/api/v1/admin/users': ['limit', 'offset', 'status'],
   '/api/v1/admin/audit-logs': ['start_time', 'end_time', 'event_type', 'limit', 'before_seq'],
   '/api/v1/admin/audit-logs/verify': ['after_seq', 'through_seq', 'predecessor_hash', 'limit'],
   '/api/v1/admin/ledger/verify': ['after_seq', 'through_seq', 'predecessor_hash', 'limit'],
+  '/api/v1/admin/legal-holds': ['account_ref', 'status', 'limit', 'offset'],
 };
 
 export class PortalClient {
@@ -72,6 +75,11 @@ export class PortalClient {
   async request<T>(path: string, decode: Decoder<T>, options: RequestOptions = {}): Promise<T> {
     const method = options.method ?? 'GET';
     const mutation = method !== 'GET';
+    const legalLookup = method === 'POST' && path === '/api/v1/admin/legal-inquiry/lookup';
+    const legalCreate =
+      method === 'POST' &&
+      (path === '/api/v1/admin/legal-holds' || path === '/api/v1/admin/preservation-requests');
+    const uncertainMutation = mutation && !legalLookup;
     if (
       typeof path !== 'string' ||
       !/^\/api\/v1\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(path) ||
@@ -79,6 +87,15 @@ export class PortalClient {
       (!mutation && options.body !== undefined)
     )
       throw new PortalError('invalid_request');
+    let idempotencyKey: string | undefined;
+    if (options.idempotencyKey !== undefined) {
+      if (!legalCreate) throw new PortalError('invalid_request');
+      try {
+        idempotencyKey = nonzeroUUID(options.idempotencyKey);
+      } catch {
+        throw new PortalError('invalid_request');
+      }
+    }
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin || url.pathname !== path || url.search || url.hash)
       throw new PortalError('invalid_request');
@@ -96,6 +113,20 @@ export class PortalClient {
       for (const [key, value] of Object.entries(query)) {
         if (!allowed.includes(key)) throw new PortalError('invalid_request');
         if (value === undefined) continue;
+        if (path === '/api/v1/admin/legal-holds') {
+          try {
+            if (key === 'account_ref') nonzeroUUID(value);
+            else if (key === 'status' && !['active', 'released', 'all'].includes(String(value)))
+              throw new PortalError('invalid_request');
+            else if (
+              (key === 'limit' || key === 'offset') &&
+              (!/^(0|[1-9][0-9]*)$/.test(String(value)) || Number(value) > 2147483647)
+            )
+              throw new PortalError('invalid_request');
+          } catch {
+            throw new PortalError('invalid_request');
+          }
+        }
         if (
           (typeof value !== 'string' && typeof value !== 'number') ||
           (typeof value === 'number' && (!Number.isSafeInteger(value) || value < 0)) ||
@@ -116,7 +147,11 @@ export class PortalClient {
     // without query/fragment. No caller can widen another route's body budget.
     const proofURL = `${url.origin}${url.pathname}`;
     const responseLimit =
-      method === 'GET' && path === '/api/v1/admin/audit-logs' ? 4 * 1024 * 1024 : undefined;
+      (method === 'GET' &&
+        (path === '/api/v1/admin/audit-logs' || path === '/api/v1/admin/legal-holds')) ||
+      legalLookup
+        ? 4 * 1024 * 1024
+        : undefined;
     const snapshot = options.anonymous ? this.#profile : this.assertSession();
     throwIfAborted(options.signal);
     throwIfAborted(this.#lifetime.signal);
@@ -130,11 +165,20 @@ export class PortalClient {
     let sent = false;
     let response: Response | undefined;
     try {
-      const body = options.body === undefined ? undefined : JSON.stringify(options.body);
-      if (body !== undefined && new TextEncoder().encode(body).length > 64 * 1024)
+      let body: string | undefined;
+      try {
+        body = options.body === undefined ? undefined : JSON.stringify(options.body);
+      } catch {
+        throw new PortalError('invalid_request');
+      }
+      if (
+        body !== undefined &&
+        new TextEncoder().encode(body).length > (legalCreate || legalLookup ? 32 : 64) * 1024
+      )
         throw new PortalError('invalid_request');
       const headers = new Headers({ Accept: 'application/json' });
       if (body !== undefined) headers.set('Content-Type', 'application/json');
+      if (idempotencyKey !== undefined) headers.set('Idempotency-Key', idempotencyKey);
       if (snapshot) headers.set('X-Portal-Session', snapshot.session.id);
       // take() clears the grant before any transmission. Only the explicit
       // pre-handler nonce branch below may resend this same logical operation.
@@ -170,7 +214,7 @@ export class PortalClient {
         if (response.ok) {
           if (snapshot && this.#profile?.session.id !== snapshot.session.id)
             throw new PortalError('session_changed', 409);
-          return decode(value);
+          return decode(value, response.status);
         }
         const errorCode = record(value).error;
         const code =
@@ -196,7 +240,7 @@ export class PortalClient {
         throw new PortalError(
           code,
           response.status,
-          mutation && response.status >= 500,
+          uncertainMutation && response.status >= 500,
           parseRetryAfter(response.headers.get('Retry-After'))
         );
       }
@@ -206,7 +250,7 @@ export class PortalClient {
       const error =
         failure instanceof PortalError
           ? failure
-          : new PortalError('network_error', response?.status ?? 0, sent && mutation);
+          : new PortalError('network_error', response?.status ?? 0, sent && uncertainMutation);
       // An unreadable success body is also an uncertain mutation, not a reason
       // to replay an authenticator response or silently replace recovery codes.
       const reported = new PortalError(
@@ -215,7 +259,7 @@ export class PortalClient {
         error.uncertain ||
           (error.code === 'invalid_response' &&
             sent &&
-            mutation &&
+            uncertainMutation &&
             (!response || response.status < 400 || response.status >= 500)),
         error.retryAfterSeconds ?? parseRetryAfter(response?.headers.get('Retry-After') ?? null)
       );

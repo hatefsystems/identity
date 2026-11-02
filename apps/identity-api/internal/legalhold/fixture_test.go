@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 )
 
@@ -25,9 +26,16 @@ func (r fixtureRow) Scan(dst ...any) error {
 	return nil
 }
 
-type fixtureReader struct{ row fixtureRow }
+type fixtureReader struct {
+	row   fixtureRow
+	query string
+	args  []any
+}
 
-func (r fixtureReader) QueryRow(context.Context, string, ...any) pgx.Row { return r.row }
+func (r *fixtureReader) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
+	r.query, r.args = query, args
+	return r.row
+}
 
 func TestLookupFixtureRejectsMissingAndMismatchedSignerKeys(t *testing.T) {
 	id := uuid.New()
@@ -51,10 +59,30 @@ func TestLookupFixtureRejectsMissingAndMismatchedSignerKeys(t *testing.T) {
 		{"different probe", fixtureRow{value: indexer.Compute(LookupFixtureEmail(uuid.New()))}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := VerifyLookupFixture(context.Background(), fixtureReader{tc.row}, indexer, id)
+			reader := &fixtureReader{row: tc.row}
+			err := VerifyLookupFixture(context.Background(), reader, indexer, id)
 			if (err != nil) != tc.wantError {
 				t.Fatalf("verification: %v", err)
 			}
+			for _, required := range []string{"FROM security_ledger_chain c", "JOIN security_event_ledger l ON l.seq=c.seq", "c.event_id=$1", "l.client_id=$2", "l.event_type=$3", "l.identity_blind_index IS NOT NULL"} {
+				if !strings.Contains(reader.query, required) {
+					t.Fatalf("fixture query omitted canonical-v2 binding %q", required)
+				}
+			}
+			if len(reader.args) != 3 || reader.args[0] != id || reader.args[1] != LookupFixtureClient || reader.args[2] != audit.EventLoginSucceeded {
+				t.Fatal("fixture verification lost synthetic marker or event binding")
+			}
 		})
+	}
+	for _, tc := range []struct {
+		reader  FixtureReader
+		indexer BlindIndexer
+		id      uuid.UUID
+	}{
+		{nil, indexer, id}, {&fixtureReader{}, nil, id}, {&fixtureReader{}, indexer, uuid.Nil},
+	} {
+		if err := VerifyLookupFixture(context.Background(), tc.reader, tc.indexer, tc.id); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("missing fixture dependency did not fail closed: %v", err)
+		}
 	}
 }

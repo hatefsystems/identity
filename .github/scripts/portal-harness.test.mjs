@@ -17,20 +17,27 @@ import {
   anonymousReclaim,
   assertLocalOrigin,
   browserFailure,
+  capturePortalJSON,
   fixtureSecretValues,
   fixtureRouteReferences,
   integrationTargets,
   failureCategories,
+  legalCoordinateRequest,
+  legalIdempotencyKey,
+  legalReferenceRequest,
+  lookupProbeFixture,
   portalCleanup,
   portalRoute,
+  portalResponseBudget,
+  privateLogSummary,
   redactFixtureSecrets,
   replicaFor,
   secretEnvironmentValues,
   startPortalServices,
 } from './portal-harness.mjs';
 import { deletionMail, startMailSink } from './portal-mail-sink.mjs';
-import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeStatusPatches, runAdminBrowser } from './web-admin.browser.mjs';
-import { clean, keyStorage, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
+import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, runAdminBrowser } from './web-admin.browser.mjs';
+import { clean, keyStorage, newContext, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
 
 test('portal harness refuses HTTP, remote, and noncanonical origins', () => {
   assert.equal(assertLocalOrigin('https://localhost:43210').port, '43210');
@@ -83,8 +90,106 @@ test('portal diagnostics use route templates rather than credential/session IDs'
   assert.equal(portalRoute('/admin/users/private-subject?email=private%40example.test#secret'), '/admin/users/{id}');
   assert.equal(portalRoute('/api/v1/admin/users/private-subject/status?reason=private'), '/api/v1/admin/users/{id}/status');
   assert.equal(portalRoute('/api/v1/admin/ledger/verify?after_seq=123'), '/api/v1/admin/ledger/verify');
+  assert.equal(portalRoute('/api/v1/admin/legal-holds/private-request?account_ref=private'), '/api/v1/admin/legal-holds/{hold_id}');
+  assert.equal(portalRoute('/api/v1/admin/legal-holds?account_ref=private'), '/api/v1/admin/legal-holds');
+  assert.equal(portalRoute('/api/v1/admin/legal-inquiry/lookup?email=private'), '/api/v1/admin/legal-inquiry/lookup');
+  assert.equal(portalRoute('/api/v1/admin/preservation-requests'), '/api/v1/admin/preservation-requests');
+  assert.equal(portalRoute('/admin/legal?email=private#private'), '/admin/legal');
+  assert.equal(portalRoute('/admin/legal/private-reference'), '[redacted-route]');
   assert.equal(portalRoute('/api/v1/admin/unknown/private?token=secret'), '[redacted-route]');
   assert.equal(portalRoute('/admin/unknown/private'), '[redacted-route]');
+});
+
+const legalAccount = 'a8c97c4a-81ed-4aef-bc8f-6c572fd53e90';
+const legalHoldID = '036bf2b2-e79e-47be-9d04-d456fa53c78b';
+const legalOperationID = 'a9a6bd84-8479-48d8-926b-a9e13c52f414';
+
+test('legal probe idempotency support permits only canonical keys on exact create POST routes', () => {
+  for (const path of ['/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests']) {
+    assert.equal(legalIdempotencyKey(path, 'POST', legalOperationID), legalOperationID);
+    for (const value of ['', null, 1, legalOperationID.toUpperCase(), `{${legalOperationID}}`,
+      '00000000-0000-0000-0000-000000000000', `${legalOperationID}\r\nX-Debug: PRIVATE`])
+      assert.throws(() => legalIdempotencyKey(path, 'POST', value), /Invalid scoped legal operation key/);
+    for (const method of ['GET', 'DELETE', 'PATCH', 'post'])
+      assert.throws(() => legalIdempotencyKey(path, method, legalOperationID));
+    for (const suffix of ['/', '?', '?account_ref=PRIVATE', '#PRIVATE'])
+      assert.throws(() => legalIdempotencyKey(path + suffix, 'POST', legalOperationID));
+  }
+  for (const path of ['/api/v1/admin/users/lookup', '/api/v1/admin/legal-inquiry/lookup', `/api/v1/admin/legal-holds/${legalHoldID}`])
+    assert.throws(() => legalIdempotencyKey(path, 'POST', legalOperationID));
+  assert.equal(legalIdempotencyKey('/api/v1/users/me', 'GET', undefined), undefined);
+});
+
+test('legal reference privacy exceptions are run-owned typed API requests, never navigation or arbitrary queries', () => {
+  const harness = { origin: 'https://localhost:43210', legalReferences: { accounts: new Set([legalAccount]), holds: new Set([legalHoldID]) } };
+  const request = (path, method = 'GET', navigation = false) => ({ url: () => harness.origin + path, method: () => method, isNavigationRequest: () => navigation });
+  const path = `/api/v1/admin/legal-holds?account_ref=${legalAccount}&status=all&limit=2&offset=0`;
+  assert(legalReferenceRequest(request(path), legalAccount, harness));
+  assert(legalReferenceRequest(request(`/api/v1/admin/legal-holds/${legalHoldID}`, 'DELETE'), legalHoldID, harness));
+  for (const bad of [request(path, 'POST'), request(path, 'GET', true), request(path + '#private'),
+    request(path + `&account_ref=${legalAccount}`), request(path + `&reason=${legalAccount}`),
+    request(path + '&unknown=x'), request(path + '&status=all'), request(path + '&%zz=x'),
+    request(`/api/v1/admin/legal-holds?account_ref=${legalAccount}&status=unknown`),
+    request(`/api/v1/admin/legal-holds?account_ref=${legalAccount}&offset=-1`),
+    request(`/api/v1/admin/legal-holds?account_ref=${legalAccount}&limit=0`),
+    request(`/admin/legal?account_ref=${legalAccount}`), request(`/api/v1/admin/users?account_ref=${legalAccount}`),
+    request(`/api/v1/admin/legal-holds/${legalAccount}`, 'DELETE'), request(`/api/v1/admin/legal-holds/${legalHoldID}`, 'GET'),
+    request(`/api/v1/admin/legal-holds/${legalHoldID}/`, 'DELETE'), request(`/api/v1/admin/legal-holds/${legalHoldID}?`, 'DELETE')])
+    assert(!legalReferenceRequest(bad, bad.url().includes(legalHoldID) ? legalHoldID : legalAccount, harness));
+  assert(!legalReferenceRequest(request(path), legalAccount, { ...harness, legalReferences: { accounts: new Set(), holds: new Set() } }));
+  assert(!legalReferenceRequest({ ...request(path), url: () => `https://remote.example.test${path}` }, legalAccount, harness));
+});
+
+test('response captures share exact audit and legal 4MiB exceptions without widening other routes', async () => {
+  for (const [path, method] of [['/api/v1/admin/audit-logs', 'GET'], ['/api/v1/admin/legal-holds', 'GET'], ['/api/v1/admin/legal-inquiry/lookup', 'POST']]) {
+    assert.equal(portalResponseBudget(path, method), 4 * 1024 * 1024);
+    assert.equal(portalResponseBudget(path + '/', method), 256 * 1024);
+    assert.equal(portalResponseBudget(path + '?limit=2', method), 256 * 1024);
+    assert.equal(portalResponseBudget(path, method === 'GET' ? 'POST' : 'GET'), 256 * 1024);
+  }
+  assert.equal(portalResponseBudget('/api/v1/admin/preservation-requests', 'POST'), 256 * 1024);
+  assert.equal(portalResponseBudget(`/api/v1/admin/legal-holds/${legalHoldID}`, 'DELETE'), 256 * 1024);
+  const capture = (body, limit, headers = {}, signal) => {
+    const response = new EventEmitter();
+    response.headers = { 'content-type': 'application/json', ...headers };
+    const pending = capturePortalJSON(response, limit);
+    queueMicrotask(() => {
+      if (signal) response.emit(signal, new Error('PRIVATE response failure'));
+      for (let offset = 0; offset < body.length; offset += 8192) response.emit('data', Buffer.from(body.slice(offset, offset + 8192)));
+      response.emit('end');
+    });
+    return pending;
+  };
+  const body = JSON.stringify({ value: 'x'.repeat(270 * 1024) });
+  assert.equal((await capture(body, 4 * 1024 * 1024)).value.length, 270 * 1024);
+  for (const attempt of [
+    () => capture(body, 256 * 1024),
+    () => capture('{}', 4 * 1024 * 1024, { 'content-length': String(4 * 1024 * 1024 + 1) }),
+    () => capture('{}', 256 * 1024, { 'content-length': 'not-a-length' }),
+    () => capture(JSON.stringify({ value: 'x'.repeat(4 * 1024 * 1024) }), 4 * 1024 * 1024),
+    () => capture('{"value":', 256 * 1024),
+    () => capture('{}', 256 * 1024, { 'content-type': 'text/html' }),
+    () => capture('{}', 256 * 1024, {}, 'aborted'),
+    () => capture('{}', 256 * 1024, {}, 'error'),
+  ]) await assert.rejects(attempt(), (error) => error.message === 'Bounded upstream response capture failed');
+});
+
+test('real lookup probe output is private, unique, bounded and canonical before API startup', () => {
+  const output = `{"fixture_id":"PRIVATE-LOG","synthetic_account":"PRIVATE-SUBJECT"}\nADMIN_LOOKUP_FIXTURE_ID=${legalHoldID}\n`;
+  assert.equal(lookupProbeFixture({ status: 0, stdout: output }), legalHoldID);
+  for (const result of [
+    { status: 1, stdout: output }, { status: null, stdout: output }, { error: new Error('PRIVATE'), status: 0, stdout: output },
+    { status: 0, stdout: '' }, { status: 0, stdout: output + output }, { status: 0, stdout: output + 'x'.repeat(64 * 1024) },
+    { status: 0, stdout: `ADMIN_LOOKUP_FIXTURE_ID=${legalHoldID.toUpperCase()}\n` },
+    { status: 0, stdout: 'ADMIN_LOOKUP_FIXTURE_ID=00000000-0000-0000-0000-000000000000\n' },
+  ]) assert.throws(() => lookupProbeFixture(result), (error) => !/PRIVATE|synthetic_account/.test(error.message));
+  const source = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
+  const signer = source.indexOf("start('Audit signer'");
+  const probe = source.indexOf("lookupProbeFixture(spawnSync(legalBinary, ['--operation=lookup-probe']");
+  const verified = source.indexOf("fixture('admin-legal-probe'");
+  const assigned = source.indexOf('apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture');
+  assert(signer >= 0 && probe > signer && verified > probe && assigned > verified && source.indexOf('startAPIs();') > assigned);
+  assert.doesNotMatch(source, /console\.(?:log|error)\([^\n]*(?:rejected|lookupFixture|result\.stdout)/);
 });
 
 test('browser failures never print request headers, bodies or locator values', () => {
@@ -588,6 +693,222 @@ test('admin privacy markers register console/URL secrets and reject drafts, payl
   assert.doesNotMatch(JSON.stringify(failures), /PRIVATE-|subject|telemetry/);
 });
 
+function legalWriteObservation(method = 'POST') {
+  const cdp = new EventEmitter();
+  const origin = 'https://localhost:43210';
+  const observer = observeLegalWrites(cdp, origin);
+  let sequence = 0;
+  return {
+    cdp, observer,
+    request({ nonce, path = method === 'POST' ? '/api/v1/admin/legal-holds' : `/api/v1/admin/legal-holds/${legalHoldID}`,
+      postData = method === 'POST' ? JSON.stringify({ account_ref: legalAccount, reason: 'PRIVATE-REASON' }) : undefined,
+      key = method === 'POST' ? legalOperationID : undefined, grant = 'PRIVATE-GRANT', session = 'PRIVATE-SESSION' } = {}) {
+      const requestId = `legal-request-${++sequence}`;
+      cdp.emit('Network.requestWillBeSent', { requestId, request: {
+        method, url: origin + path, postData, headers: {
+          DPoP: `header.${Buffer.from(JSON.stringify({ nonce })).toString('base64url')}.signature`,
+          'X-Step-Up-Auth': grant, 'X-Portal-Session': session, ...(key ? { 'Idempotency-Key': key } : {}),
+        },
+      } });
+      return requestId;
+    },
+    response(networkId, status, { body = '{"error":"use_dpop_nonce"}', headers = status === 401 ? [
+      { name: 'DPoP-Nonce', value: 'PRIVATE-NONCE' }, { name: 'WWW-Authenticate', value: 'DPoP error="use_dpop_nonce"' },
+    ] : [] } = {}) {
+      observer.response({ networkId, responseStatusCode: status, responseHeaders: headers }, body);
+    },
+  };
+}
+
+test('lost legal write observation accepts only one success and its exact pre-handler nonce retry', () => {
+  for (const method of ['POST', 'DELETE']) {
+    for (const nonce of [false, true]) {
+      const wire = legalWriteObservation(method);
+      const status = method === 'POST' ? 201 : 204;
+      try {
+        wire.response(wire.request(), nonce ? 401 : status);
+        if (nonce) wire.response(wire.request({ nonce: 'PRIVATE-NONCE' }), status);
+        wire.observer.reconcile();
+        const report = wire.observer.assertLostResponse(status);
+        assert.deepEqual(report, { outgoingLegalWrites: nonce ? 2 : 1, preHandlerNonceRetries: nonce ? 1 : 0, reconciliationWrites: 0 });
+        assert.doesNotMatch(JSON.stringify(report), /PRIVATE|account_ref|body|Idempotency/);
+      } finally { wire.observer.close(); }
+      assert.equal(wire.cdp.listenerCount('Network.requestWillBeSent'), 0);
+    }
+  }
+  for (const retry of [
+    { nonce: 'PRIVATE-NONCE', key: legalHoldID },
+    { nonce: 'PRIVATE-NONCE', postData: '{"reason":"PRIVATE-CHANGED"}' },
+    { nonce: 'PRIVATE-NONCE', path: '/api/v1/admin/preservation-requests' },
+    { nonce: 'PRIVATE-NONCE', grant: 'PRIVATE-OTHER-GRANT' },
+    { nonce: 'PRIVATE-NONCE', session: 'PRIVATE-OTHER-SESSION' },
+    { nonce: 'PRIVATE-WRONG-NONCE' },
+  ]) {
+    const wire = legalWriteObservation();
+    try {
+      wire.response(wire.request(), 401);
+      wire.response(wire.request(retry), 201);
+      assert.throws(() => wire.observer.assertLostResponse(201));
+    } finally { wire.observer.close(); }
+  }
+  for (const challenge of [{ body: '{"error":"invalid_credentials"}' }, { headers: [] }, { body: '{"error":' }]) {
+    const wire = legalWriteObservation();
+    try {
+      assert.throws(() => {
+        wire.response(wire.request(), 401, challenge);
+        wire.response(wire.request({ nonce: 'PRIVATE-NONCE' }), 201);
+        wire.observer.assertLostResponse(201);
+      });
+    } finally { wire.observer.close(); }
+  }
+});
+
+test('every automatic legal replay fails observation, including denied attempts during state reconciliation', () => {
+  for (const method of ['POST', 'DELETE']) for (const lateStatus of [undefined, 401, 403, 409, 429, 503]) {
+    const wire = legalWriteObservation(method);
+    const success = method === 'POST' ? 201 : 204;
+    try {
+      wire.response(wire.request(), success);
+      wire.observer.reconcile();
+      const late = wire.request();
+      if (lateStatus !== undefined) wire.response(late, lateStatus);
+      assert.throws(() => wire.observer.assertLostResponse(success));
+    } finally { wire.observer.close(); }
+  }
+  const early = legalWriteObservation();
+  try {
+    const first = early.request();
+    const premature = early.request({ nonce: 'PRIVATE-NONCE' });
+    early.response(first, 401);
+    early.response(premature, 201);
+    assert.throws(() => early.observer.assertLostResponse(201));
+  } finally { early.observer.close(); }
+  const badRelease = legalWriteObservation('DELETE');
+  try {
+    badRelease.request({ key: legalOperationID, postData: '{"reason":"PRIVATE"}' });
+    assert.throws(() => badRelease.observer.count);
+  } finally { badRelease.observer.close(); }
+});
+
+test('legal privacy observations reject result, narrative, operation, grant and cursor copies outside exact boundaries', () => {
+  const context = new EventEmitter();
+  const markers = { reason: 'PRIVATE-LEGAL-REASON', requesting_authority: 'PRIVATE-AUTHORITY',
+    identifier: 'private@example.test', cancelledDraft: 'PRIVATE-UNSENT-DRAFT' };
+  const harness = { origin: 'https://localhost:43210', secrets: [], legalSecrets: new Set([legalAccount, legalHoldID, 'PRIVATE-CURSOR', 'PRIVATE-RESULT']),
+    legalReferences: { accounts: new Set([legalAccount]), holds: new Set([legalHoldID]) }, routeReferences: new Set() };
+  const failures = [];
+  observeLegalPrivacy(context, harness, markers, failures);
+  const request = (path, method = 'POST', body = {}, headers = {}, navigation = false) => context.emit('request', {
+    url: () => harness.origin + path, method: () => method, postData: () => method === 'POST' ? JSON.stringify(body) : null,
+    headers: () => headers, isNavigationRequest: () => navigation,
+  });
+  request('/api/v1/admin/legal-holds', 'POST', { account_ref: legalAccount, reason: markers.reason,
+    requesting_authority: markers.requesting_authority }, { 'Idempotency-Key': legalOperationID, DPoP: 'PRIVATE-DPOP', 'X-Step-Up-Auth': 'PRIVATE-GRANT' });
+  request(`/api/v1/admin/legal-holds?account_ref=${legalAccount}`, 'GET');
+  request(`/api/v1/admin/legal-holds/${legalHoldID}`, 'DELETE');
+  request('/api/v1/admin/legal-inquiry/lookup', 'POST', { identifier: markers.identifier, cursor: 'PRIVATE-CURSOR' });
+  assert.deepEqual(failures, []);
+  assert(harness.secrets.includes(legalOperationID) && harness.secrets.includes('PRIVATE-DPOP') && harness.secrets.includes('PRIVATE-GRANT'));
+  request('/telemetry', 'POST', { reason: markers.reason });
+  request('/api/v1/admin/legal-holds', 'POST', { reason: markers.cancelledDraft });
+  request('/api/v1/admin/legal-holds', 'POST', { reason: markers.reason, unexpected: 'PRIVATE-RESULT' });
+  request(`/admin/legal?account_ref=${legalAccount}`, 'GET');
+  request(`/api/v1/admin/legal-holds?account_ref=${legalAccount}`, 'GET', {}, {}, true);
+  request(`/api/v1/admin/legal-holds?cursor=PRIVATE-CURSOR`, 'GET');
+  request('/api/v1/admin/legal-holds', 'GET', {}, { 'X-Debug': markers.reason });
+  request('/api/v1/admin/legal-inquiry/lookup', 'POST', {}, { 'Idempotency-Key': legalOperationID });
+  request('/api/v1/admin/legal-holds', 'POST', {}, { 'X-Debug': 'PRIVATE-GRANT' });
+  request('/api/v1/users/me', 'GET', {}, { 'X-Step-Up-Auth': 'PRIVATE-GRANT' });
+  request('/telemetry', 'POST', { proof: 'PRIVATE-DPOP' });
+  request('/telemetry', 'POST', { key: legalOperationID });
+  assert.equal(failures.length, 12);
+  assert.doesNotMatch(JSON.stringify(failures), /PRIVATE-|private@example|account_ref|CURSOR/);
+});
+
+test('base and legal observers agree on known coordinates without exempting arbitrary URLs or disclosures', async () => {
+  const coordinate = '9007199254740993';
+  const origin = 'https://localhost:43210';
+  const observeRequest = async ({ path, method = 'GET', headers = {}, body, navigation = false }) => {
+    const context = Object.assign(new EventEmitter(), {
+      setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, async addInitScript() {},
+    });
+    const harness = { origin, secrets: [coordinate], legalSecrets: new Set([coordinate]), routeReferences: new Set(),
+      legalReferences: { accounts: new Set(), holds: new Set() } };
+    const { observed } = await newContext({ newContext: async () => context }, harness);
+    const legal = [];
+    observeLegalPrivacy(context, harness, {}, legal);
+    const page = new EventEmitter();
+    context.emit('page', page);
+    const request = { url: () => path.startsWith('/') ? origin + path : path, method: () => method,
+      headers: () => headers, postData: () => body === undefined ? null : JSON.stringify(body),
+      isNavigationRequest: () => navigation };
+    page.emit('request', request);
+    context.emit('request', request);
+    return { base: observed.failures, legal, allowed: legalCoordinateRequest(request, coordinate, harness) };
+  };
+  for (const path of [
+    `/api/v1/admin/audit-logs?before_seq=${coordinate}&limit=2`,
+    `/api/v1/admin/audit-logs/verify?after_seq=${coordinate}&limit=5`,
+    `/api/v1/admin/audit-logs/verify?through_seq=${coordinate}&after_seq=0`,
+    `/api/v1/admin/ledger/verify?after_seq=${coordinate}&limit=5`,
+    `/api/v1/admin/ledger/verify?through_seq=${coordinate}&after_seq=0`,
+  ]) assert.deepEqual(await observeRequest({ path }), { base: [], legal: [], allowed: true });
+  for (const request of [
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}`, navigation: true },
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}`, method: 'POST' },
+    { path: `/admin/legal?after_seq=${coordinate}` },
+    { path: `/api/v1/admin/users?after_seq=${coordinate}` },
+    { path: `/api/v1/admin/audit-logs?after_seq=${coordinate}` },
+    { path: `/api/v1/admin/ledger/verify?before_seq=${coordinate}` },
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}&after_seq=${coordinate}` },
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}&debug=${coordinate}` },
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}&limit=1&limit=2` },
+    { path: `/api/v1/admin/ledger/verify?after_seq=0${coordinate}` },
+    { path: `/api/v1/admin/ledger/verify?after_seq=${coordinate}#${coordinate}` },
+    { path: `https://other.example.test/api/v1/admin/ledger/verify?after_seq=${coordinate}` },
+    { path: `https://${coordinate}@localhost:43210/api/v1/admin/ledger/verify?after_seq=${coordinate}` },
+  ]) {
+    const result = await observeRequest(request);
+    assert.equal(result.allowed, false);
+    assert(result.base.length > 0 && result.legal.length > 0);
+  }
+  for (const request of [
+    { path: '/api/v1/users/me', headers: { 'X-Debug': coordinate } },
+    { path: '/telemetry', method: 'POST', body: { result: coordinate } },
+    { path: '/api/v1/admin/legal-inquiry/lookup', method: 'POST', body: { result: coordinate } },
+  ]) {
+    const result = await observeRequest(request);
+    assert.equal(result.allowed, false);
+    assert(result.legal.length > 0);
+  }
+});
+
+test('coordinate exceptions require a known canonical signed-64 value', () => {
+  const origin = 'https://localhost:43210';
+  for (const value of ['01', '-1', '1.0', '9223372036854775808', '9007199254740993']) {
+    const request = { url: () => `${origin}/api/v1/admin/ledger/verify?after_seq=${value}`,
+      method: () => 'GET', isNavigationRequest: () => false };
+    const legalSecrets = new Set(value === '9007199254740993' ? [] : [value]);
+    assert.equal(legalCoordinateRequest(request, value, { origin, legalSecrets }), false);
+  }
+});
+
+test('privacy observer diagnostics are fixed category counts, never raw failures or route suffixes', async () => {
+  const messages = [];
+  const previous = console.error;
+  console.error = (message) => messages.push(message);
+  try {
+    await assert.rejects(clean(undefined, { pending: [], failures: [
+      'Fixture secret appeared in a request URL', 'Fixture secret appeared in a request URL',
+      'Invalid or reused outgoing browser proof for PRIVATE-ROUTE',
+      'API privacy/auth response policy failed for PRIVATE-ROUTE', 'private@example.test',
+    ] }));
+  } finally { console.error = previous; }
+  assert.deepEqual(messages.map((message) => JSON.parse(message)), [{ check: 'portal-observers',
+    counts: { 'url-data': 2, proof: 1, 'response-policy': 1, other: 1 } }]);
+  assert.doesNotMatch(messages.join(''), /PRIVATE|private@example|request URL/);
+});
+
 const adminScript = fileURLToPath(new URL('./web-admin.browser.mjs', import.meta.url));
 const adminCommand = 'npm exec -- nx run web:test-admin-browser --skipNxCache';
 function adminEvidenceOptions(directory) {
@@ -901,8 +1222,41 @@ test('fixture and replicas share one ephemeral KEK and a run-owned audit stream 
   assert.match(fixture, /\.\.\.storeEnv/);
   assert.match(fixture, /fixtureSecretValues\(input\)/);
   assert.match(fixture, /fixtureSecretValues\(value\)/);
-  assert.doesNotMatch(fixture, /result\.stderr/);
+  assert.match(fixture, /categories: failureCategories\(result\.stderr\)/);
+  assert.doesNotMatch(fixture.replace('failureCategories(result.stderr)', ''), /result\.stderr/);
   assert.match(harness.slice(harness.indexOf('const apiEnvironment =')), /\.\.\.storeEnv/);
+});
+
+test('legal fixture diagnostics emit static categories without private error details', () => {
+  const privateText = ' private@example.test private-narrative-token 123e4567-e89b-42d3-a456-426614174000';
+  for (const [error, category] of [
+    ['cannot create owned legal subject', 'legal-fixture-subject'],
+    ['real signer did not index owned legal evidence', 'legal-fixture-signing'],
+    ['owned legal publication was not acknowledged', 'legal-fixture-publication'],
+  ]) assert.deepEqual(failureCategories(error + privateText), [category]);
+  assert.deepEqual(failureCategories(privateText), []);
+});
+
+test('supervised log diagnostics report only fixed categories and field names', () => {
+  const values = ['9007199254740993', 'private@example.test', 'PRIVATE-NARRATIVE'];
+  const text = `${JSON.stringify({ seq: values[0], error: values[1], arbitrary_private_field: values[2] })}\n`;
+  const summary = privateLogSummary(text, [...values, values[0]]);
+  assert.deepEqual(summary, { matches: 3, kinds: { numeric: 1, identity: 1, text: 1 }, fields: ['error', 'seq'] });
+  assert.doesNotMatch(JSON.stringify(summary), /PRIVATE|private@example|9007199|arbitrary_private_field/);
+  assert.deepEqual(privateLogSummary('ordinary service message', values), { matches: 0, kinds: {}, fields: [] });
+});
+
+test('destructive ledger fixtures retire only a healthy, drained, cleanly exited signer', () => {
+  const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
+  const stop = harness.slice(harness.indexOf('const stopSignerForDestructiveFixtures'), harness.indexOf('const setLegalLookup'));
+  assert(stop.indexOf('assertHealthy();') < stop.indexOf("signer.kill('SIGTERM')"));
+  assert(stop.indexOf('code === 0 && signal === null') < stop.indexOf('retired.add(signer)'));
+  const browser = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
+  const destructive = browser.slice(browser.indexOf("checkpoint = 'admin-ledger-states'"));
+  const drain = destructive.indexOf('await harness.waitForAdminDelivery();');
+  const retire = destructive.indexOf('await harness.stopSignerForDestructiveFixtures();');
+  assert(drain >= 0 && retire > drain && retire < destructive.indexOf("harness.fixture('admin-tamper'"));
+  assert(destructive.includes('harness.assertHealthy();'));
 });
 
 test('CI preserves image/CSP coverage and gates release on the real portal suite', () => {
@@ -921,7 +1275,7 @@ test('admin browser is uncached, builds its production dependencies and uses arm
   assert.equal(target.cache, false);
   assert.match(target.command, /web-admin\.browser\.mjs/);
   const dependencies = target.dependsOn.map((entry) => typeof entry === 'string' ? entry : entry.target);
-  for (const build of ['build', 'build-portal-fixture', 'build-deletion-notifier', 'build-audit-signer', 'build-admin-audit-publisher'])
+  for (const build of ['build', 'build-portal-fixture', 'build-deletion-notifier', 'build-audit-signer', 'build-admin-audit-publisher', 'build-admin-legal'])
     assert(dependencies.includes(build));
   const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
   assert.match(harness, /PORTAL_FIXTURE_ADMIN: admin \? '1' : '0'/);
@@ -937,6 +1291,17 @@ test('admin browser is uncached, builds its production dependencies and uses arm
   assert.doesNotMatch(browser, /route\.fetch\s*\(/);
   assert.match(browser, /Fetch\.failRequest/);
   assert.match(browser, /guardBrowserFailures/);
+  assert(browser.indexOf('await validateLegal(harness, actors, evidence') < browser.indexOf("checkpoint = 'admin-ledger-states'"));
+  assert.match(browser, /mask: \[page\.locator\('[^']*\[data-legal-private\]/);
+  for (const check of ['legal-audit-rollback', 'legal-lost-writes', 'legal-attribution', 'legal-revocation', 'legal-privacy'])
+    assert(browser.includes(`checkpoint = '${check}'`));
+  const legalFixture = readFileSync(new URL('../../apps/identity-api/cmd/portal-fixture/legal.go', import.meta.url), 'utf8');
+  assert(legalFixture.startsWith('//go:build portalfixture\n'));
+  assert.match(legalFixture, /VerifyLookupFixture/);
+  assert.match(legalFixture, /audit\.NewEnvelope/);
+  assert.match(legalFixture, /js\.Publish/);
+  assert.match(legalFixture, /ownedLegalReference/);
+  assert.doesNotMatch(legalFixture, /WithLookup\(|UPDATE security_event_ledger|http\.Handle/);
 });
 
 test('portal integration cannot silently omit real dependencies or run in parallel', () => {

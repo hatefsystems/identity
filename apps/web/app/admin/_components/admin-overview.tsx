@@ -36,6 +36,20 @@ export function AdminOverview() {
           },
         ]
       : []),
+    ...(access?.legal_holds_read ||
+    access?.legal_holds_apply ||
+    access?.legal_holds_release ||
+    access?.preservation_requests_create ||
+    access?.legal_inquiry_lookup
+      ? [
+          {
+            href: '/admin/legal',
+            title: 'DPO and Legal',
+            description:
+              'Manage independent Legal Holds, preservation requests, and bounded attribution inquiries.',
+          },
+        ]
+      : []),
   ];
   return (
     <>
