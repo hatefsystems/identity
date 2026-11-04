@@ -39,6 +39,12 @@ import { decodeQuotedPrintableUTF8, deletionMail, startMailSink } from './portal
 import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, runAdminBrowser } from './web-admin.browser.mjs';
 import { clean, keyStorage, newContext, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
 
+function testDirectory(prefix) {
+  const parent = join(tmpdir(), 'kilo');
+  mkdirSync(parent, { recursive: true });
+  return mkdtempSync(join(parent, prefix));
+}
+
 test('portal harness refuses HTTP, remote, and noncanonical origins', () => {
   assert.equal(assertLocalOrigin('https://localhost:43210').port, '43210');
   for (const value of [
@@ -352,7 +358,7 @@ test('portal browser cleanup attempts browser close even after a context rejects
 });
 
 test('portal evidence invalidates stale success and waits for affirmative teardown before publishing', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'kilo', 'portal-evidence-test-'));
+  const directory = testDirectory('portal-evidence-test-');
   const path = join(directory, 'portal-evidence.json');
   let resume, entered;
   const waiting = new Promise((resolve) => { resume = resolve; });
@@ -390,7 +396,7 @@ test('portal evidence invalidates stale success and waits for affirmative teardo
 test('portal evidence never certifies startup, assertion, cleanup, callback or private-data failure', async (t) => {
   for (const kind of ['startup', 'assertion', 'cleanup', 'unconfirmed-cleanup', 'callback', 'private-evidence']) {
     await t.test(kind, async () => {
-      const directory = mkdtempSync(join(tmpdir(), 'kilo', 'portal-evidence-test-'));
+      const directory = testDirectory('portal-evidence-test-');
       const path = join(directory, 'portal-evidence.json');
       let interrupt, closes = 0, released = false;
       try {
@@ -965,7 +971,7 @@ test('admin worktree identity exposes only its root, revision and opaque source 
 });
 
 test('admin evidence invalidates stale success, isolates captures, and publishes only after confirmed teardown', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'kilo', 'admin-evidence-test-'));
+  const directory = testDirectory('admin-evidence-test-');
   const path = join(directory, 'admin-evidence.json');
   const read = () => JSON.parse(readFileSync(path, 'utf8'));
   try {
@@ -1006,7 +1012,7 @@ test('admin evidence invalidates stale success, isolates captures, and publishes
 test('admin evidence never certifies startup, assertion, cleanup, identity or callback failure', async (t) => {
   for (const kind of ['startup', 'assertion', 'cleanup', 'unconfirmed-cleanup', 'worktree-change', 'callback', 'private-evidence']) {
     await t.test(kind, async () => {
-      const directory = mkdtempSync(join(tmpdir(), 'kilo', 'admin-evidence-test-'));
+      const directory = testDirectory('admin-evidence-test-');
       const path = join(directory, 'admin-evidence.json');
       let closeCalls = 0;
       let interrupt;
@@ -1178,9 +1184,7 @@ test('quoted-printable alternatives decode UTF-8 Persian without changing canoni
 });
 
 test('owned mail sink requires verified TLS/auth, rejects foreign recipients, and captures retry identity in memory', { timeout: 15000 }, async () => {
-  const parent = join(tmpdir(), 'kilo');
-  mkdirSync(parent, { recursive: true });
-  const directory = mkdtempSync(join(parent, 'portal-mail-test-'));
+  const directory = testDirectory('portal-mail-test-');
   let sink;
   const clients = [];
   try {

@@ -28,7 +28,7 @@ version explicitly instead of inheriting a newer host Go.
 | Web runtime image | PASS: actual Dockerfile, non-root amd64 runtime, both-locale image CSP/auth acceptance |
 | Seven serial DB integrations | PASS: security 1,464; admin 758; retention 81; legal workflow 620; gRPC 560; lifecycle 370; portal 2,106. Zero failed or skipped tests in the pinned-toolchain run |
 | Supplemental initial-schema migration | PASS: eight test/subtest events against a disposable database |
-| Existing browser/release/container-policy script tests | PASS: 168 tests, zero failures or skips |
+| Existing browser/release/container-policy script tests | PASS: 168 tests, zero failures or skips; repeated with a fresh TMPDIR and no existing `kilo` parent |
 | Production image CSP/auth | PASS: English and Persian; strict nonce/CSP attack probes, keyboard/contrast/reflow, no-JS and exact same-origin font bytes |
 | Real-API portal browser | PASS per locale: 13 checks, 30 viewport states and six no-JS documents; teardown completed |
 | Real-API admin browser | PASS per locale: 28 checks and 70 layouts; teardown completed and worktree identity unchanged throughout each run |
