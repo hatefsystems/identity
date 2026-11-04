@@ -1,11 +1,13 @@
 'use client';
 
 import Link from 'next/link';
+import { useTranslations } from 'next-intl';
 import { PageHeading, linkClass } from '../../_components/controls';
 import { usePortal } from '../../_components/portal-provider';
 import { clearSensitiveViews } from '../../_lib/portal/invalidation';
 
 export function AdminOverview() {
+  const t = useTranslations('admin');
   const { capabilities } = usePortal();
   const access = capabilities?.capabilities;
   const workspaces = [
@@ -13,8 +15,8 @@ export function AdminOverview() {
       ? [
           {
             href: '/admin/users',
-            title: 'Accounts',
-            description: 'Read permitted account metadata and review available status actions.',
+            title: t('overview.accounts'),
+            description: t('overview.accountsDescription'),
           },
         ]
       : []),
@@ -22,8 +24,8 @@ export function AdminOverview() {
       ? [
           {
             href: '/admin/audit-logs',
-            title: 'Audit logs',
-            description: 'Search a bounded UTC window. Every disclosed page is audited.',
+            title: t('overview.audit'),
+            description: t('overview.auditDescription'),
           },
         ]
       : []),
@@ -31,8 +33,8 @@ export function AdminOverview() {
       ? [
           {
             href: '/admin/integrity',
-            title: 'Integrity',
-            description: 'Verify audit or security-ledger links in explicit, bounded pages.',
+            title: t('overview.integrity'),
+            description: t('overview.integrityDescription'),
           },
         ]
       : []),
@@ -44,22 +46,18 @@ export function AdminOverview() {
       ? [
           {
             href: '/admin/legal',
-            title: 'DPO and Legal',
-            description:
-              'Manage independent Legal Holds, preservation requests, and bounded attribution inquiries.',
+            title: t('overview.legal'),
+            description: t('overview.legalDescription'),
           },
         ]
       : []),
   ];
   return (
     <>
-      <PageHeading title="Admin control panel">
-        Elevated access is limited to your current permissions. Reads and actions are durably
-        audited; access is checked again by the API on every operation.
-      </PageHeading>
+      <PageHeading title={t('overview.title')}>{t('overview.description')}</PageHeading>
       <section aria-labelledby="admin-workspaces" className="min-w-0 rounded-xl border bg-card">
         <h2 id="admin-workspaces" className="border-b px-5 py-4 font-semibold">
-          Available workspaces
+          {t('overview.workspaces')}
         </h2>
         <ul className="divide-y">
           {workspaces.map((workspace) => (
@@ -83,9 +81,7 @@ export function AdminOverview() {
         </ul>
       </section>
       <p className="max-w-3xl text-sm leading-relaxed text-muted-foreground">
-        Private results and drafts are cleared when this page is backgrounded or left. Return to
-        revalidate access. No operation, search, or verification continues automatically in the
-        background.
+        {t('overview.clearing')}
       </p>
     </>
   );

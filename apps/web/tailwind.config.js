@@ -6,7 +6,7 @@ module.exports = {
   // Keep the existing palette available before a theme switcher is introduced.
   safelist: ['dark'],
   content: [
-    join(__dirname, '{app,pages,components,specs}/**/*.{ts,tsx,html}'),
+    join(__dirname, '{app,pages,components,specs,i18n}/**/*.{ts,tsx,html}'),
     join(__dirname, '../../libs/ui/src/**/*.{ts,tsx}'),
   ],
   theme: {

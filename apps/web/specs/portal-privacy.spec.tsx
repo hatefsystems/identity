@@ -1,5 +1,14 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { renderToStaticMarkup } from 'react-dom/server';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (...args: unknown[]) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(...args),
+}));
+
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+import type { ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+const renderToStaticMarkup = (element: ReactElement) =>
+  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-provider';
 import PrivacyPage from '../app/dashboard/privacy/page';
 import { PortalClient } from '../app/_lib/portal/client';
@@ -369,4 +378,37 @@ it('leaves a definitive authorization denial in the UV-only dialog without claim
   expect(screen.queryByRole('button', { name: 'Use authenticator code' })).toBeNull();
   expect(screen.getByText('private@example.test')).toBeTruthy();
   expect(invalidateOtherTabs).not.toHaveBeenCalled();
+});
+
+it('freezes the initiating tab locale at deletion confirmation even if presentation changes before verification', async () => {
+  const view = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider locale={locale}>
+      <PortalProvider>
+        <Content />
+      </PortalProvider>
+    </I18nTestProvider>
+  );
+  const result = render(view('fa-IR'));
+  await screen.findByRole('button', { name: 'حذف حساب من' });
+  fireEvent.click(
+    screen.getByRole('checkbox', { name: 'پیامدهای حذف حساب و مهلت بازیابی ۳۰روزه را درک می‌کنم.' })
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'حذف حساب من' }));
+  const dialog = screen.getByRole('dialog', { name: 'تأیید حذف حساب' });
+  result.rerender(view('en'));
+  expect(screen.getByRole('dialog', { name: 'Confirm account deletion' })).toBe(dialog);
+  expect(api.bootstrap).toHaveBeenCalledTimes(1);
+  expect(api.stepUpChallenge).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Verify with a passkey' }));
+  await screen.findByRole('heading', { name: 'Account deletion requested' });
+  expect(api.deleteAccount).toHaveBeenCalledTimes(1);
+  expect(api.deleteAccount).toHaveBeenCalledWith(
+    expect.any(StepUpGrant),
+    expect.any(AbortSignal),
+    expect.any(Function),
+    'fa-IR'
+  );
+  expect(api.stepUpChallenge).toHaveBeenCalledTimes(1);
+  expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
 });

@@ -1,5 +1,10 @@
 'use client';
 
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
+
+import { useTranslations } from 'next-intl';
+
 import { Button, Input, Label } from '@hatef/ui';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { errorMessage, isAborted, PortalError, throwIfAborted } from '../../_lib/portal/errors';
@@ -13,19 +18,16 @@ import { usePasskey } from '../../_lib/portal/webauthn';
 import { controlClass, Feedback, inputClass } from '../../dashboard/_components/controls';
 import { AuthLink } from './auth-card';
 
-const closedMessage =
-  'This page no longer holds a usable recovery link. Reopen the link in your recovery email to continue.';
-const hiddenMessage =
-  'Verification was cleared when this page was hidden. Start account recovery again for fresh verification.';
-const opaqueFailure =
-  'The recovery link or verification could not be accepted. Use the link in your recovery email and fresh verification. This page cannot identify the reason.';
+const closedMessage: Message = { key: 'auth.reclaim.closed' };
+const hiddenMessage: Message = { key: 'auth.reclaim.hidden' };
+const opaqueFailure: Message = { key: 'auth.reclaim.opaque' };
 
-function recoveryError(failure: unknown): string {
+function recoveryError(failure: unknown): Message {
   if (failure instanceof PortalError) {
     if (failure.code === 'invalid_token' || failure.code === 'invalid_credentials')
       return opaqueFailure;
     if (failure.status === 429 || failure.code === 'rate_limited')
-      return 'Too many attempts. Wait before trying again. Reopen the email if this page has cleared the link.';
+      return { key: 'auth.reclaim.rateLimited' };
     if (
       ['unsupported', 'cancelled', 'authenticator_security', 'user_verification_required'].includes(
         failure.code
@@ -33,18 +35,20 @@ function recoveryError(failure: unknown): string {
     )
       return errorMessage(failure, 'webauthn');
   }
-  return 'Recovery could not be verified. The service may be unavailable. Start again with fresh verification when it is available.';
+  return { key: 'auth.reclaim.unavailable' };
 }
 
 type Phase = 'loading' | 'ready' | 'working' | 'factor' | 'closed' | 'confirmed' | 'unconfirmed';
 type Outcome = 'confirmed' | 'unconfirmed';
 
 export function AccountRecovery() {
+  const t = useTranslations();
+  const message = useMessage();
   const [phase, setPhase] = useState<Phase>('loading');
   const [factor, setFactor] = useState<'webauthn' | 'totp' | null>(null);
-  const [pending, setPending] = useState('');
-  const [error, setError] = useState('');
-  const [codeError, setCodeError] = useState('');
+  const [pending, setPending] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
+  const [codeError, setCodeError] = useState<Message>('');
   const link = useRef<{ token: string; deadline: number; monotonicDeadline: number } | null>(null);
   const captured = useRef(false);
   const alive = useRef(false);
@@ -87,7 +91,7 @@ export function AccountRecovery() {
   );
 
   const discard = useCallback(
-    (message: string, forget: boolean) => {
+    (message: Message, forget: boolean) => {
       if (active.current?.sent) {
         finish('unconfirmed');
         return;
@@ -204,7 +208,7 @@ export function AccountRecovery() {
     active.current = work;
     setPhase('working');
     setError('');
-    setPending('Preparing fresh account recovery verification...');
+    setPending({ key: 'auth.reclaim.preparing' });
     try {
       const options = await client.current.options(link.current.token, work.controller.signal);
       throwIfAborted(work.controller.signal);
@@ -238,7 +242,7 @@ export function AccountRecovery() {
     const selected = challenge.current;
     let code = input.current?.value ?? '';
     if (selected.factor === 'totp' && (code.length !== 6 || !/^[0-9]{6}$/.test(code))) {
-      setCodeError('Enter the six-digit code from your authenticator app.');
+      setCodeError({ key: 'auth.reclaim.codeError' });
       input.current?.focus();
       return;
     }
@@ -251,8 +255,8 @@ export function AccountRecovery() {
     setCodeError('');
     setPending(
       selected.factor === 'webauthn'
-        ? 'Complete PIN or biometric verification on your authenticator.'
-        : 'Verifying your authenticator code...'
+        ? { key: 'auth.reclaim.passkeyPending' }
+        : { key: 'auth.reclaim.codePending' }
     );
     if (input.current) input.current.value = '';
     try {
@@ -305,44 +309,36 @@ export function AccountRecovery() {
             tabIndex={-1}
             className="text-lg font-semibold focus:outline-none"
           >
-            {phase === 'confirmed' ? 'Account recovered' : 'Recovery outcome unconfirmed'}
+            {phase === 'confirmed'
+              ? t('auth.reclaim.confirmedTitle')
+              : t('auth.reclaim.unconfirmedTitle')}
           </h2>
           <p role="status" className="text-sm leading-relaxed">
-            {phase === 'confirmed'
-              ? 'Account deletion has been cancelled. The recovery link and verification have been cleared. Sign in normally to start a new session; old sessions remain invalid.'
-              : 'The recovery response was lost or interrupted. Recovery may already have completed, but this page cannot confirm it. The request has not been retried. The link and verification have been cleared. Reopen the recovery email for fresh verification; an unavailable link does not prove whether recovery succeeded.'}
+            {phase === 'confirmed' ? t('auth.reclaim.confirmed') : t('auth.reclaim.unconfirmed')}
           </p>
-          {phase === 'confirmed' && <AuthLink href="/login">Sign in to your account</AuthLink>}
+          {phase === 'confirmed' && <AuthLink href="/login">{t('auth.reclaim.signIn')}</AuthLink>}
         </div>
       ) : (
         <>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            Opening this page does not recover your account. Start explicitly when you are ready.
-            The link is held privately in this page for at most five minutes, without extending the
-            deadline in your email. Leaving or reloading clears it.
-          </p>
+          <p className="text-sm leading-relaxed text-muted-foreground">{t('auth.reclaim.intro')}</p>
           {factor ? (
             <div ref={factorView} className="space-y-4">
               {factor === 'webauthn' ? (
                 <>
-                  <p className="text-sm leading-relaxed">
-                    Use your account passkey with a device PIN or biometric verification. The
-                    service selected this verification method; a touch-only key cannot complete
-                    recovery.
-                  </p>
+                  <p className="text-sm leading-relaxed">{t('auth.reclaim.passkeyHint')}</p>
                   <Button
                     type="button"
                     className={`${controlClass} w-full`}
                     disabled={Boolean(pending)}
                     onClick={recover}
                   >
-                    Recover with a passkey
+                    {t('auth.reclaim.passkey')}
                   </Button>
                 </>
               ) : (
                 <form
                   method="post"
-                  aria-label="Account recovery verification"
+                  aria-label={t('auth.reclaim.form')}
                   noValidate
                   onSubmit={(event) => {
                     event.preventDefault();
@@ -350,11 +346,12 @@ export function AccountRecovery() {
                   }}
                   className="space-y-3"
                 >
-                  <Label htmlFor={`${id}-code`}>Authenticator code</Label>
+                  <Label htmlFor={`${id}-code`}>{t('auth.reclaim.code')}</Label>
                   <Input
                     ref={input}
                     id={`${id}-code`}
                     name="reclaim-code"
+                    dir="ltr"
                     type="text"
                     inputMode="numeric"
                     autoComplete="one-time-code"
@@ -368,14 +365,11 @@ export function AccountRecovery() {
                     className={`${inputClass} font-mono tracking-widest`}
                   />
                   <p id={`${id}-hint`} className="text-sm leading-relaxed text-muted-foreground">
-                    Use the six-digit code from your enrolled authenticator app. Switching apps
-                    clears this form but keeps the link for the remaining five-minute limit. Start
-                    again on return for fresh options. Email, text-message and recovery codes are
-                    not accepted here.
+                    {t('auth.reclaim.codeHint')}
                   </p>
                   {codeError && (
                     <p id={`${id}-error`} className="text-sm text-red-700 dark:text-red-400">
-                      {codeError}
+                      {message(codeError)}
                     </p>
                   )}
                   <Button
@@ -383,7 +377,7 @@ export function AccountRecovery() {
                     className={`${controlClass} w-full`}
                     disabled={Boolean(pending)}
                   >
-                    Recover account
+                    {t('auth.reclaim.recover')}
                   </Button>
                 </form>
               )}
@@ -395,7 +389,7 @@ export function AccountRecovery() {
               disabled={phase !== 'ready'}
               onClick={start}
             >
-              Start account recovery
+              {t('auth.reclaim.start')}
             </Button>
           )}
           {(factor || pending) && (
@@ -403,20 +397,15 @@ export function AccountRecovery() {
               type="button"
               variant="outline"
               className={`${controlClass} w-full`}
-              onClick={() =>
-                discard('Verification cancelled. Start again when you are ready.', false)
-              }
+              onClick={() => discard({ key: 'auth.reclaim.cancelled' }, false)}
             >
-              Cancel recovery
+              {t('auth.reclaim.cancel')}
             </Button>
           )}
         </>
       )}
       <noscript>
-        <p className="text-sm">
-          JavaScript is required for secure account recovery and to clear the link from the address
-          bar. No recovery request is submitted without it. Close this page when finished.
-        </p>
+        <p className="text-sm">{t('auth.reclaim.noScript')}</p>
       </noscript>
     </div>
   );

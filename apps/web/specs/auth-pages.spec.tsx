@@ -1,14 +1,36 @@
-import { fireEvent, render, screen } from '@testing-library/react';
-import { renderToStaticMarkup } from 'react-dom/server';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (namespace: string) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(namespace, mockPageLocale),
+}));
+
+import { fireEvent, render, screen } from '../i18n/testing';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+import type { ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+const renderToStaticMarkup = (element: ReactElement) =>
+  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import AuthLayout from '../app/(auth)/layout';
-import ForgotPasswordPage, { metadata as forgotMetadata } from '../app/(auth)/forgot-password/page';
-import LoginPage, { metadata as loginMetadata } from '../app/(auth)/login/page';
-import PasskeyPage, { metadata as passkeyMetadata } from '../app/(auth)/login/webauthn/page';
-import RegistrationPage, { metadata as registrationMetadata } from '../app/(auth)/register/page';
-import ResetPasswordPage, { metadata as resetMetadata } from '../app/(auth)/reset-password/page';
-import TotpPage, { metadata as totpMetadata } from '../app/(auth)/verify-totp/page';
+import ForgotPasswordPage, {
+  generateMetadata as forgotMetadata,
+} from '../app/(auth)/forgot-password/page';
+import LoginPage, { generateMetadata as loginMetadata } from '../app/(auth)/login/page';
+import PasskeyPage, {
+  generateMetadata as passkeyMetadata,
+} from '../app/(auth)/login/webauthn/page';
+import RegistrationPage, {
+  generateMetadata as registrationMetadata,
+} from '../app/(auth)/register/page';
+import ResetPasswordPage, {
+  generateMetadata as resetMetadata,
+} from '../app/(auth)/reset-password/page';
+import TotpPage, { generateMetadata as totpMetadata } from '../app/(auth)/verify-totp/page';
 
 jest.mock('next/navigation', () => ({ useRouter: () => ({ replace: jest.fn() }) }));
+
+let mockPageLocale: 'en' | 'fa-IR' = 'en';
+afterEach(() => {
+  mockPageLocale = 'en';
+});
 
 const notice = 'This form is not connected yet. Do not enter real credentials.';
 const routes = [
@@ -90,13 +112,9 @@ const routes = [
 describe('public auth routes', () => {
   it.each(routes)(
     '$path has meaningful headings, associated labels, native controls, and real navigation',
-    ({ Page, metadata, title, heading, action, fields, links }) => {
-      const { container } = render(
-        <AuthLayout>
-          <Page />
-        </AuthLayout>
-      );
-      expect(metadata.title).toBe(title);
+    async ({ Page, metadata, title, heading, action, fields, links }) => {
+      const { container } = render(await AuthLayout({ children: await Page() }));
+      expect((await metadata()).title).toBe(title);
       expect(screen.getAllByRole('main')).toHaveLength(1);
       expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
       expect(screen.getByRole('heading', { level: 1, name: heading })).toBeTruthy();
@@ -137,7 +155,7 @@ describe('public auth routes', () => {
         expect(
           document.getElementById(submit.getAttribute('aria-describedby') ?? '')?.textContent
         ).toContain(notice);
-      for (const button of screen.getAllByRole<HTMLButtonElement>('button')) {
+      for (const button of [...container.querySelectorAll<HTMLButtonElement>('form button')]) {
         expect(button.getAttribute('type')).toBe(
           button === submit && Page !== PasskeyPage ? 'submit' : 'button'
         );
@@ -151,12 +169,8 @@ describe('public auth routes', () => {
 
   it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
     '$path is disconnected in the initial server HTML, before hydration or JavaScript',
-    ({ Page }) => {
-      const html = renderToStaticMarkup(
-        <AuthLayout>
-          <Page />
-        </AuthLayout>
-      );
+    async ({ Page }) => {
+      const html = renderToStaticMarkup(await AuthLayout({ children: await Page() }));
       const document = new DOMParser().parseFromString(html, 'text/html');
       expect(document.forms).toHaveLength(1);
       const form = document.forms[0];
@@ -170,12 +184,8 @@ describe('public auth routes', () => {
     }
   );
 
-  it('server-renders a disabled non-submitting passkey button without initiating a ceremony', () => {
-    const html = renderToStaticMarkup(
-      <AuthLayout>
-        <PasskeyPage />
-      </AuthLayout>
-    );
+  it('server-renders a disabled non-submitting passkey button without initiating a ceremony', async () => {
+    const html = renderToStaticMarkup(await AuthLayout({ children: await PasskeyPage() }));
     const document = new DOMParser().parseFromString(html, 'text/html');
     expect(document.forms).toHaveLength(0);
     const button = document.querySelector<HTMLButtonElement>('[data-testid="passkey-login"]');
@@ -216,7 +226,7 @@ describe('disconnected route interaction', () => {
 
   it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
     '$path keeps the notice and prevents submission without network, WebAuthn, storage, or navigation',
-    ({ Page, action, fields }) => {
+    async ({ Page, action, fields }) => {
       const requests = [
         fetch,
         credentials.get,
@@ -229,11 +239,7 @@ describe('disconnected route interaction', () => {
         jest.spyOn(document, 'cookie', 'set').mockImplementation(() => undefined),
       ];
       const initialUrl = window.location.href;
-      const { container } = render(
-        <AuthLayout>
-          <Page />
-        </AuthLayout>
-      );
+      const { container } = render(await AuthLayout({ children: await Page() }));
       const form = screen.getByRole<HTMLFormElement>('form');
       expect(form.method).toBe('post');
       expect(form.getAttribute('action')).toBeNull();
@@ -271,6 +277,71 @@ describe('disconnected route interaction', () => {
       expect(window.location.href).toBe(initialUrl);
       for (const request of requests) expect(request).not.toHaveBeenCalled();
       expect(container.querySelector('style, script, [style], [onclick]')).toBeNull();
+    }
+  );
+});
+
+describe('Persian public auth pages', () => {
+  it.each([
+    [LoginPage, loginMetadata, 'ورود به هاتف', 'ورود | هویت هاتف', 'ورود با گذرواژه'],
+    [
+      RegistrationPage,
+      registrationMetadata,
+      'حساب خود را ایجاد کنید',
+      'ایجاد حساب | هویت هاتف',
+      'ایجاد حساب',
+    ],
+    [
+      PasskeyPage,
+      passkeyMetadata,
+      'ورود با کلید عبور',
+      'ورود با کلید عبور | هویت هاتف',
+      'استفاده از کلید عبور',
+    ],
+    [
+      TotpPage,
+      totpMetadata,
+      'کد رمزساز خود را تأیید کنید',
+      'تأیید کد رمزساز | هویت هاتف',
+      'تأیید کد',
+    ],
+    [
+      ForgotPasswordPage,
+      forgotMetadata,
+      'گذرواژهٔ خود را بازنشانی کنید',
+      'بازنشانی گذرواژه | هویت هاتف',
+      'ارسال پیوند بازنشانی',
+    ],
+    [
+      ResetPasswordPage,
+      resetMetadata,
+      'تعیین گذرواژهٔ جدید',
+      'تعیین گذرواژهٔ جدید | هویت هاتف',
+      'بازنشانی گذرواژه',
+    ],
+  ] as const)(
+    'server-resolves the Persian heading, metadata and accessible action for %s',
+    async (Page, metadata, heading, title, action) => {
+      mockPageLocale = 'fa-IR';
+      const content = await AuthLayout({ children: await Page() });
+      const { container } = render(content, { locale: 'fa-IR' });
+      expect((await metadata()).title).toBe(title);
+      expect(screen.getByRole('heading', { name: heading, level: 1 })).toBeTruthy();
+      expect(screen.getByRole('button', { name: action })).toBeTruthy();
+      expect(screen.getByRole('combobox', { name: 'زبان' })).toBeTruthy();
+      expect(screen.getByRole('link', { name: 'صفحهٔ اصلی هویت هاتف' }).getAttribute('href')).toBe(
+        '/'
+      );
+      for (const input of container.querySelectorAll<HTMLInputElement>('input')) {
+        expect(input.dir).toBe('ltr');
+        expect(input.getAttribute('aria-invalid')).toBe('false');
+      }
+      if (Page !== PasskeyPage) {
+        expect(screen.getByRole<HTMLButtonElement>('button', { name: action }).disabled).toBe(true);
+        expect(
+          screen.getByText('این فرم هنوز متصل نیست. اطلاعات ورود واقعی را وارد نکنید.')
+        ).toBeTruthy();
+      }
     }
   );
 });

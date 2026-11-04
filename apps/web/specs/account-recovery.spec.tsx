@@ -1,8 +1,17 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (...args: unknown[]) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(...args),
+}));
+
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
 import { StrictMode } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+import type { ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+const renderToStaticMarkup = (element: ReactElement) =>
+  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import AuthLayout from '../app/(auth)/layout';
-import RecoverAccountPage, { metadata } from '../app/(auth)/recover-account/page';
+import RecoverAccountPage, { generateMetadata } from '../app/(auth)/recover-account/page';
 import {
   ReclaimClient,
   type ReclaimOptions,
@@ -26,7 +35,8 @@ const api = {
   complete: jest.fn<Promise<void>, [ReclaimProof, AbortSignal, (() => void)?]>(),
 };
 let originalVisibility: PropertyDescriptor | undefined;
-beforeEach(() => {
+let pageElement: ReactElement;
+beforeEach(async () => {
   jest.resetAllMocks();
   window.history.replaceState(null, '', `/recover-account#token=${token}`);
   originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
@@ -37,6 +47,7 @@ beforeEach(() => {
     sent?.();
   });
   jest.mocked(usePasskey).mockResolvedValue(assertion);
+  pageElement = await AuthLayout({ children: await RecoverAccountPage() });
 });
 afterEach(() => {
   if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility);
@@ -54,11 +65,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 function page() {
-  return (
-    <AuthLayout>
-      <RecoverAccountPage />
-    </AuthLayout>
-  );
+  return pageElement;
 }
 function start() {
   fireEvent.click(screen.getByRole('button', { name: 'Start account recovery' }));
@@ -84,13 +91,17 @@ function show() {
 }
 
 describe('recovery link capture', () => {
-  it('server-renders a noindex, nonsensitive, non-submitting auth shell without accessing the fragment', () => {
+  it('server-renders a noindex, nonsensitive, non-submitting auth shell without accessing the fragment', async () => {
     const html = renderToStaticMarkup(page());
     const document = new DOMParser().parseFromString(html, 'text/html');
-    expect(metadata.robots).toEqual({ index: false, follow: false });
+    expect((await generateMetadata()).robots).toEqual({ index: false, follow: false });
     expect(document.querySelector('h1')?.textContent).toBe('Recover your account');
-    expect(document.querySelector<HTMLButtonElement>('button')?.disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button')?.type).toBe('button');
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="account-recovery"] button')?.disabled
+    ).toBe(true);
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="account-recovery"] button')?.type
+    ).toBe('button');
     expect(document.forms).toHaveLength(0);
     expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
     expect(html).toContain('No recovery request is submitted without it');
@@ -200,6 +211,20 @@ describe('explicit factor verification', () => {
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(document.activeElement).toBe(input);
     expect(api.complete).not.toHaveBeenCalled();
+    for (const value of [
+      '۰۱۲۳۴۵',
+      '٠١٢٣٤٥',
+      '０１２３４５',
+      '01۲345',
+      '\u202e012345',
+      '012345\u2069',
+    ]) {
+      fireEvent.change(input, { target: { value } });
+      fireEvent.submit(form);
+      expect(input.value).toBe(value);
+      expect(input.getAttribute('aria-invalid')).toBe('true');
+      expect(api.complete).not.toHaveBeenCalled();
+    }
     fireEvent.change(input, { target: { value: '012345' } });
     expect(api.complete).not.toHaveBeenCalled();
     act(() => {
@@ -496,4 +521,43 @@ describe('uncertain completion', () => {
       expect(api.complete).toHaveBeenCalledTimes(1);
     }
   );
+});
+
+describe('recovery presentation changes', () => {
+  it('retains an active token, pending read and ASCII code without resetting its original memory deadline', async () => {
+    jest.useFakeTimers();
+    const options = deferred<ReclaimOptions>();
+    api.options.mockReturnValueOnce(options.promise);
+    const AccountRecovery = (await import('../app/(auth)/_components/account-recovery'))
+      .AccountRecovery;
+    const view = (locale: 'en' | 'fa-IR') => (
+      <I18nTestProvider locale={locale}>
+        <AccountRecovery />
+      </I18nTestProvider>
+    );
+    const result = render(view('en'));
+    start();
+    const signal = api.options.mock.calls[0][1];
+    result.rerender(view('fa-IR'));
+    expect(signal.aborted).toBe(false);
+    expect(ReclaimClient).toHaveBeenCalledTimes(1);
+    expect(api.options).toHaveBeenCalledTimes(1);
+    expect(api.complete).not.toHaveBeenCalled();
+    await act(async () => options.resolve({ factor: 'totp' }));
+    const input = screen.getByLabelText<HTMLInputElement>('کد رمزساز');
+    fireEvent.change(input, { target: { value: '012345' } });
+    result.rerender(view('en'));
+    expect(screen.getByLabelText('Authenticator code')).toBe(input);
+    expect(input.value).toBe('012345');
+    act(() => jest.advanceTimersByTime(299000));
+    result.rerender(view('fa-IR'));
+    act(() => jest.advanceTimersByTime(1001));
+    expect(screen.queryByLabelText('کد رمزساز')).toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'آغاز بازیابی حساب' }).disabled
+    ).toBe(true);
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(JSON.stringify(window.history.state)).not.toContain(token);
+    expect(window.location.hash).toBe('');
+  });
 });

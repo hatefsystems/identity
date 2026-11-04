@@ -1,14 +1,19 @@
+import { getTranslations } from 'next-intl/server';
 import { AuthCard, AuthLink } from '../_components/auth-card';
 import { TotpScreen } from '../_components/screens';
 
-export const metadata = { title: 'Verify authenticator code | Hatef Identity' };
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('totp.metadata') };
+}
 
-export default function TotpPage() {
+export default async function TotpPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Verify your authenticator code"
-      description="Use the current code from your authenticator app. No verification session is connected to this preview."
-      footer={<AuthLink href="/login">Return to sign in</AuthLink>}
+      title={t('pages.totp.title')}
+      description={t('pages.totp.description')}
+      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
     >
       <TotpScreen />
     </AuthCard>

@@ -1,5 +1,7 @@
 'use client';
 
+import { useTranslations } from 'next-intl';
+
 import {
   ForgotPasswordForm,
   LoginForm,
@@ -11,7 +13,8 @@ import { PasskeyLogin } from '../../_components/passkey-login';
 
 // Only passkey sign-in is live. Other Task 7.2 forms remain disconnected.
 export function LoginScreen() {
-  return <LoginForm passkeyAction={<PasskeyLogin label="Continue with a passkey" />} />;
+  const t = useTranslations();
+  return <LoginForm passkeyAction={<PasskeyLogin label={t('auth.passkey.continue')} />} />;
 }
 
 export function RegistrationScreen() {

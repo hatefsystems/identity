@@ -25,6 +25,9 @@
   },
   "include": [
     "proxy.ts",
+    "i18n/**/*.ts",
+    "i18n/**/*.tsx",
+    "messages/**/*.ts",
     "app/**/*.ts",
     "app/**/*.tsx",
     "app/**/*.js",
@@ -44,6 +47,7 @@
     "app/**/*.test.ts",
     "src/**/*.spec.ts",
     "src/**/*.test.ts",
+    "i18n/testing.tsx",
     ".next",
     "eslint.config.js",
     "eslint.config.cjs",

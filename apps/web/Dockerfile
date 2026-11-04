@@ -25,6 +25,7 @@ ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 COPY --from=builder --chown=node:node /app/apps/web/.next/standalone ./
 COPY --from=builder --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
 COPY --from=builder --chown=node:node /app/apps/web/public ./apps/web/public
+COPY --from=builder --chown=node:node /app/apps/web/app/fonts/OFL.txt /app/apps/web/app/fonts/AUTHORS.txt /app/apps/web/app/fonts/provenance.json ./apps/web/public/fonts/
 RUN mkdir -p apps/web/.next/cache && chown node:node apps/web/.next/cache
 
 USER node

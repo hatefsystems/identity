@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '../i18n/testing';
 import { ProfileEditor } from '../app/dashboard/_components/profile-editor';
 import { PasskeysPanel } from '../app/dashboard/_components/passkeys-panel';
 import { SessionsView } from '../app/dashboard/_components/sessions-view';
@@ -260,6 +260,19 @@ describe('native verification dialog', () => {
     expect(api.stepUpVerify).not.toHaveBeenCalled();
     const code = screen.getByLabelText<HTMLInputElement>('Authenticator code');
     expect(document.activeElement).toBe(code);
+    for (const value of [
+      '۰۱۲۳۴۵',
+      '٠١٢٣٤٥',
+      '０１２３４５',
+      '01۲345',
+      '\u202e012345',
+      '012345\u2069',
+    ]) {
+      fireEvent.change(code, { target: { value } });
+      fireEvent.submit(form);
+      expect(code.value).toBe(value);
+      expect(api.stepUpVerify).not.toHaveBeenCalled();
+    }
     fireEvent.change(code, { target: { value: '012345' } });
     expect(api.stepUpVerify).not.toHaveBeenCalled();
     fireEvent.submit(form);

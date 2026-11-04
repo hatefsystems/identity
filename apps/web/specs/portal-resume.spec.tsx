@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
 import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-provider';
 import { PasskeysPanel } from '../app/dashboard/_components/passkeys-panel';
 import { RecoveryPanel } from '../app/dashboard/_components/recovery-panel';

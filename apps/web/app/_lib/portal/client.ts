@@ -1,3 +1,4 @@
+import { isLocale, type Locale } from '../../../i18n/config';
 import { browserKey, signProof, type BrowserKey } from './dpop';
 import { isSessionLoss, parseRetryAfter, PortalError, throwIfAborted } from './errors';
 import {
@@ -23,6 +24,7 @@ type RequestOptions = {
   grant?: StepUpGrant;
   onSend?: () => void;
   idempotencyKey?: string;
+  notificationLocale?: Locale;
 };
 type Decoder<T> = (value: unknown, status: number) => T;
 
@@ -74,6 +76,7 @@ export class PortalClient {
 
   async request<T>(path: string, decode: Decoder<T>, options: RequestOptions = {}): Promise<T> {
     const method = options.method ?? 'GET';
+    const notificationLocale = options.notificationLocale;
     const mutation = method !== 'GET';
     const legalLookup = method === 'POST' && path === '/api/v1/admin/legal-inquiry/lookup';
     const legalCreate =
@@ -85,6 +88,12 @@ export class PortalClient {
       !/^\/api\/v1\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(path) ||
       !['GET', 'POST', 'PATCH', 'DELETE'].includes(method) ||
       (!mutation && options.body !== undefined)
+    )
+      throw new PortalError('invalid_request');
+    // Presentation authority is confined to the single notification-producing route.
+    if (
+      notificationLocale !== undefined &&
+      (path !== '/api/v1/users/me' || method !== 'DELETE' || !isLocale(notificationLocale))
     )
       throw new PortalError('invalid_request');
     let idempotencyKey: string | undefined;
@@ -179,6 +188,8 @@ export class PortalClient {
       const headers = new Headers({ Accept: 'application/json' });
       if (body !== undefined) headers.set('Content-Type', 'application/json');
       if (idempotencyKey !== undefined) headers.set('Idempotency-Key', idempotencyKey);
+      if (notificationLocale !== undefined)
+        headers.set('X-Hatef-Notification-Locale', notificationLocale);
       if (snapshot) headers.set('X-Portal-Session', snapshot.session.id);
       // take() clears the grant before any transmission. Only the explicit
       // pre-handler nonce branch below may resend this same logical operation.
@@ -376,9 +387,15 @@ export class PortalClient {
   logout(signal?: AbortSignal) {
     return this.request('/api/v1/auth/logout', emptyResponse, { method: 'POST', body: {}, signal });
   }
-  deleteAccount(grant: StepUpGrant, signal: AbortSignal, onSend?: () => void) {
+  deleteAccount(
+    grant: StepUpGrant,
+    signal: AbortSignal,
+    onSend?: () => void,
+    notificationLocale?: Locale
+  ) {
     return this.request('/api/v1/users/me', emptyResponse, {
       method: 'DELETE',
+      notificationLocale,
       grant,
       signal,
       onSend,

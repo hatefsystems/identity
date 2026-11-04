@@ -1,5 +1,10 @@
 'use client';
 
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
+
+import { useTranslations } from 'next-intl';
+
 import { Button, Input, Label } from '@hatef/ui';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { Passkey, StepUpGrant } from '../../_lib/portal/contracts';
@@ -13,14 +18,16 @@ import { usePortal } from './portal-provider';
 import { StepUpDialog } from './step-up-dialog';
 
 export function PasskeysPanel() {
+  const t = useTranslations();
+  const message = useMessage();
   const { client, resumedAction } = usePortal();
   const [keys, setKeys] = useState<Passkey[] | null>(null);
   const [name, setName] = useState('');
   const [editing, setEditing] = useState<{ id: string; name: string } | null>(null);
-  const [nameError, setNameError] = useState('');
-  const [editError, setEditError] = useState('');
-  const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
+  const [nameError, setNameError] = useState<Message>('');
+  const [editError, setEditError] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
+  const [status, setStatus] = useState<Message>('');
   const [action, setAction] = useState<PasskeyAction | null>(null);
   const [resumeTotp, setResumeTotp] = useState(false);
   const resume = useRef(resumedAction?.kind === 'passkey' ? resumedAction.action : null);
@@ -54,7 +61,7 @@ export function PasskeysPanel() {
     const generation = ++readGeneration.current;
     read.current = controller;
     setError('');
-    setStatus('Loading passkeys...');
+    setStatus({ key: 'security.passkeys.loading' });
     client
       .keys(controller.signal)
       .then((items) => {
@@ -63,16 +70,14 @@ export function PasskeysPanel() {
         setKeys(items);
         blocked.current = false;
         setNeedsRefresh(false);
-        setStatus(attempt ? 'Passkeys refreshed.' : '');
+        setStatus(attempt ? { key: 'security.passkeys.refreshed' } : '');
         const pending = resume.current;
         resume.current = null;
         if (pending) {
           const target =
             pending.kind === 'add' ? undefined : items.find((item) => item.id === pending.id);
           if (pending.kind !== 'add' && !target) {
-            setError(
-              'The passkey for the pending action is no longer listed. Choose a current passkey to continue.'
-            );
+            setError({ key: 'security.passkeys.missing' });
           } else {
             const restored =
               pending.kind === 'remove' ? { ...pending, name: target?.name ?? '' } : pending;
@@ -122,7 +127,7 @@ export function PasskeysPanel() {
       open({ kind: 'add', name: normalizeName(name) });
       setNameError('');
     } catch (failure) {
-      setNameError((failure as Error).message);
+      setNameError(errorMessage(failure));
       nameInput.current?.focus();
     }
   }
@@ -132,7 +137,7 @@ export function PasskeysPanel() {
       open({ kind: 'rename', id: editing.id, name: normalizeName(editing.name) });
       setEditError('');
     } catch (failure) {
-      setEditError((failure as Error).message);
+      setEditError(errorMessage(failure));
       editInput.current?.focus();
     }
   }
@@ -158,21 +163,21 @@ export function PasskeysPanel() {
         invalidateRead();
         setKeys((items) => [...(items ?? []), key]);
         setName('');
-        setStatus('Passkey added.');
+        setStatus({ key: 'security.passkeys.added' });
       } else if (target.kind === 'rename') {
         const key = await client.renameKey(target.id, target.name, grant, signal, onSend);
         throwIfAborted(signal);
         invalidateRead();
         setKeys((items) => items?.map((item) => (item.id === key.id ? key : item)) ?? null);
         setEditing(null);
-        setStatus('Passkey name saved.');
+        setStatus({ key: 'security.passkeys.renamed' });
       } else {
         await client.removeKey(target.id, grant, signal, onSend);
         throwIfAborted(signal);
         invalidateRead();
         setKeys((items) => items?.filter((item) => item.id !== target.id) ?? null);
         if (editing?.id === target.id) setEditing(null);
-        setStatus('Passkey removed.');
+        setStatus({ key: 'security.passkeys.removed' });
       }
     } catch (failure) {
       if (!signal.aborted && failure instanceof PortalError && failure.uncertain) {
@@ -186,21 +191,20 @@ export function PasskeysPanel() {
   }
 
   return (
-    <Panel title="Passkeys" id="passkeys-heading">
+    <Panel title={t('security.passkeys.title')} id="passkeys-heading">
       <p className="text-sm leading-relaxed text-muted-foreground">
-        Names are labels you choose, not verified device models. Keep at least one passkey to retain
-        sign-in access.
+        {t('security.passkeys.description')}
       </p>
       <Feedback
         error={
           needsRefresh
-            ? `The passkey change may already have completed. Refresh passkeys to check the saved state before starting another action.${error ? ` ${error}` : ''}`
+            ? `${t('security.passkeys.uncertain')}${error ? ` ${message(error)}` : ''}`
             : error
         }
         status={status}
       />
       {keys && (
-        <ul className="divide-y rounded-lg border" aria-label="Registered passkeys">
+        <ul className="divide-y rounded-lg border" aria-label={t('security.passkeys.list')}>
           {keys.map((key) => (
             <li
               key={key.id}
@@ -210,22 +214,24 @@ export function PasskeysPanel() {
             >
               <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
                 <div className="min-w-0 space-y-1">
-                  <h3 className="break-words font-medium">{key.name || 'Unnamed passkey'}</h3>
+                  <h3 dir="auto" className="break-words font-medium isolate">
+                    {key.name || t('security.passkeys.unnamed')}
+                  </h3>
                   <p className="text-xs leading-relaxed text-muted-foreground">
-                    Added <DateLabel value={key.created_at} />
-                    {key.last_used_at ? (
-                      <>
-                        . Last used <DateLabel value={key.last_used_at} />.
-                      </>
-                    ) : (
-                      '. Not used since registration.'
-                    )}
+                    {key.last_used_at
+                      ? t.rich('security.passkeys.dates', {
+                          created: () => <DateLabel value={key.created_at} />,
+                          used: () => key.last_used_at ? <DateLabel value={key.last_used_at} /> : null,
+                        })
+                      : t.rich('security.passkeys.neverUsed', {
+                          created: () => <DateLabel value={key.created_at} />,
+                        })}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     {key.backup_eligible
-                      ? 'Eligible for passkey syncing'
-                      : 'Not marked as sync eligible'}
-                    {key.user_verified ? '. User verified at enrollment.' : '.'}
+                      ? t('security.passkeys.sync')
+                      : t('security.passkeys.noSync')}
+                    {key.user_verified && <> {t('security.passkeys.verified')}</>}
                   </p>
                 </div>
                 <div className="flex shrink-0 flex-wrap gap-2">
@@ -233,30 +239,34 @@ export function PasskeysPanel() {
                     type="button"
                     variant="outline"
                     className={controlClass}
-                    aria-label={`Rename ${key.name || 'unnamed passkey'}`}
+                    aria-label={t('security.passkeys.renameLabel', {
+                      name: key.name || t('security.passkeys.unnamedLabel'),
+                    })}
                     disabled={needsRefresh}
                     onClick={() => {
                       setEditing({ id: key.id, name: key.name });
                       setEditError('');
                     }}
                   >
-                    Rename
+                    {t('security.passkeys.rename')}
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
                     className={controlClass}
-                    aria-label={`Remove ${key.name || 'unnamed passkey'}`}
+                    aria-label={t('security.passkeys.removeLabel', {
+                      name: key.name || t('security.passkeys.unnamedLabel'),
+                    })}
                     disabled={keys.length === 1 || needsRefresh}
                     onClick={() => open({ kind: 'remove', id: key.id, name: key.name })}
                   >
-                    Remove
+                    {t('security.passkeys.remove')}
                   </Button>
                 </div>
               </div>
               {editing?.id === key.id && (
                 <form
-                  aria-label="Rename passkey"
+                  aria-label={t('security.passkeys.renameTitle')}
                   noValidate
                   onSubmit={(event) => {
                     event.preventDefault();
@@ -264,11 +274,12 @@ export function PasskeysPanel() {
                   }}
                   className="space-y-3"
                 >
-                  <Label htmlFor={`${id}-rename`}>Passkey name</Label>
+                  <Label htmlFor={`${id}-rename`}>{t('security.passkeys.name')}</Label>
                   <Input
                     ref={editInput}
                     id={`${id}-rename`}
                     name="passkey_name"
+                    dir="auto"
                     value={editing.name}
                     onChange={(event) => {
                       setEditing({ ...editing, name: event.target.value });
@@ -280,12 +291,12 @@ export function PasskeysPanel() {
                   />
                   {editError && (
                     <p id={`${id}-rename-error`} className="text-sm text-red-700 dark:text-red-400">
-                      {editError}
+                      {message(editError)}
                     </p>
                   )}
                   <div className="flex flex-wrap gap-2">
                     <Button type="submit" className={controlClass} disabled={needsRefresh}>
-                      Save passkey name
+                      {t('security.passkeys.saveName')}
                     </Button>
                     <Button
                       type="button"
@@ -293,7 +304,7 @@ export function PasskeysPanel() {
                       className={controlClass}
                       onClick={() => setEditing(null)}
                     >
-                      Cancel rename
+                      {t('security.passkeys.cancelRename')}
                     </Button>
                   </div>
                 </form>
@@ -302,11 +313,9 @@ export function PasskeysPanel() {
           ))}
         </ul>
       )}
-      {keys?.length === 0 && <p className="text-sm">No passkeys are listed for this session.</p>}
+      {keys?.length === 0 && <p className="text-sm">{t('security.passkeys.empty')}</p>}
       {keys?.length === 1 && (
-        <p className="text-sm text-muted-foreground">
-          Add another passkey before removing your last one.
-        </p>
+        <p className="text-sm text-muted-foreground">{t('security.passkeys.last')}</p>
       )}
       <Button
         type="button"
@@ -318,10 +327,10 @@ export function PasskeysPanel() {
           setAttempt((value) => value + 1);
         }}
       >
-        Refresh passkeys
+        {t('security.passkeys.refresh')}
       </Button>
       <form
-        aria-label="Add passkey"
+        aria-label={t('security.passkeys.add')}
         noValidate
         onSubmit={(event) => {
           event.preventDefault();
@@ -329,11 +338,12 @@ export function PasskeysPanel() {
         }}
         className="space-y-3 border-t pt-5"
       >
-        <Label htmlFor={`${id}-name`}>New passkey name</Label>
+        <Label htmlFor={`${id}-name`}>{t('security.passkeys.newName')}</Label>
         <Input
           ref={nameInput}
           id={`${id}-name`}
           name="new_passkey_name"
+          dir="auto"
           value={name}
           onChange={(event) => {
             setName(event.target.value);
@@ -344,46 +354,41 @@ export function PasskeysPanel() {
           className={inputClass}
         />
         <p id={`${id}-hint`} className="text-sm text-muted-foreground">
-          Optional, up to 80 characters. Choose a label that helps you recognize this credential.
+          {t('security.passkeys.hint')}
         </p>
         {nameError && (
           <p id={`${id}-name-error`} className="text-sm text-red-700 dark:text-red-400">
-            {nameError}
+            {message(nameError)}
           </p>
         )}
         <Button type="submit" className={controlClass} disabled={!keys || needsRefresh}>
-          Add passkey
+          {t('security.passkeys.add')}
         </Button>
       </form>
       {action && (
         <StepUpDialog
           title={
             action.kind === 'add'
-              ? 'Add a passkey'
+              ? t('security.passkeys.addTitle')
               : action.kind === 'rename'
-                ? 'Rename passkey'
-                : 'Remove passkey'
+                ? t('security.passkeys.renameTitle')
+                : t('security.passkeys.removeTitle')
           }
-          description={
-            action.kind === 'remove' ? (
-              <>
-                Remove{' '}
-                <strong className="text-foreground">{action.name || 'Unnamed passkey'}</strong> from
-                this account? It will no longer be accepted for sign-in.
-              </>
-            ) : action.kind === 'rename' ? (
-              <>
-                Change this passkey label to{' '}
-                <strong className="text-foreground">{action.name || '(no name)'}</strong>?
-              </>
-            ) : (
-              <>
-                Create a new sign-in credential named{' '}
-                <strong className="text-foreground">{action.name || '(no name)'}</strong>. After
-                verification, your authenticator will ask to create the passkey.
-              </>
-            )
-          }
+          description={t.rich(
+            `security.passkeys.${action.kind === 'remove' ? 'removeDescription' : action.kind === 'rename' ? 'renameDescription' : 'addDescription'}`,
+            {
+              name: () => (
+                <bdi dir="auto" className="font-semibold text-foreground">
+                  {action.name ||
+                    t(
+                      action.kind === 'remove'
+                        ? 'security.passkeys.unnamed'
+                        : 'security.passkeys.noName'
+                    )}
+                </bdi>
+              ),
+            }
+          )}
           onCancel={close}
           onAuthorized={perform}
           intent={{ kind: 'passkey', action }}

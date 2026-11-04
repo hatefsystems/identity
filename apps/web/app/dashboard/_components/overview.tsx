@@ -1,5 +1,9 @@
 'use client';
 
+import type { Message } from '../../../i18n/messages';
+
+import { useFormatter, useTranslations } from 'next-intl';
+
 import { Button } from '@hatef/ui';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
@@ -8,6 +12,8 @@ import { controlClass, DateLabel, Feedback, linkClass, PageHeading, Panel } from
 import { usePortal } from './portal-provider';
 
 export function Overview() {
+  const t = useTranslations();
+  const format = useFormatter();
   const { client, profile } = usePortal();
   const [summary, setSummary] = useState<{
     keys: number;
@@ -15,7 +21,7 @@ export function Overview() {
     remaining: number;
     low: boolean;
   } | null>(null);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
@@ -42,28 +48,31 @@ export function Overview() {
   }, [client, attempt]);
   return (
     <>
-      <PageHeading title="Account overview">
-        Manage your shared identity, sign-in methods, and active browser sessions.
+      <PageHeading title={t('portal.overview.title')}>
+        {t('portal.overview.description')}
       </PageHeading>
-      <Panel title={profile.display_name || 'Your profile'} id="overview-profile">
+      <Panel title={profile.display_name || t('portal.overview.profile')} id="overview-profile">
         <dl className="grid gap-4 text-sm sm:grid-cols-2">
           <div>
-            <dt className="text-muted-foreground">Primary email</dt>
-            <dd className="mt-1 break-all font-medium">{profile.email}</dd>
+            <dt className="text-muted-foreground">{t('portal.overview.email')}</dt>
+            <dd dir="ltr" className="mt-1 break-all font-medium isolate">
+              {profile.email}
+            </dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">Account status</dt>
-            <dd className="mt-1 font-medium">{profile.status}</dd>
+            <dt className="text-muted-foreground">{t('portal.overview.status')}</dt>
+            <dd className="mt-1 font-medium">
+              {(['active', 'disabled', 'suspended', 'pending_deletion'] as const)
+                .map((value) => (value === profile.status ? t(`portal.status.${value}`) : ''))
+                .join('') || profile.status}
+            </dd>
           </div>
         </dl>
         <Link href="/dashboard/profile" className={linkClass}>
-          Edit display name
+          {t('portal.overview.edit')}
         </Link>
       </Panel>
-      <Feedback
-        error={error}
-        status={!summary && !error ? 'Loading current account summaries...' : ''}
-      />
+      <Feedback error={error} status={!summary && !error ? t('portal.overview.loading') : ''} />
       {error && (
         <Button
           type="button"
@@ -71,42 +80,46 @@ export function Overview() {
           variant="outline"
           onClick={() => setAttempt((value) => value + 1)}
         >
-          Refresh overview
+          {t('portal.overview.refresh')}
         </Button>
       )}
       {summary && (
         <div className="grid gap-5 sm:grid-cols-3">
-          <Panel title="Passkeys" id="overview-passkeys">
-            <p className="text-3xl font-semibold tabular-nums">{summary.keys}</p>
-            <p className="text-sm text-muted-foreground">Registered sign-in credentials.</p>
-            <Link href="/dashboard/security" className={linkClass}>
-              Manage passkeys
-            </Link>
-          </Panel>
-          <Panel title="Sessions" id="overview-sessions">
-            <p className="text-3xl font-semibold tabular-nums">{summary.sessions}</p>
-            <p className="text-sm text-muted-foreground">Active server-side browser sessions.</p>
-            <Link href="/dashboard/sessions" className={linkClass}>
-              Review sessions
-            </Link>
-          </Panel>
-          <Panel title="Recovery codes" id="overview-recovery">
-            <p className="text-3xl font-semibold tabular-nums">{summary.remaining}</p>
+          <Panel title={t('portal.overview.passkeys')} id="overview-passkeys">
+            <p className="text-3xl font-semibold tabular-nums">{format.number(summary.keys)}</p>
             <p className="text-sm text-muted-foreground">
-              {summary.low
-                ? 'Running low on unused recovery codes.'
-                : 'Unused recovery codes remaining.'}
+              {t('portal.overview.passkeysDescription')}
             </p>
             <Link href="/dashboard/security" className={linkClass}>
-              Manage recovery codes
+              {t('portal.overview.managePasskeys')}
+            </Link>
+          </Panel>
+          <Panel title={t('portal.overview.sessions')} id="overview-sessions">
+            <p className="text-3xl font-semibold tabular-nums">{format.number(summary.sessions)}</p>
+            <p className="text-sm text-muted-foreground">
+              {t('portal.overview.sessionsDescription')}
+            </p>
+            <Link href="/dashboard/sessions" className={linkClass}>
+              {t('portal.overview.manageSessions')}
+            </Link>
+          </Panel>
+          <Panel title={t('portal.overview.recovery')} id="overview-recovery">
+            <p className="text-3xl font-semibold tabular-nums">
+              {format.number(summary.remaining)}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {summary.low ? t('portal.overview.low') : t('portal.overview.remaining')}
+            </p>
+            <Link href="/dashboard/security" className={linkClass}>
+              {t('portal.overview.manageRecovery')}
             </Link>
           </Panel>
         </div>
       )}
       <p className="text-sm leading-relaxed text-muted-foreground">
-        This browser uses a cryptographically bound session, with an absolute expiry of{' '}
-        <DateLabel value={profile.session.expires_at} />. Inactivity or revocation can end it
-        earlier.
+        {t.rich('portal.overview.expiry', {
+          date: () => <DateLabel value={profile.session.expires_at} />,
+        })}
       </p>
     </>
   );

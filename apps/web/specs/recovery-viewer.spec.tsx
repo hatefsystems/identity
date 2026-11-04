@@ -1,4 +1,9 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (...args: unknown[]) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(...args),
+}));
+
+import { act, fireEvent, render, screen, waitFor, within } from '../i18n/testing';
 import { RecoveryPanel } from '../app/dashboard/_components/recovery-panel';
 import { usePortal } from '../app/_components/portal-provider';
 import { PortalClient } from '../app/_lib/portal/client';
@@ -294,4 +299,46 @@ describe('one-time recovery viewer', () => {
     expect(api.generateRecovery).toHaveBeenCalledTimes(2);
     expect(api.generateRecovery.mock.calls[0][0]).not.toBe(api.generateRecovery.mock.calls[1][0]);
   });
+});
+
+it('keeps one-time bytes and the original five-minute deadline when language, calendar and time zone change', async () => {
+  jest.useFakeTimers();
+  const { I18nTestProvider } = await import('../i18n/testing');
+  const view = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider
+      locale={locale}
+      preferences={{
+        calendar: locale === 'en' ? 'gregory' : 'persian',
+        timeZone: locale === 'en' ? 'UTC' : 'Asia/Tehran',
+      }}
+    >
+      <RecoveryPanel />
+    </I18nTestProvider>
+  );
+  const result = render(view('en'));
+  await generateView();
+  const originalNodes = screen.getAllByTestId('recovery-code');
+  const originalStatusReads = api.recoveryStatus.mock.calls.length;
+  act(() => jest.advanceTimersByTime(299000));
+  result.rerender(view('fa-IR'));
+  expect(
+    screen.getByRole('heading', { name: 'کدهای بازیابی جدید خود را ذخیره کنید' })
+  ).toBeTruthy();
+  const currentNodes = screen.getAllByTestId('recovery-code');
+  expect(currentNodes[0]).toBe(originalNodes[0]);
+  expect(currentNodes.map((item) => item.textContent)).toEqual(codes);
+  fireEvent.click(screen.getByRole('button', { name: 'کپی کدها' }));
+  await act(async () => undefined);
+  expect(clipboard).toHaveBeenCalledWith(`${codes.join('\n')}\n`);
+  expect(api.generateRecovery).toHaveBeenCalledTimes(1);
+  expect(api.stepUpChallenge).toHaveBeenCalledTimes(1);
+  expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+  expect(api.recoveryStatus).toHaveBeenCalledTimes(originalStatusReads);
+  act(() => jest.advanceTimersByTime(1001));
+  expect(screen.queryByTestId('recovery-viewer')).toBeNull();
+  expect(
+    screen.getByText(
+      'مهلت نمایش یک‌باره پایان یافت. کدهای ذخیره‌شده تا زمان استفاده یا جایگزینی معتبر می‌مانند.'
+    )
+  ).toBeTruthy();
 });

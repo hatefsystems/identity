@@ -2,7 +2,10 @@
 
 import { Button, Input, Label } from '@hatef/ui';
 import Link from 'next/link';
+import { useTranslations } from 'next-intl';
 import { useId, useRef, useState, type FormEvent } from 'react';
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
 import {
   controlClass,
   Feedback,
@@ -35,22 +38,21 @@ import {
 } from './query-view-state';
 import { QueryUtcTime } from './query-view-time';
 
-const accountStatuses: Record<AdminUserStatus, string> = {
-  active: 'Active',
-  suspended: 'Suspended',
-  banned: 'Banned',
-  pending_verification: 'Pending verification',
-  pending_deletion: 'Pending deletion',
-};
+const accountStatuses = [
+  'active',
+  'suspended',
+  'banned',
+  'pending_verification',
+  'pending_deletion',
+] as const satisfies readonly AdminUserStatus[];
 const maxAccountOffset = 2147483647;
 
 export function UsersView() {
+  const t = useTranslations('admin');
   const { client, profile, capabilities, reportPermissionLoss } = usePortal();
   return (
     <>
-      <PageHeading title="Accounts">
-        Read bounded account pages and review individual accounts. Each disclosure is audited.
-      </PageHeading>
+      <PageHeading title={t('accounts.title')}>{t('accounts.description')}</PageHeading>
       {capabilities?.capabilities.users_read ? (
         <AccountQuery
           key={`${profile.session.id}:${capabilities.capabilities.users_pii}:${capabilities.capabilities.users_lookup}`}
@@ -59,7 +61,7 @@ export function UsersView() {
           reportPermissionLoss={reportPermissionLoss}
         />
       ) : (
-        <Feedback error="This workspace does not grant account-read access. No accounts were requested." />
+        <Feedback error={{ key: 'admin.accounts.denied' }} />
       )}
     </>
   );
@@ -74,6 +76,8 @@ function AccountQuery({
   capabilities: AdminCapabilities;
   reportPermissionLoss: () => void;
 }) {
+  const t = useTranslations('admin');
+  const message = useMessage();
   const { limits } = capabilities;
   const canPII = capabilities.capabilities.users_pii;
   const canLookup = canPII && capabilities.capabilities.users_lookup;
@@ -84,10 +88,10 @@ function AccountQuery({
   const [query, setQuery] = useState<AdminUsersQuery | null>(null);
   const [mode, setMode] = useState<'list' | 'lookup' | null>(null);
   const [pending, setPending] = useState(false);
-  const [status, setStatus] = useState('Apply filters to load a bounded account page.');
-  const [error, setError] = useState('');
-  const [sizeError, setSizeError] = useState('');
-  const [emailError, setEmailError] = useState('');
+  const [status, setStatus] = useState<Message>({ key: 'admin.accounts.initial' });
+  const [error, setError] = useState<Message>('');
+  const [sizeError, setSizeError] = useState<Message>('');
+  const [emailError, setEmailError] = useState<Message>('');
   const sizeInput = useRef<HTMLInputElement>(null);
   const emailInput = useRef<HTMLInputElement>(null);
   const id = useId();
@@ -111,7 +115,7 @@ function AccountQuery({
     setQuery(null);
     setMode(null);
     setPending(false);
-    setStatus('Inputs changed. Submit an explicit query to load results.');
+    setStatus({ key: 'admin.accounts.changed' });
     setError('');
   }
 
@@ -124,7 +128,7 @@ function AccountQuery({
     setMode(lookup ? 'lookup' : 'list');
     setPending(true);
     setError('');
-    setStatus(lookup ? 'Looking up the exact email...' : 'Loading accounts...');
+    setStatus({ key: lookup ? 'admin.accounts.lookingUp' : 'admin.accounts.loading' });
     try {
       const api = new AdminClient(client);
       const result = lookup
@@ -137,9 +141,10 @@ function AccountQuery({
         items: result.items.map((item) => ({ ...item, email: canPII ? item.email : undefined })),
       });
       setQuery(lookup ? null : request);
-      setStatus(
-        `${result.items.length} ${lookup ? 'matching accounts' : 'accounts on this page'} loaded.`
-      );
+      setStatus({
+        key: lookup ? 'admin.accounts.matchesLoaded' : 'admin.accounts.pageLoaded',
+        values: { count: result.items.length },
+      });
     } catch (failure) {
       if (!work.current(controller) || isAborted(failure)) return;
       setPage(null);
@@ -160,7 +165,7 @@ function AccountQuery({
     if (pending || work.blocked) return;
     const limit = queryPageSize(size, limits.page_size_max);
     if (limit === null) {
-      setSizeError(`Enter a whole page size from 1 to ${limits.page_size_max}.`);
+      setSizeError({ key: 'admin.accounts.sizeError', values: { maximum: limits.page_size_max } });
       sizeInput.current?.focus();
       return;
     }
@@ -179,7 +184,7 @@ function AccountQuery({
       /[\p{Cc}\p{Cs}]/u.test(value) ||
       new TextEncoder().encode(value).length > 254
     ) {
-      setEmailError('Enter one complete email address, at most 254 UTF-8 bytes.');
+      setEmailError({ key: 'admin.accounts.emailError' });
       emailInput.current?.focus();
       return;
     }
@@ -190,15 +195,15 @@ function AccountQuery({
   if (cleared) return <Feedback status={queryClearedMessage} />;
 
   return (
-    <Panel title="Account directory" id={`${id}-heading`}>
+    <Panel title={t('accounts.directory')} id={`${id}-heading`}>
       <form
-        aria-label="Filter accounts"
+        aria-label={t('accounts.filter')}
         noValidate
         onSubmit={applyFilters}
         className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,1fr)_8rem_auto] sm:items-end"
       >
         <div className="min-w-0 space-y-2">
-          <Label htmlFor={`${id}-status`}>Account status</Label>
+          <Label htmlFor={`${id}-status`}>{t('accounts.accountStatus')}</Label>
           <select
             id={`${id}-status`}
             value={accountStatus}
@@ -208,20 +213,21 @@ function AccountQuery({
               setAccountStatus(event.target.value as AdminUserStatus | '');
             }}
           >
-            <option value="">All statuses</option>
-            {Object.entries(accountStatuses).map(([value, label]) => (
+            <option value="">{t('accounts.allStatuses')}</option>
+            {accountStatuses.map((value) => (
               <option key={value} value={value}>
-                {label}
+                {t(`statuses.${value}`)}
               </option>
             ))}
           </select>
         </div>
         <div className="min-w-0 space-y-2">
-          <Label htmlFor={`${id}-size`}>Page size</Label>
+          <Label htmlFor={`${id}-size`}>{t('accounts.pageSize')}</Label>
           <Input
             ref={sizeInput}
             id={`${id}-size`}
             type="number"
+            dir="ltr"
             min={1}
             max={limits.page_size_max}
             step={1}
@@ -237,38 +243,35 @@ function AccountQuery({
           />
         </div>
         <Button type="submit" className={controlClass} disabled={pending}>
-          Apply filters
+          {t('accounts.apply')}
         </Button>
       </form>
       <p id={`${id}-size-help`} className="text-sm text-muted-foreground">
-        Up to {limits.page_size_max} accounts per page. Only the current page is retained in memory.
+        {t('accounts.sizeHelp', { maximum: limits.page_size_max })}
       </p>
       {sizeError && (
         <p id={`${id}-size-error`} role="alert" className="text-sm text-red-700 dark:text-red-400">
-          {sizeError}
+          {message(sizeError)}
         </p>
       )}
-      {!canPII && (
-        <p className="text-sm text-muted-foreground">
-          This workspace lists safe account metadata only.
-        </p>
-      )}
+      {!canPII && <p className="text-sm text-muted-foreground">{t('accounts.safeMetadata')}</p>}
       {canLookup && (
         <form
           method="post"
           autoComplete="off"
-          aria-label="Exact email lookup"
+          aria-label={t('accounts.lookup')}
           noValidate
           onSubmit={lookup}
           className="space-y-3 border-t pt-4"
         >
           <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-end">
             <div className="min-w-0 space-y-2">
-              <Label htmlFor={`${id}-email`}>Exact email</Label>
+              <Label htmlFor={`${id}-email`}>{t('accounts.email')}</Label>
               <Input
                 ref={emailInput}
                 id={`${id}-email`}
                 type="email"
+                dir="ltr"
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}
@@ -285,7 +288,7 @@ function AccountQuery({
               />
             </div>
             <Button type="submit" className={controlClass} disabled={pending}>
-              Find account
+              {t('accounts.find')}
             </Button>
             <Button
               type="button"
@@ -295,16 +298,15 @@ function AccountQuery({
                 discardResult();
                 setEmail('');
                 setEmailError('');
-                setStatus('Lookup query and result cleared.');
+                setStatus({ key: 'admin.accounts.lookupCleared' });
                 emailInput.current?.focus();
               }}
             >
-              Clear lookup
+              {t('accounts.clear')}
             </Button>
           </div>
           <p id={`${id}-email-help`} className="text-sm text-muted-foreground">
-            Explicit exact matching only. The address is sent in the request body, never in the URL;
-            no search runs while typing.
+            {t('accounts.emailHelp')}
           </p>
           {emailError && (
             <p
@@ -312,7 +314,7 @@ function AccountQuery({
               role="alert"
               className="text-sm text-red-700 dark:text-red-400"
             >
-              {emailError}
+              {message(emailError)}
             </p>
           )}
         </form>
@@ -325,39 +327,39 @@ function AccountQuery({
           className={controlClass}
           onClick={() => {
             discardResult();
-            setStatus('Account request cancelled. No result was accepted.');
+            setStatus({ key: 'admin.accounts.cancelled' });
           }}
         >
-          Cancel account request
+          {t('accounts.cancel')}
         </Button>
       )}
       {page && page.items.length > 0 && (
         <div
           role="region"
-          aria-label="Account results, horizontally scrollable"
+          aria-label={t('accounts.resultsRegion')}
           tabIndex={0}
           className={queryTableFrameClass}
           onFocus={revealQueryFocus}
         >
           <table className="w-full min-w-[26rem] border-collapse">
             <caption className="sr-only">
-              {mode === 'lookup' ? 'Exact email lookup result' : 'Account results'}
+              {t(mode === 'lookup' ? 'accounts.lookupResult' : 'accounts.results')}
             </caption>
             <thead className="border-b bg-muted/40">
               <tr>
                 <th scope="col" className={queryHeadClass}>
-                  Account reference
+                  {t('accounts.reference')}
                 </th>
                 <th scope="col" className={queryHeadClass}>
-                  Status
+                  {t('accounts.status')}
                 </th>
                 {canPII && (
                   <th scope="col" className={queryHeadClass}>
-                    Email
+                    {t('accounts.emailColumn')}
                   </th>
                 )}
                 <th scope="col" className={`${queryHeadClass} hidden sm:table-cell`}>
-                  Created (UTC)
+                  {t('accounts.created')}
                 </th>
               </tr>
             </thead>
@@ -369,20 +371,24 @@ function AccountQuery({
                       href={`/admin/users/${account.id}`}
                       prefetch={false}
                       onClick={clearSensitiveViews}
-                      aria-label={`View account ${account.id}`}
+                      aria-label={t('accounts.view', { id: account.id })}
                       className={`${linkClass} max-w-40 break-all font-mono text-xs sm:max-w-none`}
                     >
-                      {account.id}
+                      <bdi dir="ltr">{account.id}</bdi>
                     </Link>
                   </th>
                   <td className={queryCellClass}>
                     <span className="inline-block rounded border px-2 py-1 text-xs font-medium">
-                      {accountStatuses[account.status]}
+                      {t(`statuses.${account.status}`)}
                     </span>
                   </td>
                   {canPII && (
                     <td className={`${queryCellClass} max-w-64 break-all`}>
-                      {account.email ?? 'Not provided'}
+                      {account.email === undefined ? (
+                        t('accounts.notProvided')
+                      ) : (
+                        <bdi dir="ltr">{account.email}</bdi>
+                      )}
                     </td>
                   )}
                   <td className={`${queryCellClass} hidden sm:table-cell`}>
@@ -395,14 +401,10 @@ function AccountQuery({
         </div>
       )}
       {page?.items.length === 0 && (
-        <p className="text-sm">
-          {mode === 'lookup'
-            ? 'No account matched the exact email.'
-            : 'No accounts returned on this page for the selected status.'}
-        </p>
+        <p className="text-sm">{t(mode === 'lookup' ? 'accounts.noMatch' : 'accounts.empty')}</p>
       )}
       {page && query && mode === 'list' && (
-        <nav aria-label="Account pagination" className="flex flex-wrap items-center gap-3">
+        <nav aria-label={t('accounts.pagination')} className="flex flex-wrap items-center gap-3">
           <Button
             type="button"
             variant="outline"
@@ -410,11 +412,14 @@ function AccountQuery({
             disabled={pending || page.offset === 0}
             onClick={() => void load({ ...query, offset: Math.max(0, page.offset - page.limit) })}
           >
-            Previous page
+            {t('accounts.previous')}
           </Button>
           <p className="min-w-0 text-sm text-muted-foreground">
-            {page.items.length ? `${page.offset + 1}-${page.offset + page.items.length}` : '0'} of{' '}
-            {page.total} matching accounts
+            {t(page.items.length ? 'accounts.range' : 'accounts.emptyRange', {
+              start: page.offset + 1,
+              end: page.offset + page.items.length,
+              total: page.total,
+            })}
           </p>
           <Button
             type="button"
@@ -427,13 +432,10 @@ function AccountQuery({
             }
             onClick={() => void load({ ...query, offset: page.offset + page.limit })}
           >
-            Next page
+            {t('accounts.next')}
           </Button>
           {page.offset + page.limit > maxAccountOffset && page.total > page.offset + page.limit && (
-            <p className="text-sm">
-              The offset limit has been reached. Narrow the status filter or use an authorized exact
-              lookup.
-            </p>
+            <p className="text-sm">{t('accounts.offsetLimit')}</p>
           )}
         </nav>
       )}

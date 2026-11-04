@@ -482,7 +482,10 @@ describe('nonce-only retry and bounded error feedback', () => {
       'Wed, 31 Feb 2026 09:01:00 GMT',
     ])
       expect(parseRetryAfter(value, now)).toBeUndefined();
-    expect(errorMessage(new PortalError('rate_limited', 429, false, 60))).toContain('60 seconds');
+    expect(errorMessage(new PortalError('rate_limited', 429, false, 60))).toEqual({
+      key: 'errors.rateLimitedSeconds',
+      values: { seconds: 60 },
+    });
   });
 
   it('never replays lost moderation or authenticator responses and does not retain private network errors', async () => {
@@ -686,12 +689,15 @@ describe('streamed and declared response budgets', () => {
 
   it('accepts Chromium-style empty 204 streams but rejects any body bytes', async () => {
     for (const content of ['', 'unexpected']) {
-      const response = new Response(new ReadableStream({
-        start(controller) {
-          if (content) controller.enqueue(new TextEncoder().encode(content));
-          controller.close();
-        },
-      }), { headers: { 'Content-Length': '0' } });
+      const response = new Response(
+        new ReadableStream({
+          start(controller) {
+            if (content) controller.enqueue(new TextEncoder().encode(content));
+            controller.close();
+          },
+        }),
+        { headers: { 'Content-Length': '0' } }
+      );
       Object.defineProperty(response, 'status', { value: 204 });
       const result = readResponse(response, new AbortController().signal);
       if (content) await expect(result).rejects.toMatchObject({ code: 'invalid_response' });

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
 import {
   ForgotPasswordForm,
   LoginForm,
@@ -485,3 +485,47 @@ describe('operation-specific presentations', () => {
     expect([...new FormData(form).entries()]).toEqual([]);
   });
 });
+
+it('translates visible validation and visibility controls while preserving exact draft bytes and form outcome', async () => {
+  const { I18nTestProvider } = await import('../i18n/testing');
+  const submit = jest.fn();
+  const view = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider locale={locale}>
+      <LoginForm submit={submit} />
+    </I18nTestProvider>
+  );
+  const result = render(view('en'));
+  const email = screen.getByLabelText<HTMLInputElement>('Email address');
+  const password = screen.getByLabelText<HTMLInputElement>('Password');
+  fireEvent.blur(email);
+  const exact = '  گذرواژه\u200c۱۲۳\u202e  ';
+  fireEvent.change(password, { target: { value: exact } });
+  fireEvent.click(screen.getByRole('button', { name: 'Show password' }));
+  expect(screen.getByText('Enter your email address.')).toBeTruthy();
+  result.rerender(view('fa-IR'));
+  expect(screen.getByText('نشانی ایمیل خود را وارد کنید.')).toBeTruthy();
+  expect(screen.getByLabelText('گذرواژه')).toBe(password);
+  expect(password.value).toBe(exact);
+  expect(password.type).toBe('text');
+  expect(password.dir).toBe('ltr');
+  expect(
+    screen.getByRole('button', { name: 'پنهان‌کردن گذرواژه' }).getAttribute('aria-pressed')
+  ).toBe('true');
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it.each(['۰۱۲۳۴۵', '٠١٢٣٤٥', '０１２３４５', '01۲345', '\u202e012345', '012345\u2069'])(
+  'keeps non-ASCII/bidi TOTP input %j unchanged and rejects it in Persian',
+  (value) => {
+    const submit = jest.fn();
+    render(<TotpForm submit={submit} />, { locale: 'fa-IR' });
+    const input = screen.getByLabelText<HTMLInputElement>('کد رمزساز');
+    fireEvent.change(input, { target: { value } });
+    fireEvent.submit(screen.getByRole('form', { name: 'تأیید با رمزساز' }));
+    expect(input.value).toBe(value);
+    expect(input.dir).toBe('ltr');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(screen.getByText('دقیقاً شش رقم انگلیسی (0-9) وارد کنید.')).toBeTruthy();
+    expect(submit).not.toHaveBeenCalled();
+  }
+);
