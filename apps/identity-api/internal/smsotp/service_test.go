@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 )
 
@@ -104,10 +108,11 @@ type fakeSender struct {
 	mu      sync.Mutex
 	calls   int
 	lastTo  string
+	message string
 	failErr error
 }
 
-func (f *fakeSender) Send(_ context.Context, phone, _ string) error {
+func (f *fakeSender) Send(_ context.Context, phone, message string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failErr != nil {
@@ -115,6 +120,7 @@ func (f *fakeSender) Send(_ context.Context, phone, _ string) error {
 	}
 	f.calls++
 	f.lastTo = phone
+	f.message = message
 	return nil
 }
 
@@ -325,8 +331,8 @@ func TestNewAppliesDefaults(t *testing.T) {
 	if s.perSubnetPerHour != defaultPerSubnetPerHour {
 		t.Errorf("perSubnetPerHour = %d, want %d", s.perSubnetPerHour, defaultPerSubnetPerHour)
 	}
-	if s.messageTemplate != defaultMessageTemplate {
-		t.Errorf("messageTemplate = %q, want %q", s.messageTemplate, defaultMessageTemplate)
+	if s.messageTemplate != "" {
+		t.Error("default template must be resolved per request")
 	}
 }
 
@@ -336,7 +342,7 @@ func TestSendCodeHappyPath(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 	ctx := context.Background()
 
-	verificationID, err := fx.svc.SendCode(ctx, fx.userID, fx.sessionID, "+1 555 010 2020", "203.0.113.9:5555")
+	verificationID, err := fx.svc.SendCode(ctx, fx.userID, fx.sessionID, "+1 555 010 2020", "203.0.113.9:5555", "en")
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
@@ -362,14 +368,58 @@ func TestSendCodeHappyPath(t *testing.T) {
 	}
 }
 
+func TestSendCodeLocalizedPresentationPreservesCodeAndBinding(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		locale   notification.Locale
+		template string
+		want     string
+	}{
+		{"English", notification.English, "", "Your Hatef verification code is %s"},
+		{"Persian", notification.Persian, "", "کد تأیید هویت هاتف شما: %s"},
+		{"unknown defaults to English", "unknown", "", "Your Hatef verification code is %s"},
+		{"empty defaults to English", "", "", "Your Hatef verification code is %s"},
+		{"configured English override", notification.English, "Configured code: %s", "Configured code: %s"},
+		{"configured Persian override", notification.Persian, "Configured code: %s", "Configured code: %s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newServiceFixture(t, Config{MessageTemplate: tc.template})
+			id, err := fx.svc.SendCode(t.Context(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", tc.locale)
+			if err != nil {
+				t.Fatal("localized send failed")
+			}
+			code := regexp.MustCompile(`[0-9]{6}`).FindString(fx.sender.message)
+			if len(code) != 6 || fx.sender.message != fmt.Sprintf(tc.want, code) {
+				t.Fatal("template changed the ASCII code or localized prose")
+			}
+			record := fx.otps.records[id]
+			if record.UserID != fx.userID.String() || record.SessionID != fx.sessionID || record.Phone != "+15550102020" || record.CodeHash == code {
+				t.Fatal("localization changed the challenge binding or persisted plaintext")
+			}
+			if err := fx.svc.Verify(t.Context(), fx.userID, fx.sessionID, id, code); err != nil {
+				t.Fatal("localized message's exact ASCII code did not verify")
+			}
+		})
+	}
+}
+
+func TestSendCodeGatewayFailureDoesNotRetainPrivateMessage(t *testing.T) {
+	fx := newServiceFixture(t, Config{})
+	fx.sender.failErr = errors.New("private recipient +15550102020 code 001234 کد تأیید")
+	_, err := fx.svc.SendCode(t.Context(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", notification.Persian)
+	if err != ErrSendFailed || errors.Unwrap(err) != nil || strings.Contains(fmt.Sprintf("%v %+v %#v", err, err, err), "private") || len(fx.otps.records) != 0 {
+		t.Fatal("gateway failure leaked delivery data or retained a challenge")
+	}
+}
+
 func TestSendCodeReturnsUniqueVerificationIDs(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 
-	first, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9")
+	first, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en")
 	if err != nil {
 		t.Fatalf("first SendCode: %v", err)
 	}
-	second, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9")
+	second, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en")
 	if err != nil {
 		t.Fatalf("second SendCode: %v", err)
 	}
@@ -380,7 +430,7 @@ func TestSendCodeReturnsUniqueVerificationIDs(t *testing.T) {
 
 func TestSendCodeUnknownUser(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
-	if _, err := fx.svc.SendCode(context.Background(), uuid.New(), fx.sessionID, "+15550102020", "203.0.113.9"); !errors.Is(err, ErrUserNotFound) {
+	if _, err := fx.svc.SendCode(context.Background(), uuid.New(), fx.sessionID, "+15550102020", "203.0.113.9", "en"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("SendCode unknown user: error = %v, want ErrUserNotFound", err)
 	}
 }
@@ -391,7 +441,7 @@ func TestPhoneOperationsRejectNonActiveAccount(t *testing.T) {
 	verificationID := testVerificationID(42)
 	fx.otps.setStoredCode(fx.svc, verificationID, fx.userID, fx.sessionID, "+15550102020", "123456")
 
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9"); !errors.Is(err, ErrAccountNotActive) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en"); !errors.Is(err, ErrAccountNotActive) {
 		t.Fatalf("SendCode = %v, want ErrAccountNotActive", err)
 	}
 	if err := fx.svc.Verify(context.Background(), fx.userID, fx.sessionID, verificationID, "123456"); !errors.Is(err, ErrAccountNotActive) {
@@ -407,7 +457,7 @@ func TestPhoneOperationsRejectNonActiveAccount(t *testing.T) {
 
 func TestSendCodeInvalidPhone(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "not-a-phone", "203.0.113.9"); !errors.Is(err, ErrInvalidPhone) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "not-a-phone", "203.0.113.9", "en"); !errors.Is(err, ErrInvalidPhone) {
 		t.Errorf("SendCode invalid phone: error = %v, want ErrInvalidPhone", err)
 	}
 }
@@ -415,7 +465,7 @@ func TestSendCodeInvalidPhone(t *testing.T) {
 func TestSendCodeRejectedWhenLockedOut(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 	fx.otps.lockouts["+15550102020"] = true
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9"); !errors.Is(err, ErrLockedOut) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en"); !errors.Is(err, ErrLockedOut) {
 		t.Errorf("SendCode while locked out: error = %v, want ErrLockedOut", err)
 	}
 	if fx.sender.calls != 0 {
@@ -429,7 +479,7 @@ func TestSendCodePerMinuteLimit(t *testing.T) {
 	fx.limiter.budget = map[string]int{
 		phoneRateKey("+15550102020", "1m"): 0,
 	}
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9"); !errors.Is(err, ErrRateLimited) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en"); !errors.Is(err, ErrRateLimited) {
 		t.Errorf("SendCode over minute limit: error = %v, want ErrRateLimited", err)
 	}
 	if fx.sender.calls != 0 {
@@ -445,7 +495,7 @@ func TestSendCodePerSubnetLimit(t *testing.T) {
 		phoneRateKey("+15550102020", "1h"): 5,
 		subnetRateKey("203.0.113.0/24"):    0,
 	}
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9:1234"); !errors.Is(err, ErrRateLimited) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9:1234", "en"); !errors.Is(err, ErrRateLimited) {
 		t.Errorf("SendCode over subnet limit: error = %v, want ErrRateLimited", err)
 	}
 	// Verify subnet check runs first so phone rate limits are not consumed on subnet rejection.
@@ -461,7 +511,7 @@ func TestSendCodePerHourPhoneLimit(t *testing.T) {
 		phoneRateKey("+15550102020", "1m"): 5,
 		phoneRateKey("+15550102020", "1h"): 0,
 	}
-	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9:1234"); !errors.Is(err, ErrRateLimited) {
+	if _, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9:1234", "en"); !errors.Is(err, ErrRateLimited) {
 		t.Errorf("SendCode over 1h phone limit: error = %v, want ErrRateLimited", err)
 	}
 }
@@ -469,7 +519,7 @@ func TestSendCodePerHourPhoneLimit(t *testing.T) {
 func TestSendCodeSendFailureCleansUp(t *testing.T) {
 	fx := newServiceFixture(t, Config{})
 	fx.sender.failErr = errors.New("gateway down")
-	_, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9")
+	_, err := fx.svc.SendCode(context.Background(), fx.userID, fx.sessionID, "+15550102020", "203.0.113.9", "en")
 	if !errors.Is(err, ErrSendFailed) {
 		t.Fatalf("SendCode with failing gateway: error = %v, want ErrSendFailed", err)
 	}

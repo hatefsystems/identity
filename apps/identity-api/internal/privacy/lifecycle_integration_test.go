@@ -41,7 +41,7 @@ func TestPrivacyLifecycleIntentFailureRollsBackIntegration(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 	user := createTestUser(ctx, t, pool, "lifecycle-rollback@privacy.test")
 	env.svc.tx = rejectLifecycleBeginner{pool}
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); !errors.Is(err, lifecycle.ErrEnqueue) {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); !errors.Is(err, lifecycle.ErrEnqueue) {
 		t.Fatalf("missing soft-delete intent was accepted: %v", err)
 	}
 	stored, err := env.queries.GetUserByIDForAdmin(ctx, user.ID)
@@ -52,7 +52,7 @@ func TestPrivacyLifecycleIntentFailureRollsBackIntegration(t *testing.T) {
 		t.Fatal("failed soft deletion created a notification or recovery request")
 	}
 	env.svc.tx = pool
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatal(err)
 	}
 	notice := env.deliveredNotice(ctx, t)

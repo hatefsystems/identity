@@ -84,7 +84,7 @@ func (h *harness) queuedNotice(t *testing.T) DeletionNotice {
 func requestDeletionAndToken(t *testing.T, h *harness, email string) (string, string) {
 	t.Helper()
 	user := h.store.addActiveUser(email)
-	if _, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatal(err)
 	}
 	return h.queuedNotice(t).ReclaimToken, user.ID.String()
@@ -106,7 +106,7 @@ func TestNewAndRecoveryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := store.addActiveUser("disabled@example.test")
-	if _, err := recoveryOnly.RequestDeletion(t.Context(), u.ID, u.AuthVersion, ""); !errors.Is(err, ErrDeletionUnavailable) || store.user(u.ID).Status != "active" {
+	if _, err := recoveryOnly.RequestDeletion(t.Context(), u.ID, u.AuthVersion, "", "en"); !errors.Is(err, ErrDeletionUnavailable) || store.user(u.ID).Status != "active" {
 		t.Fatal("recovery-only service did not fail closed")
 	}
 	h := newHarness(t, Config{})
@@ -126,7 +126,7 @@ func TestNewAndRecoveryOnly(t *testing.T) {
 func TestDeletionQueuesEncryptedNoticeAndRevokes(t *testing.T) {
 	h := newHarness(t, Config{})
 	user := h.store.addActiveUser("delete-me@example.test")
-	result, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, "203.0.113.10")
+	result, err := h.svc.RequestDeletion(t.Context(), user.ID, user.AuthVersion, "203.0.113.10", "en")
 	if err != nil || result.AlreadyPending || !result.TokenMinted || !result.NotificationQueued {
 		t.Fatalf("deletion outcome: %+v, %v", result, err)
 	}
@@ -171,7 +171,7 @@ func TestDeletionCoalescesWithoutRotationOrDeadlineReset(t *testing.T) {
 	firstRequest := h.store.requests[0]
 	for _, advance := range []time.Duration{0, 30 * time.Minute, 2 * time.Hour} {
 		h.clock.advance(advance)
-		result, err := h.svc.RequestDeletion(t.Context(), userID, 0, "")
+		result, err := h.svc.RequestDeletion(t.Context(), userID, 0, "", "en")
 		if err != nil || !result.AlreadyPending || result.TokenMinted || !result.NotificationQueued || !result.ExpiresAt.Equal(firstRequest.ExpiresAt.Time) {
 			t.Fatalf("duplicate did not coalesce: %+v, %v", result, err)
 		}
@@ -183,7 +183,7 @@ func TestDeletionCoalescesWithoutRotationOrDeadlineReset(t *testing.T) {
 	if _, err := h.store.ConsumeDeletionRequest(t.Context(), firstRequest.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.RequestDeletion(t.Context(), userID, 0, ""); !errors.Is(err, ErrStaleAuthority) || len(h.store.requests) != 1 {
+	if _, err := h.svc.RequestDeletion(t.Context(), userID, 0, "", "en"); !errors.Is(err, ErrStaleAuthority) || len(h.store.requests) != 1 {
 		t.Fatal("retired token was replaced by an admitted duplicate")
 	}
 }
@@ -207,7 +207,7 @@ func TestDeletionRejectsStaleAuthority(t *testing.T) {
 				expected = math.MaxInt64
 			}
 			h.store.users[u.ID] = u
-			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, expected, ""); !errors.Is(err, ErrStaleAuthority) {
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, expected, "", "en"); !errors.Is(err, ErrStaleAuthority) {
 				t.Fatal("stale admission accepted", err)
 			}
 			if len(h.store.requests)+len(h.store.notifications)+len(h.store.intents)+h.sessions.count() != 0 {
@@ -228,7 +228,7 @@ func TestDeletionRecipientsAndFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			h.store.users[u.ID] = u
-			_, err = h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, "")
+			_, err = h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, "", "en")
 			if !validNotificationAddress(backup) {
 				if err == nil || h.store.user(u.ID).Status != "active" {
 					t.Fatal("invalid configured backup was silently omitted")
@@ -249,7 +249,7 @@ func TestDeletionRecipientsAndFailures(t *testing.T) {
 		u := h.store.addActiveUser("backup-fault@example.test")
 		u.BackupEmailEncrypted = []byte("unavailable envelope")
 		h.store.users[u.ID] = u
-		if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err == nil || h.store.user(u.ID).Status != "active" {
+		if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, "", "en"); err == nil || h.store.user(u.ID).Status != "active" {
 			t.Fatal("backup decryption failure was ignored")
 		}
 	})
@@ -265,7 +265,7 @@ func TestDeletionRecipientsAndFailures(t *testing.T) {
 			case "lifecycle":
 				h.store.lifecycleErr = errBoom
 			}
-			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err == nil {
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, "", "en"); err == nil {
 				t.Fatal("persistence fault accepted")
 			}
 			if h.sessions.count()+h.tokens.count()+len(h.store.notifications) != 0 || h.recorder.countOf(audit.EventDeletionRequested, audit.StatusSuccess) != 0 {
@@ -280,7 +280,7 @@ func TestDeletionRejectsRecipientsUnsupportedBySMTPBeforeMutation(t *testing.T) 
 		t.Run(address, func(t *testing.T) {
 			h := newHarness(t, Config{})
 			u := h.store.addActiveUser(address)
-			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, ""); err == nil {
+			if _, err := h.svc.RequestDeletion(t.Context(), u.ID, u.AuthVersion, "", "en"); err == nil {
 				t.Fatal("undeliverable recipient accepted")
 			}
 			if h.store.user(u.ID).Status != "active" || h.store.user(u.ID).AuthVersion != u.AuthVersion || len(h.store.requests)+len(h.store.notifications)+len(h.store.intents) != 0 {
@@ -292,12 +292,12 @@ func TestDeletionRejectsRecipientsUnsupportedBySMTPBeforeMutation(t *testing.T) 
 
 func TestDeletionUnknownRateLimitedAndRevokerFailure(t *testing.T) {
 	h := newHarness(t, Config{DeletePerAccountPerDay: 3})
-	if _, err := h.svc.RequestDeletion(t.Context(), newUUID(), 0, ""); !errors.Is(err, ErrUserNotFound) {
+	if _, err := h.svc.RequestDeletion(t.Context(), newUUID(), 0, "", "en"); !errors.Is(err, ErrUserNotFound) {
 		t.Fatal(err)
 	}
 	u := h.store.addActiveUser("limited@example.test")
 	h.limiter.deny[deleteAccountRateKey(u.ID)] = true
-	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); !errors.Is(err, ErrRateLimited) || h.store.user(u.ID).Status != "active" {
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, "", "en"); !errors.Is(err, ErrRateLimited) || h.store.user(u.ID).Status != "active" {
 		t.Fatal("rate limit changed account", err)
 	}
 	call := h.limiter.calls[len(h.limiter.calls)-1]
@@ -306,7 +306,7 @@ func TestDeletionUnknownRateLimitedAndRevokerFailure(t *testing.T) {
 	}
 	delete(h.limiter.deny, deleteAccountRateKey(u.ID))
 	h.sessions.err, h.tokens.err = errBoom, errBoom
-	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err != nil || h.store.user(u.ID).Status != statusPendingDeletion {
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, "", "en"); err != nil || h.store.user(u.ID).Status != statusPendingDeletion {
 		t.Fatal("postcommit revoker failure reported failed deletion", err)
 	}
 	if h.recorder.countOf(audit.EventDeletionRequested, audit.StatusFailure) != 2 {
@@ -506,7 +506,7 @@ func TestReclaimTOTPReplayAndGuardFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := h.store.user(uid)
-	if _, err := h.svc.RequestDeletion(t.Context(), uid, u.AuthVersion, ""); err != nil {
+	if _, err := h.svc.RequestDeletion(t.Context(), uid, u.AuthVersion, "", "en"); err != nil {
 		t.Fatal(err)
 	}
 	attempts := h.totp.attemptCount()

@@ -10,6 +10,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 )
@@ -110,6 +111,7 @@ func (s *Server) handlePhoneSendCode() http.HandlerFunc {
 
 		verificationID, err := s.deps.SMSOTP.SendCode(
 			r.Context(), userID, current.ID, req.Phone, clientip.FromRequest(r),
+			notification.RequestLocale(r.Header.Values(notification.LocaleHeader)),
 		)
 		if err != nil {
 			s.writePhoneError(w, "send phone code", err)

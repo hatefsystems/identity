@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
@@ -156,6 +158,7 @@ type phoneCapturingSender struct {
 	calls     int
 	lastPhone string
 	lastCode  string
+	message   string
 }
 
 func (f *phoneCapturingSender) Send(_ context.Context, phone, message string) error {
@@ -163,6 +166,7 @@ func (f *phoneCapturingSender) Send(_ context.Context, phone, message string) er
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastPhone = phone
+	f.message = message
 	if fields := strings.Fields(message); len(fields) > 0 {
 		f.lastCode = fields[len(fields)-1]
 	}
@@ -306,7 +310,7 @@ func (fx *phoneTestFixture) deletePhone(t *testing.T, withGrant bool) *httptest.
 
 // doPhone issues a request against the phone routes with explicitly selected
 // session and step-up credentials.
-func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current session.Session, cookie *http.Cookie, grant string) *httptest.ResponseRecorder {
+func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current session.Session, cookie *http.Cookie, grant string, localeValues ...string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var reader io.Reader
@@ -326,6 +330,9 @@ func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current
 	}
 	if grant != "" {
 		req.Header.Set(stepup.HeaderStepUpAuth, grant)
+	}
+	for _, value := range localeValues {
+		req.Header.Add(notification.LocaleHeader, value)
 	}
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -368,6 +375,48 @@ func decodePhoneSendResponse(t *testing.T, rec *httptest.ResponseRecorder) phone
 }
 
 // --- Tests ------------------------------------------------------------------
+
+func TestPhoneNotificationLocaleHeaderIsPresentationOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []string
+		prefix string
+	}{
+		{"missing", nil, "Your Hatef verification code is "},
+		{"English", []string{"en"}, "Your Hatef verification code is "},
+		{"Persian", []string{"fa-IR"}, "کد تأیید هویت هاتف شما: "},
+		{"unknown", []string{"ar"}, "Your Hatef verification code is "},
+		{"alias", []string{"fa"}, "Your Hatef verification code is "},
+		{"duplicate", []string{"fa-IR", "fa-IR"}, "Your Hatef verification code is "},
+		{"list", []string{"fa-IR,en"}, "Your Hatef verification code is "},
+		{"oversized", []string{strings.Repeat("fa-IR", 1000)}, "Your Hatef verification code is "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := setupPhoneTestFixture(t, true)
+			rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, fx.freshGrant(t), tc.values...)
+			if rec.Code != http.StatusOK || fx.sender.calls != 1 || !regexp.MustCompile(`^[0-9]{6}$`).MatchString(fx.sender.code()) || fx.sender.message != tc.prefix+fx.sender.code() {
+				t.Fatal("presentation header changed authorization, response, or exact ASCII OTP")
+			}
+			response := decodePhoneSendResponse(t, rec)
+			if response.VerificationID == "" || strings.Contains(rec.Body.String(), "fa-IR") || strings.Contains(rec.Body.String(), fx.sender.code()) {
+				t.Fatal("locale or plaintext code leaked into phone response")
+			}
+		})
+	}
+	for _, missing := range []string{"session", "step-up"} {
+		t.Run("Persian cannot replace "+missing, func(t *testing.T) {
+			fx := setupPhoneTestFixture(t, true)
+			current, cookie := fx.sess, fx.cookie
+			if missing == "session" {
+				current, cookie = session.Session{}, nil
+			}
+			rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": "+15550102020"}, current, cookie, "", "fa-IR")
+			if rec.Code < 400 || fx.sender.calls != 0 {
+				t.Fatal("presentation header supplied missing authority")
+			}
+		})
+	}
+}
 
 func TestPhoneRoutesRequireSession(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)

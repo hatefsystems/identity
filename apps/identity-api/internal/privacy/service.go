@@ -18,6 +18,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
@@ -340,7 +341,7 @@ type ReclaimAttempt struct {
 // Concurrent requests admitted under the same authority coalesce onto one token
 // and notice set. Pending accounts cannot authenticate a later resend. Delivery
 // retries belong to the durable worker and never rotate tokens or deadlines.
-func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expectedAuthVersion int64, clientIP string) (DeletionResult, error) {
+func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expectedAuthVersion int64, clientIP string, locale notification.Locale) (DeletionResult, error) {
 	if s.cipher == nil {
 		return DeletionResult{}, ErrDeletionUnavailable
 	}
@@ -416,7 +417,7 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expecte
 		if createErr != nil {
 			return fmt.Errorf("privacy: create deletion request: %w", createErr)
 		}
-		if err := s.enqueueNotices(ctx, store, created, token, recipients); err != nil {
+		if err := s.enqueueNotices(ctx, store, created, token, recipients, notification.RequestLocale([]string{string(locale)})); err != nil {
 			return err
 		}
 		result.TokenMinted = true

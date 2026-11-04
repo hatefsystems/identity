@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 )
 
@@ -72,7 +73,7 @@ type Config struct {
 	PerSubnetPerHour  int
 
 	// MessageTemplate renders the SMS body; it must contain a single %s where
-	// the code is substituted (default "Your Hatef verification code is %s").
+	// the code is substituted. When set, it overrides the localized defaults.
 	MessageTemplate string
 
 	// HashPepper optionally binds stored OTP hashes to a secret so a Redis
@@ -111,7 +112,6 @@ const (
 	defaultPerPhonePerMinute = 1
 	defaultPerPhonePerHour   = 5
 	defaultPerSubnetPerHour  = 10
-	defaultMessageTemplate   = "Your Hatef verification code is %s"
 )
 
 // New constructs a Service, validating that all collaborators are present and
@@ -171,10 +171,6 @@ func New(cfg Config, users UserStore, encryptor Encryptor, indexer BlindIndexer,
 	if s.perSubnetPerHour <= 0 {
 		s.perSubnetPerHour = defaultPerSubnetPerHour
 	}
-	if s.messageTemplate == "" {
-		s.messageTemplate = defaultMessageTemplate
-	}
-
 	return s, nil
 }
 
@@ -183,7 +179,7 @@ func New(cfg Config, users UserStore, encryptor Encryptor, indexer BlindIndexer,
 // verification ID; the client must present that ID from the same session to
 // verify the code. clientIP is reduced to its /24 or /48 subnet for the
 // independent per-subnet rate limit.
-func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, sessionID, rawPhone, clientIP string) (string, error) {
+func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, sessionID, rawPhone, clientIP string, locale notification.Locale) (string, error) {
 	if _, err := s.loadUser(ctx, userID); err != nil {
 		return "", err
 	}
@@ -255,12 +251,18 @@ func (s *Service) SendCode(ctx context.Context, userID uuid.UUID, sessionID, raw
 		return "", err
 	}
 
-	message := fmt.Sprintf(s.messageTemplate, code)
+	template := s.messageTemplate
+	if template == "" {
+		catalog, _ := notification.Catalog(notification.RequestLocale([]string{string(locale)}), notification.CurrentVersion)
+		template = catalog.SMS
+	}
+	message := fmt.Sprintf(template, code)
 	if err := s.sender.Send(ctx, phone, message); err != nil {
 		// Best-effort cleanup: drop the pending code so a delivery failure does
 		// not leave an unusable challenge behind.
 		_ = s.otps.Delete(ctx, verificationID)
-		return "", fmt.Errorf("%w: %v", ErrSendFailed, err)
+		// A gateway error can contain the complete message or recipient.
+		return "", ErrSendFailed
 	}
 
 	return verificationID, nil
