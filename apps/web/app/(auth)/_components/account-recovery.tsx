@@ -130,6 +130,22 @@ export function AccountRecovery() {
         link.current = null;
       }
     }
+    // A child's mount effect can scrub the address bar before App Router's
+    // parent effect installs its History API integration. Synchronize the
+    // already-clean path after that effect flush too, so a cookie-action
+    // rerender cannot restore the original bearer fragment from router state.
+    // Only the public pathname crosses this boundary; token capture stays once.
+    const cleanPath = window.location.pathname;
+    if (!window.location.hash && !window.location.search) {
+      queueMicrotask(() => {
+        if (!alive.current || generation.current !== mountedGeneration || window.location.pathname !== cleanPath) return;
+        try {
+          window.history.replaceState(null, '', cleanPath);
+        } catch {
+          discard(closedMessage, true);
+        }
+      });
+    }
     client.current = new ReclaimClient();
     setPhase(link.current ? 'ready' : 'closed');
     setError(link.current ? '' : closedMessage);

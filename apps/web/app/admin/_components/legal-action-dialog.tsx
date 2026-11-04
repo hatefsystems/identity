@@ -475,7 +475,7 @@ export function LegalActionDialog({
               prepared.kind === 'hold' ? (
                 <bdi dir="auto">{prepared.request.legalBasis}</bdi>
               ) : (
-                t.rich('values.serverFixed', { value: (chunks) => <bdi dir="ltr">{chunks}</bdi> })
+                t.rich('values.serverFixed', { kind: 'preservation_request', value: (chunks) => <bdi dir="ltr">{chunks}</bdi> })
               ),
             ],
             [

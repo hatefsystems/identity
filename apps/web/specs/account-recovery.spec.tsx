@@ -4,7 +4,7 @@ jest.mock('next-intl/server', () => ({
 }));
 
 import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
-import { StrictMode } from 'react';
+import { StrictMode, useEffect } from 'react';
 import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
 import type { ReactElement } from 'react';
 import { I18nTestProvider } from '../i18n/testing';
@@ -110,7 +110,7 @@ describe('recovery link capture', () => {
     expect(ReclaimClient).not.toHaveBeenCalled();
   });
 
-  it('captures and scrubs exactly once through StrictMode without auto-redemption or any persistent secret writes', async () => {
+  it('captures once and synchronizes the clean router URL through StrictMode without auto-redemption or persistent secret writes', async () => {
     const history = jest.spyOn(window.history, 'replaceState');
     const storage = jest.spyOn(Storage.prototype, 'setItem');
     const cookie = jest.spyOn(document, 'cookie', 'set');
@@ -120,7 +120,7 @@ describe('recovery link capture', () => {
     await act(async () => undefined);
     expect(window.location.hash).toBe('');
     expect(window.location.search).toBe('');
-    expect(history).toHaveBeenCalledTimes(1);
+    expect(history).toHaveBeenCalledTimes(2);
     expect(history).toHaveBeenCalledWith(null, '', '/recover-account');
     expect(JSON.stringify(window.history.state)).not.toContain(token);
     expect(view.container.innerHTML).not.toContain(token);
@@ -136,6 +136,30 @@ describe('recovery link capture', () => {
     expect(api.options).toHaveBeenCalledTimes(1);
     expect(api.options).toHaveBeenCalledWith(token, expect.any(AbortSignal));
     expect(api.complete).not.toHaveBeenCalled();
+  });
+
+  it('synchronizes a parent router installed after child effects so later rerenders cannot restore the bearer fragment', async () => {
+    let canonical = window.location.href;
+    const original = window.history.replaceState;
+    function LateRouter() {
+      useEffect(() => {
+        window.history.replaceState = (data, title, url) => {
+          original.call(window.history, data, title, url);
+          canonical = window.location.href;
+        };
+        return () => { window.history.replaceState = original; };
+      }, []);
+      return page();
+    }
+    render(<LateRouter />);
+    await act(async () => undefined);
+    expect(new URL(canonical).hash).toBe('');
+    original.call(window.history, null, '', canonical);
+    expect(window.location.hash).toBe('');
+    expect(JSON.stringify(window.history.state)).not.toContain(token);
+    expect(api.options).not.toHaveBeenCalled();
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Start account recovery' }).disabled).toBe(false);
   });
 
   it.each([

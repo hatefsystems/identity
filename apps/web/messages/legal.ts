@@ -163,7 +163,7 @@ export const legalEn = {
     notReturned: 'Not returned',
     notSupplied: 'Not supplied',
     coreOnly: 'None (core metadata only)',
-    serverFixed: '<value>preservation_request</value> (server fixed)',
+    serverFixed: '<value>{kind}</value> (server fixed)',
   },
   read: {
     title: 'Read independent requests',
@@ -431,7 +431,7 @@ export const legalFa = {
     notReturned: 'بازگردانده نشده',
     notSupplied: 'ارائه نشده',
     coreOnly: 'هیچ‌کدام (فقط فراداده اصلی)',
-    serverFixed: '<value>preservation_request</value> (مقدار ثابت سرور)',
+    serverFixed: '<value>{kind}</value> (مقدار ثابت سرور)',
   },
   read: {
     title: 'خواندن درخواست‌های مستقل',

@@ -87,4 +87,16 @@ describe('complete and compatible committed translation catalogs', () => {
     expect(getMessagesForLocale('fa-IR').common.pageError).toBe(fa.common.pageError);
     expect(getMessagesForLocale('en').common.pageError).toBe(en.common.pageError);
   });
+
+  it('supplies the fixed legal wire value at rendering instead of serializing it in public catalogs', () => {
+    const kind = 'preservation_request';
+    for (const locale of ['en', 'fa-IR'] as const) {
+      const messages = getMessagesForLocale(locale);
+      expect(JSON.stringify(messages)).not.toContain(kind);
+      const translator = createTranslator({ locale, messages });
+      expect(translator.rich('legal.values.serverFixed', {
+        kind, value: (chunks) => chunks,
+      })).toContain(kind);
+    }
+  });
 });
