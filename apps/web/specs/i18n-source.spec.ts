@@ -12,8 +12,6 @@ import fa from '../messages/fa-IR';
 function uncatalogued(source: ts.SourceFile): string[] {
   const failures: string[] = [];
   const humanText = (value: string) => /[A-Za-z\u0600-\u06ff]/u.test(value);
-  const prose = (value: string) =>
-    /[A-Za-z\u0600-\u06ff]{2,}\s+[A-Za-z\u0600-\u06ff]{2,}/u.test(value);
   function presentationExpression(node: ts.Node) {
     return (
       ts.isJsxExpression(node) &&
@@ -24,6 +22,14 @@ function uncatalogued(source: ts.SourceFile): string[] {
     );
   }
   function report(node: ts.Node, value: string) {
+    // These are reviewed state-machine keys, never rendered prose. Keep the
+    // exception tied to this exact owner, setter and finite set of values.
+    if (
+      source.fileName.replaceAll('\\', '/') === 'app/(auth)/_lib/use-auth-form.ts' &&
+      ts.isCallExpression(node.parent) &&
+      node.parent.expression.getText(source) === 'setStatus' &&
+      ['idle', 'pending', 'error'].includes(value)
+    ) return;
     failures.push(
       `${source.fileName}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}: ${value.trim()}`
     );
@@ -42,7 +48,7 @@ function uncatalogued(source: ts.SourceFile): string[] {
       report(node, node.initializer.text);
     if (
       (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
-      prose(node.text)
+      humanText(node.text)
     ) {
       const parent = node.parent;
       if (presentationExpression(parent)) report(node, node.text);
@@ -64,7 +70,7 @@ function uncatalogued(source: ts.SourceFile): string[] {
         ' '
       );
       if (
-        prose(text) &&
+        humanText(text) &&
         (presentationExpression(node.parent) ||
           (ts.isCallExpression(node.parent) &&
             /^(setStatus|setError|setNotice)$/.test(node.parent.expression.getText(source))))
@@ -127,6 +133,31 @@ it('detects newly introduced presentation sinks without broad file exemptions', 
     ts.ScriptKind.TSX
   );
   expect(uncatalogued(fixture)).toHaveLength(5);
+});
+
+it('detects single-word labels, metadata, feedback and interpolated prose', () => {
+  const fixture = ts.createSourceFile(
+    'fixture.tsx',
+    [
+      "const metadata = { title: 'Profile' };",
+      "setStatus('Retry');",
+      "const field = { message: 'Required' };",
+      '<button aria-label="Save">{\'Save\'}</button>;',
+      'const text = <p>{`Hello ${name}`}</p>;',
+    ].join('\n'),
+    ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX
+  );
+  expect(uncatalogued(fixture)).toHaveLength(6);
+});
+
+it('limits reviewed form-state exceptions to their owner and setter', () => {
+  const fixture = (file: string, text: string) => ts.createSourceFile(
+    file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX
+  );
+  const owner = 'app/(auth)/_lib/use-auth-form.ts';
+  expect(uncatalogued(fixture(owner, "setStatus('idle'); setStatus('pending'); setStatus('error');"))).toEqual([]);
+  expect(uncatalogued(fixture('other.tsx', "setStatus('idle');"))).toHaveLength(1);
+  expect(uncatalogued(fixture(owner, "setStatus('Ready'); setError('idle'); const ui = <p>{'idle'}</p>;"))).toHaveLength(3);
 });
 
 function leaves(value: object, prefix = ''): Record<string, string> {

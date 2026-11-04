@@ -61,6 +61,12 @@ misses a translation. This fallback does not make an incomplete catalog acceptab
 in CI. Error diagnostics expose only an error category/key, never interpolation
 values, original exceptions or private server evidence.
 
+The source guard checks direct JSX/accessible labels, metadata, feedback and
+interpolated prose, including single-word messages. Its reviewed `idle`,
+`pending` and `error` exceptions apply only to the `useAuthForm` state-machine
+setter in its owning file; they do not exempt rendered text or other setters.
+There are no file-wide source-prose exemptions.
+
 Use `getTranslations` for server text/metadata and `useTranslations` for client
 text. Store stable message descriptors/status keys and bounded parameters in state;
 translate while rendering so feedback can change language without rerunning an

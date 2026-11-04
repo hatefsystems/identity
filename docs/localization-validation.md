@@ -15,7 +15,7 @@ version explicitly instead of inheriting a newer host Go.
 
 | Check | Current evidence |
 | --- | --- |
-| Web Jest with coverage | PASS: 31 suites / 702 tests, including router-history and legal-catalog regressions |
+| Web Jest with coverage | PASS: 31 suites / 704 tests, including router-history, legal-catalog and single-word prose-guard regressions |
 | Shared UI Jest with coverage | PASS: 3 suites / 17 tests |
 | Web/UI lint and typecheck | PASS; repeated after the router-history repair |
 | Recovery/router and localization regression tests | PASS: 83 tests |
