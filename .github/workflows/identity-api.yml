@@ -23,7 +23,8 @@ jobs:
   quality:
     name: Generated code, tests, and static checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Cold image/toolchain builds plus race/static gates exceeded the old margin locally.
+    timeout-minutes: 35
 
     steps:
       - name: Check out repository
@@ -320,7 +321,19 @@ jobs:
         run: npm exec -- playwright install --with-deps chromium
 
       - name: Smoke-test standalone web image and browser CSP
+        env:
+          WEB_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/auth-browser-evidence
         run: npm exec -- nx exec -p web -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
+
+      - name: Upload masked public and auth browser evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: auth-browser-evidence
+          path: ${{ runner.temp }}/auth-browser-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
 
       - name: Export tested web release image
         if: steps.image.outputs.release == 'true'
@@ -352,7 +365,8 @@ jobs:
   portal-browser:
     name: Real API production portal browser acceptance
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # Execute the complete real-service workflows independently for en and fa-IR.
+    timeout-minutes: 70
 
     steps:
       - name: Check out repository
@@ -413,7 +427,7 @@ jobs:
   admin-browser:
     name: Real API admin browser acceptance
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 70
 
     steps:
       - name: Check out repository

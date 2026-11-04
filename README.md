@@ -24,6 +24,8 @@ LDP is architected as a decentralized, highly scalable client-agnostic system co
 * **Restricted Recovery:** A backup code is physically deleted in the same ACID transaction that verifies it and yields only a ten-minute `recovery_enrollment` session, limited to one UV-required replacement passkey before normal login.
 * **Single-Use Step-up Authorization:** High-risk factor and contact operations consume short-lived ACR grants bound to the authenticated session. Redis enforces replay claims cluster-wide under opaque HMAC-derived keys.
 
+The web portal supports English (`en`) and Iranian Persian (`fa-IR`) on unchanged URLs. Language, Jalali/Gregorian calendar and time zone are per-browser display preferences; English and UTC remain the initial defaults. Persian uses a self-hosted Vazirmatn font under the existing strict CSP. See [localization](docs/localization.md) for the preference/security boundary and notification queue rollout.
+
 ---
 
 ## 2. MVP Resource Optimization Strategy
@@ -72,6 +74,8 @@ The `docs/` directory contains deep-dive low-level (LLD) and high-level (HLD) sp
    * Kubernetes deployment, CI/CD pipeline structures with Nx, Prometheus metrics, and secret management.
 8. [Disaster Recovery Plan (`docs/disaster-recovery.md`)](docs/disaster-recovery.md)
    * Data backup regimes, RTO/RPO metrics, recovery dry-runs, and ledger-integrity validation playbooks.
+9. [Localization (`docs/localization.md`)](docs/localization.md)
+   * English/Persian browser preferences, typed catalogs, RTL/font/date boundaries, notification compatibility and explicit release gates.
 
 ---
 

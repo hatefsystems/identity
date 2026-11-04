@@ -8,6 +8,25 @@ const limit = 32 * 1024;
 const canonicalToken = (token) => /^[A-Za-z0-9_-]{43}$/.test(token) &&
   Buffer.from(token, 'base64url').toString('base64url') === token;
 
+export function decodeQuotedPrintableUTF8(value) {
+  assert(Buffer.byteLength(value) <= limit, 'Unbounded quoted-printable body');
+  const unfolded = value.replace(/=\r\n/g, '');
+  const bytes = [];
+  for (let index = 0; index < unfolded.length; index++) {
+    const code = unfolded.charCodeAt(index);
+    if (code === 61) {
+      const hex = unfolded.slice(index + 1, index + 3);
+      assert(/^[0-9A-F]{2}$/i.test(hex), 'Invalid quoted-printable escape');
+      bytes.push(parseInt(hex, 16));
+      index += 2;
+    } else {
+      assert(code <= 127, 'Unencoded non-ASCII quoted-printable byte');
+      bytes.push(code);
+    }
+  }
+  return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+}
+
 export function deletionMail(message, { origin, recipient, from }) {
   assert(Buffer.byteLength(message) <= limit, 'Unbounded fixture mail');
   const split = message.indexOf('\r\n\r\n');
@@ -25,12 +44,17 @@ export function deletionMail(message, { origin, recipient, from }) {
   assert.equal(parts.length, 2, 'Expected text and HTML alternatives');
   const bodies = parts.map((part) => {
     assert(part.includes('Content-Transfer-Encoding: quoted-printable\r\n'), 'Unexpected mail encoding');
-    return part.slice(part.indexOf('\r\n\r\n') + 4)
-      .replace(/=\r\n/g, '')
-      .replace(/=([0-9A-F]{2})/gi, (_, byte) => String.fromCharCode(parseInt(byte, 16)));
+    return decodeQuotedPrintableUTF8(part.slice(part.indexOf('\r\n\r\n') + 4));
   });
   assert(parts.some((part) => /Content-Type: text\/plain;/.test(part)) &&
     parts.some((part) => /Content-Type: text\/html;/.test(part)), 'Missing alternative media types');
+  const locale = bodies[1].match(/<html lang="(en|fa-IR)" dir="(ltr|rtl)">/)?.[1];
+  assert(locale, 'Mail omitted its explicit supported language');
+  assert(bodies[1].includes(`dir="${locale === 'fa-IR' ? 'rtl' : 'ltr'}"`), 'Mail direction disagrees with its language');
+  const subject = headers.replace(/\r\n[ \t]+/g, ' ').match(/^Subject: ([^\r\n]+)$/m)?.[1];
+  assert(subject, 'Mail omitted its subject');
+  const decodedSubject = subject.replace(/\?=[ \t]+(?==\?UTF-8\?q\?)/gi, '?=').replace(/=\?UTF-8\?q\?([^?]+)\?=/gi, (_, encoded) => decodeQuotedPrintableUTF8(encoded.replaceAll('_', ' ')));
+  assert.equal(decodedSubject, locale === 'fa-IR' ? 'درخواست حذف حساب' : 'Account deletion requested', 'Mail subject disagrees with its language');
   const links = bodies.flatMap((body) => body.match(/https:\/\/[^\s<>"']+/g) || []);
   assert.equal(links.length, 2, 'Mail must contain only its recovery link in each alternative');
   assert(links[0] === links[1], 'Mail alternatives disagree about recovery');
@@ -39,9 +63,12 @@ export function deletionMail(message, { origin, recipient, from }) {
   assert(link.origin === origin && link.pathname === '/recover-account' && !link.search &&
     link.hash.startsWith('#token=') && canonicalToken(token), 'Invalid canonical recovery link');
   assert(!/<(?:img|script|iframe)\b/i.test(bodies.join('')), 'Mail included a remote asset');
-  const expires = bodies[0].match(/until (\d{4}-\d{2}-\d{2}T[0-9:.]+Z) \(UTC\)/)?.[1];
-  assert(expires && Number.isFinite(Date.parse(expires)), 'Mail omitted its original deadline');
-  return { recipient, message_id: messageID, token, link: link.href, expires_at: expires };
+  // Match the unchanged technical value, independently of surrounding prose.
+  // Exactly one authoritative UTC deadline is required in the plain alternative.
+  const deadlines = [...bodies[0].matchAll(/\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z) \(UTC\)/g)];
+  const expires = deadlines[0]?.[1];
+  assert(deadlines.length === 1 && Number.isFinite(Date.parse(expires)), 'Mail omitted or duplicated its original deadline');
+  return { recipient, locale, message_id: messageID, token, link: link.href, expires_at: expires };
 }
 
 // Implicit TLS only: no plaintext listener, external relay, transcript, or spool.

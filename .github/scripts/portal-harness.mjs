@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
-import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer } from 'node:net';
@@ -257,7 +257,7 @@ export function failureCategories(output) {
 export function browserFailure(error, stage = 'unknown') {
   const kind = error?.name === 'AssertionError' ? 'assertion' : 'operation';
   const location = typeof error?.stack === 'string'
-    ? error.stack.match(/(?:web-(?:portal|admin)\.browser|portal-harness)\.mjs:\d+:\d+/)?.[0]
+    ? error.stack.match(/(?:web-(?:portal|admin|csp)\.browser|portal-harness|browser-localization)\.mjs:\d+:\d+/)?.[0]
     : undefined;
   const checkpoint = /^[a-z-]{1,64}$/.test(stage) ? stage : 'unknown';
   // Browser exception messages can embed full Cookie/DPoP/grant headers or DOM
@@ -368,12 +368,14 @@ export async function startPortalServices({ integration = false } = {}) {
       // must be owned via create before a potentially failing port-binding start.
       const hostPorts = restartBroker ? await Promise.all(ports.map(() => freePort())) : ports.map(() => '');
       if (restartBroker) assert.equal(new Set(hostPorts).size, ports.length, 'Disposable broker ports overlapped');
-      docker([...(restartBroker ? ['create'] : ['run', '--detach']), '--name', id, '--network', name,
+      // A detached run may create the container before its start fails. Acquire
+      // ownership first so every start failure has a registered disposer.
+      docker(['create', '--name', id, '--network', name,
         '--label', restartBroker ? 'ldp.task=6.3' : 'ldp.task=7.5', '--label', `ldp.run=${runID}`,
         ...ports.flatMap((port, index) => ['--publish', `127.0.0.1:${hostPorts[index]}:${port}`]),
         ...Object.entries(environment).flatMap(([key, value]) => ['--env', `${key}=${value}`]), image, ...args]);
       cleanup.push(() => docker(['rm', '--force', '--volumes', id]));
-      if (restartBroker) docker(['start', id]);
+      docker(['start', id]);
       const [state] = JSON.parse(docker(['inspect', id]).stdout);
       const exposed = Object.fromEntries(ports.map((port, index) => {
         const [binding] = state.NetworkSettings.Ports[`${port}/tcp`];
@@ -412,10 +414,15 @@ export async function startPortalServices({ integration = false } = {}) {
 
 export const integrationTargets = Object.freeze([
   'test-security-db', 'test-admin-integration', 'test-retention-integration',
+  'test-legal-workflow-integration', 'test-grpc-integration',
   'test-lifecycle-integration', 'test-portal-integration',
 ]);
 
 export async function runPortalIntegrationSuites() {
+  // cleanEnvironment deliberately excludes ambient Go settings. Select the
+  // checked-in module toolchain explicitly instead of inheriting a newer host Go.
+  const goVersion = /^go ([0-9]+\.[0-9]+\.[0-9]+)$/m.exec(await readFile(resolve(backend, 'go.mod'), 'utf8'))?.[1];
+  assert(goVersion, 'Missing pinned Go module version for integration validation');
   const services = await startPortalServices({ integration: true });
   try {
     // Separate Nx invocations are intentional: these suites reset schemas and
@@ -425,7 +432,7 @@ export async function runPortalIntegrationSuites() {
       const child = spawn('npm', ['exec', '--', 'nx', 'run', `identity-api:${target}`, '--skipNxCache'], {
         cwd: workspace, env: {
           ...cleanEnvironment(), ...services.environment, NX_DAEMON: 'false', CI: 'true', FORCE_COLOR: '0',
-          GOFLAGS: '-v', GOMAXPROCS: '2', REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1',
+          GOTOOLCHAIN: `go${goVersion}`, GOFLAGS: '-v', GOMAXPROCS: '2', REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1',
           REQUIRE_LIFECYCLE_INTEGRATION: '1', REQUIRE_PORTAL_INTEGRATION: '1',
           REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
         },

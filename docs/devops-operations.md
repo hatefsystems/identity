@@ -350,6 +350,19 @@ events/history checks do not close those or manual assistive-technology/authenti
 and deployed-ingress gates. Dependency installation also reported existing npm audit
 findings; no dependency upgrades or audit-policy changes were made in this task.
 
+## Localized Notification Queue Rollout
+
+English/Persian UI preferences are browser-local, not a new account field. The preference cookie is `__Host-hatef-ui` with Secure, HttpOnly, Path=/, SameSite=Lax, no Domain and a one-year maximum. Keep the authentication cookie SameSite=Strict, the per-request nonce CSP and ordinary Next Server Action origin protections. Verify actual HTTPS ingress, fonts, cookie/action rerender and log redaction before production enablement; do not add permissive allowed origins or CSP font/style exceptions. [Localization](localization.md) describes the full UI/data boundary and remaining manual gates.
+
+1. Roll out v1/v2-capable `deletion-notifier` readers first. Verify compatibility, existing envelope keys and unchanged least-privilege grants on every reader before any API replica emits v2. There is no schema migration or new worker SELECT permission for locale.
+2. Deploy the locale-aware API writer, then the frontend. The encrypted v2 payload freezes the initiating action's locale and template version, so primary/backup recipients and retries/restarts retain the same language, token and original deadline. Legacy v1 stays English.
+3. Monitor sanitized existing queue due-age, lease, retry, rejection and permanent-failure signals. UTF-8/MIME encoding still obeys the 16 KiB final-message limit. Do not retain raw mail, message bodies, codes, addresses, recovery links or request locale payloads as evidence.
+4. Roll back by stopping new v2 writes before replacing writers. Keep compatible readers, keys, recovery routes and the additive schema until all live v2 deliveries are handled under existing expiry/retention rules. Never roll a v1-only reader onto live v2 work. Never rewrite accepted ciphertext or regenerate a token/deadline merely to change language.
+
+No retention, legal-hold, session or factor policy change is authorized. Independent professional Persian security/legal wording review, assistive-technology/physical-authenticator/native-zoom review, native hidden-tab/bfcache observations where absent, mailbox/provider checks and deployed-ingress verification remain explicit release gates. The root-error fallback is deliberately bilingual when request preference resolution itself fails.
+
+The existing portal/admin/CSP programs now exercise both locales with fresh run-owned fixtures. Portal/admin evidence is organized under `en/` and `fa-IR/` inside the configured artifact root. Screenshot names include state, locale, viewport and theme; only structurally masked screenshots and sanitized summaries may be uploaded. Set `WEB_BROWSER_ARTIFACT_DIR` for auth screenshots. Do not upload traces, HARs, raw SMTP mail, response bodies or storage snapshots. The `portal-harness.mjs --integration` helper runs all seven required suites serially, including legal workflow and gRPC; do not substitute historical five-suite results. Current execution status must be recorded separately in delivery evidence/PR, never inferred from this runbook.
+
 ## 1. Kubernetes Deployment & Networking
 
 The platform leverages **Traefik** as the Ingress Controller and API Gateway at the cluster boundary, and **SPIRE** to orchestrate dynamic zero-trust workloads.
