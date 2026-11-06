@@ -7,21 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"slices"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
 
-	embedded "github.com/hatefsystems/identity/apps/identity-api/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 )
@@ -42,72 +36,7 @@ func (noContextEncryption) Encrypt(context.Context, []byte) ([]byte, error) {
 
 func newPolicyIntegration(t *testing.T) *policyIntegration {
 	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Fatal("DATABASE_URL is required for governance integration tests; use a disposable PostgreSQL database")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	t.Cleanup(cancel)
-	admin, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(admin.Close)
-	if _, err := admin.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public`); err != nil {
-		t.Fatal(err)
-	}
-	schema := "policy_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
-			t.Error(err)
-		}
-	})
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
-	cfg.MaxConns = 6
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	// Use the actual dependency migrations and governance migration in an isolated
-	// schema. Task 5.4's migration 11 deliberately targets public; do not replay it
-	// against another agent's database while testing this package's singleton.
-	files := fstest.MapFS{}
-	entries, err := fs.ReadDir(embedded.Migrations, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if entry.Name() > "00012_legal_governance.sql" || strings.HasPrefix(entry.Name(), "00011_") {
-			continue
-		}
-		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[entry.Name()] = &fstest.MapFile{Data: data}
-	}
-	sqldb := stdlib.OpenDB(*cfg.ConnConfig)
-	defer func() { _ = sqldb.Close() }()
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqldb, files)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		t.Fatal(err)
-	}
-	actions, err := adminaction.New(pool, noContextEncryption{}, "identity.audit.policy-test", time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &policyIntegration{ctx: ctx, pool: pool, admin: admin, actions: actions, schema: schema}
+	return newPolicyPrivilegeIntegration(t)
 }
 
 func (f *policyIntegration) operation(t *testing.T) *adminaction.Operation {

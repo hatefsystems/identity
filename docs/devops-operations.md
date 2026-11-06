@@ -14,6 +14,48 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ---
 
+## Fresh-Baseline Environment Cutover
+
+Current installation uses only `00001_initial_schema.sql`, applying version 1 in
+`public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
+are refused regardless of their version or apparent equivalence; untracked nonempty
+application schemas and contradictory histories also fail closed. There is no
+in-place v1/v2 upgrade, data conversion or automatic history adoption. Generic
+`up-to` is for the new bundled lineage, not the old chain. Baseline Down/reset and
+rollback to zero refuse. Historical acceptance and prior plans remain unchanged;
+they are not evidence that this baseline passed.
+
+1. Record an explicitly scoped **fresh PostgreSQL 16** database and matching fresh
+   Redis 7/NATS JetStream 2.10 resources or isolated namespaces, with exact ownership,
+   names and ports. Default Compose names/volumes are not necessarily fresh. Existing
+   Identity data was confirmed disposable, but any reset of an existing named
+   developer/shared environment needs a separate explicit request naming the exact
+   targets. Do not run broad volume deletion or shared-schema reset commands.
+2. Close affected intake and stop/drain all old API, signer, publisher and maintenance
+   writers before switching. Inventory queued intent and old envelopes separately;
+   do not import old Redis sessions/grants or NATS events/consumer checkpoints into
+   the replacement DB. Keep required backups/keys and original legal/retention clocks.
+   Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
+3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
+   `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
+   fresh `up` records baseline 1, repeated `up` verifies a no-op. Do not stamp, rename
+   or clear metadata after refusal. Verify packaged embedded inventory and final
+   schema before starting compatible binaries.
+4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
+   explicit genesis heads and retention subject settings using
+   [admin operations](admin-operations.md#migration-and-contraction). None of those
+   initialization/approval actions is a migration seed. Complete real key inventory,
+   readiness and deployed signer lookup probing. Optional standalone backfill retains
+   its encryption/read-back/binding/error contracts as a focused compatibility
+   operation, **not** a new-lineage upgrade path or fresh-install prerequisite.
+5. Reconcile isolated consumer baselines and require fresh authentication before
+   compatible every-replica/caller activation. Keep intake/destructive schedules off
+   until their existing policy, retention, ingress, manual and production gates pass.
+   Automated suites create/tear down only run-owned resources and run serially. The
+   coordinator records uncached final-source outcomes in the separate
+   [acceptance placeholder](admin-operations.md#fresh-baseline-acceptance-placeholder),
+   without changing task statuses or certifying production readiness.
+
 ## User Lifecycle Publisher (Task 6.3)
 
 `lifecycle-publisher` ships in the same non-root backend image. Run it as a
@@ -36,9 +78,10 @@ explicit `APP_ENV=development` and are not production policy approval. One repli
 is not broker HA. Size disk/capacity for the approved replay horizon;
 acknowledgements do not free history early under Limits retention.
 
-1. Apply migration `00016_user_lifecycle_events.sql`, drain old mutation writers,
-   and deploy compatible producers, profile RPC and worker together. Existing
-   users start at revision 0; no registrations or historical events are synthesized.
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover), which
+   includes lifecycle revisions/outbox. Drain old mutation writers and deploy
+   compatible producers, profile RPC and worker together. Revision defaults remain
+   0; no registrations or historical events are synthesized by schema setup.
 2. Provision with a separately approved broker identity. Ordinary publishers must
    not mutate topology. Each service needs independent durable/grant permissions.
    API DB roles may insert intent, not mark it delivered; publishers cannot mutate
@@ -62,7 +105,7 @@ acknowledgements do not free history early under Limits retention.
    published rows are retained/reported and require controlled repair, not silent
    erasure to clear a backlog. Never disable holds or manually mark rows delivered
    to hide failures. Cleanup does not purge broker history or legal evidence.
-7. Rollback preserves revisions/accepted intent; migration 00016 is forward-only.
+7. Rollback preserves revisions/accepted intent; the baseline is forward-only.
    Stop incompatible writers, restore related database state consistently, and
    reconcile baselines/deletions before reopening traffic.
 
@@ -76,8 +119,9 @@ enable password login, add OAuth consent, or deploy downstream services. The
 browser and API must be released as one compatible boundary, not a mixed fleet of
 new DPoP-required and old cookie-only replicas.
 
-1. Apply additive `00017_profile_names.sql` first. Existing users/keys have empty
-   names; do not synthesize historical profile events. Verify deployed DB grants
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover) first.
+   Profile/key names default to empty; do not synthesize historical profile events.
+   Verify deployed DB grants
    for profile reads/writes and transactional outbox insertion.
 2. Deploy dual-version lifecycle publishers/readers and upgrade actual downstream
    consumers before deploying writers that emit display-name v2 events. V1 and
@@ -160,8 +204,9 @@ The separate focused database target requires explicitly configured disposable
 npm exec -- nx run identity-api:test-portal-integration --skipNxCache
 ```
 
-Run database suites serially; existing migration fixtures reset schema, and
-lifecycle tests can restart their explicitly identified disposable NATS container.
+Run database suites serially using only run-owned disposable resources; never reset
+an existing environment. Lifecycle tests can restart their explicitly identified
+disposable NATS container.
 Never point them at shared development or deployed data. CI keeps the existing
 security, lifecycle, gRPC, generated-code, vet/lint/Linux race, image and CSP suites;
 it adds focused portal integration and a separate `portal-browser` release gate.
@@ -265,8 +310,9 @@ The live routes are `/dashboard/privacy` and anonymous `/recover-account`.
 not proof supplied by a checkbox or SMTP acknowledgement. Recovery and draining
 accepted notices must remain available when new deletion requests are switched off.
 
-1. Apply additive, forward-only `00018_deletion_notifications.sql` before new API
-   writers/workers. Verify API privileges for transactional request/outbox insertion.
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover), including
+   deletion notification storage, before new API writers/workers. Verify API privileges
+   for transactional request/outbox insertion.
    Inventory any legacy pending requests without encrypted delivery intent; hashes
    cannot reconstruct their tokens. Reconcile them through an approved procedure,
    preserving the original deadline, before enabling new requests.
@@ -822,7 +868,7 @@ groups:
 
 ### Admin deployment gate
 
-Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including role separation, approved retention, encrypted backfill, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
+Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including fresh-baseline installation, role separation, approved retention, actual key/data inventory, separately scoped compatibility backfill only where applicable, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. Backfill is not a lineage upgrade path. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
 
 ## Phase 5 Technical Closure (2026-11-05)
 

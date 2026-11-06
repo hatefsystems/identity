@@ -178,7 +178,8 @@ rotates out; restoration is not a mechanism to bypass erasure or active holds.
    is no v2 purge EXECUTE grant. Stop/drain signer and ingestion, and stop affected
    publishers while selecting a recovery point. Preserve the original system
    and incident evidence; do not delete proof state to make a check pass.
-2. Restore both payload tables (`security_event_ledger`, `mvp_audit_logs`), both
+2. Restore the matching new-lineage `public.identity_schema_version`, both payload
+   tables (`security_event_ledger`, `mvp_audit_logs`), both
    chains (`security_ledger_chain`, `audit_log_chain`), both heads, chain sequence
    allocation state, `security_ledger_erasures`, `security_ledger_retention_settings`,
    legal holds/governance/workflow state and `event_outbox` from one consistent
@@ -215,17 +216,32 @@ work, retain both chains/heads/payloads/erasures/holds/settings/outbox, and repa
 with compatible code. A pre-v2 signer or verifier is
 not a safe downgrade. Exact provisioning, revocation and rollout commands are
 in [admin operations](admin-operations.md#security-ledger-retention-task-54).
-Migrations `00011`, `00014`, `00015`, `00019` and `00020` refuse Down; use forward
-recovery rather than an up/down/up drill even when payload tables appear empty.
-Before pending `00015`, supported migration entrypoints refuse existing v1 bodies
-or initialized proof state, including already-erased histories. This protects
-future runs; it cannot recover history a previous run discarded. Preserve/convert
-populated v1 history separately and inventory/drain/quarantine v1 outbox and broker
-envelopes; never reset genesis, rehash records or wipe a development database.
-For existing v2 databases, close affected intake/writers, apply `00019`, run bounded
-backfill to zero with key/data read-back inventory, then apply `00020` contraction
-and start compatible binaries. Premature contraction must fail without dropping
-data; earlier successful additive migrations can remain applied.
+The single fresh `00001_initial_schema.sql` baseline refuses Down unconditionally;
+reset/rollback to zero refuse even after later migrations. Use forward recovery,
+not an up/down/up drill, even when payload tables appear empty. Recovery restores
+matching new-lineage metadata and application state consistently; it is not an
+in-place upgrade or adoption of legacy backups. Supported migration entrypoints
+refuse ALL `public.goose_db_version` targets, untracked nonempty application schemas
+and contradictory histories without mutation. Retain legacy backups/history as
+required evidence; this runner does not convert them, rehash records, infer genesis
+or recover history already discarded.
+
+For replacement installation, stop all old writers and identify an explicitly
+scoped fresh PostgreSQL 16 target plus matching fresh/isolated Redis 7/NATS JetStream
+2.10 state. Do not carry stale sessions, queued envelopes or consumer checkpoints
+into the replacement database; recovery of accepted intent needs separate consistent
+reconciliation. Existing data was confirmed disposable, not approved for automatic
+reset: any reset of an existing named environment needs a separate explicit request
+identifying its exact targets. No broad volume deletion or shared-schema reset is
+part of these instructions. Follow [active setup](admin-operations.md#migration-and-contraction).
+
+Optional standalone backfill retains bounded encryption, binding/read-back and
+atomicity/error contracts only as a separately scoped focused compatibility
+operation, not a new-lineage upgrade or fresh-install step. Operator-only genesis,
+restricted provisioning, real key inventory, policy approval, original retention
+clocks and manual/production restore gates remain unchanged. Historical acceptance
+and prior plans retain their original evidence; the coordinator records new outcomes
+only in the [fresh-baseline placeholder](admin-operations.md#fresh-baseline-acceptance-placeholder).
 
 No procedure promises restoration of erased payloads. Database-relative chains,
 erasure annotations

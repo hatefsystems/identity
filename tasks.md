@@ -2,6 +2,26 @@
 
 This document outlines the complete step-by-step roadmap for implementing the Hatef Identity Platform. The tasks are structured from the bottom up, starting from workspace setup and infrastructure to database design, security engines, and finally the frontend application.
 
+## Active Installation Contract
+
+Install only the single fresh `00001_initial_schema.sql` baseline with `migrate up`,
+tracked as version 1 in `public.identity_schema_version`. All legacy
+`public.goose_db_version` targets, untracked nonempty application schemas and
+contradictory histories are refused, not upgraded, stamped or adopted. Stop old
+writers and select explicitly scoped fresh PostgreSQL plus matching fresh/isolated
+Redis/NATS state. Existing Identity data was confirmed disposable; resetting any
+existing environment still requires separate explicit authorization naming its
+exact targets. Baseline rollback/reset is unavailable.
+
+Optional standalone backfill is a focused compatibility operation, not an install
+or new-lineage upgrade path. Operator-only roles/genesis, policy approval, key
+inventory, legal retention and manual/production gates remain separate. See
+[active setup](docs/admin-operations.md#migration-and-contraction) and the
+[fresh-baseline acceptance placeholder](docs/admin-operations.md#fresh-baseline-acceptance-placeholder).
+The task statuses, original implementation descriptions/migration names and dated
+acceptance records below are unchanged historical records, not current install
+instructions or evidence for this new baseline. Prior plans remain unchanged.
+
 ---
 
 ## Definition of Done (DoD)

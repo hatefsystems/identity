@@ -336,6 +336,16 @@ The runtime bounds initial dependency/SVID acquisition to ten seconds, handshake
 
 Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
 
+The single fresh `00001_initial_schema.sql` install uses
+`public.identity_schema_version`, refusing all legacy `public.goose_db_version`,
+untracked nonempty application schemas and contradictory histories without
+upgrade/adoption. Stop all old writers before switching to explicitly scoped fresh
+PostgreSQL and matching fresh/isolated Redis/NATS state; do not reuse old sessions,
+events or consumer checkpoints. Reconcile each consumer baseline before activation.
+Wire formats, cryptographic contracts and production/manual gates are unchanged.
+Baseline Down/reset refuse; any existing-environment reset needs separately explicit
+scoped authorization. See [active setup](admin-operations.md#migration-and-contraction).
+
 ### 3.5 Validation and Error Forwarding
 
 Send the exact raw access token, observed authorization scheme and expected audience. For DPoP, forward the proof plus original HTTP method and absolute URI observed at the resource's trusted HTTP edge. Do not extract method/URI from the proof or trust end-user forwarding headers. The service excludes query data during RFC 9449 URI comparison and never fetches the supplied URI. A bound token cannot be sent as Bearer or rebound to another key during refresh.

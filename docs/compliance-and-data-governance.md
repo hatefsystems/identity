@@ -170,7 +170,7 @@ not settled in code:
 **Pepper compromise.** The blind index resists offline brute force while the
 pepper is secret, but email addresses and E.164 numbers are an enumerable input
 space: a leaked pepper re-identifies every indexed row. `blind_index_version`
-(migration 00015) exists so a compromised pepper can be retired - historical
+(included in the fresh baseline) exists so a compromised pepper can be retired - historical
 rows keep their recorded generation, so a lookup can compute one candidate digest
 per retained generation instead of losing the lookup path entirely. Multi-pepper
 lookup is the required follow-up; the column is the part that could not be added
@@ -186,7 +186,7 @@ applying a hold after erasure cannot restore evidence. The Class A deletion
 worker and Class C audit history remain untouched.
 
 Minimal proof metadata outlives erased events, and under canonical format v2
-(migration 00015) it is simply the chain itself. Tamper-evidence lives in
+(included in the fresh baseline) it is simply the chain itself. Tamper-evidence lives in
 `security_ledger_chain`, one row per event holding a leaf digest and a chain
 digest, and that table is never deleted. Erasure removes the payload row and
 nothing else, so the chain stays complete and verifiable from genesis across an
@@ -398,6 +398,6 @@ These are stated as posture and targets; formal certification is pursued as the 
 
 ### Task 5.3 implementation boundary
 
-Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Fresh baseline storage has no plaintext narratives. Optional standalone backfill preserves encryption/read-back/binding and error contracts only as a separately scoped focused compatibility operation, not a new-lineage upgrade path. See [admin operations](admin-operations.md#standalone-compatibility-backfill).
 
-Task 5.4 owns separately credentialed ledger payload retention, structural chain/leaf/annotation verification and independent read-only receipt reconciliation, not legal erasure certification. External anchors, phone attribution and pepper rotation remain separate work. Task 5.5 narrative/inventory approval is not satisfied by the worker. API must not get ledger DELETE, head EXECUTE or trigger bypass. Existing v2 cutover stops affected intake/writers, applies `00019`, runs bounded verified backfill to zero, then applies `00020` physical plaintext contraction without data wipe; populated v1 preservation/conversion is separate. All three tasks remain unchecked pending fresh local automated acceptance; production/manual gates remain open in [admin operations](admin-operations.md#production-checklist).
+Task 5.4 owns separately credentialed ledger payload retention, structural chain/leaf/annotation verification and independent read-only receipt reconciliation, not legal erasure certification. External anchors, phone attribution and pepper rotation remain separate work. Task 5.5 narrative/inventory approval is not satisfied by the worker. API must not get ledger DELETE, head EXECUTE or trigger bypass. Install only the single fresh `00001_initial_schema.sql` baseline tracked in `public.identity_schema_version`; all legacy `public.goose_db_version`, untracked nonempty application schemas and contradictory histories refuse without upgrade/adoption. Stop old writers and isolate matching PostgreSQL/Redis/NATS state. Baseline Down/reset refuse. Existing data was confirmed disposable, not legally erased or approved for reset: any existing-environment reset requires separate explicit scoped authorization and does not waive retention/hold/backup obligations. Historical evidence and prior plans remain unchanged, not acceptance of the new baseline. All three tasks remain unchecked pending fresh local automated acceptance; production/manual gates remain open in [admin operations](admin-operations.md#production-checklist).

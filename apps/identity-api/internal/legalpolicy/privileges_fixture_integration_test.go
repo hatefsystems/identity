@@ -4,7 +4,6 @@ package legalpolicy
 
 import (
 	"context"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -13,15 +12,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 )
 
-// Privilege acceptance uses the complete installed schema, not the historical
-// pre-retention schema fixture whose guard functions still expose PUBLIC EXECUTE.
+// Governance and privilege acceptance share a complete run-owned installation.
 func newPolicyPrivilegeIntegration(t *testing.T) *policyIntegration {
 	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
 		t.Fatal("DATABASE_URL required for restricted policy installation")
 	}
@@ -33,35 +33,38 @@ func newPolicyPrivilegeIntegration(t *testing.T) *policyIntegration {
 	}
 	t.Cleanup(func() { _ = root.Close(context.Background()) })
 	database := "policy_privilege_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := root.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize()); err != nil {
-		t.Fatal(err)
+	if _, err := root.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize()+" TEMPLATE template0"); err != nil {
+		t.Fatalf("create run-owned policy database with test provisioning credentials: %v", err)
 	}
+	t.Logf("run-owned policy database: %s", database)
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
-		if _, err := root.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()+" WITH (FORCE)"); err != nil {
+		if _, err := root.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()); err != nil {
 			t.Errorf("drop run-owned policy privilege database: %v", err)
 		}
 	})
-	parsed, err := url.Parse(dsn)
-	if err != nil || parsed.Scheme == "" {
-		t.Fatal("DATABASE_URL must be a PostgreSQL URL")
-	}
-	parsed.Path = "/" + database
-	dsn = parsed.String()
-	migrationDB, err := migrate.Open(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.ConnConfig.Database = database
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
+	cfg.MaxConns = 6
+	migrationDB := stdlib.OpenDB(*cfg.ConnConfig)
 	err = migrate.Up(ctx, migrationDB)
 	_ = migrationDB.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return &policyIntegration{ctx: ctx, pool: pool, admin: pool, schema: "public"}
+	actions, err := adminaction.New(pool, noContextEncryption{}, "identity.audit.policy-test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &policyIntegration{ctx: ctx, pool: pool, admin: pool, actions: actions, schema: "public"}
 }

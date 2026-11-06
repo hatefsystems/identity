@@ -10,17 +10,17 @@
 // that hard-delete leaves security_event_ledger untouched. Those are properties of
 // the schema, not of the Go code, so only a migrated database can confirm them.
 //
-// They require a reachable PostgreSQL instance addressed by DATABASE_URL (see
-// .env.example / docker-compose.dev.yml). The mandatory Nx security-DB target checks
+// They require a run-owned disposable PostgreSQL instance addressed by DATABASE_URL.
+// The mandatory Nx security-DB target checks
 // the variable before invoking this integration-tagged package.
 //
 // With DATABASE_URL set, run the DB-backed packages serially:
 //
-//	go test -tags=integration -p 1 ./...
+//	npm exec -- nx run identity-api:test-security-db --skipNxCache
 //
-// `go test` runs packages in parallel, and internal/migrate, internal/dbintegration,
-// internal/recovery and this package all drive goose against the one shared schema,
-// so a parallel run has them tearing down each other's tables.
+// Some integration packages still provision or clean shared fixture state, so
+// the mandatory suite keeps packages serial. Migration tests own separate
+// disposable databases; the forward-only baseline cannot be reset by Down.
 //
 // Coverage:
 //   - End-to-end soft-delete -> past cutoff -> purge, asserting exactly which rows

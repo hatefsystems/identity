@@ -221,10 +221,18 @@ initialized/purged state is forward-only and must not
 be served by old signer/verifier binaries. Task 5.3 operational approval and
 Task 5.5 narrative-retention policy remain separate gates in the runbook.
 
-Existing v2 upgrades preserve applied SQL and data: stop affected intake/writers,
-apply `00019` head-terminal/coordination repair, run bounded verified legal-hold
-backfill to zero, then apply `00020` physical plaintext-column contraction and start
-compatible binaries. Pending `00015` refuses populated v1 or initialized proof
-state through supported migration entrypoints; separate preservation/conversion
-is required, never a development-data reset. See the runbook for inventories and
-the still-unchecked production/manual checklist.
+Install only the single fresh `00001_initial_schema.sql` baseline, tracked in
+`public.identity_schema_version`, with final head-terminal/coordination behavior
+and encrypted-only legal storage. Supported entrypoints refuse all legacy
+`public.goose_db_version`, untracked nonempty application schemas and contradictory
+histories without mutation. There is no in-place v1/v2 upgrade or adoption. Stop
+old writers and select explicitly scoped fresh PostgreSQL plus matching isolated
+Redis/NATS state; do not carry sessions, events or checkpoints into the new database.
+Baseline Down/reset refuse; disposable-data confirmation is not authorization to
+reset an existing environment, which requires separately explicit scoped targets.
+Optional standalone backfill preserves cryptographic/read-back/error contracts as
+a focused compatibility operation, not a new-lineage upgrade path. Signed bytes,
+wire formats, operator-only genesis/provisioning, policy approval and legal retention
+are unchanged. See [active setup](admin-operations.md#migration-and-contraction)
+and the still-unchecked production/manual checklist. Historical acceptance and
+prior plans retain their original evidence and do not certify the new baseline.

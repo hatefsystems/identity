@@ -12,10 +12,20 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 
 The following is a selected schema illustration, not executable production
 provisioning or a substitute for the applied migrations in
-`apps/identity-api/db/migrations`. Current storage includes migrations through
-`00020`; additional account/auth/outbox/workflow columns are described below and
-in those migrations. Canonical-v2 payloads do not contain their own event UUID or
-chain digest, and contracted legal requests have no plaintext narrative columns.
+`apps/identity-api/db/migrations`. Current storage is created by the single fresh
+`00001_initial_schema.sql` baseline, tracked as version 1 in
+`public.identity_schema_version`; additional account/auth/outbox/workflow columns
+are described below and in that baseline. Canonical-v2 payloads do not contain their
+own event UUID or chain digest, and contracted legal requests have no plaintext
+narrative columns.
+
+All legacy `public.goose_db_version` targets, untracked nonempty application schemas
+and contradictory histories are refused, never upgraded or adopted. Fresh setup
+requires an explicitly scoped PostgreSQL target plus matching fresh/isolated Redis
+and NATS state with old writers stopped. Disposable-data confirmation does not
+authorize resetting an existing named environment. See
+[active setup](admin-operations.md#migration-and-contraction); historical acceptance
+and prior plans retain their original evidence, not acceptance of this baseline.
 
 ```sql
 -- Enable necessary extensions
@@ -217,16 +227,16 @@ CREATE UNIQUE INDEX legal_holds_request_identity ON legal_holds(account_ref, req
 
 ### 1.1.2 Retention Proof and Durable Head (Task 5.4)
 
-Canonical-v2 migration `00015` replaces the v1 `00011` checkpoint/routine design
-with permanently retained chains and separate erasable payloads. `00019` repairs
-head advancement and separates audit coordination from purge-run locking. Applied
-SQL remains unchanged. Supported migration entrypoints refuse pending `00015`
-when v1 bodies or initialized proof state exist, including already-erased histories;
-inventory failure is not an empty-history result. Populated v1 needs a separate
-preservation/conversion procedure, never reset/rehash/wipe. Old outbox/JetStream
-envelopes require separate inventory/drain/quarantine; they are not upgraded by
-schema conversion. Migrations neither initialize genesis nor provision deployment
-logins. Operators must inventory/verify history and explicitly bootstrap both
+The single fresh baseline creates permanently retained canonical-v2 chains and
+separate erasable payloads directly, with exact terminal head advancement and
+audit coordination separate from purge-run locking. It contains no v1 checkpoint/
+routine transition or historical data repair. Supported entrypoints refuse all
+legacy history and untracked nonempty application schemas; inventory failure is
+not an empty-history result. There is no in-place v1/v2 upgrade or automatic
+adoption, reset or rehash. Old outbox/JetStream envelopes require separate inventory/
+drain/quarantine and must not enter the fresh isolated environment. Migrations
+neither initialize genesis nor provision deployment logins. Operators must
+inventory/verify history and explicitly bootstrap both
 known terminal positions with writers stopped as described in
 [admin operations](admin-operations.md#security-ledger-retention-task-54).
 
@@ -291,8 +301,8 @@ detects coherent privileged rewrite/rollback; external anchoring stays deferred.
 
 ### 1.1.3 Lifecycle Revisions and Outbox (Task 6.3)
 
-Migration `00016_user_lifecycle_events.sql` adds nonnegative
-`users.lifecycle_revision`, independent of credential `auth_version`/`auth_epoch`.
+The fresh baseline includes nonnegative `users.lifecycle_revision`, independent
+of credential `auth_version`/`auth_epoch`.
 Explicit Go business transactions advance it and insert metadata-only lifecycle
 intent in `event_outbox` in the same commit. No CDC or lifecycle triggers are
 installed. Existing users begin at 0 without synthesized history; transactional
@@ -317,7 +327,7 @@ broadcast stream is not the audit work queue or legal-evidence archive. See the
 
 ### 1.1.4 Portal Names and Profile Transactions (Task 7.3)
 
-Additive migration `00017_profile_names.sql` adds `users.display_name` and
+The fresh baseline includes `users.display_name` and
 `webauthn_credentials.name` as non-null text defaulting to the empty string, with
 `char_length(...) <= 80` constraints. Existing users/credentials remain valid;
 names are optional, not unique, and no historical profile events are synthesized.
@@ -567,7 +577,7 @@ Where:
 
 ### Task 5.5 workflow storage
 
-Migrations `00012`-`00014` add immutable governance artifacts and baseline binding,
+The fresh baseline includes immutable governance artifacts and policy binding,
 legal cases and encrypted revision/review/response history, historical subject
 associations, existing-hold links, advisory hold-review state, business replay
 records, case-free monthly/year counters and frozen report artifacts. No workflow
@@ -598,7 +608,7 @@ truth; restore their state consistently and include them in notices/ROPA/DPIA/DS
 | Relation / material | Retained fields and linkage | Actual lifetime / cleanup |
 |---|---|---|
 | `admin_action_contexts` | `action_id`, nullable `account_ref`, `details_encrypted`, `created_at`, `retain_until`; encrypted moderation/inquiry context is still personal data. | Original `created_at +` approved context duration; strict `retain_until < cutoff`, hold-aware physical cleanup. No clock rewriting. |
-| Contracted `legal_holds` | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives. | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns after `00020`. |
+| Contracted `legal_holds` | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives. | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns in the fresh baseline. |
 | Live workflow/case associations | `legal_cases` original clocks, policy/state/revision and preparer/approver/auth-version fields; `legal_case_subjects(case_id,account_ref,current)`; `legal_case_holds(case_id,hold_id,account_ref,current)`. Historical associations remain even when not current. | Expiry is `min(created_at + max_age, closed_at + closed_retention)` where closed; at-or-after equality cleanup only without any historically associated subject hold. Reviews/retries/releases do not reset it. |
 | `legal_workflow_events` | `id`, `scope`, `scope_kind`, `revision`, `purpose`, `actor`, `auth_version`, `action_id`, `created_at`, `body_encrypted`. Bound encrypted revision/review/response/delivery narratives are restricted personal data. | Physical deletion with case/hold-review cleanup at original workflow expiry, subject to independent holds. Not a permanent narrative archive. |
 | `legal_hold_reviews` | `hold_id`, `account_ref`, `policy_id`, `version`, nullable `next_review_at`; original `legal_holds.review_at` is not overwritten. | At-or-after release-relative approved expiry, absent any active hold on account; state and encrypted history are deleted, not represented as never-created history. |
@@ -622,9 +632,9 @@ remain separate work; no additional permanent inventory is silently certified.
 
 Legal requests are independent encrypted rows, unique by `(account_ref, request_kind, idempotency_key)`, not actor or globally unique operation ID. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but **is still personal data**. Baseline section 1.7 auditing retains actor/network metadata, action/hold IDs, timestamps and response digests; section 1.8's narrower workflow projection must not be generalized to it.
 
-Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Fresh storage has no plaintext narrative columns. Optional standalone backfill retains encryption/read-back/binding and error contracts only as a separately scoped focused compatibility operation, not a new-lineage upgrade path. See [admin operations](admin-operations.md#standalone-compatibility-backfill).
 
-Task 5.4 adds separately credentialed ledger payload retention, structural chain/leaf/annotation verification and separate read-only receipt reconciliation under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External anchors, phone attribution and pepper rotation remain separate work. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Existing v2 upgrades stop affected intake/writers, apply `00019`, run bounded verified backfill to zero, and apply `00020` data-preserving physical plaintext contraction before compatible cutover.
+Task 5.4 adds separately credentialed ledger payload retention, structural chain/leaf/annotation verification and separate read-only receipt reconciliation under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External anchors, phone attribution and pepper rotation remain separate work. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install only the fresh `00001` baseline in `public.identity_schema_version`, stop old writers and isolate PostgreSQL/Redis/NATS state before compatible cutover. Baseline Down/reset refuse; any reset of an existing environment requires separate explicit scoped authorization.
 
 ### Task 7.6 Legal Disclosure Boundary
 

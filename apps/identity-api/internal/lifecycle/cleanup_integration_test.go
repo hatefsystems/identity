@@ -29,7 +29,7 @@ func TestLifecycleCleanupPublishedOnlyAndHoldsIntegration(t *testing.T) {
 	lifecycleExec(t, f, "UPDATE event_outbox SET published_at=now()-interval '2 hours' WHERE lifecycle_user_id<>$1", fresh.ID)
 	pending := lifecycleCreate(t, f)
 	lifecycleExec(t, f, "UPDATE event_outbox SET next_attempt_at=now()-interval '2 hours' WHERE lifecycle_user_id=$1", pending.ID)
-	lifecycleExec(t, f, "INSERT INTO legal_holds(account_ref,applied_by) VALUES ($1,$2)", held.ID, uuid.New())
+	lifecycleHold(t, f, f.pool, held.ID)
 	legacyID, malformedID, auditID, otherID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	lifecycleExec(t, f, `INSERT INTO event_outbox(id,subject,payload,published_at,admin_action) VALUES
 		($1,$5,$6,now()-interval '2 hours',false),
@@ -65,7 +65,8 @@ func TestLifecycleHeldHistoryCannotMonopolizeCleanupBatchIntegration(t *testing.
 	legacyUser, legacyEvent := uuid.New(), uuid.New()
 	lifecycleExec(t, f, "INSERT INTO event_outbox(id,subject,payload,published_at) VALUES ($1,$2,$3,now()-interval '4 hours')",
 		legacyEvent, lifecycle.SubjectDeleted, fmt.Sprintf(`{"user_id":%q}`, legacyUser))
-	lifecycleExec(t, f, "INSERT INTO legal_holds(account_ref,applied_by) VALUES ($1,$3),($2,$3)", held.ID, legacyUser, uuid.New())
+	lifecycleHold(t, f, f.pool, held.ID)
+	lifecycleHold(t, f, f.pool, legacyUser)
 	if n, err := lifecycle.CleanupPublished(f.ctx, f.pool, time.Hour, 1); err != nil || n != 1 {
 		t.Fatalf("held rows monopolized the bounded cleanup batch: %d %v", n, err)
 	}
@@ -146,9 +147,7 @@ func TestLifecycleCleanupRechecksHoldAfterAccountLockIntegration(t *testing.T) {
 	case <-f.ctx.Done():
 		t.Fatal("cleanup did not request account advisory lock")
 	}
-	if _, err := holdTx.Exec(f.ctx, "INSERT INTO legal_holds(account_ref,applied_by) VALUES ($1,$2)", user.ID, uuid.New()); err != nil {
-		t.Fatal(err)
-	}
+	lifecycleHold(t, f, holdTx, user.ID)
 	if err := holdTx.Commit(f.ctx); err != nil {
 		t.Fatal(err)
 	}

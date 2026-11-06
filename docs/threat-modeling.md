@@ -165,7 +165,17 @@ sentinels, report/transparency replay and governance provenance, chain event UUI
 digests and erasure/receipt material. Minimization is not unconditional anonymity
 or blanket approval of permanent retention. See the [exact retained inventory](data-architecture.md#retained-metadata-inventory)
 and unchecked [production checklist](admin-operations.md#production-checklist).
-Forward `00019`/`00020` cutover stops affected intake/writers and verifies bounded
-backfill before physical plaintext contraction; populated v1 or initialized proof
-state refuses pending `00015`, never permitting a development-data wipe or genesis
-reset. In-flight work must stop before emergency revocation is declared effective.
+Fresh installation uses only `00001_initial_schema.sql` and
+`public.identity_schema_version`. All legacy `public.goose_db_version`, untracked
+nonempty application schemas and contradictory histories refuse without mutation,
+even if old storage appears equivalent. There is no in-place upgrade/adoption,
+automatic history stamping or genesis reset. Stop all old writers and pair the
+explicitly scoped fresh PostgreSQL target with matching isolated Redis/NATS state
+so stale authority, queued events and checkpoints cannot enter the new database.
+Baseline Down/reset refuse; disposable-data confirmation does not authorize an
+existing-environment reset, which needs separately explicit scoped targets.
+Optional standalone backfill retains cryptographic/read-back/error contracts only
+as a focused compatibility operation, not a new-lineage upgrade path. Operator
+genesis/provisioning, legal retention, approval and production/manual gates remain
+unchanged; historical evidence does not certify fresh-baseline acceptance.
+In-flight work must stop before emergency revocation is declared effective.

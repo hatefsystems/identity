@@ -9,19 +9,17 @@
 // unverified there. These tests close that gap by driving the service with a real
 // pgxpool and a migrated schema.
 //
-// They require a reachable PostgreSQL instance addressed by DATABASE_URL (see
-// .env.example / docker-compose.dev.yml). The mandatory Nx security-DB target
+// They require a run-owned disposable PostgreSQL instance addressed by DATABASE_URL.
+// The mandatory Nx security-DB target
 // checks the variable before invoking this integration-tagged package.
 //
 // With DATABASE_URL set, run the DB-backed packages serially:
 //
-//	go test -p 1 ./...
+//	npm exec -- nx run identity-api:test-security-db --skipNxCache
 //
-// `go test` runs packages in parallel, and internal/migrate, internal/db, and
-// this package all drive goose against the one shared schema (internal/migrate
-// additionally Resets it), so a parallel run has them tearing down each other's
-// tables. This is a pre-existing property of the shared-database suites, not
-// something specific to these tests.
+// Some integration packages still provision or clean shared fixture state, so
+// the mandatory suite keeps packages serial. Migration tests own separate
+// disposable databases; the forward-only baseline cannot be reset by Down.
 //
 // Coverage:
 //   - Verify consumes exactly one row and the row is physically deleted, not

@@ -53,27 +53,42 @@ runner binary (`cmd/migrate`) via `go:embed`. sqlc parses the same files as its
 schema source. Regenerate Go outputs and validate the actual applied version before
 deploying compatible binaries; generation alone does not migrate a database.
 
-The initial migration (`00001_initial_schema.sql`, Task 2.1) creates the eight
-core tables from `docs/data-architecture.md` §1.1 — `users`, `roles`,
-`permissions`, `role_permissions`, `user_roles`, `webauthn_credentials`,
-`recovery_codes`, `mvp_audit_logs` — including the partial unique indexes
-(soft-delete-aware email/blind-index/recovery-code uniqueness) and the
-append-only triggers + `REVOKE` hardening on `mvp_audit_logs` (only the GDPR
-purge's FK `ON DELETE SET NULL` mutation is permitted).
+The single fresh-install baseline, `00001_initial_schema.sql`, creates the
+complete current `public` application schema: accounts/authentication, canonical-v2
+chains and erasable payloads, encrypted legal holds, governance/workflow, profile
+names and lifecycle/deletion outboxes. It seeds only 4 roles, 13 permissions and
+15 role-permission assignments. Users/operator grants, genesis heads, retention
+settings and approved policy bindings are separate operator actions, not migration
+seeds. Subsequent schema changes use `00002`, `00003` and later migrations in the
+new lineage.
 
-`DATABASE_URL` must be set in the environment (see the repository-root `.env.example`); it is never
-hardcoded. With the dev stack running (`docker compose -f
-docker-compose.dev.yml up -d`):
+Set `DATABASE_URL` to a fresh, explicitly scoped PostgreSQL 16 target (see the
+repository-root `.env.example`); never reuse an existing Compose database/volume
+for this install. Stop old writers before switching and use matching fresh or
+isolated Redis 7 and NATS JetStream 2.10 state, including consumer checkpoints:
 
 ```bash
 npm exec -- nx run identity-api:migrate-up
-npm exec -- nx run identity-api:migrate-down
 npm exec -- nx run identity-api:migrate-status
 ```
 
-Or directly: `go run ./cmd/migrate <up|down|reset|status>`; the staged cutover
-entrypoint is `go run ./cmd/migrate up-to 19` (packaged binary: `migrate up-to 19`).
-It validates the positive version before connecting and uses the same guarded wrapper.
+From this directory, `go run ./cmd/migrate up` (packaged binary: `migrate up`)
+applies baseline version 1 and records it in `public.identity_schema_version`.
+`up-to 1` targets this baseline; generic `up-to` remains available for later bundled
+migrations, not old migration numbers. Repeated `up` on valid installed history
+is a verified no-op. Public `status`/version inspection is read-only and does not
+create bookkeeping on a fresh target.
+
+Every supported migration entrypoint refuses **any** `public.goose_db_version`,
+including empty or fully migrated legacy history, even if the schema matches.
+Untracked nonempty application schemas, both history tables, malformed metadata
+or contradictory histories also fail closed without adoption or mutation. The
+runner never stamps, renames, clears or resets existing history. A legitimate
+applied version-0-only new history can be retried only with no application schema;
+a zero-row history is malformed. Baseline `Down`, `reset` and `down-to 0` refuse
+unconditionally. Disposable-data confirmation is not reset authorization: rebuilding
+an existing environment requires a separate explicit request naming its exact
+targets. See [fresh setup](../../docs/admin-operations.md#migration-and-contraction).
 
 The integration tests in `internal/migrate` verify migration invariants against
 the real database, including downgrade refusal for forward-only migrations. Do
@@ -83,33 +98,24 @@ when `DATABASE_URL` is unset or unreachable so `go test ./...` works offline.
 The same gating applies to `internal/db` (query layer) and `internal/recovery`
 (recovery-code atomicity).
 
-Canonical v2 (`00015_chain_payload_split.sql`) stores event IDs and leaf/chain
-digests in separate append-only chain tables, not payload `id`/`chain_hash`
-columns. Supported migration entrypoints refuse crossing pending `00015` when
-v1 payloads or initialized head/checkpoint/settings/proof state exist, including
-already-erased histories; inventory errors fail closed. Stop affected writers and
-inventory old outbox/JetStream envelopes separately. Populated v1 needs a separate
-preservation/conversion procedure, not genesis reset, automatic rehash or data
-wiping in development. Applied migrations are not edited, and this guard cannot
-recover data a previous run discarded.
+Canonical v2 stores event IDs and leaf/chain digests in separate append-only chain
+tables, not payload `id`/`chain_hash` columns. The baseline includes final exact
+terminal head advancement and creates `legal_holds` without `reason`,
+`requesting_authority` or `legal_basis` plaintext columns. Existing v1/v2 databases
+are not upgraded or adopted, and old queued envelopes are not converted by setup.
+Signed bytes, crypto bindings, original clocks and wire formats are unchanged.
 
-For an existing v2 deployment, stop affected intake/writers, apply the additive
-`00019_chain_head_terminal.sql` repair, run `admin-legal --operation=backfill`
-in bounded `1..1000` batches until zero and verify keys/data inventory, then apply
-`00020_legal_hold_plaintext_contract.sql` and start compatible binaries. The
-contract migration locks `legal_holds`, refuses any remaining plaintext/unconverted
-record, drops only known dependencies without CASCADE, and physically removes
-`reason`, `requesting_authority`, `legal_basis` while preserving ciphertext,
-references, keys, clocks and legitimately released/purged tombstones. No runtime
-plaintext fallback exists; backfill recognizes full contraction, rejects partial
-layouts, and checks ciphertext binding/read-back before clearing plaintext.
-Premature contraction fails without data deletion; earlier successful migrations
-can remain applied. Fresh empty databases apply the complete sequence normally.
-See [migration procedure](../../docs/admin-operations.md#migration-and-contraction).
+The optional standalone `admin-legal --operation=backfill` remains documented for
+a separately scoped focused compatibility operation, **not** a new-lineage upgrade
+path or installation step. Batches are `1..1000`; ciphertext is read back,
+decrypted and binding-checked before plaintext clears in the same transaction.
+Full contraction is recognized as no work; partial layouts and corrupt/wrong-key
+data fail closed. Preserve key recovery, actual key/data inventory and consistent
+backups; crypto readiness alone is not full inventory assurance. See
+[compatibility backfill](../../docs/admin-operations.md#standalone-compatibility-backfill).
 
-Those three packages all drive goose against the one shared schema, and
-`internal/migrate` resets it, so when `DATABASE_URL` **is** set they must not run
-in parallel:
+Database-backed suites must use only run-owned disposable resources and execute
+serially, never against retained development/shared or production history:
 
 ```bash
 go test -p 1 ./...   # DB-backed packages serialized

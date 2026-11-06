@@ -5,9 +5,9 @@
 //
 //	migrate up      apply all pending migrations
 //	migrate up-to N apply pending migrations through version N
-//	migrate down    roll back the most recent migration
-//	migrate reset   roll back everything (dev/test only)
-//	migrate status  print per-migration applied state
+//	migrate down    roll back a future migration; baseline is forward-only
+//	migrate reset   refuse reset; fresh setup requires separate explicit scope
+//	migrate status  print per-migration applied state without changing the DB
 //
 // DATABASE_URL is read from the environment (see .env.example); credentials
 // are never hardcoded (DoD #3).

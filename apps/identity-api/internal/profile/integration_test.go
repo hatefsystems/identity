@@ -5,34 +5,30 @@ package profile
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
 
-	embedded "github.com/hatefsystems/identity/apps/identity-api/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 type profileDatabase struct {
-	ctx      context.Context
-	pool     *pgxpool.Pool
-	provider *goose.Provider
-	service  *Service
+	ctx     context.Context
+	pool    *pgxpool.Pool
+	service *Service
 }
 
-func newProfileDatabase(t *testing.T, version int64) profileDatabase {
+func newProfileDatabase(t *testing.T) profileDatabase {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
@@ -54,14 +50,15 @@ func newProfileDatabase(t *testing.T, version int64) profileDatabase {
 	if err != nil {
 		t.Fatal("configured PostgreSQL integration dependency is unavailable")
 	}
-	schema := "profile_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		t.Fatal(err)
+	database := "profile_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize()+" TEMPLATE template0"); err != nil {
+		t.Fatalf("create run-owned profile database with test provisioning credentials: %v", err)
 	}
+	t.Logf("run-owned profile database: %s", database)
 	t.Cleanup(func() {
-		cleanup, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
-		if _, err := admin.Exec(cleanup, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()); err != nil {
 			t.Error(err)
 		}
 	})
@@ -69,44 +66,25 @@ func newProfileDatabase(t *testing.T, version int64) profileDatabase {
 	if err != nil {
 		t.Fatal("invalid PostgreSQL integration configuration")
 	}
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	cfg.ConnConfig.Database = database
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
 	cfg.MaxConns = 8
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	files := fstest.MapFS{}
-	entries, err := fs.ReadDir(embedded.Migrations, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		// Later legal/retention migrations intentionally target public. Include
-		// only the account and profile migrations in this owned schema.
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" && entry.Name() != "00017_profile_names.sql" {
-			continue
-		}
-		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[entry.Name()] = &fstest.MapFile{Data: data}
-	}
 	sqlDB := stdlib.OpenDB(*cfg.ConnConfig)
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, files)
+	err = migrate.Up(ctx, sqlDB)
+	_ = sqlDB.Close()
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.UpTo(ctx, version); err != nil {
 		t.Fatal(err)
 	}
 	service, err := New(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return profileDatabase{ctx: ctx, pool: pool, provider: provider, service: service}
+	return profileDatabase{ctx: ctx, pool: pool, service: service}
 }
 
 func profileExec(t *testing.T, f profileDatabase, sql string, args ...any) {
@@ -143,21 +121,18 @@ func profileIntentCount(t *testing.T, f profileDatabase, id uuid.UUID) int {
 	return count
 }
 
-func TestProfileNamesExistingRowsMigrationIntegration(t *testing.T) {
-	f := newProfileDatabase(t, 16)
-	id, credential := uuid.New(), []byte("old-test-credential")
+func TestProfileNamesFinalConstraintsIntegration(t *testing.T) {
+	f := newProfileDatabase(t)
+	id, credential := uuid.New(), []byte("test-credential")
 	profileExec(t, f, "INSERT INTO users(id,email,status) VALUES ($1,$2,'active')", id, uuid.NewString()+"@profile.invalid")
 	profileExec(t, f, "INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES ($1,$2,$3,'none',$4)", credential, id, []byte("test-key"), uuid.Nil)
-	if _, err := f.provider.Up(f.ctx); err != nil {
-		t.Fatal(err)
-	}
 	u := loadProfileUser(t, f, id)
 	var credentialName string
 	if err := f.pool.QueryRow(f.ctx, "SELECT name FROM webauthn_credentials WHERE id=$1", credential).Scan(&credentialName); err != nil || credentialName != "" || u.DisplayName != "" || u.LifecycleRevision != 0 {
-		t.Fatal("additive migration did not preserve empty names/revisions")
+		t.Fatal("final schema did not default to empty names and revision zero")
 	}
 	if profileIntentCount(t, f, id) != 0 {
-		t.Fatal("migration invented historical lifecycle intent")
+		t.Fatal("defaulted profile rows invented lifecycle intent")
 	}
 	name := strings.Repeat("\U0001f600", 80)
 	profileExec(t, f, "UPDATE users SET display_name=$2 WHERE id=$1", id, name)
@@ -166,11 +141,15 @@ func TestProfileNamesExistingRowsMigrationIntegration(t *testing.T) {
 		if _, err := f.pool.Exec(f.ctx, query, name+"x"); err == nil {
 			t.Fatal("database accepted more than 80 code points")
 		}
+		if _, err := f.pool.Exec(f.ctx, query, nil); err == nil {
+			t.Fatal("database accepted a NULL profile name")
+		}
 	}
 	other := profileUser(t, f)
 	profileExec(t, f, "UPDATE users SET display_name=$2 WHERE id=$1", other.ID, name)
-	if _, err := f.provider.Down(f.ctx); err == nil || !strings.Contains(err.Error(), "forward-only") {
-		t.Fatal("unsafe name-schema downgrade accepted")
+	profileExec(t, f, "INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid,name) VALUES ($1,$2,$3,'none',$4,$5)", []byte("second-test-credential"), id, []byte("test-key"), uuid.Nil, name)
+	if profileIntentCount(t, f, id) != 0 || profileIntentCount(t, f, other.ID) != 0 || loadProfileUser(t, f, id).LifecycleRevision != 0 || loadProfileUser(t, f, other.ID).LifecycleRevision != 0 {
+		t.Fatal("raw profile fixtures invented lifecycle intent or revisions")
 	}
 	profileExec(t, f, "DELETE FROM users WHERE id=$1", id)
 	var count int
@@ -182,7 +161,7 @@ func TestProfileNamesExistingRowsMigrationIntegration(t *testing.T) {
 func TestProfileUpdateNoopConflictAndRollbackIntegration(t *testing.T) {
 	for _, failEnqueue := range []bool{false, true} {
 		t.Run(strconv.FormatBool(failEnqueue), func(t *testing.T) {
-			f := newProfileDatabase(t, 17)
+			f := newProfileDatabase(t)
 			u := profileUser(t, f)
 			profileExec(t, f, "UPDATE users SET updated_at='2000-01-01Z',lifecycle_revision=$2 WHERE id=$1", u.ID, int64(1<<53+1))
 			before := loadProfileUser(t, f, u.ID)
@@ -228,7 +207,7 @@ func TestProfileUpdateNoopConflictAndRollbackIntegration(t *testing.T) {
 }
 
 func TestProfileConcurrentWritersIntegration(t *testing.T) {
-	f := newProfileDatabase(t, 17)
+	f := newProfileDatabase(t)
 	u := profileUser(t, f)
 	start, results := make(chan struct{}), make(chan error, 2)
 	for _, name := range []string{"First", "Second"} {
@@ -258,7 +237,7 @@ func TestProfileConcurrentWritersIntegration(t *testing.T) {
 func TestProfileModerationLockRechecksAuthorityIntegration(t *testing.T) {
 	for _, status := range []string{"active", "suspended", "banned", "pending_deletion"} {
 		t.Run(status, func(t *testing.T) {
-			f := newProfileDatabase(t, 17)
+			f := newProfileDatabase(t)
 			u := profileUser(t, f)
 			tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 			if err != nil {

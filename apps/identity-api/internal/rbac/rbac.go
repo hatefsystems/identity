@@ -5,7 +5,7 @@
 // capability it needs (for example "admin.users.status.write") and the guard
 // resolves it through the seeded roles -> role_permissions -> permissions graph
 // with a single UserHasPermission round trip. Changing who may do what is
-// therefore a role_permissions row (migration 00007), never a Go edit. Encoding
+// therefore a role_permissions row (seeded by the baseline), never a Go edit. Encoding
 // role names in handlers would have the opposite property: every capability
 // change would need a deploy, and the four roles in docs/architecture.md would
 // harden into the only roles that can ever exist.

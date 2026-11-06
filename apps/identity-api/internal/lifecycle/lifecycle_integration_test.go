@@ -3,13 +3,14 @@
 package lifecycle_test
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,18 +18,20 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
 
-	embedded "github.com/hatefsystems/identity/apps/identity-api/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 type lifecycleDatabase struct {
-	ctx      context.Context
-	pool     *pgxpool.Pool
-	provider *goose.Provider
+	ctx   context.Context
+	pool  *pgxpool.Pool
+	sqlDB *sql.DB
 }
 
 func lifecycleDependency(t *testing.T, key string) string {
@@ -59,14 +62,15 @@ func newLifecycleDatabase(t *testing.T) lifecycleDatabase {
 	if err != nil {
 		t.Fatal("configured PostgreSQL integration dependency is unavailable")
 	}
-	schema := "lifecycle_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		t.Fatal(err)
+	database := "lifecycle_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize()+" TEMPLATE template0"); err != nil {
+		t.Fatalf("create run-owned lifecycle database with test provisioning credentials: %v", err)
 	}
+	t.Logf("run-owned lifecycle database: %s", database)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		if _, err := admin.Exec(ctx, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+		if _, err := admin.Exec(ctx, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()); err != nil {
 			t.Error(err)
 		}
 	})
@@ -74,40 +78,48 @@ func newLifecycleDatabase(t *testing.T) lifecycleDatabase {
 	if err != nil {
 		t.Fatal("invalid PostgreSQL integration configuration")
 	}
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	cfg.ConnConfig.Database = database
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
 	cfg.MaxConns = 8
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	files := fstest.MapFS{}
-	entries, err := fs.ReadDir(embedded.Migrations, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		// Later audit migrations are deliberately public-specific. Never apply
-		// them from this isolated fixture or touch another suite's tables.
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" && entry.Name() != "00017_profile_names.sql" {
-			continue
-		}
-		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[entry.Name()] = &fstest.MapFile{Data: data}
-	}
 	sqlDB := stdlib.OpenDB(*cfg.ConnConfig)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, files)
+	if err := migrate.Up(ctx, sqlDB); err != nil {
+		t.Fatal(err)
+	}
+	return lifecycleDatabase{ctx: ctx, pool: pool, sqlDB: sqlDB}
+}
+
+func lifecycleHold(t *testing.T, f lifecycleDatabase, executor db.DBTX, account uuid.UUID) {
+	t.Helper()
+	provider, err := kms.NewMockProvider(bytes.Repeat([]byte{0x51}, 32), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
+	encryptor, err := envelope.New(provider)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return lifecycleDatabase{ctx: ctx, pool: pool, provider: provider}
+	id := uuid.New()
+	plain, err := json.Marshal(legalhold.Details{RecordID: id, AccountRef: account, Kind: legalhold.KindHold,
+		Reason: "lifecycle retention fixture", RequestingAuthority: "fixture court", LegalBasis: "fixture order"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := encryptor.Encrypt(f.ctx, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.New(executor).CreateEncryptedLegalHold(f.ctx, db.CreateEncryptedLegalHoldParams{
+		ID: id, AccountRef: account, AppliedBy: uuid.New(), RequestKind: legalhold.KindHold,
+		IdempotencyKey: uuid.NullUUID{UUID: uuid.New(), Valid: true}, DetailsEncrypted: sealed,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func lifecycleTx(t *testing.T, f lifecycleDatabase) pgx.Tx {
@@ -320,7 +332,7 @@ func TestLifecyclePhysicalDeletionRollbackAndHoldIntegration(t *testing.T) {
 	user := lifecycleCreate(t, f)
 	lifecycleChange(t, f, user.ID, "pending_deletion")
 	lifecycleExec(t, f, "UPDATE users SET deleted_at=now()-interval '31 days' WHERE id=$1", user.ID)
-	lifecycleExec(t, f, "INSERT INTO legal_holds(account_ref,applied_by) VALUES ($1,$2)", user.ID, uuid.New())
+	lifecycleHold(t, f, f.pool, user.ID)
 	tx := lifecycleTx(t, f)
 	if n, err := lifecycleDelete(f.ctx, tx, user.ID); err != nil || n != 0 {
 		t.Fatalf("held account deleted: %d %v", n, err)
@@ -350,7 +362,7 @@ func TestLifecyclePhysicalDeletionRollbackAndHoldIntegration(t *testing.T) {
 func TestLifecycleMigrationDownRefusesIntegration(t *testing.T) {
 	f := newLifecycleDatabase(t)
 	user := lifecycleCreate(t, f)
-	if _, err := f.provider.Down(f.ctx); err == nil || !strings.Contains(err.Error(), "forward-only") {
+	if err := migrate.Down(f.ctx, f.sqlDB); err == nil || !strings.Contains(err.Error(), "forward-only") {
 		t.Fatalf("migration down accepted initialized lifecycle state: %v", err)
 	}
 	if lifecycleCount(t, f, "SELECT lifecycle_revision FROM users WHERE id=$1", user.ID) != 1 || lifecycleCount(t, f, "SELECT COUNT(*) FROM event_outbox WHERE lifecycle_user_id=$1", user.ID) != 1 {
@@ -358,7 +370,7 @@ func TestLifecycleMigrationDownRefusesIntegration(t *testing.T) {
 	}
 	// Retention cannot make a previously initialized revision safe to remove.
 	lifecycleExec(t, f, "DELETE FROM event_outbox")
-	if _, err := f.provider.Down(f.ctx); err == nil {
+	if err := migrate.Down(f.ctx, f.sqlDB); err == nil {
 		t.Fatal("downgrade erased initialized revisions after outbox cleanup")
 	}
 }

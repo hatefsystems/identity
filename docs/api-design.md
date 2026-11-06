@@ -374,6 +374,14 @@ strict-before. Closed expiry is the minimum of original max age and closure-rela
 retention; reviews and hold release never reset it. Distinct-account approvals
 are not verification of distinct humans, and delivery remains operator attestation.
 
+Here, baseline cleanup means the governance-policy cleanup operation, not migration
+installation. Optional `admin-legal --operation=backfill` retains `1..1000` bounds
+and cryptographic/read-back/error contracts only as a separately scoped focused
+compatibility operation; it is not a fresh-install or new-lineage upgrade path.
+Fresh `00001` installation and fail-closed history refusal follow
+[admin operations](admin-operations.md#migration-and-contraction); no HTTP, signed
+canonical, wire-format or operator approval contract changes with consolidation.
+
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 

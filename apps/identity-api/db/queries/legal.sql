@@ -4,7 +4,7 @@
 -- (§6 Legal Hold, §7 Security Event Ledger) and the admin endpoints in
 -- api-design.md §1.7 (legal-holds, preservation-requests, legal-inquiry/lookup).
 --
--- Canonical format v2 (migration 00015) splits tamper-evidence from payload:
+-- Canonical format v2 (the baseline) splits tamper-evidence from payload:
 --
 --   security_ledger_chain    leaf_hash + chain_hash, append-only, never deleted
 --   security_event_ledger    the record body, immutable but erasable

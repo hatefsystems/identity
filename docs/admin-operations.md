@@ -2,12 +2,19 @@
 
 The implementation remains opt-in. This document describes the current runtime and outstanding release gates; it is not production sign-off. The current technical-closure inventory is `.kilo/plans/1793893850853-phase-5-technical-closure.md`; the inherited matrix is `.kilo/plans/1789692893214-task-5-3-admin-rbac-legal-holds.md`, and the Task 7.6 panel boundary is `.kilo/plans/1793529257288-dpo-legal-compliance-panel.md`. Plans, historical acceptance and test source do not certify the current closure changes. Tasks 5.3-5.5 remain unchecked pending fresh final-source local acceptance; production/manual gates remain independently unchecked below.
 
+Active schema installation follows the single fresh-baseline contract below and
+`.kilo/plans/1793914256582-single-migration-baseline.md`. Dated acceptance records
+and prior plans retain their original migration evidence unchanged; they do not
+certify the new lineage. Record its actual outcomes only in the separate
+[fresh-baseline acceptance placeholder](#fresh-baseline-acceptance-placeholder).
+This documentation update changes no task status or production authorization.
+
 ## Enablement
 
-1. Inventory schema/history first using the migration identity and follow [migration and contraction](#migration-and-contraction). Current compatible storage includes `00019` head repair and `00020` plaintext contraction; do not run a populated v1 database through `00015`, reset genesis or rewrite hashes to conceal old defects. Identify an explicit verification boundary if historical segments fail.
+1. Inventory schema/history first using the migration identity and follow [fresh-baseline setup](#migration-and-contraction). Install `00001_initial_schema.sql` only on an explicitly scoped fresh target, tracked in `public.identity_schema_version`. All legacy `public.goose_db_version` databases, untracked nonempty application schemas and contradictory histories are refused. Do not adopt old history, reset genesis or rewrite hashes to conceal defects. Identify an explicit verification boundary if historical segments fail.
 2. Deploy account-version-aware issuers on **every** instance and restart old process-local credential stores before moderation is enabled. Ban, suspension, deletion and reactivation advance persistent versions. Old sessions, codes, refresh tokens and step-up grants cannot regain validity. Task 6.2's `ValidateToken` checks that version and live Redis authority; downstream clients using offline JWT verification still retain the configured lifetime, at most ten minutes.
 3. Inject the envelope key/version and shared blind-index pepper through the existing secret delivery mechanism. Hold management uses envelope encryption independently of attribution. Without a pepper, SMS OTP and producer-side capture are unavailable; legal attribution stays unmounted without a verified fixture.
-4. With affected intake/writers stopped and `00019` applied, run `npm exec -- nx run identity-api:admin-legal -- --operation=backfill --limit=500` in bounded `1..1000` batches until zero, verify key/data inventory, then apply `00020`. Each converted row is read back, decrypted and binding-checked before its plaintext clearing transaction commits. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory. Full contraction is recognized as converted; partial layouts fail closed.
+4. Verify final encrypted-or-legitimately-purged legal storage and actual key/data inventory before intake. Fresh baseline storage has no plaintext narrative columns and needs no backfill. The optional [standalone compatibility backfill](#standalone-compatibility-backfill) retains its bounded encryption/read-back/binding and atomic plaintext-clear contracts, but does not upgrade or adopt a legacy database. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory. Partial layouts fail closed.
 5. Obtain approved numeric `ADMIN_CONTEXT_RETENTION` and `ADMIN_LEGAL_RELEASED_RETENTION` durations and approval for opaque replay tombstones. There are no policy defaults. Schedule `admin-audit-publisher --cleanup-contexts` and `admin-legal --operation=cleanup` with separate maintenance credentials. Both use hold-aware deletion; released holds resume original clocks. Neither command deletes ledger evidence.
 6. Run the signer and `admin-audit-publisher` on the same configured audit subject with separately scoped non-owner logins. Publication requires JetStream acknowledgement; it is not proof of chaining. Signer event-ID deduplication covers redelivery after uncertain acknowledgement. The separate Task 6.3 lifecycle publisher owns deletion-event delivery, not the admin publisher.
 7. With affected intake closed, run `NX_DAEMON=false npm exec -- nx run identity-api:admin-legal -- --operation=lookup-probe` against the **real deployed signer**, actual schema and configured keys. It creates a credential-free synthetic account, publishes a legacy envelope without a producer index, verifies the signer's stored index, deletes only that synthetic account, and verifies the fixture again after deletion. Canonical v2 resolves the fixture event UUID through `security_ledger_chain.event_id`, joining the payload by `seq`, while retaining the synthetic client/event checks and constant-time expected-index comparison. Capture the printed `ADMIN_LOOKUP_FIXTURE_ID` privately and configure every API replica with it. A timeout leaves the identified synthetic account for controlled diagnosis; never substitute a real person's identifier or delete unrelated evidence. A supplied absent/wrong fixture or mismatched key fails startup/readiness; omitting the setting explicitly keeps attribution unavailable while hold/preservation may remain independently usable. Repeat after signer/key deployment changes and keep the existing pepper pinned. Injecting `WithLookup(..., true)` is not equivalent evidence. The probe is neither a chain trust anchor nor proof of complete historical indexing.
@@ -15,46 +22,93 @@ The implementation remains opt-in. This document describes the current runtime a
 
 ## Migration and Contraction
 
-Preserve applied `00001`-`00018` SQL byte-for-byte and retain consistent backups.
-The supported migration wrapper serializes migrations and holds signer/purge
-session exclusions across preflight and application on the migration connection.
-Before pending `00015`, it inventories v1 audit/ledger bodies and initialized
-head/checkpoint/settings/chain/erasure state, including histories whose bodies
-are gone. Any data/proof state or failed inventory stops conversion. A populated
-v1 database needs a separately reviewed preservation/conversion procedure; do not
-reset genesis, rehash records or wipe a development database. This guard cannot
-recover history already discarded by an earlier migration. Inventory/drain old
-outbox and JetStream envelopes separately; v1 envelopes are quarantined, not
-transparently upgraded.
+The heading is retained for existing links; installation no longer performs a
+staged legacy contraction. The only fresh-install source is
+`00001_initial_schema.sql`, representing the complete final `public` schema.
+`migrate up` applies version 1 in **`public.identity_schema_version`**, not
+`public.goose_db_version`. Future changes use `00002`, `00003` and later bundled
+migrations in this new lineage; generic `up-to` is not an old-lineage escape hatch.
 
-For existing v2 storage, use this staged procedure with compatible operator
-binaries and separately controlled migration/backfill credentials:
+Before any migration mutation, the guarded wrapper performs fail-closed read-only
+inventory and repeats it under lock-held exclusion. It refuses **all** legacy
+`public.goose_db_version` relations regardless of version, row count or apparent
+schema equivalence, including old version 1, intermediate history and old version
+20. It also refuses both history tables, an untracked nonempty application schema,
+malformed relation/column shapes and contradictory new histories. New history
+requires exactly one applied zero, unique known versions with true applied flags,
+and baseline 1 before later applied versions; zero-row bookkeeping, missing zero,
+duplicates, false flags and unknown versions are rejected. Extension-owned objects
+and legitimate new tracking-table-owned objects are not leftover application
+schema. A valid applied-zero-only history permits retry only with no application
+schema. No target is automatically stamped, renamed, cleared, reset or adopted.
 
-1. Close affected admin/legal intake and stop/drain incompatible writers on every
-   replica and caller. Preserve queued intent, keys and original hold clocks.
-2. Apply `migrate up-to 19`. `00019_chain_head_terminal.sql` replaces head
-   advancement without rewriting chains or changing function owner/caller ACLs,
-   retains pinned search path/PUBLIC revocation, and requires observed terminal
-   sequence to equal declared `last_seq`. Audit coordination is `5200004`, ledger
-   coordination `5200002`, purge-run lifetime `5200003`.
-3. Run `admin-legal --operation=backfill --limit=500` repeatedly until zero. Limits
-   are `1..1000`; each row is encrypted, read back and binding-verified before all
-   legacy plaintext fields clear in the same transaction. Verify actual ciphertext/
-   key-version inventory, not only zero count/startup readiness. No runtime plaintext
-   fallback is allowed. Fully contracted schema is already converted; partial or
-   unexpected layouts fail closed.
-4. Apply `migrate up` to reach `00020_legal_hold_plaintext_contract.sql`. Its
-   transaction locks `legal_holds` and refuses remaining `reason`,
-   `requesting_authority`, `legal_basis` or unconverted rows before dropping those
-   columns/known constraints without CASCADE. Missing ciphertext is permitted only
-   for legitimately released/purged rows. Preserve encrypted details, original
-   references, kinds, idempotency keys, clocks and tombstones. Unexpected dependencies
-   or incomplete inventory stop contraction, never trigger deletion as a workaround.
-5. Verify physical column absence, encrypted-or-purged invariant and forward recovery,
-   then start compatible replicas/callers before reopening intake. Fresh empty
-   databases apply the whole sequence normally. A failed migration is unrecorded;
-   earlier successful additive migrations may remain applied. Do not downgrade
-   `00019`/`00020` or recreate plaintext columns as a runtime fallback.
+Use this procedure with compatible binaries and separately controlled migration
+credentials:
+
+1. Identify the exact fresh PostgreSQL 16 database and matching fresh Redis 7/NATS
+   JetStream 2.10 resources or isolated service namespaces. Record their ownership
+   and isolation; do not assume default Compose names/volumes are fresh. All existing
+   Identity data was confirmed disposable, but that is **not** authorization to
+   reset an existing named environment. Any reset requires a separate explicit
+   request identifying its exact disposable targets. Never run broad volume deletion
+   or shared-database schema reset commands.
+2. Close affected intake and stop/drain **all old writers**, including API replicas,
+   signers, publishers and maintenance workers, before switching. Inventory old
+   outbox/broker envelopes separately and retain required keys, backups and original
+   clocks. Old sessions/grants, queued events and consumer checkpoints must not
+   enter the replacement database. Schema setup does not convert envelopes or change
+   wire formats; use compatible consumers and reconcile their isolated baselines.
+3. Set the scoped migration `DATABASE_URL`; run `migrate status` then `migrate up`
+   (Nx: `identity-api:migrate-status`, `identity-api:migrate-up`). Public status/version
+   inspection is read-only and creates no bookkeeping on a fresh target. Verify
+   applied version 1 and the new history table; repeated `up` must be a verified
+   no-op. A failed baseline transaction leaves no partial application objects or
+   applied version-1 record. Do not bypass an inventory refusal to force a retry.
+4. Verify final constraints, indexes, effective privileges and exact head advancement:
+   observed terminal sequence equals declared `last_seq`, pinned search path/PUBLIC
+   revocation remain, audit coordination is `5200004`, ledger coordination `5200002`,
+   purge-run lifetime `5200003`. `legal_holds` has no `reason`, `requesting_authority`
+   or `legal_basis` columns; ciphertext absence is permitted only for legitimately
+   released/purged tombstones. No plaintext fallback or historical data repair is
+   an installation step.
+5. Provision restricted deployment roles/grants, approved governance and **both**
+   explicit genesis heads/subject settings through the operator procedures below.
+   The baseline seeds only 4 roles, 13 permissions and 15 role-permission assignments,
+   not users, operator grants, heads, runtime history, retention or policy bindings.
+   Complete key inventory, real signer probing and existing approval/readiness gates
+   before compatible replicas/callers reopen. Keep destructive schedules disabled
+   until separately approved.
+
+Baseline `Down` refuses unconditionally; `reset`/`down-to 0` refuse before undoing
+even a later migration. No up/down/up reset is supported. Keep historical acceptance
+and prior plan files unchanged; they are evidence for their original sources, not
+this baseline. Automated tests provision and clean up only run-owned resources,
+never named developer/shared environments.
+
+### Standalone Compatibility Backfill
+
+`admin-legal --operation=backfill` is retained as an optional, separately scoped
+**focused compatibility operation**, not a supported legacy schema upgrade or
+new-lineage adoption path. It does not alter migration metadata, authorize
+contraction DDL or make a legacy database acceptable to the migration runner.
+Do not recreate plaintext columns in baseline runtime storage to use it.
+
+```sh
+npm exec -- nx run identity-api:admin-legal -- --operation=backfill --limit=500
+```
+
+Use separately controlled compatibility credentials with affected writers stopped.
+Limits remain `1..1000`; repeat bounded batches until zero only within the explicitly
+scoped operation. Each row is encrypted, read back, decrypted and record/account/kind
+binding-verified before all plaintext clears in the same transaction. Original IDs,
+references, request kinds, replay keys, clocks and legitimately released/purged
+tombstones remain intact. Wrong keys/bindings, corruption, failed updates or commit
+errors are failures, not evidence of conversion; uncertain outcomes require
+read-back/reconciliation. Fully contracted storage is recognized as no work; partial
+or unexpected layouts fail closed. `ErrBackfillRequired` remains the fail-closed
+unconverted-storage contract, not permission to adopt history or serve plaintext.
+Verify actual ciphertext/key-version inventory and recoverable backups, not only
+zero count or startup crypto readiness. No runtime plaintext fallback is allowed.
 
 ## Production Checklist
 
@@ -65,7 +119,8 @@ implementation task, never these production/governance/manual authorizations.
   personal/pseudonymous inventories and lifetimes, including `no_expiry` residuals,
   legal basis, privacy notices, ROPA/DPIA and truthful DSAR responses.
 - [ ] Inventory real data, legacy requests, ciphertext/key versions and recovery
-  material; complete bounded backfill/read-back checks and data-preserving contraction.
+  material; scope any focused compatibility backfill/read-back separately and verify
+  final encrypted storage. Fresh setup never adopts legacy history.
 - [ ] Install real externally approved policy through the restricted trusted
   installer and provision operators from an authenticated MFA-protected launcher.
   Environment actor/SPIFFE strings alone are not authentication.
@@ -242,9 +297,9 @@ The new regressions cover hold/purge locking in both orders, independent legal r
 
 ## Verification and rollback
 
-Run the Nx `sqlc-vet`, `lint`, `vet`, `test`, `test-race`, `build`, worker/operator builds, `test-security-db`, and `test-admin-integration` targets. Integration runs require disposable PostgreSQL 16, Redis and NATS JetStream. Existing migration tests reset schemas. The mandatory admin target fails on missing service configuration.
+Run the Nx `sqlc-vet`, `lint`, `vet`, `test`, `test-race`, `build`, worker/operator builds, `test-security-db`, and `test-admin-integration` targets. Integration runs require run-owned disposable PostgreSQL 16, Redis and NATS JetStream, serialized and isolated from developer/shared environments. The mandatory admin target fails on missing service configuration.
 
-Do not downgrade migrations `00008`–`00010` over durable intent, encrypted requests or auth versions. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, outbox intent and evidence. Migration `00007` preserves seeded/pre-existing roles on rollback and refuses downgrade with banned users. A clean up/down/up of forward-only migrations is deliberately unavailable; test downgrade refusal and forward recovery on disposable fixtures instead.
+The single `00001` baseline is forward-only; `Down`, reset and rollback to zero refuse. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, auth versions, outbox intent and evidence. A clean up/down/up is deliberately unavailable; test downgrade refusal and forward recovery only on run-owned disposable fixtures. Fresh-baseline acceptance is separate from historical upgrade evidence.
 
 Tasks 5.3-5.5 remain unchecked until the current closure plan's complete fresh local automated acceptance passes against final source, including all seven serial real-service suites with zero mandatory skips, forward recovery/consistent local restore, generated outputs, images and browser gates. Historical October/November results above do not certify these changes. Production ingress/privacy, policy, deployed privilege/restore and manual checks remain independently open in the [production checklist](#production-checklist). Task 5.4 structural annotations and separate receipt reconciliation are database-relative, not legal-policy proof or protection against coherent privileged rewrite. Task 6.2 does not close those gates or change offline-JWT residual authority. Phone attribution and historical key rotation remain separate work.
 
@@ -471,12 +526,13 @@ claim that production provisioning, verification or deployment has passed.
    to drain acknowledged work and verify signer shutdown; account for queued
    envelopes rather than silently discarding them. The initial cutover is not a
    routine hourly shutdown requirement. Keep all old signer instances stopped.
-3. Apply compatible schema through `00019`/`00020` using the staged
-   [migration procedure](#migration-and-contraction). Pending `00015` rebuilds
-   payload tables and therefore must refuse any populated v1 or initialized proof
-   history, even if payloads are already empty. Stop for separate preservation/
-   conversion, never wipe data or infer fresh genesis. `00015`, `00019`, `00020`
-   are forward-only and Down refuses; compatible v2 history is never rehashed.
+3. Install `00001_initial_schema.sql` in an explicitly scoped fresh PostgreSQL
+   environment with matching isolated Redis/NATS through the
+   [baseline procedure](#migration-and-contraction). All legacy
+   `public.goose_db_version`, untracked nonempty application schemas and contradictory
+   histories refuse without mutation. There is no in-place v1/v2 upgrade/adoption;
+   do not reset a named environment or infer genesis from empty payloads. Baseline
+   Down/reset refuse; signed bytes and compatible v2 history are never rehashed.
 4. Provision the separate runtime roles and narrowly scoped grants (First-Time
    Provisioning SQL), then explicitly initialize **both** chain heads from each
    verified terminal record. Genesis is allowed only for a demonstrably new ledger,
@@ -568,7 +624,8 @@ the chain rows are the only surviving record of what was already erased.
 ### First-Time Provisioning SQL
 
 Run the following in an authenticated `psql` operator session connected to the
-target database after `00019`/`00020`, with the signer drained and the schedule disabled.
+fresh-baseline target after version 1 in `public.identity_schema_version`, with
+writers stopped and the schedule disabled.
 The operator must be authorized to create roles and transfer function ownership;
 these are not runtime privileges. Replace the four uppercase role placeholders
 with existing, separately provisioned deployment logins. The new owner/worker
@@ -586,7 +643,7 @@ publisher subject-scoped outbox permissions remain required.
 \set reconciler_role 'DEPLOYED_RECEIPT_RECONCILIATION_ROLE'
 SELECT current_database() AS ledger_database \gset
 
--- Canonical format v2 (migration 00015).
+-- Canonical format v2 (single fresh 00001 baseline).
 --
 -- There is no maintenance-owner role here and no SECURITY DEFINER purge routine
 -- to own. Erasure is an ordinary DELETE on the payload table, so the authority
@@ -681,9 +738,10 @@ ALTER FUNCTION public.advance_chain_head(text, bigint, bigint, bigint, bigint)
     OWNER TO identity_chain_head_owner;
 ```
 
-A migration must never create or empower a role, which is why this is an operator
-step rather than part of 00015. `internal/retentiondbintegration` asserts the
-properties that do not depend on it: SECURITY DEFINER, a pinned `search_path`,
+A migration must never create or empower a deployment database role, which is why
+this is an operator step rather than part of the baseline.
+`internal/retentiondbintegration` asserts the properties that do not depend on it:
+SECURITY DEFINER, a pinned `search_path`,
 and no PUBLIC EXECUTE.
 
 Do not give the worker a chain-table write, a sequence grant, or EXECUTE on
@@ -1005,11 +1063,12 @@ Keep signer and verifier binaries compatible with canonical-v2 storage throughou
 rollback. Pre-v2 binaries expect the retired payload/`chain_hash` layout and are
 not a recovery path. Treat initialized proof state and erasure as forward-only;
 repair with a compatible release, never downgrade storage or rewrite stored
-hashes. Migration `00015` refuses Down unconditionally, including against a
-seemingly empty database, and `00011` does the same.
+hashes. The single `00001` baseline refuses Down unconditionally, including against
+a seemingly empty database; reset and rollback to zero are not recovery paths.
 
-Restore both chain/payload tables and sequence state, both heads, erasure index,
-holds, governance/workflow, retention settings and outbox from one
+Restore `public.identity_schema_version`, both chain/payload tables and sequence
+state, both heads, erasure index, holds, governance/workflow, retention settings
+and outbox from one
 consistent backup, validate before reopening ingestion or purge, reconcile
 authoritative holds/deletions, then resume eligible expiry without resetting clocks
 or bypassing holds. A restore that includes `security_ledger_chain` but predates
@@ -1099,3 +1158,137 @@ purge grants, erasure annotations and receipts do not prove legal authorization
 or policy compliance by a compromised trusted worker. External anchoring remains
 deferred. No production flags, deployed credentials or approvals were changed,
 and this work was not committed or published.
+
+## Fresh-Baseline Acceptance, November 6, 2026
+
+This record belongs exclusively to
+`.kilo/plans/1793914256582-single-migration-baseline.md`. It does not replace the
+historical acceptance above. Only newly executed, uncached baseline checks are
+reported below. Task statuses and manual/production gates remain unchanged.
+
+### Source And Reference
+
+The unchanged 20-file working-tree chain was frozen before consolidation and
+applied through its supported runner to a new PostgreSQL 16 reference database.
+The reference is not an existing development or deployed database. All frozen SQL
+bytes were independently checked against the original executable's embedded
+filesystem; transient loss of temporary copies was recovered with identical
+fingerprints, including working-tree migrations that differed from HEAD.
+
+| Artifact | SHA-256 |
+|---|---|
+| Final `00001_initial_schema.sql` | `1ffe1d6bde9f5d9a80a8d04e9dc2df8410a035af4fdca07c5dc2c0f23a1cc107` |
+| Frozen 20-file fingerprint manifest | `e3826b85f52a2d1ba7f40c05003f1b17ebbb14fb78573d7469ba96388146961f` |
+| Original supported reference runner | `30dccfa9be6bcc529cc2dfd24935ab54a88c9540bea66229335debab9b496bd2` |
+| Latest guarded standalone baseline runner | `5c8345dbf325517da1cc18f1d9a69d45e65a632302184d61eae6e61dba0d9e27` |
+
+The completed admin browser run identified HEAD
+`223a156656a8108f125a4e498a1fbaf2124cd719`, staged-diff SHA-256
+`80179aba005d3821fd526fcad055e47783ab5e850016e1a1ae02de0243731efa`,
+and empty unstaged/untracked content hashes
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Its start/finish worktree identities matched. This acceptance record was appended
+afterward; runtime and test sources were not changed by recording the results.
+
+Reference artifacts remain outside the executable tree in the approved temporary
+root `baseline-sql-20261106-070557`: `frozen-reference.zip`, fingerprint manifest,
+catalogs, schema dumps, parity/security/smoke reports and recovery provenance.
+Only fingerprints and sanitized summaries are retained in this document.
+
+### Schema And Runner
+
+| Evidence | Verified Outcome |
+|---|---|
+| Executable inventory | Exactly one embedded baseline. No historical SQL remains in runtime, test-fixture, build or sqlc schema inputs; the in-memory future migration is test-only. |
+| Complete schema parity | 34 application tables, 242 columns, 153 constraints, 78 indexes, 3 sequences, 11 functions and 17 triggers matched. All 181 non-Goose schema-dump blocks matched after ordering normalization. |
+| Security and seeds | Exact 4-role, 13-permission and 15-grant contents, all application row counts, 2,454 bare effective-privilege checks and 19,648 provisioned ownership/grant-option/RLS checks matched. Provisioning comparison transactions were rolled back and catalog parity rechecked. |
+| Normalization limits | Incidental OIDs, dropped-column holes, seed timestamps, dump ordering and intentional old/new Goose metadata differences only. No function, expression, predicate, default, grant or application row-count differences were accepted. |
+| Lineage and atomicity | Full PostgreSQL migration/CLI tests passed without skips, including immutable legacy version-1/intermediate/20 refusal, coexistence, complete malformed/contradictory histories, permission failures, untracked objects, read-only status/version, lock-held initialization/reinspection and atomic failure/retry. |
+| Forward-only and future | Reset/baseline rollback/rollback-to-zero refused before partial rollback, including after a test-only later version. Future exact-version prerequisites, ordinary up/down/reapply, concurrent first install, one-connection retry, cancellation and bad-session lock cleanup passed. |
+| Final invariants | Auth epoch/status/deletion semantics, encrypted holds, FK actions, immutable audit/ledger tables, effective PUBLIC execute denial, head-function SECURITY DEFINER/search path/timeout, unchanged genesis vectors and both phantom-terminal refusals passed. |
+
+### Quality, Images And Browsers
+
+All following runs bypassed Nx caches or used `go test -count=1`. Nx remained the
+entry point for workspace tasks. Linux test-target command overrides used a
+read-only workspace mount, Go 1.26.9 and CGO/GCC for race checks; no assertion was
+weakened for the Windows host.
+
+| Gate | Verified Outcome |
+|---|---|
+| `schemas:lint`, `identity-api:sqlc-vet`, `identity-api:sqlc-generate` | Passed. All 28 generated files reproduced identically on repeat generation. Against the frozen reference, only four query-comment files differed; models, SQL statements, signatures and protobuf output did not change. |
+| `identity-api:test` and `identity-api:test-race` | Full Linux unit and race targets passed. A separate integration-tagged, real-PostgreSQL Linux race run passed `internal/migrate` and `cmd/migrate` (502.189s and 1.019s). |
+| `identity-api:vet`, `identity-api:lint` | Normal and integration-tagged whole-backend checks passed; lint reported zero issues. A competing-linter attempt was rerun serially. |
+| `identity-api:test-portal-fixture` | Passed. |
+| CI API/worker/operator binaries | All ten resolved build targets passed uncached: API, admin audit publisher, admin roles, admin legal, lifecycle publisher, audit signer, purge worker, security-ledger purge, deletion notifier and portal fixture. |
+| Fresh Linux/amd64 image | Built from the hardened runner. Immutable image ID: `sha256:7ed607ffc66457cb2d5facc617944752382128267400cca6b0a03058eb1fc210`. Maintenance-entrypoint/missing-credential smoke passed. |
+| Packaged migrator | Eleven image-level smoke operations passed on an owned database: exactly one pending/applied source, read-only fresh status, history 0/1, repeated/up-to-1 no-ops, immutable down/reset/unknown-target and legacy refusals, and missing-DSN status. The standalone guarded runner's separate 14-check smoke also passed. |
+| Consistent restoration | Matching PostgreSQL 16 clients exercised both ordinary and expanded `pg_dump`/`pg_restore` paths plus four repeated frozen TEMPLATE clones: nine checks passed, zero failures/skips. Data, sequences, proofs, crypto/binding, replay, signing and forward-only invariants were retained. This is local restoration evidence, not deployed-backup certification. |
+| Existing helper/image harness tests | 142 tests passed, zero skips. |
+| Frontend unit/production build | `web:test` passed 25 suites/586 tests; `web:build` passed. |
+| `web:test-admin-browser` | Production-built real-API/signing/probe run passed: 42 layout checks and 27 legal verifications. Run `ce30ed9c1bd60a7ada15b24dfaf6995c`; service namespace `b89de3b6a7148ed8600f23719061cd9a`; assertions and teardown passed, worktree identity matched. Windows used the immutable image above for the production signer. |
+| `web:test-portal-browser` | Production-built real-API portal/deletion/recovery run passed: 18 light/dark viewports and six no-JavaScript shells; teardown completed. |
+
+Masked browser artifacts and sanitized reports are retained only under the
+approved temporary `baseline-admin-browser` and `baseline-portal-browser` roots.
+No legal narrative, personal identifier, proof, grant, credential or raw dump is
+copied into this record.
+
+### Mandatory Real Services
+
+All suites use the existing `runPortalIntegrationTarget` implementation with its
+mandatory flags, `--skipNxCache`, serial packages and zero-skip assertion against
+new PostgreSQL 16, Redis 7 and JetStream 2.10 resources. The primary final-source
+batch completed five suites before the local harness's 60-minute global deadline
+interrupted lifecycle. Its successful suites are not claimed as one complete
+uninterrupted job. Lifecycle and portal completed in a second fresh serial batch with
+the same implementation and assertions, not reduced test selections.
+
+| Target | Packages | Passed Checks | Failed | Skipped | Final Outcome |
+|---|---:|---:|---:|---:|---|
+| `test-security-db` | 19 | 2030 | 0 | 0 | Passed. |
+| `test-admin-integration` | 7 | 825 | 0 | 0 | Passed. |
+| `test-retention-integration` | 3 | 355 | 0 | 0 | Passed. |
+| `test-legal-workflow-integration` | 4 | 671 | 0 | 0 | Passed. |
+| `test-grpc-integration` | 4 | 560 | 0 | 0 | Passed. |
+| `test-lifecycle-integration` | 1 | 370 | 0 | 0 | Passed in the second fresh batch. |
+| `test-portal-integration` | 11 | 2110 | 0 | 0 | Passed in the second fresh batch. |
+
+The earlier development batch, started before final fixture corrections, was
+deadline-limited and is not accepted as final-source evidence. Scoped migration,
+profile, policy, lifecycle, gRPC, Backfill and restore checks were additionally
+run on separately owned fixture databases; interrupted development fixtures were
+identified and cleaned before their corrected reruns.
+
+### Isolation And Remaining Gates
+
+The reference container `ldp-baseline-sql-20261106-070557-pg16` and its exact owned
+anonymous volume were removed after verifying zero active fixture connections
+and zero remaining migration/Backfill/restore/packaged-smoke fixture databases.
+Frozen files and reports remain in temporary storage. Primary service namespace
+`4979b7f0e858c594e704279f4f05cc56` reported completed teardown; its containers and
+network were independently confirmed absent. Browser teardown completed.
+Second service namespace `f479768ddc9a054ca3a2d2269f6abec6` reported completed
+teardown; its containers and network were independently confirmed absent.
+Temporary driver-startup namespace `c236bb4ab23fc4cb57998d677c350680` also reported
+completed teardown and was independently confirmed absent before the corrected
+driver ran either required suite.
+
+No existing named environment or volume was reset or deleted. Every test batch
+started without inherited Redis sessions, NATS messages/checkpoints or old
+writers. Production writers were not stopped or otherwise modified. No
+deployment, approval, production flag or credential was changed by this work.
+
+The native Windows unit run encountered the existing POSIX spool-file mode
+assertion (0666 versus 0600); unchanged Linux unit/race assertions passed instead.
+The single local 60-minute seven-suite job remains deadline-limited; it must not
+be described as an uninterrupted pass. All seven complete target runs passed
+across the two final-source serial batches, with zero failures and zero skips.
+Physical authenticators, native zoom, assistive technology, deployed HTTPS/log
+redaction, actual backup/media recovery, independent mailbox/provider handling,
+downstream rollout, real key inventory, operator role/genesis provisioning,
+governance/retention approvals and unobserved native hidden-tab/bfcache behavior
+remain manual or deployed-system gates. These results do not certify production
+readiness, external anchoring or a compromised trusted worker's conduct. No
+commit, publication, broad volume deletion or existing-environment reset is
+authorized by this record; any later reset needs a separately explicit target.

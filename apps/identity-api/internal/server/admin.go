@@ -20,7 +20,7 @@ import (
 )
 
 // Permission ids enforced by the admin routes. They mirror the rows seeded by
-// migration 00007; the guard resolves them through UserHasPermission, so these
+// the baseline; the guard resolves them through UserHasPermission, so these
 // constants and that seed must stay in step. An id that exists here but not in
 // the table simply denies everyone, which is the safe direction to fail.
 const (
