@@ -188,7 +188,7 @@ User-list GET accepts only `limit`, `offset`, and `status`; audit-list GET only 
 
 Legal subjects are the original `account_ref` UUID (`users.id`, retained independently after deletion), not a `user_id` alias or a live-account resolver. Each create requires exactly one nonzero UUID `Idempotency-Key` header supplied from the controlled external intake record. The browser uses canonical lowercase hyphenated, nonzero UUIDs for subjects, holds and keys; it never synthesizes a request key. Actor references come from the authenticated session, never the body.
 
-Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); unknown/duplicate fields, malformed input and trailing documents are rejected. The shared browser boundary additionally has a 64-KiB ceiling. All legal POSTs and release reject query strings, including a bare `?`. Release sends no body or idempotency header. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
+Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); exact field spelling/types are required, with unknown fields, case aliases, duplicates, null strings, malformed UTF-8/JSON and trailing documents rejected. Live session and permission checks precede bounded declared/chunked body preflight, which precedes grant consumption; interrupted/oversized input cannot consume the grant or buffer unbounded data. The backend 32-KiB ceiling does not depend on browser enforcement. All legal POSTs and release reject query strings, including bare `?`. Release sends no body or idempotency header; the backend refuses either rather than ignoring it. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
 
 | Operation | JSON request | Success |
 |---|---|---|
@@ -262,7 +262,8 @@ Legal and shared errors use the JSON `error` code (with the existing step-up cha
 
 | Outcome | Meaning / required handling |
 |---|---|
-| `400 invalid_request` | Invalid body, UUID/key, byte/date/page/field bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. Legal JSON above 32 KiB fails here; above the shared 64-KiB boundary can instead return `413 invalid_request`. |
+| `400 invalid_request` | Invalid body, UUID/key, date/page/field/type bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. |
+| `413 invalid_request` | Backend legal preflight rejects declared or streamed body above 32 KiB before consuming step-up; no browser-only guarantee. |
 | `415 invalid_content_type` | Missing, duplicated or unsupported media type/charset for a nonempty body. |
 | `400 unsupported_identifier_type` | Only email attribution is supported. |
 | `401 use_dpop_nonce` | Explicit pre-handler challenge permits one retry with a fresh proof and the **same** body/key/grant; no handler/grant has been consumed. |
@@ -286,7 +287,13 @@ Canonical-v2 verification defaults to a 1,000-node page (maximum 5,000). Start a
 
 Responses include `chain`, `canonical_version: 2`, `seed_source`, `seed_hash`, `scope`, page counts, `verified`, `complete`, positions, and failure metadata. Hashes are 64-character lowercase SHA-256 hex. Every sequence coordinate (`after_seq`, `through_seq`, nullable `first_seq`, `last_seq`, `broken_at_seq`, and `next_after_seq`) is a canonical decimal string; counts and limits stay numeric. `complete` is authoritative even if a cursor is present. A clean partial page is not a complete-run result.
 
-The API returns explanatory scope text, which the panel validates and displays without inventing shorter scope aliases. Audit scope is relative to its seed and does not claim complete ingestion, tail-truncation detection or independent historical authenticity. Ledger scope is database-relative chain and retained-payload verification, with erased payloads authorized by erasure records rather than recomputed. An unseeded stored-predecessor start proves only local consistency. `checked` counts visited nodes, including nodes with authorized erased payloads; ledger `erased_checked` is a subset, never added to it. Authorized erasure is not erased-content verification. An initialized empty chain reports zero checked records and is not proof that no activity occurred; a missing head is an error. Missing payloads without erasure authorization, invalid leaf/chain data, predecessor mismatch, and head mismatch stop the run without success.
+The API returns exact explanatory scope text, which the panel validates/displays without inventing aliases. Audit scope is `database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization`. Ledger scope is `database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity`. Both are relative to their seed/snapshot; a stored-predecessor start proves local consistency, not independent trust. `checked` includes erased annotated nodes; `erased_checked` is a subset, never added. Annotations do not recompute erased bodies or certify policy compliance by a compromised purge credential. Both durable heads are validated against their own actual terminal/genesis even for empty/historical `through_seq` requests, not compared to an older requested bound. Initialized-empty is not proof of no activity; missing/malformed head, absent payload without annotation, invalid leaf/link or predecessor/head mismatch stops success.
+
+Operational receipt assurance is separate: the bounded read-only `admin-legal --operation=ledger-receipts` uses `LEDGER_RECEIPTS_DATABASE_URL`, not expanded purge grants or a public API/UI. It distinguishes pending intent, manifest-bound chained receipts, legacy/unbound, missing/unavailable, invalid and incomplete coverage. PubAck/`published_at` does not establish chaining; a partial proof is not a full-chain pass. It never rewrites/certifies old signed bytes or independently proves legal authorization.
+
+Its proof flags/counts concern Class C chain linkage in hash-only bounded pages;
+correlated receipt bodies/leaves are checked separately. They do not certify
+unrelated audit narrative bodies or complete ingestion.
 
 Canonical v2 retains separate chain nodes and verifies available payload leaf digests. The erased-span checkpoint protocol, `purged_count`, `proof_steps`, and checkpoint restart rules belong to the retired format and are not current fields. There is no browser-side rehash or claim of independent historical authenticity. A privileged coherent database rewrite remains undetectable without external anchoring, which is explicitly deferred.
 
@@ -316,6 +323,7 @@ fingerprints in audit.
 | `POST /legal-cases/{case_id}/close` | Explicit closure without a response; never releases a hold. |
 | `GET /legal-reviews` | Due review queue requiring both case-read and hold-read permissions. |
 | `POST /legal-holds/{hold_id}/reviews` | Advisory review/history, starting at `expected_version=0`; original hold replay fields are unchanged. |
+| `GET /legal-holds/{hold_id}/reviews` | Gated audited handoff requiring live `legal.holds.read` only, no case-read or step-up. Returns effective schedule, current version and bounded decrypted newest-first history. No query/body/idempotency key. |
 | `POST /legal-cases/{case_id}/response` | Exact content revision, outcome, rationale and encrypted manifest (recipient/evidence/legal basis and exact subject/time/field/artifact selection). |
 | `POST /legal-cases/{case_id}/response/approve` | Exact expected state, content and proposal revisions; different DPO for data-bearing outcomes. |
 | `POST /legal-cases/{case_id}/response/delivery` | Same approved revisions, UTC `delivered_at`, external `receipt_reference`; attests one final delivery and closes the case. |
@@ -341,6 +349,30 @@ policy/storage failures 503, and authorization failures 403. Operator delivery
 attestation is not evidence that the API transferred data. Supplements, reopening,
 external messaging, uploads, public publishing and the UI are not implemented by
 this contract. See [operator procedures](admin-operations.md#legal-review-and-transparency-task-55).
+
+Hold-review GET returns exactly `{version,next_review_at,history,history_truncated}`:
+`version` is the existing numeric workflow version, `next_review_at` nullable UTC,
+`history` an array of `{id,revision,purpose,actor,action_id,created_at,input}`.
+It reuses subject/scope locks and expiry/hold checks before decrypting and durably
+audits disclosure before bytes. Never-reviewed is version 0/history `[]` with the
+original hold `review_at`; after review, the effective override includes explicit
+null (not fallback to the original date). History is newest-first and capped at
+200 events/1 MiB decrypted input with explicit truncation. Erased/expired returns
+`410 legal_record_unavailable`; missing/inconsistent retained history returns
+`503 legal_workflow_unavailable`, not a never-created response. No existing-hold
+replay fields, review/retention clocks or scope permissions change, no narratives
+are resurrected and no workflow UI is supplied. A missing hold is `404 not_found`.
+
+`admin-legal --operation=workflow-status` is a separate bounded read-only operator
+snapshot using installed baseline policy with intake disabled, no keys/actor
+configuration. It reports only cutoff/count/age/lower-bound review/backlog metadata,
+not identifiers. `--limit` is `1..1000` (default 500), cleanup is `1..500` and
+baseline backfill/cleanup `1..1000`; operation-specific unsupported flags are rejected
+before connection, including explicitly supplied `--dry-run=false` outside cleanup.
+Workflow expiry uses at-or-after equality; context/baseline released cleanup is
+strict-before. Closed expiry is the minimum of original max age and closure-relative
+retention; reviews and hold release never reset it. Distinct-account approvals
+are not verification of distinct humans, and delivery remains operator attestation.
 
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.

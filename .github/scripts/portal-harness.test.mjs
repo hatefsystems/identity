@@ -32,6 +32,8 @@ import {
   privateLogSummary,
   redactFixtureSecrets,
   replicaFor,
+  runPortalIntegrationSuites,
+  runPortalIntegrationTarget,
   secretEnvironmentValues,
   startPortalServices,
 } from './portal-harness.mjs';
@@ -496,6 +498,254 @@ function mockPortalDocker(t, { failCleanup, failCreate, failStart } = {}) {
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
   return state;
 }
+
+function mockIntegrationRunner(t, { failAt, hang = false, startError = false, output, exit = 0 } = {}) {
+  const state = { children: [], active: 0, maximumActive: 0, terminated: [], messages: [] };
+  const originalSpawnSync = childProcess.spawnSync;
+  const close = (child, code, signal = null) => {
+    child.exitCode = code;
+    child.signalCode = signal;
+    child.emit('exit', code, signal);
+    state.active--;
+    child.emit('close', code, signal);
+  };
+  t.mock.method(console, 'log', (message) => state.messages.push(message));
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    assert.equal(command, process.execPath);
+    assert.match(args[0], /[\\/]nx[\\/]dist[\\/]bin[\\/]nx\.js$/);
+    assert.equal(args[1], 'run');
+    assert.deepEqual(args.slice(3), ['--skipNxCache', '--outputStyle=stream-without-prefixes']);
+    assert.equal(options.env.NX_DAEMON, 'false');
+    assert.equal(options.env.CI, 'true');
+    assert.equal(options.env.GOFLAGS, '-v');
+    assert.equal(options.env.REQUIRE_LEGAL_WORKFLOW_INTEGRATION, '1');
+    assert.equal(options.env.REQUIRE_PORTAL_INTEGRATION, '1');
+    assert.equal(options.env.REQUIRE_GRPC_INTEGRATION, '1');
+    assert.equal(options.env.NODE_TLS_REJECT_UNAUTHORIZED, undefined);
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+    assert.equal(options.detached, true);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 100_000 + state.children.length, stdout: new EventEmitter(), stderr: new EventEmitter(),
+      exitCode: null, signalCode: null, target: args[2], options,
+      kill(signal) { state.terminated.push(signal); queueMicrotask(() => close(child, null, signal)); return true; },
+    });
+    state.children.push(child);
+    state.maximumActive = Math.max(state.maximumActive, ++state.active);
+    if (!hang) queueMicrotask(() => {
+      if (startError) {
+        child.emit('error', new Error('PRIVATE process error'));
+        close(child, null);
+        return;
+      }
+      if (output) output(child);
+      else {
+        child.stdout.emit('data', '--- PA');
+        child.stderr.emit('data', 'PRIVATE stderr diagnostic\n');
+        child.emit('exit', 0, null);
+        child.stdout.emit('data', 'SS: TestOwnedFixture (0.01s)\nok fixture/package\t0.01s');
+      }
+      close(child, state.children.length === failAt ? 130 : exit);
+    });
+    return child;
+  });
+  if (hang) t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
+    if (command !== 'taskkill.exe') return originalSpawnSync(command, args, options);
+    const child = state.children.find((candidate) => String(candidate.pid) === args[1]);
+    assert(child, 'Teardown targeted a process outside the owned runner');
+    assert.deepEqual(args, ['/PID', String(child.pid), '/T', '/F']);
+    assert.equal(options.stdio, 'ignore');
+    assert.equal(options.timeout, 10_000);
+    state.terminated.push('owned-tree');
+    queueMicrotask(() => close(child, 1));
+    return { status: 0 };
+  });
+  if (hang) {
+    const originalKill = process.kill;
+    t.mock.method(process, 'kill', (pid, signal) => {
+      const child = state.children.find((candidate) => -candidate.pid === pid);
+      if (!child) return originalKill(pid, signal);
+      if (state.active === 0) throw Object.assign(new Error('Owned group is gone'), { code: 'ESRCH' });
+      return child.kill(signal);
+    });
+  }
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return state;
+}
+
+test('integration runner preserves the Windows Go cache location but excludes inherited credentials', async (t) => {
+  const previous = { LOCALAPPDATA: process.env.LOCALAPPDATA, DATABASE_URL: process.env.DATABASE_URL };
+  process.env.LOCALAPPDATA = 'fixture-local-app-data';
+  process.env.DATABASE_URL = 'PRIVATE inherited database';
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const state = mockIntegrationRunner(t);
+  const result = await runPortalIntegrationTarget(integrationTargets[0], { DATABASE_URL: 'PRIVATE owned database' });
+  assert.equal(state.children[0].options.env.LOCALAPPDATA, 'fixture-local-app-data');
+  assert.equal(state.children[0].options.env.DATABASE_URL, 'PRIVATE owned database');
+  assert.deepEqual(result, { packages: 1, tests: 1, failed: 0, skipped: 0 });
+  assert.doesNotMatch(state.messages.join(''), /PRIVATE|database|app-data|stderr diagnostic/);
+});
+
+test('integration runner executes all seven uncached mandatory suites serially and confirms owned service cleanup', async (t) => {
+  const docker = mockPortalDocker(t);
+  const state = mockIntegrationRunner(t);
+  await runPortalIntegrationSuites();
+  assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
+  assert.equal(state.maximumActive, 1);
+  assert.equal(state.active, 0);
+  assert.equal(state.terminated.length, 0);
+  assert.deepEqual(docker.removed, ['nats', 'redis', 'postgres', 'network']);
+  assert.equal(docker.ownershipViolation, false);
+  assert(state.messages.some((message) => message.includes('serial-integration-teardown')));
+  assert.doesNotMatch(state.messages.join(''), /PRIVATE/);
+});
+
+test('integration runner fails closed on a prerequisite failure without running later suites or leaking diagnostics', async (t) => {
+  const docker = mockPortalDocker(t);
+  const state = mockIntegrationRunner(t, { failAt: 2, output(child) {
+    if (child.target === `identity-api:${integrationTargets[1]}`)
+      child.stderr.emit('data', 'build cache is required, but could not be located: GOCACHE is not defined\nPRIVATE body\n');
+    else child.stdout.emit('data', '--- PASS: TestOwnedFixture\nok fixture/package\n');
+  } });
+  await assert.rejects(runPortalIntegrationSuites(), /Required test-admin-integration failed/);
+  assert.equal(state.children.length, 2);
+  assert.deepEqual(docker.removed, ['nats', 'redis', 'postgres', 'network']);
+  assert.deepEqual(failureCategories('build cache is required, GOCACHE is not defined'), ['go-build-cache']);
+  assert.doesNotMatch(state.messages.join(''), /PRIVATE|GOCACHE|build cache is required/);
+});
+
+test('integration runner bounds private summaries and rejects skips, test failures, missing evidence and process errors', async (t) => {
+  for (const kind of ['skipped', 'failed', 'no-evidence', 'exit', 'start']) {
+    await t.test(kind, async (t) => {
+      const state = mockIntegrationRunner(t, { startError: kind === 'start', exit: kind === 'exit' ? 130 : 0,
+        output(child) {
+          child.stderr.emit('data', 'PRIVATE'.repeat(20_000));
+          child.stderr.emit('data', '\n');
+          if (kind === 'no-evidence') return;
+          child.stdout.emit('data', '--- PASS: TestOwnedFixture\nok fixture/package\n');
+          if (kind === 'skipped') child.stdout.emit('data', '--- SKIP: TestOwnedSkip\n');
+          if (kind === 'failed') for (let index = 0; index < 40; index++) {
+            child.stdout.emit('data', `--- FAIL: TestOwned${index}\n source${index}.go:12: PRIVATE assertion\n`);
+          }
+        },
+      });
+      await assert.rejects(runPortalIntegrationTarget(integrationTargets[0], {}), (error) => !error.message.includes('PRIVATE'));
+      assert.equal(state.active, 0);
+      assert.doesNotMatch(state.messages.join(''), /PRIVATE|assertion|process error/);
+      for (const message of state.messages) {
+        const summary = JSON.parse(message);
+        assert((summary.failures?.length ?? 0) <= 30);
+        assert((summary.locations?.length ?? 0) <= 30);
+        assert((summary.categories?.length ?? 0) <= 12);
+      }
+    });
+  }
+});
+
+test('integration runner deadline and interruption terminate only the owned process tree before returning', async (t) => {
+  for (const kind of ['deadline', 'interrupted']) await t.test(kind, async (t) => {
+    const state = mockIntegrationRunner(t, { hang: true });
+    const pending = runPortalIntegrationTarget(integrationTargets[0], {}, kind === 'deadline' ? 10 : 1000);
+    state.children[0].stdout.emit('data', '--- FAIL: TestOwnedDeadline\n source.go:12: PRIVATE assertion\n');
+    state.children[0].stderr.emit('data', 'build cache is required: GOCACHE is not defined');
+    if (kind === 'interrupted') process.emit('SIGTERM');
+    await assert.rejects(pending, new RegExp(kind));
+    assert.equal(state.active, 0);
+    assert.deepEqual(state.terminated, [process.platform === 'win32' ? 'owned-tree' : 'SIGTERM']);
+    assert.doesNotMatch(state.messages.join(''), /100000|PRIVATE/);
+    const summary = JSON.parse(state.messages.at(-1));
+    assert.deepEqual(summary.failures, ['TestOwnedDeadline']);
+    assert.deepEqual(summary.locations, ['source.go:12']);
+    assert.deepEqual(summary.categories, ['go-build-cache']);
+  });
+});
+
+test('integration runner total deadline includes startup and never resets between mandatory suites', async (t) => {
+  const docker = mockPortalDocker(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const state = mockIntegrationRunner(t, { output(child) {
+    child.stdout.emit('data', '--- PASS: TestOwnedFixture\nok fixture/package\n');
+    now += 60 * 60_000;
+  } });
+  await assert.rejects(runPortalIntegrationSuites(), /Integration runner deadline exceeded/);
+  assert.equal(state.children.length, 1);
+  assert.equal(state.active, 0);
+  assert.deepEqual(docker.removed, ['nats', 'redis', 'postgres', 'network']);
+});
+
+test('POSIX integration interruption signals the owned detached process group', async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  const state = mockIntegrationRunner(t, { hang: true });
+  await assert.rejects(runPortalIntegrationTarget(integrationTargets[0], {}, 10), /deadline/);
+  assert.equal(state.children[0].options.detached, true);
+  assert.deepEqual(state.terminated, ['SIGTERM']);
+  assert.equal(state.active, 0);
+});
+
+test('integration runner refuses an unknown suite or an absent, infinite or excessive deadline before spawning', async (t) => {
+  const state = mockIntegrationRunner(t);
+  await assert.rejects(runPortalIntegrationTarget('test-unknown', {}), /Unknown required/);
+  for (const timeout of [0, -1, NaN, Infinity, 30 * 60_000 + 1])
+    await assert.rejects(runPortalIntegrationTarget(integrationTargets[0], {}, timeout), /Invalid integration deadline/);
+  assert.equal(state.children.length, 0);
+});
+
+test('integration runner deadline tears down a real owned Node process and its descendant', async (t) => {
+ for (const output of ['inherit', 'ignore']) await t.test(output, async (t) => {
+  const originalSpawn = childProcess.spawn;
+  const messages = [];
+  let root, descendant;
+  t.mock.method(console, 'log', (message) => messages.push(message));
+  t.mock.method(childProcess, 'spawn', (_command, _args, options) => {
+    root = originalSpawn(process.execPath, ['-e', `
+      const { spawn } = require('node:child_process');
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        stdio: ['ignore', '${output}', '${output}'],
+      });
+      console.log('OWNED_DESCENDANT=' + child.pid);
+      process.on('SIGTERM', () => {
+        if (child.exitCode !== null || child.signalCode !== null) process.exit(0);
+        child.once('exit', () => process.exit(0));
+      });
+      setInterval(() => {}, 1000);
+    `], options);
+    root.stdout.on('data', (chunk) => {
+      const match = String(chunk).match(/OWNED_DESCENDANT=(\d+)/);
+      if (match) descendant = Number(match[1]);
+    });
+    return root;
+  });
+  syncBuiltinESMExports();
+  const alive = (pid) => {
+    try { process.kill(pid, 0); return true; } catch (error) {
+      assert.equal(error.code, 'ESRCH');
+      return false;
+    }
+  };
+  t.after(() => {
+    for (const pid of [root?.pid, descendant]) if (pid && alive(pid)) {
+      if (process.platform === 'win32') childProcess.spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore', timeout: 10_000, windowsHide: true,
+      });
+      else process.kill(pid, 'SIGKILL');
+    }
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(runPortalIntegrationTarget(integrationTargets[0], {}, 2000), /deadline/);
+  assert(Number.isSafeInteger(descendant), 'The real owned descendant was not started');
+  assert.equal(alive(root.pid), false, 'The owned runner process survived teardown');
+  assert.equal(alive(descendant), false, 'An owned descendant survived teardown');
+  assert.doesNotMatch(messages.join(''), /OWNED_DESCENDANT/);
+ });
+});
 
 test('portal cleanup preserves fresh service ownership and successful idempotent close with mocked Docker', async (t) => {
   const state = mockPortalDocker(t);
@@ -1160,10 +1410,10 @@ test('owned mail sink requires verified TLS/auth, rejects foreign recipients, an
       ...mailPolicy, runID: mailRunID, cert, key: readFileSync(keyPath),
       username: 'fixture-user', password: 'fixture-password', onSecrets: (values) => secrets.push(...values),
     });
-    const untrusted = connect({ host: '127.0.0.1', port: sink.port });
+    const untrusted = connect({ host: '127.0.0.1', port: sink.port, rejectUnauthorized: true });
     clients.push(untrusted);
     await assert.rejects(once(untrusted, 'secureConnect'));
-    const socket = connect({ host: '127.0.0.1', port: sink.port, ca: cert, minVersion: 'TLSv1.2' });
+    const socket = connect({ host: '127.0.0.1', port: sink.port, ca: cert, minVersion: 'TLSv1.2', rejectUnauthorized: true });
     clients.push(socket);
     await once(socket, 'secureConnect');
     assert(socket.authorized, 'Fixture TLS was not verified');
@@ -1286,7 +1536,8 @@ test('admin browser is uncached, builds its production dependencies and uses arm
   assert.match(harness, /A supervised portal process exited/);
   assert.match(harness, /return \{ runID, origin, tlsSPKI/);
   assert.doesNotMatch(harness, /console\.error\([^\n]*output/);
-  assert.deepEqual(integrationTargets, ['test-security-db', 'test-admin-integration', 'test-retention-integration', 'test-lifecycle-integration', 'test-portal-integration']);
+  assert.deepEqual(integrationTargets, ['test-security-db', 'test-admin-integration', 'test-retention-integration',
+    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-portal-integration']);
   const browser = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(browser, /route\.fetch\s*\(/);
   assert.match(browser, /Fetch\.failRequest/);
@@ -1296,7 +1547,7 @@ test('admin browser is uncached, builds its production dependencies and uses arm
   for (const check of ['legal-audit-rollback', 'legal-lost-writes', 'legal-attribution', 'legal-revocation', 'legal-privacy'])
     assert(browser.includes(`checkpoint = '${check}'`));
   const legalFixture = readFileSync(new URL('../../apps/identity-api/cmd/portal-fixture/legal.go', import.meta.url), 'utf8');
-  assert(legalFixture.startsWith('//go:build portalfixture\n'));
+  assert.match(legalFixture, /^\/\/go:build portalfixture\r?\n/);
   assert.match(legalFixture, /VerifyLookupFixture/);
   assert.match(legalFixture, /audit\.NewEnvelope/);
   assert.match(legalFixture, /js\.Publish/);
@@ -1330,6 +1581,31 @@ test('portal integration cannot silently omit real dependencies or run in parall
   }
 });
 
+test('local integration inventory matches all seven mandatory CI suites in order', () => {
+  const workflow = readFileSync(new URL('../workflows/identity-api.yml', import.meta.url), 'utf8');
+  const job = workflow.slice(workflow.indexOf('  security-db:'), workflow.indexOf('  frontend:'));
+  const targets = [...job.matchAll(/nx run identity-api:(test-[a-z-]+) --skipNxCache/g)].map((match) => match[1]);
+  assert.equal(targets.length, 7);
+  assert.deepEqual(integrationTargets, targets);
+  assert(Object.isFrozen(integrationTargets));
+  const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(harness, /docker-compose\.dev|--volumes-from|--mount.*volume/);
+  assert.match(harness, /outcomes\.skipped, 0/);
+  assert.match(harness, /Integration service teardown was not confirmed/);
+});
+
+test('Windows admin acceptance uses an immutable production signer container and real graceful stop', () => {
+  const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
+  assert.match(harness, /ADMIN_BROWSER_SIGNER_IMAGE/);
+  assert.match(harness, /sha256:\[0-9a-f\]\{64\}/);
+  assert.match(harness, /'--network', services\.network/);
+  assert.match(harness, /'--entrypoint', '\/usr\/local\/bin\/audit-signer'/);
+  assert.match(harness, /docker\(\['stop', '--time', '10', signerContainer\]\)/);
+  assert.match(harness, /assert\(code === 0 && signal === null/);
+  assert.match(harness, /cleanup\.push\(\(\) => docker\(\['rm', '--force', '--volumes', signerContainer\]\)\)/);
+  assert.doesNotMatch(harness, /code === 0 \|\| signal === 'SIGTERM'/);
+});
+
 test('credential fixture is opt-in and not packaged into the production API image', () => {
   const fixture = readFileSync(
     new URL('../../apps/identity-api/cmd/portal-fixture/main.go', import.meta.url),
@@ -1339,7 +1615,7 @@ test('credential fixture is opt-in and not packaged into the production API imag
     new URL('../../apps/identity-api/Dockerfile', import.meta.url),
     'utf8'
   );
-  assert(fixture.startsWith('//go:build portalfixture\n'));
+  assert.match(fixture, /^\/\/go:build portalfixture\r?\n/);
   assert.match(fixture, /PORTAL_FIXTURE_ALLOW/);
   assert.match(fixture, /portal_browser_/);
   assert(!dockerfile.includes('portal-fixture') && !dockerfile.includes('portalfixture'));

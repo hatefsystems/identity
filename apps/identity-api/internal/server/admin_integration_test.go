@@ -30,6 +30,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -84,6 +85,31 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 	if err != nil {
 		t.Fatal(err)
 	}
+	baseline, err := legalpolicy.LoadBaseline(ctx, pool, uuid.Nil, "test")
+	if errors.Is(err, legalpolicy.ErrNotApproved) {
+		baseline = legalpolicy.Policy{ID: uuid.New(), ApprovalReference: "fixture-approval", Fixture: true,
+			ContextRetentionSeconds: 3600, ReleasedHoldRetentionSeconds: 3600,
+			ContextClock: legalpolicy.ClockCreatedAt, ReleasedHoldClock: legalpolicy.ClockReleasedAt,
+			HoldTombstoneFields: legalpolicy.HoldTombstoneFields(), HoldTombstoneLifetime: legalpolicy.LifetimeNoExpiry,
+			LegacyInventoryReference: "fixture-inventory"}
+		op, beginErr := actions.Begin(ctx)
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		defer func() { _ = op.Rollback(ctx) }()
+		op.Event = audit.Event{ActorID: uuid.New(), ActorSPIFFEID: "spiffe://identity.test/policy-operator"}
+		if err := legalpolicy.Install(ctx, op, baseline, "test"); err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if err := legalpolicy.ValidateBaseline(baseline, time.Hour, time.Hour, "test"); err != nil {
+		t.Fatal(err)
+	}
 	holds, err := legalhold.New(q, enc, legalhold.WithReleasedMetadataRetention(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +158,7 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 			if _, err := pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", user.ID); err != nil {
 				t.Fatal(err)
 			}
-			if err := rbac.ProvisionRole(ctx, actions, uuid.New(), "spiffe://identity.test/operator", user.ID, role, false); err != nil {
+			if err := rbac.ProvisionRole(ctx, actions, uuid.New(), "spiffe://identity.test/operator", user.ID, role, false, "test"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -169,7 +195,11 @@ func (f *adminIntegration) grant(t *testing.T, role string) string {
 
 func (f *adminIntegration) request(t *testing.T, role, method, path, body, grant string) *httptest.ResponseRecorder {
 	t.Helper()
-	return f.requestWithKey(t, role, method, path, body, grant, uuid.NewString())
+	key := ""
+	if method != http.MethodDelete {
+		key = uuid.NewString()
+	}
+	return f.requestWithKey(t, role, method, path, body, grant, key)
 }
 
 func (f *adminIntegration) requestWithKey(t *testing.T, role, method, path, body, grant, key string) *httptest.ResponseRecorder {
@@ -235,7 +265,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 	if _, err := f.step.Validate(context.Background(), grant, f.actors["support"]); err != nil {
 		t.Fatalf("denial consumed grant: %v", err)
 	}
-	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["support"].UserID), "support", true); err != nil {
+	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["support"].UserID), "support", true, "test"); err != nil {
 		t.Fatal(err)
 	}
 	if w := f.request(t, "support", "GET", "/users", "", ""); w.Code != 403 {

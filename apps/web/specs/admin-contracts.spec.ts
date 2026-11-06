@@ -35,9 +35,9 @@ const ledgerSeed = '6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea
 const hash = 'b'.repeat(64);
 const finalHash = 'c'.repeat(64);
 const auditScope =
-  'stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity';
+  'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization';
 const ledgerScope =
-  'database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity';
+  'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity';
 const user = {
   id,
   status: 'active',

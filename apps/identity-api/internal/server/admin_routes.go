@@ -3,6 +3,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -15,7 +16,7 @@ import (
 //
 // # Middleware order is fixed and load-bearing
 //
-// session -> permission -> step-up, always.
+// session -> permission -> legal body preflight (legal mutations) -> step-up.
 //
 //   - Session first because both later guards read the caller from the request
 //     context; neither establishes identity.
@@ -76,7 +77,11 @@ func (s *Server) registerAdminRoutes() {
 					slog.String("pattern", pattern))
 				return false
 			}
-			r.With(permHandler, stepGuard.Handler).Method(method, pattern, h)
+			if strings.HasPrefix(permission, "legal.") {
+				r.With(permHandler, s.legalBodyPreflight, stepGuard.Handler).Method(method, pattern, h)
+			} else {
+				r.With(permHandler, stepGuard.Handler).Method(method, pattern, h)
+			}
 			return true
 		}
 		r.With(permHandler).Method(method, pattern, h)
@@ -131,6 +136,7 @@ func (s *Server) registerAdminRoutes() {
 				mount(r.With(holdRead), http.MethodGet, "/legal-reviews", permLegalCasesRead, false, s.handleListLegalCases(true))
 			}
 			mount(r, http.MethodPost, "/legal-holds/{hold_id}/reviews", permLegalHoldsWrite, true, s.handleReviewExistingHold())
+			mount(r, http.MethodGet, "/legal-holds/{hold_id}/reviews", permLegalHoldsRead, false, s.handleGetHoldReviews())
 			mount(r, http.MethodGet, "/legal-transparency/monthly", legalreport.PermissionRead, false, s.handleMonthlyLegalTransparency())
 			mount(r, http.MethodPost, "/legal-transparency/reports", legalreport.PermissionRead, true, s.handleLegalReport("prepare"))
 			mount(r, http.MethodGet, "/legal-transparency/reports/{report_id}", legalreport.PermissionRead, false, s.handleLegalReport("get"))

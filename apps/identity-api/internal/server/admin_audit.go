@@ -100,7 +100,7 @@ func (s *Server) handleAdminListAuditLogs() http.HandlerFunc {
 			PageLimit: limit,
 		})
 		if err != nil {
-			s.logger.Error("admin: list audit logs failed", "error", err.Error())
+			s.logger.Error("admin: list audit logs failed", "category", "audit_query_failed")
 			s.writeAdminError(w, http.StatusInternalServerError, "server_error")
 			return
 		}
@@ -241,8 +241,8 @@ func (s *Server) handleAdminVerifyLedgerChain() http.HandlerFunc {
 // here is recomputed from the same database that would be rewritten by a
 // privileged attacker. External anchoring is deliberately out of scope.
 const (
-	auditVerifyScope  = "stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity"
-	ledgerVerifyScope = "database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity"
+	auditVerifyScope  = "database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization"
+	ledgerVerifyScope = "database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity"
 )
 
 // Short, stable codes for the audit record. The prose above is for the operator

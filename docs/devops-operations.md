@@ -197,7 +197,9 @@ npm exec -- nx run web:test-admin-browser --skipNxCache
 node .github/scripts/portal-harness.mjs --integration
 ```
 
-The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-lifecycle-integration`, and `test-portal-integration` through Nx, serially on its disposable services; missing configuration or skipped tests fail the run. Never point reset-schema suites at development or deployed databases. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs all seven CI suites in CI order: `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, and `test-portal-integration`, through Nx serially on disposable PostgreSQL 16, Redis 7 and JetStream 2.10; missing configuration or skipped tests fail the run. Its 60-minute total deadline includes startup, with a maximum 30-minute target deadline; interruption/deadline failures terminate the owned process tree before removing services. Migration and retention Go package budgets are explicitly 20 minutes while production transaction/lock limits remain unchanged. `LOCALAPPDATA` is retained solely for the Windows Go build cache; credentials, peppers and feature flags are not inherited. A collision on the reserved restart broker name fails rather than reusing or removing another run's container. Never point reset-schema suites at shared Compose volumes, development or deployed databases. Successful teardown is explicitly confirmed. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+
+Windows cannot deliver a graceful Go `SIGTERM` using Node's process kill. For Windows admin browser acceptance, first build and inspect the fresh production API image, then set `ADMIN_BROWSER_SIGNER_IMAGE` to its immutable `sha256:` image ID before running `web:test-admin-browser`. The harness uses its real non-root `/usr/local/bin/audit-signer` on the private run-owned service network and `docker stop` for graceful retirement; it still requires exit 0 before destructive fixtures. The signer and publisher receive separate restricted real logins, and publisher reads/delivery updates use its exact subject/marker RLS policies. No production image is inferred from a mutable tag and no forced termination is accepted as clean signer shutdown. Linux CI retains the normal locally built signer binary.
 
 CI requires the separate `admin-browser` job before image publication in addition to the existing quality, security, frontend and portal-browser jobs. For acceptance, set `ADMIN_BROWSER_ARTIFACT_DIR` to a fresh run-specific directory under `/tmp/kilo` for masked desktop/320px light/dark screenshots and sanitized `admin-evidence.json`. Do not retain raw traces, storage snapshots, fixture credentials, proofs, grants, account identifiers or audit bodies. Diagnostic output is restricted to route templates, counts, static failure categories and sanitized scenario labels; require confirmed cleanup of all run-owned services.
 
@@ -821,3 +823,102 @@ groups:
 ### Admin deployment gate
 
 Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including role separation, approved retention, encrypted backfill, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
+
+## Phase 5 Technical Closure (2026-11-05)
+
+Fresh local automated acceptance of the Phase 5 closure plan passed on
+2026-11-05. It is separate from production enablement and the unchecked
+[operator checklist](admin-operations.md#production-checklist). The final
+seven-suite run produced 6,462 passing test/subtest records over 49 package runs,
+zero failures/skips and confirmed teardown; the detailed suite counts and
+restore/trust limitations are recorded in
+[admin operations](admin-operations.md#phase-5-technical-closure-2026-11-05).
+
+The actual host toolchain was Node 24.18.0, npm 11.16.0, Go 1.26.5 and
+golangci-lint 2.12.2. Linux unit/race execution used Go 1.26.9 and Alpine GCC
+15.2.0; race execution had `CGO_ENABLED=1` and current source/module-cache mounts
+were read-only. The existing POSIX spool-permission test fails on Windows and
+was not weakened: the complete named unit and race targets passed on Linux.
+Only dependency generation was excluded after its explicit successful fresh
+run, not test execution or cache misses. All test gates were uncached.
+
+These exact final commands exited 0:
+
+```powershell
+npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+npm exec -- nx run schemas:lint --skipNxCache
+npm exec -- nx run-many -t lint,vet,test-portal-fixture,sqlc-vet -p identity-api --skipNxCache --excludeTaskDependencies
+npm exec -- nx run identity-api:lint --skipNxCache --excludeTaskDependencies --args="--build-tags=integration"
+$env:GOFLAGS='-tags=integration'; npm exec -- nx run identity-api:vet --skipNxCache --excludeTaskDependencies
+npm exec -- nx run-many -t build,build-admin-audit-publisher,build-admin-roles,build-admin-legal,build-lifecycle-publisher,build-audit-signer,build-purge-worker,build-security-ledger-purge,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache --excludeTaskDependencies
+npm exec -- nx run-many -t lint,typecheck,build -p web,ui --skipNxCache --parallel=1
+npm exec -- nx run web:test --skipNxCache --ci --runInBand
+npm exec -- nx run ui:test --skipNxCache --ci --runInBand
+npm exec -- nx exec -p schemas -- node --test "D:/Projects/hatef.ir/ldp/.github/scripts/*.test.mjs"
+npm exec -- nx exec -p schemas -- node "D:/Projects/hatef.ir/ldp/.github/scripts/portal-harness.mjs" --integration
+```
+
+The complete named Linux unit/race commands also exited 0 and removed their
+owned containers:
+
+```powershell
+npm exec -- nx run identity-api:test --skipNxCache --excludeTaskDependencies --command='docker run --rm --name ldp-phase5-unit-final2-20261105T165058Z --network none --volume D:/Projects/hatef.ir/ldp:/workspace:ro --volume C:/Users/Hatef/go/pkg/mod:/go/pkg/mod:ro --env CGO_ENABLED=0 --env GOFLAGS=-mod=readonly --entrypoint sh identity-api-race:ci -c "go test -count=1 ./..."'
+npm exec -- nx run identity-api:test-race --skipNxCache --excludeTaskDependencies --command='docker run --rm --name ldp-phase5-race-final2-20261105T165058Z --network none --volume D:/Projects/hatef.ir/ldp:/workspace:ro --volume C:/Users/Hatef/go/pkg/mod:/go/pkg/mod:ro --env CGO_ENABLED=1 --env GOFLAGS=-mod=readonly --entrypoint sh identity-api-race:ci -c "go test -race -count=1 ./..."'
+```
+
+Fresh API and web builds used `--platform linux/amd64 --pull --network=host`;
+no inline proxy credentials, push or publication was performed. Immutable
+accepted image IDs were:
+
+- API/maintenance: `sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8`.
+- Web: `sha256:b7539e32e78ee3c7f85f14f709ea63f98575831724c52674e0e9d7fa8961b5eb`.
+
+```powershell
+docker build --platform linux/amd64 --pull --network=host --file apps/identity-api/Dockerfile --tag identity-api:phase5-20261105T165058Z .
+docker build --platform linux/amd64 --pull --network=host --file apps/web/Dockerfile --tag identity-web:phase5-20261105T165058Z .
+npm exec -- nx exec -p schemas -- node "D:/Projects/hatef.ir/ldp/.github/scripts/smoke-image.mjs" api sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8
+npm exec -- nx exec -p web -- node "D:/Projects/hatef.ir/ldp/.github/scripts/web-csp.browser.mjs" sha256:b7539e32e78ee3c7f85f14f709ea63f98575831724c52674e0e9d7fa8961b5eb
+$env:PORTAL_BROWSER_ARTIFACT_DIR='C:/Users/Hatef/AppData/Local/Temp/kilo/phase5-20261105T165058Z/portal-browser'; npm exec -- nx run web:test-portal-browser --skipNxCache
+$env:ADMIN_BROWSER_SIGNER_IMAGE='sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8'; $env:ADMIN_BROWSER_ARTIFACT_DIR='C:/Users/Hatef/AppData/Local/Temp/kilo/phase5-20261105T165058Z/admin-browser'; npm exec -- nx run web:test-admin-browser --skipNxCache
+```
+
+All four smoke/browser commands exited 0. Helpers passed 177 tests with zero
+skips, web passed 586, UI passed 17, and the real browsers produced 18 portal
+viewports/six no-JavaScript routes and 42 masked admin/legal layouts. Signer
+retirement used the immutable production binary and required clean exit before
+destructive fixtures. All browser and integration resources were confirmed
+removed, and `docker ps -a --filter label=ldp.run` returned no owned containers.
+
+Repeated SQL/protobuf generation preserved every byte in all 24 generated SQL
+Go files and four protobuf Go files. Their ordered `git hash-object --no-filters`
+vector has SHA-256
+`79c724165e0057fd93d4795a8e742524fa0775092c3947f4fededd4c37367991`;
+complete filename/object vectors are in the sanitized external acceptance JSON.
+Tracked migrations 00001-00018 and canonical schema sources were unchanged.
+
+The accepted implementation snapshot was dirty, based on
+`fedbe1ebee53be2bfd3dfeb5d66ef6ee2e8749d7`, with empty staged diff,
+unstaged-diff SHA-256
+`6bf21a0e22bac832dcf3d848d8d7a00b286ca8365dba24a7949f3f2f013633e8`
+and untracked-content SHA-256
+`f865a882e6bf71f00b6963355a17e8292658fdd0d0da48f91f3a84b5ebac9866`.
+After validation only acceptance/task bookkeeping was changed; the resulting
+final worktree fingerprint is recorded externally to avoid a self-referential
+hash in these runbooks. The earlier post-browser changes were a test-only
+contracted-schema shadowing fixture and POSIX-only integration interruption
+teardown, checked by the full fresh serial retry and strengthened helpers;
+the successful Windows/browser/runtime-image paths were unchanged.
+
+Run-specific evidence is under
+`C:\Users\Hatef\AppData\Local\Temp\kilo\phase5-20261105T165058Z`:
+`acceptance.json`, `admin-browser/admin-evidence.json` and
+`portal-browser/portal-evidence.json`, with masked captures only. Raw diagnostic
+traces, private keys, account/operation identifiers, proofs and legal narratives
+were not retained. Earlier prerequisite/concurrent-generation/fixture failures
+were corrected and retried, not counted as passing evidence. Existing non-lint
+Next project-reference/toolchain and npm dependency advisories (62 reported by
+the image install) remain recorded caveats; dependency remediation was not
+silently added to this plan and no lint negatives or test failures were waived.
+Production release still requires its separate dependency/security review and
+all manual/operator gates. No commit, push, deployed governance or production
+enablement occurred.

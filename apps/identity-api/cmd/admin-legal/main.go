@@ -20,6 +20,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit/receiptreconcile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
@@ -32,31 +33,85 @@ import (
 )
 
 func main() {
-	op := flag.String("operation", "", "backfill, cleanup, lookup-probe, policy-install, or workflow-cleanup")
-	limit := flag.Int("limit", 500, "maximum records (1..1000)")
-	policyFile := flag.String("policy-file", "", "approved JSON artifact for policy-install")
-	dryRun := flag.Bool("dry-run", false, "report workflow cleanup eligibility without committing changes")
-	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	opts, err := parseOptions(os.Args[1:])
+	if err != nil {
+		slog.Error("legal maintenance options invalid")
+		os.Exit(1)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := run(ctx, *op, *limit, *policyFile, *dryRun); err != nil {
+	if err := run(ctx, opts); err != nil {
 		slog.Error("legal maintenance failed; verify operator configuration, keys and dependencies")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, operation string, limit int, policyFile string, dryRun bool) error {
-	if limit < 1 || limit > 1000 {
+type options struct {
+	operation, policyFile string
+	limit, proofLimit     int
+	dryRun                bool
+	supplied              map[string]bool
+}
+
+func parseOptions(args []string) (options, error) {
+	opts := options{supplied: make(map[string]bool)}
+	flags := flag.NewFlagSet("admin-legal", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&opts.operation, "operation", "", "backfill, cleanup, lookup-probe, policy-install, workflow-cleanup, workflow-status, or ledger-receipts")
+	flags.IntVar(&opts.limit, "limit", 500, "maximum records: workflow-cleanup 1..500; maintenance/status/receipts 1..1000")
+	flags.StringVar(&opts.policyFile, "policy-file", "", "approved JSON artifact for policy-install only")
+	flags.BoolVar(&opts.dryRun, "dry-run", false, "workflow-cleanup only: roll back eligible cleanup")
+	flags.IntVar(&opts.proofLimit, "receipt-proof-limit", 1000, "ledger-receipts only: Class C proof nodes (1..10000)")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return opts, errors.New("invalid options")
+	}
+	flags.Visit(func(f *flag.Flag) { opts.supplied[f.Name] = true })
+	if opts.operation == "ledger-receipts" && !opts.supplied["limit"] {
+		opts.limit = 100
+	}
+	return opts, validateOptions(opts)
+}
+
+func validateOptions(opts options) error {
+	maximum := 1000
+	if opts.operation == "workflow-cleanup" {
+		maximum = 500
+	}
+	if opts.limit < 1 || opts.limit > maximum {
 		return errors.New("invalid batch size")
 	}
-	if operation != "backfill" && operation != "cleanup" && operation != "lookup-probe" && operation != "policy-install" && operation != "workflow-cleanup" {
+	switch opts.operation {
+	case "backfill", "cleanup", "lookup-probe", "policy-install", "workflow-cleanup", "workflow-status", "ledger-receipts":
+	default:
 		return errors.New("invalid operation")
 	}
-	if (dryRun && operation != "workflow-cleanup") || (policyFile != "" && operation != "policy-install") {
+	if ((opts.dryRun || opts.supplied["dry-run"]) && opts.operation != "workflow-cleanup") ||
+		((opts.policyFile != "" || opts.supplied["policy-file"]) && opts.operation != "policy-install") ||
+		(opts.supplied["receipt-proof-limit"] && opts.operation != "ledger-receipts") ||
+		(opts.supplied["limit"] && (opts.operation == "lookup-probe" || opts.operation == "policy-install")) {
 		return errors.New("operation does not support supplied options")
 	}
+	if opts.operation == "policy-install" && opts.policyFile == "" {
+		return errors.New("policy-file required")
+	}
+	if opts.operation == "ledger-receipts" && (opts.proofLimit < 1 || opts.proofLimit > 10000) {
+		return errors.New("invalid proof size")
+	}
+	return nil
+}
+
+func run(ctx context.Context, opts options) error {
+	if err := validateOptions(opts); err != nil {
+		return err
+	}
 	dsn := os.Getenv("DATABASE_URL")
+	if opts.operation == "ledger-receipts" {
+		dsn = os.Getenv("LEDGER_RECEIPTS_DATABASE_URL")
+		if dsn == "" {
+			return errors.New("LEDGER_RECEIPTS_DATABASE_URL required")
+		}
+	}
 	if dsn == "" {
 		return errors.New("DATABASE_URL required")
 	}
@@ -68,8 +123,39 @@ func run(ctx context.Context, operation string, limit int, policyFile string, dr
 	if err := pool.Ping(ctx); err != nil {
 		return err
 	}
-	if operation == "lookup-probe" {
+	if opts.operation == "lookup-probe" {
 		return lookupProbe(ctx, pool)
+	}
+	if opts.operation == "ledger-receipts" {
+		if err := receiptreconcile.ProbePrivileges(ctx, pool); err != nil {
+			return err
+		}
+		result, err := receiptreconcile.ReconcileSnapshot(ctx, pool, receiptreconcile.Options{Limit: opts.limit, ProofLimit: opts.proofLimit})
+		if err == nil {
+			slog.Info("ledger receipt reconciliation complete", "summary", result)
+		}
+		return err
+	}
+	environment := os.Getenv("APP_ENV")
+	if environment == "" {
+		environment = "development"
+	}
+	if opts.operation == "workflow-status" {
+		result, err := legalworkflow.StatusSnapshot(ctx, pool, environment, opts.limit, time.Now())
+		if err == nil {
+			slog.Info("legal workflow status", "summary", result)
+		}
+		return err
+	}
+	if opts.operation == "policy-install" {
+		if err := legalpolicy.ProbeInstaller(ctx, pool); err != nil {
+			return err
+		}
+	}
+	if opts.operation == "cleanup" {
+		if err := legalpolicy.ProbeMetadataMaintenance(ctx, pool); err != nil {
+			return err
+		}
 	}
 	crypto, err := config.LoadEnvelopeCrypto()
 	if err != nil {
@@ -83,15 +169,11 @@ func run(ctx context.Context, operation string, limit int, policyFile string, dr
 	if err != nil {
 		return err
 	}
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
-	}
-	if operation == "policy-install" || operation == "workflow-cleanup" {
-		return runWorkflowOperation(ctx, pool, enc, environment, operation, policyFile, limit, dryRun)
+	if opts.operation == "policy-install" || opts.operation == "workflow-cleanup" {
+		return runWorkflowOperation(ctx, pool, enc, environment, opts.operation, opts.policyFile, opts.limit, opts.dryRun)
 	}
 	var releasedRetention time.Duration
-	if operation == "cleanup" {
+	if opts.operation == "cleanup" {
 		policy, err := legalpolicy.LoadBaseline(ctx, pool, uuid.Nil, environment)
 		if err != nil {
 			return err
@@ -102,14 +184,14 @@ func run(ctx context.Context, operation string, limit int, policyFile string, dr
 	if err != nil {
 		return err
 	}
-	if operation == "backfill" {
-		n, err := holds.Backfill(ctx, pool, limit)
+	if opts.operation == "backfill" {
+		n, err := holds.Backfill(ctx, pool, opts.limit)
 		if err == nil {
 			slog.Info("legal backfill batch committed", slog.Int("records", n)) //nolint:gosec // G706: a typed integer count cannot inject log text.
 		}
 		return err
 	}
-	n, err := holds.CleanupReleased(ctx, pool, limit)
+	n, err := holds.CleanupReleased(ctx, pool, opts.limit)
 	if err == nil {
 		slog.Info("legal cleanup batch committed", slog.Int64("records", n)) //nolint:gosec // G706: a typed integer count cannot inject log text.
 	}

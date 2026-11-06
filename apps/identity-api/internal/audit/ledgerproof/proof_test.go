@@ -11,11 +11,9 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 )
 
-// These tests cover the three checks v2 verification makes, and in particular the
-// one v1 could not make at all: deciding whether an absent payload was lawfully
-// erased or silently deleted. Under v1 an erased record left a hole that had to be
-// bridged with stored checkpoint digests, so "payload missing" was indistinguishable
-// from "payload removed" and could only ever be tolerated.
+// These tests cover linkage, retained leaf integrity and erasure annotations.
+// An annotation accounts for absent material; it does not prove legal authority,
+// policy compliance or receipt delivery.
 
 var proofTime = time.Date(2026, 5, 6, 7, 8, 9, 101112000, time.UTC)
 
@@ -31,6 +29,7 @@ type fakeSource struct {
 	pageErr   error
 	hashErr   error
 	pageCalls int
+	emptyPage bool
 }
 
 func (f *fakeSource) Head(context.Context) (Head, error) {
@@ -56,6 +55,9 @@ func (f *fakeSource) Page(_ context.Context, after, through int64, limit int32) 
 	f.pageCalls++
 	if f.pageErr != nil {
 		return nil, f.pageErr
+	}
+	if f.emptyPage {
+		return nil, nil
 	}
 	var out []Node
 	for _, n := range f.nodes {
@@ -132,9 +134,9 @@ func TestVerifyIntactChain(t *testing.T) {
 	}
 }
 
-// TestVerifyAcceptsLawfullyErasedPayload is the core v2 property: the chain still
+// TestVerifyAcceptsAnnotatedErasedPayload is the core v2 property: the chain still
 // verifies end to end after a retention purge, because the leaf digest survives.
-func TestVerifyAcceptsLawfullyErasedPayload(t *testing.T) {
+func TestVerifyAcceptsAnnotatedErasedPayload(t *testing.T) {
 	t.Parallel()
 
 	src := buildChain(t, 5)
@@ -216,8 +218,8 @@ func TestVerifyRejectsNonLinkingNode(t *testing.T) {
 	}
 }
 
-// TestVerifyRejectsHeadMismatch closes the coherent-rewrite gap: a chain can be
-// internally consistent and still not be the chain the head commits to.
+// TestVerifyRejectsHeadMismatch checks an inconsistent head, not privileged
+// coherent replacement of both the chain and its head.
 func TestVerifyRejectsHeadMismatch(t *testing.T) {
 	t.Parallel()
 
@@ -231,14 +233,14 @@ func TestVerifyRejectsHeadMismatch(t *testing.T) {
 	if result.FailureReason == nil || *result.FailureReason != "head_mismatch" {
 		t.Errorf("failure reason = %v, want head_mismatch", result.FailureReason)
 	}
-	if result.Complete || result.Checked != 3 || result.FirstSeq == nil || *result.FirstSeq != 1 || result.LastSeq == nil || *result.LastSeq != 3 || result.BrokenAtSeq == nil || *result.BrokenAtSeq != 3 || result.NextAfterSeq == nil || *result.NextAfterSeq != 3 {
-		t.Fatalf("head mismatch lost the visited range or retained cursor: %+v", result)
+	if result.Complete || result.Checked != 0 || result.FirstSeq != nil || result.LastSeq != nil || result.BrokenAtSeq == nil || *result.BrokenAtSeq != 3 || result.NextAfterSeq != nil || src.pageCalls != 0 {
+		t.Fatalf("head mismatch walked records before rejecting the snapshot: %+v", result)
 	}
 	last, err := audit.DecodeDigest(src.nodes[2].ChainHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.LastHash != last.Hex() || result.ExpectedHash == nil || *result.ExpectedHash != last.Hex() || result.StoredHash == nil || *result.StoredHash != audit.LedgerGenesis().Hex() {
+	if result.LastHash != audit.LedgerGenesis().Hex() || result.ExpectedHash == nil || *result.ExpectedHash != last.Hex() || result.StoredHash == nil || *result.StoredHash != audit.LedgerGenesis().Hex() {
 		t.Fatal("head mismatch did not preserve both compared digests")
 	}
 	if _, ok := result.NextParams(Params{Chain: ChainLedger}); ok {
@@ -261,7 +263,7 @@ func TestVerifyReportsUncheckableRecords(t *testing.T) {
 		{"record_not_serializable", func(src *fakeSource) {
 			src.nodes[0].Recompute = func() (audit.Digest, error) { return audit.Digest{}, audit.ErrFieldTooLarge }
 		}, 1, ptr(int64(1)), ptr(int64(1))},
-		{"no_stored_records", func(src *fakeSource) { src.nodes = nil }, 0, nil, nil},
+		{"no_stored_records", func(src *fakeSource) { src.emptyPage = true }, 0, nil, nil},
 	} {
 		t.Run(tc.reason, func(t *testing.T) {
 			t.Parallel()
@@ -429,6 +431,44 @@ func TestVerifyEmptyChain(t *testing.T) {
 	}
 	if result.Checked != 0 || result.ErasedChecked != 0 || result.AfterSeq != 0 || result.ThroughSeq != 0 || result.FirstSeq != nil || result.LastSeq != nil || result.BrokenAtSeq != nil || result.NextAfterSeq != nil || result.FailureReason != nil {
 		t.Fatalf("empty chain manufactured checked coordinates or failure evidence: %+v", result)
+	}
+}
+
+func TestHeadValidationPrecedesEmptyAndHistoricalSuccess(t *testing.T) {
+	for _, chain := range []Chain{ChainAudit, ChainLedger} {
+		for _, tc := range []struct {
+			name string
+			head Head
+		}{
+			{"empty nonzero head", Head{Seq: 1, Hash: chain.Genesis().Bytes()}},
+			{"false genesis", Head{Hash: chain.Link(chain.Genesis(), chain.Genesis()).Bytes()}},
+			{"negative head", Head{Seq: -1, Hash: chain.Genesis().Bytes()}},
+			{"query-invalid", Head{Hash: chain.Genesis().Bytes(), Invalid: true}},
+		} {
+			t.Run(string(chain)+"/"+tc.name, func(t *testing.T) {
+				for _, p := range []Params{{Chain: chain}, {Chain: chain, HasThrough: true, ThroughSeq: 0}} {
+					src := &fakeSource{head: tc.head}
+					result, err := Verify(context.Background(), src, p)
+					if err != nil || result.Verified || result.Complete || src.pageCalls != 0 {
+						t.Fatalf("invalid head was accepted or walked: %+v %v", result, err)
+					}
+				}
+			})
+		}
+	}
+	src := buildChain(t, 5)
+	for _, p := range []Params{{Chain: ChainLedger, HasThrough: true, ThroughSeq: 2}, {Chain: ChainLedger, HasThrough: true, ThroughSeq: 0}} {
+		result, err := Verify(context.Background(), src, p)
+		if err != nil || !result.Verified || !result.Complete {
+			t.Fatalf("live head broke historical proof: %+v %v", result, err)
+		}
+	}
+	src.head.Hash = audit.LedgerGenesis().Bytes()
+	for _, p := range []Params{{Chain: ChainLedger, HasThrough: true, ThroughSeq: 2}, {Chain: ChainLedger, AfterSeq: 5}} {
+		result, err := Verify(context.Background(), src, p)
+		if err != nil || result.Verified || result.Complete {
+			t.Fatalf("historical/early-return path discarded invalid live head: %+v %v", result, err)
+		}
 	}
 }
 

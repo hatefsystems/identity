@@ -250,8 +250,8 @@ export function verificationResponse(value: unknown): AdminVerification {
   if (item.chain !== 'audit' && item.chain !== 'ledger') throw new PortalError('invalid_response');
   const scope =
     item.chain === 'audit'
-      ? 'stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity'
-      : 'database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity';
+      ? 'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization'
+      : 'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity';
   if (item.scope !== scope) throw new PortalError('invalid_response');
   if (
     !['genesis', 'database_predecessor', 'supplied_predecessor'].includes(

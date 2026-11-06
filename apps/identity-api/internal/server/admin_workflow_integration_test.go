@@ -94,7 +94,7 @@ func newWorkflowHTTPIntegration(t *testing.T) *adminIntegration {
 	if _, err := f.pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", user.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := rbac.ProvisionRole(ctx, deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", user.ID, "dpo", false); err != nil {
+	if err := rbac.ProvisionRole(ctx, deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", user.ID, "dpo", false, "test"); err != nil {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
@@ -126,7 +126,9 @@ func workflowHTTPRequest(t *testing.T, f *adminIntegration, role, method, path s
 	if cookie := f.cookies[role]; cookie != nil {
 		f.browser.authorize(t, r, f.actors[role], cookie)
 	}
-	r.Header.Set("Idempotency-Key", key.String())
+	if key != uuid.Nil && method != http.MethodGet && method != http.MethodDelete {
+		r.Header.Set("Idempotency-Key", key.String())
+	}
 	if method != http.MethodGet {
 		r.Header.Set(stepup.HeaderStepUpAuth, f.grant(t, role))
 	}
@@ -361,5 +363,108 @@ func TestLegalWorkflowOptInAndStepUpBoundaries(t *testing.T) {
 	}
 	if w := f.request(t, "dpo", "GET", "/legal-cases", "", ""); w.Code != 200 {
 		t.Fatalf("read unnecessarily requires step-up: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHoldReviewHTTPReadHandoffPrivacyAndRollback(t *testing.T) {
+	f := newWorkflowHTTPIntegration(t)
+	ctx := context.Background()
+	body := `{"account_ref":"` + f.target.ID.String() + `","reason":"hold fixture","requesting_authority":"fixture court","legal_basis":"fixture law","review_at":"2026-01-01T00:00:00Z"}`
+	w := f.request(t, "dpo", "POST", "/legal-holds", body, f.grant(t, "dpo"))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("hold create=%d %s", w.Code, w.Body.String())
+	}
+	var hold adminLegalHoldResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &hold); err != nil {
+		t.Fatal(err)
+	}
+	path := "/legal-holds/" + hold.ID.String() + "/reviews"
+	if _, err := f.pool.Exec(ctx, `DELETE FROM role_permissions WHERE role_id='dpo' AND permission_id='legal.cases.read'`); err != nil {
+		t.Fatal(err)
+	}
+	w = workflowHTTPRequest(t, f, "reviewer", "GET", path, nil, uuid.Nil)
+	var history legalworkflow.HoldReviews
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &history) != nil || history.Version != 0 || len(history.History) != 0 || history.NextReviewAt == nil {
+		t.Fatalf("hold-only never-reviewed read=%d %s", w.Code, w.Body.String())
+	}
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	review := legalworkflow.HoldReviewRequest{Decision: "continue", Rationale: "task55-private-handoff", NextReviewAt: &future}
+	workflowResult(t, workflowHTTPRequest(t, f, "dpo", "POST", path, review, uuid.New()), http.StatusOK)
+	w = workflowHTTPRequest(t, f, "reviewer", "GET", path, nil, uuid.Nil)
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &history) != nil || history.Version != 1 || len(history.History) != 1 || !strings.Contains(w.Body.String(), "task55-private-handoff") || history.NextReviewAt == nil || !history.NextReviewAt.Equal(future) {
+		t.Fatalf("different-operator handoff=%d %s", w.Code, w.Body.String())
+	}
+	var leaked bool
+	if err := f.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM event_outbox WHERE payload LIKE '%GET /api/v1/admin/legal-holds/{hold_id}/reviews%'
+        AND (payload LIKE '%task55-private%' OR payload LIKE '%response_digest%' OR payload LIKE '%record_set_digest%' OR payload LIKE $1))`, "%"+hold.ID.String()+"%").Scan(&leaked); err != nil || leaked {
+		t.Fatalf("review disclosure audit leaked=%v err=%v", leaked, err)
+	}
+	for _, role := range []string{"support", "moderator", "super_admin", "ordinary"} {
+		if denied := workflowHTTPRequest(t, f, role, "GET", path, nil, uuid.Nil); denied.Code != http.StatusForbidden {
+			t.Fatalf("%s hold review read=%d", role, denied.Code)
+		}
+	}
+	for _, tc := range []struct{ path, body, key string }{
+		{path + "?", "", ""}, {path + "?email=private", "", ""}, {path, "private body", ""}, {path, "", uuid.NewString()},
+	} {
+		if invalid := f.requestWithKey(t, "reviewer", "GET", tc.path, tc.body, "", tc.key); invalid.Code != http.StatusBadRequest {
+			t.Fatalf("invalid review read=%d %s", invalid.Code, invalid.Body.String())
+		}
+	}
+	deps := f.srv.deps
+	failed, err := adminaction.New(rejectAuditBeginner{f.pool}, f.enc, "identity.audit.admin-test", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedDeps := deps
+	failedDeps.AdminActions = failed
+	f.srv = New(f.srv.cfg, nil, failedDeps)
+	w = workflowHTTPRequest(t, f, "reviewer", "GET", path, nil, uuid.Nil)
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "task55-private") || strings.Contains(w.Body.String(), "history") {
+		t.Fatalf("read disclosed before audit commit=%d %s", w.Code, w.Body.String())
+	}
+	f.srv = New(f.srv.cfg, nil, deps)
+	if _, err := f.pool.Exec(ctx, `DELETE FROM role_permissions WHERE role_id='dpo' AND permission_id='legal.holds.read'`); err != nil {
+		t.Fatal(err)
+	}
+	if denied := workflowHTTPRequest(t, f, "reviewer", "GET", path, nil, uuid.Nil); denied.Code != http.StatusForbidden {
+		t.Fatalf("live hold-read revocation=%d", denied.Code)
+	}
+}
+
+func TestHoldReviewReadMountingBoundaries(t *testing.T) {
+	f := newWorkflowHTTPIntegration(t)
+	body := `{"account_ref":"` + f.target.ID.String() + `","reason":"fixture hold","requesting_authority":"fixture court","legal_basis":"fixture law"}`
+	w := f.request(t, "dpo", "POST", "/legal-holds", body, f.grant(t, "dpo"))
+	var hold adminLegalHoldResponse
+	if w.Code != http.StatusCreated || json.Unmarshal(w.Body.Bytes(), &hold) != nil {
+		t.Fatalf("hold fixture=%d %s", w.Code, w.Body.String())
+	}
+	path := "/legal-holds/" + hold.ID.String() + "/reviews"
+	cfg, deps := f.srv.cfg, f.srv.deps
+	cfg.Admin.WorkflowEnabled = false
+	f.srv = New(cfg, nil, deps)
+	if w := workflowHTTPRequest(t, f, "dpo", "GET", path, nil, uuid.Nil); w.Code != http.StatusNotFound {
+		t.Fatalf("disabled review GET mounted=%d", w.Code)
+	}
+	cfg.Admin.WorkflowEnabled = true
+	deps.StepUp = nil
+	f.srv = New(cfg, nil, deps)
+	if w := workflowHTTPRequest(t, f, "dpo", "GET", path, nil, uuid.Nil); w.Code != http.StatusOK {
+		t.Fatalf("hold read wrongly requires stepup=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestWorkflowStatusUsesStoredBaselineWithLaterWorkflowPolicy(t *testing.T) {
+	f := newWorkflowHTTPIntegration(t)
+	// Baseline installation and workflow approval are separate operations.
+	// Status must not require enabling intake or replacing the singleton policy.
+	baseline, err := legalpolicy.LoadBaseline(context.Background(), f.pool, uuid.Nil, "test")
+	if err != nil || baseline.Workflow != nil {
+		t.Fatalf("baseline fixture=%+v err=%v", baseline, err)
+	}
+	status, err := legalworkflow.StatusSnapshot(context.Background(), f.pool, "test", 500, time.Now())
+	if err != nil || status.EligibleExpired.Count != 0 || status.HeldExpired.Count != 0 {
+		t.Fatalf("later workflow policy blocked status=%+v err=%v", status, err)
 	}
 }

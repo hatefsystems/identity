@@ -12,6 +12,8 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/dbprivilege"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
@@ -19,66 +21,27 @@ import (
 // bypasses. Deployment supplies a separate login with precisely these grants.
 // It is deliberately not an application DPO authorization check.
 func ProbeMaintenance(ctx context.Context, tx pgx.Tx) error {
-	var safe bool
-	err := tx.QueryRow(ctx, `SELECT current_user=session_user AND
-      NOT EXISTS(SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user,r.oid,'MEMBER') AND
-        (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls))
-      AND NOT has_schema_privilege(current_user,current_schema(),'CREATE')
-      AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname IN (current_schema(),'public') AND c.relkind IN ('r','p') AND pg_has_role(current_user,c.relowner,'MEMBER'))
-      AND has_table_privilege(current_user,'legal_cases','SELECT')
-      AND has_table_privilege(current_user,'legal_cases','UPDATE')
-      AND has_table_privilege(current_user,'legal_workflow_replays','SELECT')
-      AND has_column_privilege(current_user,'legal_workflow_replays','erased','UPDATE')
-      AND has_column_privilege(current_user,'legal_workflow_replays','event_id','UPDATE')
-      AND has_table_privilege(current_user,'legal_workflow_events','DELETE')
-      AND has_table_privilege(current_user,'legal_case_subjects','SELECT,DELETE')
-      AND has_table_privilege(current_user,'legal_case_holds','DELETE')
-      AND has_table_privilege(current_user,'legal_hold_reviews','SELECT,DELETE')
-      AND has_table_privilege(current_user,'legal_holds','SELECT')
-      AND has_table_privilege(current_user,'legal_governance_policies','SELECT')
-      AND has_table_privilege(current_user,'legal_governance_baseline','SELECT')
-      AND has_table_privilege(current_user,'event_outbox','INSERT')
-      AND NOT has_table_privilege(current_user,'legal_cases','INSERT,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_workflow_events','INSERT,UPDATE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_workflow_replays','INSERT,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_case_subjects','INSERT,UPDATE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_case_holds','INSERT,UPDATE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_hold_reviews','INSERT,UPDATE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_governance_policies','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_governance_baseline','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'legal_holds','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'users','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'user_roles','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'role_permissions','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'event_outbox','UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'mvp_audit_logs','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT has_table_privilege(current_user,'security_event_ledger','INSERT,UPDATE,DELETE,TRUNCATE')
-      AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY[
-        'users','roles','permissions','user_roles','role_permissions','legal_holds',
-        'legal_governance_policies','legal_governance_baseline','mvp_audit_logs','security_event_ledger',
-        -- Canonical format v2: the chain and erasure tables replaced
-        -- security_ledger_checkpoints. They are the tamper-evidence and the proof
-        -- that an erasure was lawful, so the workflow maintenance login must hold
-        -- nothing on them at all.
-        'audit_log_chain','security_ledger_chain','security_ledger_erasures',
-        'security_ledger_head','audit_log_head','security_ledger_retention_settings',
-        'legal_transparency_coverage','legal_transparency_years','legal_transparency_months',
-        'legal_transparency_reports','legal_transparency_replays']) AS protected(name)
-        WHERE has_table_privilege(current_user,name,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER')
-           OR has_any_column_privilege(current_user,name,'INSERT,UPDATE'))
-      AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY[
-        'legal_workflow_events','legal_case_subjects','legal_case_holds','legal_hold_reviews']) AS restricted(name)
-        WHERE has_any_column_privilege(current_user,name,'INSERT,UPDATE') OR has_table_privilege(current_user,name,'TRIGGER'))
-      AND NOT has_any_column_privilege(current_user,'legal_cases','INSERT')
-      AND NOT has_any_column_privilege(current_user,'legal_workflow_replays','INSERT')
-      AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY['operation','scope','idempotency_key','result_id']) AS immutable(name)
-        WHERE has_column_privilege(current_user,'legal_workflow_replays',name,'UPDATE'))
-      AND NOT has_any_column_privilege(current_user,'event_outbox','UPDATE')
-      AND NOT EXISTS(SELECT 1 FROM pg_proc p WHERE p.proname IN
-        ('advance_chain_head','chain_table_guard','security_event_ledger_guard','mvp_audit_logs_guard')
-        AND has_function_privilege(current_user,p.oid,'EXECUTE'))`).Scan(&safe)
-	if err != nil || !safe {
+	guards := append(dbprivilege.EvidenceGuards(),
+		dbprivilege.Guard{Table: "legal_workflow_events", Name: "legal_workflow_events_immutable", Function: "legal_workflow_event_immutable()", Type: 19},
+		dbprivilege.Guard{Table: "legal_governance_policies", Name: "legal_governance_policy_immutable", Function: "legal_governance_immutable()", Type: 27},
+		dbprivilege.Guard{Table: "legal_governance_policies", Name: "legal_governance_policy_no_truncate", Function: "legal_governance_immutable()", Type: 34},
+		dbprivilege.Guard{Table: "legal_governance_baseline", Name: "legal_governance_baseline_immutable", Function: "legal_governance_immutable()", Type: 27},
+		dbprivilege.Guard{Table: "legal_governance_baseline", Name: "legal_governance_baseline_no_truncate", Function: "legal_governance_immutable()", Type: 34})
+	if err := dbprivilege.Check(ctx, tx, dbprivilege.Contract{
+		Tables: []dbprivilege.Table{
+			{Name: "legal_cases", Select: true, Update: true},
+			{Name: "legal_workflow_replays", Select: true, UpdateColumns: []string{"erased", "event_id"}},
+			{Name: "legal_workflow_events", Select: true, Delete: true},
+			{Name: "legal_case_subjects", Select: true, Delete: true},
+			{Name: "legal_case_holds", Select: true, Delete: true},
+			{Name: "legal_hold_reviews", Select: true, Delete: true},
+			{Name: "legal_holds", Select: true},
+			{Name: "legal_governance_policies", Select: true},
+			{Name: "legal_governance_baseline", Select: true},
+			{Name: "event_outbox", Insert: true},
+		},
+		Guards: guards,
+	}); err != nil {
 		return ErrUnavailable
 	}
 	return nil
@@ -100,6 +63,12 @@ func (s *Service) Cleanup(ctx context.Context, pool *pgxpool.Pool, actions *admi
 		return result, ErrUnavailable
 	}
 	err = ProbeMaintenance(ctx, probe)
+	if err == nil {
+		_, policyErr := legalpolicy.LoadBaseline(ctx, probe, uuid.Nil, s.cfg.Environment)
+		if policyErr != nil {
+			err = ErrUnavailable
+		}
+	}
 	_ = probe.Rollback(context.WithoutCancel(ctx))
 	if err != nil {
 		return result, err

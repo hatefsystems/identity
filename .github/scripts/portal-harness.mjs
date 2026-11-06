@@ -6,6 +6,7 @@ import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promise
 import { request as httpRequest } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer } from 'node:net';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -196,7 +197,7 @@ export function fixtureSecretValues(value) {
         return [item];
       }
     }
-    if (/(?:^id$|_id$|(?:^|_)account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|^database_url$|^password$|reason|narrative|payload|^identifier$|^requesting_authority$|^legal_basis$|^case_reference$|^purpose$|cursor$|^seq$|^through_seq$|^client_ip$|^ip_subnet$|^user_agent$|^device_fingerprint$)/i.test(key)) {
+    if (/(?:^id$|_id$|(?:^|_)account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|(?:^|_)database_url$|^password$|reason|narrative|payload|^identifier$|^requesting_authority$|^legal_basis$|^case_reference$|^purpose$|cursor$|^seq$|^through_seq$|^client_ip$|^ip_subnet$|^user_agent$|^device_fingerprint$)/i.test(key)) {
       if (item && typeof item === 'object') return [JSON.stringify(item), ...fixtureSecretValues(item)];
       return typeof item === 'string' && item ? [item] : [];
     }
@@ -230,6 +231,7 @@ export function failureCategories(output) {
   if (typeof output !== 'string') return [];
   const categories = [];
   for (const [category, pattern] of [
+    ['go-build-cache', /build cache is required|GOCACHE.*not defined|LOCALAPPDATA.*not defined/i],
     ['configuration', /\bconfig:/i],
     ['governance', /governance|baseline/i],
     ['key-material', /missing.*key|key.*required|OIDC.*KEY/i],
@@ -340,9 +342,10 @@ async function freePort() {
 function cleanEnvironment() {
   // Do not inherit a developer's DATABASE_URL, signing keys, admin/gRPC flags,
   // proxy settings, peppers, or credential state into acceptance fixtures.
+  // Go requires LOCALAPPDATA to locate its default build cache on Windows.
   return Object.fromEntries(
     Object.entries(process.env).filter(([key]) =>
-      /^(?:path|systemroot|windir|comspec|pathext|temp|tmp|home|userprofile|lang|lc_all)$/i.test(
+      /^(?:path|systemroot|windir|comspec|pathext|temp|tmp|home|userprofile|localappdata|lang|lc_all)$/i.test(
         key
       )
     )
@@ -398,7 +401,10 @@ export async function startPortalServices({ integration = false } = {}) {
         return response.ok;
       } catch { return false; }
     }, 'disposable JetStream');
-    return { runID, close, environment: {
+    return { runID, close, network: name, internalEnvironment: {
+      DATABASE_URL: `postgres://portal:${password}@${postgres.id}:5432/${database}?sslmode=disable`,
+      NATS_URL: `nats://${nats.id}:4222`,
+    }, environment: {
       DATABASE_URL: `postgres://portal:${password}@127.0.0.1:${postgres.ports[5432]}/${database}?sslmode=disable`,
       REDIS_URL: `redis://127.0.0.1:${redis.ports[6379]}/0`,
       NATS_URL: `nats://127.0.0.1:${nats.ports[4222]}`,
@@ -412,58 +418,137 @@ export async function startPortalServices({ integration = false } = {}) {
 
 export const integrationTargets = Object.freeze([
   'test-security-db', 'test-admin-integration', 'test-retention-integration',
+  'test-legal-workflow-integration', 'test-grpc-integration',
   'test-lifecycle-integration', 'test-portal-integration',
 ]);
 
+export async function runPortalIntegrationTarget(target, environment, timeout = 30 * 60_000) {
+  assert(integrationTargets.includes(target), 'Unknown required integration suite');
+  assert(Number.isInteger(timeout) && timeout > 0 && timeout <= 30 * 60_000, 'Invalid integration deadline');
+  const nxCLI = createRequire(resolve(workspace, 'package.json')).resolve('nx/bin/nx.js');
+  const child = spawn(process.execPath,
+    [nxCLI, 'run', `identity-api:${target}`, '--skipNxCache', '--outputStyle=stream-without-prefixes'], {
+      cwd: workspace, env: {
+        ...cleanEnvironment(), ...environment, NX_DAEMON: 'false', CI: 'true', FORCE_COLOR: '0',
+        GOFLAGS: '-v', GOMAXPROCS: '2', REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1',
+        REQUIRE_LIFECYCLE_INTEGRATION: '1', REQUIRE_PORTAL_INTEGRATION: '1',
+        REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: true,
+    });
+  // Keep streams separate and retain only bounded partial lines and fixed summaries.
+  const outcomes = { packages: 0, tests: 0, failed: 0, skipped: 0 };
+  const locations = new Set(), failures = new Set(), categories = new Set();
+  const pending = { stdout: '', stderr: '' };
+  const record = (stream, chunk) => {
+    const lines = (pending[stream] + String(chunk)).split('\n');
+    pending[stream] = lines.pop().slice(-4096);
+    for (const line of lines) {
+      for (const category of failureCategories(line)) if (categories.size < 12) categories.add(category);
+      if (/^ok\s/.test(line)) outcomes.packages++;
+      if (/^\s*--- PASS:/.test(line)) outcomes.tests++;
+      if (/^\s*--- FAIL:/.test(line)) outcomes.failed++;
+      if (/^\s*--- SKIP:/.test(line)) outcomes.skipped++;
+      const test = line.match(/^\s*--- FAIL: (Test[A-Za-z0-9_]+)/)?.[1];
+      if (test && failures.size < 30) failures.add(test);
+      const source = line.match(/(?:^|\s)([a-zA-Z0-9_]+\.go:\d+(?::\d+)?):/)?.[1];
+      if (source && locations.size < 30) locations.add(source);
+    }
+  };
+  child.stdout.on('data', (chunk) => record('stdout', chunk));
+  child.stderr.on('data', (chunk) => record('stderr', chunk));
+  let closed = false, timer, teardownTimer, forceTimer, runnerFailure;
+  const completion = new Promise((resolve) => child.once('close', (code, signal) => {
+    closed = true;
+    resolve([code, signal]);
+  }));
+  let interrupt;
+  const stopped = new Promise((_, reject) => {
+    const fail = (category) => {
+      runnerFailure ||= category;
+      reject(new Error('Integration process stopped; sensitive diagnostics suppressed'));
+    };
+    child.once('error', () => fail('process-start'));
+    interrupt = () => fail('interrupted');
+    timer = setTimeout(() => fail('deadline'), timeout);
+  });
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', interrupt);
+  try {
+    const [code, signal] = await Promise.race([completion, stopped]);
+    record('stdout', '\n');
+    record('stderr', '\n');
+    console.log(JSON.stringify({ target, exit: code, signal, ...outcomes,
+      ...(code !== 0 ? { failures: [...failures], locations: [...locations], categories: [...categories] } : {}),
+    }));
+    assert.equal(code, 0, `Required ${target} failed; sensitive test diagnostics suppressed`);
+    assert(outcomes.packages > 0 && outcomes.tests > 0, 'Integration suite produced no test evidence');
+    assert.equal(outcomes.skipped, 0, 'Required integration suite skipped a test');
+    assert.equal(outcomes.failed, 0, 'Required integration suite reported a failed test');
+    return outcomes;
+  } catch (error) {
+    if (!closed && child.pid) {
+      // Stop the exact owned tree while its root is alive, before removing services.
+      if (process.platform === 'win32') {
+        const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+          stdio: 'ignore', timeout: 10_000, windowsHide: true,
+        });
+        assert(!killed.error && killed.status === 0, 'Integration process-tree teardown failed');
+       } else {
+         // Signal the detached group, not only Nx: a child with closed output
+         // pipes must not keep writing to the services after its parent exits.
+         try { process.kill(-child.pid, 'SIGTERM'); } catch (error) {
+           assert.equal(error.code, 'ESRCH', 'Integration process-group teardown failed');
+         }
+         forceTimer = setTimeout(() => {
+           try { process.kill(-child.pid, 'SIGKILL'); } catch { /* The owned group may already be gone. */ }
+         }, 5000);
+      }
+       await Promise.race([completion, new Promise((_, reject) => {
+         teardownTimer = setTimeout(() => reject(new Error('Integration process-tree teardown was not confirmed')), 10_000);
+       })]);
+       if (process.platform !== 'win32') {
+         try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
+           assert.equal(error.code, 'ESRCH', 'Integration process-group teardown failed');
+         }
+       }
+    }
+    if (runnerFailure) {
+      record('stdout', '\n');
+      record('stderr', '\n');
+      console.log(JSON.stringify({ target, check: 'integration-runner', category: runnerFailure, ...outcomes,
+        failures: [...failures], locations: [...locations], categories: [...categories],
+      }));
+      throw new Error(`Required ${target} ${runnerFailure}; sensitive process diagnostics suppressed`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(teardownTimer);
+    clearTimeout(forceTimer);
+    process.off('SIGINT', interrupt);
+    process.off('SIGTERM', interrupt);
+    pending.stdout = pending.stderr = '';
+  }
+}
+
 export async function runPortalIntegrationSuites() {
+  // Match the existing CI integration job budget, including service startup.
+  const deadline = Date.now() + 60 * 60_000;
   const services = await startPortalServices({ integration: true });
   try {
-    // Separate Nx invocations are intentional: these suites reset schemas and
-    // exercise broker outages. They must never overlap, even with Nx parallelism.
+    // Schema resets and broker outages must never overlap, even with Nx parallelism.
     for (const target of integrationTargets) {
       console.log(`Running identity-api:${target} on run-owned disposable services`);
-      const child = spawn('npm', ['exec', '--', 'nx', 'run', `identity-api:${target}`, '--skipNxCache'], {
-        cwd: workspace, env: {
-          ...cleanEnvironment(), ...services.environment, NX_DAEMON: 'false', CI: 'true', FORCE_COLOR: '0',
-          GOFLAGS: '-v', GOMAXPROCS: '2', REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1',
-          REQUIRE_LIFECYCLE_INTEGRATION: '1', REQUIRE_PORTAL_INTEGRATION: '1',
-          REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      // Test failures can contain bodies and identifiers. Keep only aggregate
-      // package outcomes, never raw driver or assertion diagnostics.
-      const outcomes = { packages: 0, tests: 0, failed: 0, skipped: 0 };
-      const locations = new Set();
-      const failures = new Set();
-      const categories = new Set();
-      let pending = '';
-      const record = (chunk) => {
-        const lines = (pending + String(chunk)).split('\n');
-        pending = lines.pop().slice(-4096);
-        for (const line of lines) {
-          for (const category of failureCategories(line)) if (categories.size < 12) categories.add(category);
-          if (/^ok\s/.test(line)) outcomes.packages++;
-          if (/^\s*--- PASS:/.test(line)) outcomes.tests++;
-          if (/^\s*--- FAIL:/.test(line)) outcomes.failed++;
-          if (/^\s*--- SKIP:/.test(line)) outcomes.skipped++;
-          const test = line.match(/^\s*--- FAIL: (Test[A-Za-z0-9_]+)/)?.[1];
-          if (test && failures.size < 30) failures.add(test);
-          const source = line.match(/(?:^|\s)([a-zA-Z0-9_]+\.go:\d+(?::\d+)?):/)?.[1];
-          if (source && locations.size < 30) locations.add(source);
-        }
-      };
-      child.stdout.on('data', record);
-      child.stderr.on('data', record);
-      const [code] = await once(child, 'exit');
-      console.log(JSON.stringify({ target, exit: code, ...outcomes,
-        ...(code !== 0 ? { failures: [...failures], locations: [...locations], categories: [...categories] } : {}),
-      }));
-      assert.equal(code, 0, `Required ${target} failed; sensitive test diagnostics suppressed`);
-      assert(outcomes.packages > 0 && outcomes.tests > 0, 'Integration suite produced no test evidence');
-      assert.equal(outcomes.skipped, 0, 'Required integration suite skipped a test');
+      const remaining = deadline - Date.now();
+      assert(remaining > 0, 'Integration runner deadline exceeded');
+      await runPortalIntegrationTarget(target, services.environment, Math.min(30 * 60_000, remaining));
     }
-  } finally { await services.close(); }
+  } finally {
+    const cleanup = await services.close();
+    assert.equal(cleanup?.completed, true, 'Integration service teardown was not confirmed');
+    console.log(JSON.stringify({ check: 'serial-integration-teardown', completed: true }));
+  }
 }
 
 export async function startPortalHarness({ admin = false } = {}) {
@@ -870,10 +955,32 @@ export async function startPortalHarness({ admin = false } = {}) {
     secrets.push(...secretEnvironmentValues(apiEnvironment));
     let lookupFixture;
     let signer;
+    let signerContainer;
     if (admin) {
       const auditEnvironment = { ...apiEnvironment, PORT: '8080', AUDIT_BATCH_SIZE: '20', AUDIT_FLUSH_INTERVAL: '1s' };
-      signer = start('Audit signer', signerBinary, [], auditEnvironment, backend);
-      start('Admin audit publisher', publisherBinary, [], auditEnvironment, backend);
+      const workers = fixture('admin-worker-roles');
+      secrets.push(...fixtureSecretValues({ database_url: workers.signer_database_url }),
+        ...fixtureSecretValues({ database_url: workers.publisher_database_url }));
+      if (process.platform === 'win32') {
+        const image = process.env.ADMIN_BROWSER_SIGNER_IMAGE;
+        assert(/^sha256:[0-9a-f]{64}$/.test(image ?? ''),
+          'Windows admin acceptance requires a fresh immutable production signer image');
+        signerContainer = `portal-signer-${runID}`;
+        const database = new URL(workers.signer_database_url);
+        const internalDatabase = new URL(services.internalEnvironment.DATABASE_URL);
+        database.host = internalDatabase.host;
+        const environment = { ...auditEnvironment, DATABASE_URL: database.href,
+          NATS_URL: services.internalEnvironment.NATS_URL };
+        secrets.push(...fixtureSecretValues({ database_url: database.href }));
+        docker(['create', '--name', signerContainer, '--network', services.network,
+          '--label', `ldp.run=${runID}`, '--entrypoint', '/usr/local/bin/audit-signer',
+          ...Object.entries(environment).flatMap(([key, value]) => ['--env', `${key}=${value}`]), image]);
+        cleanup.push(() => docker(['rm', '--force', '--volumes', signerContainer]));
+        signer = start('Audit signer', 'docker', ['start', '--attach', signerContainer], cleanEnvironment(), backend);
+      } else {
+        signer = start('Audit signer', signerBinary, [], { ...auditEnvironment, DATABASE_URL: workers.signer_database_url }, backend);
+      }
+      start('Admin audit publisher', publisherBinary, [], { ...auditEnvironment, DATABASE_URL: workers.publisher_database_url }, backend);
       // stdout includes a synthetic identity and fixture ID. Parse in bounded
       // process-local memory, never send it to child diagnostics or artifacts.
       lookupFixture = lookupProbeFixture(spawnSync(legalBinary, ['--operation=lookup-probe'], {
@@ -951,7 +1058,8 @@ export async function startPortalHarness({ admin = false } = {}) {
       assert(admin && signer && !retired.has(signer), 'No live owned signer to retire');
       assertHealthy();
       const exited = once(signer, 'exit');
-      assert(signer.kill('SIGTERM'), 'Owned signer did not accept graceful shutdown');
+      if (signerContainer) docker(['stop', '--time', '10', signerContainer]);
+      else assert(signer.kill('SIGTERM'), 'Owned signer did not accept graceful shutdown');
       const [code, signal] = await Promise.race([exited,
         delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Owned signer did not stop'); })]);
       assert(code === 0 && signal === null, 'Owned signer did not exit cleanly');

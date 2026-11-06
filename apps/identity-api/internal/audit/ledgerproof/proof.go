@@ -10,13 +10,9 @@
 //   - every retained payload reproduces its node's leaf digest;
 //   - every absent payload is covered by an erasure record.
 //
-// The third check is new. In v1 an erased record left a hole in the chain, so
-// verification had to bridge it using predecessor/terminal digests stored in a
-// checkpoint table, and compaction of adjacent spans meant the bridge itself was
-// rewritten over time. The consequence was that "payload missing" could only be
-// tolerated, never judged: a lawful erasure and a malicious deletion were the same
-// observation. Now the chain is never broken, so an absent payload is a positive
-// claim that must be authorized, and an unauthorized one is reported as tampering.
+// An erasure record is only an annotation, not proof of policy compliance or legal
+// authorization. Receipt reconciliation is separate from structural verification.
+// Neither check independently detects a privileged coherent rewrite or rollback.
 //
 // # Why one implementation serves both chains
 //
@@ -68,6 +64,8 @@ type Head struct {
 	Seq    int64
 	MaxSeq int64
 	Hash   []byte
+	// Invalid preserves a database snapshot's explicit head-validity failure.
+	Invalid bool
 }
 
 // Node is one chain node and, when retained, a way to recompute its leaf.
@@ -79,7 +77,7 @@ type Node struct {
 	// the payload has been erased.
 	Recompute func() (audit.Digest, error)
 	// ErasureOperation is non-nil when an erasure record covers this node. It is
-	// what distinguishes a lawful erasure from a deletion.
+	// an annotation explaining absence, not legal authorization of the erasure.
 	ErasureOperation *string
 }
 
@@ -133,7 +131,7 @@ type Result struct {
 	// a hex round trip.
 	lastDigest   audit.Digest
 	NextAfterSeq *int64
-	// ErasedChecked counts nodes whose payload was absent but lawfully erased.
+	// ErasedChecked counts absent payloads covered by erasure annotations.
 	ErasedChecked int
 	BrokenAtSeq   *int64
 	ExpectedHash  *string
@@ -179,6 +177,30 @@ func Verify(ctx context.Context, source Source, p Params) (Result, error) {
 	result := Result{
 		Chain: string(p.Chain), Verified: true, AfterSeq: p.AfterSeq, ThroughSeq: through,
 		SeedSource: "genesis",
+		SeedHash:   p.Chain.Genesis().Hex(), LastHash: p.Chain.Genesis().Hex(), lastDigest: p.Chain.Genesis(),
+	}
+	// Check the live head against its own terminal before any early return, even
+	// when the requested proof is historical or empty. Never compare it to an old
+	// requested bound: later legitimate appends do not invalidate historical proofs.
+	expectedHead := p.Chain.Genesis()
+	if head.MaxSeq > 0 {
+		terminal, terminalErr := source.HashAt(ctx, head.MaxSeq)
+		if terminalErr != nil {
+			if !errors.Is(terminalErr, ErrUnknownSeq) {
+				return Result{}, terminalErr
+			}
+			return failAt(result, "head_mismatch", head.Seq), nil
+		}
+		expectedHead, err = audit.DecodeDigest(terminal)
+		if err != nil {
+			return failAt(result, "head_mismatch", head.MaxSeq), nil
+		}
+	}
+	storedHead, _ := audit.DecodeDigest(head.Hash)
+	if head.Invalid || head.Seq < 0 || head.MaxSeq < 0 || head.Seq != head.MaxSeq || storedHead != expectedHead {
+		out := failAt(result, "head_mismatch", max(0, head.Seq))
+		out.ExpectedHash, out.StoredHash = ptr(expectedHead.Hex()), ptr(storedHead.Hex())
+		return out, nil
 	}
 
 	// Seed the predecessor. after_seq == 0 starts at genesis, which is chained
@@ -275,7 +297,7 @@ func Verify(ctx context.Context, source Source, p Params) (Result, error) {
 				out.ExpectedHash, out.StoredHash = ptr(recomputed.Hex()), ptr(leafHash.Hex())
 				return out, nil
 			}
-		// 3. An absent payload must be authorized by an erasure record.
+		// 3. An absent payload must be covered by an erasure annotation.
 		case node.ErasureOperation == nil:
 			return failAt(result, "payload_absent_without_erasure_record", node.Seq), nil
 		default:
@@ -293,8 +315,8 @@ func Verify(ctx context.Context, source Source, p Params) (Result, error) {
 	if result.Complete && !p.HasThrough {
 		// The walk reached the chain's end, so the digest it arrived at must be the
 		// digest the head commits to. Without this the verifier would accept a
-		// chain that is internally consistent but is not the one the head names —
-		// which is exactly what a coherent rewrite produces.
+		// chain that is internally consistent but is not the one the head names.
+		// A privileged rewrite of BOTH chain and head remains undetectable here.
 		expected, err := audit.DecodeDigest(head.Hash)
 		if err != nil {
 			return Result{}, ErrMissingHead

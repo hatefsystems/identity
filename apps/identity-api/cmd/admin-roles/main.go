@@ -17,6 +17,8 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
 
@@ -77,9 +79,33 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 	if err != nil {
 		return err
 	}
-	actions, err := adminaction.New(pool, enc, auditCfg.Subject, cfg.ContextRetention)
+	baseline, err := loadOperatorBaseline(ctx, pool, cfg, environment)
 	if err != nil {
 		return err
 	}
-	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke)
+	actions, err := adminaction.New(pool, enc, auditCfg.Subject, baseline.ContextRetention())
+	if err != nil {
+		return err
+	}
+	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke, environment)
+}
+
+func loadOperatorBaseline(ctx context.Context, q db.DBTX, cfg config.AdminConfig, environment string) (legalpolicy.Policy, error) {
+	var configuredID uuid.UUID
+	var err error
+	if cfg.GovernancePolicyID != "" {
+		configuredID, err = uuid.Parse(cfg.GovernancePolicyID)
+		if err != nil || configuredID == uuid.Nil {
+			return legalpolicy.Policy{}, legalpolicy.ErrInvalidPolicy
+		}
+	}
+	baseline, err := legalpolicy.LoadBaseline(ctx, q, configuredID, environment)
+	if err != nil {
+		return legalpolicy.Policy{}, err
+	}
+	if (os.Getenv(config.EnvAdminContextRetention) != "" && cfg.ContextRetention != baseline.ContextRetention()) ||
+		(os.Getenv(config.EnvAdminLegalReleasedRetention) != "" && cfg.LegalReleasedRetention != baseline.ReleasedHoldRetention()) {
+		return legalpolicy.Policy{}, legalpolicy.ErrMismatch
+	}
+	return baseline, nil
 }

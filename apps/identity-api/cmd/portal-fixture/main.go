@@ -92,7 +92,7 @@ func run(args []string) error {
 	}
 	switch args[0] {
 	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
-	case "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
+	case "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
 	case "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup":
 	default:
 		return errors.New("unsupported fixture action")

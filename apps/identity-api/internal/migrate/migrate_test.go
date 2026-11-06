@@ -55,7 +55,7 @@ func openTestDB(ctx context.Context, t *testing.T) *sql.DB {
 		t.Fatalf("create disposable migration database: %v", err)
 	}
 	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		if _, err := admin.ExecContext(cleanup, "DROP DATABASE "+quoted+" WITH (FORCE)"); err != nil {
 			t.Errorf("drop disposable migration database: %v", err)

@@ -1,21 +1,97 @@
 # Admin and Ledger Retention Operations
 
-The implementation remains opt-in. This document describes the current runtime and outstanding release gates; it is not production sign-off. The inherited acceptance matrix is in `.kilo/plans/1789692893214-task-5-3-admin-rbac-legal-holds.md`; the Task 7.6 panel boundary and required evidence are in `.kilo/plans/1793529257288-dpo-legal-compliance-panel.md`. Neither plan is evidence of completed validation or production approval.
+The implementation remains opt-in. This document describes the current runtime and outstanding release gates; it is not production sign-off. The current technical-closure inventory is `.kilo/plans/1793893850853-phase-5-technical-closure.md`; the inherited matrix is `.kilo/plans/1789692893214-task-5-3-admin-rbac-legal-holds.md`, and the Task 7.6 panel boundary is `.kilo/plans/1793529257288-dpo-legal-compliance-panel.md`. Plans, historical acceptance and test source do not certify the current closure changes. Tasks 5.3-5.5 remain unchecked pending fresh final-source local acceptance; production/manual gates remain independently unchecked below.
 
 ## Enablement
 
-1. Apply additive migrations through `00010` using the migration identity. Inventory existing signed data before rollout; never rewrite hashes to conceal old timestamp defects. Identify an explicit verification boundary if historical segments fail.
+1. Inventory schema/history first using the migration identity and follow [migration and contraction](#migration-and-contraction). Current compatible storage includes `00019` head repair and `00020` plaintext contraction; do not run a populated v1 database through `00015`, reset genesis or rewrite hashes to conceal old defects. Identify an explicit verification boundary if historical segments fail.
 2. Deploy account-version-aware issuers on **every** instance and restart old process-local credential stores before moderation is enabled. Ban, suspension, deletion and reactivation advance persistent versions. Old sessions, codes, refresh tokens and step-up grants cannot regain validity. Task 6.2's `ValidateToken` checks that version and live Redis authority; downstream clients using offline JWT verification still retain the configured lifetime, at most ten minutes.
 3. Inject the envelope key/version and shared blind-index pepper through the existing secret delivery mechanism. Hold management uses envelope encryption independently of attribution. Without a pepper, SMS OTP and producer-side capture are unavailable; legal attribution stays unmounted without a verified fixture.
-4. With intake disabled, run `npm exec -- nx run identity-api:admin-legal -- --operation=backfill` in bounded batches until it reports zero. Each converted row is decrypted and checked before plaintext columns are cleared in the same transaction. Retain a key recovery plan and backups. Check all legacy rows and deployed key versions; startup's crypto probe is not a full inventory of old ciphertexts.
+4. With affected intake/writers stopped and `00019` applied, run `npm exec -- nx run identity-api:admin-legal -- --operation=backfill --limit=500` in bounded `1..1000` batches until zero, verify key/data inventory, then apply `00020`. Each converted row is read back, decrypted and binding-checked before its plaintext clearing transaction commits. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory. Full contraction is recognized as converted; partial layouts fail closed.
 5. Obtain approved numeric `ADMIN_CONTEXT_RETENTION` and `ADMIN_LEGAL_RELEASED_RETENTION` durations and approval for opaque replay tombstones. There are no policy defaults. Schedule `admin-audit-publisher --cleanup-contexts` and `admin-legal --operation=cleanup` with separate maintenance credentials. Both use hold-aware deletion; released holds resume original clocks. Neither command deletes ledger evidence.
-6. Run the signer and `admin-audit-publisher` on the same configured audit subject. Publication requires JetStream acknowledgement; delivered metadata is never inferred from an in-memory queue. Signer event-ID deduplication covers redelivery after uncertain acknowledgements. The deletion-event outbox consumer is separate work.
+6. Run the signer and `admin-audit-publisher` on the same configured audit subject with separately scoped non-owner logins. Publication requires JetStream acknowledgement; it is not proof of chaining. Signer event-ID deduplication covers redelivery after uncertain acknowledgement. The separate Task 6.3 lifecycle publisher owns deletion-event delivery, not the admin publisher.
 7. With affected intake closed, run `NX_DAEMON=false npm exec -- nx run identity-api:admin-legal -- --operation=lookup-probe` against the **real deployed signer**, actual schema and configured keys. It creates a credential-free synthetic account, publishes a legacy envelope without a producer index, verifies the signer's stored index, deletes only that synthetic account, and verifies the fixture again after deletion. Canonical v2 resolves the fixture event UUID through `security_ledger_chain.event_id`, joining the payload by `seq`, while retaining the synthetic client/event checks and constant-time expected-index comparison. Capture the printed `ADMIN_LOOKUP_FIXTURE_ID` privately and configure every API replica with it. A timeout leaves the identified synthetic account for controlled diagnosis; never substitute a real person's identifier or delete unrelated evidence. A supplied absent/wrong fixture or mismatched key fails startup/readiness; omitting the setting explicitly keeps attribution unavailable while hold/preservation may remain independently usable. Repeat after signer/key deployment changes and keep the existing pepper pinned. Injecting `WithLookup(..., true)` is not equivalent evidence. The probe is neither a chain trust anchor nor proof of complete historical indexing.
 8. Configure exact HTTPS `ADMIN_ALLOWED_ORIGINS`, Redis actor/subnet limits and timeouts. Set `ADMIN_ENABLED=true` only after the existing governance, authenticated smoke-test and deployed-ingress gates are satisfied. Startup requires DB, Redis, encryption, audit delivery configuration and approved retention. Readiness probes dependencies; missing step-up leaves mutations and attribution unmounted, not ungated. The Task 7.5/7.6 panels have their own acceptance and rollout gates below; this runbook does not authorize enablement.
 
+## Migration and Contraction
+
+Preserve applied `00001`-`00018` SQL byte-for-byte and retain consistent backups.
+The supported migration wrapper serializes migrations and holds signer/purge
+session exclusions across preflight and application on the migration connection.
+Before pending `00015`, it inventories v1 audit/ledger bodies and initialized
+head/checkpoint/settings/chain/erasure state, including histories whose bodies
+are gone. Any data/proof state or failed inventory stops conversion. A populated
+v1 database needs a separately reviewed preservation/conversion procedure; do not
+reset genesis, rehash records or wipe a development database. This guard cannot
+recover history already discarded by an earlier migration. Inventory/drain old
+outbox and JetStream envelopes separately; v1 envelopes are quarantined, not
+transparently upgraded.
+
+For existing v2 storage, use this staged procedure with compatible operator
+binaries and separately controlled migration/backfill credentials:
+
+1. Close affected admin/legal intake and stop/drain incompatible writers on every
+   replica and caller. Preserve queued intent, keys and original hold clocks.
+2. Apply `migrate up-to 19`. `00019_chain_head_terminal.sql` replaces head
+   advancement without rewriting chains or changing function owner/caller ACLs,
+   retains pinned search path/PUBLIC revocation, and requires observed terminal
+   sequence to equal declared `last_seq`. Audit coordination is `5200004`, ledger
+   coordination `5200002`, purge-run lifetime `5200003`.
+3. Run `admin-legal --operation=backfill --limit=500` repeatedly until zero. Limits
+   are `1..1000`; each row is encrypted, read back and binding-verified before all
+   legacy plaintext fields clear in the same transaction. Verify actual ciphertext/
+   key-version inventory, not only zero count/startup readiness. No runtime plaintext
+   fallback is allowed. Fully contracted schema is already converted; partial or
+   unexpected layouts fail closed.
+4. Apply `migrate up` to reach `00020_legal_hold_plaintext_contract.sql`. Its
+   transaction locks `legal_holds` and refuses remaining `reason`,
+   `requesting_authority`, `legal_basis` or unconverted rows before dropping those
+   columns/known constraints without CASCADE. Missing ciphertext is permitted only
+   for legitimately released/purged rows. Preserve encrypted details, original
+   references, kinds, idempotency keys, clocks and tombstones. Unexpected dependencies
+   or incomplete inventory stop contraction, never trigger deletion as a workaround.
+5. Verify physical column absence, encrypted-or-purged invariant and forward recovery,
+   then start compatible replicas/callers before reopening intake. Fresh empty
+   databases apply the whole sequence normally. A failed migration is unrecorded;
+   earlier successful additive migrations may remain applied. Do not downgrade
+   `00019`/`00020` or recreate plaintext columns as a runtime fallback.
+
+## Production Checklist
+
+Every item remains unchecked here. Local automated acceptance can close a defined
+implementation task, never these production/governance/manual authorizations.
+
+- [ ] Approve numeric baseline/workflow/Class B/Class C policies and the actual
+  personal/pseudonymous inventories and lifetimes, including `no_expiry` residuals,
+  legal basis, privacy notices, ROPA/DPIA and truthful DSAR responses.
+- [ ] Inventory real data, legacy requests, ciphertext/key versions and recovery
+  material; complete bounded backfill/read-back checks and data-preserving contraction.
+- [ ] Install real externally approved policy through the restricted trusted
+  installer and provision operators from an authenticated MFA-protected launcher.
+  Environment actor/SPIFFE strings alone are not authentication.
+- [ ] Validate effective deployed non-owner grants, PUBLIC/column/sequence ACLs,
+  ownership/membership/SET ROLE paths, RLS/subject scoping, armed guards and separate
+  API/signer/publisher/purge/maintenance/reconciliation secrets.
+- [ ] Close/drain affected intake and coordinate compatible migration, all replicas,
+  callers, open forms and v1 envelope inventory before reopening; preserve accepted
+  intent, original clocks and rollback compatibility.
+- [ ] Run the real deployed signer lookup probe with actual schema/keys, privately
+  provision its fixture, and verify authenticated post-deletion attribution.
+- [ ] Prove acknowledged outbox delivery, signer dedup/restart and separately
+  reconciled chained receipts/manifest coverage; pending intent/PubAck is not chaining.
+- [ ] Verify ingress/API/worker/APM redaction with synthetic sensitive sentinels,
+  including rejected paths/queries and operator diagnostics.
+- [ ] Perform bounded scoped-login dry-runs, consistent deployed restore/forward-
+  recovery drills, hold/deletion reconciliation and key recovery without data wiping.
+- [ ] Connect aggregate backlog/age/due-review/publisher/failure signals to monitoring
+  with approved thresholds and incident ownership; explicitly authorize destructive
+  scheduling only after the other gates are satisfied.
+- [ ] Complete manual assistive-technology, physical-authenticator, native-browser
+  zoom/hidden-tab/bfcache and actual-ingress checks not observed by automated suites.
+
 ## Operator role provisioning
 
-Use `npm exec -- nx run identity-api:admin-roles -- --user-id=<uuid> --role=<role>`; add `--revoke` for revocation. Roles are `super_admin`, `moderator`, `support`, `dpo`. A grant requires an active account with an enrolled passkey or enabled MFA. Revocation works for inactive targets too. Changes serialize with moderation and commit the encrypted target reference plus durable audit intent in one transaction; retries are audited no-ops.
+Use `npm exec -- nx run identity-api:admin-roles -- --user-id=<uuid> --role=<role>`; add `--revoke` for revocation. Roles are `super_admin`, `moderator`, `support`, `dpo`. The command first loads the installed baseline (optionally pinned by `ADMIN_GOVERNANCE_POLICY_ID`), validates `APP_ENV`/fixture policy and derives context retention from it. Explicit `ADMIN_CONTEXT_RETENTION` or `ADMIN_LEGAL_RELEASED_RETENTION` mismatch, or absent policy, refuses before role/context/outbox changes. Provisioning rechecks the baseline and context retention in the transaction. Install policy separately first; no pre-baseline unaudited provisioning exception exists. A grant requires an active account with an enrolled passkey or enabled MFA. Revocation works for inactive targets too. Changes serialize with moderation and commit encrypted target reference plus durable audit intent; retries are audited no-ops, and old context expiries are never rewritten.
 
 Run from an authenticated, MFA-protected operator environment with separately scoped `DATABASE_URL`. Its trusted launcher supplies `ADMIN_OPERATOR_ID` and `ADMIN_OPERATOR_SPIFFE_ID` from the authenticated identity. These environment values are **attribution, not authentication**; arbitrary callers must not control the launcher or database credentials. Provisioning approval remains an organizational control. No HTTP route assigns roles, no unaudited one-row bootstrap is documented, and no two-person HTTP workflow is claimed.
 
@@ -96,14 +172,55 @@ Production identities must be non-owner and non-superuser. Migrations and test o
 | Identity | Required scope | Must not receive |
 |---|---|---|
 | API | Existing authentication table access; live RBAC SELECT; legal request SELECT/INSERT/UPDATE; restricted context INSERT; admin outbox INSERT; chain/head/erasure SELECT for gated routes; auth epoch sequence USAGE | RBAC membership writes; ledger/audit/chain INSERT, UPDATE, DELETE, TRUNCATE; `advance_chain_head` EXECUTE; outbox delivery UPDATE; trigger bypass |
-| Admin publisher | Subject-scoped marked outbox SELECT/row locks and UPDATE of `published_at`, `attempts`, `next_attempt_at` | User/role writes; narrative decryption keys; chain writes |
-| Signer | Audit/ledger/chain SELECT + INSERT and chain-sequence usage; head SELECT and validated `advance_chain_head` EXECUTE; narrow user-email/FK lookup with compatible locks | Payload or chain UPDATE/DELETE/TRUNCATE; direct head mutation; role writes; legal narratives |
+| Admin publisher | Outbox SELECT/row locks and column UPDATE of `published_at`, `attempts`, `next_attempt_at`, `last_error`; enabled RLS with exact configured-subject/`admin_action` SELECT/UPDATE policies required by startup probe | Other table reads/writes, narrative keys, evidence/role writes, payload/subject/marker updates, PUBLIC/extra/widened policies or RLS bypass |
+| Signer | Both payloads/chains SELECT + INSERT; chain-sequence USAGE; both heads and ledger erasures SELECT; validated `advance_chain_head` EXECUTE; users SELECT and UPDATE(`id`) for existing FK row locking | Payload/chain UPDATE/DELETE/TRUNCATE, direct head mutation, role/DDL authority, legal narratives; users column UPDATE remains SQL authority, not an enforced lock-only API |
 | Operator | Target eligibility/credential and role access, account locks, outbox/context insertion | API network exposure; unrestricted evidence editing |
 | Metadata maintenance | Hold checks, subject locks and bounded context/released-narrative cleanup | Ledger DELETE or trigger bypass |
 | Ledger purge worker | Dedicated `identity_ledger_purge` login; payload `SELECT` + `DELETE`; erasure-index `SELECT` + `INSERT`; outbox `INSERT`; chain/head/hold/settings `SELECT` | Any write on chain, head or erasure index beyond the insert; payload `UPDATE`/`TRUNCATE`; sequence usage; `advance_chain_head` EXECUTE; role/trigger/schema changes; superuser or replication privileges |
+| Receipt reconciliation | Separate SELECT-only login for `security_ledger_erasures`, `event_outbox`, `mvp_audit_logs`, `audit_log_chain`, `audit_log_head`; `LEDGER_RECEIPTS_DATABASE_URL` only | Purge DELETE, outbox/evidence writes, other table reads, sequences, narrative keys, role/DDL authority or fallback to purge/API credentials |
 | Chain-head routine owner (optional) | `identity_chain_head_owner` NOLOGIN; `advance_chain_head` ownership with chain `SELECT` and head `SELECT`/`UPDATE` | Runtime login; membership granted to API/signer/worker; ownership of application tables/schema/database |
 
-Repository migrations do not create deployment login roles. Database grant/RLS policy deployment and validation remain a release gate. Shared `event_outbox` currently relies on subject/marker predicates in publisher SQL; enforce the same restriction in deployment permissions/RLS. Protect backups, restricted context and all secret delivery paths.
+Repository migrations do not create deployment login roles or deploy RLS policies. Deployment/validation remains a release gate. The publisher startup probe now requires enabled `event_outbox` RLS and the exact two applicable role-specific SELECT/UPDATE policies described below, in addition to trusted subject/marker query predicates. Startup probes inspect effective PUBLIC/table/column/sequence privileges, ownership, membership/SET ROLE paths, database/schema CREATE, replication/trigger bypass and armed guards, not only group-role grants. All maintenance/signer/publisher/reconciliation identities are non-owner NOINHERIT logins without memberships. The trusted Go purge enforces retention/holds; ordinary DELETE is not a database-enforced policy boundary against compromised credentials. Protect backups, restricted context and all secret delivery paths.
+
+### Publisher Row Scope
+
+`ProbePublisher` requires `row_security=on`, table RLS enabled and exactly two
+applicable permissive role-only policies: SELECT USING `admin_action AND subject`
+equals the exact configured subject; UPDATE uses the identical USING and WITH
+CHECK. PUBLIC, extra applicable, missing, widened or malformed policies fail.
+The probe matches the canonical `pg_get_expr` form; arbitrary logically equivalent
+expressions are not silently accepted. This is row isolation for publisher
+delivery, not a SQL proof of purge retention/holds or receipt legal authorization.
+
+Run controlled provisioning after auditing existing policies/ACLs; do not overwrite
+conflicting policy names or reuse an owner login. Before enabling table-wide RLS,
+provide reviewed policies for **every other non-owner outbox producer/consumer**,
+including API/admin/lifecycle writes and publishers, purge receipt INSERT and
+receipt-reader SELECT. Missing policies fail closed and can block accepted intent.
+The following is the publisher-only portion, not complete outbox provisioning:
+
+```sql
+\set publisher_role 'DEPLOYED_ADMIN_PUBLISHER_ROLE'
+\set audit_subject 'identity.audit.logs'
+BEGIN;
+GRANT SELECT ON public.event_outbox TO :"publisher_role";
+GRANT UPDATE (published_at, attempts, next_attempt_at, last_error)
+    ON public.event_outbox TO :"publisher_role";
+ALTER TABLE public.event_outbox ENABLE ROW LEVEL SECURITY;
+CREATE POLICY admin_publisher_read ON public.event_outbox FOR SELECT
+    TO :"publisher_role" USING (admin_action AND subject=:'audit_subject');
+CREATE POLICY admin_publisher_delivery ON public.event_outbox FOR UPDATE
+    TO :"publisher_role" USING (admin_action AND subject=:'audit_subject')
+    WITH CHECK (admin_action AND subject=:'audit_subject');
+COMMIT;
+```
+
+Audit effective column grants as well: table REVOKE alone can leave column grants,
+and table-wide UPDATE or payload/subject/marker UPDATE is prohibited. Verify the
+actual publisher login can read/update only marked rows on the configured subject
+and refuses a different configured subject or widened/missing RLS. Reconciliation
+has its own SELECT-only credentials/policies; do not expand purge SELECT to receipt
+material or give that login delivery/evidence mutation rights.
 
 ## Audit, logging and monitoring
 
@@ -129,7 +246,7 @@ Run the Nx `sqlc-vet`, `lint`, `vet`, `test`, `test-race`, `build`, worker/opera
 
 Do not downgrade migrations `00008`–`00010` over durable intent, encrypted requests or auth versions. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, outbox intent and evidence. Migration `00007` preserves seeded/pre-existing roles on rollback and refuses downgrade with banned users. A clean up/down/up of forward-only migrations is deliberately unavailable; test downgrade refusal and forward recovery on disposable fixtures instead.
 
-Task 5.3 stays open until its complete role/route, concurrency, migration, ingress/privacy and operational acceptance matrix is verified. Task 5.4 owns ledger maintenance with subject locks, erasure-record proof and signer-head coordination; external anchoring is explicitly deferred and remains the largest residual gap, because database-relative verification cannot detect a privileged coherent rewrite. Task 5.5 owns operational reviews/transparency and restricted-narrative retention approval. Task 6.2 supplies shared credential stores and live RPC token revocation, but does not close these deployment gates or change the offline-JWT residual-authority window. Phone attribution and historical key rotation remain separate work.
+Tasks 5.3-5.5 remain unchecked until the current closure plan's complete fresh local automated acceptance passes against final source, including all seven serial real-service suites with zero mandatory skips, forward recovery/consistent local restore, generated outputs, images and browser gates. Historical October/November results above do not certify these changes. Production ingress/privacy, policy, deployed privilege/restore and manual checks remain independently open in the [production checklist](#production-checklist). Task 5.4 structural annotations and separate receipt reconciliation are database-relative, not legal-policy proof or protection against coherent privileged rewrite. Task 6.2 does not close those gates or change offline-JWT residual authority. Phone attribution and historical key rotation remain separate work.
 
 ## Legal Review and Transparency (Task 5.5)
 
@@ -164,8 +281,13 @@ The existing hold inventory is `id`, `account_ref`, `applied_by`, `is_active`,
 `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`,
 `idempotency_key`, `details_purged_at`. These are **linkable pseudonymous records**,
 not anonymous tokens. The new erased workflow replay inventory is `operation`,
-`scope`, `idempotency_key`, `result_id`, `erased`; it contains no subjects, actors,
-narratives or content fingerprints. Neither mechanism implements finite replay
+`scope`, `idempotency_key`, `result_id`, `erased`; actor/narrative/content-fingerprint
+values are removed from these stubs. However, `hold_review` scope/result IDs join
+the surviving hold tombstone and therefore remain subject/actor/time linkable.
+Case stubs join an erased case sentinel. This five-field approval does not approve
+all permanent report, transparency replay, governance, chain or receipt metadata;
+see the [complete retained inventory](data-architecture.md#retained-metadata-inventory).
+Neither mechanism implements finite replay
 expiry. If governance does not approve its actual inventory and lifetime, intake
 must stay disabled until a separately reviewed replay protocol exists.
 
@@ -175,6 +297,7 @@ Run with separately provisioned credentials and trusted launcher attribution:
 npm exec -- nx run identity-api:admin-legal -- --operation=policy-install --policy-file=/approved/legal-policy.json
 npm exec -- nx run identity-api:admin-legal -- --operation=workflow-cleanup --limit=500 --dry-run
 npm exec -- nx run identity-api:admin-legal -- --operation=workflow-cleanup --limit=500
+npm exec -- nx run identity-api:admin-legal -- --operation=workflow-status --limit=500
 ```
 
 The policy installer records durable audit intent atomically. It does not verify
@@ -240,7 +363,7 @@ access; they do not create deployment logins or grant production approval.
 |---|---|
 | API | SELECT policy/baseline; required workflow SELECT/INSERT and state-column UPDATE; append-only encrypted history INSERT; transactional replay/counter/report operations. No policy INSERT, narrative/history DELETE, evidence maintenance, or outbox delivery updates. |
 | Policy operator | SELECT/INSERT policy and first baseline binding, legacy inventory reads, outbox INSERT. No workflow cleanup or evidence editing. |
-| Workflow maintenance | Policy and workflow/hold reads, subject locks, restricted-history/association cleanup and erased-state updates, outbox INSERT. No user/role writes, policy writes, audit/ledger mutation or ledger-purge EXECUTE. |
+| Workflow maintenance | SELECT cases/replays/subjects/hold reviews/holds/policy/baseline; existing legal_cases UPDATE; replay UPDATE only `erased`, `event_id`; DELETE events/subjects/case-hold links/hold-review state; outbox INSERT. No user/role/policy/evidence mutation, sequences or head EXECUTE. |
 | Publisher/signer | Existing Task 5.3/5.4 scopes only; no restricted workflow plaintext or keys. |
 
 Restrict mutable columns rather than granting table-wide rewriting where possible.
@@ -262,6 +385,42 @@ commit. Legal case input is capped at 100 historically associated subjects and a
 32 KiB encrypted-history plaintext envelope. Detail history is bounded to 200
 events and 1 MiB of decrypted input, with `history_truncated` when omitted; it is
 not an unbounded document/archive export.
+
+Read `GET /api/v1/admin/legal-holds/{hold_id}/reviews` for a different operator's
+handoff with live `legal.holds.read`, not case-read. The workflow gate remains
+required; no workflow UI or permission expansion is added. Response fields are
+numeric `version`, nullable UTC `next_review_at`, `history` and
+`history_truncated`, using the same 200-event/1-MiB caps. Before the first review,
+version is zero, history empty and scheduling uses original `legal_holds.review_at`;
+after review, an explicit null schedule remains null. Expired/erased/missing
+history is unavailable, not a never-reviewed result. Disclosure audit commits
+before response bytes; reads never restore narratives, change replay inputs or
+release/reset a hold.
+
+`admin-legal --operation=workflow-status --limit=500` uses the installed baseline in a read-only
+REPEATABLE READ snapshot with a 15-second bound. It emits `as_of`, `limit`,
+`eligible_expired`, `held_expired`, nullable `oldest_eligible_age_seconds`,
+`due_reviews` and `overdue_reviews`. Each category has `count` and `lower_bound`;
+at most limit+1 ordered rows per category are aggregated (`1..1000`), so capped
+counts are not totals. Candidate discovery remains subject to statement/deadline
+bounds, not a claim of constant-cost scanning. Due includes equality; overdue is
+strict-before. No subject,
+case, hold, policy ID or narrative appears in diagnostics. A baseline-only binding
+is sufficient for status; it does not enable intake or approve a workflow extension.
+Held expired backlog
+is not cleanup's per-run `Held`, which only counts candidates actually rechecked
+after locking. Status needs only SELECT on cases/subjects/hold-review/hold/policy/
+baseline metadata, no keys, intake enablement, mutation or outbox rights.
+
+Validate CLI options before connecting: backfill/baseline cleanup `1..1000`,
+workflow cleanup `1..500`, status `1..1000`; `--dry-run` only for workflow cleanup
+and `--policy-file` only for policy installation. Status/cleanup use persisted
+policy independently of intake flags. Context/released baseline cleanup is
+strict-before; workflow expiry is at-or-after equality. Closed-case expiry is
+the minimum of original maximum age and closure-relative retention; reviews,
+closure retries and hold release never extend/reset clocks. Two-person approval
+means distinct authorized accounts, not verified distinct humans; delivery is
+still operator attestation.
 
 ## Security Ledger Retention (Task 5.4)
 
@@ -312,12 +471,12 @@ claim that production provisioning, verification or deployment has passed.
    to drain acknowledged work and verify signer shutdown; account for queued
    envelopes rather than silently discarding them. The initial cutover is not a
    routine hourly shutdown requirement. Keep all old signer instances stopped.
-3. Apply additive schema `00015` using the migration identity. **This migration
-   is forward-only and its `Down` refuses**, matching 00008 and 00011: reverting
-   would reinstate a format whose digests nothing can recompute and would drop the
-   chain and erasure tables that are the only surviving record of what was already
-   erased. Confirm both ledgers are empty before applying, since 00015 rebuilds
-   their payload tables.
+3. Apply compatible schema through `00019`/`00020` using the staged
+   [migration procedure](#migration-and-contraction). Pending `00015` rebuilds
+   payload tables and therefore must refuse any populated v1 or initialized proof
+   history, even if payloads are already empty. Stop for separate preservation/
+   conversion, never wipe data or infer fresh genesis. `00015`, `00019`, `00020`
+   are forward-only and Down refuses; compatible v2 history is never rehashed.
 4. Provision the separate runtime roles and narrowly scoped grants (First-Time
    Provisioning SQL), then explicitly initialize **both** chain heads from each
    verified terminal record. Genesis is allowed only for a demonstrably new ledger,
@@ -356,10 +515,10 @@ contract is a privilege contract rather than a function-ownership contract.
 
 | Surface | Runtime authority |
 |---|---|
-| `public.security_event_ledger` | `identity_ledger_purge` holds `SELECT` and `DELETE`. Nothing else may delete, and nobody may `UPDATE` (the trigger rejects it), including on columns. |
+| `public.security_event_ledger` | `identity_ledger_purge` holds `SELECT` and `DELETE`; signer may SELECT/INSERT. No other runtime deletion, payload UPDATE or TRUNCATE is permitted. The trigger does not enforce DELETE retention/holds. |
 | `public.security_ledger_erasures` | `identity_ledger_purge` holds `SELECT` and `INSERT`. Append-only for everyone. |
 | `public.event_outbox` | `identity_ledger_purge` holds `INSERT` only, for its receipt. |
-| `public.security_ledger_chain`, `public.audit_log_chain` | No runtime role holds any write privilege. Append-only for everyone, with no maintenance exemption. |
+| `public.security_ledger_chain`, `public.audit_log_chain` | Signer SELECT/INSERT; purge SELECT on ledger chain only; API/read tools have their scoped SELECT. No runtime UPDATE/DELETE/TRUNCATE; no maintenance exemption. |
 | `public.advance_chain_head(text,bigint,bigint,bigint,bigint)` | Only the signer may execute. SECURITY DEFINER, pinned `search_path`, PUBLIC EXECUTE revoked. |
 
 The worker's startup probe refuses to run unless all of the following hold, so an
@@ -368,20 +527,25 @@ over-provisioned role fails closed at boot rather than at the first erasure:
 - `current_user = session_user` and the login is `identity_ledger_purge`;
 - no superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`, no role
   membership, no `CREATE` on the schema or database;
-- `DELETE` on the payload, `INSERT` on the erasure index and outbox — and
-  **nothing** on either chain table, the heads, `advance_chain_head`, or any
-  `UPDATE`/`TRUNCATE`/`TRIGGER` on the payload or erasure index;
-- both immutability triggers on the payload and both append-only triggers on the
-  chain are enabled (`tgenabled IN ('O','A')`), because erasure is only bounded
-  while the guards are armed;
+- required payload/ledger-chain/head/erasures/holds/settings SELECT, payload
+  DELETE and erasure/outbox INSERT only; no chain/head writes, payload INSERT/
+  UPDATE/TRUNCATE, unrelated reads/writes, sequences or head EXECUTE;
+- payload immutable/no-truncate, both chains' append-only/no-truncate and erasure
+  append-only/no-truncate guards are armed with their expected functions. Guards
+  protect immutability, not retention/hold predicates on ordinary DELETE;
 - the configured receipt subject is provisioned in
   `security_ledger_retention_settings`.
 
-Eligibility is re-decided under the account advisory locks, and the `DELETE`
+Trusted Go code rechecks canonical candidate leaves and eligibility under ordered
+coordination/account/row locks, and its `DELETE`
 restates every predicate: `retain_until < cutoff`, `seq <= highwater`, and no
 active hold on the original `account_ref`. A short row count aborts the whole
 transaction rather than recording an erasure span that does not describe what was
-removed — a wrong span would make a retained payload look lawfully erased.
+removed. An annotation explains missing payloads; it does not prove lawful erasure.
+Ordinary table DELETE permits arbitrary DELETE by that credential. Neither the
+probe, SQL predicates in the honest worker nor a receipt independently proves
+that a compromised purge credential honored retention/holds. Do not claim a SQL
+policy-enforcing routine, restored serializer or erased-content verification.
 
 The transaction is READ COMMITTED with `lock_timeout='2s'` and
 `statement_timeout='15s'`, batches are capped at 5000, and the erasure, its span
@@ -404,9 +568,9 @@ the chain rows are the only surviving record of what was already erased.
 ### First-Time Provisioning SQL
 
 Run the following in an authenticated `psql` operator session connected to the
-target database after `00015`, with the signer drained and the schedule disabled.
+target database after `00019`/`00020`, with the signer drained and the schedule disabled.
 The operator must be authorized to create roles and transfer function ownership;
-these are not runtime privileges. Replace the three uppercase role placeholders
+these are not runtime privileges. Replace the four uppercase role placeholders
 with existing, separately provisioned deployment logins. The new owner/worker
 roles deliberately fail creation if already present: inspect existing attributes,
 memberships, ownership and ACLs instead of silently reusing or resetting a role.
@@ -419,6 +583,7 @@ publisher subject-scoped outbox permissions remain required.
 \set signer_role 'DEPLOYED_SIGNER_ROLE'
 \set api_role 'DEPLOYED_API_ROLE'
 \set metadata_role 'DEPLOYED_METADATA_MAINTENANCE_ROLE'
+\set reconciler_role 'DEPLOYED_RECEIPT_RECONCILIATION_ROLE'
 SELECT current_database() AS ledger_database \gset
 
 -- Canonical format v2 (migration 00015).
@@ -427,17 +592,17 @@ SELECT current_database() AS ledger_database \gset
 -- to own. Erasure is an ordinary DELETE on the payload table, so the authority
 -- question is a plain privilege question, and the purge login is given exactly
 -- three write rights: DELETE on the payload, INSERT on the erasure index, and
--- INSERT on the outbox for its receipt. It holds nothing at all on the chain
--- tables, which is what keeps a retention purge from being able to remove
--- tamper-evidence.
+-- INSERT on the outbox for its receipt. Required ledger-chain SELECT is not a
+-- chain write. This isolates tamper-evidence mutation, not retention/hold policy
+-- enforcement against a compromised ordinary DELETE credential.
 BEGIN;
 CREATE ROLE identity_ledger_purge LOGIN NOINHERIT NOSUPERUSER
     NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC,
-    :"signer_role", :"api_role", :"metadata_role";
+    :"signer_role", :"api_role", :"metadata_role", :"reconciler_role";
 REVOKE CREATE ON DATABASE :"ledger_database" FROM PUBLIC,
-    :"signer_role", :"api_role", :"metadata_role";
+    :"signer_role", :"api_role", :"metadata_role", :"reconciler_role";
 GRANT CONNECT ON DATABASE :"ledger_database" TO identity_ledger_purge;
 GRANT USAGE ON SCHEMA public TO identity_ledger_purge, :"signer_role", :"api_role";
 
@@ -472,6 +637,8 @@ GRANT SELECT, INSERT ON public.security_event_ledger, public.security_ledger_cha
 GRANT USAGE ON SEQUENCE public.security_ledger_chain_seq, public.audit_log_chain_seq
     TO :"signer_role";
 GRANT SELECT ON public.security_ledger_head, public.audit_log_head TO :"signer_role";
+GRANT SELECT ON public.security_ledger_erasures, public.users TO :"signer_role";
+GRANT UPDATE (id) ON public.users TO :"signer_role";
 GRANT EXECUTE ON FUNCTION public.advance_chain_head(text, bigint, bigint, bigint, bigint)
     TO :"signer_role";
 
@@ -479,7 +646,17 @@ GRANT EXECUTE ON FUNCTION public.advance_chain_head(text, bigint, bigint, bigint
 GRANT SELECT ON public.security_event_ledger, public.security_ledger_chain,
     public.mvp_audit_logs, public.audit_log_chain,
     public.security_ledger_head, public.audit_log_head,
-    public.security_ledger_erasures TO :"api_role";
+     public.security_ledger_erasures TO :"api_role";
+
+-- Reconciliation is separate from the purge login. Existing login attributes,
+-- ownership, PUBLIC/column ACLs and membership paths must be audited separately.
+REVOKE ALL ON public.security_ledger_erasures, public.event_outbox,
+    public.mvp_audit_logs, public.audit_log_chain, public.audit_log_head
+    FROM :"reconciler_role";
+GRANT USAGE ON SCHEMA public TO :"reconciler_role";
+GRANT SELECT ON public.security_ledger_erasures, public.event_outbox,
+    public.mvp_audit_logs, public.audit_log_chain, public.audit_log_head
+    TO :"reconciler_role";
 
 ALTER ROLE identity_ledger_purge IN DATABASE :"ledger_database" SET statement_timeout = '15s';
 ALTER ROLE identity_ledger_purge IN DATABASE :"ledger_database" SET lock_timeout = '2s';
@@ -509,8 +686,9 @@ step rather than part of 00015. `internal/retentiondbintegration` asserts the
 properties that do not depend on it: SECURITY DEFINER, a pinned `search_path`,
 and no PUBLIC EXECUTE.
 
-Do not give the worker a chain-table grant, a sequence grant, or EXECUTE on
-`advance_chain_head`. Its startup probe refuses to run if it holds any of them,
+Do not give the worker a chain-table write, a sequence grant, or EXECUTE on
+`advance_chain_head`. Required ledger-chain SELECT remains necessary. Its startup
+probe refuses to run if it holds any prohibited grant,
 so an over-provisioned worker fails closed at boot rather than at the first
 erasure. Deployment roles must have no
 inherited ownership/CREATE/bypass grants either; the REVOKEs above do not remove
@@ -567,7 +745,7 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '15s';
 SELECT pg_advisory_xact_lock(5200002::bigint);
-SELECT pg_advisory_xact_lock(5200003::bigint);
+SELECT pg_advisory_xact_lock(5200004::bigint);
 -- SHARE MODE on the chain tables: they are what a terminal claim is checked
 -- against, and they are the tables that must not gain a row mid-bootstrap.
 LOCK TABLE public.security_ledger_chain, public.audit_log_chain IN SHARE MODE;
@@ -630,7 +808,7 @@ The selected subject must match `AUDIT_SUBJECT` on worker, publisher and signer.
 Keep the schedule disabled while validating deployed ACLs with `psql` metadata
 (`\du+`, `\dp`, `\df+`) and the worker's startup probe.
 
-Privilege audit. Every result in the first query must be `false`; every
+Privilege audit. Only the signer in the first query must report `true`; every
 `can_erase` and `can_record` must be `true`; and every `can_write_chain` must be
 `false`:
 
@@ -648,14 +826,24 @@ SELECT has_table_privilege('identity_ledger_purge', 'public.security_event_ledge
        has_table_privilege('identity_ledger_purge', 'public.security_ledger_erasures', 'INSERT') AS can_record,
        has_table_privilege('identity_ledger_purge', 'public.event_outbox', 'INSERT') AS can_receipt;
 
--- No runtime role, including the worker, may touch tamper-evidence.
+-- No runtime UPDATE/DELETE/TRUNCATE on chains, erasures or heads.
 SELECT role_name, table_name,
-       has_table_privilege(role_name, table_name, 'INSERT,UPDATE,DELETE,TRUNCATE') AS can_write_chain
-FROM (VALUES ('identity_ledger_purge'), (:'signer_role'), (:'api_role'), (:'metadata_role')) AS roles(role_name)
+       has_table_privilege(role_name, table_name, 'UPDATE,DELETE,TRUNCATE') AS can_write_chain
+FROM (VALUES ('identity_ledger_purge'), (:'signer_role'), (:'api_role'), (:'metadata_role'), (:'reconciler_role')) AS roles(role_name)
 CROSS JOIN (VALUES ('public.security_ledger_chain'), ('public.audit_log_chain'),
     ('public.security_ledger_erasures'), ('public.security_ledger_head'), ('public.audit_log_head'))
     AS tables(table_name)
-WHERE has_table_privilege(role_name, table_name, 'INSERT,UPDATE,DELETE,TRUNCATE');
+WHERE has_table_privilege(role_name, table_name, 'UPDATE,DELETE,TRUNCATE');
+
+-- INSERT is signer-only on chains, purge-only on erasures, and absent on heads.
+-- Any row here is an unexpected effective INSERT grant.
+SELECT role_name, table_name
+FROM (VALUES ('identity_ledger_purge'), (:'signer_role'), (:'api_role'), (:'metadata_role'), (:'reconciler_role')) AS roles(role_name)
+CROSS JOIN (VALUES ('public.security_ledger_chain'), ('public.audit_log_chain'),
+    ('public.security_ledger_erasures'), ('public.security_ledger_head'), ('public.audit_log_head')) AS tables(table_name)
+WHERE has_table_privilege(role_name, table_name, 'INSERT')
+  AND NOT (role_name=:'signer_role' AND table_name IN ('public.security_ledger_chain','public.audit_log_chain'))
+  AND NOT (role_name='identity_ledger_purge' AND table_name='public.security_ledger_erasures');
 
 -- The payload is immutable for everyone: this must report 0 rows.
 SELECT role_name FROM (VALUES ('identity_ledger_purge'), (:'signer_role'),
@@ -663,11 +851,11 @@ SELECT role_name FROM (VALUES ('identity_ledger_purge'), (:'signer_role'),
 WHERE has_table_privilege(role_name, 'public.security_event_ledger', 'UPDATE')
    OR has_any_column_privilege(role_name, 'public.security_event_ledger', 'UPDATE');
 
--- Both immutability and append-only guards must be armed, or erasure is unbounded.
+-- Immutability/append-only guards must be armed; they do not police DELETE policy.
 SELECT c.relname, t.tgname, t.tgenabled
 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
 WHERE t.tgname LIKE 'trg\_%' AND c.relname IN
-      ('security_event_ledger', 'security_ledger_chain', 'audit_log_chain', 'mvp_audit_logs')
+      ('security_event_ledger', 'security_ledger_chain', 'audit_log_chain', 'mvp_audit_logs', 'security_ledger_erasures')
 ORDER BY c.relname, t.tgname;
 ```
 
@@ -754,6 +942,55 @@ Linux/CGO and a C compiler. Validate generated-code reproducibility, image launc
 forward-only downgrade refusal and restoration. The older Task 5.3 test results
 above are not evidence that these new gates have passed.
 
+### Receipt Reconciliation
+
+DELETE, erasure spans and durable receipt intent commit together, not a signed
+receipt. The compatible publisher retries outbox delivery and the signer appends
+the receipt; PubAck/`published_at` only establishes transport acknowledgement, not
+chaining. Legitimate pending intent must not prevent signer reseeding/restart.
+Actually inspected held-only batches write one `legal.ledger.purge_skipped`
+receipt with no erasure rows; prefiltered holds are not inspected skips. Dry-run
+rolls back DELETE, spans and receipt intent.
+
+New receipt bodies add `span_manifest_version=1` and lowercase-hex
+`span_manifest_sha256` binding the exact ordered inclusive span manifest. Hash
+ASCII `identity/security-ledger-erasure-spans/v1`, one NUL byte, unsigned big-endian
+64-bit span count, then each `(first_seq,last_seq)` as two unsigned big-endian
+64-bit integers. Coordinates are positive signed-int64-range values, sorted,
+non-overlapping and maximally coalesced, matching deleted count/high-water. A
+held-only receipt commits the empty manifest. This is receipt content, not a new
+audit canonical format; old signed bytes/hashes are never rewritten or retroactively
+certified. Historical receipts without both manifest fields are legacy/unbound.
+
+```sh
+npm exec -- nx run identity-api:admin-legal -- --operation=ledger-receipts --limit=100 --receipt-proof-limit=1000
+```
+
+Inject only separately scoped `LEDGER_RECEIPTS_DATABASE_URL`, never purge/API
+credentials. Required SELECT is exactly erasures, receipt outbox and Class C
+payload/chain/head; no keys, evidence writes or sequence/DDL/role authority.
+Options are operation-specific: limit `1..1000`, proof limit `1..10000`, no
+dry-run/policy file. One read-only REPEATABLE READ snapshot keyset-pages inventory,
+caps span queries and Class C proof work, and has a 15-second deadline.
+
+Sanitized aggregates are `inspected`, `recorded_pending`, `chained`,
+`legacy_unbound`, `missing_unavailable`, `invalid`, `incomplete`, `pages`,
+`inventory_capped`, `inventory_complete`, `proof_checked`, `proof_complete`,
+`proof_verified`. Proof counts/flags refer to bounded Class C chain **linkage**,
+not recomputation of unrelated audit narratives. Hash-only pages are at most 100
+nodes within the total proof limit; each correlated receipt body/leaf is checked
+separately. They correlate operation UUID internally across annotations,
+outbox, receipt body/leaf and bounded linkage coverage, but output contains no IDs,
+receipt bodies or proof digests. A verified prefix can cover a receipt while
+`proof_complete=false`; it is not a full-chain pass. Capped inventory is not full
+inventory assurance, and missing retained material is unavailable assurance.
+Inventory coverage is limited to operations discoverable from retained erasures,
+receipt outbox and Class C receipt material; it is not proof that no lost or
+never-ingested historical operation existed.
+There is no global pass or independent proof of legal/policy compliance by a
+compromised trusted purge credential. Structural verification remains separate;
+both operations remain database-relative without an external anchor.
+
 ### Rollback and Restore Gates
 
 Disable the schedule and follow the existing [emergency disablement](#routine-authority-contract)
@@ -771,7 +1008,8 @@ repair with a compatible release, never downgrade storage or rewrite stored
 hashes. Migration `00015` refuses Down unconditionally, including against a
 seemingly empty database, and `00011` does the same.
 
-Restore the chain tables, both heads, the erasure index, holds and outbox from one
+Restore both chain/payload tables and sequence state, both heads, erasure index,
+holds, governance/workflow, retention settings and outbox from one
 consistent backup, validate before reopening ingestion or purge, reconcile
 authoritative holds/deletions, then resume eligible expiry without resetting clocks
 or bypassing holds. A restore that includes `security_ledger_chain` but predates
@@ -782,3 +1020,82 @@ Neither a database-relative proof nor a Class C receipt independently detects a
 coherent database rewrite or rolled-back backup. External anchoring remains
 deferred; Task 5.3 deployment sign-off and Task 5.5 narrative-retention approval
 and cleanup are not satisfied by this worker.
+
+## Phase 5 Technical Closure (2026-11-05)
+
+The plan `.kilo/plans/1793893850853-phase-5-technical-closure.md` passed fresh
+local automated acceptance against the dirty worktree based on
+`fedbe1ebee53be2bfd3dfeb5d66ef6ee2e8749d7`. This is implementation acceptance,
+not authorization to enable production admin, purge, legal intake or governance.
+The production checklist above remains unchecked.
+
+The complete uncached seven-suite retry used fresh PostgreSQL 16, Redis 7 and
+JetStream 2.10, sequentially through the existing Nx harness. Every final exit was
+0, every mandatory skip/failure count was 0, and owned service teardown was
+affirmatively confirmed. Counts include nested test records and repeated package
+coverage across suites, not 6,462 distinct test functions.
+
+| Suite | Passing Package Runs | Passing Test/Subtest Records |
+|---|---:|---:|
+| `test-security-db` | 19 | 1,577 |
+| `test-admin-integration` | 7 | 819 |
+| `test-retention-integration` | 3 | 355 |
+| `test-legal-workflow-integration` | 4 | 671 |
+| `test-grpc-integration` | 4 | 560 |
+| `test-lifecycle-integration` | 1 | 370 |
+| `test-portal-integration` | 11 | 2,110 |
+| Total | 49 | 6,462 |
+
+Coverage included single-connection migration entrypoints and cancellation,
+pre-00015 populated/initialized/erased-v1 refusal without lost history,
+00019 terminal/coordinator/owner/ACL checks, verified backfill and transactional
+00020 contraction, exact legal input preflight before grant consumption, keyless
+release, captured query-log privacy sentinels, review GET handoff/expiry and
+workflow status, and the effective restricted-login privilege matrices.
+
+The real worker/publisher/signer/reconciler cases covered pending intent during
+publisher outage, signer restart, acknowledged redelivery deduplication, both
+hold/purge lock orders, simultaneous batches, cutoff/high-water boundaries,
+canonical corruption rollback, held-only receipts, manifest tampering, legacy
+unbound receipts, and unavailable retained receipt evidence. The uncertainty
+test commits a real transaction and then injects a client lost-ack error; it does
+not certify actual socket-loss handling or production fault recovery.
+
+`TestForwardRecoveryConsistentRestoreIntegration` passed the refused-20/verified
+backfill/forward-20 recovery path, two frozen whole-database TEMPLATE restores,
+and a matching PostgreSQL 16 `pg_dump` to `pg_restore` streamed in memory
+(78.91 seconds for the matching-client run). It compared all public rows and
+sequence state, then verified both chains/heads, retained/erased payloads,
+erasures, encrypted holds/replay clocks, governance/settings, pending/chained
+receipts, crypto bindings and signer recovery. No raw dump or key material was
+retained. This local clone/logical-restore drill is not deployed backup, key
+recovery, independent-history or disaster-recovery certification.
+
+Linux unit and CGO race targets, ordinary and integration-tag vet/lint (zero
+issues), SQL/Buf checks, all required binary builds, web/UI checks, fresh image
+smoke/CSP and both real browser suites also exited 0. Final counts were 177
+helpers, 586 web tests and 17 UI tests; the portal browser covered 18 viewports
+and six no-JavaScript routes, and admin/legal covered 42 masked layouts and
+clean retirement of the actual production signer. Repeated generation preserved
+all 24 SQL Go and four protobuf Go files byte-for-byte; migrations 00001-00018
+and tracked canonical schema sources were unchanged.
+
+Exact command/exit records, generated-file vectors, sanitized browser evidence
+and final source reconciliation are in this run's
+`C:\Users\Hatef\AppData\Local\Temp\kilo\phase5-20261105T165058Z\acceptance.json`
+and its `admin-browser`/`portal-browser` directories. The
+[DevOps acceptance record](devops-operations.md#phase-5-technical-closure-2026-11-05)
+records toolchain and immutable image identities. Earlier failures are recorded,
+not counted as passes; the obsolete plaintext shadowing fixture was corrected
+without removing its negative assertion, followed by a complete seven-suite retry.
+
+Production DPO/Legal numeric policy, joinable-metadata and replay inventories,
+real-key backfill, authenticated grants/RLS, deployed ingress/APM redaction,
+signer probing, schedule/consumer rollout and backup recovery remain open.
+Native bfcache/hidden-tab/zoom, physical authenticators and assistive-technology
+review remain unobserved manual gates. The signer `UPDATE(id)` grant is actual
+SQL update authority, not a database-enforced lock-only capability. Ordinary
+purge grants, erasure annotations and receipts do not prove legal authorization
+or policy compliance by a compromised trusted worker. External anchoring remains
+deferred. No production flags, deployed credentials or approvals were changed,
+and this work was not committed or published.

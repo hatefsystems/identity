@@ -113,7 +113,7 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 #### The "Zero Trust" Admin Philosophy
 - **No Manual Deletion:** Admins cannot manually perform a "Hard Delete" on a user account. Hard Deletes are exclusively triggered by the user via the "Right to be Forgotten" self-service flow, which initiates a scheduled Cron Job.
 - **Immutable Audit Logging:** Every state change initiated by an admin (e.g., banning a user, changing a role, triggering password resets) is immutably logged in the database ledger. To minimize resource utilization during the MVP phase, these logs are stored in a dedicated PostgreSQL table; they are migrated to the analytical database (ClickHouse) post-MVP.
-  - **Cryptographic Log Chaining:** Each audit log row is chained to its predecessor. Verification detects inconsistent stored segments; it is not an independent defense against a privileged coherent database rewrite. Class B authorized retention uses checkpoints and a durable head, while Class C remains unchanged. External trust anchoring is deferred.
+  - **Cryptographic Log Chaining:** Canonical v2 separates retained payloads from append-only `audit_log_chain` / `security_ledger_chain` nodes and maintains both durable heads. Verification checks links, retained leaves and Class B erasure annotations, not legal authorization or receipt chaining. Nodes retain event UUIDs and digests with no expiry, one per event; there is no constant-size proof after payload erasure. A coherent privileged rewrite/rollback is not independently detected. External anchoring remains deferred.
 
 ### Privacy & GDPR Compliance
 - **PII Masking:** Personally Identifiable Information is masked at the application layer before logging or analytics processing.
@@ -193,26 +193,38 @@ Task 5.3 runtime and release boundaries: [Admin operations](admin-operations.md)
 
 `security-ledger-purge` is independent of Class A erasure and Class C history.
 The worker uses a dedicated database login, bounded keyset batches and one
-database cutoff/high-water mark per run. A restricted SECURITY DEFINER routine
-rechecks active holds under the same account-lock protocol as hold changes,
-including absent user rows; only strict expired rows may be deleted. The routine
-atomically compacts content-free erased-span checkpoints and writes durable
-Class C maintenance intent. `admin-audit-publisher` delivers that intent with
+database cutoff/high-water mark per run. Trusted Go code rechecks canonical leaves
+and active holds under the same account-lock protocol as hold changes, including
+absent user rows, before ordinary bounded DELETE of strict expired payloads.
+There is no v2 SECURITY DEFINER purge routine or SQL proof that a compromised
+purge credential honored policy. DELETE, exact erased-span annotations and durable
+Class C receipt intent commit together. `admin-audit-publisher` delivers intent with
 JetStream acknowledgement on `AUDIT_SUBJECT` (default `identity.audit.logs`).
 The retention worker itself has no broker credential or encryption secret.
 
 Signer and purge share short READ COMMITTED transactions with ledger coordination
 before account/row locks. Signer restart and uncertain-commit recovery use the
-durable `security_ledger_head`, never the latest surviving payload. Routine
+durable heads and actual terminal chain nodes, never the latest surviving payload. Routine
 operation requires no scheduled signer stop. Initial rollout does require a
 controlled drain, verified-history bootstrap and compatible signer/API/worker
 deployment before destructive enablement. The non-root image ships all three
 plus the existing admin publisher; host jobs use explicit entrypoint overrides.
 
-Retained-segment verification uses a bounded snapshot of live rows, head and
-checkpoints. It distinguishes erased spans from hash failures but cannot
-recompute erased bodies or independently detect a coherent privileged rewrite.
-External anchors are explicitly deferred. Rollback first disables scheduling
-and maintenance EXECUTE; initialized/purged state is forward-only and must not
+Structural verification uses bounded snapshots of chains, heads, retained bodies
+and erasure annotations. Separate read-only `admin-legal --operation=ledger-receipts`
+uses its own scoped credentials to assess pending/chained/legacy/unavailable receipt
+and manifest coverage; publication is not chaining. Neither operation recomputes
+erased bodies, proves legal authorization or independently detects coherent
+privileged rewrite/rollback. External anchors are deferred. Rollback first disables
+scheduling, revokes purge DELETE/erasure INSERT and waits for in-flight work;
+initialized/purged state is forward-only and must not
 be served by old signer/verifier binaries. Task 5.3 operational approval and
 Task 5.5 narrative-retention policy remain separate gates in the runbook.
+
+Existing v2 upgrades preserve applied SQL and data: stop affected intake/writers,
+apply `00019` head-terminal/coordination repair, run bounded verified legal-hold
+backfill to zero, then apply `00020` physical plaintext-column contraction and start
+compatible binaries. Pending `00015` refuses populated v1 or initialized proof
+state through supported migration entrypoints; separate preservation/conversion
+is required, never a development-data reset. See the runbook for inventories and
+the still-unchecked production/manual checklist.

@@ -244,6 +244,10 @@ func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, err
 	}
+	if err := signer.ProbePrivileges(connectCtx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return pool, nil
 }
 

@@ -35,7 +35,7 @@ const integrityFailureDescriptions: Record<AdminVerificationFailure, string> = {
   record_not_serializable: 'A retained record could not be serialized in canonical format.',
   head_mismatch: 'The checked end does not agree with the stored logical head.',
   payload_absent_without_erasure_record:
-    'A payload is absent without an authorizing erasure record.',
+    'A payload is absent without a recorded erasure annotation.',
   no_stored_records:
     'No stored records were available in the reported range. This is no verification evidence, not proof of no activity.',
 };
@@ -304,7 +304,7 @@ function IntegrityQuery({
             {page.chain === 'ledger' && run && (
               <div className="space-y-2 text-sm">
                 <p>
-                  Authorized erasures checked: {page.erased_checked} on the last page;{' '}
+                  Erasure annotations checked: {page.erased_checked} on the last page;{' '}
                   {run.erased_checked} cumulative. These are a subset of {run.checked} checked chain
                   nodes, not extra work.
                 </p>
@@ -315,9 +315,10 @@ function IntegrityQuery({
                   </p>
                 )}
                 <p className="text-muted-foreground">
-                  Erased payloads retain chain links and erasure authorization, but their original
+                  Erased payloads retain chain links and erasure annotations, but their original
                   bodies cannot be recomputed. A fully erased ledger can have clean surviving links
-                  without verifying its erased content.
+                  without verifying its erased content. An annotation does not establish legal
+                  authorization or that the purge operator honored retention and holds.
                 </p>
               </div>
             )}
@@ -343,7 +344,7 @@ function IntegrityQuery({
         <p className="text-sm leading-relaxed text-muted-foreground">
           Each page uses its own database snapshot, not one multi-page global snapshot or an
           independently authenticated head. A continued run does not authenticate new tail records.
-          Audit-chain verification does not establish tail-truncation detection; preserve the
+          A durable-head check does not independently detect a coherent privileged rollback; preserve the
           backend&apos;s reported scope when interpreting any result.
         </p>
         <p className="text-sm leading-relaxed text-muted-foreground">

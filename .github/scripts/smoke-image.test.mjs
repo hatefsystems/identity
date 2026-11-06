@@ -78,6 +78,18 @@ test('migration smoke checks its missing-database error instead of a JSON log or
   assert(!maintenanceSucceeded({ ...missingDatabase, stderr: '{"level":"ERROR"}' }, 'migrate'));
 });
 
+test('ledger purge smoke requires its exact dedicated configuration failure, not an arbitrary ERROR', () => {
+  const reason = 'config: SECURITY_LEDGER_PURGE_DATABASE_URL is required; API credentials are not a fallback';
+  const good = { status: 1, stdout: JSON.stringify({ level: 'ERROR', msg: 'security ledger purge failed', reason }), stderr: '' };
+  assert(maintenanceSucceeded(good, 'security-ledger-purge'));
+  for (const record of [{ level: 'ERROR' }, { level: 'ERROR', msg: 'another binary failed', reason },
+    { level: 'ERROR', msg: 'security ledger purge failed', reason: 'connection refused' },
+    { level: 'INFO', msg: 'security ledger purge failed', reason }]) {
+    assert(!maintenanceSucceeded({ ...good, stdout: JSON.stringify(record) }, 'security-ledger-purge'));
+  }
+  for (const status of [0, 125, null]) assert(!maintenanceSucceeded({ ...good, status }, 'security-ledger-purge'));
+});
+
 test('collects real local static assets, preserves queries, and deduplicates preloads', () => {
   const html =
     '<link href="/_next/static/app.css?v=1&amp;x=2"><script src="/_next/static/app.js"></script>' +

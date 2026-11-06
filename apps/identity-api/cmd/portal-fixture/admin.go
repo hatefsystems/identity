@@ -4,15 +4,20 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -76,6 +81,8 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 	}
 	operator, identity := uuid.New(), "spiffe://portal-fixture.test/operator"
 	switch action {
+	case "admin-worker-roles":
+		return adminWorkerRoles(ctx, pool, runID, cfg.Subject)
 	case "admin-policy":
 		op, err := actions.Begin(ctx)
 		if err != nil {
@@ -121,7 +128,7 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 		}
 		id := uuid.MustParse(account.UserID)
 		for _, role := range roles {
-			if err := rbac.ProvisionRole(ctx, actions, operator, identity, id, role, false); err != nil {
+			if err := rbac.ProvisionRole(ctx, actions, operator, identity, id, role, false, "test"); err != nil {
 				return nil, errors.New("cannot provision fixture operator grant")
 			}
 		}
@@ -237,7 +244,7 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 			return nil, errors.New("explicit fixture role required for revocation")
 		}
 		for _, role := range roles {
-			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, true); err != nil {
+			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, true, "test"); err != nil {
 				return nil, errors.New("cannot revoke fixture operator grant")
 			}
 		}
@@ -313,4 +320,63 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 		}
 	}
 	return nil, errors.New("unsupported administrative fixture operation")
+}
+
+func adminWorkerRoles(ctx context.Context, pool *pgxpool.Pool, runID, subject string) (any, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if !runIDPattern.MatchString(runID) || validateDatabase(dsn, runID) != nil {
+		return nil, errors.New("invalid admin worker database boundary")
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.New("cannot begin owned worker provisioning")
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	urls := map[string]string{}
+	for _, kind := range []string{"signer", "publisher"} {
+		password := make([]byte, 32)
+		if _, err := rand.Read(password); err != nil {
+			return nil, errors.New("cannot generate owned worker credentials")
+		}
+		secret := base64.RawURLEncoding.EncodeToString(password)
+		role := "portal_" + kind + "_" + runID
+		identifier := pgx.Identifier{role}.Sanitize()
+		statements := []string{
+			"CREATE ROLE " + identifier + " LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '" + secret + "'",
+			"GRANT USAGE ON SCHEMA public TO " + identifier,
+		}
+		if kind == "signer" {
+			statements = append(statements,
+				"GRANT SELECT, INSERT ON audit_log_chain, security_ledger_chain, mvp_audit_logs, security_event_ledger TO "+identifier,
+				"GRANT SELECT ON audit_log_head, security_ledger_head, security_ledger_erasures TO "+identifier,
+				"GRANT SELECT ON users TO "+identifier,
+				"GRANT UPDATE(id) ON users TO "+identifier,
+				"GRANT USAGE ON SEQUENCE audit_log_chain_seq, security_ledger_chain_seq TO "+identifier,
+				"GRANT EXECUTE ON FUNCTION advance_chain_head(text,bigint,bigint,bigint,bigint) TO "+identifier,
+			)
+		} else {
+			// Owner API/fixture writes remain unaffected. This real publisher login
+			// can see and mark only the configured, committed admin receipt scope.
+			predicate := "admin_action AND subject='" + strings.ReplaceAll(subject, "'", "''") + "'"
+			statements = append(statements,
+				"GRANT SELECT ON event_outbox TO "+identifier,
+				"GRANT UPDATE(published_at, attempts, next_attempt_at, last_error) ON event_outbox TO "+identifier,
+				"ALTER TABLE event_outbox ENABLE ROW LEVEL SECURITY",
+				"CREATE POLICY portal_publisher_read ON event_outbox FOR SELECT TO "+identifier+" USING ("+predicate+")",
+				"CREATE POLICY portal_publisher_delivery ON event_outbox FOR UPDATE TO "+identifier+" USING ("+predicate+") WITH CHECK ("+predicate+")",
+			)
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(ctx, statement); err != nil {
+				return nil, errors.New("cannot install owned worker privileges")
+			}
+		}
+		endpoint, _ := url.Parse(dsn)
+		endpoint.User = url.UserPassword(role, secret)
+		urls[kind+"_database_url"] = endpoint.String()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, errors.New("cannot commit owned worker privileges")
+	}
+	return urls, nil
 }

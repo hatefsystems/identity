@@ -163,7 +163,7 @@ A backup is only as good as its recovery validation. The operations team execute
 4. **Redis Cache Reconstruction:**
    * Restore the latest RDB file. Validate that the rate limiting sliding window sets are parsed correctly.
 5. **Ledger Integrity Audit (MVP PostgreSQL / Post-MVP ClickHouse):**
-   * Recompute Class C's stored chain in `mvp_audit_logs`. For the Class B security ledger, validate the restored durable head, retained bodies and authorized checkpoint transitions as described below; erased bodies cannot be recomputed. These are database-relative checks, not proof of complete ingestion or detection of a coherently rolled-back backup. Post-MVP ClickHouse still requires its separately approved verification procedure.
+   * Verify canonical-v2 `audit_log_chain` and `security_ledger_chain` against their own durable heads and derived genesis, recomputing leaves only from retained `mvp_audit_logs` / `security_event_ledger` bodies. Ledger erasure annotations explain absent bodies; they do not prove receipt chaining or legal authorization. These are database-relative checks, not complete-ingestion assurance or detection of a coherently rolled-back backup. Post-MVP ClickHouse still requires its separately approved verification procedure.
 
 ### 3.3 Security Ledger Retention Recovery
 
@@ -172,21 +172,25 @@ HA deployments. The independent backup rotations above do not change when a
 live ledger row expires. Deleted payloads may exist in an older backup until it
 rotates out; restoration is not a mechanism to bypass erasure or active holds.
 
-1. Disable the host retention schedule and revoke the purge routine's EXECUTE
-   grant before recovery. Stop/drain signer and ingestion, and stop affected
+1. Disable the host retention schedule and revoke the purge login's payload
+   DELETE and erasure-index INSERT grants before recovery. Wait for or stop
+   in-flight workers; revocation does not cancel an executing statement. There
+   is no v2 purge EXECUTE grant. Stop/drain signer and ingestion, and stop affected
    publishers while selecting a recovery point. Preserve the original system
    and incident evidence; do not delete proof state to make a check pass.
-2. Restore `security_event_ledger`, `security_ledger_head`,
-   `security_ledger_checkpoints`, protected maintenance settings, legal holds,
-   Class C history and `event_outbox` from a consistent backup/WAL point. Never
-   combine payloads from one point with a later or earlier head/checkpoint set.
+2. Restore both payload tables (`security_event_ledger`, `mvp_audit_logs`), both
+   chains (`security_ledger_chain`, `audit_log_chain`), both heads, chain sequence
+   allocation state, `security_ledger_erasures`, `security_ledger_retention_settings`,
+   legal holds/governance/workflow state and `event_outbox` from one consistent
+   backup/WAL point. Never mix a chain/head, payload, erasure or receipt inventory
+   from different points. The retired checkpoint table is not v2 proof state.
    Restore protected ownership/grants through the controlled provisioning
    procedure, not the runtime worker login.
 3. Keep ingestion and destructive purge closed while verifying canonical
-   retained bodies, checkpoint boundaries/counts/non-overlap, logical terminal
+   retained bodies, erasure boundaries/non-overlap, actual terminal nodes,
    head and sequence allocation state. Missing proof, unexplained gaps or
    historic hash defects require investigation. Never rehash history, reset the
-   sequence, invent checkpoints or infer fresh genesis from an empty ledger.
+   sequence, invent erasure annotations or infer fresh genesis from empty payloads.
    A consistent all-purged result is neither successful content verification
    nor a tampering alarm.
 4. Reconcile authoritative post-backup holds, releases and deletion obligations
@@ -196,20 +200,35 @@ rotates out; restoration is not a mechanism to bypass erasure or active holds.
    authorizes expiry of a hold. Reapply eligible deletions without bypassing
    holds; preserve original event expiry rather than restarting its clock.
 5. Deploy only compatible signer/API/worker versions. Validate non-owner roles,
-   outbox acknowledgement/redelivery, online append/head/checkpoint consistency
-   and a dry-run against the recovered state. Keep destructive scheduling off
+   outbox acknowledgement/redelivery and online append/head/annotation consistency.
+   Run bounded read-only receipt reconciliation with its separate SELECT-only
+   credentials: distinguish recorded-pending intent, chained manifest-bound receipts,
+   legacy/unbound, invalid/missing and unavailable/incomplete coverage. PubAck or
+   `published_at` is not chaining. Run a bounded dry-run against recovered state.
+   Keep destructive scheduling off
    until operations and legal owners approve these checks. Then resume eligible
    expiry on the hourly host schedule and monitor backlog/cutoff/failure totals.
 
 Rollback is forward recovery after initialization/proof state or erasure exists:
-disable schedule/revoke maintenance EXECUTE first, retain head/checkpoints/holds/
-outbox, and repair with compatible code. A pre-retention signer or verifier is
+disable schedule/revoke purge DELETE and erasure INSERT first, wait for in-flight
+work, retain both chains/heads/payloads/erasures/holds/settings/outbox, and repair
+with compatible code. A pre-v2 signer or verifier is
 not a safe downgrade. Exact provisioning, revocation and rollout commands are
 in [admin operations](admin-operations.md#security-ledger-retention-task-54).
-Migration `00011` refuses Down unconditionally; use forward recovery rather than
-an up/down/up drill even when a restored payload table appears empty.
+Migrations `00011`, `00014`, `00015`, `00019` and `00020` refuse Down; use forward
+recovery rather than an up/down/up drill even when payload tables appear empty.
+Before pending `00015`, supported migration entrypoints refuse existing v1 bodies
+or initialized proof state, including already-erased histories. This protects
+future runs; it cannot recover history a previous run discarded. Preserve/convert
+populated v1 history separately and inventory/drain/quarantine v1 outbox and broker
+envelopes; never reset genesis, rehash records or wipe a development database.
+For existing v2 databases, close affected intake/writers, apply `00019`, run bounded
+backfill to zero with key/data read-back inventory, then apply `00020` contraction
+and start compatible binaries. Premature contraction must fail without dropping
+data; earlier successful additive migrations can remain applied.
 
-No procedure promises restoration of erased payloads. Database-only checkpoints
+No procedure promises restoration of erased payloads. Database-relative chains,
+erasure annotations
 and Class C receipts cannot independently detect a coherent privileged rewrite
 or backup rollback without an external anchor. External anchoring remains
 explicitly deferred; drills and production restore validation are release gates,

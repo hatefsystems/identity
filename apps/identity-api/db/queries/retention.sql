@@ -41,11 +41,12 @@ LIMIT LEAST(GREATEST(sqlc.arg('page_limit')::integer, 1), 5000);
 -- is not needed either: DeleteExpiredSecurityEvents restates every predicate, so
 -- eligibility is decided atomically at erasure time, and this read only has to be
 -- fresh — which the preceding account locks guarantee.
-SELECT l.seq, l.account_ref,
+SELECT l.*, c.event_id, c.leaf_hash,
        (l.retain_until < sqlc.arg('cutoff')::timestamptz) AS expired,
        EXISTS (SELECT 1 FROM public.legal_holds h
                WHERE h.account_ref = l.account_ref AND h.is_active) AS held
 FROM public.security_event_ledger l
+LEFT JOIN public.security_ledger_chain c ON c.seq = l.seq
 WHERE l.seq = ANY(sqlc.arg('seqs')::bigint[])
 ORDER BY l.seq;
 
@@ -61,9 +62,8 @@ WHERE l.seq = ANY(sqlc.arg('seqs')::bigint[])
                   WHERE h.account_ref = l.account_ref AND h.is_active);
 
 -- name: RecordSecurityLedgerErasure :exec
--- Append-only annotation making a lawful erasure distinguishable from a
--- deletion. Written in the same transaction as the DELETE; its authority comes
--- from the chained receipt carrying the same operation_id.
+-- Append-only annotation written atomically with DELETE and receipt intent.
+-- Neither annotation nor receipt certifies legal authorization or policy compliance.
 INSERT INTO public.security_ledger_erasures (first_seq, last_seq, operation_id, erased_at)
 VALUES (sqlc.arg('first_seq'), sqlc.arg('last_seq'), sqlc.arg('operation_id'), sqlc.arg('erased_at'));
 

@@ -129,11 +129,15 @@ func (f *fakeStore) LegalAttributionHighWater(context.Context) (int64, error) {
 func (f *fakeStore) CountUnencryptedLegalHolds(context.Context) (int64, error) {
 	var count int64
 	for _, h := range f.holds {
-		if h.Reason != nil || len(h.DetailsEncrypted) == 0 && !h.DetailsPurgedAt.Valid {
+		if len(h.DetailsEncrypted) == 0 && (!h.DetailsPurgedAt.Valid || h.IsActive || !h.ReleasedAt.Valid) {
 			count++
 		}
 	}
 	return count, f.err
+}
+
+func (f *fakeStore) GetLegalHoldSchema(context.Context) (db.GetLegalHoldSchemaRow, error) {
+	return db.GetLegalHoldSchemaRow{ColumnCount: 12, CurrentCount: 12}, f.err
 }
 
 func testEncryptor(t *testing.T) *envelope.Encryptor {
@@ -179,7 +183,7 @@ func TestIndependentHoldsAndIdempotentReplay(t *testing.T) {
 		t.Fatal("unexpected first result")
 	}
 	row := store.holds[first.Hold.Record.ID]
-	if row.Reason != nil || row.RequestingAuthority != nil || row.LegalBasis != nil || bytes.Contains(row.DetailsEncrypted, []byte("investigation")) {
+	if bytes.Contains(row.DetailsEncrypted, []byte("investigation")) {
 		t.Fatal("plaintext retained")
 	}
 	replay, err := s.Apply(ctx, req)
@@ -317,10 +321,38 @@ func TestCiphertextBindingAndTombstone(t *testing.T) {
 	row = res.Hold.Record
 	row.IsActive = false
 	row.DetailsEncrypted = nil
+	row.ReleasedAt = timestamptz(s.now())
 	row.DetailsPurgedAt = timestamptz(s.now())
 	store.holds[row.ID] = row
 	if _, err := s.Apply(ctx, req); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatal("tombstone reapplied")
+	}
+}
+
+func TestCryptoReadinessChecksExistingKeysAndBinding(t *testing.T) {
+	s, store := testService(t)
+	ctx := context.Background()
+	res, err := s.Apply(ctx, validApply())
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := res.Hold.Record
+	row.AccountRef = uuid.New()
+	store.holds[row.ID] = row
+	if err := s.CheckCrypto(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("transplanted row passed readiness: %v", err)
+	}
+	store.holds[row.ID] = res.Hold.Record
+	provider, err := kms.NewMockProvider(bytes.Repeat([]byte{0x63}, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.encryptor, err = envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckCrypto(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("inaccessible old key passed readiness: %v", err)
 	}
 }
 

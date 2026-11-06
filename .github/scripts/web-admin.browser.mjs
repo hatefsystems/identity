@@ -1571,7 +1571,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(initial.complete, false, 'The bounded first page must remain partial');
     assert.equal(initial.after_seq, '0');
     assert.equal(typeof initial.through_seq, 'string');
-    assert.equal(initial.scope, 'stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity');
+    assert.equal(initial.scope, 'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization');
     harness.fixture('admin-audit', { user_id: target.user_id });
     const continuation = operationResponse(dpo, '/api/v1/admin/audit-logs/verify', 'GET');
     await dpo.getByRole('button', { name: 'Continue verification', exact: true }).click();
@@ -1590,7 +1590,9 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     await verifier.getByLabel('Chain', { exact: true }).selectOption('ledger');
     const ledgerProof = operationResponse(verifier, '/api/v1/admin/ledger/verify', 'GET');
     await verifier.getByRole('button', { name: 'Start new run', exact: true }).click();
-    assert.equal((await (await ledgerProof).json()).chain, 'ledger');
+    const ledgerResult = await (await ledgerProof).json();
+    assert.equal(ledgerResult.chain, 'ledger');
+    assert.equal(ledgerResult.scope, 'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity');
     evidence.checks.push('independent explicit verifier pages use fixed captured bounds and prior hashes across later appends; stop stays partial; verifier-only role cannot read accounts/payloads');
 
     checkpoint = 'admin-clearing';
@@ -1682,7 +1684,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal((await missing).status(), 400);
     await dpo.getByRole('main').getByRole('alert').waitFor();
     assert(await dpo.getByRole('button', { name: 'Continue verification', exact: true }).isDisabled());
-    evidence.checks.push('real tampered ledger stops; database-relative authorized erasure never claims content verification; initialized empty and missing head stay distinct');
+    evidence.checks.push('real tampered ledger stops; database-relative erasure annotations never claim content verification, receipt chaining or legal authorization; initialized empty and missing head stay distinct');
 
     checkpoint = 'admin-final';
     for (const { page, observed } of Object.values(actors)) {

@@ -14,6 +14,7 @@ func TestWorkflowAuditContainsNoRestrictedFingerprints(t *testing.T) {
 	for _, operation := range []string{
 		"POST /api/v1/admin/legal-cases", "GET /api/v1/admin/legal-cases/{case_id}",
 		"POST /api/v1/admin/legal-holds/{hold_id}/reviews",
+		"GET /api/v1/admin/legal-holds/{hold_id}/reviews",
 		"POST /api/v1/admin/legal-transparency/reports/{report_id}/download",
 	} {
 		t.Run(operation, func(t *testing.T) {

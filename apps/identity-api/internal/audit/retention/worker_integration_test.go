@@ -165,8 +165,7 @@ func TestWorkerHoldOutranksRetention(t *testing.T) {
 		expired(t, held, 400*24*time.Hour),
 		expired(t, free, 400*24*time.Hour),
 	)
-	workerExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
-VALUES($1,'integration','court','legal claims',$2)`, held, uuid.New())
+	f.hold(t, f.admin, held)
 
 	stats := f.run(t, 10, 100, false)
 	if stats.Deleted != 1 {
@@ -202,8 +201,7 @@ func TestWorkerHoldAppliedAfterListingStillBlocks(t *testing.T) {
 
 	// A hold lands between the listing and the purge, exactly as a DPO action
 	// would.
-	workerExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
-VALUES($1,'late hold','court','legal claims',$2)`, account, uuid.New())
+	f.hold(t, f.admin, account)
 
 	result, err := f.store.Purge(f.ctx, boundary, candidates, false)
 	if err != nil {
@@ -216,7 +214,7 @@ VALUES($1,'late hold','court','legal claims',$2)`, account, uuid.New())
 		t.Errorf("payload rows = %d, want 1 retained under hold", got)
 	}
 	// Nothing was erased, so nothing may be recorded as erased.
-	f.assertState(t, 1, 0, 0)
+	f.assertState(t, 1, 0, 1)
 }
 
 // TestWorkerDryRunChangesNothing proves the rollback is a full-fidelity dry run:
@@ -292,6 +290,32 @@ func TestWorkerProbeRejectsOverPrivilegedRole(t *testing.T) {
 			"REVOKE DELETE ON public.security_ledger_erasures FROM identity_ledger_purge"},
 		{"head advance", "GRANT EXECUTE ON FUNCTION public.advance_chain_head(text,bigint,bigint,bigint,bigint) TO identity_ledger_purge",
 			"REVOKE EXECUTE ON FUNCTION public.advance_chain_head(text,bigint,bigint,bigint,bigint) FROM identity_ledger_purge"},
+		{"payload insert", "GRANT INSERT ON public.security_event_ledger TO identity_ledger_purge",
+			"REVOKE INSERT ON public.security_event_ledger FROM identity_ledger_purge"},
+		{"PUBLIC payload column update", "GRANT UPDATE(event_type) ON public.security_event_ledger TO PUBLIC",
+			"REVOKE UPDATE(event_type) ON public.security_event_ledger FROM PUBLIC"},
+		{"PUBLIC chain column insert", "GRANT INSERT(seq) ON public.audit_log_chain TO PUBLIC",
+			"REVOKE INSERT(seq) ON public.audit_log_chain FROM PUBLIC"},
+		{"head column insert", "GRANT INSERT(seq) ON public.security_ledger_head TO identity_ledger_purge",
+			"REVOKE INSERT(seq) ON public.security_ledger_head FROM identity_ledger_purge"},
+		{"head delete", "GRANT DELETE ON public.audit_log_head TO identity_ledger_purge",
+			"REVOKE DELETE ON public.audit_log_head FROM identity_ledger_purge"},
+		{"payload truncate", "GRANT TRUNCATE ON public.security_event_ledger TO identity_ledger_purge",
+			"REVOKE TRUNCATE ON public.security_event_ledger FROM identity_ledger_purge"},
+		{"outbox update", "GRANT UPDATE(last_error) ON public.event_outbox TO identity_ledger_purge",
+			"REVOKE UPDATE(last_error) ON public.event_outbox FROM identity_ledger_purge"},
+		{"unrelated write", "GRANT INSERT ON public.user_roles TO identity_ledger_purge",
+			"REVOKE INSERT ON public.user_roles FROM identity_ledger_purge"},
+		{"unrelated read", "GRANT SELECT ON public.admin_action_contexts TO identity_ledger_purge",
+			"REVOKE SELECT ON public.admin_action_contexts FROM identity_ledger_purge"},
+		{"sequence USAGE", "GRANT USAGE ON SEQUENCE public.security_ledger_chain_seq TO identity_ledger_purge",
+			"REVOKE USAGE ON SEQUENCE public.security_ledger_chain_seq FROM identity_ledger_purge"},
+		{"PUBLIC sequence SELECT", "GRANT SELECT ON SEQUENCE public.audit_log_chain_seq TO PUBLIC",
+			"REVOKE SELECT ON SEQUENCE public.audit_log_chain_seq FROM PUBLIC"},
+		{"column REFERENCES", "GRANT REFERENCES(seq) ON public.security_ledger_chain TO identity_ledger_purge",
+			"REVOKE REFERENCES(seq) ON public.security_ledger_chain FROM identity_ledger_purge"},
+		{"trigger", "GRANT TRIGGER ON public.security_ledger_chain TO identity_ledger_purge",
+			"REVOKE TRIGGER ON public.security_ledger_chain FROM identity_ledger_purge"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workerExec(t, f.ctx, f.admin, tc.grant)
@@ -318,6 +342,12 @@ func TestWorkerProbeRequiresArmedGuards(t *testing.T) {
 		{"security_event_ledger", "trg_security_event_ledger_no_truncate"},
 		{"security_ledger_chain", "trg_security_ledger_chain_append_only"},
 		{"security_ledger_chain", "trg_security_ledger_chain_no_truncate"},
+		{"audit_log_chain", "trg_audit_log_chain_append_only"},
+		{"audit_log_chain", "trg_audit_log_chain_no_truncate"},
+		{"mvp_audit_logs", "trg_mvp_audit_logs_immutable"},
+		{"mvp_audit_logs", "trg_mvp_audit_logs_no_truncate"},
+		{"security_ledger_erasures", "trg_security_ledger_erasures_append_only"},
+		{"security_ledger_erasures", "trg_security_ledger_erasures_no_truncate"},
 	} {
 		t.Run(tc.trigger, func(t *testing.T) {
 			disable := "ALTER TABLE public." + tc.table + " DISABLE TRIGGER " + tc.trigger

@@ -21,8 +21,21 @@ func (s *Service) Backfill(ctx context.Context, pool *pgxpool.Pool, limit int) (
 	if pool == nil || limit < 1 || limit > 1000 {
 		return 0, ErrInvalidRequest
 	}
+	expanded, err := legalHoldSchema(ctx, db.New(pool))
+	if err != nil {
+		return 0, err
+	}
+	if !expanded {
+		check := *s
+		check.store = db.New(pool)
+		if err := check.CheckCrypto(ctx); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
 	rows, err := pool.Query(ctx, `SELECT id, account_ref FROM legal_holds
-		WHERE details_encrypted IS NULL AND details_purged_at IS NULL ORDER BY id LIMIT $1`, limit)
+		WHERE reason IS NOT NULL OR requesting_authority IS NOT NULL OR legal_basis IS NOT NULL
+		OR (details_encrypted IS NULL AND details_purged_at IS NULL) ORDER BY id LIMIT $1`, limit)
 	if err != nil {
 		return 0, ErrUnavailable
 	}
@@ -52,38 +65,55 @@ func (s *Service) Backfill(ctx context.Context, pool *pgxpool.Pool, limit int) (
 			if err := pglock.LockAccount(ctx, tx, c.account); err != nil {
 				return ErrUnavailable
 			}
-			row, err := db.New(tx).GetLegalHold(ctx, c.id)
+			// Legacy plaintext belongs only to this operator projection, never to
+			// generated current models or runtime read fallbacks.
+			var legacy struct{ reason, authority, basis *string }
+			err = tx.QueryRow(ctx, `SELECT reason, requesting_authority, legal_basis FROM public.legal_holds
+				WHERE id=$1 FOR UPDATE`, c.id).Scan(&legacy.reason, &legacy.authority, &legacy.basis)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			if err != nil {
 				return ErrUnavailable
 			}
+			row, err := db.New(tx).GetLegalHold(ctx, c.id)
+			if err != nil {
+				return ErrUnavailable
+			}
 			if len(row.DetailsEncrypted) != 0 || row.DetailsPurgedAt.Valid {
+				if legacy.reason != nil || legacy.authority != nil || legacy.basis != nil {
+					return ErrBackfillRequired
+				}
+				if _, err := s.openHold(ctx, row); err != nil {
+					return err
+				}
 				return nil
 			}
-			if row.Reason == nil || row.RequestingAuthority == nil || row.LegalBasis == nil {
+			if legacy.reason == nil || legacy.authority == nil || legacy.basis == nil {
 				return ErrBackfillRequired
 			}
-			kind := KindHold
-			if *row.LegalBasis == LegalBasisPreservation {
-				kind = KindPreservation
-			}
-			details := Details{RecordID: row.ID, AccountRef: row.AccountRef, Kind: kind,
-				Reason: *row.Reason, RequestingAuthority: *row.RequestingAuthority, LegalBasis: *row.LegalBasis}
+			details := Details{RecordID: row.ID, AccountRef: row.AccountRef, Kind: row.RequestKind,
+				Reason: *legacy.reason, RequestingAuthority: *legacy.authority, LegalBasis: *legacy.basis}
 			blob, err := s.seal(ctx, details)
 			if err != nil {
 				return err
 			}
-			row.DetailsEncrypted, row.RequestKind = blob, kind
-			row.Reason, row.RequestingAuthority, row.LegalBasis = nil, nil, nil
-			opened, err := s.openHold(ctx, row)
+			_, err = tx.Exec(ctx, `UPDATE legal_holds SET details_encrypted=$2,
+				reason=NULL, requesting_authority=NULL, legal_basis=NULL WHERE id=$1`, c.id, blob)
+			if err != nil {
+				return ErrUnavailable
+			}
+			stored, err := db.New(tx).GetLegalHold(ctx, c.id)
+			if err != nil {
+				return ErrUnavailable
+			}
+			opened, err := s.openHold(ctx, stored)
 			if err != nil || opened.Details != details {
 				return ErrUnavailable
 			}
-			_, err = tx.Exec(ctx, `UPDATE legal_holds SET details_encrypted=$2, request_kind=$3,
-				reason=NULL, requesting_authority=NULL, legal_basis=NULL WHERE id=$1`, c.id, blob, kind)
-			if err != nil {
+			var plaintextCleared bool
+			if err := tx.QueryRow(ctx, `SELECT reason IS NULL AND requesting_authority IS NULL AND legal_basis IS NULL
+				FROM legal_holds WHERE id=$1`, c.id).Scan(&plaintextCleared); err != nil || !plaintextCleared {
 				return ErrUnavailable
 			}
 			if err := tx.Commit(ctx); err != nil {
@@ -97,6 +127,17 @@ func (s *Service) Backfill(ctx context.Context, pool *pgxpool.Pool, limit int) (
 		}
 	}
 	return count, nil
+}
+
+func legalHoldSchema(ctx context.Context, q interface {
+	GetLegalHoldSchema(context.Context) (db.GetLegalHoldSchemaRow, error)
+}) (bool, error) {
+	row, err := q.GetLegalHoldSchema(ctx)
+	if err != nil || row.CurrentCount != 12 ||
+		((row.LegacyCount != 3 || row.ColumnCount != 15) && (row.LegacyCount != 0 || row.ColumnCount != 12)) {
+		return false, ErrUnavailable
+	}
+	return row.LegacyCount == 3, nil
 }
 
 // CleanupReleased destroys narratives after the configured release-relative
@@ -142,9 +183,9 @@ func (s *Service) CleanupReleased(ctx context.Context, pool *pgxpool.Pool, limit
 				return ErrUnavailable
 			}
 			result, err := tx.Exec(ctx, `UPDATE legal_holds SET details_encrypted=NULL,
-				reason=NULL, requesting_authority=NULL, legal_basis=NULL, details_purged_at=clock_timestamp()
+				details_purged_at=clock_timestamp()
 				WHERE id IN (SELECT id FROM legal_holds WHERE account_ref=$1 AND NOT is_active
-				AND released_at < $2 AND details_purged_at IS NULL ORDER BY released_at,id LIMIT $3)
+				AND released_at < $2 AND details_purged_at IS NULL AND details_encrypted IS NOT NULL ORDER BY released_at,id LIMIT $3)
 				AND NOT EXISTS (SELECT 1 FROM legal_holds active WHERE active.account_ref=$1 AND active.is_active)`,
 				account, cutoff, limit-int(count))
 			if err != nil {

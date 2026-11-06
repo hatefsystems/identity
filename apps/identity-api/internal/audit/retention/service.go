@@ -55,7 +55,8 @@ type Backlog struct {
 	Oldest time.Time
 }
 
-// Store keeps the security boundary in PostgreSQL as well as in the worker.
+// Store enforces policy in the trusted worker; PostgreSQL restricts the principal's
+// capabilities but does not constrain arbitrary DELETE to retention-eligible rows.
 type Store interface {
 	Probe(context.Context) error
 	Capture(context.Context) (Boundary, error)

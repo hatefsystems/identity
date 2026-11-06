@@ -30,9 +30,10 @@ import (
 
 // verifySource is an in-memory chain for one of the two chains.
 type verifySource struct {
-	chain ledgerproof.Chain
-	head  ledgerproof.Head
-	nodes []ledgerproof.Node
+	chain     ledgerproof.Chain
+	head      ledgerproof.Head
+	nodes     []ledgerproof.Node
+	emptyPage bool
 }
 
 func (s *verifySource) Head(context.Context) (ledgerproof.Head, error) { return s.head, nil }
@@ -47,6 +48,9 @@ func (s *verifySource) HashAt(_ context.Context, seq int64) ([]byte, error) {
 }
 
 func (s *verifySource) Page(_ context.Context, after, through int64, limit int32) ([]ledgerproof.Node, error) {
+	if s.emptyPage {
+		return nil, nil
+	}
 	var out []ledgerproof.Node
 	for _, n := range s.nodes {
 		if n.Seq > after && n.Seq <= through && len(out) < int(limit) {
@@ -219,8 +223,8 @@ func TestAdminVerifyFailureCoordinates(t *testing.T) {
 		{"record_not_serializable", func(src *verifySource) {
 			src.nodes[0].Recompute = func() (audit.Digest, error) { return audit.Digest{}, errors.New("private-serialization-detail") }
 		}, 1, `"2"`, `"2"`, `"2"`, "null", audit.StatusFailure},
-		{"no_stored_records", func(src *verifySource) { src.nodes = nil }, 0, "null", "null", "null", "null", audit.StatusSuccess},
-		{"head_mismatch", func(src *verifySource) { src.head.Hash = audit.Genesis().Bytes() }, 2, `"2"`, `"8"`, `"8"`, `"8"`, audit.StatusFailure},
+		{"no_stored_records", func(src *verifySource) { src.emptyPage = true }, 0, "null", "null", "null", "null", audit.StatusSuccess},
+		{"head_mismatch", func(src *verifySource) { src.head.Hash = audit.Genesis().Bytes() }, 0, "null", "null", `"8"`, "null", audit.StatusFailure},
 	} {
 		t.Run(tc.reason, func(t *testing.T) {
 			src := buildAuditSource(t, 2, 8)
@@ -249,7 +253,7 @@ func TestAdminVerifyFailureCoordinates(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if resp.LastHash != last.Hex() || resp.ExpectedHash == nil || *resp.ExpectedHash != last.Hex() || resp.StoredHash == nil || *resp.StoredHash != audit.Genesis().Hex() {
+				if resp.LastHash != audit.Genesis().Hex() || resp.ExpectedHash == nil || *resp.ExpectedHash != last.Hex() || resp.StoredHash == nil || *resp.StoredHash != audit.Genesis().Hex() {
 					t.Fatal("head mismatch lost its terminal digest or compared hashes")
 				}
 			} else if resp.LastHash != resp.SeedHash || string(fields["expected_hash"]) != "null" || string(fields["stored_hash"]) != "null" {
@@ -342,7 +346,7 @@ func TestAdminVerifyLedgerAcceptsLawfulErasure(t *testing.T) {
 		t.Errorf("checked = %d, want 3", resp.Checked)
 	}
 	if operation.Event.ActionStatus != audit.StatusSuccess {
-		t.Errorf("a lawful erasure must not be audited as a verification failure, got %q", operation.Event.ActionStatus)
+		t.Errorf("an annotated erasure must not be audited as a structural verification failure, got %q", operation.Event.ActionStatus)
 	}
 }
 

@@ -584,7 +584,7 @@ func TestPrivacyNotificationCleanupHoldLockAndFailureIntegration(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	hold, err := db.New(tx).ApplyLegalHold(ctx, db.ApplyLegalHoldParams{AccountRef: u.ID, Reason: legalFixtureString("payload preservation fixture"), RequestingAuthority: legalFixtureString("test-court"), LegalBasis: legalFixtureString("legal obligation"), AppliedBy: uuid.New()})
+	hold, err := db.New(tx).CreateEncryptedLegalHold(ctx, db.CreateEncryptedLegalHoldParams{ID: uuid.New(), AccountRef: u.ID, RequestKind: "legal_hold", DetailsEncrypted: []byte("fixture ciphertext"), AppliedBy: uuid.New()})
 	if err != nil {
 		t.Fatal(err)
 	}

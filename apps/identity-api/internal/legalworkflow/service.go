@@ -267,7 +267,7 @@ func auditResult(ctx context.Context, a Actor, purpose string, replayed bool) {
 	switch purpose {
 	case "prepare", "approve", "deliver":
 		name = "legal.response." + purpose
-	case "review", "hold_review":
+	case "review", "hold_review", "hold_read":
 		name = "legal.review." + purpose
 	}
 	adminaction.SetEvent(ctx, audit.Event{EventType: name, ActorID: a.ID, ActionStatus: audit.StatusSuccess, Payload: map[string]any{"replayed": replayed}})

@@ -365,10 +365,9 @@ func TestPolicyStoredChecksAndAttributionIntegration(t *testing.T) {
 }
 
 func TestPolicyRealLoginRolesIntegration(t *testing.T) {
-	f := newPolicyIntegration(t)
+	f := newPolicyPrivilegeIntegration(t)
 	p := fixturePolicy()
-	f.install(t, p)
-	for _, kind := range []string{"api", "maintenance", "installer"} {
+	for _, kind := range []string{"installer", "api", "maintenance"} {
 		t.Run(kind, func(t *testing.T) {
 			role := "policy_" + kind + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 			name := pgx.Identifier{role}.Sanitize()
@@ -394,6 +393,9 @@ func TestPolicyRealLoginRolesIntegration(t *testing.T) {
 				if _, err := f.pool.Exec(f.ctx, "GRANT INSERT ON legal_governance_policies,legal_governance_baseline,event_outbox TO "+name); err != nil {
 					t.Fatal(err)
 				}
+				if _, err := f.pool.Exec(f.ctx, "GRANT SELECT ON legal_holds,admin_action_contexts TO "+name); err != nil {
+					t.Fatal(err)
+				}
 			}
 			cfg := f.pool.Config().Copy()
 			cfg.ConnConfig.User, cfg.ConnConfig.Password = role, password
@@ -405,6 +407,60 @@ func TestPolicyRealLoginRolesIntegration(t *testing.T) {
 			var current string
 			if err := login.QueryRow(f.ctx, `SELECT current_user`).Scan(&current); err != nil || current != role {
 				t.Fatal("test did not authenticate as real restricted login")
+			}
+			if kind == "installer" {
+				if _, err := LoadBaseline(f.ctx, login, uuid.Nil, "test"); !errors.Is(err, ErrNotApproved) {
+					t.Fatal("first restricted installation fixture already had a baseline")
+				}
+				if err := ProbeInstaller(f.ctx, login); err != nil {
+					t.Fatalf("restricted installer probe: %v", err)
+				}
+				for _, change := range []struct{ grant, revoke string }{
+					{"GRANT UPDATE(artifact) ON legal_governance_policies TO PUBLIC", "REVOKE UPDATE(artifact) ON legal_governance_policies FROM PUBLIC"},
+					{"GRANT INSERT(id) ON legal_holds TO " + name, "REVOKE INSERT(id) ON legal_holds FROM " + name},
+					{"GRANT UPDATE ON legal_governance_baseline TO " + name, "REVOKE UPDATE ON legal_governance_baseline FROM " + name},
+					{"REVOKE SELECT ON admin_action_contexts FROM " + name, "GRANT SELECT ON admin_action_contexts TO " + name},
+					{"GRANT SET ON PARAMETER session_replication_role TO " + name, "REVOKE SET ON PARAMETER session_replication_role FROM " + name},
+					{"ALTER TABLE legal_governance_baseline ENABLE REPLICA TRIGGER legal_governance_baseline_immutable", "ALTER TABLE legal_governance_baseline ENABLE TRIGGER legal_governance_baseline_immutable"},
+				} {
+					if _, err := f.pool.Exec(f.ctx, change.grant); err != nil {
+						t.Fatal(err)
+					}
+					probeErr := ProbeInstaller(f.ctx, login)
+					if _, err := f.pool.Exec(f.ctx, change.revoke); err != nil {
+						t.Fatal(err)
+					}
+					if !errors.Is(probeErr, ErrUnavailable) {
+						t.Fatal("installer probe accepted forbidden grant/disarmed guard/missing inventory")
+					}
+					if err := ProbeInstaller(f.ctx, login); err != nil {
+						t.Fatalf("installer restart after revoke: %v", err)
+					}
+				}
+				actions, err := adminaction.New(login, noContextEncryption{}, "identity.audit.policy-test", time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				op, err := actions.Begin(f.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = op.Rollback(f.ctx) }()
+				op.Event = audit.Event{ActorID: uuid.New(), ActorSPIFFEID: "spiffe://identity.test/operator/policy"}
+				if err := Install(f.ctx, op, p, "test"); err != nil {
+					t.Fatalf("FIRST restricted installation failed: %v", err)
+				}
+				if noop, _ := op.Event.Payload["noop"].(bool); noop {
+					t.Fatal("first installation was a no-op")
+				}
+				if err := op.Commit(f.ctx); err != nil {
+					t.Fatal(err)
+				}
+				var baseline, policies, receipts int
+				if err := f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM legal_governance_baseline),
+ (SELECT count(*) FROM legal_governance_policies), (SELECT count(*) FROM event_outbox WHERE admin_action)`).Scan(&baseline, &policies, &receipts); err != nil || baseline != 1 || policies != 1 || receipts != 1 {
+					t.Fatal("first installation did not commit policy, binding and audit intent together")
+				}
 			}
 			if _, err := Load(f.ctx, login, p.ID, "test"); err != nil {
 				t.Fatal(err)

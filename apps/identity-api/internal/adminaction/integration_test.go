@@ -447,7 +447,7 @@ func TestAdminActionCleanupRechecksHoldAfterSharedLockIntegration(t *testing.T) 
 		t.Fatal(err)
 	}
 	hold := uuid.New()
-	if _, err := holdTx.Exec(ctx, "INSERT INTO legal_holds(id,account_ref,applied_by,reason,requesting_authority,legal_basis) VALUES($1,$2,$3,'fixture','fixture','fixture')", hold, account, uuid.New()); err != nil {
+	if _, err := holdTx.Exec(ctx, "INSERT INTO legal_holds(id,account_ref,applied_by,details_encrypted) VALUES($1,$2,$3,'\\x01')", hold, account, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DELETE FROM legal_holds WHERE id=$1", hold) })

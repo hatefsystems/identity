@@ -200,6 +200,16 @@ type HistoryEntry struct {
 	Input     any       `json:"input"`
 }
 
+// HoldReviews is restricted handoff history, not an edit of the original hold.
+// A never-reviewed hold has version zero and an empty history. Erased or missing
+// history returns an error instead of impersonating that state.
+type HoldReviews struct {
+	Version          int64          `json:"version"`
+	NextReviewAt     *time.Time     `json:"next_review_at"`
+	History          []HistoryEntry `json:"history"`
+	HistoryTruncated bool           `json:"history_truncated"`
+}
+
 // ListRequest supports bounded pagination and lifecycle filtering, never identifiers.
 type ListRequest struct {
 	Status        string

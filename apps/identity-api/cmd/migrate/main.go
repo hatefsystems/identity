@@ -4,6 +4,7 @@
 // Usage:
 //
 //	migrate up      apply all pending migrations
+//	migrate up-to N apply pending migrations through version N
 //	migrate down    roll back the most recent migration
 //	migrate reset   roll back everything (dev/test only)
 //	migrate status  print per-migration applied state
@@ -16,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
@@ -33,10 +35,23 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: migrate <up|down|reset|status>")
+	if len(args) == 0 {
+		return fmt.Errorf("usage: migrate <up|up-to VERSION|down|reset|status>")
 	}
 	command := args[0]
+	var target int64
+	if command == "up-to" {
+		if len(args) != 2 {
+			return fmt.Errorf("usage: migrate up-to VERSION")
+		}
+		var err error
+		target, err = strconv.ParseInt(args[1], 10, 64)
+		if err != nil || target < 1 || strconv.FormatInt(target, 10) != args[1] {
+			return fmt.Errorf("migrate: version must be a positive decimal integer")
+		}
+	} else if len(args) != 1 || (command != "up" && command != "down" && command != "reset" && command != "status") {
+		return fmt.Errorf("usage: migrate <up|up-to VERSION|down|reset|status>")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
@@ -48,6 +63,11 @@ func run(args []string) error {
 	defer func() { _ = sqldb.Close() }()
 
 	switch command {
+	case "up-to":
+		if err := migrate.UpTo(ctx, sqldb, target); err != nil {
+			return err
+		}
+		fmt.Printf("migrations applied through version %d\n", target)
 	case "up":
 		if err := migrate.Up(ctx, sqldb); err != nil {
 			return err

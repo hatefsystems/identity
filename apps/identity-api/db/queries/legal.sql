@@ -165,21 +165,16 @@ LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
 -- Legal Holds
 -- ---------------------------------------------------------------------------
 
--- name: ApplyLegalHold :one
--- Legacy migration/integration fixture only; runtime writes encrypted requests.
-INSERT INTO legal_holds (
-    account_ref, reason, requesting_authority, legal_basis, applied_by, review_at
-) VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING *;
-
 -- name: CreateEncryptedLegalHold :one
 INSERT INTO legal_holds (
     id, account_ref, applied_by, review_at, request_kind, idempotency_key, details_encrypted
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING *;
+RETURNING id, account_ref, applied_by, is_active, applied_at, review_at,
+          released_at, released_by, request_kind, idempotency_key, details_encrypted, details_purged_at;
 
 -- name: GetLegalHoldByRequest :one
-SELECT * FROM legal_holds
+SELECT id, account_ref, applied_by, is_active, applied_at, review_at,
+       released_at, released_by, request_kind, idempotency_key, details_encrypted, details_purged_at FROM legal_holds
 WHERE account_ref = $1 AND request_kind = $2 AND idempotency_key = $3;
 
 -- name: ReleaseLegalHold :one
@@ -190,16 +185,20 @@ SET is_active = FALSE,
     released_at = NOW(),
     released_by = $2
 WHERE id = $1 AND is_active = TRUE
-RETURNING *;
+RETURNING id, account_ref, applied_by, is_active, applied_at, review_at,
+          released_at, released_by, request_kind, idempotency_key, details_encrypted, details_purged_at;
 
 -- name: GetLegalHold :one
-SELECT * FROM legal_holds WHERE id = $1;
+SELECT id, account_ref, applied_by, is_active, applied_at, review_at,
+       released_at, released_by, request_kind, idempotency_key, details_encrypted, details_purged_at
+FROM legal_holds WHERE id = $1;
 
 -- name: ListLegalHolds :one
 -- One statement guarantees count/page snapshot consistency, including offsets
 -- beyond the last page, without a stale REPEATABLE READ snapshot after a lock.
 WITH filtered AS (
-    SELECT * FROM legal_holds
+    SELECT id, account_ref, applied_by, is_active, applied_at, review_at,
+           released_at, released_by, request_kind, idempotency_key, details_encrypted, details_purged_at FROM legal_holds
     WHERE (sqlc.narg('account_ref')::uuid IS NULL OR account_ref = sqlc.narg('account_ref')::uuid)
       AND (sqlc.arg('status')::text = 'all'
           OR (sqlc.arg('status')::text = 'active' AND is_active)
@@ -214,8 +213,36 @@ SELECT (SELECT COUNT(*) FROM filtered) AS total,
 
 -- name: CountUnencryptedLegalHolds :one
 SELECT COUNT(*) FROM legal_holds
-WHERE reason IS NOT NULL OR requesting_authority IS NOT NULL OR legal_basis IS NOT NULL
-   OR (details_encrypted IS NULL AND details_purged_at IS NULL);
+WHERE to_jsonb(legal_holds)->>'reason' IS NOT NULL
+   OR to_jsonb(legal_holds)->>'requesting_authority' IS NOT NULL
+   OR to_jsonb(legal_holds)->>'legal_basis' IS NOT NULL
+   OR NOT ((details_encrypted IS NOT NULL AND octet_length(details_encrypted) > 0 AND details_purged_at IS NULL)
+       OR (details_encrypted IS NULL AND NOT is_active AND released_at IS NOT NULL AND details_purged_at IS NOT NULL));
+
+-- name: GetLegalHoldSchema :one
+-- Catalog inspection sees inaccessible/missing columns rather than treating an
+-- information_schema privilege-filtered partial inventory as full contraction.
+SELECT COUNT(*)::int AS column_count,
+       COUNT(*) FILTER (WHERE (attname='reason' AND atttypid='text'::regtype)
+           OR (attname IN ('requesting_authority','legal_basis') AND atttypid='varchar'::regtype))::int AS legacy_count,
+       COUNT(*) FILTER (WHERE (
+           (attname IN ('id','account_ref','applied_by','released_by','idempotency_key') AND atttypid='uuid'::regtype)
+           OR (attname='is_active' AND atttypid='boolean'::regtype)
+           OR (attname IN ('applied_at','review_at','released_at','details_purged_at') AND atttypid='timestamptz'::regtype)
+           OR (attname='request_kind' AND atttypid='text'::regtype)
+           OR (attname='details_encrypted' AND atttypid='bytea'::regtype)
+       ) AND (
+           EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=to_regclass('public.legal_holds')
+               AND conname='legal_holds_encrypted_or_purged' AND contype='c' AND convalidated)
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('public.legal_holds')
+               AND attname IN ('reason','requesting_authority','legal_basis') AND attnum > 0 AND NOT attisdropped)
+           OR ((SELECT COUNT(*) FROM pg_catalog.pg_constraint WHERE conrelid=to_regclass('public.legal_holds')
+               AND conname IN ('legal_holds_details_exclusive','legal_holds_request_details') AND contype='c' AND convalidated)=2
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('public.legal_holds') AND attname='reason' AND NOT attisdropped)
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=to_regclass('public.legal_holds') AND conname='legal_holds_encrypted_or_purged'))
+       ))::int AS current_count
+FROM pg_catalog.pg_attribute
+WHERE attrelid = to_regclass('public.legal_holds') AND attnum > 0 AND NOT attisdropped;
 
 -- name: HasActiveLegalHold :one
 -- Consulted by the hard-delete Cron (Task 5.1) and the ledger purge (Task 5.4)

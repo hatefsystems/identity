@@ -54,6 +54,9 @@ func New(beginner Beginner, encryptor Encryptor, subject string, retention time.
 	return &Service{beginner: beginner, encryptor: encryptor, subject: subject, retention: retention}, nil
 }
 
+// ContextRetention exposes the configured clock for transaction-time policy checks.
+func (s *Service) ContextRetention() time.Duration { return s.retention }
+
 func validSubject(subject string) bool {
 	if subject == "" || len(subject) > 100 || subject == "identity.user.deleted" || strings.ContainsAny(subject, "*> \t\r\n") {
 		return false

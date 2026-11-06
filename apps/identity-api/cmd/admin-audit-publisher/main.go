@@ -52,6 +52,9 @@ func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
 		return err
 	}
 	if cleanup {
+		if err := adminaction.ProbeContextMaintenance(startupCtx, pool); err != nil {
+			return err
+		}
 		environment := os.Getenv("APP_ENV")
 		if environment == "" {
 			environment = "development"
@@ -75,6 +78,9 @@ func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
 	}
 	if !cfg.HasNATS() {
 		return errors.New("NATS_URL is required")
+	}
+	if err := adminaction.ProbePublisher(startupCtx, pool, cfg.Subject); err != nil {
+		return err
 	}
 	nc, js, err := natsjs.Connect(startupCtx, cfg.NATSURL, "admin-audit-publisher", logger)
 	if err != nil {

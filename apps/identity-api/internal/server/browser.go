@@ -173,7 +173,9 @@ func (s *Server) browserSessionHandler(next http.Handler, logout bool) http.Hand
 			writeJSON(w, http.StatusServiceUnavailable, sessionErrorResponse{Error: "temporarily_unavailable"})
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/") && !s.browserRequestAllowed(w, r) {
+		// Legal mutation bodies are preflighted after live permission checks.
+		legalMutation := unsafeBrowserMethod(r.Method) && (strings.HasPrefix(r.URL.Path, "/api/v1/admin/legal-") || r.URL.Path == "/api/v1/admin/preservation-requests")
+		if strings.HasPrefix(r.URL.Path, "/api/v1/admin/") && !legalMutation && !s.browserRequestAllowed(w, r) {
 			return
 		}
 		current, err := s.deps.SessionManager.Resolve(r)

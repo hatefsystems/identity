@@ -141,7 +141,7 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {

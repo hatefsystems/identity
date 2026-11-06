@@ -85,7 +85,7 @@ func (s *Store) Head(ctx context.Context) (Head, error) {
 		if err != nil {
 			return Head{}, err
 		}
-		return Head{Seq: row.Seq, MaxSeq: maxSeq, Hash: row.ChainHash}, nil
+		return Head{Seq: row.Seq, MaxSeq: maxSeq, Hash: row.ChainHash, Invalid: !row.StateValid}, nil
 	}
 	row, err := s.queries.GetLedgerVerificationHead(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {

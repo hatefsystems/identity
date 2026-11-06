@@ -170,4 +170,15 @@ func TestTransactionsAndDisabledConfiguration(t *testing.T) {
 	if _, err = New(testEncryptor(t), Config{Enabled: true}); !errors.Is(err, ErrUnavailable) {
 		t.Fatal("enabled without policy")
 	}
+	if _, err = s.GetHoldReviews(context.Background(), Actor{}, uuid.Nil); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("nil hold ID=%v", err)
+	}
+	if _, err = s.GetHoldReviews(context.Background(), Actor{}, uuid.New()); !errors.Is(err, ErrTransactionRequired) {
+		t.Fatalf("review read outside audit transaction=%v", err)
+	}
+	for _, limit := range []int{0, 1001} {
+		if _, err = StatusSnapshot(context.Background(), nil, "test", limit, time.Now()); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("status accepted invalid snapshot options=%v", err)
+		}
+	}
 }

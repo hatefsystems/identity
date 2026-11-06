@@ -398,8 +398,10 @@ func TestSearchPathShadowingCannotDeceiveTheGuards(t *testing.T) {
 	if err := f.admin.QueryRow(f.ctx, "SELECT account_ref FROM public.security_event_ledger WHERE seq=$1", seq).Scan(&account); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
-VALUES($1,'shadowing','court','legal claims',$2)`, account, uuid.New())
+	// Erasure must honor the metadata-only blocker even when its encrypted
+	// details cannot be read; the purge role has neither keys nor narrative need.
+	mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,details_encrypted,applied_by)
+VALUES($1,decode('01','hex'),$2)`, account, uuid.New())
 
 	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE legal_holds(account_ref uuid, is_active boolean)")
 	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE security_ledger_head(singleton boolean, seq bigint, chain_hash bytea)")

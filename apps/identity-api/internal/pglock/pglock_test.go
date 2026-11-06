@@ -11,7 +11,7 @@ import (
 
 func TestReservedWorkerKeysArePositiveAndDistinct(t *testing.T) {
 	seen := make(map[int64]bool)
-	for _, key := range []int64{PurgeKey, AuditSignerKey, LedgerCoordinationKey, SecurityLedgerPurgeKey} {
+	for _, key := range []int64{PurgeKey, AuditSignerKey, LedgerCoordinationKey, SecurityLedgerPurgeKey, AuditCoordinationKey, MigrationKey} {
 		if key <= 0 || seen[key] {
 			t.Fatalf("nonpositive or reused worker key: %d", key)
 		}

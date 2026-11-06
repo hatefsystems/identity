@@ -84,7 +84,7 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
   * *Mitigation:* Sensitive PII is encrypted in the application layer using AES-GCM-256 envelope encryption. User roles and permissions are validated against signed, immutable gRPC SVID scopes. Backup codes have at least 128 bits of entropy and are stored under a deterministic SHA-256 digest (or HMAC-SHA-256 when the optional service-wide pepper is configured), preserving indexed lookup without storing plaintext. Verification and physical deletion occur in one ACID transaction.
 * **Threat T2: Audit Log Alteration (Repudiation & Cover-up)**
   * *Description:* A malicious administrator or attacker gains access to logs and tries to delete trace events to cover their tracks.
-  * *Mitigation:* Logs are stored in ClickHouse which is configured to be strictly Append-Only (administrative DB roles lack `ALTER...DELETE` privileges). Every audit log row's cryptographic hash is chained to the preceding row's hash. Any tampering breaks the chain and triggers immediate system alerts.
+   * *Mitigation:* The MVP uses PostgreSQL canonical-v2 append-only `audit_log_chain` / `security_ledger_chain`, separate retained payloads and both durable heads; ClickHouse is deferred. Checks validate links, retained leaves and absent-ledger-payload annotations against current heads/genesis. Armed guards and effective non-owner ACLs restrict ordinary mutation, but annotations do not prove lawful erasure and a coherent privileged rewrite/rollback is not independently detected. External anchoring and deployed monitoring remain separate gates.
 * **Threat T3: Malicious Account Deletion (Account Takeover / ATO)**
   * *Description:* An attacker gains access to a user's active session or credentials and initiates immediate account deletion to destroy their data or lock them out permanently.
   * *Mitigation:* Deletion requires fresh WebAuthn UV, with active status/auth-version rechecked under the deciding account lock. The 30-day pending window, hashed reclaim request and encrypted email intents commit together. A separate SMTP worker retries primary/configured-backup notices. Pending users cancel through anonymous emailed-token plus UV/TOTP verification, not login. Recovery rechecks retirement, expiry and attempt limits at commit and never revives old sessions. Deployment requires a mailbox independently accessible after deactivation. This mitigates accidental/attacker deletion without claiming guaranteed delivery or recovery after mailbox/factor loss.
@@ -99,7 +99,7 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 
 * **Threat R1: Admin Denies Performing Unauthorized Account Ban or Deletion**
   * *Description:* An admin performs a sensitive action (e.g., banning a user, changing roles) and claims they did not initiate it.
-  * *Mitigation:* ClickHouse immutable append-only logs record every single state change initiated by an administrator. Every row contains the admin's verified user ID, SPIFFE SVID details, IP address, and a cryptographic signature. This immutable log is checked during periodic compliance audits.
+   * *Mitigation:* Privileged acceptance commits minimized durable outbox intent with the business transaction, then the separately credentialed publisher and signer deliver/chain it in PostgreSQL. Actor/network/action/time metadata remains personal data. HTTP operator identity is authenticated by the session; CLI actor/SPIFFE environment strings are launcher attribution, not independently verified SVID authentication. Hash chains are tamper-evidence, not cryptographic signatures by an operator or complete-ingestion/legal-authorization proof. PubAck or pending intent is not a chained receipt.
 * **Threat R2: Deletion-to-Evade-Attribution (User Destroys Trail to Escape Accountability)**
   * *Description:* A user requests account deletion after a security-relevant action, and a lawful inquiry may arrive after hard deletion, for example at day 60 about an action before a day-30 deletion. A nulled Class C `user_id` FK is not a reliable identity-attribution mechanism. It also does **not** imply that no attributable trace remains: baseline administrative audit still contains personal data, including actor/network metadata and linkable references despite payload minimization.
   * *Mitigation:* The **`security_event_ledger`** (Class B) retains minimal **pseudonymized personal data**, not anonymous or non-PII data, for supported security events. Its original `account_ref` and keyed identity blind index survive account deletion subject to the existing independent retention policy and holds; it stores no raw email/phone, but network/device metadata remains personal data. Lookup is bounded to matching indexed, currently eligible records and does not prove complete activity, live-account existence or verified real-world identity. Independent holds protect still-retained data until explicit release; advisory review/expiry dates never release them. Release resumes original clocks and cannot restore erased data, extend account recovery or create an immutable snapshot. Preservation does not require a completed disclosure order/case workflow, and investigative access is not authority to transfer data externally. The documented retention bases remain legitimate interest / legal obligation, not consent; applicability and production approval remain separate governance requirements in `compliance-and-data-governance.md` and [admin operations](admin-operations.md). This panel does not supply approval.
@@ -149,3 +149,23 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 | False-negative signer setup / incompatible rollout | Require the real `admin-legal --operation=lookup-probe` against the actual canonical-v2 schema and keys before exposing attribution, including the post-synthetic-deletion check. Fixture omission keeps lookup unavailable; wrong supplied fixtures/keys fail rather than yield no match. Fake verified wiring is not acceptance evidence. Close/drain affected old admin ingress and retire incompatible callers/forms before every-replica API/UI cutover or rollback; preserve holds, intent, clocks and signed data. |
 
 These controls do not close existing governance or deployment risks. Baseline admin audit remains personal data; approved narrative/replay/ledger retention, Class C policy, effective DB grants, actual signer/publisher delivery, exact-origin/APM redaction, privacy notices and ROPA/DPIA/DSAR duties remain separate. External anchoring and historical multi-pepper coverage remain deferred. Automated/source changes are not validation results or production approval; unobserved manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks, and Task 5.3/5.4/5.5 statuses, remain open/unchanged as applicable.
+
+### 2.8 Trusted Maintenance and Retained Metadata
+
+The v2 purge login has ordinary Class B payload DELETE and erasure/outbox INSERT
+plus required SELECT, not a SQL policy-enforcing purge routine. Trusted Go code
+rechecks canonical candidates and retention/holds under ordered locks; a compromised
+credential can issue arbitrary DELETE within its table authority. Structural chain/
+leaf/annotation checks and separate bounded SELECT-only receipt reconciliation do
+not independently prove policy compliance, receipt ingestion completeness or legal
+authorization. Signer restart must tolerate legitimate pending receipt intent.
+
+`no_expiry` metadata includes joinable hold tombstones/review replay, erased case
+sentinels, report/transparency replay and governance provenance, chain event UUIDs/
+digests and erasure/receipt material. Minimization is not unconditional anonymity
+or blanket approval of permanent retention. See the [exact retained inventory](data-architecture.md#retained-metadata-inventory)
+and unchecked [production checklist](admin-operations.md#production-checklist).
+Forward `00019`/`00020` cutover stops affected intake/writers and verifies bounded
+backfill before physical plaintext contraction; populated v1 or initialized proof
+state refuses pending `00015`, never permitting a development-data wipe or genesis
+reset. In-flight work must stop before emergency revocation is declared effective.

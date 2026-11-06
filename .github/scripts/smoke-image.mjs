@@ -37,7 +37,12 @@ export function maintenanceSucceeded(result, binary = '') {
   }
   return `${result.stdout}\n${result.stderr}`.split('\n').some((line) => {
     try {
-      return JSON.parse(line).level === 'ERROR';
+      const record = JSON.parse(line);
+      if (binary === 'security-ledger-purge') {
+        return record.level === 'ERROR' && record.msg === 'security ledger purge failed' &&
+          record.reason === 'config: SECURITY_LEDGER_PURGE_DATABASE_URL is required; API credentials are not a fallback';
+      }
+      return record.level === 'ERROR';
     } catch {
       return false;
     }
@@ -271,7 +276,7 @@ export async function smokeImage(kind, reference, validateWeb) {
         );
         assert(
           maintenanceSucceeded(result, binary),
-          `${binary} must reject missing production configuration with exit 1: ${result.stdout}${result.stderr}`
+          `${binary} must reject its missing production configuration with exit 1; diagnostics suppressed`
         );
       } finally {
         docker(['rm', '--force', name], true);

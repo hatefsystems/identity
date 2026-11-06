@@ -33,11 +33,12 @@ type workerFixture struct {
 	js      jetstream.JetStream
 	subject string
 	appName string
+	dsn     string
 }
 
-// The database is disposable and separate from the migration/reset suites. The
-// database-local session lock also serializes separate invocations of this suite.
-// Shared cluster roles are created only, never altered or dropped by these tests.
+// Each test owns a fresh disposable database and never resets an existing one.
+// A cluster lock serializes create-only provisioning of the shared purge login;
+// these tests never change its attributes, memberships or ownership.
 func newWorkerFixture(t *testing.T) *workerFixture {
 	t.Helper()
 	for _, key := range []string{"DATABASE_URL", "REDIS_URL", "NATS_URL"} {
@@ -84,19 +85,21 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 	workerExec(t, ctx, root, `DO $$ BEGIN
  CREATE ROLE identity_ledger_purge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'retention-worker-integration-only';
  EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;`)
-	var exists bool
-	if err := root.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname='worker_integration_agent')").Scan(&exists); err != nil {
-		t.Fatal(err)
-	}
-	if !exists {
-		workerExec(t, ctx, root, "CREATE DATABASE worker_integration_agent")
-	}
+	database := "worker_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	workerExec(t, ctx, root, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize())
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
+		defer stop()
+		if _, err := root.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop run-owned worker database: %v", err)
+		}
+	})
 	workerExec(t, ctx, root, "SELECT pg_advisory_unlock(5299999)")
 	dsn, err := url.Parse(os.Getenv("DATABASE_URL"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	dsn.Path = "/worker_integration_agent"
+	dsn.Path = "/" + database
 	admin, err := pgxpool.New(ctx, dsn.String())
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +114,7 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		guard.Release()
 	})
 	workerExec(t, ctx, guard, "SELECT pg_advisory_lock(5299998)")
-	workerExec(t, ctx, admin, "DROP SCHEMA public CASCADE; CREATE SCHEMA public; REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+	workerExec(t, ctx, admin, "REVOKE CREATE ON SCHEMA public FROM PUBLIC")
 	sqldb, err := migrate.Open(ctx, dsn.String())
 	if err != nil {
 		t.Fatal(err)
@@ -130,8 +133,8 @@ GRANT SELECT,DELETE ON public.security_event_ledger TO identity_ledger_purge;
 GRANT SELECT,INSERT ON public.security_ledger_erasures TO identity_ledger_purge;
 GRANT SELECT ON public.security_ledger_chain,public.security_ledger_head,
  public.legal_holds,public.security_ledger_retention_settings TO identity_ledger_purge;
-GRANT INSERT ON public.event_outbox TO identity_ledger_purge;
-REVOKE CREATE ON DATABASE worker_integration_agent FROM identity_ledger_purge;`)
+GRANT INSERT ON public.event_outbox TO identity_ledger_purge;`)
+	workerExec(t, ctx, admin, "REVOKE CREATE ON DATABASE "+pgx.Identifier{database}.Sanitize()+" FROM PUBLIC,identity_ledger_purge")
 	// Separate statement: a parameterized query cannot share an Exec with a
 	// multi-command string, because pgx prepares it.
 	workerExec(t, ctx, admin, "INSERT INTO public.security_ledger_head VALUES(true,0,$1)", audit.LedgerGenesis().Bytes())
@@ -162,7 +165,7 @@ REVOKE CREATE ON DATABASE worker_integration_agent FROM identity_ledger_purge;`)
 	if err := store.Probe(ctx); err != nil {
 		t.Fatalf("correctly provisioned real worker login failed startup: %v", err)
 	}
-	return &workerFixture{ctx: ctx, admin: admin, worker: worker, store: store, js: js, subject: subject, appName: appName}
+	return &workerFixture{ctx: ctx, admin: admin, worker: worker, store: store, js: js, subject: subject, appName: appName, dsn: dsn.String()}
 }
 
 type workerExecutor interface {
@@ -234,6 +237,7 @@ func (f *workerFixture) seed(t *testing.T, records ...audit.LedgerRecord) []work
 	if len(records) > 0 {
 		workerExec(t, f.ctx, tx, "SELECT public.advance_chain_head('ledger',$1,$2,$3,$4)",
 			expected, first, seq, int64(len(records)))
+		workerExec(t, f.ctx, tx, "SELECT setval('public.security_ledger_chain_seq',$1,true)", seq)
 	}
 	if err := tx.Commit(f.ctx); err != nil {
 		t.Fatal(err)
