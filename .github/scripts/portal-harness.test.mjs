@@ -449,6 +449,12 @@ function mockPortalDocker(t, { failCleanup, failCreate, failStart, internalNullB
       network = args.at(-1);
       state.internal = args.includes('--internal');
       assert.match(network, /^portal-browser-[a-f0-9]{32}$/);
+      if (state.internal) {
+        assert(args.includes('--subnet'), 'Static registration peers require an explicit Docker subnet');
+        const subnet = args[args.indexOf('--subnet') + 1];
+        assert.match(subnet, /^10\.(?:1[2-8][0-9]|19[01])\.\d{1,3}\.0\/24$/);
+        state.subnet = subnet;
+      } else assert(!args.includes('--subnet'), 'Ordinary suites keep Docker pool allocation');
       const id = 'f'.repeat(64);
       names.set(id, network);
       labels.set(id, { 'ldp.run': network.slice('portal-browser-'.length) });
@@ -523,6 +529,7 @@ test('internal browser services tolerate null Docker bindings and expose only pr
   const services = await startPortalServices({ internal: true });
   try {
     assert.equal(state.internal, true);
+    assert(state.subnet, 'Internal service creation must declare its static-IP pool');
     assert.equal(services.environment, null);
     assert.equal(state.fetches, 0);
     assert(state.created.every(({ ports }) => Object.keys(ports).length === 0));
