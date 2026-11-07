@@ -234,7 +234,13 @@ func TestSMSRevocationAfterProofAdmissionRejectsFinalMutationIntegration(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(f.ctx)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanup); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error("SMS fixture transaction rollback failed")
+		}
+	}()
 	if err := pglock.LockAccount(f.ctx, tx, u.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +328,13 @@ func TestSMSRealRedisMalformedExpiryAndConsumeFailureIntegration(t *testing.T) {
 	if err := f.store.Store(f.ctx, id, rec, time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
-	defer f.store.Delete(f.ctx, id)
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := f.store.Delete(cleanup, id); err != nil {
+			t.Error("SMS fixture OTP cleanup failed")
+		}
+	})
 	if err := f.redis.PExpire(f.ctx, otpKey(id), time.Millisecond).Err(); err != nil {
 		t.Fatal(err)
 	}

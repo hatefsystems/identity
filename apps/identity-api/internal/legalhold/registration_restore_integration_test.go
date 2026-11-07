@@ -168,7 +168,6 @@ func registrationRestoreJKT(t *testing.T) string {
 	if err != nil {
 		t.Fatal("create restore browser public key failed")
 	}
-	defer key.D.SetInt64(0)
 	public := struct {
 		Crv string `json:"crv"`
 		Kty string `json:"kty"`

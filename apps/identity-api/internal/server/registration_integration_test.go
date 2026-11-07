@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,11 @@ import (
 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
 	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
@@ -39,10 +45,6 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 )
 
 // These fixtures never adopt/migrate the supplied DATABASE_URL. The shared
@@ -392,7 +394,11 @@ func (a *signupAuthenticator) authData(flags byte, count uint32, attested bool) 
 	data = binary.BigEndian.AppendUint32(data, count)
 	if attested {
 		data = append(data, make([]byte, 16)...)
-		data = binary.BigEndian.AppendUint16(data, uint16(len(a.id)))
+		idLength := len(a.id)
+		if idLength > math.MaxUint16 {
+			panic("fixture credential ID exceeds the WebAuthn length field")
+		}
+		data = binary.BigEndian.AppendUint16(data, uint16(idLength))
 		data = append(data, a.id...)
 		data = append(data, a.cose...)
 	}
@@ -630,14 +636,14 @@ func TestRegistrationBindingsExpiryCollisionsAndConsumeFailureIntegration(t *tes
 	options := f.prove(t, a, phone)
 	auth := newSignupAuthenticator(t, options)
 	for _, kind := range []string{"origin", "rp", "uv"} {
-		copy := *auth
+		candidate := *auth
 		if kind == "origin" {
-			copy.origin = "https://attacker.example"
+			candidate.origin = "https://attacker.example"
 		}
 		if kind == "rp" {
-			copy.rp = "attacker.example"
+			candidate.rp = "attacker.example"
 		}
-		if _, err = f.service.Complete(f.ctx, a, copy.credential(t, options, kind != "uv")); err == nil {
+		if _, err = f.service.Complete(f.ctx, a, candidate.credential(t, options, kind != "uv")); err == nil {
 			t.Fatal("invalid signed signup accepted")
 		}
 	}

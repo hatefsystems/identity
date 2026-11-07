@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -151,7 +152,13 @@ func TestPhoneHTTPRealRedisPostgresRevocationFenceIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanup); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error("phone fixture transaction rollback failed")
+		}
+	}()
 	if err := pglock.LockAccount(ctx, tx, fx.userID); err != nil {
 		t.Fatal(err)
 	}

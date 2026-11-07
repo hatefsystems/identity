@@ -13,13 +13,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/dbprivilege"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Only this helper's unique child database is migrated. DATABASE_URL supplies
@@ -41,6 +43,11 @@ func registrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 			t.Error("registration provisioning close failed")
 		}
 	})
+	const catalogInventory = `SELECT COALESCE(jsonb_agg(jsonb_build_array(oid,relname,relkind,relowner) ORDER BY oid)::text,'[]') FROM pg_class WHERE relnamespace='public'::regnamespace`
+	var provisioningSchema string
+	if err := admin.QueryRowContext(ctx, catalogInventory).Scan(&provisioningSchema); err != nil {
+		t.Fatal("cannot inventory provisioning schema")
+	}
 	name := "registration_fixture_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	quoted := pgx.Identifier{name}.Sanitize()
 	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+quoted+" TEMPLATE template0"); err != nil {
@@ -69,9 +76,13 @@ func registrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	sqlDB, err := migrate.Open(ctx, cfg.ConnString())
-	if err != nil {
-		t.Fatal(err)
+	// ConnString retains the original provisioning DSN; use the mutated config
+	// directly so migration can only reach this newly allocated child database.
+	sqlDB := stdlib.OpenDB(*cfg.ConnConfig)
+	var migrationDatabase string
+	if err := sqlDB.QueryRowContext(ctx, "SELECT current_database()").Scan(&migrationDatabase); err != nil || migrationDatabase != name {
+		_ = sqlDB.Close()
+		t.Fatal("registration migration target is not the owned fixture database")
 	}
 	if err := migrate.Up(ctx, sqlDB); err != nil {
 		_ = sqlDB.Close()
@@ -80,43 +91,47 @@ func registrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 	if err := sqlDB.Close(); err != nil {
 		t.Fatal(err)
 	}
+	var afterMigration string
+	if err := admin.QueryRowContext(ctx, catalogInventory).Scan(&afterMigration); err != nil || afterMigration != provisioningSchema {
+		t.Fatal("registration fixture changed the provisioning schema")
+	}
 	if err := CheckSchema(ctx, pool); err != nil {
 		t.Fatal("new migration schema readiness failed", err)
 	}
 	return ctx, pool
 }
 
-func registrationExec(t *testing.T, ctx context.Context, q db.DBTX, sql string, args ...any) {
+func registrationExec(ctx context.Context, t *testing.T, q db.DBTX, sql string, args ...any) {
 	t.Helper()
 	if _, err := q.Exec(ctx, sql, args...); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func registrationRole(t *testing.T, ctx context.Context, root *pgxpool.Pool, kind string) (*pgxpool.Pool, string) {
+func registrationRole(ctx context.Context, t *testing.T, root *pgxpool.Pool, kind string) (*pgxpool.Pool, string) {
 	t.Helper()
 	name := "registration_" + kind + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	quoted := pgx.Identifier{name}.Sanitize()
 	password := uuid.NewString()
-	registrationExec(t, ctx, root, "CREATE ROLE "+quoted+" LOGIN NOINHERIT PASSWORD '"+password+"'")
+	registrationExec(ctx, t, root, "CREATE ROLE "+quoted+" LOGIN NOINHERIT PASSWORD '"+password+"'")
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		registrationExec(t, cleanup, root, "DROP OWNED BY "+quoted)
-		registrationExec(t, cleanup, root, "DROP ROLE "+quoted)
+		registrationExec(cleanup, t, root, "DROP OWNED BY "+quoted)
+		registrationExec(cleanup, t, root, "DROP ROLE "+quoted)
 	})
-	registrationExec(t, ctx, root, "GRANT CONNECT ON DATABASE "+pgx.Identifier{root.Config().ConnConfig.Database}.Sanitize()+" TO "+quoted)
-	registrationExec(t, ctx, root, "GRANT USAGE ON SCHEMA public TO "+quoted)
+	registrationExec(ctx, t, root, "GRANT CONNECT ON DATABASE "+pgx.Identifier{root.Config().ConnConfig.Database}.Sanitize()+" TO "+quoted)
+	registrationExec(ctx, t, root, "GRANT USAGE ON SCHEMA public TO "+quoted)
 	if kind == "cleanup" {
-		registrationExec(t, ctx, root, "GRANT SELECT, DELETE ON public.registration_attempts TO "+quoted)
-		registrationExec(t, ctx, root, "GRANT SELECT ON public.legal_holds TO "+quoted)
+		registrationExec(ctx, t, root, "GRANT SELECT, DELETE ON public.registration_attempts TO "+quoted)
+		registrationExec(ctx, t, root, "GRANT SELECT ON public.legal_holds TO "+quoted)
 	} else {
-		registrationExec(t, ctx, root, "GRANT SELECT, INSERT ON public.registration_attempts TO "+quoted)
+		registrationExec(ctx, t, root, "GRANT SELECT, INSERT ON public.registration_attempts TO "+quoted)
 		columns := make([]string, 0)
 		for _, column := range APIUpdateColumns() {
 			columns = append(columns, pgx.Identifier{column}.Sanitize())
 		}
-		registrationExec(t, ctx, root, "GRANT UPDATE ("+strings.Join(columns, ",")+") ON public.registration_attempts TO "+quoted)
+		registrationExec(ctx, t, root, "GRANT UPDATE ("+strings.Join(columns, ",")+") ON public.registration_attempts TO "+quoted)
 	}
 	cfg := root.Config().Copy()
 	cfg.ConnConfig.User = name
@@ -136,8 +151,8 @@ func registrationRole(t *testing.T, ctx context.Context, root *pgxpool.Pool, kin
 
 func TestRegistrationRealRolePrivilegesAndSchemaReadiness(t *testing.T) {
 	ctx, root := registrationDatabase(t)
-	cleaner, cleanupRole := registrationRole(t, ctx, root, "cleanup")
-	api, apiRole := registrationRole(t, ctx, root, "api")
+	cleaner, cleanupRole := registrationRole(ctx, t, root, "cleanup")
+	api, apiRole := registrationRole(ctx, t, root, "api")
 	if err := CheckCleanupReady(ctx, cleaner); err != nil {
 		t.Fatal("least-privilege actual cleanup login refused", err)
 	}
@@ -166,16 +181,16 @@ func TestRegistrationRealRolePrivilegesAndSchemaReadiness(t *testing.T) {
 			t.Fatalf("API frozen authority/delete grant widened: %v", err)
 		}
 	}
-	registrationExec(t, ctx, root, "GRANT UPDATE ON public.registration_attempts TO "+cleanupRole)
+	registrationExec(ctx, t, root, "GRANT UPDATE ON public.registration_attempts TO "+cleanupRole)
 	if err := CheckCleanupReady(ctx, cleaner); err != dbprivilege.ErrUnsafe {
 		t.Fatal("overgranted cleanup login admitted")
 	}
-	registrationExec(t, ctx, root, "REVOKE UPDATE ON public.registration_attempts FROM "+cleanupRole)
-	registrationExec(t, ctx, root, "GRANT "+apiRole+" TO "+cleanupRole)
+	registrationExec(ctx, t, root, "REVOKE UPDATE ON public.registration_attempts FROM "+cleanupRole)
+	registrationExec(ctx, t, root, "GRANT "+apiRole+" TO "+cleanupRole)
 	if err := CheckCleanupReady(ctx, cleaner); err != dbprivilege.ErrUnsafe {
 		t.Fatal("NOINHERIT role membership admitted")
 	}
-	registrationExec(t, ctx, root, "REVOKE "+apiRole+" FROM "+cleanupRole)
+	registrationExec(ctx, t, root, "REVOKE "+apiRole+" FROM "+cleanupRole)
 	if err := CheckCleanupReady(ctx, cleaner); err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +228,8 @@ func TestRegistrationRealRolePrivilegesAndSchemaReadiness(t *testing.T) {
 
 func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 	ctx, root := registrationDatabase(t)
-	api, _ := registrationRole(t, ctx, root, "api")
-	cleaner, _ := registrationRole(t, ctx, root, "cleanup")
+	api, _ := registrationRole(ctx, t, root, "api")
+	cleaner, _ := registrationRole(ctx, t, root, "cleanup")
 	stores := make([]*Store, 2)
 	for i := range stores {
 		s, err := NewStore(api, testCipher(t), 1)
@@ -267,7 +282,7 @@ func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 	}
 }
 
-func completedRegistration(t *testing.T, ctx context.Context, pool *pgxpool.Pool, start time.Time) (Attempt, []byte) {
+func completedRegistration(ctx context.Context, t *testing.T, pool *pgxpool.Pool, start time.Time) (Attempt, []byte) {
 	t.Helper()
 	s, err := NewStore(pool, testCipher(t), 100)
 	if err != nil {
@@ -319,14 +334,14 @@ func completedRegistration(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 
 func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 	ctx, root := registrationDatabase(t)
-	cleaner, _ := registrationRole(t, ctx, root, "cleanup")
-	held, secret := completedRegistration(t, ctx, root, time.Now().Add(-80*time.Minute))
+	cleaner, _ := registrationRole(ctx, t, root, "cleanup")
+	held, secret := completedRegistration(ctx, t, root, time.Now().Add(-80*time.Minute))
 	defer clear(secret)
-	contended, key := completedRegistration(t, ctx, root, time.Now().Add(-79*time.Minute))
+	contended, key := completedRegistration(ctx, t, root, time.Now().Add(-79*time.Minute))
 	defer clear(key)
-	free, freeKey := completedRegistration(t, ctx, root, time.Now().Add(-78*time.Minute))
+	free, freeKey := completedRegistration(ctx, t, root, time.Now().Add(-78*time.Minute))
 	defer clear(freeKey)
-	registrationExec(t, ctx, root, `INSERT INTO public.legal_holds(account_ref,applied_by,details_encrypted) VALUES($1,gen_random_uuid(),'\x01')`, held.Record.ResultUserID.UUID)
+	registrationExec(ctx, t, root, `INSERT INTO public.legal_holds(account_ref,applied_by,details_encrypted) VALUES($1,gen_random_uuid(),'\x01')`, held.Record.ResultUserID.UUID)
 	blocker, err := root.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +359,7 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 		t.Fatal("free receipt not deleted")
 	}
 	rollback(blocker)
-	registrationExec(t, ctx, root, `UPDATE legal_holds SET is_active=false,released_at=now() WHERE account_ref=$1`, held.Record.ResultUserID.UUID)
+	registrationExec(ctx, t, root, `UPDATE legal_holds SET is_active=false,released_at=now() WHERE account_ref=$1`, held.Record.ResultUserID.UUID)
 	restarted, err := NewStore(root, testCipher(t), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -364,11 +379,11 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 	if _, err := restarted.Get(ctx, pending.Record.ID, capability, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"); err != ErrUnauthorized {
 		t.Fatal("foreign JKT authorized")
 	}
-	registrationExec(t, ctx, root, `UPDATE registration_attempts SET details_encrypted=set_byte(details_encrypted,octet_length(details_encrypted)-1,$2) WHERE id=$1`, pending.Record.ID, int(pending.Record.DetailsEncrypted[len(pending.Record.DetailsEncrypted)-1]^1))
+	registrationExec(ctx, t, root, `UPDATE registration_attempts SET details_encrypted=set_byte(details_encrypted,octet_length(details_encrypted)-1,$2) WHERE id=$1`, pending.Record.ID, int(pending.Record.DetailsEncrypted[len(pending.Record.DetailsEncrypted)-1]^1))
 	if _, err := restarted.Get(ctx, pending.Record.ID, capability, pending.Record.Jkt); err != ErrInvalid {
 		t.Fatal("corrupt pending envelope accepted")
 	}
-	receipt, receiptKey := completedRegistration(t, ctx, root, time.Now().Add(-time.Minute))
+	receipt, receiptKey := completedRegistration(ctx, t, root, time.Now().Add(-time.Minute))
 	defer clear(receiptKey)
 	got, err := restarted.Get(ctx, receipt.Record.ID, receiptKey, receipt.Record.Jkt)
 	if err != nil {
@@ -377,7 +392,7 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 	if _, replay, err := CheckReplay(got, bytes.Repeat([]byte{7}, 32)); err != nil || !replay {
 		t.Fatal("lost-response replay receipt unavailable")
 	}
-	registrationExec(t, ctx, root, `DELETE FROM users WHERE id=$1`, receipt.Record.ResultUserID.UUID)
+	registrationExec(ctx, t, root, `DELETE FROM users WHERE id=$1`, receipt.Record.ResultUserID.UUID)
 	if err := root.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM registration_attempts WHERE id=$1)`, receipt.Record.ID).Scan(&exists); err != nil || exists {
 		t.Fatal("receipt FK prevented lawful account purge")
 	}
@@ -385,7 +400,7 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 
 func TestRegistrationSQLConstraintsAndCleanupFailureResume(t *testing.T) {
 	ctx, root := registrationDatabase(t)
-	cleaner, _ := registrationRole(t, ctx, root, "cleanup")
+	cleaner, _ := registrationRole(ctx, t, root, "cleanup")
 	// Every mutation is in this unique fixture, never in the provisioning DB.
 	s, err := NewStore(root, testCipher(t), 100)
 	if err != nil {
@@ -422,13 +437,13 @@ func TestRegistrationSQLConstraintsAndCleanupFailureResume(t *testing.T) {
 		})
 	}
 	function := `CREATE FUNCTION public.registration_fixture_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id='` + b.Record.ID.String() + `'::uuid THEN RAISE EXCEPTION 'fixture delete failure'; END IF; RETURN OLD; END $$`
-	registrationExec(t, ctx, root, function)
-	registrationExec(t, ctx, root, `CREATE TRIGGER registration_fixture_failure BEFORE DELETE ON registration_attempts FOR EACH ROW EXECUTE FUNCTION registration_fixture_failure()`)
+	registrationExec(ctx, t, root, function)
+	registrationExec(ctx, t, root, `CREATE TRIGGER registration_fixture_failure BEFORE DELETE ON registration_attempts FOR EACH ROW EXECUTE FUNCTION registration_fixture_failure()`)
 	stats, err := Cleanup(ctx, cleaner, 10)
 	if err != ErrUnavailable || stats.Deleted != 1 {
 		t.Fatalf("later delete failure rolled back prior candidate: %+v %v", stats, err)
 	}
-	registrationExec(t, ctx, root, `DROP TRIGGER registration_fixture_failure ON registration_attempts`)
+	registrationExec(ctx, t, root, `DROP TRIGGER registration_fixture_failure ON registration_attempts`)
 	stats, err = Cleanup(ctx, cleaner, 10)
 	if err != nil || stats.Deleted != 1 {
 		t.Fatalf("failed candidate did not resume: %+v %v", stats, err)
@@ -455,7 +470,7 @@ func TestRegistrationReadinessRejectsMalformedSchema(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer rollback(tx)
-			registrationExec(t, ctx, tx, ddl)
+			registrationExec(ctx, t, tx, ddl)
 			if err := CheckSchema(ctx, tx); err != ErrUnavailable {
 				t.Fatal("malformed signup storage admitted", err)
 			}
