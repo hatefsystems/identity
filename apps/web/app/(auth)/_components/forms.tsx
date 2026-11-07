@@ -1,3 +1,4 @@
+import { useTranslations } from 'next-intl';
 import { Button } from '@hatef/ui';
 import { Fingerprint } from 'lucide-react';
 import Link from 'next/link';
@@ -23,6 +24,7 @@ export function LoginForm({
   submit?: FormSubmit<LoginValues>;
   passkeyAction?: ReactNode;
 }) {
+  const t = useTranslations();
   const form = useAuthForm({ email: '', password: '' }, validateLogin, submit);
 
   return (
@@ -31,28 +33,28 @@ export function LoginForm({
         <Button asChild className="h-auto min-h-11 w-full whitespace-normal">
           <Link href="/login/webauthn">
             <Fingerprint aria-hidden="true" />
-            Continue with a passkey
+            {t('auth.passkey.continue')}
           </Link>
         </Button>
       )}
       <div className="flex items-center gap-3 text-xs text-muted-foreground">
         <span aria-hidden="true" className="h-px flex-1 bg-border" />
-        <span>or use your password</span>
+        <span>{t('auth.forms.login.separator')}</span>
         <span aria-hidden="true" className="h-px flex-1 bg-border" />
       </div>
       <AuthForm
         {...form}
-        label="Password sign in"
-        submitLabel="Sign in with password"
+        label={t('auth.forms.login.label')}
+        submitLabel={t('auth.forms.login.submit')}
         messages={{
-          pending: 'Signing in...',
-          success: 'Sign-in completed.',
-          error: 'We could not sign you in. Check your details and try again.',
+          pending: t('auth.forms.login.pending'),
+          success: t('auth.forms.login.success'),
+          error: t('auth.forms.login.error'),
         }}
       >
         <AuthField
           {...form.field('email')}
-          label="Email address"
+          label={t('auth.fields.email')}
           type="email"
           autoComplete="username"
           autoCapitalize="none"
@@ -61,13 +63,13 @@ export function LoginForm({
         />
         <AuthField
           {...form.field('password')}
-          label="Password"
+          label={t('auth.fields.password')}
           type="password"
           autoComplete="current-password"
           required
         />
         <div className="flex justify-end">
-          <AuthLink href="/forgot-password">Forgot password?</AuthLink>
+          <AuthLink href="/forgot-password">{t('auth.forms.login.forgot')}</AuthLink>
         </div>
       </AuthForm>
     </>
@@ -75,28 +77,25 @@ export function LoginForm({
 }
 
 export function PasskeyForm({ submit }: { submit?: () => Promise<FormOutcome> }) {
+  const t = useTranslations();
   const form = useAuthForm({}, () => ({}), submit);
 
   return (
     <>
       <div className="flex items-start gap-3 rounded-md bg-muted/50 p-4">
         <Fingerprint aria-hidden="true" className="mt-0.5 size-6 shrink-0" />
-        <p className="text-sm leading-relaxed">
-          Use a fingerprint, face recognition, device PIN, or a security key. Your device chooses
-          the account, so you do not need to enter an email address.
-        </p>
+        <p className="text-sm leading-relaxed">{t('auth.forms.passkey.intro')}</p>
       </div>
       <AuthForm
         {...form}
-        label="Passkey sign in"
-        submitLabel="Use a passkey"
+        label={t('auth.forms.passkey.label')}
+        submitLabel={t('auth.forms.passkey.submit')}
         messages={{
-          pending: 'Complete the prompt on your device.',
-          success: 'Passkey verification completed.',
-          error: 'We could not verify the passkey. Please try again.',
-          cancelled: 'The passkey request was cancelled. You can try again.',
-          unsupported:
-            'Passkeys are not supported in this browser. Try another browser or use the password form.',
+          pending: t('auth.forms.passkey.pending'),
+          success: t('auth.forms.passkey.success'),
+          error: t('auth.forms.passkey.error'),
+          cancelled: t('auth.forms.passkey.cancelled'),
+          unsupported: t('auth.forms.passkey.unsupported'),
         }}
       />
     </>
@@ -104,24 +103,24 @@ export function PasskeyForm({ submit }: { submit?: () => Promise<FormOutcome> })
 }
 
 export function TotpForm({ submit }: { submit?: FormSubmit<TotpValues> }) {
+  const t = useTranslations();
   const form = useAuthForm({ code: '' }, validateTotp, submit);
 
   return (
     <AuthForm
       {...form}
-      label="Authenticator verification"
-      submitLabel="Verify code"
+      label={t('auth.forms.totp.label')}
+      submitLabel={t('auth.forms.totp.submit')}
       messages={{
-        pending: 'Verifying your code...',
-        success: 'Code verification completed.',
-        error:
-          'We could not verify that code. Use the current code from your authenticator and try again.',
+        pending: t('auth.forms.totp.pending'),
+        success: t('auth.forms.totp.success'),
+        error: t('auth.forms.totp.error'),
       }}
     >
       <AuthField
         {...form.field('code')}
-        label="Authenticator code"
-        hint="Enter the six-digit code from your authenticator app, not an email or text message."
+        label={t('security.stepUp.code')}
+        hint={t('auth.fields.codeHint')}
         type="text"
         inputMode="numeric"
         autoComplete="one-time-code"
@@ -135,28 +134,28 @@ export function TotpForm({ submit }: { submit?: FormSubmit<TotpValues> }) {
 }
 
 export function ForgotPasswordForm({ submit }: { submit?: FormSubmit<EmailValues> }) {
+  const t = useTranslations();
   const form = useAuthForm({ email: '' }, validateEmail, submit);
 
   return (
     <AuthForm
       {...form}
-      label="Request a password reset"
-      submitLabel="Send reset link"
+      label={t('auth.forms.forgot.label')}
+      submitLabel={t('auth.forms.forgot.submit')}
       messages={{
-        pending: 'Requesting a reset link...',
-        success:
-          'If an account matches that email address, you will receive a password reset link. Check your inbox and spam folder.',
-        error: 'We could not request a reset link. Please try again.',
+        pending: t('auth.forms.forgot.pending'),
+        success: t('auth.forms.forgot.success'),
+        error: t('auth.forms.forgot.error'),
       }}
     >
       <AuthField
         {...form.field('email')}
-        label="Email address"
+        label={t('auth.fields.email')}
         type="email"
         autoComplete="email"
         autoCapitalize="none"
         spellCheck={false}
-        hint="Use the primary email address for your account."
+        hint={t('auth.fields.emailHint')}
         required
       />
     </AuthForm>
@@ -170,6 +169,7 @@ export function ResetPasswordForm({
   submit?: FormSubmit<PasswordValues>;
   linkState?: 'unverified' | 'ready' | 'invalid' | 'expired';
 }) {
+  const t = useTranslations();
   const form = useAuthForm(
     { password: '', confirmation: '' },
     validatePassword,
@@ -183,11 +183,9 @@ export function ResetPasswordForm({
           role="alert"
           className="rounded-md border border-red-700 bg-red-50 p-3 text-sm leading-relaxed text-red-800 dark:border-red-400 dark:bg-red-950 dark:text-red-200"
         >
-          {linkState === 'expired'
-            ? 'This reset link has expired. Request a new link to continue.'
-            : 'This reset link cannot be used. Request a new link to continue.'}
+          {linkState === 'expired' ? t('auth.forms.reset.expired') : t('auth.forms.reset.invalid')}
         </p>
-        <AuthLink href="/forgot-password">Request a new reset link</AuthLink>
+        <AuthLink href="/forgot-password">{t('auth.forms.reset.newLink')}</AuthLink>
       </div>
     );
   }
@@ -195,25 +193,25 @@ export function ResetPasswordForm({
   return (
     <AuthForm
       {...form}
-      label="Set a new password"
-      submitLabel="Reset password"
+      label={t('auth.forms.reset.label')}
+      submitLabel={t('auth.forms.reset.submit')}
       messages={{
-        pending: 'Resetting your password...',
-        success: 'Password reset completed. Return to sign in with your new password.',
-        error: 'We could not reset your password. Please try again or request a new link.',
+        pending: t('auth.forms.reset.pending'),
+        success: t('auth.forms.reset.success'),
+        error: t('auth.forms.reset.error'),
       }}
     >
       <AuthField
         {...form.field('password')}
-        label="New password"
+        label={t('auth.fields.newPassword')}
         type="password"
         autoComplete="new-password"
-        hint="Use a long, unique password. You can include spaces."
+        hint={t('auth.fields.passwordHint')}
         required
       />
       <AuthField
         {...form.field('confirmation')}
-        label="Confirm password"
+        label={t('auth.fields.confirmPassword')}
         type="password"
         autoComplete="new-password"
         required

@@ -122,7 +122,7 @@ func TestPrivacyNotificationPersistenceRollbackIntegration(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err == nil {
+			if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "fa-IR"); err == nil {
 				t.Fatal("notification persistence failure accepted")
 			}
 			stored, err := env.queries.GetUserByIDForAdmin(ctx, u.ID)
@@ -162,7 +162,7 @@ func TestPrivacyConcurrentDeletionCoalescesIntegration(t *testing.T) {
 	for range callers {
 		wg.Go(func() {
 			<-start
-			result, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "")
+			result, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "fa-IR")
 			results <- result
 			errorsOut <- err
 		})
@@ -216,7 +216,7 @@ func TestPrivacyDeletionRechecksAuthorityAfterSubjectLockIntegration(t *testing.
 	env.svc.tx = notificationFaultBeginner{pool: pool, started: started}
 	done := make(chan error, 1)
 	go func() {
-		_, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "")
+		_, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "en")
 		done <- err
 	}()
 	select {
@@ -247,7 +247,7 @@ func TestPrivacyReclaimRetirementRacesIntegration(t *testing.T) {
 		t.Run(retirement, func(t *testing.T) {
 			env := newIntegrationEnv(t, pool)
 			u := createTestUser(ctx, t, pool, "reclaim-retirement-"+retirement+"@privacy.test")
-			if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err != nil {
+			if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "en"); err != nil {
 				t.Fatal(err)
 			}
 			notice := integrationQueuedNotice(ctx, t, env, u.ID)
@@ -328,7 +328,7 @@ func TestPrivacyReclaimDeadlineEvaluatedAfterLockWaitIntegration(t *testing.T) {
 	pool := openTestPool(ctx, t)
 	env := newIntegrationEnv(t, pool)
 	u := createTestUser(ctx, t, pool, "reclaim-lock-deadline@privacy.test")
-	result, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "")
+	result, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "en")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +375,7 @@ func TestPrivacyNotificationRestartAndRecipientRetryIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "UPDATE users SET backup_email_encrypted=$2 WHERE id=$1", u.ID, backup); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "fa-IR"); err != nil {
 		t.Fatal(err)
 	}
 	before := integrationNotification(ctx, t, env, u.ID, "backup")
@@ -392,6 +392,9 @@ func TestPrivacyNotificationRestartAndRecipientRetryIntegration(t *testing.T) {
 	var attempts []DeletionNotice
 	fail := true
 	sender := notifierFunc(func(_ context.Context, n DeletionNotice) error {
+		if n.Locale != "fa-IR" || n.TemplateVersion != 1 {
+			t.Error("restart/retry changed frozen presentation")
+		}
 		attempts = append(attempts, n)
 		if n.PrimaryEmail == "restart-backup@privacy.test" && fail {
 			return errBoom
@@ -431,7 +434,7 @@ func TestPrivacyNotifierRoleCannotReadContactsOrChangeAuthorityIntegration(t *te
 	pool := openTestPool(ctx, t)
 	env := newIntegrationEnv(t, pool)
 	u := createTestUser(ctx, t, pool, "notifier-privileges@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "fa-IR"); err != nil {
 		t.Fatal(err)
 	}
 	role := "privacy_notice_" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -502,7 +505,7 @@ func TestPrivacyNotificationLeasesFenceConcurrentWorkersIntegration(t *testing.T
 	pool := openTestPool(ctx, t)
 	env := newIntegrationEnv(t, pool)
 	u := createTestUser(ctx, t, pool, "concurrent-workers@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "en"); err != nil {
 		t.Fatal(err)
 	}
 	started, proceed := make(chan struct{}), make(chan struct{})
@@ -559,7 +562,7 @@ func TestPrivacyNotificationCleanupHoldLockAndFailureIntegration(t *testing.T) {
 	pool := openTestPool(ctx, t)
 	env := newIntegrationEnv(t, pool)
 	u := createTestUser(ctx, t, pool, "notification-held-cleanup@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, u.ID, u.AuthVersion, "", "en"); err != nil {
 		t.Fatal(err)
 	}
 	notice := integrationQueuedNotice(ctx, t, env, u.ID)

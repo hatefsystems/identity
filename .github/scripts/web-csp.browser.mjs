@@ -1,8 +1,25 @@
+import {
+  assertOnlyPreferenceCookies,
+  browserLocale,
+  browserLocales,
+  configureBrowserPreferences,
+  exercisePreferenceFailure,
+  exercisePreferenceSwitch,
+  localHTTPSProxy,
+  localizedText,
+  preferenceActionInput,
+  screenshotName,
+  setBrowserLocale,
+  waitForFonts,
+} from './browser-localization.mjs';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, readFile } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { request as httpsRequest } from 'node:https';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
+import { browserFailure } from './portal-harness.mjs';
 import { smokeImage, webDocumentNonce } from './smoke-image.mjs';
 
 const previewNotice = 'This form is not connected yet. Do not enter real credentials.';
@@ -65,6 +82,60 @@ const viewports = [
   { width: 320, height: 256 },
 ];
 
+// Browser SPKI trust does not configure Playwright's Node-side route.fetch.
+// Retrieve only this public probe through the same ingress using its exact CA.
+export function fetchPinnedCspDocument(url, certificate, cookies = []) {
+  assert(
+    url instanceof URL && url.protocol === 'https:' && url.hostname === 'localhost' && url.port
+  );
+  assert.equal(url.pathname, '/');
+  assert.deepEqual([...url.searchParams.keys()], ['__csp_fixture']);
+  assert.match(url.searchParams.get('__csp_fixture'), /^[a-f0-9-]{36}$/);
+  assertOnlyPreferenceCookies(cookies);
+  const headers = cookies.length
+    ? { Cookie: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ') }
+    : {};
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(new Error('Pinned public CSP document retrieval failed'));
+    const request = httpsRequest(
+      url,
+      { method: 'GET', ca: certificate, headers, timeout: 30_000 },
+      (response) => {
+        const chunks = [];
+        let size = 0;
+        response.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > 2 * 1024 * 1024) {
+            request.destroy(new Error('Public CSP document exceeded its bound'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on('error', fail);
+        response.on('aborted', fail);
+        response.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          chunks.length = 0;
+          resolve({
+            status: response.statusCode,
+            headers: Object.fromEntries(
+              Object.entries(response.headers)
+                .filter(([, value]) => value !== undefined)
+                .map(([name, value]) => [name, Array.isArray(value) ? value.join(', ') : value])
+            ),
+            body,
+          });
+        });
+      }
+    );
+    request.on('timeout', () =>
+      request.destroy(new Error('Public CSP document retrieval timed out'))
+    );
+    request.on('error', fail);
+    request.end();
+  });
+}
+
 async function waitForExternalCss(page, dark = false) {
   await page.waitForFunction((dark) => {
     const externalStylesheet = [...document.querySelectorAll('link[rel="stylesheet"]')].some(
@@ -108,6 +179,10 @@ function observePage(page, expected404s = new Set()) {
   const requests = [];
   const navigations = [];
   const consoleMessages = [];
+  const expectedResourceFailures = [];
+  const fontResources = [];
+  const fontTasks = [];
+  let fontFailures = 0;
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('console', (message) => {
     const text = message.text();
@@ -117,6 +192,18 @@ function observePage(page, expected404s = new Set()) {
       text === 'Failed to load resource: the server responded with a status of 404 (Not Found)' &&
       expected404s.has(message.location().url)
     ) {
+      return;
+    }
+    const expected = expectedResourceFailures.find(
+      (failure) =>
+        !failure.observed &&
+        failure.url === message.location().url &&
+        failure.status === 503 &&
+        text ===
+          'Failed to load resource: the server responded with a status of 503 (Service Unavailable)'
+    );
+    if (expected) {
+      expected.observed = true;
       return;
     }
     errors.push(`${message.type()}: ${text} (${message.location().url})`);
@@ -130,16 +217,103 @@ function observePage(page, expected404s = new Set()) {
       body: request.postData(),
     });
   });
+  page.on('response', (response) => {
+    if (response.request().resourceType() !== 'font') return;
+    fontTasks.push(
+      (async () => {
+        const body = await response.body();
+        assert(
+          body.byteLength > 0 && body.byteLength <= 1024 * 1024,
+          'Invalid bounded font content'
+        );
+        fontResources.push({
+          url: response.url(),
+          status: response.status(),
+          contentType: response.headers()['content-type'] || '',
+          magic: body.subarray(0, 4).toString('ascii'),
+          sha256: createHash('sha256').update(body).digest('hex'),
+        });
+      })().catch(() => {
+        fontFailures++;
+      })
+    );
+  });
   page.on('framenavigated', (frame) => {
     if (frame === page.mainFrame()) navigations.push(frame.url());
   });
-  return { errors, requests, navigations, consoleMessages };
+  return {
+    errors,
+    requests,
+    navigations,
+    consoleMessages,
+    fontResources,
+    fontTasks,
+    get fontFailures() {
+      return fontFailures;
+    },
+    expectResourceFailure(url, status) {
+      assert.equal(status, 503);
+      assert.equal(url, page.url().split('#')[0]);
+      expectedResourceFailures.push({ url, status, observed: false });
+    },
+  };
+}
+
+async function assertInitialFontResources(page, observed) {
+  await waitForFonts(page);
+  await Promise.all(observed.fontTasks);
+  assert.equal(observed.fontFailures, 0, 'Public font response validation failed');
+  const requests = observed.requests.filter((request) => request.type === 'font');
+  const family = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
+  if (browserLocale() === 'en') {
+    assert.equal(requests.length, 0, 'English downloaded an unnecessary Persian font');
+    assert.equal(observed.fontResources.length, 0);
+    assert(!/persianfont/i.test(family), 'English did not retain system typography');
+    return;
+  }
+  assert(requests.length > 0, 'Persian did not request its local font');
+  assert.equal(
+    observed.fontResources.length,
+    requests.length,
+    'A font request had no validated response'
+  );
+  assert(/persianfont/i.test(family), 'Persian did not apply its local font family');
+  const provenance = JSON.parse(
+    await readFile(new URL('../../apps/web/app/fonts/provenance.json', import.meta.url), 'utf8')
+  );
+  for (const font of observed.fontResources) {
+    const url = new URL(font.url);
+    assert.equal(
+      url.origin,
+      new URL(page.url()).origin,
+      'Font request left the application origin'
+    );
+    assert(!url.search && !url.hash, 'Generated font URL included unexpected parameters');
+    assert.match(
+      decodeURIComponent(url.pathname),
+      /^\/_next\/static\/media\/(?=[^/]*[a-f0-9]{8})[^/]+\.woff2$/i,
+      'Font URL was not a fingerprinted same-origin static WOFF2'
+    );
+    assert.equal(font.status, 200);
+    assert.match(font.contentType, /^font\/woff2(?:;|$)/i);
+    assert.equal(font.magic, 'wOF2');
+    assert.equal(
+      font.sha256,
+      provenance.fontSha256,
+      'Image font differs from the pinned unmodified release'
+    );
+  }
 }
 
 function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
   for (const request of observed.requests) {
     const url = new URL(request.url);
     assert.equal(url.origin, new URL(baseURL).origin, 'No third-party auth or telemetry requests');
+    if (request.method === 'POST' && request.headers['next-action']) {
+      assert(documentPaths.has(url.pathname), 'Preference action left a rendered page');
+      preferenceActionInput(request, request.url);
+      continue;
+    }
     assert(
       ['GET', 'HEAD'].includes(request.method),
       `Unexpected ${request.method} ${url.pathname}`
@@ -199,15 +373,15 @@ async function assertUnavailable(page, route, noScript = false) {
     return;
   }
   if (route.registration) {
-    const form = page.getByRole('form', { name: 'Create an account', exact: true });
+    const form = page.getByRole('form', { name: localizedText('Create an account'), exact: true });
     assert.equal(await form.getAttribute('method'), 'post');
     assert.equal(
       await form.getAttribute('action'),
       null,
       'Registration has no native credential endpoint'
     );
-    const submit = form.getByRole('button', { name: route.submit, exact: true });
-    const mailbox = form.getByLabel('Email address', { exact: true });
+    const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
+    const mailbox = form.getByLabel(localizedText('Email address'), { exact: true });
     assert.equal(
       await mailbox.getAttribute('type'),
       'text',
@@ -222,11 +396,11 @@ async function assertUnavailable(page, route, noScript = false) {
     if (noScript) {
       assert(await submit.isDisabled(), 'Registration remains inert without JavaScript');
       for (const field of route.fields)
-        assert(await form.getByLabel(field.label, { exact: true }).isDisabled());
+        assert(await form.getByLabel(localizedText(field.label), { exact: true }).isDisabled());
     } else {
       await page.waitForFunction(
         () =>
-          !document.querySelector('form[aria-label="Create an account"] button[type=submit]')
+          !document.querySelector('[data-registration-form] button[type=submit]')
             ?.disabled
       );
     }
@@ -239,11 +413,11 @@ async function assertUnavailable(page, route, noScript = false) {
     return;
   }
   const form = page.getByRole('form');
-  await form.getByText('UI preview', { exact: true }).waitFor({ state: 'visible' });
-  await form.getByText(previewNotice).waitFor({ state: 'visible' });
+  await form.getByText(localizedText('UI preview'), { exact: true }).waitFor({ state: 'visible' });
+  await form.getByText(localizedText(previewNotice, { exact: false })).waitFor({ state: 'visible' });
   assert.equal(await form.getAttribute('method'), 'post', `${route.path} keeps POST semantics`);
   assert.equal(await form.getAttribute('action'), null, `${route.path} has no action endpoint`);
-  const submit = form.getByRole('button', { name: route.submit, exact: true });
+  const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
   assert(await submit.isDisabled(), `${route.path} submit must remain natively disabled`);
   assert.equal(await submit.getAttribute('type'), 'submit');
   assert.equal(
@@ -255,7 +429,7 @@ async function assertUnavailable(page, route, noScript = false) {
 }
 
 async function assertFieldError(page, field, value = '') {
-  const input = page.getByLabel(field.label, { exact: true });
+  const input = page.getByLabel(localizedText(field.label), { exact: true });
   await input.fill(value);
   await input.press('Tab');
   await input.and(page.locator('[aria-invalid="true"]')).waitFor({ state: 'visible' });
@@ -367,7 +541,7 @@ function auditAuthAppearance({ focusedOnly = false } = {}) {
     if (
       !node.textContent.trim() ||
       !element ||
-      element.closest('script, style, noscript, [aria-hidden="true"], :disabled') ||
+      element.closest('script, style, noscript, option, [aria-hidden="true"], :disabled') ||
       !element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
     )
       continue;
@@ -384,14 +558,25 @@ function auditAuthAppearance({ focusedOnly = false } = {}) {
     range.selectNodeContents(node);
     for (const rect of range.getClientRects()) geometry(element, rect);
   }
-  for (const element of document.querySelectorAll('header a, main a, main button, main input')) {
+  for (const element of document.querySelectorAll(
+    'header a, main a, main button, main input, main select, main textarea, [data-ui-preferences] button, [data-ui-preferences] select, [data-ui-preferences] summary'
+  )) {
+    if (!element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
     geometry(element, rect);
     if (rect.width < 44 || rect.height < 44)
       failures.push(`${describe(element)}: touch area ${rect.width}x${rect.height}, need 44x44`);
-    if (element instanceof HTMLInputElement) {
-      if (innerWidth < 768 && Number.parseFloat(style.fontSize) < 16)
+    if (
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLSelectElement ||
+      element instanceof HTMLTextAreaElement
+    ) {
+      if (
+        element instanceof HTMLInputElement &&
+        innerWidth < 768 &&
+        Number.parseFloat(style.fontSize) < 16
+      )
         failures.push(`${describe(element)}: mobile input text below 16px`);
       if (Number.parseFloat(style.borderTopWidth) < 1)
         failures.push(`${describe(element)}: missing field boundary`);
@@ -410,7 +595,7 @@ function auditAuthAppearance({ focusedOnly = false } = {}) {
 
 async function assertKeyboardTraversal(page, label) {
   const candidates = page.locator(
-    'a[href], button, input, select, textarea, [tabindex], [contenteditable="true"]'
+    'a[href], button, input, select, textarea, summary, [tabindex], [contenteditable="true"]'
   );
   const stops = await candidates.evaluateAll((elements) =>
     elements.flatMap((element, index) => {
@@ -419,6 +604,9 @@ async function assertKeyboardTraversal(page, label) {
         element.matches(':disabled, input[type="hidden"]') ||
         element.closest('[hidden], [inert]') ||
         !element.getClientRects().length ||
+        // Closed native details may retain layout rects after being opened.
+        // Chromium skips those descendants in the sequential focus order.
+        !element.checkVisibility({ checkVisibilityCSS: true }) ||
         getComputedStyle(element).visibility === 'hidden'
       )
         return [];
@@ -427,23 +615,40 @@ async function assertKeyboardTraversal(page, label) {
   );
   assert(stops.length >= 2, `${label}: expected home and return/navigation links`);
   const first = candidates.nth(stops[0]);
-  assert.equal(await first.getAttribute('aria-label'), 'Hatef Identity home');
+  const home = localizedText('Hatef Identity home');
+  const homeLabel = await first.getAttribute('aria-label');
+  assert(home instanceof RegExp ? home.test(homeLabel) : homeLabel === home);
   await first.focus();
   await page.keyboard.press('Tab');
   await page.keyboard.press('Shift+Tab');
   for (let i = 0; i < stops.length; i++) {
     if (i) await page.keyboard.press('Tab');
     const target = candidates.nth(stops[i]);
-    assert(
-      await target.evaluate(
-        (element) =>
-          element === document.activeElement &&
-          element.tabIndex === 0 &&
-          !element.closest('[aria-hidden="true"]') &&
-          element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
-      ),
-      `${label}: skipped, hidden or out-of-order tab stop ${i}`
+    const reachable = await target.evaluate(
+      (element) =>
+        element === document.activeElement &&
+        element.tabIndex === 0 &&
+        !element.closest('[aria-hidden="true"]') &&
+        element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
     );
+    if (!reachable) {
+      const controls = await target.evaluate((element) => ({
+        expected: {
+          tag: element.tagName,
+          tabIndex: element.tabIndex,
+          visible: element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }),
+          detailsOpen: element.closest('details')?.open ?? null,
+        },
+        active: {
+          tag: document.activeElement?.tagName,
+          tabIndex: document.activeElement?.tabIndex,
+        },
+      }));
+      console.error(
+        JSON.stringify({ check: 'keyboard-target', context: label, index: i, controls })
+      );
+    }
+    assert(reachable, `${label}: skipped, hidden or out-of-order tab stop ${i}`);
     assert.deepEqual(
       await page.evaluate(auditAuthAppearance, { focusedOnly: true }),
       [],
@@ -480,9 +685,24 @@ async function checkAuthViewports(page, route) {
       await page.setViewportSize(viewport);
       await page.evaluate(() => scrollTo(0, 0));
       const label = `${route.path} ${dark ? 'dark' : 'light'} ${viewport.width}x${viewport.height}`;
+      await waitForFonts(page);
       assert.deepEqual(await page.evaluate(auditAuthAppearance), [], label);
       await assertKeyboardTraversal(page, label);
-      const submit = page.getByRole('button', { name: route.submit, exact: true });
+      if (process.env.WEB_BROWSER_ARTIFACT_DIR) {
+        const directory = resolve(process.env.WEB_BROWSER_ARTIFACT_DIR);
+        await mkdir(directory, { recursive: true });
+        const state = route.path.slice(1).replaceAll('/', '-') || 'home';
+        await page.screenshot({
+          path: resolve(directory, screenshotName(state, viewport, dark)),
+          fullPage: true,
+          // Carets are already hidden by these structural masks. Playwright's
+          // default caret hiding mutates input.style and leaves empty attributes.
+          caret: 'initial',
+          animations: 'disabled',
+          mask: [page.locator('input, textarea, [data-legal-private]')],
+        });
+      }
+      const submit = page.getByRole('button', { name: localizedText(route.submit), exact: true });
       await submit.scrollIntoViewIfNeeded();
       assert(
         await submit.evaluate((element) => {
@@ -500,6 +720,197 @@ async function checkAuthViewports(page, route) {
   }
   await page.evaluate(() => document.documentElement.classList.remove('dark'));
   await page.setViewportSize({ width: 1280, height: 800 });
+}
+
+const alternateFieldLabels = {
+  'Email address': 'نشانی ایمیل',
+  Password: 'گذرواژه',
+  'New password': 'گذرواژهٔ جدید',
+  'Confirm password': 'تکرار گذرواژه',
+  'Authenticator code': 'کد رمزساز',
+};
+const missingFieldMessages = {
+  en: {
+    email: 'Enter your email address.',
+    password: 'Enter your password.',
+    newPassword: 'Enter a new password.',
+    confirmation: 'Confirm your password.',
+    code: 'Enter exactly six digits (0-9).',
+  },
+  'fa-IR': {
+    email: 'نشانی ایمیل خود را وارد کنید.',
+    password: 'گذرواژهٔ خود را وارد کنید.',
+    newPassword: 'یک گذرواژهٔ جدید وارد کنید.',
+    confirmation: 'گذرواژهٔ خود را تکرار کنید.',
+    code: 'دقیقاً شش رقم انگلیسی (0-9) وارد کنید.',
+  },
+};
+
+async function checkValidationLanguageSwitch(page, route) {
+  await page.evaluate(() => {
+    document.__validationInputNodes = [...document.querySelectorAll('form input')];
+  });
+  try {
+    await exercisePreferenceSwitch(page, {
+      privateSelector: 'form input',
+      onOtherLocale: async (locale) => {
+        assert(
+          await page.evaluate(() =>
+            document.__validationInputNodes.every(
+              (node) => node.isConnected && document.getElementById(node.id) === node
+            )
+          ),
+          'Language switching remounted an auth field'
+        );
+        for (const field of route.fields) {
+          const input = page.getByLabel(
+            locale === 'en' ? field.label : alternateFieldLabels[field.label],
+            { exact: true }
+          );
+          assert.equal(
+            await input.getAttribute('aria-invalid'),
+            'true',
+            'Language switching cleared visible validation'
+          );
+          assert.equal(await input.inputValue(), '');
+          const key = field.label === 'New password' ? 'newPassword' : field.name;
+          assert.equal(
+            await input.evaluate(
+              (node) => document.getElementById(node.id + '-error')?.textContent
+            ),
+            missingFieldMessages[locale][key],
+            'Visible validation did not update to the selected language'
+          );
+        }
+        assert.equal(await page.evaluate(() => globalThis.__authObservations.submissions), 0);
+        assert.deepEqual(
+          await page.evaluate(() => globalThis.__authObservations.credentialCalls),
+          []
+        );
+      },
+    });
+    await assertUnavailable(page, route);
+  } finally {
+    await page.evaluate(() => {
+      delete document.__validationInputNodes;
+    });
+  }
+}
+
+async function checkExpandedDisplaySettings(page, route) {
+  const summary = page.locator('[data-ui-preferences] summary');
+  const details = page.locator('[data-ui-preferences] details');
+  if (!(await details.evaluate((node) => node.open))) await summary.click();
+  try {
+    for (const dark of [false, true]) {
+      await page.evaluate((dark) => document.documentElement.classList.toggle('dark', dark), dark);
+      await waitForExternalCss(page, dark);
+      for (const viewport of [
+        { width: 320, height: 568 },
+        { width: 320, height: 256 },
+      ]) {
+        await page.setViewportSize(viewport);
+        await waitForFonts(page);
+        const label = `${route.path} expanded display preferences ${browserLocale()} ${dark ? 'dark' : 'light'} ${viewport.width}x${viewport.height}`;
+        const failures = await page.evaluate(auditAuthAppearance);
+        if (failures.length) {
+          const categories = {};
+          for (const failure of failures) {
+            const category = /outside the document/.test(failure)
+              ? 'document-bounds'
+              : /clipped by the viewport/.test(failure)
+                ? 'viewport-focus-bounds'
+                : /clipped by/.test(failure)
+                  ? 'ancestor-clipping'
+                  : /touch area/.test(failure)
+                    ? 'touch-target'
+                    : /Horizontal document/.test(failure)
+                      ? 'document-overflow'
+                      : /need [0-9.]+:1/.test(failure)
+                        ? 'contrast'
+                        : /mobile input/.test(failure)
+                          ? 'mobile-font'
+                          : /focus/.test(failure)
+                            ? 'focus'
+                            : /Application inline style/.test(failure)
+                              ? 'inline-style'
+                              : 'other';
+            categories[category] = (categories[category] || 0) + 1;
+          }
+          const geometry = await page.evaluate(() => ({
+            viewport: {
+              width: innerWidth,
+              height: innerHeight,
+              scrollX,
+              scrollY,
+              scrollWidth: document.documentElement.scrollWidth,
+            },
+            controls: [
+              ...document.querySelectorAll(
+                '[data-ui-preferences] summary, [data-ui-preferences] select, [data-ui-preferences] button, main input'
+              ),
+            ].map((element, index) => {
+              const rect = element.getBoundingClientRect();
+              return {
+                index,
+                tag: element.tagName,
+                visible: element.checkVisibility(),
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              };
+            }),
+            inlineStyles: [...document.querySelectorAll('[style]:not(next-route-announcer)')].map(
+              (element) => ({
+                tag: element.tagName,
+                properties: Array.from(element.style),
+                length: element.getAttribute('style').length,
+              })
+            ),
+          }));
+          console.error(
+            JSON.stringify({
+              check: 'expanded-display-settings',
+              locale: browserLocale(),
+              dark,
+              viewport,
+              categories,
+              geometry,
+            })
+          );
+        }
+        assert.deepEqual(failures, [], label);
+        await assertKeyboardTraversal(page, label);
+        for (const name of ['Calendar', 'Time zone']) {
+          const control = page.getByRole('combobox', { name: localizedText(name), exact: true });
+          assert(await control.isVisible(), 'Expanded display control is hidden');
+          assert.equal(await control.inputValue(), name === 'Calendar' ? 'auto' : 'UTC');
+        }
+        assert.equal(
+          await page
+            .getByRole('button', { name: localizedText('Use device time zone'), exact: true })
+            .getAttribute('type'),
+          'button'
+        );
+        if (process.env.WEB_BROWSER_ARTIFACT_DIR) {
+          const directory = resolve(process.env.WEB_BROWSER_ARTIFACT_DIR);
+          await mkdir(directory, { recursive: true });
+          await page.screenshot({
+            path: resolve(directory, screenshotName('login-display-settings', viewport, dark)),
+            fullPage: true,
+            caret: 'initial',
+            animations: 'disabled',
+            mask: [page.locator('input, textarea, [data-legal-private]')],
+          });
+        }
+      }
+    }
+  } finally {
+    if (await details.evaluate((node) => node.open)) await summary.click();
+    await page.evaluate(() => document.documentElement.classList.remove('dark'));
+    await page.setViewportSize({ width: 1280, height: 800 });
+  }
 }
 
 async function storageSnapshot(page) {
@@ -521,8 +932,8 @@ async function assertInertInteraction(page, route, observed, beforeStorage, noSc
     document.__authDocumentMarker = marker;
   }, marker);
   for (const field of route.fields)
-    await page.getByLabel(field.label, { exact: true }).press('Enter');
-  const submit = page.getByRole('button', { name: route.submit, exact: true });
+    await page.getByLabel(localizedText(field.label), { exact: true }).press('Enter');
+  const submit = page.getByRole('button', { name: localizedText(route.submit), exact: true });
   assert(await submit.isDisabled());
   await submit.scrollIntoViewIfNeeded();
   const bounds = await submit.boundingBox();
@@ -552,9 +963,20 @@ export async function validateWebCsp({
   baseURL,
   notFoundPaths = [`/__csp-browser-${randomUUID()}`, `/__csp-browser-${randomUUID()}.html`],
 }) {
-  const browser = await chromium.launch({ channel: 'chromium' });
+  const ingress = await localHTTPSProxy(baseURL);
+  baseURL = ingress.origin;
+  let browser;
   try {
-    const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block' });
+    browser = await chromium.launch({
+      channel: 'chromium',
+      args: [`--ignore-certificate-errors-spki-list=${ingress.tlsSPKI}`],
+    });
+    const context = await browser.newContext({
+      bypassCSP: false,
+      serviceWorkers: 'block',
+      locale: 'fa-IR',
+    });
+    await configureBrowserPreferences(context, new URL(baseURL).origin);
     context.setDefaultTimeout(15_000);
     context.setDefaultNavigationTimeout(30_000);
     // Init/evaluate scripts only observe the page; executable attack probes come from parsed HTML.
@@ -636,15 +1058,25 @@ export async function validateWebCsp({
       assert(response, `${path} has no document response`);
       assert.equal(response.status(), status, `${path} browser HTTP status`);
       const html = await response.text();
+      assert.match(
+        html,
+        new RegExp(`<html\\b[^>]*lang="${browserLocale()}"`),
+        'Initial production HTML locale'
+      );
+      assert.match(
+        html,
+        new RegExp(`<html\\b[^>]*dir="${browserLocale() === 'fa-IR' ? 'rtl' : 'ltr'}"`),
+        'Initial production HTML direction'
+      );
       webDocumentNonce(new Headers(await response.allHeaders()), html, seenNonces);
       await page
-        .getByRole('heading', { name: heading, level: 1, exact: true })
+        .getByRole('heading', { name: localizedText(heading), level: 1, exact: true })
         .waitFor({ state: 'visible' });
       await waitForExternalCss(page);
       await assertCleanBaseline();
     };
     const navigate = async (name, path) => {
-      const link = page.getByRole('link', { name, exact: true });
+      const link = page.getByRole('link', { name: localizedText(name), exact: true });
       assert.equal(await link.getAttribute('href'), path, `Real ${name} link destination`);
       await waitForReactHandler(link, 'onClick');
       const marker = randomUUID();
@@ -655,7 +1087,7 @@ export async function validateWebCsp({
       const route = authRoutes.find((route) => route.path === path);
       await page
         .getByRole('heading', {
-          name: route?.heading || 'Hatef Identity Platform',
+          name: localizedText(route?.heading || 'Hatef Identity Platform'),
           level: 1,
           exact: true,
         })
@@ -671,9 +1103,13 @@ export async function validateWebCsp({
     };
 
     await visit('/', 200, 'Hatef Identity Platform');
+    assert.equal(await page.locator('html').getAttribute('lang'), browserLocale());
+    await assertInitialFontResources(page, observed);
+    await exercisePreferenceSwitch(page, { settings: true });
+    await assertCleanBaseline();
     assert.equal(
       await page
-        .getByRole('heading', { name: 'Hatef Identity Platform', exact: true })
+        .getByRole('heading', { name: localizedText('Hatef Identity Platform'), exact: true })
         .evaluate((heading) => getComputedStyle(heading).fontSize),
       '36px',
       'Homepage Tailwind typography must be applied'
@@ -706,7 +1142,11 @@ export async function validateWebCsp({
         await page.evaluate(() => document.activeElement === document.body),
         `${route.path}: no autofocus on direct load`
       );
-      const beforeStorage = await storageSnapshot(page);
+      if (route.path === '/login') {
+        await exercisePreferenceFailure(page, observed.expectResourceFailure);
+        await assertUnavailable(page, route);
+        await checkExpandedDisplaySettings(page, route);
+      }
 
       // Measure untouched boundaries as well as the invalid fields used in the reflow matrix.
       for (const dark of [false, true]) {
@@ -715,8 +1155,19 @@ export async function validateWebCsp({
           dark
         );
         await waitForExternalCss(page, dark);
+        const appearance = await page.evaluate(auditAuthAppearance);
+        if (appearance.length) {
+          const categories = appearance.map((failure) =>
+            /inline style/.test(failure) ? 'inline-style' : /outside|clipped|scrolling/.test(failure) ? 'geometry'
+              : /need [0-9.]+:1/.test(failure) ? 'contrast' : /touch area/.test(failure) ? 'target-size' : 'other');
+          console.error(JSON.stringify({ check: 'untouched-auth-appearance', path: route.path, locale: browserLocale(), dark, categories }));
+          if (process.env.WEB_BROWSER_ARTIFACT_DIR) await page.screenshot({
+            path: resolve(process.env.WEB_BROWSER_ARTIFACT_DIR, `appearance-failure-${browserLocale()}.png`),
+            fullPage: true, caret: 'initial', mask: [page.locator('input, textarea, [data-legal-private]')],
+          });
+        }
         assert.deepEqual(
-          await page.evaluate(auditAuthAppearance),
+          appearance,
           [],
           `${route.path}: untouched ${dark ? 'dark' : 'light'} palette`
         );
@@ -725,23 +1176,23 @@ export async function validateWebCsp({
         // Valid signup sends mail and belongs to the separately gated real-API
         // suite. Here only explicit invalid submissions may run: no API work,
         // credentials ceremony or durable browser state is permitted.
-        const form = page.getByRole('form', { name: 'Create an account', exact: true });
-        const submit = form.getByRole('button', { name: route.submit, exact: true });
+        const form = page.getByRole('form', { name: localizedText('Create an account'), exact: true });
+        const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
         for (const invalid of ['', 'not-an-identity']) {
           for (const field of route.fields)
-            await form.getByLabel(field.label, { exact: true }).fill(invalid);
+            await form.getByLabel(localizedText(field.label), { exact: true }).fill(invalid);
           expectedSubmissions++;
           await submit.click();
           for (const field of route.fields)
             await form
-              .getByLabel(field.label, { exact: true })
+              .getByLabel(localizedText(field.label), { exact: true })
               .and(page.locator('[aria-invalid="true"]'))
               .waitFor({ state: 'visible' });
           await assertCleanBaseline();
         }
         await checkAuthViewports(page, route);
         for (const field of route.fields)
-          await form.getByLabel(field.label, { exact: true }).fill(values[field.name]);
+          await form.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
         assert(await submit.isEnabled(), 'Hydrated signup requires explicit contact submission');
         assert.deepEqual(
           await storageSnapshot(page),
@@ -759,10 +1210,13 @@ export async function validateWebCsp({
         continue;
       }
       for (const field of route.fields) await assertFieldError(page, field);
+      if (route.fields.length) await checkValidationLanguageSwitch(page, route);
+      // Preference actions precede the inert-form storage baseline.
+      const beforeStorage = await storageSnapshot(page);
       await checkAuthViewports(page, route);
 
       for (const field of route.fields) {
-        const input = page.getByLabel(field.label, { exact: true });
+        const input = page.getByLabel(localizedText(field.label), { exact: true });
         if (field.name === 'email') await assertFieldError(page, field, 'not-an-email');
         await input.fill(values[field.name]);
         if (['password', 'confirmation'].includes(field.name)) {
@@ -771,13 +1225,13 @@ export async function validateWebCsp({
           const hide = `Hide ${field.label.toLowerCase()}`;
           await input.focus();
           await page.keyboard.press('Tab');
-          const toggle = page.getByRole('button', { name: show, exact: true });
+          const toggle = page.getByRole('button', { name: localizedText(show), exact: true });
           assert(await toggle.evaluate((element) => element === document.activeElement));
           assert.equal(await toggle.getAttribute('type'), 'button');
           assert.equal(await toggle.getAttribute('aria-controls'), id);
           assert.equal(await toggle.getAttribute('aria-pressed'), 'false');
           await page.keyboard.press('Space');
-          const revealed = page.getByRole('button', { name: hide, exact: true });
+          const revealed = page.getByRole('button', { name: localizedText(hide), exact: true });
           await revealed.waitFor({ state: 'visible' });
           assert.equal(await input.getAttribute('type'), 'text');
           assert.equal(await revealed.getAttribute('aria-pressed'), 'true');
@@ -874,6 +1328,7 @@ export async function validateWebCsp({
       serviceWorkers: 'block',
     });
     try {
+      await noScriptContext.addCookies(await context.cookies(new URL(baseURL).origin));
       noScriptContext.setDefaultTimeout(15_000);
       noScriptContext.setDefaultNavigationTimeout(30_000);
       const noScript = await noScriptContext.newPage();
@@ -888,13 +1343,13 @@ export async function validateWebCsp({
         webDocumentNonce(new Headers(await response.allHeaders()), html, seenNonces);
         await waitForExternalCss(noScript);
         await noScript
-          .getByRole('heading', { name: route.heading, level: 1, exact: true })
+          .getByRole('heading', { name: localizedText(route.heading), level: 1, exact: true })
           .waitFor({ state: 'visible' });
         await assertUnavailable(noScript, route, true);
         const beforeStorage = await storageSnapshot(noScript);
         if (!route.registration) {
           for (const field of route.fields)
-            await noScript.getByLabel(field.label, { exact: true }).fill(values[field.name]);
+            await noScript.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
         }
         await assertInertInteraction(
           noScript,
@@ -922,20 +1377,26 @@ export async function validateWebCsp({
     const attackURL = new URL('/', baseURL);
     attackURL.searchParams.set('__csp_fixture', randomUUID());
     let fixturePolicy;
+    let attackFailed = false;
     await attack.route(attackURL.href, async (route) => {
-      const response = await route.fetch({ maxRedirects: 0 });
-      assert.equal(
-        response.status(),
-        200,
-        'Attack fixture must start from a real production document'
-      );
-      const html = await response.text();
-      const headers = new Headers(response.headers());
-      const nonce = webDocumentNonce(headers, html, seenNonces);
-      fixturePolicy = headers.get('content-security-policy');
-      const wrongNonce = randomBytes(32).toString('base64');
-      assert.notEqual(wrongNonce, nonce);
-      const headProbes = `
+      try {
+        const response = await fetchPinnedCspDocument(
+          attackURL,
+          ingress.certificate,
+          await context.cookies(baseURL)
+        );
+        assert.equal(
+          response.status,
+          200,
+          'Attack fixture must start from a real production document'
+        );
+        const html = response.body;
+        const headers = new Headers(response.headers);
+        const nonce = webDocumentNonce(headers, html, seenNonces);
+        fixturePolicy = headers.get('content-security-policy');
+        const wrongNonce = randomBytes(32).toString('base64');
+        assert.notEqual(wrongNonce, nonce);
+        const headProbes = `
         <script nonce="${nonce}">globalThis.__cspProbe = { allowed: true, unnonced: false, wrongNonce: false, handler: false };</script>
         <script>globalThis.__cspProbe.unnonced = true;</script>
         <script nonce="${wrongNonce}">globalThis.__cspProbe.wrongNonce = true;</script>
@@ -943,23 +1404,33 @@ export async function validateWebCsp({
         <style>#csp-style-probe { --csp-unnonced: applied; }</style>
         <style nonce="${wrongNonce}">#csp-style-probe { --csp-wrong-nonce: applied; }</style>
       `;
-      const bodyProbes = `
+        const bodyProbes = `
         <section aria-label="CSP attack fixture">
           <button type="button" onclick="globalThis.__cspProbe.handler = true">CSP handler probe</button>
           <div id="csp-style-probe" style="--csp-attribute: applied">CSP style probe</div>
         </section>
       `;
-      assert.match(html, /<\/head>/i);
-      assert.match(html, /<\/body>/i);
-      // Baseline hydration used unmodified HTML. Omit framework scripts only here so React
-      // cannot replace the parser-inserted probes before we exercise them.
-      const fixture = html
-        .replace(/<script\b(?:[^"'<>]|"[^"]*"|'[^']*')*>[\s\S]*?<\/script\s*>/gi, '')
-        .replace(/<\/head>/i, `${headProbes}</head>`)
-        .replace(/<\/body>/i, `${bodyProbes}</body>`);
-      await route.fulfill({ response, body: fixture });
+        assert.match(html, /<\/head>/i);
+        assert.match(html, /<\/body>/i);
+        // Baseline hydration used unmodified HTML. Omit framework scripts only here so React
+        // cannot replace the parser-inserted probes before we exercise them.
+        const fixture = html
+          .replace(/<script\b(?:[^"'<>]|"[^"]*"|'[^']*')*>[\s\S]*?<\/script\s*>/gi, '')
+          .replace(/<\/head>/i, `${headProbes}</head>`)
+          .replace(/<\/body>/i, `${bodyProbes}</body>`);
+        const fixtureHeaders = { ...response.headers };
+        for (const header of ['content-length', 'content-encoding', 'transfer-encoding'])
+          delete fixtureHeaders[header];
+        await route.fulfill({ status: response.status, headers: fixtureHeaders, body: fixture });
+      } catch {
+        attackFailed = true;
+        await route.abort().catch(() => {});
+      }
     });
-    const attackResponse = await attack.goto(attackURL.href, { waitUntil: 'load' });
+    const attackResponse = await attack.goto(attackURL.href, { waitUntil: 'load' }).catch(() => {
+      throw new Error('Public CSP fixture navigation failed');
+    });
+    assert(!attackFailed, 'Public CSP fixture interception failed');
     assert(attackResponse);
     assert.equal(attackResponse.status(), 200);
     assert.equal(
@@ -968,7 +1439,9 @@ export async function validateWebCsp({
       'Preserve the real enforcing CSP'
     );
     await waitForExternalCss(attack);
-    await attack.getByRole('button', { name: 'CSP handler probe', exact: true }).click();
+    await attack
+      .getByRole('button', { name: localizedText('CSP handler probe'), exact: true })
+      .click();
     await attack.waitForFunction(() => {
       const count = (directive) =>
         globalThis.__cspViolations.filter((event) => event.directive === directive).length;
@@ -1016,17 +1489,26 @@ export async function validateWebCsp({
       assert.equal(violation.policy, fixturePolicy);
     }
     assert.deepEqual(attackErrors, [], 'Unexpected attack-fixture errors');
-    console.log(
-      'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
-    );
   } finally {
-    await browser.close();
+    try {
+      await browser?.close();
+    } finally {
+      await ingress.close();
+    }
   }
+  console.log(
+    'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
+  );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  smokeImage('web', process.argv[2], validateWebCsp).catch((error) => {
-    console.error(error);
+  smokeImage('web', process.argv[2], async (options) => {
+    for (const locale of browserLocales) {
+      setBrowserLocale(locale);
+      await validateWebCsp(options);
+    }
+  }).catch((error) => {
+    console.error(browserFailure(error, 'csp'));
     process.exitCode = 1;
   });
 }

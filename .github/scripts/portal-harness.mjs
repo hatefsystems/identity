@@ -261,7 +261,7 @@ export function failureCategories(output) {
 export function browserFailure(error, stage = 'unknown') {
   const kind = error?.name === 'AssertionError' ? 'assertion' : 'operation';
   const location = typeof error?.stack === 'string'
-    ? error.stack.match(/(?:web-(?:portal|admin)\.browser|portal-harness)\.mjs:\d+:\d+/)?.[0]
+    ? error.stack.match(/(?:web-(?:portal|admin|csp)\.browser|portal-harness|browser-localization)\.mjs:\d+:\d+/)?.[0]
     : undefined;
   const checkpoint = /^[a-z-]{1,64}$/.test(stage) ? stage : 'unknown';
   // Browser exception messages can embed full Cookie/DPoP/grant headers or DOM
@@ -464,7 +464,12 @@ export async function startPortalServices({ integration = false, lifecycle, inte
   const close = portalCleanup(cleanup);
   const operation = (args, allowFailure = false) => docker(args, allowFailure, lifecycle);
   try {
-    const network = createOwnedDockerResource('network', ['--label', 'ldp.task=7.5', ...(internal ? ['--internal'] : []), name], runID, lifecycle);
+    // The registration gateway/API reserve addresses with --ip. Docker rejects
+    // those reservations on automatically allocated pools, even when inspect
+    // reports a subnet. Declare a run-scoped private /24 for internal services;
+    // a subnet collision fails acquisition without adopting another network.
+    const privateSubnet = `10.${128 + (parseInt(runID.slice(0, 2), 16) % 64)}.${parseInt(runID.slice(2, 4), 16)}.0/24`;
+    const network = createOwnedDockerResource('network', ['--label', 'ldp.task=7.5', ...(internal ? ['--internal', '--subnet', privateSubnet] : []), name], runID, lifecycle);
     cleanup.push(() => removeOwnedDockerResource(network, lifecycle));
     const container = async (suffix, ports, image, args = [], environment = {}) => {
       // The existing lifecycle restart test admits only this explicit broker

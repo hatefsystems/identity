@@ -1,5 +1,11 @@
+'use client';
+
 import { cn } from '@hatef/ui';
 import type { ReactNode } from 'react';
+import type { MessageDescriptor } from '../../i18n/messages';
+import { useMessage } from '../../i18n/use-message';
+import { useDisplayPreferences } from '../../i18n/provider';
+import { formatDisplayDate } from '../../i18n/formats';
 
 export function PageHeading({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -24,7 +30,7 @@ export function Panel({
       aria-labelledby={id}
       className="min-w-0 space-y-5 rounded-xl border bg-card p-5 text-card-foreground sm:p-6"
     >
-      <h2 id={id} className="text-lg font-semibold tracking-tight">
+      <h2 id={id} dir="auto" className="text-lg font-semibold tracking-tight">
         {title}
       </h2>
       {children}
@@ -32,7 +38,11 @@ export function Panel({
   );
 }
 
-export function Feedback({ error = '', status = '' }: { error?: string; status?: string }) {
+export function Feedback({ error = '', status = '' }: {
+  error?: MessageDescriptor | string;
+  status?: MessageDescriptor | string;
+}) {
+  const message = useMessage();
   return (
     <>
       <p
@@ -41,14 +51,14 @@ export function Feedback({ error = '', status = '' }: { error?: string; status?:
         aria-atomic="true"
         className={status ? 'text-sm leading-relaxed text-muted-foreground' : 'sr-only'}
       >
-        {status}
+        {typeof status === 'string' ? status : message(status)}
       </p>
       {error && (
         <p
           role="alert"
           className="rounded-md border border-red-700 bg-red-50 p-3 text-sm leading-relaxed text-red-800 dark:border-red-400 dark:bg-red-950 dark:text-red-200"
         >
-          {error}
+          {typeof error === 'string' ? error : message(error)}
         </p>
       )}
     </>
@@ -61,9 +71,10 @@ export const linkClass =
   'inline-flex min-h-11 items-center rounded-md px-2 text-sm font-medium underline decoration-border underline-offset-4 hover:decoration-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
 
 export function DateLabel({ value, className }: { value: string; className?: string }) {
+  const preferences = useDisplayPreferences();
   return (
-    <time dateTime={value} className={cn('break-words', className)}>
-      {new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}
+    <time dateTime={value} className={cn('break-words isolate', className)}>
+      {formatDisplayDate(value, preferences)}
     </time>
   );
 }

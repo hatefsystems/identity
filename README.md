@@ -167,3 +167,12 @@ statuses and dated acceptance remain unchanged.
 * **Go Code:** Formatted using `gofmt` and linted with `golangci-lint`. Avoid manual database manipulation or inline SQL; define queries in `.sql` files and let `sqlc` build type-safe abstractions.
 * **TypeScript/React:** Enforce strict ESLint rules and Prettier formats defined in the workspace root.
 * **Security Checks:** Every pull request is subject to static security analysis. Secret commits, plain-text PII storage, or insecure hashing algorithms (e.g., MD5, SHA-1, or raw bcrypt for passwords) are strictly rejected.
+
+## Browser localization
+
+English and Iranian Persian share the existing routes, including passkey-only
+registration. Explicit browser preferences control language, calendar and time
+zone without changing authentication or operation deadlines. Deletion notification
+queue v2 freezes its locale; deploy compatible v1/v2 readers before v2 writers.
+The configured SMS.ir VERIFY template remains operator-owned. See the
+[localization contract](docs/localization.md) for maintenance and rollout gates.

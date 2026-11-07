@@ -1,9 +1,12 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { TextEncoder } from 'node:util';
+import { I18nTestProvider, render } from '../i18n/testing';
 import { PortalProvider } from '../app/_components/portal-provider';
 import { NativeDialog } from '../app/_components/native-dialog';
 import { LegalView } from '../app/admin/_components/legal-view';
+import { legalFailureMessage } from '../app/admin/_components/legal-view-state';
+import { generateMetadata } from '../app/admin/legal/page';
 import { QueryUtcTime } from '../app/admin/_components/query-view-time';
 import { AdminOverview } from '../app/admin/_components/admin-overview';
 import { AdminClient } from '../app/_lib/admin/client';
@@ -26,6 +29,11 @@ import { clearSensitiveViews, onOtherTabInvalidation } from '../app/_lib/portal/
 import { usePasskey } from '../app/_lib/portal/webauthn';
 
 let mockPathname = '/admin/legal';
+let mockMetadataLocale: 'en' | 'fa-IR' = 'en';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (namespace: 'legal') =>
+    jest.requireActual('../i18n/testing').getTestTranslations(namespace, mockMetadataLocale),
+}));
 jest.mock('next/navigation', () => ({
   usePathname: () => mockPathname,
   useRouter: () => ({ replace: jest.fn() }),
@@ -264,6 +272,7 @@ beforeAll(() => {
 beforeEach(() => {
   jest.clearAllMocks();
   mockPathname = '/admin/legal';
+  mockMetadataLocale = 'en';
   clients = [];
   grants = [];
   grantSeconds = 60;
@@ -301,12 +310,17 @@ afterEach(() => {
   if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
   else Reflect.deleteProperty(document, 'visibilityState');
 });
-function renderLegal() {
-  return render(
-    <PortalProvider surface="admin">
-      <LegalView />
-    </PortalProvider>
+function legalTree(locale: 'en' | 'fa-IR' = 'en') {
+  return (
+    <I18nTestProvider locale={locale}>
+      <PortalProvider surface="admin">
+        <LegalView />
+      </PortalProvider>
+    </I18nTestProvider>
   );
+}
+function renderLegal(locale: 'en' | 'fa-IR' = 'en') {
+  return render(legalTree(locale));
 }
 function hide() {
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
@@ -384,11 +398,7 @@ async function inquiry(fields: string[] = [], size = '1') {
 }
 
 it('server-renders only a neutral shell without legal fields, values or requests', () => {
-  const html = renderToStaticMarkup(
-    <PortalProvider surface="admin">
-      <LegalView />
-    </PortalProvider>
-  );
+  const html = renderToStaticMarkup(legalTree());
   expect(html).toContain('Checking your secure browser session and administrative access');
   for (const value of [reference, operationID, 'Operation UUID', 'Email for attribution', '<form'])
     expect(html).not.toContain(value);
@@ -400,7 +410,7 @@ it.each([
   ['2020-01-01T00:00:00.123456Z', '2020-01-01 00:00:00.123456 UTC'],
   ['2020-01-01T00:00:00.123456789Z', '2020-01-01 00:00:00.123456789 UTC'],
   ['2020-01-01T03:30:00.123456+03:30', '2020-01-01 00:00:00.123456 UTC'],
-  ['2020-01-01T00:00:00.000Z', '2020-01-01 00:00:00 UTC'],
+  ['2020-01-01T00:00:00.000Z', '2020-01-01 00:00:00.000 UTC'],
 ])('visibly retains exact UTC wire precision for %s', (value, expected) => {
   render(<QueryUtcTime value={value} />);
   expect(screen.getByText(expected).getAttribute('datetime')).toBe(value);
@@ -983,4 +993,354 @@ it('clears a forbidden privileged view and rechecks capabilities without ordinar
   await screen.findByTestId('admin-ready');
   expect(clients[1].admin.capabilities).toHaveBeenCalledTimes(1);
   expect(clients[1].legal.holds).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['en', 'DPO and Legal'],
+  ['fa-IR', 'مسئول حفاظت از داده و امور حقوقی'],
+] as const)('resolves legal metadata per request in %s', async (locale, title) => {
+  mockMetadataLocale = locale;
+  expect(await generateMetadata()).toEqual({ title });
+});
+
+it.each([
+  ['idempotency_conflict', 409, 'legal.failure.conflict'],
+  ['hold_not_found', 404, 'legal.failure.notFound'],
+  ['insufficient_user_authentication', 403, 'legal.failure.verification'],
+  ['grant_expired', 0, 'legal.failure.verification'],
+  ['forbidden', 403, 'legal.failure.denied'],
+  ['session_required', 401, 'legal.failure.session'],
+  ['session_changed', 0, 'legal.failure.session'],
+  ['not_found', 404, 'legal.failure.unavailable'],
+  ['rate_limited', 429, 'legal.failure.rateLimited'],
+  ['invalid_request', 400, 'legal.failure.invalidRequest'],
+  ['unsupported_identifier_type', 400, 'legal.failure.invalidRequest'],
+  ['invalid_response', 200, 'legal.failure.invalidResponse'],
+  ['response_too_large', 200, 'legal.failure.invalidResponse'],
+  ['audit_unavailable', 503, 'legal.failure.service'],
+] as const)('keeps the safe %s distinction as a stable descriptor', (code, status, key) => {
+  expect(legalFailureMessage(new PortalError(code, status))).toEqual({ key });
+});
+
+it('never promotes arbitrary exceptions to translated or raw legal feedback', () => {
+  expect(legalFailureMessage(new Error('private narrative / internal database exception'))).toEqual(
+    {
+      key: 'legal.failure.unknown',
+    }
+  );
+  const failure = new PortalError('rate_limited', 429, false, 17);
+  expect(legalFailureMessage(failure)).toEqual({
+    key: 'legal.failure.retryAfter',
+    values: { seconds: 17 },
+  });
+});
+
+it('translates validation and a pending bounded read without widening or replaying the query', async () => {
+  const view = renderLegal();
+  fireEvent.click(await screen.findByRole('button', { name: 'Read Legal Holds' }));
+  expect(screen.getByRole('alert').textContent).toContain('never becomes an all-subject');
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByRole('heading', { name: 'مسئول حفاظت از داده و امور حقوقی' })).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toContain(
+    'ورودی نامعتبر هرگز به پرس‌وجوی همه اشخاص تبدیل نمی‌شود'
+  );
+  const input = screen.getByLabelText<HTMLInputElement>('شناسه اصلی حساب');
+  const readRegion = screen.getByRole('region', { name: 'خواندن درخواست‌های مستقل' });
+  expect(input.dir).toBe('ltr');
+  fireEvent.change(input, { target: { value: reference } });
+  const pending = deferred<LegalHoldsPage>();
+  const api = clients[0];
+  api.legal.holds.mockReturnValueOnce(pending.promise);
+  fireEvent.click(screen.getByRole('button', { name: 'خواندن دستورهای نگهداشت حقوقی' }));
+  expect(within(readRegion).getByRole('status').textContent).toContain(
+    'در حال خواندن یک صفحه محدود'
+  );
+  const signal = api.legal.holds.mock.calls[0][1];
+  view.rerender(legalTree());
+  expect(within(readRegion).getByRole('status').textContent).toContain(
+    'Loading one bounded Legal Holds page'
+  );
+  expect(screen.getByLabelText('Original account reference')).toBe(input);
+  expect(input.value).toBe(reference);
+  expect(signal?.aborted).toBe(false);
+  await act(async () => pending.resolve({ items: [hold()], total: 1, limit: 2, offset: 0 }));
+  view.rerender(legalTree('fa-IR'));
+  const row = await screen.findByTestId('legal-hold-row');
+  expect(within(row).getByRole('button', { name: 'مشاهده جزئیات محدودشده' })).toBeTruthy();
+  expect(within(row).getByText(holdID).closest('bdi')?.dir).toBe('ltr');
+  expect(within(readRegion).getByRole('status').textContent).toContain(
+    'فهرست ثابت چندصفحه‌ای نیست'
+  );
+  expect(api.legal.holds).toHaveBeenCalledTimes(1);
+  expect(api.legal.holds.mock.calls[0][0]).toEqual({
+    accountRef: reference,
+    status: 'active',
+    limit: 2,
+    offset: 0,
+  });
+  expect(api.stepUpChallenge).not.toHaveBeenCalled();
+  expect(api.bootstrap).toHaveBeenCalledTimes(1);
+  expect(clients).toHaveLength(1);
+  expect(api.dispose).not.toHaveBeenCalled();
+});
+
+it('keeps the held grant, frozen tuple and final confirmation across locale changes without replay', async () => {
+  const view = renderLegal();
+  await openAction();
+  const api = clients[0];
+  const clear = jest.spyOn(grants[0], 'clear');
+  const deadline = grants[0].deadline;
+  const narrative = 'دلیل حقوقی پرونده Case-41 <script>alert(1)</script>';
+  const input = within(screen.getByRole('dialog')).getByLabelText<HTMLTextAreaElement>('Reason');
+  expect(input.dir).toBe('auto');
+  fillCreate('hold', {
+    Reason: `  ${narrative}  `,
+    'Review at (UTC)': '2020-01-01T00:00:00.123456Z',
+  });
+  expect(input.value).toBe('');
+  const form = screen.getByRole('form', { name: 'Confirm legal request' });
+  const acknowledgement = within(form).getByRole<HTMLInputElement>('checkbox');
+  fireEvent.click(acknowledgement);
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByRole('form', { name: 'تأیید درخواست حقوقی' })).toBe(form);
+  expect(acknowledgement.checked).toBe(true);
+  expect(within(form).getByText(narrative).closest('bdi')?.dir).toBe('auto');
+  expect(form.querySelector('script, a')).toBeNull();
+  expect(within(form).getByText(operationID).closest('bdi')?.dir).toBe('ltr');
+  expect(form.textContent).toContain('2020-01-01 00:00:00.123456 UTC');
+  expect(form.textContent).toContain('هر درخواست مستقل است');
+  expect(form.textContent).toContain('اگر فقط رکورد نشانه باقی مانده');
+  expect(clear).not.toHaveBeenCalled();
+  expect(grants[0].deadline).toBe(deadline);
+  const pending = deferred<LegalHold>();
+  api.legal.applyHold.mockImplementationOnce((_request, grant, _signal, sent) => {
+    grant.take('private-session');
+    sent?.();
+    return pending.promise;
+  });
+  fireEvent.submit(form);
+  expect(
+    screen.getByRole<HTMLButtonElement>('button', { name: 'در حال ارسال درخواست حقوقی…' }).disabled
+  ).toBe(true);
+  const signal = api.legal.applyHold.mock.calls[0][2];
+  view.rerender(legalTree());
+  expect(screen.getByRole('form', { name: 'Confirm legal request' })).toBe(form);
+  expect(
+    screen.getByRole<HTMLButtonElement>('button', { name: 'Submitting legal request...' }).disabled
+  ).toBe(true);
+  fireEvent.submit(form);
+  expect(signal?.aborted).toBe(false);
+  expect(api.legal.applyHold).toHaveBeenCalledTimes(1);
+  expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+  expect(grants[0].deadline).toBe(deadline);
+  await act(async () =>
+    pending.resolve(hold({ reason: narrative, review_at: '2020-01-01T00:00:00.123456Z' }))
+  );
+  expect((await screen.findByTestId('legal-outcome')).getAttribute('data-outcome')).toBe(
+    'confirmed'
+  );
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByTestId('legal-outcome').textContent).toContain('درخواست حقوقی جدید ایجاد شد');
+  expect(api.legal.applyHold.mock.calls[0][0]).toEqual({
+    accountRef: reference,
+    requestId: operationID,
+    reason: narrative,
+    requestingAuthority: 'Authority',
+    legalBasis: 'Reviewed legal basis',
+    reviewAt: '2020-01-01T00:00:00.123456Z',
+  });
+  expect(Object.isFrozen(api.legal.applyHold.mock.calls[0][0])).toBe(true);
+  expect(api.legal.applyHold).toHaveBeenCalledTimes(1);
+  expect(api.legal.holds).not.toHaveBeenCalled();
+  expect(clients).toHaveLength(1);
+  expect(screen.queryByTestId('legal-interruption')).toBeNull();
+  hide();
+  expect(screen.queryByTestId('legal-outcome')).toBeNull();
+});
+
+it('translates held-grant validation without clearing private drafts or extending expiry', async () => {
+  jest.useFakeTimers();
+  grantSeconds = 2;
+  const view = renderLegal();
+  await openAction();
+  fillCreate('hold', { 'Operation UUID': 'invalid-uuid' });
+  const input = screen.getByLabelText<HTMLInputElement>('Operation UUID');
+  const clear = jest.spyOn(grants[0], 'clear');
+  const deadline = grants[0].deadline;
+  act(() => jest.advanceTimersByTime(1000));
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByRole('alert').textContent).toContain('UUIDهای استاندارد و غیرصفر');
+  expect(screen.getByLabelText('UUID عملیات')).toBe(input);
+  expect(input.value).toBe('invalid-uuid');
+  expect(clear).not.toHaveBeenCalled();
+  expect(grants[0].deadline).toBe(deadline);
+  act(() => jest.advanceTimersByTime(1001));
+  expect(screen.getByRole('alert').textContent).toContain('اعتبار تأیید هویت منقضی شد');
+  expect(input.value).toBe('');
+  expect(input.defaultValue).toBe('');
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(clients[0].legal.applyHold).not.toHaveBeenCalled();
+  expect(clients[0].stepUpVerify).toHaveBeenCalledTimes(1);
+});
+
+it('preserves waiting TOTP work on locale rerender but still clears it on privacy suspension', async () => {
+  const view = renderLegal();
+  fireEvent.click(await screen.findByRole('button', { name: 'Attribution' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Start attribution inquiry' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Use authenticator code' }));
+  const code = screen.getByLabelText<HTMLInputElement>('Authenticator code');
+  fireEvent.change(code, { target: { value: '123456' } });
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByRole('dialog', { name: 'استعلام انتساب' }).contains(code)).toBe(true);
+  expect(code.value).toBe('123456');
+  expect(clients[0].stepUpChallenge).toHaveBeenCalledTimes(1);
+  expect(clients[0].stepUpVerify).not.toHaveBeenCalled();
+  expect(clients).toHaveLength(1);
+  hide();
+  expect(code.value).toBe('');
+  expect(code.defaultValue).toBe('');
+  expect(clients[0].legal.lookup).not.toHaveBeenCalled();
+});
+
+const preservationNote =
+  'preservation does not restore purged data; ingestion may still be pending; account and ledger presence are observations, not completeness guarantees; expires_at is advisory only';
+const coverageNote =
+  'matching indexed retained records only; ingestion may be pending; unindexed or purged history is not covered; separate account references do not establish one person';
+const unknownNote =
+  '<script>alert(1)</script> https://example.test یادداشت جدید\nRaw original note';
+
+it.each([preservationNote, unknownNote])(
+  'localizes preservation explanations without altering original note %p',
+  async (note) => {
+    const view = renderLegal();
+    fireEvent.click(await screen.findByRole('button', { name: 'Preservation' }));
+    await openAction('Record preservation');
+    const api = clients[0];
+    const response: LegalPreservationResult = {
+      hold: hold({ request_kind: 'preservation', legal_basis: 'preservation_request' }),
+      replayed: false,
+      account_present: false,
+      ledger_evidence_present: false,
+      observed_at: '2026-11-01T11:00:00.123456Z',
+      note,
+    };
+    api.legal.preserve.mockImplementationOnce(async (_request, grant, _signal, sent) => {
+      grant.take('private-session');
+      sent?.();
+      return response;
+    });
+    fillCreate('preservation');
+    confirm();
+    await screen.findByTestId('legal-outcome');
+    view.rerender(legalTree('fa-IR'));
+    const outcome = screen.getByTestId('legal-outcome');
+    expect(outcome.hasAttribute('data-legal-private')).toBe(true);
+    expect(outcome.textContent).toContain('حتی اگر هر دو مشاهده منفی باشند، نگهداشت معتبر است');
+    expect(outcome.textContent).toContain('جست‌وجو و ایجاد نگهداشت دو تراکنش جداگانه‌اند');
+    expect(outcome.textContent).toContain('2026-11-01 11:00:00.123456 UTC');
+    if (note === preservationNote) {
+      expect(outcome.textContent).toContain(
+        'حفظ پیشگیرانه، داده‌های پاک‌سازی‌شده را بازنمی‌گرداند'
+      );
+      expect(outcome.textContent).toContain('ممکن است ورود داده‌ها هنوز در انتظار انجام باشد');
+      expect(outcome.textContent).toContain('نه تضمین کامل بودن');
+      expect(outcome.textContent).toContain('نگهداشت را خودکار لغو نمی‌کند');
+      expect(
+        within(outcome).getByText('یادداشت اصلی سرور (بدون تغییر)').closest('details')
+      ).not.toBeNull();
+      expect(outcome.querySelector('details bdi')?.textContent).toBe(note);
+    } else {
+      expect(outcome.textContent).toContain('این یادداشت سرور از توضیحات ثابت شناخته‌شده نیست');
+      expect(outcome.querySelector('details')).toBeNull();
+      expect(outcome.textContent).not.toContain(
+        'حفظ پیشگیرانه، داده‌های پاک‌سازی‌شده را بازنمی‌گرداند'
+      );
+    }
+    expect(outcome.textContent).toContain(note);
+    expect(outcome.querySelector('script, a')).toBeNull();
+    expect(response.note).toBe(note);
+    view.rerender(legalTree());
+    expect(screen.getByTestId('legal-outcome').textContent).toContain(note);
+    expect(api.legal.preserve).toHaveBeenCalledTimes(1);
+    expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+    expect(clients).toHaveLength(1);
+    hide();
+    expect(screen.queryByTestId('legal-outcome')).toBeNull();
+  }
+);
+
+it.each([coverageNote, `${coverageNote} `, unknownNote])(
+  'uses only exact known attribution notes and preserves final evidence across locales: %p',
+  async (note) => {
+    const view = renderLegal();
+    await screen.findByTestId('admin-ready');
+    const api = clients[0];
+    const response = lookupPage({
+      next_cursor: undefined,
+      coverage: {
+        ...lookupPage().coverage,
+        note,
+        observed_at: '2026-11-01T11:00:00.123456789Z',
+        eligibility_checked_at: '2026-11-01T11:00:00.123456789Z',
+      },
+    });
+    api.legal.lookup.mockResolvedValueOnce(response);
+    await inquiry();
+    const row = screen.getByTestId('legal-result-row');
+    const heading = screen.getByRole('columnheader', { name: 'Original account reference' });
+    view.rerender(legalTree('fa-IR'));
+    expect(screen.getByRole('columnheader', { name: 'شناسه اصلی حساب' })).toBe(heading);
+    expect(screen.getByTestId('legal-result-row')).toBe(row);
+    expect(within(row).getByText(high).closest('bdi')?.dir).toBe('ltr');
+    const coverage = screen.getByTestId('legal-coverage');
+    expect(within(coverage).getByText(maximum).closest('bdi')?.dir).toBe('ltr');
+    expect(coverage.textContent).toContain('2026-11-01 11:00:00.123456789 UTC');
+    expect(coverage.textContent).toContain(note);
+    if (note === coverageNote) {
+      expect(coverage.textContent).toContain(
+        'پوشش فقط شامل سوابق نگهداری‌شده و نمایه‌شده‌ای است که مطابقت دارند'
+      );
+      expect(coverage.textContent).toContain('تاریخچه نمایه‌نشده یا پاک‌سازی‌شده در این پوشش نیست');
+      expect(coverage.textContent).toContain('متعلق به یک شخص هستند');
+      expect(coverage.querySelector('details bdi')?.textContent).toBe(note);
+    } else {
+      expect(coverage.textContent).toContain('این یادداشت سرور از توضیحات ثابت شناخته‌شده نیست');
+      expect(coverage.querySelector('details')).toBeNull();
+    }
+    expect(coverage.querySelector('script, a')).toBeNull();
+    expect(
+      screen.getByText('نشانگر ادامه‌ای بازگردانده نشد. این نتیجه به معنای کامل بودن تاریخچه نیست.')
+    ).toBeTruthy();
+    expect(response.coverage.note).toBe(note);
+    expect(screen.queryByText('Person@example.test')).toBeNull();
+    expect(api.legal.lookup).toHaveBeenCalledTimes(1);
+    expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+    expect(clients).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'پاک کردن استعلام' }));
+    expect(screen.queryByTestId('legal-coverage')).toBeNull();
+    expect(screen.queryByTestId('legal-result-row')).toBeNull();
+  }
+);
+
+it('keeps unconfirmed writes distinct and unreplayed when the language changes after failure', async () => {
+  const view = renderLegal();
+  await openAction();
+  const api = clients[0];
+  api.legal.applyHold.mockImplementationOnce(async (_request, grant, _signal, sent) => {
+    grant.take('private-session');
+    sent?.();
+    throw new PortalError('service_unavailable', 503);
+  });
+  fillCreate();
+  confirm();
+  await screen.findByTestId('legal-outcome');
+  view.rerender(legalTree('fa-IR'));
+  expect(screen.getByTestId('legal-outcome').getAttribute('data-outcome')).toBe('unconfirmed');
+  expect(screen.getByText(/نتیجه عملیات نوشتن حقوقی تأیید نشده است/)).toBeTruthy();
+  expect(screen.queryByText(operationID)).toBeNull();
+  expect(api.legal.applyHold).toHaveBeenCalledTimes(1);
+  expect(api.legal.holds).not.toHaveBeenCalled();
+  expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+  expect(clients).toHaveLength(1);
 });

@@ -416,3 +416,71 @@ describe('bound session intent and one-use mutations', () => {
     expect(lost).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('notification presentation header boundary', () => {
+  it.each(['en', 'fa-IR'] as const)(
+    'freezes %s on deletion and its one permitted nonce retry',
+    async (locale) => {
+      const fetcher = jest
+        .fn()
+        .mockResolvedValueOnce(json({ ...profile(), deletion_enabled: true }))
+        .mockResolvedValueOnce(nonceResponse())
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      const api = client(fetcher);
+      await api.bootstrap();
+      const grant = new StepUpGrant(
+        { token: 'presentation-grant', token_type: 'StepUp', expires_in: 60 },
+        'session-id',
+        Date.now(),
+        Date.now() + 60000
+      );
+      await api.deleteAccount(grant, new AbortController().signal, undefined, locale);
+      expect(new Headers(fetcher.mock.calls[0][1].headers).has('X-Hatef-Notification-Locale')).toBe(
+        false
+      );
+      for (const [, options] of fetcher.mock.calls.slice(1)) {
+        expect(new Headers(options.headers).get('X-Hatef-Notification-Locale')).toBe(locale);
+        expect(options.body).toBeUndefined();
+        expect(new Headers(options.headers).get('X-Step-Up-Auth')).toBe('presentation-grant');
+      }
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    }
+  );
+
+  it.each([
+    ['/api/v1/users/me', 'GET', 'fa-IR'],
+    ['/api/v1/auth/logout', 'POST', 'fa-IR'],
+    ['/api/v1/users/me', 'DELETE', 'fa'],
+    ['/api/v1/users/me', 'DELETE', 'fa-IR\r\nInjected: value'],
+  ])(
+    'rejects a locale outside its exact route/method/allowlist before network access',
+    async (path, method, locale) => {
+      const fetcher = jest.fn();
+      const api = client(fetcher);
+      // Exercise the runtime boundary against untyped JavaScript callers too.
+      await expect(
+        api.request(path, () => undefined, {
+          method: method as 'GET' | 'POST' | 'DELETE',
+          notificationLocale: locale as 'fa-IR',
+        })
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  );
+});
+
+it('snapshots the validated presentation locale before asynchronous proof generation', async () => {
+  const fetcher = jest
+    .fn()
+    .mockResolvedValueOnce(json(profile()))
+    .mockResolvedValueOnce(new Response(null, { status: 204 }));
+  const api = client(fetcher);
+  await api.bootstrap();
+  const options = { method: 'DELETE' as const, notificationLocale: 'fa-IR' as 'en' | 'fa-IR' };
+  const work = api.request('/api/v1/users/me', () => undefined, options);
+  options.notificationLocale = 'en';
+  await work;
+  expect(new Headers(fetcher.mock.calls[1][1].headers).get('X-Hatef-Notification-Locale')).toBe(
+    'fa-IR'
+  );
+});

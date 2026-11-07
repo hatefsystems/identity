@@ -1,5 +1,11 @@
 'use client';
 
+import { useTranslations } from 'next-intl';
+import type { Message, MessageDescriptor } from '../../i18n/messages';
+import { useMessage } from '../../i18n/use-message';
+import { useDisplayPreferences } from '../../i18n/provider';
+import { formatDisplayDate } from '../../i18n/formats';
+
 import { Button } from '@hatef/ui';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { AuthLink } from '../(auth)/_components/auth-card';
@@ -21,33 +27,33 @@ import {
 } from '../_lib/portal/registration-client';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
 
-const cleared =
-  'Registration was cleared. Start again, or sign in normally if account creation may have completed.';
-const invalidLink =
-  'This link cannot be verified here. Use the original browser, or restart registration. The link cannot recover signup authority.';
-function registrationError(failure: unknown): string {
+const cleared: MessageDescriptor =
+  { key: 'registration.cleared' };
+const invalidLink: MessageDescriptor =
+  { key: 'registration.invalidLink' };
+function registrationError(failure: unknown): MessageDescriptor {
   if (failure instanceof PortalError) {
     if (failure.uncertain || failure.code === 'result_required')
-      return 'The completion response was lost. Check the registration result before creating anything else. You can also try normal passkey sign-in.';
+      return { key: 'registration.completionLost' };
     switch (failure.code) {
       case 'invalid_registration':
       case 'registration_key_changed':
-        return 'Registration no longer belongs to this browser key. Start again in the original browser, or sign in normally.';
+        return { key: 'registration.keyChanged' };
       case 'registration_expired':
-        return 'Registration or an ownership proof expired. Start again; resending never extends the registration deadline.';
+        return { key: 'registration.proofExpired' };
       case 'registration_conflict':
       case 'restart_registration':
-        return 'Registration could not be completed. Start again or use normal sign-in. No existing account has been changed.';
+        return { key: 'registration.conflict' };
       case 'proof_required':
-        return 'The ownership proof could not be accepted. Check the saved result and use fresh verification.';
+        return { key: 'registration.proofRequired' };
       case 'restart_phone_proof':
-        return 'The phone proof could not be saved. Check the saved result, then explicitly request a fresh SMS if needed.';
+        return { key: 'registration.phoneProofLost' };
       case 'send_failed':
-        return 'Delivery was not confirmed. Ownership is not verified. Any new send requires your action and is separately rate-limited.';
+        return { key: 'registration.deliveryUnconfirmed' };
       case 'temporarily_unavailable':
-        return 'Registration is temporarily unavailable. No delivery or account creation is confirmed.';
+        return { key: 'registration.temporarilyUnavailable' };
       case 'not_found':
-        return 'Registration is currently unavailable. Use normal passkey sign-in for an existing account.';
+        return { key: 'registration.unavailable' };
     }
   }
   return errorMessage(failure, 'webauthn');
@@ -91,10 +97,11 @@ function Feedback({
   error,
   pending,
 }: {
-  message: string;
-  error: string;
-  pending: string;
+  message: Message;
+  error: Message;
+  pending: Message;
 }) {
+  const translate = useMessage();
   const feedback = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (message || error) feedback.current?.focus();
@@ -113,14 +120,14 @@ function Feedback({
           message || pending ? 'rounded-md bg-muted/50 p-3 text-sm leading-relaxed' : 'sr-only'
         }
       >
-        {pending || message}
+        {translate(pending || message)}
       </p>
       {error && (
         <p
           role="alert"
           className="rounded-md border border-red-700 bg-red-50 p-3 text-sm leading-relaxed text-red-800 dark:border-red-400 dark:bg-red-950 dark:text-red-200"
         >
-          {error}
+          {translate(error)}
         </p>
       )}
     </div>
@@ -129,16 +136,18 @@ function Feedback({
 
 type Phase = 'contacts' | 'email' | 'phone' | 'passkey' | 'uncertain' | 'completed' | 'closed';
 export function Registration() {
+  const t = useTranslations();
+  const preferences = useDisplayPreferences();
   const [hydrated, setHydrated] = useState(false);
   const [phase, setPhase] = useState<Phase>('contacts');
   const [attempt, setAttempt] = useState<RegistrationAttempt>();
   const [values, setValues] = useState<RegistrationValues>({ email: '', phone: '' });
   const [errors, setErrors] = useState<FieldErrors<RegistrationValues>>({});
-  const [codeError, setCodeError] = useState('');
+  const [codeError, setCodeError] = useState<Message>('');
   const [hasSMS, setHasSMS] = useState(false);
-  const [pending, setPending] = useState('');
-  const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
+  const [pending, setPending] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
+  const [message, setMessage] = useState<Message>('');
   const api = useRef<RegistrationClient | null>(null);
   const active = useRef<AbortController | null>(null);
   const alive = useRef(false);
@@ -148,7 +157,7 @@ export function Registration() {
   const code = useRef<HTMLInputElement>(null);
   const view = useRef<HTMLDivElement>(null);
 
-  const clear = useCallback((message = cleared) => {
+  const clear = useCallback((message: Message = cleared) => {
     active.current?.abort();
     active.current = null;
     api.current?.dispose();
@@ -172,7 +181,7 @@ export function Registration() {
   function usable() {
     const limit = deadline.current;
     if (limit && (Date.now() >= limit.wall || performance.now() >= limit.monotonic)) {
-      clear('Registration expired. Start again; no message is sent automatically.');
+      clear({ key: 'registration.expiredNoSend' });
       return false;
     }
     return hydrated && document.visibilityState !== 'hidden';
@@ -213,7 +222,7 @@ export function Registration() {
       const remaining = Math.min(limit.wall - Date.now(), limit.monotonic - performance.now());
       // A queued pending timer must observe the synchronous completion handoff.
       if (remaining > 0) timeout = setTimeout(expire, remaining);
-      else clear('Registration expired. Start again or try normal passkey sign-in.');
+      else clear({ key: 'registration.expired' });
     };
     expire();
     return () => clearTimeout(timeout);
@@ -236,25 +245,25 @@ export function Registration() {
       setValues({ email: '', phone: '' });
       setPhase('completed');
       setMessage(
-        'Your account was created. Sign in with your passkey to continue. Registration did not sign you in.'
+        { key: 'registration.created' }
       );
     } else if (result.state === 'failed')
-      clear('Registration could not complete. Start again or use normal sign-in.');
+      clear({ key: 'registration.failed' });
     else {
       deadline.current = pendingDeadline.current;
       if (!usable()) return;
       setPhase(result.phone_verified ? 'passkey' : result.email_verified ? 'phone' : 'email');
       setMessage(
         result.phone_verified
-          ? 'Email and phone ownership are verified. Create a discoverable passkey with a device PIN or biometrics.'
+          ? { key: 'registration.contactsVerified' }
           : result.email_verified
-            ? 'Email ownership is verified. Request an SMS when you are ready.'
-            : 'Email ownership is not yet verified. Open the email link in this browser and confirm it, then check again.'
+            ? { key: 'registration.emailVerified' }
+            : { key: 'registration.emailNotVerified' }
       );
     }
   }
   async function run(
-    label: string,
+    label: MessageDescriptor,
     operation: (client: RegistrationClient, signal: AbortSignal) => Promise<void>
   ) {
     if (active.current || !usable()) return;
@@ -317,7 +326,7 @@ export function Registration() {
       return;
     }
     void run(
-      'Starting registration and requesting your verification email...',
+      { key: 'registration.starting' },
       async (client, signal) => {
         requireWebAuthn();
         const next = await client.start(contacts, signal);
@@ -330,8 +339,8 @@ export function Registration() {
         setPhase('email');
         setMessage(
           next.email_sent
-            ? 'Verification email accepted for delivery. Open its link in this browser and explicitly confirm it. No account exists yet.'
-            : 'Email delivery was not confirmed. Request another email explicitly when ready. No ownership is verified.'
+            ? { key: 'registration.emailAccepted' }
+            : { key: 'registration.emailUnconfirmed' }
         );
       }
     );
@@ -345,7 +354,7 @@ export function Registration() {
       code.current?.focus();
       return;
     }
-    void run('Verifying phone ownership...', async (client, signal) => {
+    void run({ key: 'registration.verifyingPhone' }, async (client, signal) => {
       if (code.current) code.current.value = '';
       try {
         await client.verifyPhone(value, signal);
@@ -357,7 +366,7 @@ export function Registration() {
       setHasSMS(false);
       setPhase('passkey');
       setMessage(
-        'Phone ownership is verified. Create a discoverable passkey with a device PIN or biometrics.'
+        { key: 'registration.phoneVerified' }
       );
     });
   }
@@ -369,19 +378,18 @@ export function Registration() {
       {phase === 'contacts' && (
         <form
           ref={form}
+          data-registration-form
           method="post"
           noValidate
-          aria-label="Create an account"
+          aria-label={t('registration.formLabel')}
           onSubmit={start}
           className="space-y-5"
         >
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Use an existing mailbox you own and an Iranian mobile number. Verify both before
-            creating a passkey. No password, invitation or new mailbox is needed.
-          </p>
+            {t('registration.introduction')}</p>
           <AuthField
             name="email"
-            label="Email address"
+            label={t('registration.emailLabel')}
             type="text"
             inputMode="email"
             autoComplete="email"
@@ -391,7 +399,7 @@ export function Registration() {
             disabled={disabled}
             value={values.email}
             error={errors.email}
-            hint="Unicode addresses are supported. The server determines the canonical address; input is limited to 1024 UTF-8 bytes."
+            hint={t('registration.emailHint')}
             onChange={(event) => {
               setValues({ ...values, email: event.target.value });
               setErrors({});
@@ -399,7 +407,7 @@ export function Registration() {
           />
           <AuthField
             name="phone"
-            label="Iranian mobile number"
+            label={t('registration.phoneLabel')}
             type="tel"
             inputMode="tel"
             autoComplete="tel"
@@ -407,26 +415,27 @@ export function Registration() {
             disabled={disabled}
             value={values.phone}
             error={errors.phone}
-            hint="For example, +989123456789. SMS is sent only when you request it after email verification."
+            hint={t('registration.phoneHint')}
             onChange={(event) => {
               setValues({ ...values, phone: event.target.value });
               setErrors({});
             }}
           />
           <Button type="submit" disabled={disabled} className={actionClass}>
-            Start registration and send email
-          </Button>
+            {t('registration.start')}</Button>
         </form>
       )}
       {attempt && (
         <p className="break-words rounded-md bg-muted/50 p-3 text-sm leading-relaxed">
-          Canonical mailbox: <bdi dir="auto">{attempt.canonical_email}</bdi>
+          {t.rich('registration.canonicalMailbox', {
+            email: attempt.canonical_email,
+            mailbox: (chunks) => <bdi dir="auto">{chunks}</bdi>,
+          })}
           <br />
-          Registration expires at{' '}
-          <time dateTime={attempt.expires_at}>
-            {new Date(attempt.expires_at).toLocaleTimeString()}
-          </time>
-          . Resends do not extend this deadline. Keep this registration tab open.
+          {t.rich('registration.deadline', {
+            deadline: formatDisplayDate(attempt.expires_at, preferences),
+            time: (chunks) => <time dateTime={attempt.expires_at}>{chunks}</time>,
+          })}
         </p>
       )}
       {phase === 'email' && (
@@ -436,30 +445,28 @@ export function Registration() {
             disabled={disabled}
             className={actionClass}
             onClick={() =>
-              void run('Checking email ownership...', async (client, signal) =>
+              void run({ key: 'registration.checkingEmail' }, async (client, signal) =>
                 applyOutcome(await client.result(signal), signal)
               )
             }
           >
-            Check email verification
-          </Button>
+            {t('registration.checkEmail')}</Button>
           <Button
             type="button"
             variant="outline"
             disabled={disabled}
             className={actionClass}
             onClick={() =>
-              void run('Requesting a new verification email...', async (client, signal) => {
+              void run({ key: 'registration.resendingEmail' }, async (client, signal) => {
                 await client.resendEmail(signal);
                 throwIfAborted(signal);
                 setMessage(
-                  'A new email was accepted for delivery. Previous email and phone proofs are invalidated. Confirm the new email link before continuing.'
+                  { key: 'registration.emailResent' }
                 );
               })
             }
           >
-            Send another verification email
-          </Button>
+            {t('registration.resendEmail')}</Button>
         </div>
       )}
       {phase === 'phone' && (
@@ -469,32 +476,32 @@ export function Registration() {
             disabled={disabled}
             className={actionClass}
             onClick={() =>
-              void run('Requesting your SMS code...', async (client, signal) => {
+              void run({ key: 'registration.requestingSMS' }, async (client, signal) => {
                 setHasSMS(false);
                 if (code.current) code.current.value = '';
                 await client.sendPhone(signal);
                 throwIfAborted(signal);
                 setHasSMS(true);
                 setMessage(
-                  'SMS accepted for delivery. Enter the six-digit code to prove ownership; delivery alone does not verify your phone.'
+                  { key: 'registration.smsAccepted' }
                 );
               })
             }
           >
-            {hasSMS ? 'Send a new SMS code' : 'Send SMS code'}
+            {hasSMS ? t('registration.resendSMS') : t('registration.sendSMS')}
           </Button>
           {hasSMS && (
             <form
               method="post"
               noValidate
-              aria-label="Verify registration phone"
+              aria-label={t('registration.verifyPhoneLabel')}
               className="space-y-4"
               onSubmit={verifyPhone}
             >
               <AuthField
                 ref={code}
                 name="code"
-                label="SMS verification code"
+                label={t('registration.smsCode')}
                 type="text"
                 inputMode="numeric"
                 autoComplete="one-time-code"
@@ -502,12 +509,11 @@ export function Registration() {
                 spellCheck={false}
                 required
                 disabled={disabled}
-                error={codeError}
-                hint="Enter six ASCII digits, including any leading zero. The code is never submitted automatically."
+                error={codeError || undefined}
+                hint={t('registration.codeHint')}
               />
               <Button type="submit" disabled={disabled} className={actionClass}>
-                Verify phone
-              </Button>
+                {t('registration.verifyPhone')}</Button>
             </form>
           )}
           <Button
@@ -516,13 +522,12 @@ export function Registration() {
             disabled={disabled}
             className={actionClass}
             onClick={() =>
-              void run('Checking saved ownership proofs...', async (client, signal) =>
+              void run({ key: 'registration.checkingProofs' }, async (client, signal) =>
                 applyOutcome(await client.result(signal), signal)
               )
             }
           >
-            Check saved proofs
-          </Button>
+            {t('registration.checkProofs')}</Button>
         </div>
       )}
       {phase === 'passkey' && (
@@ -532,7 +537,7 @@ export function Registration() {
           className={actionClass}
           onClick={() =>
             void run(
-              'Create a passkey with a device PIN or biometrics...',
+              { key: 'registration.creatingPasskey' },
               async (client, signal) => {
                 requireWebAuthn();
                 const options = await client.passkeyOptions(signal);
@@ -550,8 +555,7 @@ export function Registration() {
             )
           }
         >
-          Create passkey and complete registration
-        </Button>
+          {t('registration.complete')}</Button>
       )}
       {phase === 'uncertain' && (
         <Button
@@ -559,15 +563,14 @@ export function Registration() {
           disabled={disabled}
           className={actionClass}
           onClick={() =>
-            void run('Reading the durable registration result...', async (client, signal) =>
+            void run({ key: 'registration.readingResult' }, async (client, signal) =>
               applyOutcome(await client.result(signal), signal)
             )
           }
         >
-          Check registration result
-        </Button>
+          {t('registration.checkResult')}</Button>
       )}
-      {phase === 'completed' && <AuthLink href="/login">Sign in with your passkey</AuthLink>}
+      {phase === 'completed' && <AuthLink href="/login">{t('registration.signIn')}</AuthLink>}
       {phase === 'closed' && (
         <Button
           type="button"
@@ -579,8 +582,7 @@ export function Registration() {
             setPhase('contacts');
           }}
         >
-          Start a new registration
-        </Button>
+          {t('registration.restart')}</Button>
       )}
       {!['completed', 'closed'].includes(phase) && (
         <Button
@@ -590,25 +592,23 @@ export function Registration() {
           className={actionClass}
           onClick={() => clear()}
         >
-          Cancel registration
-        </Button>
+          {t('registration.cancel')}</Button>
       )}
-      {phase === 'uncertain' && <AuthLink href="/login">Try normal passkey sign-in</AuthLink>}
+      {phase === 'uncertain' && <AuthLink href="/login">{t('registration.normalSignIn')}</AuthLink>}
       <noscript>
         <p className="text-sm">
-          JavaScript is required for secure registration. No credentials or verification request are
-          submitted without it.
-        </p>
+          {t('registration.noScript')}</p>
       </noscript>
     </div>
   );
 }
 
 export function RegistrationEmailVerification() {
+  const t = useTranslations();
   const [ready, setReady] = useState(false);
-  const [pending, setPending] = useState('');
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
+  const [pending, setPending] = useState<Message>('');
+  const [message, setMessage] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
   const captured = useRef(false);
   const proof = useRef<EmailProof | undefined>(undefined);
   const deadline = useRef<{ wall: number; monotonic: number } | undefined>(undefined);
@@ -654,6 +654,17 @@ export function RegistrationEmailVerification() {
         proof.current = undefined;
       }
       deadline.current = { wall: Date.now() + 600000, monotonic: performance.now() + 600000 };
+    }
+    // Update App Router's history integration after its parent effect installs,
+    // using only the scrubbed public pathname. Locale actions must not restore
+    // the original email bearer fragment from router state.
+    const cleanPath = window.location.pathname;
+    if (!window.location.hash && !window.location.search) {
+      queueMicrotask(() => {
+        if (!alive.current || generation.current !== mounted || window.location.pathname !== cleanPath) return;
+        try { window.history.replaceState(null, '', cleanPath); }
+        catch { clear(); }
+      });
     }
     setReady(Boolean(proof.current));
     if (!proof.current) setError(invalidLink);
@@ -701,13 +712,13 @@ export function RegistrationEmailVerification() {
     proof.current = undefined;
     setReady(false);
     setError('');
-    setPending('Verifying email ownership in the original browser...');
+    setPending({ key: 'registration.verifyingEmail' });
     try {
       // No key initialization here. Another browser cannot redeem this link.
       await current.verifyEmail(capturedProof, controller.signal);
       throwIfAborted(controller.signal);
       setMessage(
-        'Email ownership is verified. Return to the original registration tab and check email verification there. This page cannot create an account or recover signup authority.'
+        { key: 'registration.emailConfirmed' }
       );
     } catch (failure) {
       if (alive.current && active.current === controller && !isAborted(failure))
@@ -724,9 +735,7 @@ export function RegistrationEmailVerification() {
   return (
     <div className="space-y-5">
       <p className="text-sm leading-relaxed">
-        Confirm only in the browser where registration started. Keep the original registration tab
-        open. A different browser must restart registration.
-      </p>
+        {t('registration.originalBrowser')}</p>
       <Feedback message={message} error={error} pending={pending} />
       <Button
         type="button"
@@ -734,18 +743,14 @@ export function RegistrationEmailVerification() {
         className="h-auto min-h-11 w-full whitespace-normal"
         onClick={() => void verify()}
       >
-        Verify email ownership
-      </Button>
+        {t('registration.verifyEmail')}</Button>
       {pending && (
         <Button type="button" variant="outline" className="min-h-11 w-full" onClick={clear}>
-          Cancel email verification
-        </Button>
+          {t('registration.cancelEmail')}</Button>
       )}
       <noscript>
         <p className="text-sm">
-          JavaScript is required to scrub and verify this link securely. No verification request is
-          submitted without it.
-        </p>
+          {t('registration.emailNoScript')}</p>
       </noscript>
     </div>
   );

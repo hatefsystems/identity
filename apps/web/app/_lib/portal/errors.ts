@@ -1,3 +1,5 @@
+import type { MessageDescriptor } from '../../../i18n/messages';
+
 export class PortalError extends Error {
   constructor(
     readonly code: string,
@@ -42,85 +44,89 @@ export function isSessionLoss(error: unknown): boolean {
   );
 }
 
-export function errorMessage(error: unknown, method?: 'webauthn'): string {
+export function errorMessage(error: unknown, method?: 'webauthn'): MessageDescriptor {
   if (error instanceof PortalError) {
     if (error.uncertain)
-      return 'The response was lost. The action may already have completed. Refresh the saved state before trying a new action.';
+      return { key: 'errors.uncertain' };
     switch (error.code) {
       case 'key_unavailable':
-        return 'Secure browser key storage is unavailable. Allow IndexedDB and Web Crypto, then sign in again. If site storage is damaged, clear it before signing in. Access cannot continue without the browser key.';
+        return { key: 'errors.keyUnavailable' };
       case 'unsupported':
-        return 'Passkeys require a supported browser and a secure connection. Use a supported browser to continue.';
+        return { key: 'errors.unsupported' };
       case 'cancelled':
-        return 'The passkey request was cancelled or timed out. Start a new verification to try again.';
+        return { key: 'errors.cancelled' };
       case 'authenticator_security':
-        return 'The passkey could not be used on this origin. Check the secure site address and try again.';
+        return { key: 'errors.authenticatorSecurity' };
       case 'invalid_credentials':
         return method === 'webauthn'
-          ? 'Verification failed or expired. Start a new passkey verification with a device PIN or biometrics.'
-          : 'Verification failed or expired. Use a current authenticator code or start a new passkey verification.';
+          ? { key: 'errors.invalidCredentialsWebauthn' }
+          : { key: 'errors.invalidCredentials' };
       case 'challenge_invalid':
       case 'verification_failed':
-        return 'The passkey ceremony expired or could not be verified. Start again with fresh verification.';
+        return { key: 'errors.challengeInvalid' };
       case 'user_verification_required':
         return method === 'webauthn'
-          ? 'This action requires a passkey with a device PIN or biometric verification.'
-          : 'Use a passkey with a device PIN or biometric verification, or your enrolled authenticator app.';
+          ? { key: 'errors.userVerificationWebauthn' }
+          : { key: 'errors.userVerification' };
       case 'no_stepup_factor':
         return method === 'webauthn'
-          ? 'This action requires a passkey with a device PIN or biometric verification. No suitable passkey verification is available. You can manage your passkeys in Security.'
-          : 'No supported verification factor is available for this account.';
+          ? { key: 'errors.noFactorWebauthn' }
+          : { key: 'errors.noFactor' };
       case 'deletion_disabled':
-        return 'Account deletion is currently unavailable.';
+        return { key: 'errors.deletionDisabled' };
       case 'insufficient_user_authentication':
       case 'grant_expired':
-        return 'Fresh verification is required. Start the action again.';
+        return { key: 'errors.freshVerification' };
       case 'last_credential':
-        return 'Your last passkey cannot be removed. Add another passkey first.';
+        return { key: 'errors.lastCredential' };
       case 'credential_not_found':
       case 'user_not_found':
       case 'not_found':
-        return 'This item is no longer available. Refresh the list to see its current state.';
+        return { key: 'errors.notFound' };
       case 'profile_conflict':
-        return 'The saved profile changed. Refresh the saved profile, review your draft, then save again.';
+        return { key: 'errors.profileConflict' };
       case 'account_conflict':
-        return 'The account changed. Read its current state and review it before starting a new action with fresh verification.';
+        return { key: 'errors.accountConflict' };
       case 'account_not_moderatable':
-        return 'This account is not eligible for a status change.';
+        return { key: 'errors.notModeratable' };
       case 'forbidden':
-        return 'You do not have permission for this operation. Your normal account session is still available.';
+        return { key: 'errors.forbidden' };
       case 'session_changed':
-        return 'The browser session changed. Private data has been cleared. Verify the current session before continuing.';
+        return { key: 'errors.sessionChanged' };
       case 'unauthorized':
       case 'session_required':
       case 'invalid_session':
       case 'session_expired':
       case 'invalid_dpop_proof':
-        return 'Your session is no longer available. Sign in again to continue.';
+        return { key: 'errors.sessionRequired' };
       case 'rate_limited':
         return error.retryAfterSeconds
-          ? `Too many attempts. Wait ${error.retryAfterSeconds} seconds before trying again.`
-          : 'Too many attempts. Please try again later.';
+          ? { key: 'errors.rateLimitedSeconds', values: { seconds: error.retryAfterSeconds } }
+          : { key: 'errors.rateLimited' };
       case 'use_dpop_nonce':
-        return 'The secure request could not be authorized. Start a new action to try again.';
+        return { key: 'errors.nonce' };
       case 'network_error':
-        return 'The service could not be reached. Check your connection and try again.';
+        return { key: 'errors.network' };
       case 'temporarily_unavailable':
-        return 'The service is temporarily unavailable. Your session could not be verified. Please try again later.';
+        return { key: 'errors.temporarilyUnavailable' };
       case 'audit_unavailable':
       case 'service_unavailable':
       case 'rate_limit_unavailable':
-        return 'The administrative service is unavailable. No result can be shown. Please try again later.';
+        return { key: 'errors.serviceUnavailable' };
       case 'invalid_response':
-        return 'The service returned an invalid or oversized response. No result can be trusted.';
+        return { key: 'errors.invalidResponse' };
       case 'unknown_seq':
-        return 'The requested verification boundary is no longer available. Start a new run.';
+        return { key: 'errors.unknownSequence' };
       case 'missing_head':
-        return 'Verification state is unavailable. This is not evidence of an intact or empty chain.';
+        return { key: 'errors.missingHead' };
+      case 'name_single_line':
+        return { key: 'errors.nameSingleLine' };
+      case 'name_too_long':
+        return { key: 'errors.nameTooLong' };
     }
-    if (error.status === 429) return 'Too many attempts. Please try again later.';
+    if (error.status === 429) return { key: 'errors.rateLimited' };
   }
-  return 'The request could not be completed. Please try again.';
+  return { key: 'errors.requestFailed' };
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {

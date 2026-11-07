@@ -1,7 +1,10 @@
 'use client';
 
 import { Button, Label } from '@hatef/ui';
+import { useTranslations } from 'next-intl';
 import { useEffect, useId, useRef, useState } from 'react';
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
 import { controlClass, inputClass } from '../../_components/controls';
 import { StepUpDialog } from '../../_components/step-up-dialog';
 import { usePortal } from '../../_components/portal-provider';
@@ -10,17 +13,12 @@ import type { AdminModerationStatus, AdminUser } from '../../_lib/admin/contract
 import { normalizeModerationReason } from '../../_lib/admin/validation';
 import type { StepUpGrant } from '../../_lib/portal/contracts';
 import { isAborted, PortalError, throwIfAborted } from '../../_lib/portal/errors';
+import { QueryUtcTime } from './query-view-time';
 
 export type ModerationStatus = AdminModerationStatus;
 export type ModerationOutcome =
   | { kind: 'cancelled' | 'confirmed' | 'conflict' | 'unconfirmed' | 'expired' }
   | { kind: 'failed'; error: unknown };
-
-export const moderationLabel: Record<ModerationStatus, string> = {
-  active: 'Reactivate',
-  suspended: 'Suspend',
-  banned: 'Ban',
-};
 
 export function canModerate(user: AdminUser, actorID: string): boolean {
   return (
@@ -41,11 +39,13 @@ export function ModerationDialog({
   resumeTotp: boolean;
   onOutcome: (outcome: ModerationOutcome) => void;
 }) {
+  const t = useTranslations('admin');
+  const message = useMessage();
   const { client, profile, capabilities, reportPermissionLoss, reportModerationInterruption } =
     usePortal();
   const [deadline, setDeadline] = useState<number | null>(null);
   const [reason, setReason] = useState('');
-  const [reasonError, setReasonError] = useState('');
+  const [reasonError, setReasonError] = useState<Message>('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const input = useRef<HTMLTextAreaElement>(null);
@@ -150,7 +150,7 @@ export function ModerationDialog({
     try {
       narrative = normalizeModerationReason(reason);
     } catch {
-      setReasonError('Enter a reason using no more than 2,000 UTF-8 bytes.');
+      setReasonError({ key: 'admin.moderation.reasonError' });
       input.current?.focus();
       return;
     }
@@ -226,26 +226,29 @@ export function ModerationDialog({
 
   return (
     <StepUpDialog
-      title={`${moderationLabel[desiredStatus]} account`}
+      title={t(`moderation.titles.${desiredStatus}`)}
       description={
         <div className="space-y-3">
           <p>
-            Account <span className="break-all font-mono text-foreground">{target.id}</span>
+            {t.rich('moderation.account', {
+              id: target.id,
+              reference: (chunks) => (
+                <bdi dir="ltr" className="break-all font-mono text-foreground">
+                  {chunks}
+                </bdi>
+              ),
+            })}
           </p>
           <p>
-            Current status: <strong>{target.status}</strong>. Proposed status:{' '}
-            <strong>{desiredStatus}</strong>.
+            {t.rich('moderation.statuses', {
+              currentStatus: t(`statuses.${target.status}`),
+              proposedStatus: t(`statuses.${desiredStatus}`),
+              current: (chunks) => <strong>{chunks}</strong>,
+              proposed: (chunks) => <strong>{chunks}</strong>,
+            })}
           </p>
-          <p>
-            Suspension and ban remain until explicit restoration. They are not erasure and do not
-            prevent re-registration. Subsequent live credential checks reject old credentials;
-            already admitted requests and offline JWT consumers may retain bounded residual access.
-            Reactivation never restores old credentials.
-          </p>
-          <p>
-            Verify first, then enter the reason and explicitly confirm. Cancel before sending to
-            make no change.
-          </p>
+          <p>{t('moderation.consequences')}</p>
+          <p>{t('moderation.instructions')}</p>
         </div>
       }
       onCancel={cancel}
@@ -254,15 +257,15 @@ export function ModerationDialog({
       resumeMethod={resumeTotp ? 'totp' : undefined}
       verifiedStatus={
         submitting
-          ? 'Sending status change. Do not submit again.'
+          ? { key: 'admin.moderation.sending' }
           : deadline
-            ? 'Verification complete. Enter a reason and review the final confirmation before verification expires.'
-            : 'Verification complete. Checking the pinned account before final confirmation.'
+            ? { key: 'admin.moderation.verified' }
+            : { key: 'admin.moderation.checking' }
       }
       verifiedContent={
         deadline && (
           <form
-            aria-label="Confirm account status change"
+            aria-label={t('moderation.form')}
             className="space-y-4"
             noValidate
             onSubmit={(event) => {
@@ -271,23 +274,31 @@ export function ModerationDialog({
             }}
           >
             <p className="text-sm">
-              Confirm <strong>{target.status}</strong> to <strong>{desiredStatus}</strong> for the
-              account above, at revision{' '}
-              <span className="break-all font-mono">{target.lifecycle_revision}</span>.
+              {t.rich('moderation.review', {
+                currentStatus: t(`statuses.${target.status}`),
+                proposedStatus: t(`statuses.${desiredStatus}`),
+                revision: (chunks) => (
+                  <bdi dir="ltr" className="break-all font-mono">
+                    {chunks}
+                  </bdi>
+                ),
+                current: (chunks) => <strong>{chunks}</strong>,
+                proposed: (chunks) => <strong>{chunks}</strong>,
+                revisionValue: target.lifecycle_revision,
+              })}
             </p>
             <p className="text-sm text-muted-foreground">
-              Single-use verification expires at{' '}
-              <time dateTime={new Date(deadline).toISOString()}>
-                {new Date(deadline).toLocaleTimeString()}
-              </time>
-              . Expiry or leaving this page clears the reason and requires fresh verification.
+              {t.rich('moderation.expires', {
+                deadline: () => <QueryUtcTime value={new Date(deadline).toISOString()} />,
+              })}
             </p>
             <div className="space-y-2">
-              <Label htmlFor={`${id}-reason`}>Moderation reason</Label>
+              <Label htmlFor={`${id}-reason`}>{t('moderation.reason')}</Label>
               <textarea
                 ref={input}
                 id={`${id}-reason`}
                 name="moderation-reason"
+                dir="auto"
                 value={reason}
                 autoComplete="off"
                 spellCheck={false}
@@ -303,12 +314,11 @@ export function ModerationDialog({
                 className={`${inputClass} min-h-28 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring`}
               />
               <p id={`${id}-hint`} className="text-sm text-muted-foreground">
-                Required for every action. At most 2,000 UTF-8 bytes; avoid unnecessary personal
-                information.
+                {t('moderation.reasonHelp')}
               </p>
               {reasonError && (
                 <p id={`${id}-error`} role="alert" className="text-sm text-destructive">
-                  {reasonError}
+                  {message(reasonError)}
                 </p>
               )}
             </div>
@@ -320,16 +330,14 @@ export function ModerationDialog({
                 onChange={(event) => setAcknowledged(event.target.checked)}
                 className="mt-1 size-5 shrink-0 accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
-              I reviewed the account, current status, new status, and consequences of this action.
+              {t('moderation.acknowledged')}
             </label>
             <Button
               type="submit"
               className={`${controlClass} w-full`}
               disabled={!acknowledged || submitting}
             >
-              {submitting
-                ? 'Submitting status change...'
-                : `Confirm ${moderationLabel[desiredStatus].toLowerCase()}`}
+              {submitting ? t('moderation.submitting') : t(`moderation.confirm.${desiredStatus}`)}
             </Button>
           </form>
         )

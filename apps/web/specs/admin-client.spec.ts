@@ -566,7 +566,10 @@ describe('nonce-only retry and bounded error feedback', () => {
       'Wed, 31 Feb 2026 09:01:00 GMT',
     ])
       expect(parseRetryAfter(value, now)).toBeUndefined();
-    expect(errorMessage(new PortalError('rate_limited', 429, false, 60))).toContain('60 seconds');
+    expect(errorMessage(new PortalError('rate_limited', 429, false, 60))).toEqual({
+      key: 'errors.rateLimitedSeconds',
+      values: { seconds: 60 },
+    });
   });
 
   it('never replays lost moderation or authenticator responses and does not retain private network errors', async () => {

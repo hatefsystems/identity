@@ -1,7 +1,9 @@
 import { TextEncoder } from 'node:util';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { StrictMode } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
+import { StrictMode, type ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+const renderToStaticMarkup = (element: ReactElement) => renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import { Registration, RegistrationEmailVerification } from '../app/_components/registration';
 import { RegistrationClient } from '../app/_lib/portal/registration-client';
 import { requireWebAuthn, usePasskey } from '../app/_lib/portal/webauthn';
@@ -718,3 +720,36 @@ it.each(['result', 'complete'] as const)(
     view.unmount();
   }
 );
+
+
+test('language changes preserve the registration client, frozen deadline and pending ownership without sending', async () => {
+  const { rerender, container } = render(<I18nTestProvider locale="en"><Registration /></I18nTestProvider>);
+  start();
+  await screen.findByRole('button', { name: 'Check email verification' });
+  const expiry = container.querySelector('time')?.dateTime;
+  expect(expiry).toBeTruthy();
+  const clients = jest.mocked(RegistrationClient).mock.calls.length;
+  rerender(<I18nTestProvider locale="fa-IR"><Registration /></I18nTestProvider>);
+  expect(screen.getByRole('button', { name: 'بررسی تأیید ایمیل' })).toBeTruthy();
+  expect(container.querySelector('time')?.dateTime).toBe(expiry);
+  expect(container.textContent).toContain(canonical);
+  expect(RegistrationClient).toHaveBeenCalledTimes(clients);
+  expect(api.start).toHaveBeenCalledTimes(1);
+  for (const action of [api.result, api.resendEmail, api.sendPhone, api.verifyPhone, api.complete]) expect(action).not.toHaveBeenCalled();
+  expect(api.dispose).not.toHaveBeenCalled();
+});
+
+test('email-link presentation changes retain one proof and the scrubbed public URL without verification', async () => {
+  window.history.replaceState(null, '', `/register/verify-email#attempt_id=${attemptID}&token=${token}`);
+  const { rerender } = render(<I18nTestProvider locale="en"><RegistrationEmailVerification /></I18nTestProvider>);
+  await act(async () => { await Promise.resolve(); });
+  expect(window.location.hash).toBe('');
+  rerender(<I18nTestProvider locale="fa-IR"><RegistrationEmailVerification /></I18nTestProvider>);
+  expect(screen.getByRole<HTMLButtonElement>('button', { name: 'تأیید مالکیت ایمیل' }).disabled).toBe(false);
+  expect(window.location.pathname).toBe('/register/verify-email');
+  expect(window.location.hash).toBe('');
+  expect(api.verifyEmail).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'تأیید مالکیت ایمیل' }));
+  await waitFor(() => expect(api.verifyEmail).toHaveBeenCalledTimes(1));
+  expect(api.verifyEmail.mock.calls[0][0]).toEqual({ attempt_id: attemptID, token });
+});

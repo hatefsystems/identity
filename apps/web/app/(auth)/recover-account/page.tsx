@@ -1,17 +1,19 @@
-import { AccountRecovery } from '../_components/account-recovery';
+import { getTranslations } from 'next-intl/server';
 import { AuthCard } from '../_components/auth-card';
+import { AccountRecovery } from '../_components/account-recovery';
 
-export const metadata = {
-  title: 'Recover your account | Hatef Identity',
-  robots: { index: false, follow: false },
-};
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('reclaim.metadata'), robots: { index: false, follow: false } };
+}
 
-export default function RecoverAccountPage() {
+export default async function RecoverAccountPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Recover your account"
-      description="Cancel a pending account deletion using the recovery link from your email and strong verification."
-      footer="Recovery does not sign you in or restore old sessions."
+      title={t('pages.reclaim.title')}
+      description={t('pages.reclaim.description')}
+      footer={t('pages.reclaim.footer')}
     >
       <AccountRecovery />
     </AuthCard>

@@ -1,14 +1,19 @@
+import { getTranslations } from 'next-intl/server';
 import { AuthCard, AuthLink } from '../../_components/auth-card';
 import { PasskeyScreen } from '../../_components/screens';
 
-export const metadata = { title: 'Sign in with a passkey | Hatef Identity' };
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('passkey.metadata') };
+}
 
-export default function PasskeyPage() {
+export default async function PasskeyPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Sign in with a passkey"
-      description="Use a passkey already saved on your device or security key."
-      footer={<AuthLink href="/login">Return to sign in</AuthLink>}
+      title={t('pages.passkey.title')}
+      description={t('pages.passkey.description')}
+      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
     >
       <PasskeyScreen />
     </AuthCard>
