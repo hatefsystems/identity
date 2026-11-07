@@ -69,6 +69,7 @@ const failureStages = Object.freeze({
   'controller-start': 'controller',
   'controller-network': 'controller',
   'controller-ready': 'controller',
+  'controller-running': 'controller',
   'gateway-network': 'controller',
   'gateway-connect': 'controller',
   'gateway-targets': 'controller',
@@ -648,6 +649,13 @@ export async function startRegistrationGateway(config, track) {
     if (gateway.listening) await closeServer(gateway);
     throw new RegistrationFailure('controller-start', false);
   }
+}
+
+// Owner-only bind-mounted TLS material must be read by its creating host UID.
+// Root with dropped DAC capabilities cannot read another user's 0700/0600 files.
+export function registrationControllerUser(uid = process.getuid?.() ?? 0, gid = process.getgid?.() ?? 0) {
+  fixed([uid, gid].every((value) => Number.isInteger(value) && value >= 0 && value < 4294967295), 'Invalid controller credential owner');
+  return `${uid}:${gid}`;
 }
 
 // This controller is mounted only into a separately owned Node container. It is
@@ -1424,6 +1432,8 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
         '127.0.0.1::8080',
         '--publish',
         '127.0.0.1::8081',
+        '--user',
+        registrationControllerUser(),
         '--cap-drop',
         'ALL',
         '--cap-add',
@@ -1514,6 +1524,8 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     };
     failureCheck = 'controller-ready';
     await waitUntil(async () => {
+      const [state] = JSON.parse(docker(['inspect', ownedController.id], lifecycle));
+      if (!state.State.Running) throw new RegistrationFailure('controller-running', false);
       try {
         return (await control('/summary')).violations === 0;
       } catch {

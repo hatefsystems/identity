@@ -1173,6 +1173,9 @@ export async function validateWebCsp({
         );
       }
       if (route.registration) {
+        // Registration has its own baseline before invalid submissions; the
+        // disconnected-form baseline below is outside this branch's lifetime.
+        const beforeStorage = await storageSnapshot(page);
         // Valid signup sends mail and belongs to the separately gated real-API
         // suite. Here only explicit invalid submissions may run: no API work,
         // credentials ceremony or durable browser state is permitted.
