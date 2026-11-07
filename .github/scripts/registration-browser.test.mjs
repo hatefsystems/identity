@@ -25,6 +25,7 @@ import {
   registrationControllerUser,
   assertRegistrationAPINetwork,
   registrationStartupSummary,
+  registrationBrowserDiagnostic,
   registrationPasskeyEnvironment,
   registrationChecks,
   registrationFailureDetails,
@@ -39,6 +40,27 @@ import {
 import { portalCleanup } from './portal-harness.mjs';
 
 const token = randomBytes(32).toString('base64url');
+
+test('browser diagnostics expose only fixed routes, HTTP statuses and numeric source lines', () => {
+  const privateValue = 'private-email-token-cookie';
+  const error = Object.assign(new Error(privateValue), { name: 'TimeoutError',
+    stack: `TimeoutError: ${privateValue}\n at startAttempt (/private/path/registration-browser.mjs:123:7)` });
+  const result = registrationBrowserDiagnostic(error, {
+    replies: [
+      { path: '/api/v1/auth/register/start', status: 503, value: { token: privateValue } },
+      { path: `/api/v1/auth/register/start?${privateValue}`, status: 401 },
+      { path: '/api/v1/auth/register', status: privateValue },
+      { path: '/api/v1/auth/register', status: 999 },
+      null,
+    ], failures: new Set(['browser-response-privacy', privateValue]),
+  });
+  assert.deepEqual(result, { kind: 'timeout', line: 123,
+    replies: [{ path: '/api/v1/auth/register/start', status: 503 }],
+    failures: ['browser-response-privacy'] });
+  assert(!JSON.stringify(result).includes(privateValue));
+  assert.deepEqual(registrationBrowserDiagnostic({ stack: privateValue }),
+    { kind: 'other', line: null, replies: [], failures: [] });
+});
 const expected = {
   apiKey: 'controller-key-not-a-provider-credential',
   templateId: 1793984,

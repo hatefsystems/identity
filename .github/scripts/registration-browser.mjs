@@ -690,6 +690,24 @@ export function registrationStartupSummary(output) {
         smtp: /smtp/i, nats: /nats|jetstream/i })[name].test(text)) };
 }
 
+// Public diagnostics must never copy exception messages, request bodies or URLs.
+export function registrationBrowserDiagnostic(error, observed = {}) {
+  const frames = String(error?.stack ?? '').split('\n').filter((frame) => !/^\s+at fixed[ (]/.test(frame)).join('\n');
+  const line = Number(/registration-browser\.mjs:(\d+):\d+/.exec(frames)?.[1]);
+  const paths = new Set([root, ...['start', 'email/resend', 'email/verify', 'result',
+    'phone/send', 'phone/verify', 'passkey/options'].map((suffix) => `${root}/${suffix}`)]);
+  return {
+    kind: error?.name === 'TimeoutError' ? 'timeout' : error?.code === 'ERR_ASSERTION' ? 'assertion' : 'other',
+    line: Number.isSafeInteger(line) && line > 0 && line < 10000 ? line : null,
+    replies: (Array.isArray(observed.replies) ? observed.replies : []).flatMap((reply) =>
+      paths.has(reply?.path) && Number.isInteger(reply.status) && reply.status >= 100 && reply.status <= 599
+        ? [{ path: reply.path, status: reply.status }] : []).slice(-12),
+    failures: ['browser-runtime', 'browser-csp-hydration', 'browser-private-console',
+      'unexpected-download', 'browser-request-privacy', 'browser-response-privacy']
+      .filter((name) => observed.failures instanceof Set && observed.failures.has(name)),
+  };
+}
+
 // Owner-only bind-mounted TLS material must be read by its creating host UID.
 // Root with dropped DAC capabilities cannot read another user's 0700/0600 files.
 export function registrationControllerUser(uid = process.getuid?.() ?? 0, gid = process.getgid?.() ?? 0) {
@@ -2667,6 +2685,9 @@ async function exerciseSuccessfulSignup(
     );
     await Promise.all(observed.pending);
     fixed(observed.failures.size === 0, 'Browser CSP, privacy or runtime assertion failed');
+  } catch (error) {
+    console.error(JSON.stringify({ check: 'registration-flow-failure', ...registrationBrowserDiagnostic(error, observed) }));
+    throw error;
   } finally {
     try {
       if (lost && !page.isClosed())
@@ -2947,6 +2968,7 @@ export async function runRegistrationBrowser() {
     failed = false;
     return report;
   } catch (error) {
+    if (harness) console.error(JSON.stringify({ check: 'registration-browser-failure', ...registrationBrowserDiagnostic(error) }));
     failure = registrationFailureDetails(error, failureCheck);
     if (!harness) cleanup = failure.cleanup;
   } finally {
