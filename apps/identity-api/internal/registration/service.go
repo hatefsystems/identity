@@ -118,6 +118,13 @@ func (s *Service) Start(ctx context.Context, email, phone, jkt, ip string) (Star
 	if err != nil {
 		return StartResult{}, ErrInvalid
 	}
+	// The form sends the original identifier. Canonicalize its Iranian aliases
+	// before rate-limit keys, pending encryption and provider binding are derived.
+	if len(phone) == 11 && strings.HasPrefix(phone, "09") {
+		phone = "+98" + phone[1:]
+	} else if len(phone) == 12 && strings.HasPrefix(phone, "989") {
+		phone = "+" + phone
+	}
 	phone, err = smsotp.NormalizePhone(phone)
 	if err != nil || len(phone) != 13 || !strings.HasPrefix(phone, "+989") || !ValidJKT(jkt) {
 		return StartResult{}, ErrInvalid
