@@ -1,14 +1,18 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -52,22 +56,127 @@ type adminApplyLegalHoldRequest struct {
 	ReviewAt            string `json:"review_at"`
 }
 
-// Legal endpoints additionally reject all query parameters on body-based paths,
-// so a caller cannot accidentally place an identifier or narrative in a URL.
+const legalBodyLimit = 32 * 1024
+
+// Preflight runs after live session/permission checks, before one-use step-up.
+// Read at most the ceiling plus one byte, including for chunked bodies.
+func (s *Server) legalBodyPreflight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validAdminQuery(r) {
+			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+			return
+		}
+		release := r.Method == http.MethodDelete
+		if release && len(r.Header.Values("Idempotency-Key")) != 0 {
+			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+			return
+		}
+		if r.ContentLength > legalBodyLimit {
+			s.writeAdminError(w, http.StatusRequestEntityTooLarge, "invalid_request")
+			return
+		}
+		var body []byte
+		if r.Body != nil {
+			source := r.Body
+			defer func() { _ = source.Close() }()
+			var err error
+			body, err = io.ReadAll(io.LimitReader(r.Body, legalBodyLimit+1))
+			defer clear(body)
+			if err != nil || r.Context().Err() != nil {
+				s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+				return
+			}
+		}
+		if len(body) > legalBodyLimit {
+			s.writeAdminError(w, http.StatusRequestEntityTooLarge, "invalid_request")
+			return
+		}
+		if release && len(body) != 0 {
+			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if !s.browserRequestAllowed(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// These bodies never accept identifiers or narratives in query parameters.
 func decodeLegalBody(w http.ResponseWriter, r *http.Request, dst any) error {
-	if !validAdminQuery(r) {
+	if !validAdminQuery(r) || r.Body == nil {
 		return legalhold.ErrInvalidRequest
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, legalBodyLimit))
+	defer clear(raw)
+	typeOf := reflect.TypeOf(dst)
+	if err != nil || !utf8.Valid(raw) || !json.Valid(raw) || !uniqueJSONFields(raw) || typeOf == nil || typeOf.Kind() != reflect.Pointer {
 		return legalhold.ErrInvalidRequest
 	}
-	if decoder.Decode(&struct{}{}) != io.EOF {
+	if !exactLegalJSON(raw, typeOf.Elem()) || json.Unmarshal(raw, dst) != nil {
 		return legalhold.ErrInvalidRequest
+	}
+	if _, inquiry := dst.(*adminLegalInquiryRequest); inquiry {
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &fields)
+		if bytes.Equal(bytes.TrimSpace(fields["fields"]), []byte("null")) {
+			return legalhold.ErrInvalidRequest
+		}
 	}
 	return nil
+}
+
+// encoding/json accepts case aliases and null scalar values. Match declared
+// wire names recursively instead; nullable pointers/collections keep their contract.
+func exactLegalJSON(raw json.RawMessage, typ reflect.Type) bool {
+	if typ.Kind() == reflect.Pointer {
+		return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || exactLegalJSON(raw, typ.Elem())
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return typ.Kind() == reflect.Slice || typ.Kind() == reflect.Map
+	}
+	if reflect.PointerTo(typ).Implements(reflect.TypeFor[json.Unmarshaler]()) {
+		return true
+	}
+	if reflect.PointerTo(typ).Implements(reflect.TypeFor[encoding.TextUnmarshaler]()) {
+		return bytes.TrimSpace(raw)[0] == '"'
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		var object map[string]json.RawMessage
+		if json.Unmarshal(raw, &object) != nil || object == nil {
+			return false
+		}
+		fields := make(map[string]reflect.Type)
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if field.IsExported() && name != "-" {
+				if name == "" {
+					name = field.Name
+				}
+				fields[name] = field.Type
+			}
+		}
+		for name, value := range object {
+			field, ok := fields[name]
+			if !ok || !exactLegalJSON(value, field) {
+				return false
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil {
+			return false
+		}
+		for _, value := range values {
+			if !exactLegalJSON(value, typ.Elem()) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func legalRequestKey(r *http.Request) (uuid.UUID, error) {
@@ -187,9 +296,16 @@ func (s *Server) handleAdminReleaseLegalHold() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if !validAdminQuery(r) {
+		if !validAdminQuery(r) || len(r.Header.Values("Idempotency-Key")) != 0 {
 			s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
 			return
+		}
+		if r.Body != nil {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+			if err != nil || len(body) != 0 || r.Context().Err() != nil {
+				s.writeLegalHoldError(w, legalhold.ErrInvalidRequest)
+				return
+			}
 		}
 		result, err := s.deps.LegalHold.Release(r.Context(), id, actor)
 		if err != nil {

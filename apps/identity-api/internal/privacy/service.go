@@ -341,7 +341,11 @@ type ReclaimAttempt struct {
 // Concurrent requests admitted under the same authority coalesce onto one token
 // and notice set. Pending accounts cannot authenticate a later resend. Delivery
 // retries belong to the durable worker and never rotate tokens or deadlines.
-func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expectedAuthVersion int64, clientIP string, locale notification.Locale) (DeletionResult, error) {
+func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expectedAuthVersion int64, clientIP string, locales ...notification.Locale) (DeletionResult, error) {
+	locale := notification.English
+	if len(locales) == 1 {
+		locale = notification.RequestLocale([]string{string(locales[0])})
+	}
 	if s.cipher == nil {
 		return DeletionResult{}, ErrDeletionUnavailable
 	}

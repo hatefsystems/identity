@@ -5,26 +5,23 @@ package identitygrpc
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	embedded "github.com/hatefsystems/identity/apps/identity-api/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	identityv1 "github.com/hatefsystems/identity/libs/schemas/gen/go/hatef/identity/v1"
 )
@@ -44,7 +41,7 @@ func integrationDependency(t *testing.T, name string) string {
 func integrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 	dsn := integrationDependency(t, "DATABASE_URL")
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancel)
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -57,14 +54,15 @@ func integrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal("configured PostgreSQL integration dependency is unavailable")
 	}
-	schema := "grpc_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		t.Fatal(err)
+	database := "grpc_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{database}.Sanitize()+" TEMPLATE template0"); err != nil {
+		t.Fatalf("create run-owned gRPC database with test provisioning credentials: %v", err)
 	}
+	t.Logf("run-owned gRPC database: %s", database)
 	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		if _, err := admin.Exec(cleanup, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()); err != nil {
 			t.Error(err)
 		}
 	})
@@ -72,39 +70,18 @@ func integrationDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal("invalid PostgreSQL integration configuration")
 	}
-	// Missing extensions are installed by the migrations into this owned schema,
-	// not public. An already installed public extension is only reused.
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	cfg.ConnConfig.Database = database
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
 	cfg.MaxConns = 6
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	// Reuse the real identity/RBAC and lifecycle migrations in an isolated
-	// schema. Unrelated retention migrations deliberately target public.
-	files := fstest.MapFS{}
-	entries, err := fs.ReadDir(embedded.Migrations, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() > "00010_account_auth_version.sql" && entry.Name() != "00016_user_lifecycle_events.sql" && entry.Name() != "00017_profile_names.sql" {
-			continue
-		}
-		data, err := fs.ReadFile(embedded.Migrations, "migrations/"+entry.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		files[entry.Name()] = &fstest.MapFile{Data: data}
-	}
 	sqlDB := stdlib.OpenDB(*cfg.ConnConfig)
-	defer func() { _ = sqlDB.Close() }()
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, files)
+	err = migrate.Up(ctx, sqlDB)
+	_ = sqlDB.Close()
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
 	return ctx, pool

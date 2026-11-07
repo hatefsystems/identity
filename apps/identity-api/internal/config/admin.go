@@ -83,11 +83,13 @@ const (
 
 // LoadAdmin reads the admin surface configuration from the environment.
 //
-// Unlike most Load* functions here it takes no environment argument: the
-// defaults are production-safe on their own, and there is no development
-// relaxation that would make sense (a larger page cap is not more convenient,
-// only slower).
+// Resource bounds are production-safe; only explicit development permits HTTP
+// origins. Environment admission does not load credentials or HTTP settings.
 func LoadAdmin() (AdminConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return AdminConfig{}, err
+	}
 	enabled, err := getEnvBool(EnvAdminEnabled, false)
 	if err != nil {
 		return AdminConfig{}, err
@@ -149,7 +151,7 @@ func LoadAdmin() (AdminConfig, error) {
 			if parseErr != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" || (u.Scheme != "https" && u.Scheme != "http") {
 				return AdminConfig{}, fmt.Errorf("config: %s requires exact HTTP(S) origins without paths", EnvAdminAllowedOrigins)
 			}
-			if getEnv("APP_ENV", "development") != "development" && u.Scheme != "https" {
+			if environment != "development" && u.Scheme != "https" {
 				return AdminConfig{}, fmt.Errorf("config: admin origins require HTTPS outside development")
 			}
 			origins = append(origins, origin)

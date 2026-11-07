@@ -125,6 +125,29 @@ func (s *Server) handleReviewExistingHold() http.HandlerFunc {
 	})
 }
 
+func (s *Server) handleGetHoldReviews() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := s.workflowActor(w, r)
+		if !ok {
+			return
+		}
+		id, ok := s.adminPathUUID(w, r, "hold_id")
+		if !ok {
+			return
+		}
+		if !validAdminQuery(r) || r.ContentLength != 0 || r.Header.Get("Idempotency-Key") != "" {
+			s.writeWorkflowError(w, legalworkflow.ErrInvalidRequest)
+			return
+		}
+		result, err := s.deps.LegalWorkflow.GetHoldReviews(r.Context(), actor, id)
+		if err != nil {
+			s.writeWorkflowError(w, err)
+			return
+		}
+		s.writeAdminJSON(w, http.StatusOK, result)
+	}
+}
+
 func (s *Server) handleGetLegalCase() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		actor, ok := s.workflowActor(w, r)

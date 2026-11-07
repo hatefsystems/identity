@@ -136,10 +136,9 @@ func (c DeletionSMTPConfig) Validate() error {
 }
 
 // ValidateDeletionSMTPAddress accepts exactly one ASCII dot-atom mailbox. The
-// transport shares this validator for recipients; display names, quoted local
-// parts, address lists, literals and SMTPUTF8 are intentionally unsupported.
+// system sender remains ASCII; recipient validation is a separate transport concern.
 func ValidateDeletionSMTPAddress(address string) error {
-	if !emailaddress.ValidMailbox(address) {
+	if !deletionSMTPASCII(address, 1, 254, false) || !emailaddress.ValidMailbox(address) {
 		return errors.New("deletion smtp: invalid mailbox")
 	}
 	return nil
@@ -180,14 +179,24 @@ func deletionSMTPHost(host string) bool {
 // LoadDeletionNotifier loads delivery bounds without reading the API feature
 // switch. SMTP's end-to-end timeout also bounds each core worker send.
 func LoadDeletionNotifier() (DeletionNotifierConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return DeletionNotifierConfig{}, err
+	}
 	cfg := DeletionNotifierConfig{DatabaseURL: os.Getenv(EnvDeletionNotifierDatabaseURL)}
 	if strings.TrimSpace(cfg.DatabaseURL) == "" || strings.TrimSpace(cfg.DatabaseURL) != cfg.DatabaseURL ||
 		len(cfg.DatabaseURL) > 8192 || strings.ContainsAny(cfg.DatabaseURL, "\x00\r\n") {
 		return DeletionNotifierConfig{}, fmt.Errorf("config: %s requires an explicit bounded database DSN; DATABASE_URL is not a fallback", EnvDeletionNotifierDatabaseURL)
 	}
-	var err error
 	if cfg.SMTP, err = LoadDeletionSMTP(); err != nil {
 		return DeletionNotifierConfig{}, err
+	}
+	portalOrigin, err := canonicalPortalOrigin(os.Getenv(EnvPortalOrigin), environment)
+	if err != nil {
+		return DeletionNotifierConfig{}, err
+	}
+	if cfg.SMTP.PublicOrigin != portalOrigin {
+		return DeletionNotifierConfig{}, errors.New("config: DELETION_SMTP_PUBLIC_ORIGIN must match PORTAL_ORIGIN")
 	}
 	batch, err := lifecycleInt(EnvDeletionNotifierBatchSize, 50, 1, 200)
 	if err != nil {
@@ -226,7 +235,7 @@ func LoadDeletionNotifier() (DeletionNotifierConfig, error) {
 	if cfg.GracePeriod, err = lifecycleDuration(EnvGDPRGracePeriod, defaultGDPRGracePeriod, MinGDPRGracePeriod, math.MaxInt64); err != nil {
 		return DeletionNotifierConfig{}, err
 	}
-	if environment := os.Getenv("APP_ENV"); environment != "development" && environment != "test" && cfg.GracePeriod != defaultGDPRGracePeriod {
+	if environment == "production" && cfg.GracePeriod != defaultGDPRGracePeriod {
 		return DeletionNotifierConfig{}, fmt.Errorf("config: %s must be 720h outside development/test", EnvGDPRGracePeriod)
 	}
 	attempts, err := lifecycleInt(EnvGDPRReclaimMaxAttempts, defaultGDPRReclaimMaxAttempts, 1, math.MaxInt32)

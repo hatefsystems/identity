@@ -51,6 +51,14 @@ type LifecycleCleanupConfig struct {
 // LoadLifecycleProvision loads only broker topology and startup policy. Database,
 // publisher and outbox-retention fields remain unset and are not read.
 func LoadLifecycleProvision() (LifecycleConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return LifecycleConfig{}, err
+	}
+	return loadLifecycleProvision(environment)
+}
+
+func loadLifecycleProvision(environment string) (LifecycleConfig, error) {
 	cfg := LifecycleConfig{
 		NATSURL:    strings.TrimSpace(os.Getenv(EnvNATSURL)),
 		StreamName: getEnv(EnvLifecycleStreamName, "IDENTITY_USERS"),
@@ -62,7 +70,7 @@ func LoadLifecycleProvision() (LifecycleConfig, error) {
 	if cfg.StreamMaxBytes, err = lifecycleInt(EnvLifecycleStreamMaxBytes, 128<<20, lifecycle.MaxMessageBytes, math.MaxInt64); err != nil {
 		return LifecycleConfig{}, err
 	}
-	if cfg.StreamMaxAge, err = lifecycleDuration(EnvLifecycleStreamMaxAge, lifecycleRetentionDefault(), lifecycle.DuplicateWindow+1, math.MaxInt64); err != nil {
+	if cfg.StreamMaxAge, err = lifecycleDuration(EnvLifecycleStreamMaxAge, lifecycleRetentionDefault(environment), lifecycle.DuplicateWindow+1, math.MaxInt64); err != nil {
 		return LifecycleConfig{}, err
 	}
 	if cfg.StartupTimeout, err = lifecycleDuration(EnvLifecycleStartupTimeout, 15*time.Second, time.Millisecond, time.Minute); err != nil {
@@ -76,13 +84,17 @@ func LoadLifecycleProvision() (LifecycleConfig, error) {
 
 // LoadLifecycle never selects a log-only fallback, even in development.
 func LoadLifecycle() (LifecycleConfig, error) {
-	cfg, err := LoadLifecycleProvision()
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return LifecycleConfig{}, err
+	}
+	cfg, err := loadLifecycleProvision(environment)
 	if err != nil {
 		return LifecycleConfig{}, err
 	}
 	cfg.DatabaseURL = strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	cfg.Publisher = lifecycle.DefaultPublisherConfig()
-	if cfg.OutboxRetention, err = lifecycleDuration(EnvLifecycleOutboxRetention, lifecycleRetentionDefault(), time.Microsecond, math.MaxInt64); err != nil {
+	if cfg.OutboxRetention, err = lifecycleDuration(EnvLifecycleOutboxRetention, lifecycleRetentionDefault(environment), time.Microsecond, math.MaxInt64); err != nil {
 		return LifecycleConfig{}, err
 	}
 	batch, err := lifecycleInt(EnvLifecycleBatchSize, int64(cfg.Publisher.BatchSize), 1, 200)
@@ -113,12 +125,15 @@ func LoadLifecycle() (LifecycleConfig, error) {
 // unrelated broker configuration. A distinct environment key is not a substitute
 // for the operator's least-privilege grants and hold-preservation policy.
 func LoadLifecycleCleanup() (LifecycleCleanupConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return LifecycleCleanupConfig{}, err
+	}
 	cfg := LifecycleCleanupConfig{DatabaseURL: strings.TrimSpace(os.Getenv(EnvLifecycleCleanupDatabaseURL))}
 	if cfg.DatabaseURL == "" {
 		return LifecycleCleanupConfig{}, errors.New("config: LIFECYCLE_CLEANUP_DATABASE_URL is required; publisher credentials are not a fallback")
 	}
-	var err error
-	if cfg.Retention, err = lifecycleDuration(EnvLifecycleOutboxRetention, lifecycleRetentionDefault(), time.Microsecond, math.MaxInt64); err != nil {
+	if cfg.Retention, err = lifecycleDuration(EnvLifecycleOutboxRetention, lifecycleRetentionDefault(environment), time.Microsecond, math.MaxInt64); err != nil {
 		return LifecycleCleanupConfig{}, err
 	}
 	batch, err := lifecycleInt(EnvLifecycleCleanupBatchSize, 500, 1, 500)
@@ -132,8 +147,8 @@ func LoadLifecycleCleanup() (LifecycleCleanupConfig, error) {
 	return cfg, nil
 }
 
-func lifecycleRetentionDefault() time.Duration {
-	if os.Getenv("APP_ENV") == "development" {
+func lifecycleRetentionDefault(environment string) time.Duration {
+	if environment == "development" {
 		return 168 * time.Hour
 	}
 	return 0

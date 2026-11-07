@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +19,7 @@ func randB64(t *testing.T, n int) string {
 }
 
 func TestLoadCryptoValid(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
 	kekB64 := randB64(t, 32)
 	pepperB64 := randB64(t, 32)
 	t.Setenv(EnvMasterKEK, kekB64)
@@ -45,6 +47,7 @@ func TestLoadCryptoValid(t *testing.T) {
 }
 
 func TestLoadCryptoDefaultVersion(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvMasterKEK, randB64(t, 32))
 	t.Setenv(EnvMasterKEKVersion, "")
 	t.Setenv(EnvBlindIndexPepper, randB64(t, 32))
@@ -59,6 +62,7 @@ func TestLoadCryptoDefaultVersion(t *testing.T) {
 }
 
 func TestLoadCryptoMissingKEK(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvMasterKEK, "")
 	t.Setenv(EnvBlindIndexPepper, randB64(t, 32))
 	if _, err := LoadCrypto(); err == nil {
@@ -67,6 +71,7 @@ func TestLoadCryptoMissingKEK(t *testing.T) {
 }
 
 func TestLoadCryptoMissingPepper(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvMasterKEK, randB64(t, 32))
 	t.Setenv(EnvBlindIndexPepper, "")
 	if _, err := LoadCrypto(); err == nil {
@@ -75,6 +80,7 @@ func TestLoadCryptoMissingPepper(t *testing.T) {
 }
 
 func TestLoadCryptoInvalidBase64(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvMasterKEK, "not!valid!base64!")
 	t.Setenv(EnvBlindIndexPepper, randB64(t, 32))
 	if _, err := LoadCrypto(); err == nil {
@@ -83,6 +89,7 @@ func TestLoadCryptoInvalidBase64(t *testing.T) {
 }
 
 func TestLoadCryptoWrongKEKSize(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	cases := map[string]int{
 		"16-bytes": 16,
 		"24-bytes": 24,
@@ -100,6 +107,7 @@ func TestLoadCryptoWrongKEKSize(t *testing.T) {
 }
 
 func TestLoadCryptoShortPepper(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvMasterKEK, randB64(t, 32))
 	t.Setenv(EnvBlindIndexPepper, randB64(t, 16))
 	if _, err := LoadCrypto(); err == nil {
@@ -108,6 +116,7 @@ func TestLoadCryptoShortPepper(t *testing.T) {
 }
 
 func TestLoadCryptoInvalidVersion(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	cases := map[string]string{
 		"non-numeric":  "abc",
 		"out-of-range": "256",
@@ -122,6 +131,56 @@ func TestLoadCryptoInvalidVersion(t *testing.T) {
 				t.Fatalf("LoadCrypto with version %q = nil error, want error", value)
 			}
 		})
+	}
+}
+
+func TestCryptoPublicSentinelIsProductionOnly(t *testing.T) {
+	for _, environment := range []string{"development", "test", "production"} {
+		for _, key := range []string{EnvMasterKEK, EnvBlindIndexPepper} {
+			t.Run(environment+"/"+key, func(t *testing.T) {
+				t.Setenv("APP_ENV", environment)
+				t.Setenv(EnvMasterKEK, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)))
+				t.Setenv(EnvBlindIndexPepper, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)))
+				t.Setenv(key, base64.StdEncoding.EncodeToString(make([]byte, 32)))
+				_, err := LoadCrypto()
+				if environment == "production" {
+					if err == nil || !strings.Contains(err.Error(), key) {
+						t.Fatalf("public sentinel accepted or wrong setting: %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("explicit primitive test vector rejected: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCryptoRejectsOnlyExactPublicSentinel(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv(EnvMasterKEKVersion, "")
+	t.Setenv(EnvBlindIndexPepperVersion, "")
+	for _, value := range [][]byte{append(make([]byte, 31), 1), bytes.Repeat([]byte{1}, 32)} {
+		t.Setenv(EnvMasterKEK, base64.StdEncoding.EncodeToString(value))
+		t.Setenv(EnvBlindIndexPepper, base64.StdEncoding.EncodeToString(value))
+		if _, err := LoadCrypto(); err != nil {
+			t.Fatalf("unapproved entropy heuristic: %v", err)
+		}
+	}
+	t.Setenv(EnvBlindIndexPepper, base64.StdEncoding.EncodeToString(make([]byte, 33)))
+	if _, err := LoadBlindIndexPepper(); err != nil {
+		t.Fatalf("non-sentinel pepper rejected: %v", err)
+	}
+}
+
+func TestEnvelopeCryptoIndependentOfLookupAndAPISecrets(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv(EnvMasterKEK, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)))
+	t.Setenv(EnvMasterKEKVersion, "")
+	for _, key := range []string{EnvBlindIndexPepper, EnvBlindIndexPepperVersion, EnvOIDCClients, EnvOIDCSigningKey, "SMS_GATEWAY_API_KEY"} {
+		t.Setenv(key, "unrelated-invalid-setting")
+	}
+	if _, err := LoadEnvelopeCrypto(); err != nil {
+		t.Fatalf("encryption depends on unrelated secrets: %v", err)
 	}
 }
 

@@ -38,8 +38,9 @@ const authRoutes = [
   {
     path: '/register',
     heading: 'Create your account',
-    submit: 'Create account',
-    fields: [email, password, confirmation],
+    submit: 'Start registration and send email',
+    registration: true,
+    fields: [email, { name: 'phone', label: 'Iranian mobile number' }],
     back: 'Sign in',
   },
   {
@@ -369,6 +370,46 @@ async function assertUnavailable(page, route, noScript = false) {
       0,
       'Passkey action has no native submission'
     );
+    return;
+  }
+  if (route.registration) {
+    const form = page.getByRole('form', { name: localizedText('Create an account'), exact: true });
+    assert.equal(await form.getAttribute('method'), 'post');
+    assert.equal(
+      await form.getAttribute('action'),
+      null,
+      'Registration has no native credential endpoint'
+    );
+    const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
+    const mailbox = form.getByLabel(localizedText('Email address'), { exact: true });
+    assert.equal(
+      await mailbox.getAttribute('type'),
+      'text',
+      'Unicode mailbox entry must not use ASCII-only native validity'
+    );
+    assert.equal(await mailbox.getAttribute('inputmode'), 'email');
+    assert.equal(
+      await form.locator('input[type=password]').count(),
+      0,
+      'Signup creates a passkey, not a password'
+    );
+    if (noScript) {
+      assert(await submit.isDisabled(), 'Registration remains inert without JavaScript');
+      for (const field of route.fields)
+        assert(await form.getByLabel(localizedText(field.label), { exact: true }).isDisabled());
+    } else {
+      await page.waitForFunction(
+        () =>
+          !document.querySelector('[data-registration-form] button[type=submit]')
+            ?.disabled
+      );
+    }
+    assert.equal(
+      (await page.getByRole('main').getByRole('status').textContent()).trim(),
+      '',
+      'No signup progress without an explicit action'
+    );
+    assert.equal(await page.getByRole('main').getByRole('alert').count(), 0);
     return;
   }
   const form = page.getByRole('form');
@@ -986,9 +1027,11 @@ export async function validateWebCsp({
       password: ` ${canary} password `,
       confirmation: ` ${canary} password `,
       code: '012345',
+      phone: '+989123456789',
     };
     const secrets = Object.values(values);
     const seenNonces = new Set();
+    let expectedSubmissions = 0;
     const assertCleanBaseline = async () => {
       assert.deepEqual(
         await page.evaluate(() => globalThis.__cspViolations),
@@ -1002,10 +1045,15 @@ export async function validateWebCsp({
         [],
         'No navigator.credentials calls during load/navigation'
       );
-      assert.equal(auth.submissions, 0, 'No preview submission during load/navigation');
+      assert.equal(
+        auth.submissions,
+        expectedSubmissions,
+        'No unexpected form submission during load/navigation'
+      );
       assertSafeRequests(observed, baseURL, documentPaths, secrets);
     };
     const visit = async (path, status, heading) => {
+      expectedSubmissions = 0;
       const response = await page.goto(new URL(path, baseURL).href, { waitUntil: 'load' });
       assert(response, `${path} has no document response`);
       assert.equal(response.status(), status, `${path} browser HTTP status`);
@@ -1123,6 +1171,43 @@ export async function validateWebCsp({
           [],
           `${route.path}: untouched ${dark ? 'dark' : 'light'} palette`
         );
+      }
+      if (route.registration) {
+        // Valid signup sends mail and belongs to the separately gated real-API
+        // suite. Here only explicit invalid submissions may run: no API work,
+        // credentials ceremony or durable browser state is permitted.
+        const form = page.getByRole('form', { name: localizedText('Create an account'), exact: true });
+        const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
+        for (const invalid of ['', 'not-an-identity']) {
+          for (const field of route.fields)
+            await form.getByLabel(localizedText(field.label), { exact: true }).fill(invalid);
+          expectedSubmissions++;
+          await submit.click();
+          for (const field of route.fields)
+            await form
+              .getByLabel(localizedText(field.label), { exact: true })
+              .and(page.locator('[aria-invalid="true"]'))
+              .waitFor({ state: 'visible' });
+          await assertCleanBaseline();
+        }
+        await checkAuthViewports(page, route);
+        for (const field of route.fields)
+          await form.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
+        assert(await submit.isEnabled(), 'Hydrated signup requires explicit contact submission');
+        assert.deepEqual(
+          await storageSnapshot(page),
+          beforeStorage,
+          'Invalid signup must not allocate persistent proof authority'
+        );
+        await assertCleanBaseline();
+        await navigate(route.back, route.backPath || '/login');
+        await navigate('Hatef Identity home', '/');
+        assert.deepEqual(
+          await storageSnapshot(page),
+          beforeStorage,
+          'Leaving signup must not persist contacts'
+        );
+        continue;
       }
       for (const field of route.fields) await assertFieldError(page, field);
       if (route.fields.length) await checkValidationLanguageSwitch(page, route);
@@ -1262,11 +1347,17 @@ export async function validateWebCsp({
           .waitFor({ state: 'visible' });
         await assertUnavailable(noScript, route, true);
         const beforeStorage = await storageSnapshot(noScript);
-        for (const field of route.fields)
-          await noScript
-            .getByLabel(localizedText(field.label), { exact: true })
-            .fill(values[field.name]);
-        await assertInertInteraction(noScript, route, noScriptObserved, beforeStorage, true);
+        if (!route.registration) {
+          for (const field of route.fields)
+            await noScript.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
+        }
+        await assertInertInteraction(
+          noScript,
+          route.registration ? { ...route, fields: [] } : route,
+          noScriptObserved,
+          beforeStorage,
+          true
+        );
         assertSafeRequests(noScriptObserved, baseURL, documentPaths, secrets);
         assert.deepEqual(noScriptObserved.errors, [], 'JavaScript-disabled runtime/CSP errors');
       }

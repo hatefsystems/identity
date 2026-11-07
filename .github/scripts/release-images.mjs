@@ -5,7 +5,6 @@ import { appendFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acceptanceIdentity } from './portal-harness.mjs';
 
 export const REPOSITORY = 'hatefsystems/identity';
 export const SOURCE = `https://github.com/${REPOSITORY}`;
@@ -171,12 +170,12 @@ function imageInfo(document, imageId = document?.Id) {
   };
 }
 
-export function assertImage(image, expected = {}, { candidate = false } = {}) {
+export function assertImage(image, expected = {}) {
   if (
     !image ||
     !DIGEST.test(image.imageId) ||
     image.platform !== PLATFORM ||
-    image.source !== (candidate ? expected.source : SOURCE) ||
+    image.source !== SOURCE ||
     !COMMIT.test(image.revision)
   ) {
     throw new Error(
@@ -185,7 +184,7 @@ export function assertImage(image, expected = {}, { candidate = false } = {}) {
   }
   if (image.digest !== undefined && !DIGEST.test(image.digest))
     throw new Error('Invalid registry manifest digest');
-  if (!(candidate && image.version === `sha-${image.revision}`)) parseVersion(image.version);
+  parseVersion(image.version);
   for (const key of ['imageId', 'platform', 'source', 'revision', 'version']) {
     if (expected[key] !== undefined && image[key] !== expected[key])
       throw new Error(`Image ${key} mismatch`);
@@ -215,16 +214,15 @@ export async function exportImage(
   kind,
   reference,
   directory,
-  { env = process.env, run = runCommand, candidate = false } = {}
+  { env = process.env, run = runCommand } = {}
 ) {
   imageRepository(kind);
   if (!/^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,254}(?![\s\S])/.test(reference || ''))
     throw new Error('Invalid local image reference');
   const metadata = await getMetadata({ env, run });
-  if (!candidate) requireRelease(metadata, env);
-  else if (!/^[0-9]+$/.test(env.GITHUB_RUN_ID || '')) throw new Error('Candidate export requires a workflow run ID');
+  requireRelease(metadata, env);
   const image = await inspectImage(reference, run, env);
-  assertImage(image, metadata, { candidate });
+  assertImage(image, metadata);
   await mkdir(directory, { recursive: true });
   const archive = `${kind}.tar`;
   const path = resolve(directory, archive);
@@ -239,13 +237,12 @@ export async function exportImage(
     sha256: await hashFile(path),
     ...image,
     runId: env.GITHUB_RUN_ID,
-    ...(candidate ? { identity: await acceptanceIdentity() } : {}),
   };
   await writeFile(resolve(directory, `${kind}.json`), `${JSON.stringify(artifact, null, 2)}\n`);
   return artifact;
 }
 
-export async function readArtifact(directory, kind, metadata, env) {
+async function readArtifact(directory, kind, metadata, env) {
   const path = resolve(directory, `${kind}.json`);
   await regularFile(path, 64 * 1024);
   const artifact = JSON.parse(await readFile(path, 'utf8'));
@@ -257,7 +254,7 @@ export async function readArtifact(directory, kind, metadata, env) {
   ) {
     throw new Error(`Invalid ${kind} artifact metadata or workflow run ID`);
   }
-  assertImage(artifact, metadata, { candidate: !metadata.release });
+  assertImage(artifact, metadata);
   const archivePath = resolve(directory, `${kind}.tar`);
   await regularFile(archivePath, 20 * 1024 ** 3);
   if ((await hashFile(archivePath)) !== artifact.sha256)
@@ -724,15 +721,15 @@ export async function main(args = process.argv.slice(2), env = process.env, depe
           .join('\n')}\n`
       );
     console.log(JSON.stringify(metadata));
-  } else if (['export', 'export-candidate'].includes(args[0]) && args.length === 4) {
+  } else if (args[0] === 'export' && args.length === 4) {
     console.log(
-      JSON.stringify(await exportImage(args[1], args[2], args[3], { ...dependencies, env, candidate: args[0] === 'export-candidate' }))
+      JSON.stringify(await exportImage(args[1], args[2], args[3], { ...dependencies, env }))
     );
   } else if (args[0] === 'publish' && args.length === 2) {
     await publishImages(args[1], { ...dependencies, env });
   } else {
     throw new Error(
-      'Usage: release-images.mjs metadata | export[-candidate] <api|web> <local-image-ref> <directory> | publish <directory>'
+      'Usage: release-images.mjs metadata | export <api|web> <local-image-ref> <directory> | publish <directory>'
     );
   }
 }

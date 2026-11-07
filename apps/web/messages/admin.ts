@@ -44,7 +44,8 @@ export const adminEn = {
     pageLoaded:
       '{count, plural, one {# account on this page loaded.} other {# accounts on this page loaded.}}',
     sizeError: 'Enter a whole page size from 1 to {maximum, number}.',
-    emailError: 'Enter one complete email address, at most 254 UTF-8 bytes.',
+    emailError: 'Enter one complete email address. The canonical address must fit 254 UTF-8 bytes.',
+    canonicalEmail: 'Canonical email: <value>{email}</value>',
     directory: 'Account directory',
     filter: 'Filter accounts',
     accountStatus: 'Account status',
@@ -194,7 +195,8 @@ export const adminFa = {
     pageLoaded:
       '{count, plural, one {# حساب در این صفحه بارگیری شد.} other {# حساب در این صفحه بارگیری شد.}}',
     sizeError: 'تعداد حساب‌های هر صفحه را به‌صورت عدد صحیح از ۱ تا {maximum, number} وارد کنید.',
-    emailError: 'یک نشانی ایمیل کامل با حداکثر ۲۵۴ بایت UTF-8 وارد کنید.',
+    emailError: 'یک نشانی ایمیل کامل وارد کنید. نشانی استاندارد باید حداکثر ۲۵۴ بایت UTF-8 باشد.',
+    canonicalEmail: 'ایمیل استاندارد: <value>{email}</value>',
     directory: 'فهرست حساب‌ها',
     filter: 'فیلتر حساب‌ها',
     accountStatus: 'وضعیت حساب',

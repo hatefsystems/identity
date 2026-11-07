@@ -17,6 +17,8 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 )
 
@@ -35,6 +37,10 @@ func main() {
 }
 
 func run(ctx context.Context, user, role string, revoke bool) error {
+	environment, err := config.LoadEnvironment()
+	if err != nil {
+		return err
+	}
 	target, err := uuid.Parse(user)
 	if err != nil {
 		return err
@@ -49,6 +55,10 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 		return errors.New("operator database and identity required")
 	}
 	cfg, err := config.LoadAdmin()
+	if err != nil {
+		return err
+	}
+	subject, err := config.LoadAuditSubject()
 	if err != nil {
 		return err
 	}
@@ -69,17 +79,33 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 		return err
 	}
 	defer pool.Close()
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
-	}
-	auditCfg, err := config.LoadAudit(environment)
+	baseline, err := loadOperatorBaseline(ctx, pool, cfg, environment)
 	if err != nil {
 		return err
 	}
-	actions, err := adminaction.New(pool, enc, auditCfg.Subject, cfg.ContextRetention)
+	actions, err := adminaction.New(pool, enc, subject, baseline.ContextRetention())
 	if err != nil {
 		return err
 	}
-	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke)
+	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke, environment)
+}
+
+func loadOperatorBaseline(ctx context.Context, q db.DBTX, cfg config.AdminConfig, environment string) (legalpolicy.Policy, error) {
+	var configuredID uuid.UUID
+	var err error
+	if cfg.GovernancePolicyID != "" {
+		configuredID, err = uuid.Parse(cfg.GovernancePolicyID)
+		if err != nil || configuredID == uuid.Nil {
+			return legalpolicy.Policy{}, legalpolicy.ErrInvalidPolicy
+		}
+	}
+	baseline, err := legalpolicy.LoadBaseline(ctx, q, configuredID, environment)
+	if err != nil {
+		return legalpolicy.Policy{}, err
+	}
+	if (os.Getenv(config.EnvAdminContextRetention) != "" && cfg.ContextRetention != baseline.ContextRetention()) ||
+		(os.Getenv(config.EnvAdminLegalReleasedRetention) != "" && cfg.LegalReleasedRetention != baseline.ReleasedHoldRetention()) {
+		return legalpolicy.Policy{}, legalpolicy.ErrMismatch
+	}
+	return baseline, nil
 }

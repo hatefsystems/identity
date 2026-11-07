@@ -173,6 +173,7 @@ func TestCLIModesKeepProvisionAndCleanupSeparate(t *testing.T) {
 	for _, mode := range []string{"", "publish", "provision", "cleanup-published", "--help"} {
 		t.Run(mode, func(t *testing.T) {
 			cliEnvironment(t)
+			t.Setenv("PORT", "-1")
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			state := &cliState{}
@@ -191,6 +192,9 @@ func TestCLIModesKeepProvisionAndCleanupSeparate(t *testing.T) {
 				t.Setenv("NATS_URL", "invalid broker credentials")
 				t.Setenv(config.EnvLifecycleStreamMaxAge, "invalid")
 				t.Setenv(config.EnvLifecycleCleanupBatchSize, "17")
+			}
+			if mode == "--help" {
+				t.Setenv("APP_ENV", "")
 			}
 			var args []string
 			if mode != "" {
@@ -227,6 +231,29 @@ func TestCLIModesKeepProvisionAndCleanupSeparate(t *testing.T) {
 				t.Fatal("CLI disclosed connection credentials")
 			}
 		})
+	}
+}
+
+func TestCLIInvalidEnvironmentPrecedesConnectionsAndMutation(t *testing.T) {
+	for _, mode := range []string{"publish", "provision", "cleanup-published"} {
+		for _, environment := range []string{"unset", "", " ", "\t", "staging", "Development", "production "} {
+			t.Run(mode+"/"+environment, func(t *testing.T) {
+				cliEnvironment(t)
+				t.Setenv(config.EnvLifecycleStreamMaxAge, "168h")
+				t.Setenv(config.EnvLifecycleOutboxRetention, "72h")
+				t.Setenv("APP_ENV", environment)
+				if environment == "unset" {
+					if err := os.Unsetenv("APP_ENV"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				state := &cliState{}
+				err := runWithDependencies(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), []string{mode}, state.dependencies())
+				if err == nil || !strings.Contains(err.Error(), "APP_ENV") || state.databaseOpens != 0 || state.connects != 0 || state.database.begins != 0 || state.js.creates != 0 {
+					t.Fatalf("invalid mode reached dependencies or mutation: %v", err)
+				}
+			})
+		}
 	}
 }
 

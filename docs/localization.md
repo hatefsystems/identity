@@ -49,11 +49,18 @@ fails, `global-error.tsx` intentionally provides independent English and Persian
 sections with explicit language/direction and local styles. This fatal fallback
 requires no root provider, error message, digest, account state or browser sniffing.
 
+## Registration synchronization
+
+Registration uses whole English/Persian messages and stable descriptors, including
+pending, uncertain and completed states. Preference changes preserve the mounted
+client, in-memory capabilities and original wall/monotonic deadlines. Existing
+Unicode email validation and canonical identity bytes remain server-owned.
+
 ## Catalogs and maintenance
 
 `apps/web/messages/en.ts` is the `as const` type source. Namespaces are `common`,
 `metadata`, `auth`, `portal`, `security`, `privacy`, `admin`, `audit`, `integrity`,
-`legal`, `preferences` and `errors`. Each Persian namespace satisfies the same
+`legal`, `preferences`, `registration` and `errors`. Each Persian namespace satisfies the same
 recursive string-valued shape. `i18n/types.ts` and the `next-intl` AppConfig
 augmentation type locale, message keys and formats. Committed catalogs must remain
 complete; the runtime merge supplies an English leaf if a deployment accidentally
@@ -142,8 +149,8 @@ locale, not the browser cookie another tab may have saved. Its transport option 
 typed and restricted to the deletion route; request bodies, DPoP canonical URLs,
 middleware, factors, rate limits and recipient selection are unchanged.
 
-The Go `internal/notification` catalog is small and typed, shared by privacy and
-SMS senders. Encrypted deletion payload v2 freezes validated locale and template
+The Go `internal/notification` catalog is small and typed and renders privacy
+notifications. Its legacy SMS prose is retained as catalog data only. Encrypted deletion payload v2 freezes validated locale and template
 version atomically with the existing intent. Legacy v1 decodes as English/template
 1; malformed v2 values fail closed. Existing envelope/row/request/token/deadline
 bindings and size bounds remain enforced. No new preference column or worker
@@ -159,10 +166,12 @@ queries, token queries, redirect chains or remote assets. A different browser us
 its own saved preference or English and can change language in place. Mail
 contains the authoritative exact UTC deadline regardless of UI settings.
 
-SMS changes prose around the same ASCII code and retains configured-template
-behavior. The existing logging sender remains a development implementation; this
-work does not supply a production SMS gateway. Do not log bodies, codes, recipients,
-recovery links or locale request payloads.
+The current SMS.ir VERIFY adapter sends the unchanged ASCII code using its
+operator-configured provider template. UI language does not change the SMS.ir
+template ID or request provider-side translation. There is no logging-sender
+fallback. Do not log bodies, codes, recipients, recovery links or locale request
+payloads. The new passkey-only registration UI is localized without changing its
+email/phone proof, key ownership, explicit-delivery or durable-result contracts.
 
 ## Queue rollout and rollback
 

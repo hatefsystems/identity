@@ -10,7 +10,23 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 
 ### 1.1 Physical Schema Definition (DDL)
 
-Below is the production DDL schema:
+The following is a selected schema illustration, not executable production
+provisioning or a substitute for the applied migrations in
+`apps/identity-api/db/migrations`. The active forward-only bundle is unchanged
+`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`, tracked
+through version 2 in `public.identity_schema_version`. No legacy history adoption,
+baseline rewrite or Down/reset is implied. Additional columns/state are described
+below and in the bundle. Canonical-v2 payloads do not contain their
+own event UUID or chain digest, and contracted legal requests have no plaintext
+narrative columns.
+
+All legacy `public.goose_db_version` targets, untracked nonempty application schemas
+and contradictory histories are refused, never upgraded or adopted. Fresh setup
+requires an explicitly scoped PostgreSQL target plus matching fresh/isolated Redis
+and NATS state with old writers stopped. Disposable-data confirmation does not
+authorize resetting an existing named environment. See
+[active setup](admin-operations.md#migration-and-contraction); historical acceptance
+and prior plans retain their original evidence, not acceptance of this baseline.
 
 ```sql
 -- Enable necessary extensions
@@ -111,9 +127,27 @@ CREATE TABLE recovery_codes (
 CREATE UNIQUE INDEX idx_recovery_codes_hash ON recovery_codes(code_hash) WHERE used_at IS NULL;
 CREATE INDEX idx_recovery_codes_user_id ON recovery_codes(user_id);
 
--- 6. MVP FALLBACK: Audit Logs Table (Used in place of ClickHouse during the MVP Phase to reduce memory)
+-- 6. Canonical-v2 chains retain one node per event, including after payload erasure.
+CREATE SEQUENCE public.audit_log_chain_seq AS BIGINT;
+CREATE TABLE public.audit_log_chain (
+    seq BIGINT PRIMARY KEY DEFAULT nextval('public.audit_log_chain_seq'),
+    event_id UUID NOT NULL UNIQUE,
+    leaf_hash BYTEA NOT NULL CHECK (octet_length(leaf_hash) = 32),
+    chain_hash BYTEA NOT NULL CHECK (octet_length(chain_hash) = 32)
+);
+ALTER SEQUENCE public.audit_log_chain_seq OWNED BY public.audit_log_chain.seq;
+CREATE SEQUENCE public.security_ledger_chain_seq AS BIGINT;
+CREATE TABLE public.security_ledger_chain (
+    seq BIGINT PRIMARY KEY DEFAULT nextval('public.security_ledger_chain_seq'),
+    event_id UUID NOT NULL UNIQUE,
+    leaf_hash BYTEA NOT NULL CHECK (octet_length(leaf_hash) = 32),
+    chain_hash BYTEA NOT NULL CHECK (octet_length(chain_hash) = 32)
+);
+ALTER SEQUENCE public.security_ledger_chain_seq OWNED BY public.security_ledger_chain.seq;
+
+-- MVP Class C payload, separate from immutable chain nodes.
 CREATE TABLE mvp_audit_logs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    seq BIGINT PRIMARY KEY REFERENCES public.audit_log_chain(seq) ON DELETE RESTRICT,
     user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
     actor_id UUID NOT NULL,
     actor_spiffe_id VARCHAR(255) NOT NULL,
@@ -122,8 +156,7 @@ CREATE TABLE mvp_audit_logs (
     client_ip VARCHAR(50) NOT NULL,
     user_agent TEXT NOT NULL,
     payload TEXT NOT NULL, -- Minimized JSON; audit records still contain personal data
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    chain_hash VARCHAR(64) NOT NULL -- Chained Cryptographic hash for auditing integrity
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_mvp_audit_logs_event_type ON mvp_audit_logs(event_type);
@@ -136,9 +169,10 @@ CREATE INDEX idx_mvp_audit_logs_timestamp ON mvp_audit_logs(timestamp DESC);
 -- CRITICAL: rows here are decoupled from users(id). There is NO foreign key that would
 -- cascade or null on account deletion; the stable account_ref persists independently.
 CREATE TABLE security_event_ledger (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    seq BIGINT PRIMARY KEY REFERENCES public.security_ledger_chain(seq) ON DELETE RESTRICT,
     account_ref UUID NOT NULL,               -- Stable identity reference; survives hard-delete (NO FK to users)
     identity_blind_index VARCHAR(64) NULL,   -- HMAC-SHA256(normalized identity, keyed by pepper); no raw email/phone
+    blind_index_version SMALLINT NOT NULL CHECK (blind_index_version >= 0),
     event_type VARCHAR(100) NOT NULL,        -- e.g., 'auth.login', 'token.issued', 'security.rtr_breach'
     client_ip VARCHAR(50) NULL,
     ip_subnet VARCHAR(50) NULL,              -- /24 (IPv4) or /48 (IPv6) grouping
@@ -147,14 +181,13 @@ CREATE TABLE security_event_ledger (
     client_id VARCHAR(100) NULL,             -- OAuth client that received an authorization, if any
     scope TEXT NULL,
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    retain_until TIMESTAMP WITH TIME ZONE NOT NULL, -- Event occurrence + SECURITY_LEDGER_RETENTION (default 8760h)
-    chain_hash VARCHAR(64) NOT NULL          -- Same cryptographic chaining as audit logs
+    retain_until TIMESTAMP WITH TIME ZONE NOT NULL -- Event occurrence + SECURITY_LEDGER_RETENTION (8760h = 365 days)
 );
 
 -- Attribution lookups by identity (court supplies an identifier -> we compute the blind index)
 CREATE INDEX idx_security_ledger_blind_index ON security_event_ledger(identity_blind_index);
 CREATE INDEX idx_security_ledger_account_ref ON security_event_ledger(account_ref);
-CREATE INDEX idx_security_ledger_retain_until ON security_event_ledger(retain_until);
+CREATE INDEX idx_security_ledger_retention ON security_event_ledger(retain_until, seq);
 CREATE INDEX idx_security_ledger_event_type ON security_event_ledger(event_type);
 
 -- 8. Legal Holds (Precedence Lock over erasure eligibility)
@@ -163,50 +196,65 @@ CREATE INDEX idx_security_ledger_event_type ON security_event_ledger(event_type)
 CREATE TABLE legal_holds (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     account_ref UUID NOT NULL,               -- Subject reference (matches security_event_ledger.account_ref)
-    reason TEXT NOT NULL,                    -- Why the hold exists
-    requesting_authority VARCHAR(255) NOT NULL, -- Court / agency / case reference
-    legal_basis VARCHAR(255) NOT NULL,       -- e.g., 'legal obligation', 'legal claims / investigation'
+    request_kind TEXT NOT NULL DEFAULT 'legal_hold' CHECK (request_kind IN ('legal_hold','preservation')),
+    idempotency_key UUID,
+    details_encrypted BYTEA,                 -- Record/account/kind-bound reason, authority and legal basis
+    details_purged_at TIMESTAMPTZ,
     applied_by UUID NOT NULL,                -- Actor (e.g., DPO / Legal) who created the hold
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     review_at TIMESTAMP WITH TIME ZONE NULL, -- Optional expected review date (advisory only)
     released_at TIMESTAMP WITH TIME ZONE NULL,
-    released_by UUID NULL
+    released_by UUID NULL,
+    CONSTRAINT legal_holds_encrypted_or_purged CHECK (
+        (details_encrypted IS NOT NULL AND octet_length(details_encrypted) > 0 AND details_purged_at IS NULL)
+        OR (details_encrypted IS NULL AND NOT is_active AND released_at IS NOT NULL AND details_purged_at IS NOT NULL)
+    )
 );
 
 -- The hard-delete Cron and the ledger purge job MUST consult this index before purging.
 CREATE INDEX idx_legal_holds_active ON legal_holds(account_ref) WHERE is_active = TRUE;
+CREATE UNIQUE INDEX legal_holds_request_identity ON legal_holds(account_ref, request_kind, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
 ```
 
 ### 1.1.1 Persistence & Deletion Rules for Ledger and Holds
 
 - **`security_event_ledger` is intentionally NOT linked to `users(id)`.** The ledger keeps the original `account_ref` and an `identity_blind_index` after account deletion, subject to its own retention/holds. This is **pseudonymized personal data**, not anonymous or non-PII. The nullable Class C `user_id` link and minimized payload do not anonymize `mvp_audit_logs`: baseline administrative audit retains actor/network metadata, linkable action/hold references, timestamps and response digests, which are personal data too.
 - **Purge of the ledger** is driven by `retain_until` and active holds (scheduled job), never by account deletion alone.
-- **Legal Hold precedence:** Before any purge - the 30-day hard-delete Cron on `users`, or the ledger purge job - the worker MUST check `legal_holds` for an active row matching the `account_ref`. If one exists, the purge is skipped and the skip is recorded in the audit log.
+- **Legal Hold precedence:** Both the 30-day hard-delete worker and the ledger purge recheck independent active holds on the original `account_ref`. Protection does not depend on a surviving user row. Candidate prefilter exclusions are not individually inspected skips; ledger skipped receipts/counts describe only candidates actually rechecked after locks. Release resumes original clocks, never resets them.
 - **No raw email/phone identifiers in Class B.** Exact identity lookup uses the keyed blind index; Class A contacts follow their own deletion policy. Stable references, IP/subnet, user-agent and device/client metadata remain personal data. Removing raw identifiers is minimization, not anonymity.
 - **Independent requests and original clocks:** `review_at` and preservation `expires_at` are advisory, never automatic release. Releasing one request cannot release another. Once no hold protects the subject, original retention clocks resume, potentially making data eligible immediately; no recovery extension, clock reset, restoration of purged data or immutable evidence snapshot is created.
 
 ### 1.1.2 Retention Proof and Durable Head (Task 5.4)
 
-Additive migration `00011` protects the logical chain independently of surviving
-payloads. The migration does not initialize genesis or provision deployment
-logins. Operators must inventory and verify history, stop/drain the old signer,
-and explicitly bootstrap the known terminal position as described in
+The unchanged `00001` baseline creates permanently retained canonical-v2 chains and
+separate erasable payloads directly, with exact terminal head advancement and
+audit coordination separate from purge-run locking. It contains no v1 checkpoint/
+routine transition or historical data repair. Supported entrypoints refuse all
+legacy history and untracked nonempty application schemas; inventory failure is
+not an empty-history result. There is no in-place v1/v2 upgrade or automatic
+adoption, reset or rehash. Old outbox/JetStream envelopes require separate inventory/
+drain/quarantine and must not enter the fresh isolated environment. Migrations
+neither initialize genesis nor provision deployment logins. Operators must
+inventory/verify history and explicitly bootstrap both
+known terminal positions with writers stopped as described in
 [admin operations](admin-operations.md#security-ledger-retention-task-54).
 
 | Protected relation | State |
 |---|---|
-| `security_ledger_head` | `singleton boolean` primary key constrained to true, `seq bigint`, `chain_hash text`; latest committed logical position even if its payload has been erased. |
-| `security_ledger_checkpoints` | `first_seq`, `last_seq`, `predecessor_seq`, `predecessor_hash`, `terminal_hash`, `erased_count`; compact maximal erased spans in committed chain order. |
+| `audit_log_chain`, `security_ledger_chain` | `seq bigint`, unique `event_id uuid`, `leaf_hash bytea(32)`, `chain_hash bytea(32)`; one append-only node per event with no expiry. |
+| `audit_log_head`, `security_ledger_head` | `singleton boolean` primary key constrained to true, nonnegative `seq bigint`, 32-byte `chain_hash`; each head must match its actual terminal node, or its derived chain-specific genesis when empty. |
+| `security_ledger_erasures` | Positive inclusive `first_seq`, `last_seq`, `operation_id uuid`, `erased_at timestamptz`; append-only span annotations, not checkpoint digests or policy certificates. |
 | `security_ledger_retention_settings` | `singleton boolean` primary key constrained to true, `audit_subject text`; explicitly provisioned subject binding for maintenance receipts, never worker-writable. |
 
-Genesis is an explicit initialized head, not an inference from an empty ledger.
-Missing/malformed state fails closed. Checkpoints retain only sequence boundaries,
-counts and digests, never erased account refs, source event IDs, blind indexes,
-network/device metadata or bodies. Numeric sequence allocation gaps are legal;
-a checkpoint must never cover a surviving row. Only chain-adjacent, hash-linked
-spans can merge. Fully erased history compacts to a bounded prefix proof plus
-the head, not one tombstone per erased event.
+Genesis is explicit initialized proof state, not an inference from empty payloads.
+Missing/malformed heads and terminal mismatches fail closed even for historical or
+empty requested ranges. Numeric sequence allocation gaps are legal; erasure spans
+are maximally coalesced per new batch, not globally compacted checkpoints. All
+chain event IDs/digests and each operation's erasure/receipt metadata survive
+payload erasure. Storage is not constant-size, and digests/UUIDs may remain linkable
+to retained external or internal records even without a payload/account column.
 
 The purge candidate index is `(retain_until, seq)`. Bounded keyset traversal uses
 one database cutoff and logical high-water mark per run, never OFFSET over a
@@ -218,33 +266,44 @@ Signer and purge transactions use READ COMMITTED and the common lock order:
 ledger coordination advisory transaction lock (`5200002`), account locks in UUID
 order, then deterministic row locks. No account-locked path may acquire the
 ledger lock later. Purge overlap uses a separate run lock (`5200003`), not the
-daemon-lifetime signer lock (`5200001`). After account-lock acquisition a fresh
-statement rechecks holds. Routine checks remain authoritative if a run-lock
-connection is lost or the routine is invoked without the Go worker.
+daemon-lifetime signer lock (`5200001`). Audit head coordination is `5200004`,
+not purge-run `5200003`. After account-lock acquisition a fresh statement rechecks
+holds and canonical leaves; the fixed cutoff/high-water excludes late/backdated
+rows beyond that bound.
 
-The trusted maintenance function, owned by non-login
-`identity_ledger_maintenance_owner`, is the only ledger DELETE/checkpoint
-compaction authority. `identity_ledger_purge` is a non-owner login with narrow
-reads and approved EXECUTE only, never owner membership or direct chain writes.
-Signer head advancement is separately granted and validates the actual newly
-inserted terminal row in the append transaction. UPDATE/TRUNCATE guards stay
-unconditional; there is no trigger disabling or caller-settable bypass. This
-replaces the old broad append-only exemption comment, not the guards on Class C.
+There is no v2 maintenance function/owner or purge EXECUTE. Dedicated non-owner
+`identity_ledger_purge` gets required Class B payload/chain/head/erasure/hold/settings
+SELECT, payload DELETE, erasure INSERT and receipt-outbox INSERT only, no sequence,
+chain/head-write/role/DDL authority. The trusted Go worker enforces retention/holds
+and canonical candidate rechecks; SQL does not constrain arbitrary DELETE by a
+compromised purge credential to these predicates. Signer separately gets chain/
+payload append, chain sequence USAGE, both heads and ledger erasures SELECT, and
+verified `advance_chain_head` EXECUTE. Payload UPDATE/TRUNCATE and chain/erasure
+UPDATE/DELETE/TRUNCATE guards remain armed; Class C permits only its existing
+FK `user_id` nulling. No trigger bypass is an operational exemption.
 
-Canonical-body verification, exact-row deletion, checkpoint compaction and
-sanitized Class C `admin_action` outbox intent commit atomically. Dry-run rolls
-all of them back. Retained-segment verification uses a bounded read-only
-REPEATABLE READ snapshot of the head, live rows and checkpoints. It recomputes
-only retained bodies, distinguishes authorized erasure from unexplained damage,
-and never invents an erased interior digest. All-purged is not successful content
-verification. This proof is database-relative; external anchoring is deferred,
-so a privileged coherent database rewrite/rollback is not independently detected.
+Canonical-leaf rechecks, exact-row DELETE, span annotations and sanitized Class C
+`admin_action` receipt intent commit atomically; dry-run rolls them back. Inspected
+held-only batches write one skipped receipt with an empty span manifest, but
+prefiltered holds are not individually inspected/reported. New receipts commit
+`span_manifest_version=1` and SHA-256 of the domain-separated ordered inclusive
+span manifest, plus operation/cutoff/count/high-water metadata. Retained structural
+verification uses bounded read-only REPEATABLE READ snapshots and checks chain
+links, retained leaves and absent-payload annotations. It does not prove receipt
+chaining or legal authorization. Legitimate pending receipts do not block signer
+restart. The separate bounded read-only `ledger-receipts` CLI uses its own SELECT-
+only credentials to correlate erasures, receipt outbox and Class C linkage
+coverage in hash-only pages with correlated receipt bodies/leaves checked separately,
+distinguishing pending/chained/legacy-unbound/missing/invalid/incomplete.
+PubAck or `published_at` is not chaining; missing retained material is unavailable
+assurance. All-erased is not content verification. Neither operation independently
+detects coherent privileged rewrite/rollback; external anchoring stays deferred.
 
 
 ### 1.1.3 Lifecycle Revisions and Outbox (Task 6.3)
 
-Migration `00016_user_lifecycle_events.sql` adds nonnegative
-`users.lifecycle_revision`, independent of credential `auth_version`/`auth_epoch`.
+The fresh baseline includes nonnegative `users.lifecycle_revision`, independent
+of credential `auth_version`/`auth_epoch`.
 Explicit Go business transactions advance it and insert metadata-only lifecycle
 intent in `event_outbox` in the same commit. No CDC or lifecycle triggers are
 installed. Existing users begin at 0 without synthesized history; transactional
@@ -269,7 +328,7 @@ broadcast stream is not the audit work queue or legal-evidence archive. See the
 
 ### 1.1.4 Portal Names and Profile Transactions (Task 7.3)
 
-Additive migration `00017_profile_names.sql` adds `users.display_name` and
+The fresh baseline includes `users.display_name` and
 `webauthn_credentials.name` as non-null text defaulting to the empty string, with
 `char_length(...) <= 80` constraints. Existing users/credentials remain valid;
 names are optional, not unique, and no historical profile events are synthesized.
@@ -295,6 +354,29 @@ V1 lifecycle validation/producers are retained. V2 adds only the explicit
 remain readable. Unknown versions/fields still fail validation. Retain additive
 columns and v2-compatible publisher/readers during rollback, and upgrade downstream
 consumers before deploying name writers.
+
+### 1.1.5 Durable Registration Attempts
+
+Migration 2 adds `registration_attempts`, not users or privileged seeds. Pending
+attempts cannot log in and have no resulting account. The durable contract is:
+
+| Material | Binding / lifetime |
+|---|---|
+| Attempt ID, capability SHA-256 hash, browser JKT | Independent opaque ID and 256-bit capability, hashed at rest; exact original JKT. ID/email alone cannot resume or recover authority. |
+| Pending envelope | Existing AES-GCM format binds attempt/JKT/signup purpose and freezes exact canonical email, Iranian E.164 phone, random eight-byte WebAuthn handle and ceremony revision. No raw capability/email token/OTP/private authenticator key is persisted. |
+| Token/proof/challenge metadata | Hashes, bounded references/revisions and verification timestamps are separate from delivery ACKs. Email proof at most 10m; passkey challenge at most 5m, each capped by immutable pending expiry. |
+| Pending/failed state | Original pending lifetime 15m; resends/holds/retries do not restart it. Failed outcomes retain their bounded stored terminal/receipt metadata. Finite SQL capacity/admission bounds cannot be bypassed by cleanup failure. |
+| Completion fingerprint and resulting-user FK | Final caller-owned commit creates user+resident UV credential+encrypted verified phone+revision-1 created intent+receipt atomically. Transient envelope/token/challenge fields clear. No role/password/mailbox/session; existing-user attachment is never conflict recovery. |
+| Completed receipt / cleanup | One hour from completion, subject to current holds and original-user FK `ON DELETE CASCADE`. Receipt access remains capability+JKT-bound and cannot authenticate or prevent lawful purge. |
+
+Dedicated cleanup has only registration SELECT/DELETE and legal-hold SELECT with
+actual non-owner login checks. It takes the subject lock before completed-row
+hold checks, defers held/contended rows and preserves bounded progress. Pending/
+failed rows have no user subject. A held expired receipt remains evidence, not
+renewed authority; expiry checks alone are not physical erasure. Restore this
+relation and migration metadata consistently with users/credentials/outbox/holds.
+No new global active-user-requires-passkey constraint is added: legitimate
+credential-free lookup probes are not signup bootstrap.
 
 ### 1.2 `sqlc` & `pgx` Configurations
 
@@ -322,6 +404,12 @@ WHERE id = $1;
 
 Passkey deletion and TOTP disablement both begin a transaction and acquire `GetUserByIDForUpdate` first. Passkey deletion then locks that user's WebAuthn rows in stable credential-ID order before it counts and deletes. TOTP disablement counts passkeys while holding the same user-row mutex before clearing the secret. This common lock order serializes cross-factor races and guarantees at least one passkey remains, reflecting that WebAuthn is currently the only browser session-issuing login surface.
 
+Credential/recovery/SMS mutations also carry the session's admitted auth version,
+take the subject lock and recheck locked active/nondeleted user state before
+child/proof writes. Revocation-first execution refuses stale mutations; already
+committed work is not retrospectively cancelled. Client assertion replay is a
+separate shared Redis tuple claim through the full accepted leeway window.
+
 ---
 
 ## 2. PII Storage & Application-Layer Encryption
@@ -330,10 +418,10 @@ To comply with high-security privacy directives, Personal Identifiable Informati
 
 ```
                            +--------------------------------------+
-                           |          Environment-injected key custody             |
+                           |     Operator secret provisioning     |
                            +--------------------------------------+
                                               |
-                                              | Loads one master KEK/version at startup
+                                              | Injects one KEK/version at process startup
                                               v
 +------------------+       +--------------------------------------+
 | Plaintext PII    | ----> |       Go Application Layer           |
@@ -370,7 +458,7 @@ Each encrypted record has a composite structure serialized into a binary payload
 1. **Version (1 byte):** Enables key rotation and cryptopackage schema upgrades.
 2. **DEK-Wrap Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for wrapping the DEK with the Master KEK.
 3. **PII-Enc Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for encrypting the PII with the local DEK.
-4. **Encrypted DEK:** The Data Encryption Key (DEK) used to encrypt the payload, wrapped by the Master Key Encryption Key (KEK) loaded from the environment.
+4. **Encrypted DEK:** The per-record DEK wrapped by the one runtime-loaded KEK/version in process-local custody. Real AES-GCM primitives do not imply a live Infisical fetch/cache/fallback/rotation integration or automatic retired-key selection.
 5. **Encrypted Ciphertext:** The GCM-authenticated ciphertext of the PII value.
 
 ### 2.2 Cryptographic Blind Indexes for Secure Exact-Match Searches
@@ -379,10 +467,26 @@ To prevent $O(N)$ full-table decryptions when performing user queries by phone n
 
 $$\text{blind\_index} = \text{HMAC-SHA256}_{\text{secret\_pepper}}(\text{lowercase}(\text{NFKC}(\text{trim}(\text{identity}))))$$
 
-This is the existing server-side keyed construction, not plain concatenation or anonymous data. Legal email attribution uses the same normalization; callers must not introduce provider-specific normalization or send the digest/pepper material to the browser. This documentation does not add phone attribution or historical multi-pepper search.
+This generic construction remains unchanged for phone/generic callers and is not
+plain concatenation or anonymous data. **Mailbox identity has an explicit separate
+input seam:** NFC/local lowercase/NFC plus strict non-transitional IDNA lowercase
+ASCII domain; `ComputeEmail` HMACs those exact canonical bytes without a second
+NFKC pass. Verification, new storage, delivery, real/decoy lookup, producer capture,
+signer fallback and legal attribution share that profile. NFC equivalents converge;
+Persian/Arabic letters, dot/plus variants and NFKC-distinct mailboxes stay distinct.
+Malformed/invalid/invisible inputs fail rather than being stripped/aliased.
+
+Producer capture preserves digest and `blind_index_version` generation together;
+explicit generation 0 is valid, not missing metadata. Signer storage admission
+rejects invalid declared metadata before canonical hashing, with fixed redacted
+quarantine categories rather than parser/PII text. Missing capture has its bounded
+live-email fallback, not a generic-NFKC algorithm fallback. External producers must
+use the same profile/generation before acceptance. Do not send digest/pepper to the
+browser, rewrite signed history, rehash old Unicode records or add dual-normalized/
+historical multi-pepper search. Existing ASCII and generic-index bytes remain intact.
 
 - **Uniqueness & Indexing:** Blind indexes are stored in separate database columns (`phone_blind_index`, `backup_email_blind_index`) and indexed via B-tree. This enables $O(1)$ fast lookups without revealing plain text.
-- **Salt/Pepper Management:** One secret pepper/version is loaded from the environment at bootstrap and kept in process memory; dynamic retrieval and historical-generation lookup are not implemented. Non-exact queries (such as wildcards or substring matches) on PII columns are prohibited to ensure data minimization.
+- **Key Custody:** Operators inject one KEK/version and one pepper/version into local process memory. There is no live Infisical fetch/cache/hot rotation, historical key retrieval or transparent multi-generation reader. Retired backup keys, controlled rotation/re-encryption and verified recovery remain operator obligations. Non-exact PII queries remain prohibited.
 
 ---
 
@@ -445,8 +549,13 @@ Redis eviction/reset fails closed and requires reauthentication or a new ceremon
 ACLs/TLS and an eviction/availability policy suitable for authority, not a
 disposable performance cache. Never restore stale session/grant/replay snapshots
 after revocation; invalidate the namespace and require new authentication instead.
-Client-assertion replay storage remains a separate single-process boundary; shared
-portal/WebAuthn state does not claim unrelated OAuth client-assertion scaling.
+Client-assertion replay is separately scoped to canonical client/audience/JTI and
+shared Redis outside development. Claims survive through the complete accepted
+`exp + 60s` leeway window. Redis `TIME` is the common authority for temporal
+admission and the atomic expiration check; local replica clocks cannot shorten
+another replica's replay window. Claims use rounded absolute `NX PXAT` expiry,
+never extend on replay, and fail closed without memory fallback on clock errors.
+Atomic replay authority does not by itself certify fleet rollout or Redis operation.
 
 ### 3.2 OTP Rate Limiting Structure
 
@@ -508,17 +617,18 @@ ORDER BY (event_type, timestamp, actor_id);
 To prevent parallel write bottlenecks and lock contention inherent to multi-writer column-oriented ClickHouse configurations, the cryptographic chaining ledger is decoupled from direct database writes:
 
 1. **Asynchronous Ledger Queue:** Go API instances write log records concurrently to a partitioned NATS JetStream queue subject `identity.audit.logs`.
-2. **Single-Threaded Signing Consumer:** A dedicated single-threaded consumer pulls events sequentially, computes the stateful signature hash, and performs bulk inserts into ClickHouse in batches (e.g., every 5 seconds or 1000 records). **(MVP Fallback: During the MVP phase, the consumer performs bulk inserts directly into the `mvp_audit_logs` PostgreSQL table, applying the same batching optimization and maintaining the exact same cryptographic chaining formula below).**
-3. **Log Chaining Formula:**
-   $$\text{chain\_hash}(N) = \text{SHA-256}\Big(\text{chain\_hash}(N-1) \ \big|\big|\ \text{serialize}\big(\text{audit\_log\_record}(N)\big)\Big)$$
+2. **Single-Threaded Signing Consumer:** The current MVP consumer batches both PostgreSQL payloads and their separate canonical-v2 chain nodes, then advances both heads in the append transaction. ClickHouse remains a future deployment blueprint, not the current writer or proof layout.
+3. **Current MVP Canonical-v2 Formula:**
+   $$\text{leaf\_hash}(N) = \text{SHA-256}\Big(\text{leaf\_prefix} \ \big|\big|\ \text{serialize}\big(\text{record}(N)\big)\Big)$$
+   $$\text{chain\_hash}(N) = \text{SHA-256}\Big(\text{chain\_prefix} \ \big|\big|\ \text{chain\_hash}(N-1) \ \big|\big|\ \text{leaf\_hash}(N)\Big)$$
 
 Where:
-* `audit_log_record(N)` is a deterministic canonical serialization of the record attributes (IDs, event types, payloads, timestamps).
-* The ledger's integrity is verified periodically by recalculating the chains. Any break in the sequence alerts the security operations team instantly.
+* `record(N)` is serialized by the existing Go canonical serializer with chain-specific NUL-terminated prefixes; nullable Class C `user_id` is excluded. Stored bytes/hashes are never retroactively rewritten.
+* Verification checks links/retained leaves/ledger annotations against the durable heads. Monitoring integration and thresholds remain operator gates; sequence allocation gaps alone are not integrity failures.
 
 ### Task 5.5 workflow storage
 
-Migrations `00012`-`00014` add immutable governance artifacts and baseline binding,
+The fresh baseline includes immutable governance artifacts and policy binding,
 legal cases and encrypted revision/review/response history, historical subject
 associations, existing-hold links, advisory hold-review state, business replay
 records, case-free monthly/year counters and frozen report artifacts. No workflow
@@ -537,13 +647,47 @@ bound; year-version synchronization prevents an unchanged approval from covering
 different counts. See the [operational gate](admin-operations.md#legal-review-and-transparency-task-55)
 for actual tombstone fields and pending retention approval.
 
+### Retained Metadata Inventory
+
+These are actual current inventories, not blanket legal approval. `no_expiry`
+means no implemented finite expiry, not anonymous data, approved indefinite
+retention or deletion from external records/backups. Baseline's eleven-field hold
+and workflow's five-field replay approvals do not cover every table below.
+The DDL migrations and current cleanup/replay serializers remain the source of
+truth; restore their state consistently and include them in notices/ROPA/DPIA/DSAR.
+
+| Relation / material | Retained fields and linkage | Actual lifetime / cleanup |
+|---|---|---|
+| `registration_attempts` pending/failed | Opaque attempt, capability hash, original JKT, encrypted frozen contacts/handle/ceremony, proof hashes/times/references and immutable expiry/revisions. Transient Class A personal data, not an account or authentication session. | Pending 15m, email <=10m, passkey <=5m; proof checks expire independently of physical cleanup. Dedicated bounded cleanup; finite admission capacity prevents unbounded allocation. |
+| `registration_attempts` completed receipt | Capability/JKT-bound outcome, fingerprint, proof/terminal timestamps and resulting-user reference; transient envelope/token/challenge material cleared. | Receipt 1h after completion, current-subject-hold aware. Hold never renews authority; resulting-user FK cascade cannot block lawful purge. Backups keep their independent protected rotation policy. |
+| `admin_action_contexts` | `action_id`, nullable `account_ref`, `details_encrypted`, `created_at`, `retain_until`; encrypted moderation/inquiry context is still personal data. | Original `created_at +` approved context duration; strict `retain_until < cutoff`, hold-aware physical cleanup. No clock rewriting. |
+| Contracted `legal_holds` | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives. | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns in the fresh baseline. |
+| Live workflow/case associations | `legal_cases` original clocks, policy/state/revision and preparer/approver/auth-version fields; `legal_case_subjects(case_id,account_ref,current)`; `legal_case_holds(case_id,hold_id,account_ref,current)`. Historical associations remain even when not current. | Expiry is `min(created_at + max_age, closed_at + closed_retention)` where closed; at-or-after equality cleanup only without any historically associated subject hold. Reviews/retries/releases do not reset it. |
+| `legal_workflow_events` | `id`, `scope`, `scope_kind`, `revision`, `purpose`, `actor`, `auth_version`, `action_id`, `created_at`, `body_encrypted`. Bound encrypted revision/review/response/delivery narratives are restricted personal data. | Physical deletion with case/hold-review cleanup at original workflow expiry, subject to independent holds. Not a permanent narrative archive. |
+| `legal_hold_reviews` | `hold_id`, `account_ref`, `policy_id`, `version`, nullable `next_review_at`; original `legal_holds.review_at` is not overwritten. | At-or-after release-relative approved expiry, absent any active hold on account; state and encrypted history are deleted, not represented as never-created history. |
+| `legal_workflow_replays` | Before cleanup, five fields plus `event_id` joining encrypted history. After cleanup exactly `operation`, `scope`, `idempotency_key`, `result_id`, `erased` (`event_id=NULL`). `hold_review` scope/result joins the surviving hold tombstone, so subject/actor/time correlation remains possible. Case scope/result joins a case sentinel/external intake. | `no_expiry` remains the supported replay protocol. No narratives, actors or fingerprints inside the erased stub, but no claim of absence of joinable personal metadata. |
+| Erased `legal_cases` sentinel | Retains `id`, `status='erased'`, zero `version`, `content_revision`, `proposal_revision`, `reviewed_revision`, `response_content_revision`, `approved_proposal_revision`, and `decision='pending'`. Policy, received/created/closed/review/expiry times, content/response event IDs, preparer/approver/auth versions become NULL; associations/history are deleted. | No sentinel expiry implemented (`no_expiry`). ID remains correlatable with replay or external records; it is not a reconstructed case or narrative. |
+| `legal_transparency_reports` | `id`, `version`, `year`, `data_version`, `schema_version`, `policy_id`, exact `payload`, `digest`, `status`, `prepared_by`, `prepared_auth_version`, `prepared_at`, nullable `approved_by`, `approved_auth_version`, `approved_at`, `downloaded_at`. Restricted personal approval provenance differs from export-safe aggregate payload. | No report/provenance cleanup implemented (`no_expiry`). Snapshot/provenance is immutable apart from permitted approval/download transitions. |
+| `legal_transparency_replays` | `operation`, `scope`, `idempotency_key`, bounded JSON `input`, exact-byte `result`. Prepare/approve results retain `id`, `version`, `year`, `data_version`, `policy_version`, `digest`, `payload`, `status`, `prepared_by`, optional `approved_by`, `stale`, `replayed`; download result retains `payload`, `replayed`. Inputs include year/version or exact approval data version/policy/digest; scope links a year or report. | No expiry/minimization worker (`no_expiry`). Not covered by the five-field erased workflow-stub approval. No actor/auth-version timestamps are fabricated into the result, but report actor provenance remains joinable. |
+| Governance provenance | `legal_governance_policies`: `id`, complete `artifact` (approval/inventory references, fixture, clocks, numeric periods, field inventories/lifetimes and optional workflow), `installed_by`, `operator_identity`, `action_id`, `installed_environment`, `installed_at`. Baseline: `singleton`, `policy_id`, `bound_at`. | Immutable with no expiry (`no_expiry`). Personal operator/action/time provenance and external approval/inventory references require their own governance inventory, not inferred replay approval. |
+| Aggregate reporting state | Coverage `singleton,started_at`; years `year,data_version`; months `month,received,answered,full_disclosure,partial_disclosure,no_responsive_data,refusal,preservation_acknowledgement`. No per-case IDs. | Permanent/no expiry. Exact small-cell counters stay internal; suppression is not anonymity or differential privacy. |
+| Both chain nodes/heads | Chain `seq,event_id,leaf_hash,chain_hash`; heads `singleton,seq,chain_hash`; sequence allocation state. Event UUIDs/digests can correlate to other records and remain one node per event after body erasure. | No expiry (`no_expiry`), no constant-size post-erasure compaction. Class B payload expiry does not delete these nodes. |
+| Ledger erasures/receipts/outbox | Erasures `first_seq,last_seq,operation_id,erased_at`; settings `singleton,audit_subject`. Receipt body `operation_id,cutoff,deleted_count,held_count,dry_run,outcome,highwater_seq` and new `span_manifest_version,span_manifest_sha256`; Class C carries system actor/event UUID/time and leaf/chain digest. Shared outbox retains `id,subject,payload,created_at,published_at,attempts,last_error,admin_action,next_attempt_at` and nullable lifecycle IDs/revisions. These are operation/time/digest-correlatable metadata, not account narratives. | Erasures/settings and retained administrative receipt outbox/Class C material have no finite cleanup here (`no_expiry`); publication is not chaining. Missing future retained receipt material is unavailable assurance, not success. Lifecycle rows have separate approved acknowledged/transport cleanup, not the admin receipt policy. |
+| Class C retained payload | `seq,user_id,actor_id,actor_spiffe_id,event_type,action_status,client_ip,user_agent,payload,timestamp`; nullable user FK can clear but actor/network/action/hold/digest linkage remains. | No Class C purge worker or approved implemented expiry supplied here; current indefinite retention is an open storage-limitation gap, not approval. |
+
+`SECURITY_LEDGER_RETENTION=8760h` is exactly 365 days, between 4320h (180 days)
+and 13140h (547.5 days); it is not the top of that range. Those are engineering
+bounds, not a legally justified period. Class B's original stored expiry and holds
+govern payload cleanup only. Identifiers, pepper lifecycle and finite replay expiry
+remain separate work; no additional permanent inventory is silently certified.
+
 ### Task 5.3 inherited boundary
 
 Legal requests are independent encrypted rows, unique by `(account_ref, request_kind, idempotency_key)`, not actor or globally unique operation ID. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but **is still personal data**. Baseline section 1.7 auditing retains actor/network metadata, action/hold IDs, timestamps and response digests; section 1.8's narrower workflow projection must not be generalized to it.
 
-Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Fresh storage has no plaintext narrative columns; obsolete Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 adds separately credentialed ledger retention and retained-segment proof under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External trust anchors are explicitly deferred; phone attribution and pepper rotation remain separate work. Do not grant the API ledger DELETE, maintenance EXECUTE or trigger-bypass privileges.
+Task 5.4 adds separately credentialed ledger payload retention, structural verification and read-only receipt reconciliation, not Task 5.3 deployment approval or Task 5.5 narrative-retention approval. External anchors, phone attribution and pepper rotation remain separate. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002` through `public.identity_schema_version`, stop incompatible writers and isolate PostgreSQL/Redis/NATS before approved cutover. Down/reset refuse; any existing-environment reset needs separate explicit scoped authorization.
 
 ### Task 7.6 Legal Disclosure Boundary
 

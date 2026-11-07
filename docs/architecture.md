@@ -51,7 +51,7 @@ The Identity Provider (IdP) is custom-built in Go, designed with a Zero-Trust, p
 ### Advanced Cryptographic Controls & Data Protection
 To guarantee extreme safety and satisfy rigorous privacy requirements:
 - **NIST-Compliant Password Hashing:** User passwords are hashed using **Argon2id** with secure parameters: $m=64\text{MB}$ (memory cost), $t=3\text{ iterations}$ (time cost), and $p=4\text{ parallelism}$, generating a cryptographically secure salt per user.
-- **Application-Layer Envelope Encryption:** Sensitive Personal Identifiable Information (PII) such as phone numbers, backup emails, and MFA secrets is never stored in plain text in PostgreSQL. It is encrypted in-transit in the application layer using **AES-GCM-256** for Data Encryption Keys (DEKs). The DEKs are encrypted (wrapped) by one active master Key Encryption Key (KEK), supplied through environment injection and held locally in memory. No live KMS fetch or automatic retired-key selection is implemented.
+- **Application-Layer Envelope Encryption:** Encrypted phone/backup-email/MFA and pending signup payloads use real AES-GCM-256 with per-record DEKs wrapped by one environment-injected runtime KEK/version. The process also loads one blind-index pepper/version; Infisical/SOPS/Sealed Secrets are operator delivery options, not live fetch/cache/hot-rotation or retired-key lookup integrations. Preserve original backup keys and controlled rotation/recovery obligations.
 - **Timing Attack Resistance:** All cryptographic matching (including OTP verification, token comparison, and credentials validation) is executed via constant-time comparison algorithms (`crypto/subtle.ConstantTimeCompare`) to eliminate timing side-channels.
 
 ### Account Security & Advanced Authentication
@@ -87,6 +87,38 @@ To protect user identities against modern threats (e.g., phishing, credential st
   - **Cross-Factor Lock Ordering:** Factor removal starts a PostgreSQL transaction and locks the owning `users` row first. Passkey deletion then locks that user's credential rows in credential-ID order before enforcing the last-passkey rule; TOTP disable counts passkeys while holding the same account mutex. This stable order prevents concurrent removals from observing stale factor counts. Because WebAuthn is currently the only normal browser-session issuer, the final passkey is never removable; TOTP disable likewise requires a remaining passkey.
 - **Risk-Based Authentication:** The system monitors for anomalies (e.g., logins from unknown IPs, new devices, or impossible travel times). Suspicious activities trigger automatic account lockouts or require step-up authentication (MFA/WebAuthn), preventing brute-force and fraud attempts.
 
+### Conditional New-Account Registration
+
+`REGISTRATION_ENABLED=false` and `SMS_ENABLED=false` are independent defaults.
+When enabled with all explicit dependencies and separately approved budgets,
+registration verifies an existing owned Unicode email and Iranian mobile phone,
+then a resident UV-required passkey. It creates no mailbox, password, role or
+browser session; the new account must perform normal discoverable login.
+SQL-authoritative attempts freeze exact canonical contacts, random eight-byte
+handle, original DPoP JKT and ceremony revisions. Pending/email/passkey/receipt
+validity is 15m/10m/at-most-5m/1h, with dedicated hold-aware bounded cleanup.
+Final account/credential/encrypted-phone/created-event/receipt writes commit
+together. Capability+original-JKT result lookup reconciles ambiguous completion
+using a new DPoP proof, not email-based recovery or general mutation retries.
+
+Canonical mailbox identity is NFC/local lowercase/NFC plus strict non-transitional
+IDNA lowercase ASCII domain; verify/store/deliver/lookup exact bytes. NFC equivalents
+converge; Persian/Arabic letters, dot/plus variants and NFKC-distinct local parts
+stay distinct. Email-specific HMAC input bypasses the generic BlindIndex's unchanged
+NFKC pass and captures the configured generation. Invalid/invisible characters
+fail rather than being stripped; no historical rehash/dual-normalization reader.
+SMTPUTF8 must be advertised by strict EHLO after verified TLS before any EAI
+AUTH/envelope/DATA. System sender/auth stays ASCII; no address downgrade.
+
+Enabled SMS uses only fixed SMS.ir VERIFY HTTPS POST, Iranian destinations and
+explicit live/sandbox selection (production live-only), a named template parameter
+and six-digit string preserving zeros. Sandbox/relay success is not actual delivery;
+external sends are not exactly once. Disabled SMS does not remove DB-only factor
+removal/recovery. Source contracts and readiness checks do not approve deployed
+provider provenance, budgets, cleanup supervision or real-message tests. See
+[API](api-design.md#15-new-account-registration) and
+[enablement](devops-operations.md#registration-enablement-and-cleanup).
+
 ### Role-Based Access Control (RBAC) & Admin Capabilities
 The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Principle of Least Privilege. Admin capabilities are decoupled from user data modification where possible.
 
@@ -113,7 +145,7 @@ The IdP uses a strict Role-Based Access Control (RBAC) model adhering to the Pri
 #### The "Zero Trust" Admin Philosophy
 - **No Manual Deletion:** Admins cannot manually perform a "Hard Delete" on a user account. Hard Deletes are exclusively triggered by the user via the "Right to be Forgotten" self-service flow, which initiates a scheduled Cron Job.
 - **Immutable Audit Logging:** Every state change initiated by an admin (e.g., banning a user, changing a role, triggering password resets) is immutably logged in the database ledger. To minimize resource utilization during the MVP phase, these logs are stored in a dedicated PostgreSQL table; they are migrated to the analytical database (ClickHouse) post-MVP.
-  - **Cryptographic Log Chaining:** Each audit log row is chained to its predecessor. Verification detects inconsistent stored segments; it is not an independent defense against a privileged coherent database rewrite. Class B authorized retention uses checkpoints and a durable head, while Class C remains unchanged. External trust anchoring is deferred.
+  - **Cryptographic Log Chaining:** Canonical v2 separates retained payloads from append-only `audit_log_chain` / `security_ledger_chain` nodes and maintains both durable heads. Verification checks links, retained leaves and Class B erasure annotations, not legal authorization or receipt chaining. Nodes retain event UUIDs and digests with no expiry, one per event; there is no constant-size proof after payload erasure. A coherent privileged rewrite/rollback is not independently detected. External anchoring remains deferred.
 
 ### Privacy & GDPR Compliance
 - **PII Masking:** Personally Identifiable Information is masked at the application layer before logging or analytics processing.
@@ -137,7 +169,7 @@ A comprehensive observability stack is critical for a distributed, privacy-first
 - **Tracing:** **OpenTelemetry** is used to trace requests as they flow from the Ingress Gateway, through the Go APIs, and down to other dependent microservices. This allows developers to pinpoint latency bottlenecks without logging user PII.
 
 ### Secret Management
-- **Implemented custody:** Runtime configuration and cryptographic material are environment-injected, with one loaded KEK/version and one pepper/version. No secrets belong in source or logs. External vault/ESO/SOPS integration is a deployment option, not a runtime fetch, cache, fallback or rotation service. Retained-key recovery and coordinated replay-key cutover remain operator obligations.
+- **Secret Injection:** Operators inject private signing, encryption, pepper/replay and database credentials through approved runtime environment delivery (Infisical/SOPS/Sealed Secrets are options), never committed samples. Current crypto has process-local custody of one loaded KEK/version and pepper/version, not a live KMS adapter. Exactly `APP_ENV=development|test|production` is required; test has no development fallback. Known public zero key/pepper vectors are production-rejected, not subject to entropy guessing. Backup/retired-key inventory and coordinated replay/encryption-key rollout remain separate gates.
 
 ## 4. Monorepo Strategy
 ### Development Workflow
@@ -149,8 +181,7 @@ A comprehensive observability stack is critical for a distributed, privacy-first
 - **Shared Packages:** Common configurations (ESLint, Prettier, Tailwind) and UI components (using **shadcn/ui**) are extracted into shared packages.
 
 ### Type Safety (Next.js & Go)
-- To maintain strict type safety across the stack, API contracts are defined exclusively using **Protocol Buffers (protobuf)** as the single source of truth.
-- TypeScript types, Go structs, and OpenAPI (Swagger) documentation are auto-generated from these `.proto` schemas using tools like `buf` or `grpc-gateway`. This ensures the frontend, backend, internal gRPC services, and external HTTP REST documentation are always perfectly in sync.
+- Shared gRPC/lifecycle contracts use canonical protobuf and generated Go/TypeScript outputs. First-party REST/OIDC and signup use their explicit strict JSON/browser adapter contracts; adding signup does not change protobuf or event versions. Generated reproducibility and final API/UI compatibility need actual acceptance, not inferred synchronization.
 
 ## 5. API Design & Integration
 ### Internal vs. External APIs
@@ -176,7 +207,7 @@ The Identity Platform is isolated in its own repository (`hatefsystems/identity`
 ### Local Setup
 1. Clone the repository: `git clone https://github.com/hatefsystems/identity.git`
 2. Install dependencies: `npm install`
-3. Start the development environment: `nx run-many --target=serve --all`
+3. Inject explicit `APP_ENV=development` and required private settings, then run `npm exec -- nx run identity-api:serve` and `npm exec -- nx run web:dev` separately. Use one canonical portal ingress origin; copying the environment template alone does not load Go settings.
 
 ### Coding Standards
 - **Go:** Follow standard Go formatting (`gofmt`) and linting (`golangci-lint`). Use `sqlc` to generate type-safe database queries instead of ORMs.
@@ -193,26 +224,47 @@ Task 5.3 runtime and release boundaries: [Admin operations](admin-operations.md)
 
 `security-ledger-purge` is independent of Class A erasure and Class C history.
 The worker uses a dedicated database login, bounded keyset batches and one
-database cutoff/high-water mark per run. A restricted SECURITY DEFINER routine
-rechecks active holds under the same account-lock protocol as hold changes,
-including absent user rows; only strict expired rows may be deleted. The routine
-atomically compacts content-free erased-span checkpoints and writes durable
-Class C maintenance intent. `admin-audit-publisher` delivers that intent with
+database cutoff/high-water mark per run. Trusted Go code rechecks canonical leaves
+and active holds under the same account-lock protocol as hold changes, including
+absent user rows, before ordinary bounded DELETE of strict expired payloads.
+There is no v2 SECURITY DEFINER purge routine or SQL proof that a compromised
+purge credential honored policy. DELETE, exact erased-span annotations and durable
+Class C receipt intent commit together. `admin-audit-publisher` delivers intent with
 JetStream acknowledgement on `AUDIT_SUBJECT` (default `identity.audit.logs`).
 The retention worker itself has no broker credential or encryption secret.
 
 Signer and purge share short READ COMMITTED transactions with ledger coordination
 before account/row locks. Signer restart and uncertain-commit recovery use the
-durable `security_ledger_head`, never the latest surviving payload. Routine
+durable heads and actual terminal chain nodes, never the latest surviving payload. Routine
 operation requires no scheduled signer stop. Initial rollout does require a
 controlled drain, verified-history bootstrap and compatible signer/API/worker
 deployment before destructive enablement. The non-root image ships all three
 plus the existing admin publisher; host jobs use explicit entrypoint overrides.
 
-Retained-segment verification uses a bounded snapshot of live rows, head and
-checkpoints. It distinguishes erased spans from hash failures but cannot
-recompute erased bodies or independently detect a coherent privileged rewrite.
-External anchors are explicitly deferred. Rollback first disables scheduling
-and maintenance EXECUTE; initialized/purged state is forward-only and must not
+Structural verification uses bounded snapshots of chains, heads, retained bodies
+and erasure annotations. Separate read-only `admin-legal --operation=ledger-receipts`
+uses its own scoped credentials to assess pending/chained/legacy/unavailable receipt
+and manifest coverage; publication is not chaining. Neither operation recomputes
+erased bodies, proves legal authorization or independently detects coherent
+privileged rewrite/rollback. External anchors are deferred. Rollback first disables
+scheduling, revokes purge DELETE/erasure INSERT and waits for in-flight work;
+initialized/purged state is forward-only and must not
 be served by old signer/verifier binaries. Task 5.3 operational approval and
 Task 5.5 narrative-retention policy remain separate gates in the runbook.
+
+Install unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql`, tracked through version 2 in
+`public.identity_schema_version`, with final head-terminal/coordination behavior
+and encrypted-only legal storage. Supported entrypoints refuse all legacy
+`public.goose_db_version`, untracked nonempty application schemas and contradictory
+histories without mutation. There is no in-place v1/v2 upgrade or adoption. Stop
+old writers and select explicitly scoped fresh PostgreSQL plus matching isolated
+Redis/NATS state; do not carry sessions, events or checkpoints into the new database.
+Baseline Down/reset refuse; disposable-data confirmation is not authorization to
+reset an existing environment, which requires separately explicit scoped targets.
+Obsolete legal Backfill/plaintext compatibility is removed, not a new-lineage
+upgrade path. Signed bytes,
+wire formats, operator-only genesis/provisioning, policy approval and legal retention
+are unchanged. See [active setup](admin-operations.md#migration-and-contraction)
+and the still-unchecked production/manual checklist. Historical acceptance and
+prior plans retain their original evidence and do not certify the new baseline.

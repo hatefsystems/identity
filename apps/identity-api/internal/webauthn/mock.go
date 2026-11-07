@@ -3,9 +3,10 @@ package webauthn
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"strings"
 
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 )
 
 // Mock challenge generation for the user-named login fallback (Task 4.3).
@@ -56,15 +57,10 @@ const (
 	mockCredLabel   = "hatef.identity.webauthn.mock.credential.v1"
 )
 
-// normalizeLoginIdentifier canonicalises a user-supplied email for mock
-// derivation, so "User@Example.com " and "user@example.com" yield the same decoy
-// rather than two different ones for what is the same account.
-//
-// It deliberately only trims and lowercases: this value is used exclusively to
-// derive decoy bytes and never to look an account up, so it cannot widen or
-// narrow any real lookup.
+// Decoy derivation uses exactly the real account lookup identity profile.
 func normalizeLoginIdentifier(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
+	canonical, _ := emailaddress.Canonicalize(email)
+	return canonical
 }
 
 // deriveMockBytes returns HMAC-SHA256(key, label || identifier), the primitive

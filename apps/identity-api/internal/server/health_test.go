@@ -7,16 +7,21 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
 )
 
 // testConfig loads the default configuration for handler tests, failing the
 // test if the environment produces an invalid config.
 func testConfig(t *testing.T) config.Config {
 	t.Helper()
+	if _, supplied := os.LookupEnv("APP_ENV"); !supplied {
+		t.Setenv("APP_ENV", "development")
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load() error: %v", err)
@@ -118,6 +123,37 @@ func TestGRPCReadinessDoesNotChangeLiveness(t *testing.T) {
 					want = http.StatusServiceUnavailable
 				}
 				if response.Code != want || strings.Contains(response.Body.String(), "private dependency details") {
+					t.Fatalf("%s: %d %s", path, response.Code, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestRegistrationReadinessIsBoundedRedactedAndSeparateFromLiveness(t *testing.T) {
+	for _, mode := range []string{"missing", "unavailable", "ready"} {
+		t.Run(mode, func(t *testing.T) {
+			deps := Deps{Registration: &registration.Service{}}
+			if mode != "missing" {
+				deps.RegistrationReady = func(ctx context.Context) error {
+					if _, bounded := ctx.Deadline(); !bounded {
+						t.Error("unbounded registration readiness")
+					}
+					if mode == "unavailable" {
+						return errors.New("private registration dependency secret")
+					}
+					return nil
+				}
+			}
+			srv := New(testConfig(t), nil, deps)
+			for _, path := range []string{"/readyz", "/healthz"} {
+				response := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+				want := http.StatusOK
+				if path == "/readyz" && mode != "ready" {
+					want = http.StatusServiceUnavailable
+				}
+				if response.Code != want || strings.Contains(response.Body.String(), "private registration") {
 					t.Fatalf("%s: %d %s", path, response.Code, response.Body.String())
 				}
 			}

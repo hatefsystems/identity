@@ -23,7 +23,7 @@ export const authEn = {
     register: {
       metadata: 'Create an account | Hatef Identity',
       title: 'Create your account',
-      description: 'Start with your email and a password that you do not use anywhere else.',
+      description: 'Verify your existing email and Iranian mobile number, then create a passkey.',
       existing: 'Already have an account?',
     },
     forgot: {
@@ -220,7 +220,7 @@ export const authFa = {
     register: {
       metadata: 'ایجاد حساب | هویت هاتف',
       title: 'حساب خود را ایجاد کنید',
-      description: 'با ایمیل و گذرواژه‌ای که در جای دیگری استفاده نمی‌کنید آغاز کنید.',
+      description: 'ایمیل موجود و شمارهٔ همراه ایران خود را تأیید کنید، سپس کلید عبور بسازید.',
       existing: 'از قبل حساب دارید؟',
     },
     forgot: {

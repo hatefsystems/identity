@@ -36,7 +36,11 @@ func VerifyLookupFixture(ctx context.Context, reader FixtureReader, indexer Blin
 		JOIN security_event_ledger l ON l.seq=c.seq
 		WHERE c.event_id=$1 AND l.client_id=$2 AND l.event_type=$3 AND l.identity_blind_index IS NOT NULL`,
 		id, LookupFixtureClient, audit.EventLoginSucceeded).Scan(&index)
-	if err != nil || subtle.ConstantTimeCompare([]byte(index), []byte(indexer.Compute(LookupFixtureEmail(id)))) != 1 {
+	if err != nil {
+		return ErrUnavailable
+	}
+	expected, err := indexer.ComputeEmail(LookupFixtureEmail(id))
+	if err != nil || subtle.ConstantTimeCompare([]byte(index), []byte(expected)) != 1 {
 		return ErrUnavailable
 	}
 	return nil

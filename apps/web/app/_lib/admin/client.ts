@@ -5,6 +5,7 @@ import { emptyResponse } from '../portal/json-response';
 import {
   auditPageResponse,
   capabilitiesResponse,
+  lookupResponse,
   userResponse,
   usersResponse,
   type AdminAuditQuery,
@@ -58,27 +59,19 @@ export class AdminClient {
 
   async lookup(email: string, signal?: AbortSignal) {
     if (typeof email !== 'string') throw new PortalError('invalid_request');
-    const normalized = email.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '').toLowerCase();
+    const bounded = email.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
     if (
-      !normalized.includes('@') ||
-      /[\p{Cc}\p{Cs}]/u.test(normalized) ||
-      new TextEncoder().encode(normalized).length > 254
+      !/^[^@\s]+@[^@\s]+$/.test(bounded) ||
+      /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\ufffd]/u.test(bounded) ||
+      new TextEncoder().encode(email).length > 1024
     )
       throw new PortalError('invalid_request');
     return this.portal.request(
       '/api/v1/admin/users/lookup',
-      (value) => {
-        const page = usersResponse(value);
-        if (
-          page.limit !== 1 ||
-          page.offset !== 0 ||
-          page.total > 1 ||
-          page.items.some((user) => user.email?.toLowerCase() !== normalized)
-        )
-          throw new PortalError('invalid_response');
-        return page;
-      },
-      { method: 'POST', body: { email: normalized }, signal }
+      lookupResponse,
+      // The backend is the identity authority. Preserve input bytes rather than
+      // deriving a divergent JavaScript casing or IDNA result.
+      { method: 'POST', body: { email }, signal }
     );
   }
 

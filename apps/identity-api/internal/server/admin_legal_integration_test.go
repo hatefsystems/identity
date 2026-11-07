@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +27,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 )
 
 func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
@@ -212,7 +215,7 @@ func TestAdminLegalAuditFailureRollsBackIntegration(t *testing.T) {
 					t.Fatal(err)
 				}
 				row, err := db.New(tx).GetLegalHold(ctx, metadata.HoldID)
-				if err != nil || row.AccountRef != account || len(row.DetailsEncrypted) == 0 || row.Reason != nil {
+				if err != nil || row.AccountRef != account || len(row.DetailsEncrypted) == 0 {
 					t.Fatalf("injection preceded encrypted legal business state: %v", err)
 				}
 				if env.EventType == audit.EventLegalHoldReleased {
@@ -638,28 +641,29 @@ func TestAdminLegalStrictHTTPBoundaryIntegration(t *testing.T) {
 	cases := []struct {
 		method, path, body string
 		beforeGrant        bool
+		status             int
 	}{
-		{http.MethodGet, "/legal-holds?account_ref=", "", false},
-		{http.MethodGet, "/legal-holds?account_ref=%zz", "", false},
-		{http.MethodGet, "/legal-holds?account_ref=" + account.String() + "&account_ref=", "", false},
-		{http.MethodGet, "/legal-holds?account_ref=" + account.String() + ";status=all", "", false},
-		{http.MethodGet, "/legal-holds?unexpected=private", "", false},
-		{http.MethodGet, "/legal-holds?limit=-1", "", false},
-		{http.MethodGet, "/legal-holds?status=invalid", "", false},
-		{http.MethodPost, "/legal-holds?", body, false},
-		{http.MethodPost, "/preservation-requests?", `{}`, false},
-		{http.MethodDelete, "/legal-holds/" + uuid.NewString() + "?", "", false},
-		{http.MethodPost, "/legal-holds", strings.Replace(body, `"reason":"sealed-reason"`, `"reason":"sealed-reason","reason":"other"`, 1), true},
-		{http.MethodPost, "/legal-holds", body + `{}`, true},
-		{http.MethodPost, "/legal-holds", strings.TrimSuffix(body, "}") + `,"user_id":"not-an-alias"}`, false},
-		{http.MethodPost, "/legal-holds", strings.Replace(body, "sealed-reason", strings.Repeat("x", 4097), 1), false},
-		{http.MethodPost, "/legal-holds", strings.Replace(body, "sealed-reason", strings.Repeat("x", 32*1024), 1), false},
-		{http.MethodPost, "/preservation-requests", `{"account_ref":"` + account.String() + `","reason":"sealed","requesting_authority":"court","legal_basis":"not-supported"}`, false},
+		{http.MethodGet, "/legal-holds?account_ref=", "", false, 400},
+		{http.MethodGet, "/legal-holds?account_ref=%zz", "", false, 400},
+		{http.MethodGet, "/legal-holds?account_ref=" + account.String() + "&account_ref=", "", false, 400},
+		{http.MethodGet, "/legal-holds?account_ref=" + account.String() + ";status=all", "", false, 400},
+		{http.MethodGet, "/legal-holds?unexpected=private", "", false, 400},
+		{http.MethodGet, "/legal-holds?limit=-1", "", false, 400},
+		{http.MethodGet, "/legal-holds?status=invalid", "", false, 400},
+		{http.MethodPost, "/legal-holds?", body, true, 400},
+		{http.MethodPost, "/preservation-requests?", `{}`, true, 400},
+		{http.MethodDelete, "/legal-holds/" + uuid.NewString() + "?", "", true, 400},
+		{http.MethodPost, "/legal-holds", strings.Replace(body, `"reason":"sealed-reason"`, `"reason":"sealed-reason","reason":"other"`, 1), true, 400},
+		{http.MethodPost, "/legal-holds", body + `{}`, true, 400},
+		{http.MethodPost, "/legal-holds", strings.TrimSuffix(body, "}") + `,"user_id":"not-an-alias"}`, false, 400},
+		{http.MethodPost, "/legal-holds", strings.Replace(body, "sealed-reason", strings.Repeat("x", 4097), 1), false, 400},
+		{http.MethodPost, "/legal-holds", strings.Replace(body, "sealed-reason", strings.Repeat("x", 32*1024), 1), true, 413},
+		{http.MethodPost, "/preservation-requests", `{"account_ref":"` + account.String() + `","reason":"sealed","requesting_authority":"court","legal_basis":"not-supported"}`, false, 400},
 	}
 	for _, tc := range cases {
 		grant := f.grant(t, "dpo")
 		w := f.request(t, "dpo", tc.method, tc.path, tc.body, grant)
-		if w.Code != http.StatusBadRequest || w.Body.String() != "{\"error\":\"invalid_request\"}\n" ||
+		if w.Code != tc.status || w.Body.String() != "{\"error\":\"invalid_request\"}\n" ||
 			w.Header().Get("Cache-Control") != "private, no-store" || w.Header().Get("Referrer-Policy") != "no-referrer" {
 			t.Fatalf("invalid legal browser request was accepted or disclosed: method=%s status=%d", tc.method, w.Code)
 		}
@@ -730,5 +734,74 @@ func TestAdminLegalPreservationPresenceAndReplayObservationIntegration(t *testin
 		} else if result.Hold.ID != holdID {
 			t.Fatal("replay changed the independent preservation request")
 		}
+	}
+}
+
+func TestAdminLegalPreflightAuthenticatedHTTPAndAuditPrivacyIntegration(t *testing.T) {
+	f := newAdminIntegration(t)
+	const sentinel = "sensitive-preflight-sentinel"
+	var logs bytes.Buffer
+	f.srv.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	oversize := `{"reason":"` + strings.Repeat(sentinel, legalBodyLimit/len(sentinel)+1) + `"}`
+	for _, tc := range []struct {
+		name, role, method, path, key string
+		reader                        io.Reader
+		length                        int64
+		status                        int
+		unread                        bool
+	}{
+		{"no session", "", "POST", "/legal-holds", "", strings.NewReader(oversize), -1, 401, true},
+		{"no permission", "ordinary", "POST", "/legal-holds", "", strings.NewReader(oversize), -1, 403, true},
+		{"declared oversize", "dpo", "POST", "/legal-holds", "", strings.NewReader(oversize), int64(len(oversize)), 413, true},
+		{"chunked oversize", "dpo", "POST", "/legal-holds", "", strings.NewReader(oversize), -1, 413, false},
+		{"aborted read", "dpo", "POST", "/legal-holds", "", legalInterruptedReader{}, -1, 400, false},
+		{"bare query", "dpo", "POST", "/preservation-requests?", "", strings.NewReader(`{}`), -1, 400, true},
+		{"sensitive query", "dpo", "POST", "/legal-holds?reason=" + sentinel, "", strings.NewReader(`{}`), -1, 400, true},
+		{"release whitespace", "dpo", "DELETE", "/legal-holds/" + uuid.NewString(), "", strings.NewReader(" "), -1, 400, false},
+		{"release key", "dpo", "DELETE", "/legal-holds/" + uuid.NewString(), uuid.NewString(), strings.NewReader(""), -1, 400, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &legalPreflightBody{reader: tc.reader}
+			r := httptest.NewRequest(tc.method, "https://identity.example/api/v1/admin"+tc.path, nil)
+			r.Body, r.ContentLength = body, tc.length
+			r.Header.Set("Origin", "https://identity.example")
+			f.browser.prepare(r)
+			grant := ""
+			if tc.role != "" {
+				f.browser.authorize(t, r, f.actors[tc.role], f.cookies[tc.role])
+				grant = f.grant(t, tc.role)
+				r.Header.Set(stepup.HeaderStepUpAuth, grant)
+			}
+			if tc.key != "" {
+				r.Header.Set("Idempotency-Key", tc.key)
+			}
+			var before int64
+			if err := f.pool.QueryRow(t.Context(), "SELECT count(*) FROM event_outbox WHERE admin_action").Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			f.srv.Handler().ServeHTTP(w, r)
+			if w.Code != tc.status || body.read > legalBodyLimit+1 || (tc.unread && body.read != 0) {
+				t.Fatalf("HTTP preflight order/bound changed: status=%d want=%d read=%d", w.Code, tc.status, body.read)
+			}
+			if grant != "" {
+				if _, err := f.step.Validate(t.Context(), grant, f.actors[tc.role]); err != nil {
+					t.Fatalf("rejected preflight consumed grant: %v", err)
+				}
+			}
+			var after int64
+			if err := f.pool.QueryRow(t.Context(), "SELECT count(*) FROM event_outbox WHERE admin_action").Scan(&after); err != nil || after != before+1 {
+				t.Fatal("preflight denial lacks one durable failure audit")
+			}
+			var payload string
+			if err := f.pool.QueryRow(t.Context(), "SELECT payload FROM event_outbox WHERE admin_action ORDER BY created_at DESC,id DESC LIMIT 1").Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			for _, private := range []string{sentinel, "sensitive-abort", "sensitive-query"} {
+				if strings.Contains(payload, private) || strings.Contains(logs.String(), private) || strings.Contains(w.Body.String(), private) {
+					t.Fatal("preflight leaked sensitive read/query material into diagnostics")
+				}
+			}
+		})
 	}
 }

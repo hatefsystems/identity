@@ -17,11 +17,10 @@ const EnvPortalOrigin = "PORTAL_ORIGIN"
 // never to Host or forwarding headers. An issuer may have a path; its origin
 // must still be exactly the origin used for first-party browser ceremonies.
 func LoadPortal(environment, issuer string, webauthnOrigins []string) (string, error) {
-	issuerURL, err := url.Parse(issuer)
-	if err != nil || issuerURL.User != nil || issuerURL.Opaque != "" || issuerURL.RawQuery != "" || issuerURL.Fragment != "" {
-		return "", errors.New("config: invalid issuer for portal origin")
+	if err := ValidateEnvironment(environment); err != nil {
+		return "", err
 	}
-	issuerOrigin, err := canonicalPortalOrigin(issuerURL.Scheme+"://"+issuerURL.Host, environment)
+	issuerOrigin, err := issuerOrigin(issuer, environment)
 	if err != nil {
 		return "", err
 	}
@@ -45,6 +44,18 @@ func LoadPortal(environment, issuer string, webauthnOrigins []string) (string, e
 		}
 	}
 	return "", errors.New("config: PORTAL_ORIGIN must be an allowed WebAuthn origin")
+}
+
+func issuerOrigin(raw, environment string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || strings.ContainsAny(raw, "?#\\ \t\r\n") || strings.TrimSpace(raw) != raw {
+		return "", errors.New("config: OIDC_ISSUER must be a canonical URL without query or fragment markers")
+	}
+	origin, err := canonicalPortalOrigin(u.Scheme+"://"+u.Host, environment)
+	if err != nil {
+		return "", errors.New("config: OIDC_ISSUER requires a canonical HTTPS origin (local HTTP is development-only)")
+	}
+	return origin, nil
 }
 
 func canonicalPortalOrigin(raw, environment string) (string, error) {

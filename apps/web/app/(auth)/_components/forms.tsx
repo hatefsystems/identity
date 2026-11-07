@@ -8,12 +8,10 @@ import {
   validateEmail,
   validateLogin,
   validatePassword,
-  validateRegistration,
   validateTotp,
   type EmailValues,
   type LoginValues,
   type PasswordValues,
-  type RegistrationValues,
   type TotpValues,
 } from '../_lib/validation';
 import { AuthLink } from './auth-card';
@@ -75,53 +73,6 @@ export function LoginForm({
         </div>
       </AuthForm>
     </>
-  );
-}
-
-export function RegistrationForm({ submit }: { submit?: FormSubmit<RegistrationValues> }) {
-  const t = useTranslations();
-  const form = useAuthForm(
-    { email: '', password: '', confirmation: '' },
-    validateRegistration,
-    submit
-  );
-
-  return (
-    <AuthForm
-      {...form}
-      label={t('auth.forms.register.label')}
-      submitLabel={t('auth.forms.register.submit')}
-      messages={{
-        pending: t('auth.forms.register.pending'),
-        success: t('auth.forms.register.success'),
-        error: t('auth.forms.register.error'),
-      }}
-    >
-      <AuthField
-        {...form.field('email')}
-        label={t('auth.fields.email')}
-        type="email"
-        autoComplete="email"
-        autoCapitalize="none"
-        spellCheck={false}
-        required
-      />
-      <AuthField
-        {...form.field('password')}
-        label={t('auth.fields.newPassword')}
-        type="password"
-        autoComplete="new-password"
-        hint={t('auth.fields.passwordHint')}
-        required
-      />
-      <AuthField
-        {...form.field('confirmation')}
-        label={t('auth.fields.confirmPassword')}
-        type="password"
-        autoComplete="new-password"
-        required
-      />
-    </AuthForm>
   );
 }
 

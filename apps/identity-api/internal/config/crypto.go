@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -81,6 +82,10 @@ func LoadCrypto() (CryptoConfig, error) {
 // LoadEnvelopeCrypto loads only the keys needed to encrypt records. Retention
 // holds and moderation must not depend on the independent lookup pepper.
 func LoadEnvelopeCrypto() (CryptoConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return CryptoConfig{}, err
+	}
 	var cfg CryptoConfig
 
 	rawKEK, ok := os.LookupEnv(EnvMasterKEK)
@@ -93,6 +98,9 @@ func LoadEnvelopeCrypto() (CryptoConfig, error) {
 	}
 	if len(kek) != kekSizeBytes {
 		return CryptoConfig{}, fmt.Errorf("config: %s must decode to %d bytes (AES-256), got %d", EnvMasterKEK, kekSizeBytes, len(kek))
+	}
+	if environment == "production" && bytes.Equal(kek, make([]byte, kekSizeBytes)) {
+		return CryptoConfig{}, fmt.Errorf("config: %s must not use the public all-zero test key in production", EnvMasterKEK)
 	}
 	cfg.MasterKEK = kek
 
@@ -114,6 +122,10 @@ func LoadEnvelopeCrypto() (CryptoConfig, error) {
 
 // LoadBlindIndexPepper never invents replacement key material.
 func LoadBlindIndexPepper() ([]byte, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return nil, err
+	}
 	rawPepper, ok := os.LookupEnv(EnvBlindIndexPepper)
 	if !ok || rawPepper == "" {
 		return nil, fmt.Errorf("config: %s is required", EnvBlindIndexPepper)
@@ -124,6 +136,9 @@ func LoadBlindIndexPepper() ([]byte, error) {
 	}
 	if len(pepper) < minPepperBytes {
 		return nil, fmt.Errorf("config: %s must decode to at least %d bytes, got %d", EnvBlindIndexPepper, minPepperBytes, len(pepper))
+	}
+	if environment == "production" && bytes.Equal(pepper, make([]byte, minPepperBytes)) {
+		return nil, fmt.Errorf("config: %s must not use the public all-zero test pepper in production", EnvBlindIndexPepper)
 	}
 	return pepper, nil
 }

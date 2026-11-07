@@ -141,7 +141,7 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {
@@ -237,12 +237,97 @@ func TestLegalFixtureMetadataContainsOnlySupportedSyntheticDisclosures(t *testin
 
 func fixtureKEK(t *testing.T) {
 	t.Helper()
+	t.Setenv("APP_ENV", "test")
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal("cannot generate test KEK")
 	}
 	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(key))
 	t.Setenv(config.EnvMasterKEKVersion, "37")
+}
+
+func TestFixtureEnvironmentAdmissionBeforeInputOrResources(t *testing.T) {
+	t.Setenv("PORTAL_FIXTURE_ALLOW", "1")
+	t.Setenv("PORTAL_FIXTURE_RUN_ID", fixtureRunID)
+	t.Setenv("PORTAL_FIXTURE_ADMIN", "1")
+	for _, raw := range []string{"missing", "", " ", "staging", "development ", "TEST", "production"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("APP_ENV", raw)
+			if raw == "missing" {
+				if err := os.Unsetenv("APP_ENV"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, action := range []string{"tls", "seed", "migrate", "admin-policy"} {
+				err := run([]string{action})
+				if err == nil || strings.Contains(err.Error(), "stdin") || strings.Contains(err.Error(), "PostgreSQL") {
+					t.Fatalf("unsafe mode reached input/resources: %v", err)
+				}
+			}
+		})
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	previous := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() { os.Stdin = previous; _ = reader.Close() })
+	for _, environment := range []string{"development", "test"} {
+		t.Setenv("APP_ENV", environment)
+		err := run([]string{"tls"})
+		if err == nil || !strings.Contains(err.Error(), "stdin") {
+			t.Fatalf("explicit local fixture mode rejected: %v", err)
+		}
+	}
+	t.Setenv("APP_ENV", "test")
+	if err := run([]string{"admin-policy"}); err == nil || !strings.Contains(err.Error(), "stdin") {
+		t.Fatalf("explicit admin test fixture rejected: %v", err)
+	}
+	t.Setenv("APP_ENV", "development")
+	if err := run([]string{"admin-policy"}); err == nil || !strings.Contains(err.Error(), "test-only") {
+		t.Fatalf("admin development exemption: %v", err)
+	}
+}
+
+func TestFixtureTLSRunsInExplicitLocalModesWithoutServices(t *testing.T) {
+	for _, environment := range []string{"development", "test"} {
+		t.Run(environment, func(t *testing.T) {
+			t.Setenv("APP_ENV", environment)
+			t.Setenv("PORTAL_FIXTURE_ALLOW", "1")
+			t.Setenv("PORTAL_FIXTURE_RUN_ID", fixtureRunID)
+			t.Setenv("DATABASE_URL", "")
+			t.Setenv("REDIS_URL", "")
+			t.Setenv(config.EnvMasterKEK, "")
+			inputReader, inputWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = inputReader.Close(); _ = inputWriter.Close() }()
+			if _, err := inputWriter.WriteString("{}"); err != nil {
+				t.Fatal(err)
+			}
+			_ = inputWriter.Close()
+			outputReader, outputWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = outputReader.Close(); _ = outputWriter.Close() }()
+			previousInput, previousOutput := os.Stdin, os.Stdout
+			os.Stdin, os.Stdout = inputReader, outputWriter
+			defer func() { os.Stdin, os.Stdout = previousInput, previousOutput }()
+			output := make(chan []byte, 1)
+			go func() { data, _ := io.ReadAll(outputReader); output <- data }()
+			err = run([]string{"tls"})
+			_ = outputWriter.Close()
+			data := <-output
+			var material map[string]string
+			if err != nil || json.Unmarshal(data, &material) != nil || material["cert"] == "" || material["key"] == "" || material["ca"] == "" {
+				t.Fatal("explicit local TLS fixture failed without services")
+			}
+		})
+	}
 }
 
 type seedTransaction struct {

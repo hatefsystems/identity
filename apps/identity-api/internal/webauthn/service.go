@@ -15,6 +15,7 @@ import (
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -289,6 +290,11 @@ func (s *Service) BeginLogin(ctx context.Context, email string) (*protocol.Crede
 	}
 	defer s.enforceFloor(s.now())
 
+	canonical, err := emailaddress.Canonicalize(email)
+	if err != nil {
+		return nil, ErrInvalidResponse
+	}
+	email = canonical
 	user, err := s.users.GetUserByEmail(ctx, email)
 	switch {
 	case err == nil:

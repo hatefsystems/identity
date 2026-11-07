@@ -56,7 +56,7 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 		t.Fatalf("ordinary account capabilities: %d", response.Code)
 	}
 	actor := uuid.MustParse(f.actors["moderator"].UserID)
-	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "dpo", false); err != nil {
+	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "dpo", false, "test"); err != nil {
 		t.Fatal(err)
 	}
 	response := f.request(t, "moderator", http.MethodGet, "/capabilities", "", "")
@@ -89,7 +89,7 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 func TestAdminCapabilitiesRevocationAndRestrictedSessionsIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	actor := uuid.MustParse(f.actors["support"].UserID)
-	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "support", true); err != nil {
+	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "support", true, "test"); err != nil {
 		t.Fatal(err)
 	}
 	if response := f.request(t, "support", http.MethodGet, "/capabilities", "", ""); response.Code != http.StatusForbidden {
@@ -236,7 +236,7 @@ func TestAdminConcurrentModeratorsRejectStaleRevisionIntegration(t *testing.T) {
 	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=true WHERE id=$1", otherActor); err != nil {
 		t.Fatal(err)
 	}
-	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", otherActor, "moderator", false); err != nil {
+	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", otherActor, "moderator", false, "test"); err != nil {
 		t.Fatal(err)
 	}
 	var before int64
@@ -332,7 +332,7 @@ func TestAdminPinnedTargetsRemainServerAuthoritativeIntegration(t *testing.T) {
 		}
 	}
 	grant := f.grant(t, "moderator")
-	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["moderator"].UserID), "moderator", true); err != nil {
+	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["moderator"].UserID), "moderator", true, "test"); err != nil {
 		t.Fatal(err)
 	}
 	response := f.request(t, "moderator", http.MethodPatch, "/users/"+f.target.ID.String()+"/status", adminStatusBody(t, "banned", "revoked", 0), grant)
@@ -385,7 +385,7 @@ func TestAdminPrivilegedTargetGrantWinsModerationRaceIntegration(t *testing.T) {
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		granted <- rbac.ProvisionRole(ctx, grantActions, uuid.New(), "spiffe://identity.test/operator", f.target.ID, "dpo", false)
+		granted <- rbac.ProvisionRole(ctx, grantActions, uuid.New(), "spiffe://identity.test/operator", f.target.ID, "dpo", false, "test")
 	}()
 	var holder uint32
 	select {

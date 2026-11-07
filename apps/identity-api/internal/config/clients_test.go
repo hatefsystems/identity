@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
 
@@ -38,6 +39,46 @@ func TestLoadClientsRequiredOutsideDev(t *testing.T) {
 	t.Setenv(EnvOIDCClients, "")
 	if _, err := LoadClients("production"); err == nil {
 		t.Fatal("expected error when OIDC_CLIENTS_JSON is unset outside development")
+	}
+}
+
+func TestLoadClientsCallbacksByEnvironment(t *testing.T) {
+	for _, environment := range []string{"development", "test", "production"} {
+		for _, tc := range []struct {
+			uri           string
+			secure, local bool
+		}{
+			{uri: "https://client.example.test/callback?fixed=1", secure: true},
+			{uri: "http://localhost:3000/callback", local: true},
+			{uri: "http://127.0.0.1:3000/callback", local: true},
+			{uri: "http://[::1]:3000/callback", local: true},
+			{uri: "http://client.example.test/callback"},
+			{uri: "https://client.example.test#"},
+			{uri: "https://user@client.example.test/callback"},
+			{uri: "custom:/callback"},
+		} {
+			t.Run(environment+"/"+tc.uri, func(t *testing.T) {
+				raw, err := json.Marshal([]clientJSON{{ClientID: "client", RedirectURIs: []string{tc.uri}, TokenEndpointAuthMethod: clients.AuthMethodNone}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv(EnvOIDCClients, string(raw))
+				registry, err := LoadClients(environment)
+				if (err == nil) != (tc.secure || environment == "development" && tc.local) {
+					t.Fatalf("callback admission: %v", err)
+				}
+				if err == nil {
+					client, err := registry.Lookup("client")
+					if err != nil || !client.HasRedirectURI(tc.uri) || client.HasRedirectURI(tc.uri+"&extra=1") {
+						t.Fatal("exact matching changed")
+					}
+				}
+			})
+		}
+	}
+	t.Setenv(EnvOIDCClients, "")
+	if _, err := LoadClients("test"); err == nil {
+		t.Fatal("test inherited development seed")
 	}
 }
 

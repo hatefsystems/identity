@@ -182,10 +182,8 @@ func (t *pgBatchTx) LockAccounts(ctx context.Context, ids []uuid.UUID) error {
 // ValidateLedgerState walks the whole retained chain before the signer appends to
 // it, so a signer never extends a chain it has not confirmed.
 //
-// Unlike v1 this can always reach a definitive answer: every node is retained, so
-// there is no erased span whose contents have to be taken on trust from stored
-// boundary digests. An absent payload is still verifiable as a *node*, and whether
-// its absence was lawful is decided by ledgerproof against the erasure records.
+// This checks chain linkage, retained leaves and erasure annotations only. Receipt
+// assurance is separate: a legitimate pending outbox receipt must not block restart.
 func (t *pgBatchTx) ValidateLedgerState(ctx context.Context, through int64) error {
 	source := ledgerproof.NewSource(t.tx, ledgerproof.ChainLedger)
 	params := ledgerproof.Params{

@@ -1,6 +1,6 @@
 -- Task 2.2: MVP audit ledger queries (insert/select only).
 --
--- Canonical format v2 (migration 00015) splits tamper-evidence from payload:
+-- Canonical format v2 (the baseline) splits tamper-evidence from payload:
 --
 --   audit_log_chain   leaf_hash + chain_hash, append-only, never deleted
 --   mvp_audit_logs    the record body, immutable but erasable

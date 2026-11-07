@@ -1,3 +1,4 @@
+import { registrationEn } from './registration';
 import { commonEn } from './common';
 import { preferencesEn } from './preferences';
 import { metadataEn } from './metadata';
@@ -12,6 +13,7 @@ import { integrityEn } from './integrity';
 import { legalEn } from './legal';
 
 const en = {
+  registration: registrationEn,
   common: commonEn,
   preferences: preferencesEn,
   metadata: metadataEn,

@@ -37,6 +37,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/smtptransport"
 )
 
 const privateReply = "private-recipient@example.test private-token private-password private-relay-reply"
@@ -54,6 +55,8 @@ type relayOptions struct {
 	oversizedReply   bool
 	closeAfterAccept bool
 	legacyTLS        bool
+	smtpUTF8         bool
+	preTLSUTF8       bool
 }
 
 type relayCapture struct {
@@ -216,7 +219,7 @@ func (r *testRelay) serve(conn net.Conn) {
 	}
 	wire := textproto.NewConn(conn)
 	if r.options.oversizedReply {
-		_, _ = io.WriteString(conn, "220 "+strings.Repeat("x", 2*maxRelayBytes))
+		_, _ = io.WriteString(conn, "220 "+strings.Repeat("x", 2*smtptransport.MaxRelayBytes))
 		return
 	}
 	if err := wire.PrintfLine("220 test SMTP relay"); err != nil {
@@ -240,6 +243,9 @@ func (r *testRelay) serve(conn net.Conn) {
 		case "EHLO":
 			capture.hellos++
 			_ = wire.PrintfLine("250-test relay")
+			if capture.secured && r.options.smtpUTF8 || !capture.secured && r.options.preTLSUTF8 {
+				_ = wire.PrintfLine("250-SMTPUTF8")
+			}
 			if !capture.secured && !r.options.noStartTLS {
 				_ = wire.PrintfLine("250-STARTTLS")
 			}
@@ -353,7 +359,7 @@ func TestSMTPVerifiedTLSAcceptanceAndStableMessages(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if notifier.IsDevelopmentOnly() || notifier.tlsConfig.InsecureSkipVerify || notifier.tlsConfig.MinVersion < tls.VersionTLS12 {
+			if notifier.IsDevelopmentOnly() {
 				t.Fatal("transport did not enforce production TLS")
 			}
 			notice := testNotice()
@@ -722,7 +728,7 @@ func TestSMTPRecipientIsolationAndNoticeValidation(t *testing.T) {
 
 func TestSMTPCABundleValidationAndConfigRedaction(t *testing.T) {
 	relay := newTestRelay(t, relayOptions{})
-	for _, data := range [][]byte{nil, []byte("private-token invalid PEM"), bytes.Repeat([]byte("x"), maxCABundleBytes+1)} {
+	for _, data := range [][]byte{nil, []byte("private-token invalid PEM"), bytes.Repeat([]byte("x"), smtptransport.MaxCABundleBytes+1)} {
 		path := filepath.Join(t.TempDir(), "private-recipient@example.test.pem")
 		if err := os.WriteFile(path, data, 0600); err != nil {
 			t.Fatal(err)
@@ -848,5 +854,46 @@ func TestSMTPWrongCredentialsNeverSubmitRecipientOrToken(t *testing.T) {
 	capture := relay.capture(t)
 	if !capture.authAttempted || capture.authenticated || !capture.secured || len(capture.recipients) != 0 || len(capture.message) != 0 {
 		t.Fatal("failed authentication sent recipient/token or skipped TLS")
+	}
+}
+
+func TestSMTPUnicodeDeletionNoticeAndPostTLSGate(t *testing.T) {
+	for _, mode := range []string{config.DeletionSMTPStartTLS, config.DeletionSMTPImplicit} {
+		for _, supported := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/smtputf8=%v", mode, supported), func(t *testing.T) {
+				relay := newTestRelay(t, relayOptions{mode: mode, smtpUTF8: supported, preTLSUTF8: true})
+				notifier, err := New(relay.config)
+				if err != nil {
+					t.Fatal(err)
+				}
+				notice := testNotice()
+				notice.PrimaryEmail = "\u0639\u0644\u06cc@xn--mgbh0fb.xn--mgba3a4f16a"
+				err = notifier.NotifyDeletionRequested(t.Context(), notice)
+				capture := relay.capture(t)
+				if !supported {
+					var failure interface{ Permanent() bool }
+					if err == nil || !errors.As(err, &failure) || failure.Permanent() || capture.authAttempted ||
+						capture.from != "" || len(capture.recipients) != 0 || len(capture.message) != 0 {
+						t.Fatal("unsupported EAI transmitted addresses/tokens or used pre-TLS capability")
+					}
+					assertRedacted(t, err, notice)
+					return
+				}
+				if err != nil || capture.from != "<"+relay.config.From+"> SMTPUTF8" ||
+					len(capture.recipients) != 1 || capture.recipients[0] != "<"+notice.PrimaryEmail+">" ||
+					!bytes.Contains(capture.message, []byte("To: <"+notice.PrimaryEmail+">\n")) {
+					t.Fatal("Unicode envelope/header changed or was not accepted", err)
+				}
+				message, err := mail.ReadMessage(bytes.NewReader(capture.message))
+				if err != nil || message.Header.Get("Subject") != "Account deletion requested" ||
+					message.Header.Get("Message-ID") != "<deletion."+notice.DeliveryID.String()+"@example.test>" {
+					t.Fatal("deletion template or delivery identity changed")
+				}
+				to, err := message.Header.AddressList("To")
+				if err != nil || len(to) != 1 || to[0].Address != notice.PrimaryEmail {
+					t.Fatal("SMTPUTF8 addr-spec was replaced with encoded-word syntax")
+				}
+			})
+		}
 	}
 }

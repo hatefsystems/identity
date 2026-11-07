@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/mail"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -16,6 +15,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -126,9 +126,8 @@ func (s *Server) handleAdminLookupUser() http.HandlerFunc {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		email := strings.ToLower(strings.TrimSpace(req.Email))
-		address, err := mail.ParseAddress(email)
-		if err != nil || len(email) > 254 || address.Address != email {
+		email, err := emailaddress.Canonicalize(req.Email)
+		if err != nil {
 			s.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
@@ -142,7 +141,10 @@ func (s *Server) handleAdminLookupUser() http.HandlerFunc {
 			items = append(items, newAdminUserResponse(user, true))
 		}
 		adminaction.SetEvent(r.Context(), audit.Event{EventType: "admin.users.looked_up", Payload: map[string]any{"result_count": len(items), "selected_fields": []string{"id", "status", "email", "mfa_enabled", "created_at", "updated_at", "deleted_at", "lifecycle_revision"}}})
-		s.writeAdminJSON(w, http.StatusOK, adminPage[adminUserResponse]{Items: items, Total: int64(len(items)), Limit: 1})
+		s.writeAdminJSON(w, http.StatusOK, struct {
+			adminPage[adminUserResponse]
+			CanonicalEmail string `json:"canonical_email"`
+		}{adminPage[adminUserResponse]{Items: items, Total: int64(len(items)), Limit: 1}, email})
 	}
 }
 

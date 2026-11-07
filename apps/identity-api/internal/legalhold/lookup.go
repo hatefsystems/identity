@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"net/mail"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 )
 
 // LookupRequest defines the legal scope, disclosure fields and pagination.
@@ -69,16 +69,15 @@ func (s *Service) Lookup(ctx context.Context, req LookupRequest) (LookupResult, 
 	if req.IdentifierType != IdentifierTypeEmail {
 		return LookupResult{}, ErrUnsupportedIdentifierType
 	}
-	if req.ActorID == uuid.Nil || !bounded(req.Identifier, 320) || !bounded(req.RequestingAuthority, MaxContextBytes) ||
+	email, err := emailaddress.Canonicalize(req.Identifier)
+	if err != nil {
+		return LookupResult{}, ErrInvalidRequest
+	}
+	if req.ActorID == uuid.Nil || !bounded(req.RequestingAuthority, MaxContextBytes) ||
 		!bounded(req.CaseReference, MaxContextBytes) || !bounded(req.Purpose, MaxReasonBytes) ||
 		req.StartTime.IsZero() || req.EndTime.IsZero() || req.StartTime.After(req.EndTime) ||
 		req.EndTime.Sub(req.StartTime) > s.maxWindow || req.StartTime.Year() < 1 || req.EndTime.Year() > 9999 ||
 		req.Limit < 1 || req.Limit > 200 || len(req.Cursor) > 4096 || len(req.Fields) > len(extraFields) {
-		return LookupResult{}, ErrInvalidRequest
-	}
-	email := strings.TrimSpace(req.Identifier)
-	parsed, err := mail.ParseAddress(email)
-	if err != nil || parsed.Address != email {
 		return LookupResult{}, ErrInvalidRequest
 	}
 	fields := append([]string{}, req.Fields...)
@@ -95,7 +94,10 @@ func (s *Service) Lookup(ctx context.Context, req LookupRequest) (LookupResult, 
 	if err != nil {
 		return LookupResult{}, err
 	}
-	index := s.indexer.Compute(req.Identifier)
+	index, err := s.indexer.ComputeEmail(email)
+	if err != nil {
+		return LookupResult{}, ErrInvalidRequest
+	}
 	// Scope is inside the authenticated ciphertext only. Never emit it in audit.
 	scopeJSON, _ := json.Marshal(struct {
 		Index                    string

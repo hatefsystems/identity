@@ -20,11 +20,9 @@ LDP is architected as a decentralized, highly scalable client-agnostic system co
 * **Mutual TLS (mTLS) with SPIFFE/SPIRE:** Dynamic, certificate-less service-to-service communication within the microservices grid, with method-level gRPC RBAC verified via SAN checks.
 * **OAuth 2.1 & OpenID Connect Compliance:** Enforces Proof Key for Code Exchange (PKCE S256), Refresh Token Rotation (RTR), and sender-constrained access tokens via **DPoP (RFC 9449)**.
 * **Phishing-Resistant Passwordless (WebAuthn / FIDO2):** Primary secure path using passkeys, platform authenticators, and discoverable credentials.
-* **Advanced Cryptography:** NIST-compliant Argon2id password hashing, AES-GCM-256 Application-Layer Envelope Encryption for sensitive PII (environment-injected local key custody), and SHA-256 for database-indexed recovery codes to prevent CPU DoS.
+* **Advanced Cryptography:** Argon2id password hashing, real AES-GCM-256 envelope encryption with environment-injected process-local key custody, and SHA-256 database-indexed recovery codes. Infisical/SOPS/Sealed Secrets are operator provisioning options, not live application key-fetch, cache or hot-rotation integrations.
 * **Restricted Recovery:** A backup code is physically deleted in the same ACID transaction that verifies it and yields only a ten-minute `recovery_enrollment` session, limited to one UV-required replacement passkey before normal login.
 * **Single-Use Step-up Authorization:** High-risk factor and contact operations consume short-lived ACR grants bound to the authenticated session. Redis enforces replay claims cluster-wide under opaque HMAC-derived keys.
-
-The web portal supports English (`en`) and Iranian Persian (`fa-IR`) on unchanged URLs. Language, Jalali/Gregorian calendar and time zone are per-browser display preferences; English and UTC remain the initial defaults. Persian uses a self-hosted Vazirmatn font under the existing strict CSP. See [localization](docs/localization.md) for the preference/security boundary and notification queue rollout.
 
 ---
 
@@ -74,8 +72,6 @@ The `docs/` directory contains deep-dive low-level (LLD) and high-level (HLD) sp
    * Kubernetes deployment, CI/CD pipeline structures with Nx, Prometheus metrics, and secret management.
 8. [Disaster Recovery Plan (`docs/disaster-recovery.md`)](docs/disaster-recovery.md)
    * Data backup regimes, RTO/RPO metrics, recovery dry-runs, and ledger-integrity validation playbooks.
-9. [Localization (`docs/localization.md`)](docs/localization.md)
-   * English/Persian browser preferences, typed catalogs, RTL/font/date boundaries, notification compatibility and explicit release gates.
 
 ---
 
@@ -85,7 +81,7 @@ Ensure the following prerequisites are installed locally:
 * **Docker & Docker Compose**
 * **Go (latest stable release)**
 * **Node.js (LTS version)**
-* **Nx CLI** (global or local runner)
+* **Workspace-local Nx** (invoke through `npm exec -- nx`)
 
 > Note: `buf` (Protobuf) and `sqlc` (SQL codegen) are **not** installed
 > globally. They are pinned as Go `tool` dependencies (in `libs/schemas/go.mod`
@@ -109,7 +105,7 @@ Ensure the following prerequisites are installed locally:
    ```bash
    cp .env.example .env
    ```
-   Keep `TRUSTED_PROXY_CIDRS` empty when the API is reached directly. The empty `STEPUP_REPLAY_HMAC_KEY` is an explicit development-only fallback; staging and production require a base64 key that decodes to at least 32 bytes and is identical on every API replica. See the deployment and coordinated-rotation runbook in `docs/devops-operations.md` §2.2.
+   Inject/export the selected variables into each process; copying the file does not automatically load it into Go. `APP_ENV` must be exactly `development`, `test`, or `production`; missing, empty, whitespace and unknown modes fail. Test is not a development exemption. KEK/pepper placeholders are intentionally unusable. Keep `TRUSTED_PROXY_CIDRS` empty for direct API access. The empty `STEPUP_REPLAY_HMAC_KEY` is development-only; test/production require a private base64 key of at least 32 decoded bytes, identical across replicas. See [key custody and rotation](docs/devops-operations.md#2-secrets-injection--configuration).
 
 4. **Spin up local backing services (PostgreSQL, Redis, NATS):**
    ```bash
@@ -127,12 +123,42 @@ Ensure the following prerequisites are installed locally:
    npm exec -- nx run identity-api:sqlc-generate
    ```
 
-6. **Start frontend and backend development servers simultaneously:**
+6. **Start frontend and backend development servers separately:**
    ```bash
-   # Run in separate terminals after explicitly loading your local environment.
    npm exec -- nx run identity-api:serve
    npm exec -- nx run web:dev
    ```
+   Inject explicit `APP_ENV=development` and required settings. The portal uses one canonical ingress origin; separate dev-server ports are not a cross-origin authentication mode.
+
+### Active Installation and Registration
+
+The forward-only bundle is unchanged
+`apps/identity-api/db/migrations/00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql`, tracked through version 2 in
+`public.identity_schema_version`. Migration 2 does not rewrite baseline 1 or
+adopt legacy `public.goose_db_version` history. Supported entrypoints refuse
+legacy/untracked/contradictory targets; Down/reset are not recovery paths. Stop
+incompatible writers and select explicitly scoped fresh PostgreSQL and isolated
+Redis/NATS state. No instruction here authorizes resets or live target use.
+Obsolete legal Backfill/plaintext compatibility is absent from active setup;
+dated records and prior plans retain historical meaning. Genesis, actual grants,
+key inventory and policy approval remain separate operator obligations. See
+[installation](docs/admin-operations.md#migration-and-contraction).
+
+`REGISTRATION_ENABLED=false` and `SMS_ENABLED=false` are safe defaults. When
+explicitly enabled with complete dependencies and approved budgets, `/register`
+verifies an existing owned Unicode email and Iranian mobile number, then creates
+a resident UV-required passkey. It creates no mailbox, password, role or session;
+completion requires normal login. Pending/email/passkey/receipt validity is
+15m/10m/at-most-5m/1h. Capability+original-DPoP-key result reconciliation uses a
+fresh proof after ambiguity; external email/SMS delivery is not exactly once.
+See [HTTP contract](docs/api-design.md#15-new-account-registration) and
+[enablement/cleanup](docs/devops-operations.md#registration-enablement-and-cleanup).
+
+Final-source acceptance remains required under
+[automated validation](docs/admin-operations.md#automated-validation). This setup
+note is not a test result, deployed gate or production approval; historical
+statuses and dated acceptance remain unchanged.
 
 ---
 
@@ -142,16 +168,11 @@ Ensure the following prerequisites are installed locally:
 * **TypeScript/React:** Enforce strict ESLint rules and Prettier formats defined in the workspace root.
 * **Security Checks:** Every pull request is subject to static security analysis. Secret commits, plain-text PII storage, or insecure hashing algorithms (e.g., MD5, SHA-1, or raw bcrypt for passwords) are strictly rejected.
 
-## Pre-production acceptance and launch boundary
+## Browser localization
 
-The selected cleanup plan's reference state differs from this checkout: numbered
-migrations 1–18, plaintext legal-hold compatibility and development environment
-fallbacks remain. Public signup, SMS.ir, NFC internationalized-email identity,
-SMTPUTF8 delivery and durable signup receipts are not implemented here. Existing
-passkey login/enrollment is not public account creation. Do not infer launch
-readiness from a migration, historical test result or localized form.
-
-The bounded seven-suite runner and separate security race matrix are described in
-[acceptance and bootstrap gates](docs/devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
-Registration acceptance fails closed until its missing implementation and real
-production-image browser harness are delivered. No deployment is authorized.
+English and Iranian Persian share the existing routes, including passkey-only
+registration. Explicit browser preferences control language, calendar and time
+zone without changing authentication or operation deadlines. Deletion notification
+queue v2 freezes its locale; deploy compatible v1/v2 readers before v2 writers.
+The configured SMS.ir VERIFY template remains operator-owned. See the
+[localization contract](docs/localization.md) for maintenance and rollout gates.

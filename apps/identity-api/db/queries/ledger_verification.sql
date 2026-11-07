@@ -8,7 +8,7 @@
 -- In v2 there are no holes. The chain table retains every node, so verification
 -- is a straight keyset walk (ListSecurityLedgerChainForVerification in
 -- legal.sql) and the only extra fact a verifier needs is whether a missing
--- payload was lawfully erased. That is one lookup.
+-- payload has an erasure annotation. That is one lookup, not legal assurance.
 
 -- name: GetLedgerVerificationHead :one
 -- Read this and every node in one bounded READ ONLY REPEATABLE READ
@@ -21,7 +21,7 @@ WHERE h.singleton = true;
 
 -- name: ListSecurityLedgerErasures :many
 -- The erasure records covering a verification window, so the verifier can
--- authorize each absent payload. A node whose payload is gone and which no
+-- account for each absent payload. A node whose payload is gone and which no
 -- record covers is reported as tampering, not tolerated as retention.
 SELECT e.first_seq, e.last_seq, e.operation_id, e.erased_at
 FROM public.security_ledger_erasures e

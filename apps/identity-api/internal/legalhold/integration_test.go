@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -103,25 +101,11 @@ type legalIntegration struct {
 
 func newLegalIntegration(t *testing.T) *legalIntegration {
 	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Fatal("DATABASE_URL is required for integration-tag legal tests; use a disposable database")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	baselineCtx, baseline := restoreDatabase(t)
+	ctx, cancel := context.WithTimeout(baselineCtx, 30*time.Second)
 	t.Cleanup(cancel)
-	migrations, err := migrate.Open(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = migrate.Up(ctx, migrations)
-	_ = migrations.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := baseline.Config()
+	baseline.Close()
 	cfg.MaxConns = 8 // Two contenders plus a separate lock observer must run concurrently.
 	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -566,7 +550,7 @@ func TestLegalMaintenanceHoldPrecedenceAndTombstoneIntegration(t *testing.T) {
 	if _, err := f.svc.CleanupReleased(f.ctx, f.pool, 1000); err != nil {
 		t.Fatal(err)
 	}
-	// Cleanup scans all subjects, including requests retained by earlier fixtures.
+	// Cleanup scans all subjects, including other requests in this fixture.
 	// Assert preservation for these two owned requests, not a global cleanup count.
 	ctx, op = f.operation(t, 0)
 	preserved, err := f.svc.List(ctx, ListRequest{AccountRef: uuid.NullUUID{UUID: account, Valid: true}, Status: "all", Limit: 2})

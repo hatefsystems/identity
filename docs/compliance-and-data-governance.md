@@ -1,7 +1,5 @@
 # Hatef Identity Platform - Compliance & Data Governance
 
-Public enrollment, SMS.ir live/Sandbox selection, canonical NFC Unicode identity and temporary signup-data retention are proposed controls, not deployed processing. Legal approval of actual retention, destination/template/spend policy and independent mailbox/handset delivery remains required. The current runtime holds one environment-injected KEK/version and pepper/version; external-vault rotation and retained-key recovery are not established by unit tests. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
-
 This document is the single authoritative reference for the legal, privacy, and data-governance posture of the Hatef Identity Platform (IdP). It defines what data we retain, for how long, on what basis, and how we respond to lawful requests, account-deletion requests, and abuse investigations.
 
 Principles in this document are written to be **law-agnostic** (they hold regardless of jurisdiction). Where a specific statute reinforces a principle, it is cited inline as a supporting reference (e.g., GDPR Article 17, Iran Computer Crimes Law). The platform launches first in Iran and expands to other jurisdictions afterward; the governance model is designed so that entering a new jurisdiction adds obligations without rewriting these principles.
@@ -25,8 +23,14 @@ Personal data that exists to serve the user and is erased when the user is delet
 - Phone number, backup email, MFA/TOTP secrets (stored envelope-encrypted).
 - Password hash, WebAuthn credentials, recovery codes.
 - Active sessions and refresh tokens.
+- Durable registration attempts: encrypted frozen email/phone/handle/ceremony,
+  capability/token hashes, original browser JKT and bounded proof/outcome metadata.
+  Pending state is not an account or login; possession proofs do not identify a
+  legal person or confer any privileged role.
 
 **Lifecycle:** Removed during hard-delete (see Section 5). Erasure is the default.
+Pending signup has no user subject and expires via its separate bounded cleanup;
+completed receipt retains the original-subject FK cascade and hold-aware policy.
 
 ### 2.2 Class B - Minimal Security Metadata (Platform-Owned), Pseudonymized Personal Data
 Non-content, minimized metadata retained to attribute abusive or security-relevant actions even after an account is deleted. This is the class that answers "who did this, and when" after the fact.
@@ -43,7 +47,7 @@ Non-content, minimized metadata retained to attribute abusive or security-releva
 ### 2.3 Class C - Immutable Audit Logs
 Tamper-evident administrative and system audit trail.
 - Append-only, cryptographically chained. Under canonical format v2 the chain lives in `audit_log_chain` (leaf digest + chain digest, one row per event), separate from the `mvp_audit_logs` payload.
-- No DB role holds `UPDATE`/`DELETE` on the chain table, with no maintenance exemption. The payload table rejects `UPDATE` for everyone.
+- No runtime role holds chain `UPDATE`/`DELETE`/`TRUNCATE`; signer INSERT is separate, with no maintenance exemption. Class C payload mutation permits only its existing `user_id` FK nulling, not narrative rewriting.
 
 **Lifecycle:** Retained per the audit-retention policy; integrity verified periodically. Never rewritten.
 
@@ -66,12 +70,23 @@ Retention is purpose-bound and time-boxed. Expiry-driven purges run after their 
 | :--- | :--- | :--- | :--- | :--- |
 | Active account PII & credentials | A | Life of account | Contract / consent | Hard-delete on erasure |
 | Sessions & refresh tokens | A | Until logout / expiry | Contract | TTL + revocation |
+| Pending registration | A | 15m; email proof <=10m, passkey <=5m, capped by original deadline | Account enrollment / abuse prevention, subject to approved notices and lawful basis | Dedicated bounded cleanup; expiry checks alone are not physical erasure |
+| Registration completion receipt | A | 1h after completion, subject to current original-subject holds | Bounded outcome reconciliation | Dedicated hold-aware cleanup; user FK cascade cannot prevent lawful account purge |
 | Deletion grace record | A | 30 days | Contract / user recovery | Cron after grace window |
 | Security event ledger | B | 365 days (`8760h`; validated `4320h..13140h` range) | Legitimate interest / legal obligation | Separately credentialed hourly worker after rollout gates |
 | Admin/system audit logs | C | Long-term (policy-defined) | Legal obligation / accountability | Append-only; no ad-hoc delete |
 | Backups (PostgreSQL) | Mixed | Per backup retention (e.g., 14-30 days) | Operational continuity | Backup rotation |
 
 The configured security-ledger policy is `SECURITY_LEDGER_RETENTION=8760h` (365 days). Changes within the validated range require a documented policy decision. The signer derives expiry from event occurrence, not ingestion time. The worker honors persisted `retain_until`; it neither rewrites signed timestamps nor restarts retention after a hold release. A shorter window is more privacy-protective; a longer window reduces the risk of being unable to answer a late-arriving lawful request. There is no "keep everything indefinitely" fallback.
+
+Registration/SMS default disabled. Transient windows and finite admission/send
+ceilings are not production budget/legal-basis approval. Complete ROPA/DPIA/notices,
+vendor terms, country-routing/spend approval and supervised cleanup before
+enablement. Completed attempts clear transient contact/token/ceremony payloads;
+retained receipts need only bounded capability/JKT-bound outcome metadata. Current
+holds can retain a completed receipt, never extend an expired proof or capability.
+Pending/failed attempts have no user subject; expiry alone does not erase stored
+PII, and protected backups retain their independent rotation/recovery obligations.
 
 ---
 
@@ -157,8 +172,9 @@ ones:
 **Open governance items.** Two decisions remain outstanding and are deliberately
 not settled in code:
 
-1. **Retention length.** `SECURITY_LEDGER_RETENTION` is 8760h (365 days), the top
-   of the stated 6-18 month range. If the purpose is RTR-breach and
+1. **Retention length.** `SECURITY_LEDGER_RETENTION` is 8760h (365 days), between
+   the implementation bounds 4320h (180 days) and 13140h (547.5 days), not the top
+   of that range. Bounds are not legal approval. If the purpose is RTR-breach and
    credential-stuffing correlation, evidentiary value decays in weeks; 90-180
    days is materially easier to defend. 365 days needs a written justification
    tied to a concrete limitation period.
@@ -171,7 +187,7 @@ not settled in code:
 **Pepper compromise.** The blind index resists offline brute force while the
 pepper is secret, but email addresses and E.164 numbers are an enumerable input
 space: a leaked pepper re-identifies every indexed row. `blind_index_version`
-(migration 00015) exists so a compromised pepper can be retired - historical
+(included in the fresh baseline) exists so a compromised pepper can be retired - historical
 rows keep their recorded generation, so a lookup can compute one candidate digest
 per retained generation instead of losing the lookup path entirely. Multi-pepper
 lookup is the required follow-up; the column is the part that could not be added
@@ -187,19 +203,23 @@ applying a hold after erasure cannot restore evidence. The Class A deletion
 worker and Class C audit history remain untouched.
 
 Minimal proof metadata outlives erased events, and under canonical format v2
-(migration 00015) it is simply the chain itself. Tamper-evidence lives in
+(included in the fresh baseline) it is simply the chain itself. Tamper-evidence lives in
 `security_ledger_chain`, one row per event holding a leaf digest and a chain
 digest, and that table is never deleted. Erasure removes the payload row and
 nothing else, so the chain stays complete and verifiable from genesis across an
 erased span.
 
-An erased span is additionally recorded in `security_ledger_erasures`
-(first_seq, last_seq, operation_id), paired with a chained receipt carrying the
-same operation id. That pairing is what makes a lawful erasure *provable*: a
-verifier that finds a missing payload with no erasure record reports tampering
-rather than absorbing it as retention. Neither the chain rows nor the erasure
-records contain an account reference, blind index, network/device metadata, or
-body.
+An erased span is additionally annotated in `security_ledger_erasures`
+(`first_seq`, `last_seq`, `operation_id`, `erased_at`). DELETE, exact spans and
+durable receipt intent commit together; chaining happens later through publisher
+and signer. Structural verification requires an annotation for an absent ledger
+payload, not proof of receipt chaining or legal authorization. The trusted Go
+worker rechecks canonical leaves, expiry and holds under ordered locks; ordinary
+table DELETE permits arbitrary DELETE by that credential, so neither SQL grants,
+annotations nor receipts prove a compromised worker honored policy. Chains retain
+`seq`, unique `event_id`, `leaf_hash`, `chain_hash`; erasures retain operation/time
+coordinates. They omit body/account/network fields but can remain correlated to
+internal/external records and are not anonymous or constant-size proof state.
 
 v1 instead stored each event's digest on its own row, so erasing a row removed a
 chain link and had to be bridged by checkpoints recording the removed span's
@@ -209,20 +229,60 @@ serializer it required. The purpose is validating surviving segments and future
 appends, not preserving erased evidence under a different name.
 
 Sanitized `legal.ledger.purged` / `legal.ledger.purge_skipped` Class C receipts
-contain a system actor, opaque operation ID, cutoff, aggregate counts and bounded
-outcomes, never identifiers, legal narratives or complete checkpoint histories.
-Receipt intent, proof changes and deletion are one transaction; delivery uses
-the acknowledged admin audit publisher. Receipt retention follows the existing
-Class C policy, which this task does not redesign. Dry-run commits neither
-deletion, checkpoints nor receipts.
+contain a system actor/event UUID/time, opaque operation ID, cutoff, aggregate
+deleted/held counts, dry-run/outcome and high-water, plus new
+`span_manifest_version=1` / `span_manifest_sha256` committing the exact ordered
+inclusive spans. They omit account refs, source event IDs, blind indexes,
+network/device data and narratives, but are still operation/time/digest-correlatable
+metadata. An actually inspected held-only batch commits the empty manifest with no
+erasure rows; prefiltered holds are not individually inspected skips. Dry-run
+commits neither DELETE, erasure annotations nor receipt intent.
 
-Verification is explicitly database-relative. Checkpoints and Class C receipts
+Separately scoped read-only `admin-legal --operation=ledger-receipts` correlates
+erasure, retained outbox, receipt body/leaf and bounded Class C linkage coverage.
+Unrelated audit narrative bodies are not read for the linkage proof. It reports
+recorded-pending, chained, legacy/unbound, missing/unavailable, invalid and incomplete
+states, bounded pagination and proof coverage, never a global pass. PubAck or
+`published_at` is not chaining, a partial prefix is not a full-chain pass, and
+missing retained material is unavailable assurance. Legitimate pending receipts
+must not block signer restart. Legacy receipts without a manifest remain unbound;
+signed bytes/hashes are not rewritten or retroactively certified. Receipt/outbox
+finite retention is not implemented here; Class C's existing policy gap remains.
+
+Verification is explicitly database-relative. Chains, annotations and Class C receipts
 are not external anchors and do not independently defeat a privileged coherent
 rewrite or backup rollback. External anchoring is a deferred follow-up, not a
 completed Task 5.4 control. Enablement requires the [operator gates](admin-operations.md#security-ledger-retention-task-54),
 including history assessment, explicit bootstrap, real-role denial tests and
 successful dry-run/audit delivery. Task 5.3 deployment closure and Task 5.5
 restricted-narrative retention approval/cleanup remain independent and open.
+
+### 7.2 Surviving Metadata and Lifetimes
+
+The [retained metadata inventory](data-architecture.md#retained-metadata-inventory)
+enumerates exact fields and current lifetimes, including more than the approved
+five-field erased workflow replay stub. Contracted hold tombstones retain original
+account/actor/kind/time/key metadata with `no_expiry`. Erased hold-review replay
+`scope`/`result_id` still joins those tombstones. Case stubs join an erased
+`legal_cases` ID/sentinel even after narratives/associations/clocks are removed.
+These are minimized but not unconditionally anonymous.
+
+Reports retain preparer/approver/auth-version/time/policy/digest/source-version
+provenance; transparency replay prepare/approve results retain actor/report/policy
+references and exact snapshot bytes. Immutable governance records retain operator,
+action, installation time/environment and external approval/inventory references.
+Both chains retain one event UUID/digest node per event; erasures, receipt material,
+settings, aggregate reporting state and Class C payloads have no implemented finite
+expiry here. The literal supported replay lifetime remains `no_expiry`; it does
+not legally approve all these permanent tables or supply a Class C purge policy.
+
+Numeric narrative/context periods do not reset on review/release/retry. Baseline
+context/released-hold cleanup is strict-before; workflow cleanup is at-or-after
+expiry, with closed expiry the minimum of original max age and closure-relative
+retention. Active independent holds defer cleanup, not account recovery expiry.
+Approve actual purposes, legal basis, linkability, notices and retained inventories
+before production processing; finite replay and identifier/pepper lifecycle remain
+separate work. Local automated acceptance is not governance/deployment approval.
 
 ---
 
@@ -253,7 +313,8 @@ case is not an indefinite-retention exemption. Exact policy numbers remain
 unapproved until an external governance decision is installed.
 
 Data-bearing response plans require an accepted content revision and approval by
-a different active DPO account. This is distinct from investigative access and
+a different active DPO account. This means distinct authorized accounts, not
+verification that they represent different humans. This is distinct from investigative access and
 does not automatically transfer data. Document handling and delivery use the
 approved external system with its own retention/access controls. Case review or
 closure never releases Task 5.3 holds. The first release supports one final
@@ -277,7 +338,7 @@ manual governance decision.
 - Deleted data does not vanish from backups instantly. It persists until the relevant backup rotates out (e.g., 14-30 days per Section 3).
 - Backups are encrypted and access-controlled. They are not used to circumvent erasure; they are a disaster-recovery mechanism only.
 - A restore that would reintroduce erased data must re-apply pending deletions and active holds after recovery.
-- Restore ledger, durable head, checkpoints, holds and outbox from one consistent recovery point. Verify before reopening ingestion or purge, then reconcile authoritative holds/deletions and resume eligible expiry. Backup rotation remains independent of live-ledger retention; no automatic fresh genesis, hold bypass or guarantee of recovering erased payloads is permitted. See [disaster recovery](disaster-recovery.md#33-security-ledger-retention-recovery).
+- Restore both payload/chain/head tables and sequence state, erasures, holds, governance/workflow, settings and outbox from one consistent recovery point. Verify before reopening ingestion/purge; separately reconcile pending/chained/legacy/unavailable receipt coverage and authoritative holds/deletions, then resume original eligible expiry. Backup rotation remains independent; no automatic genesis, hold bypass or guarantee of recovering erased payloads. See [disaster recovery](disaster-recovery.md#33-security-ledger-retention-recovery).
 
 ---
 
@@ -328,9 +389,28 @@ Each right is exposed through user-facing endpoints and dashboard controls, and 
 
 ## 15. Vendor / Sub-processor Management
 
-- Third-party processors (e.g., SMS gateway, Infisical KMS) are inventoried.
+- Inventory proposed/enabled SMS.ir and SMTP processors and operator secret-delivery
+  tools. Current crypto loads environment-injected local keys; it does not fetch
+  live Infisical material or supply cached/offline/hot-rotation guarantees.
 - Each has a data-processing agreement (DPA) defining scope, security obligations, and data handling.
 - Sub-processors are reviewed before onboarding and periodically thereafter.
+
+SMS.ir VERIFY sends only to the supported Iranian mobile policy with explicit
+key/template/parameter and budget approval. Sandbox shares the endpoint and
+success-shaped responses but sends nothing; ID/cost/ACK does not prove live key
+provenance or handset delivery. A live received-message test needs separate
+billing/target authorization. SMTP must use verified authenticated TLS and strict
+post-TLS SMTPUTF8 before EAI AUTH/envelope/DATA; no ASCII mailbox downgrade. Relay
+acceptance and durable send intent are not inbox receipt or exactly-once delivery.
+
+New account email is an existing owned mailbox, not a mailbox supplied by the IdP.
+NFC/local lowercase/NFC plus strict IDNA is the declared identity profile; verify,
+store, deliver and lookup exact canonical bytes. Persian/Arabic letters, dot/plus
+variants and NFKC-distinct addresses stay distinct. Generic BlindIndex's NFKC
+construction is unchanged; email capture/fallback/attribution shares its explicit
+canonical input and pepper generation, without rehashing signed history or adding
+historical dual-normalization lookup. Private retired-key backup/recovery and
+coordinated rotation remain operator obligations, not primitive-test assurance.
 
 ---
 
@@ -354,6 +434,6 @@ These are stated as posture and targets; formal certification is pursued as the 
 
 ### Task 5.3 implementation boundary
 
-Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Existing plaintext rows require controlled backfill and verification before enabling intake. See [admin operations](admin-operations.md).
+Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives deletion. Restricted narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but remains personal data. Review dates are advisory. Approved retention and hold-aware cleanup retain replay tombstones without reapplying cleaned holds. Fresh storage has no plaintext narratives; obsolete legal Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 owns separately credentialed ledger retention and retained-segment verification, subject to its deployment gates. External trust anchors are explicitly deferred; phone attribution and pepper rotation remain separate work. Task 5.5 narrative-retention approval is not satisfied by this worker. Do not grant the API ledger DELETE, maintenance EXECUTE or trigger-bypass privileges.
+Task 5.4 owns separately credentialed payload retention, structural verification and read-only receipt reconciliation, not erasure certification or Task 5.5 approval. External anchors, phone attribution and pepper rotation remain separate. API must not get ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002_registration_attempts.sql` through `public.identity_schema_version`; legacy/untracked/contradictory histories refuse without adoption. Stop incompatible writers and isolate matching PostgreSQL/Redis/NATS. Down/reset refuse; any existing-environment reset requires separate explicit scoped authorization and never waives retention/hold/backup obligations. Historical statuses/evidence/plans remain unchanged and do not certify this bundle. Fresh final-source acceptance and [production/manual gates](admin-operations.md#production-checklist) remain independently required.

@@ -11,8 +11,13 @@ package clients
 import (
 	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 )
@@ -113,6 +118,16 @@ type StaticRegistry struct {
 // token endpoint authentication methods so that misconfiguration fails fast at
 // startup rather than surfacing as confusing runtime authorization errors.
 func NewStaticRegistry(list []Client) (*StaticRegistry, error) {
+	return newStaticRegistry(list, false)
+}
+
+// NewDevelopmentStaticRegistry permits HTTP callbacks only at canonical localhost
+// or loopback addresses. Runtime composition must select this only in development.
+func NewDevelopmentStaticRegistry(list []Client) (*StaticRegistry, error) {
+	return newStaticRegistry(list, true)
+}
+
+func newStaticRegistry(list []Client, development bool) (*StaticRegistry, error) {
 	byID := make(map[string]Client, len(list))
 	for _, c := range list {
 		if strings.TrimSpace(c.ID) == "" {
@@ -123,6 +138,11 @@ func NewStaticRegistry(list []Client) (*StaticRegistry, error) {
 		}
 		if len(c.RedirectURIs) == 0 {
 			return nil, fmt.Errorf("clients: client %q has no redirect URIs", c.ID)
+		}
+		for _, uri := range c.RedirectURIs {
+			if !validRedirectURI(uri, development) {
+				return nil, fmt.Errorf("clients: client %q has an invalid redirect URI (HTTPS required; local HTTP is development-only)", c.ID)
+			}
 		}
 		switch c.TokenEndpointAuthMethod {
 		case AuthMethodNone:
@@ -151,6 +171,73 @@ func NewStaticRegistry(list []Client) (*StaticRegistry, error) {
 		byID[c.ID] = c
 	}
 	return &StaticRegistry{byID: byID}, nil
+}
+
+func validRedirectURI(raw string, development bool) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Host == "" || strings.ContainsAny(raw, "#\\") || !utf8.ValidString(raw) {
+		return false
+	}
+	for _, c := range raw {
+		if unicode.IsSpace(c) || unicode.IsControl(c) {
+			return false
+		}
+	}
+	host := u.Hostname()
+	authority := host
+	local := host == "localhost"
+	if address, err := netip.ParseAddr(host); err == nil {
+		if address.Zone() != "" || address.Is4In6() || address.String() != host {
+			return false
+		}
+		local = address.IsLoopback()
+		if address.Is6() {
+			authority = "[" + host + "]"
+		}
+	} else {
+		if len(host) == 0 || len(host) > 253 {
+			return false
+		}
+		for _, label := range strings.Split(host, ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return false
+			}
+			for _, c := range label {
+				if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+					return false
+				}
+			}
+		}
+		// Reject alternate browser IPv4 spellings instead of treating them as DNS.
+		last := strings.ToLower(host[strings.LastIndex(host, ".")+1:])
+		hex := strings.HasPrefix(last, "0x")
+		if hex {
+			last = last[2:]
+		}
+		numeric := true
+		for _, c := range last {
+			if (c < '0' || c > '9') && (!hex || c < 'a' || c > 'f') {
+				numeric = false
+			}
+		}
+		if numeric {
+			return false
+		}
+	}
+	if u.Scheme != "https" && (!development || !local || u.Scheme != "http") {
+		return false
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
+		authority += ":" + port
+	}
+	return u.Host == authority
 }
 
 // Lookup implements Registry.

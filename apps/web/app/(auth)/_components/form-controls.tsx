@@ -42,7 +42,7 @@ export function AuthField({
         <Input
           {...props}
           id={id}
-          dir={isPassword || type === 'email' || props.inputMode === 'numeric' ? 'ltr' : 'auto'}
+          dir={isPassword || type === 'email' || type === 'tel' || props.inputMode === 'numeric' ? 'ltr' : 'auto'}
           type={isPassword && visible ? 'text' : type}
           aria-describedby={describedBy || undefined}
           aria-invalid={Boolean(error)}

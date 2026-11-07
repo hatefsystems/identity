@@ -2,8 +2,11 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -23,6 +26,21 @@ import (
 // the signer quarantines it rather than defaulting the version and signing a claim
 // the producer never made.
 const EnvelopeSchemaVersion = 2
+
+// MaxEnvelopeBytes bounds intake before JSON allocation. TEXT fields have separate
+// resource bounds; VARCHAR limits below count characters, as PostgreSQL does.
+const MaxEnvelopeBytes = 1024 * 1024
+
+// Envelope admission errors are fixed reason codes, safe for quarantine evidence.
+var (
+	ErrEnvelopeSchema    = errors.New("unsupported_schema")
+	ErrEnvelopeEventID   = errors.New("invalid_event_id")
+	ErrEnvelopeActor     = errors.New("invalid_actor_id")
+	ErrEnvelopeReference = errors.New("invalid_reference")
+	ErrEnvelopeText      = errors.New("invalid_text")
+	ErrEnvelopeTime      = errors.New("invalid_timestamp")
+	ErrEnvelopeIndex     = errors.New("invalid_blind_index")
+)
 
 // Envelope is the JSON message published to the audit subject.
 //
@@ -86,6 +104,75 @@ type EnvelopeSecurity struct {
 	// indistinguishable on the wire — which is exactly the ambiguity that makes a
 	// pepper unrotatable.
 	BlindIndexVersion int16 `json:"blind_index_version"`
+}
+
+// Validate checks the admitted v2 representation without rewriting any field.
+// In particular, hashing actor text and then storing a parsed UUID is safe only
+// when that text already equals the database's canonical UUID representation.
+func (e Envelope) Validate() error {
+	if e.SchemaVersion != EnvelopeSchemaVersion {
+		return ErrEnvelopeSchema
+	}
+	if e.EventID == uuid.Nil {
+		return ErrEnvelopeEventID
+	}
+	if !canonicalEnvelopeUUID(e.ActorID) {
+		return ErrEnvelopeActor
+	}
+	if e.SubjectID != "" && !canonicalEnvelopeUUID(e.SubjectID) {
+		return ErrEnvelopeReference
+	}
+	if e.OccurredAt.IsZero() || e.OccurredAt.UTC().Year() < 1 || e.OccurredAt.UTC().Year() > 9999 {
+		return ErrEnvelopeTime
+	}
+	for _, field := range []struct {
+		value string
+		limit int
+	}{
+		{e.ActorSPIFFEID, 255}, {e.EventType, 100}, {e.ActionStatus, 50}, {e.ClientIP, 50},
+		{e.UserAgent, 8192}, {e.Payload, MaxEnvelopeBytes},
+	} {
+		if !validEnvelopeText(field.value, field.limit) {
+			return ErrEnvelopeText
+		}
+	}
+	if e.EventType == "" {
+		return ErrEnvelopeText
+	}
+	if security := e.Security; security != nil {
+		if !canonicalEnvelopeUUID(security.AccountRef) {
+			return ErrEnvelopeReference
+		}
+		for _, field := range []struct {
+			value string
+			limit int
+		}{
+			{security.ClientID, 100}, {security.DeviceFingerprint, 128}, {security.Scope, 8192},
+		} {
+			if !validEnvelopeText(field.value, field.limit) {
+				return ErrEnvelopeText
+			}
+		}
+		if security.BlindIndexVersion < 0 {
+			return ErrEnvelopeIndex
+		}
+		if index := security.IdentityBlindIndex; index != nil {
+			if len(*index) != ChainHashHexLen || strings.Trim(*index, "0123456789abcdef") != "" {
+				return ErrEnvelopeIndex
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalEnvelopeUUID(value string) bool {
+	id, err := uuid.Parse(value)
+	return err == nil && value == id.String()
+}
+
+func validEnvelopeText(value string, limit int) bool {
+	return len(value) <= MaxEnvelopeBytes && utf8.ValidString(value) &&
+		!strings.ContainsRune(value, 0) && utf8.RuneCountInString(value) <= limit
 }
 
 // emptyPayload is the JSON text used when an event carries no context. The column

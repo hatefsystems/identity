@@ -116,7 +116,7 @@ func deriveGenesis(prefix string) Digest {
 // GoldenAuditGenesisHex and GoldenLedgerGenesisHex restate the two genesis
 // digests as literals.
 //
-// They exist because migration 00015 has to embed the same two values in the
+// They exist because the baseline has to embed the same two values in the
 // chain heads' CHECK constraints, and a CHECK cannot call into Go. That makes the
 // migration the one place the canonical format is duplicated outside this file,
 // so the duplication is pinned from both ends: chain_golden_test.go asserts these

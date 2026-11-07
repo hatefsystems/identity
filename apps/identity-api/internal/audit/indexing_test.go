@@ -26,7 +26,7 @@ func (f identitySourceFunc) GetUserEmailForBlindIndex(ctx context.Context, id uu
 
 func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {
 	next := &capturedRecorder{}
-	indexer, err := blindindex.New([]byte(strings.Repeat("p", 32)), 0)
+	indexer, err := blindindex.New([]byte(strings.Repeat("p", 32)), 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,9 @@ func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {
 	if got := next.event.Security.IdentityBlindIndex; got == nil || *got != indexer.Compute(email) {
 		t.Fatal("index was not captured synchronously")
 	}
+	if next.event.Security.BlindIndexVersion != 7 || e.Security.BlindIndexVersion != 0 {
+		t.Fatal("captured generation missing or caller mutated")
+	}
 	env, err := NewEnvelope(next.event, uuid.New(), fixedTime)
 	if err != nil {
 		t.Fatal(err)
@@ -64,6 +67,10 @@ func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {
 	}
 	if strings.Contains(env.Payload, *env.Security.IdentityBlindIndex) {
 		t.Fatal("index leaked into audit payload")
+	}
+	var decoded Envelope
+	if err := json.Unmarshal(raw, &decoded); err != nil || decoded.Security.BlindIndexVersion != 7 {
+		t.Fatal("captured generation lost across envelope roundtrip")
 	}
 	*next.event.Security.IdentityBlindIndex = "changed"
 	if *env.Security.IdentityBlindIndex != indexer.Compute(email) {
@@ -111,13 +118,75 @@ func TestIndexingRecorderCaptureFailureDoesNotLeakError(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, _, _ := envelopeTestEvent()
+	e.Security.BlindIndexVersion = 9
 	if err := r.Record(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
 	if next.event.Security.IdentityBlindIndex != nil {
 		t.Fatal("invented index after failed capture")
 	}
+	if next.event.Security.BlindIndexVersion != 9 {
+		t.Fatal("missing-capture fallback generation changed")
+	}
 	if strings.Contains(logs.String(), "sensitive") || !strings.Contains(logs.String(), "audit_index_capture_missing") {
 		t.Fatalf("unsafe or missing diagnostic: %s", logs.String())
+	}
+}
+
+func TestIndexingRecorderPreservesCapturedPair(t *testing.T) {
+	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)), 7)
+	next := &capturedRecorder{}
+	r, err := NewIndexingRecorder(next, identitySourceFunc(func(context.Context, uuid.UUID) (string, error) {
+		t.Fatal("already captured pair queried live identity")
+		return "", nil
+	}), indexer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _, _ := envelopeTestEvent()
+	digest := strings.Repeat("a", 64)
+	e.Security.IdentityBlindIndex = &digest
+	e.Security.BlindIndexVersion = 3
+	if err := r.Record(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if next.event.Security.BlindIndexVersion != 3 || *next.event.Security.IdentityBlindIndex != digest {
+		t.Fatal("existing capture pair replaced")
+	}
+	*next.event.Security.IdentityBlindIndex = "changed"
+	if digest != strings.Repeat("a", 64) {
+		t.Fatal("retained caller's mutable index pointer")
+	}
+}
+
+func TestIndexingRecorderEmailSpecificCapture(t *testing.T) {
+	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)), 7)
+	for _, email := range []string{"\u062d\u0627\u062a\u0641@\u0645\u062b\u0627\u0644.ir", "\ufb00@example.test", "f\u0066@example.test", "bad\x00@example.test"} {
+		t.Run(email, func(t *testing.T) {
+			next := &capturedRecorder{}
+			var logs bytes.Buffer
+			r, err := NewIndexingRecorder(next, identitySourceFunc(func(context.Context, uuid.UUID) (string, error) { return email, nil }), indexer, slog.New(slog.NewTextHandler(&logs, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, _, _ := envelopeTestEvent()
+			e.Security.BlindIndexVersion = 3
+			if err := r.Record(context.Background(), e); err != nil {
+				t.Fatal(err)
+			}
+			want, err := indexer.ComputeEmail(email)
+			if err != nil {
+				if next.event.Security.IdentityBlindIndex != nil || next.event.Security.BlindIndexVersion != 3 || strings.Contains(logs.String(), "bad") {
+					t.Fatal("invalid email captured or leaked")
+				}
+				return
+			}
+			if next.event.Security.IdentityBlindIndex == nil || *next.event.Security.IdentityBlindIndex != want || next.event.Security.BlindIndexVersion != 7 {
+				t.Fatal("email-specific capture pair mismatch")
+			}
+			if email == "\ufb00@example.test" && want == indexer.Compute(email) {
+				t.Fatal("capture used generic NFKC index")
+			}
+		})
 	}
 }

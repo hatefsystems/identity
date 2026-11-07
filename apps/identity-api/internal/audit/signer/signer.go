@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -58,7 +59,7 @@ type Fetcher interface {
 // generation is hashed into the signed ledger body, so a row written without it
 // could never be re-derived after a pepper rotation.
 type BlindIndexer interface {
-	Compute(pii string) string
+	ComputeEmail(email string) (string, error)
 	Version() int16
 }
 
@@ -676,23 +677,30 @@ func (s *Signer) decode(msgs []jetstream.Msg) []messageOutcome {
 	outcomes := make([]messageOutcome, 0, len(msgs))
 	for _, msg := range msgs {
 		var env audit.Envelope
-		err := json.Unmarshal(msg.Data(), &env)
-		if err == nil && env.SchemaVersion != audit.EnvelopeSchemaVersion {
-			// Forward compatibility is a decode failure on purpose: guessing at an
-			// unknown layout would write a record whose hashed bytes do not describe
-			// the event that actually happened.
-			err = fmt.Errorf("unsupported envelope schema version %d (this signer speaks %d)",
-				env.SchemaVersion, audit.EnvelopeSchemaVersion)
+		reason := ""
+		switch {
+		case len(msg.Data()) > audit.MaxEnvelopeBytes:
+			reason = "envelope_too_large"
+		case !utf8.Valid(msg.Data()) || json.Unmarshal(msg.Data(), &env) != nil:
+			reason = "invalid_json"
+		default:
+			if err := env.Validate(); err != nil {
+				reason = err.Error()
+			} else if audit.IsLedgerEventType(env.EventType) && env.OccurredAt.Add(s.cfg.LedgerRetention).UTC().Year() > 9999 {
+				reason = "invalid_retention_timestamp"
+			} else if audit.IsLedgerEventType(env.EventType) && env.ClientIP != "" {
+				// The subnet is a derived VARCHAR(50), not an envelope field. Even
+				// the rate limiter's invalid-source bucket must be representable.
+				subnet := ratelimit.Subnet(env.ClientIP)
+				if !utf8.ValidString(subnet) || utf8.RuneCountInString(subnet) > 50 {
+					reason = "invalid_subnet"
+				}
+			}
 		}
-		if err == nil && env.EventID == uuid.Nil {
-			// Without an id there is no deduplication key, so an at-least-once
-			// redelivery would silently append a duplicate.
-			err = errors.New("envelope carries no event id")
-		}
-		if err != nil {
+		if reason != "" {
 			outcomes = append(outcomes, messageOutcome{
 				msg:         msg,
-				record:      s.quarantineRecord(msg, err),
+				record:      s.quarantineRecord(msg, reason),
 				undecodable: true,
 			})
 			continue
@@ -704,7 +712,7 @@ func (s *Signer) decode(msgs []jetstream.Msg) []messageOutcome {
 
 // quarantineRecord synthesizes the audit record that stands in for a message the
 // signer could not decode.
-func (s *Signer) quarantineRecord(msg jetstream.Msg, cause error) pendingRecord {
+func (s *Signer) quarantineRecord(msg jetstream.Msg, reason string) pendingRecord {
 	raw := msg.Data()
 	digest := sha256.Sum256(raw)
 	rawDigest := hex.EncodeToString(digest[:])
@@ -732,7 +740,7 @@ func (s *Signer) quarantineRecord(msg jetstream.Msg, cause error) pendingRecord 
 		slog.Uint64("stream_sequence", streamSeq),
 		slog.Int("raw_bytes", len(raw)),
 		slog.String("raw_sha256", rawDigest),
-		slog.String("error", cause.Error()))
+		slog.String("reason", reason))
 
 	env := audit.Envelope{
 		EventID:       eventID,
@@ -747,7 +755,7 @@ func (s *Signer) quarantineRecord(msg jetstream.Msg, cause error) pendingRecord 
 			"stream_sequence": streamSeq,
 			"raw_bytes":       len(raw),
 			"raw_sha256":      rawDigest,
-			"reason":          cause.Error(),
+			"reason":          reason,
 		}),
 	}
 	return pendingRecord{envelope: env}
@@ -880,7 +888,7 @@ var errUnattributableLedgerEvent = errors.New("signer: ledger event attribution 
 
 // blindIndexFor resolves and caches identity_blind_index for one account.
 //
-// This is the fallback for legacy queued envelopes or failed producer capture.
+// This is the fallback for current v2 envelopes with missing producer capture.
 // The email is read, hashed, and discarded; it is never logged.
 //
 // A purged subject yields NULL, which is the column's designed state for
@@ -910,7 +918,10 @@ func (s *Signer) blindIndexFor(ctx context.Context, store Store, cache map[uuid.
 		return nil, fmt.Errorf("signer: resolve email for blind index: %w", err)
 	}
 
-	digest := s.indexer.Compute(email)
+	digest, err := s.indexer.ComputeEmail(email)
+	if err != nil {
+		return nil, errors.New("signer: invalid email for blind index")
+	}
 	cache[accountRef] = &digest
 	return &digest, nil
 }

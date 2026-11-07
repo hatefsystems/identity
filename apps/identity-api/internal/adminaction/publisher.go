@@ -82,15 +82,32 @@ func (p *Publisher) RunOnce(ctx context.Context) (int, error) {
 	}
 	published := 0
 	failed := false
-	for _, row := range rows {
+	deadline, _ := ctx.Deadline()
+	commitReserve := min(time.Second, p.cfg.BatchTimeout/10)
+	for index, row := range rows {
+		if ctx.Err() != nil {
+			return 0, ErrUnavailable
+		}
+		// Commit attempted outcomes instead of exhausting the batch on the broker.
+		// Unattempted claims are unlocked at commit with their metadata unchanged.
+		remaining := time.Until(deadline)
+		if remaining <= commitReserve || (index > 0 && remaining <= p.cfg.PublishTimeout+commitReserve) {
+			break
+		}
 		// Protect the signer against accidentally misrouted or corrupted rows.
 		// Never include the payload or broker error text in last_error/logs.
 		var env audit.Envelope
 		retryCode := "invalid_envelope"
 		var ack *jetstream.PubAck
-		if json.Unmarshal([]byte(row.Payload), &env) == nil && env.EventID == row.ID &&
-			env.SchemaVersion == audit.EnvelopeSchemaVersion && env.Security == nil && eventName.MatchString(env.EventType) {
-			publishCtx, cancelPublish := context.WithTimeout(ctx, p.cfg.PublishTimeout)
+		if len(row.Payload) <= audit.MaxEnvelopeBytes && json.Unmarshal([]byte(row.Payload), &env) == nil && env.EventID == row.ID &&
+			env.Validate() == nil && env.Security == nil && eventName.MatchString(env.EventType) {
+			// The first attempt may have a shortened budget, but never takes the
+			// reserved time needed to persist even an uncertain PubAck outcome.
+			publishDeadline := time.Now().Add(p.cfg.PublishTimeout)
+			if reservedDeadline := deadline.Add(-commitReserve); reservedDeadline.Before(publishDeadline) {
+				publishDeadline = reservedDeadline
+			}
+			publishCtx, cancelPublish := context.WithDeadline(ctx, publishDeadline)
 			ack, err = p.js.Publish(publishCtx, p.subject, []byte(row.Payload), jetstream.WithMsgID(row.ID.String()))
 			cancelPublish()
 			retryCode = "publish_unacknowledged"

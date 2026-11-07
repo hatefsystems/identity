@@ -5,10 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -17,9 +18,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
@@ -35,7 +36,10 @@ import (
 // phoneFakeUserStore is the smsotp.UserStore seam: it confirms the account
 // exists and records the persisted, encrypted phone plus its blind index.
 type phoneFakeUserStore struct {
-	users map[uuid.UUID]bool
+	mu           sync.Mutex
+	users        map[uuid.UUID]bool
+	version      int64
+	phonePresent bool
 
 	setCalled     bool
 	setUserID     uuid.UUID
@@ -47,24 +51,39 @@ type phoneFakeUserStore struct {
 }
 
 func (f *phoneFakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if !f.users[id] {
 		return db.User{}, pgx.ErrNoRows
 	}
-	return db.User{ID: id, Status: "active"}, nil
+	return db.User{ID: id, Status: "active", AuthVersion: f.version}, nil
 }
 
-func (f *phoneFakeUserStore) SetUserPhone(_ context.Context, arg db.SetUserPhoneParams) (int64, error) {
+func (f *phoneFakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, version int64, encrypted []byte, index string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if version != f.version {
+		return smsotp.ErrStaleSession
+	}
 	f.setCalled = true
-	f.setUserID = arg.ID
-	f.setEncrypted = arg.PhoneEncrypted
-	f.setBlindIndex = arg.PhoneBlindIndex
-	return 1, nil
+	f.setUserID = id
+	f.setEncrypted = encrypted
+	f.setBlindIndex = &index
+	f.phonePresent = true
+	return nil
 }
 
-func (f *phoneFakeUserStore) RemoveUserPhone(_ context.Context, id uuid.UUID) (int64, error) {
+func (f *phoneFakeUserStore) RemovePhoneIfCurrent(_ context.Context, id uuid.UUID, version int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if version != f.version {
+		return false, smsotp.ErrStaleSession
+	}
 	f.removeCalled = true
 	f.removeUserID = id
-	return 1, nil
+	changed := f.phonePresent
+	f.phonePresent = false
+	return changed, nil
 }
 
 // phoneFakeEncryptor prefixes plaintext so the test can confirm encryption ran.
@@ -101,7 +120,7 @@ func newPhoneFakeOTPStore() *phoneFakeOTPStore {
 	}
 }
 
-func (f *phoneFakeOTPStore) Store(_ context.Context, verificationID string, record smsotp.OTPRecord, _ time.Duration) error {
+func (f *phoneFakeOTPStore) Store(_ context.Context, verificationID string, record smsotp.OTPRecord, _ time.Duration, _ int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	record.Attempts = 0
@@ -119,15 +138,30 @@ func (f *phoneFakeOTPStore) Get(_ context.Context, verificationID string) (smsot
 	return *rec, nil
 }
 
-func (f *phoneFakeOTPStore) IncrementAttempts(_ context.Context, verificationID string) (int, error) {
+func (f *phoneFakeOTPStore) Consume(_ context.Context, verificationID string, expected smsotp.OTPRecord, candidate string, maxAttempts int, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	rec, ok := f.records[verificationID]
 	if !ok {
-		return 0, smsotp.ErrNoActiveCode
+		return smsotp.ErrNoActiveCode
+	}
+	if rec.OTPBinding != expected.OTPBinding || rec.Phone != expected.Phone || rec.CodeHash != expected.CodeHash {
+		return smsotp.ErrNoActiveCode
+	}
+	if f.lockouts[rec.Phone] {
+		return smsotp.ErrLockedOut
+	}
+	if rec.CodeHash == candidate {
+		delete(f.records, verificationID)
+		return nil
 	}
 	rec.Attempts++
-	return rec.Attempts, nil
+	if rec.Attempts >= maxAttempts {
+		f.lockouts[rec.Phone] = true
+		delete(f.records, verificationID)
+		return smsotp.ErrLockedOut
+	}
+	return smsotp.ErrInvalidCode
 }
 
 func (f *phoneFakeOTPStore) Delete(_ context.Context, verificationID string) error {
@@ -150,26 +184,20 @@ func (f *phoneFakeOTPStore) IsLockedOut(_ context.Context, phone string) (bool, 
 	return f.lockouts[phone], nil
 }
 
-// phoneCapturingSender records the delivered message so the test can recover the
-// plaintext OTP (the last whitespace-delimited token of the default template)
-// and replay it against the verify endpoint.
+// phoneCapturingSender receives the code directly through the sender seam.
 type phoneCapturingSender struct {
 	mu        sync.Mutex
 	calls     int
 	lastPhone string
 	lastCode  string
-	message   string
 }
 
-func (f *phoneCapturingSender) Send(_ context.Context, phone, message string) error {
+func (f *phoneCapturingSender) SendCode(_ context.Context, phone, code string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastPhone = phone
-	f.message = message
-	if fields := strings.Fields(message); len(fields) > 0 {
-		f.lastCode = fields[len(fields)-1]
-	}
+	f.lastCode = code
 	return nil
 }
 
@@ -210,7 +238,7 @@ func newPhoneTestFixture(t *testing.T, limiterAllows, withStepUp bool) *phoneTes
 	sender := &phoneCapturingSender{}
 
 	svc, err := smsotp.New(
-		smsotp.Config{},
+		smsotp.Config{HashPepper: []byte(strings.Repeat("p", 32))},
 		users,
 		phoneFakeEncryptor{},
 		phoneFakeIndexer{},
@@ -243,10 +271,11 @@ func newPhoneTestFixture(t *testing.T, limiterAllows, withStepUp bool) *phoneTes
 	// Pre-issue a bound session and capture its cookie.
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
-		UserID:    userID.String(),
-		IP:        "127.0.0.1",
-		UserAgent: "test-agent",
-		DPoPJKT:   browser.jkt,
+		UserID:         userID.String(),
+		IP:             "127.0.0.1",
+		UserAgent:      "test-agent",
+		DPoPJKT:        browser.jkt,
+		AuthVersionSet: true,
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)
@@ -310,7 +339,7 @@ func (fx *phoneTestFixture) deletePhone(t *testing.T, withGrant bool) *httptest.
 
 // doPhone issues a request against the phone routes with explicitly selected
 // session and step-up credentials.
-func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current session.Session, cookie *http.Cookie, grant string, localeValues ...string) *httptest.ResponseRecorder {
+func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current session.Session, cookie *http.Cookie, grant string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	var reader io.Reader
@@ -331,9 +360,6 @@ func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current
 	if grant != "" {
 		req.Header.Set(stepup.HeaderStepUpAuth, grant)
 	}
-	for _, value := range localeValues {
-		req.Header.Add(notification.LocaleHeader, value)
-	}
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
@@ -348,10 +374,11 @@ func (fx *phoneTestFixture) issueSession(t *testing.T) (session.Session, *http.C
 	t.Helper()
 	w := httptest.NewRecorder()
 	sess, err := fx.sessionManager.Issue(w, session.IssueParams{
-		UserID:    fx.userID.String(),
-		IP:        "127.0.0.2",
-		UserAgent: "second-test-agent",
-		DPoPJKT:   fx.browser.jkt,
+		UserID:         fx.userID.String(),
+		IP:             "127.0.0.2",
+		UserAgent:      "second-test-agent",
+		DPoPJKT:        fx.browser.jkt,
+		AuthVersionSet: true,
 	})
 	if err != nil {
 		t.Fatalf("issue second session: %v", err)
@@ -375,48 +402,6 @@ func decodePhoneSendResponse(t *testing.T, rec *httptest.ResponseRecorder) phone
 }
 
 // --- Tests ------------------------------------------------------------------
-
-func TestPhoneNotificationLocaleHeaderIsPresentationOnly(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		values []string
-		prefix string
-	}{
-		{"missing", nil, "Your Hatef verification code is "},
-		{"English", []string{"en"}, "Your Hatef verification code is "},
-		{"Persian", []string{"fa-IR"}, "کد تأیید هویت هاتف شما: "},
-		{"unknown", []string{"ar"}, "Your Hatef verification code is "},
-		{"alias", []string{"fa"}, "Your Hatef verification code is "},
-		{"duplicate", []string{"fa-IR", "fa-IR"}, "Your Hatef verification code is "},
-		{"list", []string{"fa-IR,en"}, "Your Hatef verification code is "},
-		{"oversized", []string{strings.Repeat("fa-IR", 1000)}, "Your Hatef verification code is "},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fx := setupPhoneTestFixture(t, true)
-			rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": "+15550102020"}, fx.sess, fx.cookie, fx.freshGrant(t), tc.values...)
-			if rec.Code != http.StatusOK || fx.sender.calls != 1 || !regexp.MustCompile(`^[0-9]{6}$`).MatchString(fx.sender.code()) || fx.sender.message != tc.prefix+fx.sender.code() {
-				t.Fatal("presentation header changed authorization, response, or exact ASCII OTP")
-			}
-			response := decodePhoneSendResponse(t, rec)
-			if response.VerificationID == "" || strings.Contains(rec.Body.String(), "fa-IR") || strings.Contains(rec.Body.String(), fx.sender.code()) {
-				t.Fatal("locale or plaintext code leaked into phone response")
-			}
-		})
-	}
-	for _, missing := range []string{"session", "step-up"} {
-		t.Run("Persian cannot replace "+missing, func(t *testing.T) {
-			fx := setupPhoneTestFixture(t, true)
-			current, cookie := fx.sess, fx.cookie
-			if missing == "session" {
-				current, cookie = session.Session{}, nil
-			}
-			rec := fx.doPhone(t, "/api/v1/users/me/phone/send-code", map[string]string{"phone": "+15550102020"}, current, cookie, "", "fa-IR")
-			if rec.Code < 400 || fx.sender.calls != 0 {
-				t.Fatal("presentation header supplied missing authority")
-			}
-		})
-	}
-}
 
 func TestPhoneRoutesRequireSession(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
@@ -528,8 +513,12 @@ func TestPhoneVerifyWrongCode(t *testing.T) {
 	}
 
 	response := decodePhoneSendResponse(t, rec)
+	wrongCode := "000000"
+	if fx.sender.code() == wrongCode {
+		wrongCode = "000001"
+	}
 	rec = fx.doPhone(t, "/api/v1/users/me/phone/verify",
-		map[string]string{"verification_id": response.VerificationID, "code": "000000"}, fx.sess, fx.cookie, "")
+		map[string]string{"verification_id": response.VerificationID, "code": wrongCode}, fx.sess, fx.cookie, "")
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("verify wrong code: expected 400, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -724,5 +713,101 @@ func TestPhoneRemoveAbsentWithoutStepUpService(t *testing.T) {
 	}
 	if fx.users.removeCalled {
 		t.Error("an unmounted route removed the phone")
+	}
+}
+
+func TestPhoneDisabledDeliveryKeepsAuthorizedRemoval(t *testing.T) {
+	fx := setupPhoneTestFixture(t, true)
+	disabled, err := smsotp.NewDisabled(fx.users)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.server = New(config.Config{Environment: "development", PortalOrigin: fx.browser.origin}, nil, Deps{SessionManager: fx.sessionManager, DPoPValidator: fx.browser.validator, SMSOTP: disabled, StepUp: fx.stepUp})
+	for _, path := range []string{"/api/v1/users/me/phone/send-code", "/api/v1/users/me/phone/verify"} {
+		rec := fx.doPhone(t, path, map[string]string{}, fx.sess, fx.cookie, "")
+		if rec.Code != 404 && rec.Code != 405 {
+			t.Fatalf("disabled route mounted: %d", rec.Code)
+		}
+	}
+	fx.users.phonePresent = true
+	if rec := fx.deletePhone(t, true); rec.Code != 204 || fx.users.phonePresent {
+		t.Fatalf("disabled removal failed: %d", rec.Code)
+	}
+}
+
+func TestPhoneErrorsDoNotLogPrivateDependencyErrors(t *testing.T) {
+	fx := setupPhoneTestFixture(t, true)
+	var logs bytes.Buffer
+	fx.server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	for _, err := range []error{errors.New("private-key phone code provider-body"), smsotp.ErrSendFailed, smsotp.ErrRestartRequired} {
+		rec := httptest.NewRecorder()
+		fx.server.writePhoneError(rec, "verify phone code", err)
+		if rec.Code != 500 || errorBody(t, rec) != "server_error" || strings.Contains(rec.Body.String(), "private-key") {
+			t.Fatal("private error disclosed")
+		}
+	}
+	if strings.Contains(logs.String(), "private-key") || strings.Contains(logs.String(), "provider-body") {
+		t.Fatal("private dependency error logged")
+	}
+}
+
+type phoneAuditRecorder struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (r *phoneAuditRecorder) Record(_ context.Context, event audit.Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+	return nil
+}
+func (r *phoneAuditRecorder) count(kind string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, event := range r.events {
+		if event.EventType == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func TestPhoneConcurrentRemovalRecordsOneEvent(t *testing.T) {
+	fx := setupPhoneTestFixture(t, true)
+	fx.users.phonePresent = true
+	recorder := &phoneAuditRecorder{}
+	fx.server.deps.AuditRecorder = recorder
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			fx.server.handlePhoneRemove().ServeHTTP(w, profileHandlerRequest(fx.sess, http.MethodDelete, ""))
+			if w.Code != 204 {
+				t.Errorf("removal status=%d", w.Code)
+			}
+		}()
+	}
+	wg.Wait()
+	if recorder.count(audit.EventPhoneRemoved) != 1 {
+		t.Fatal("duplicate phone-removal audit event")
+	}
+}
+func TestPhoneMissingAuthVersionAndStaleRequestsDoNotRecordSuccess(t *testing.T) {
+	fx := setupPhoneTestFixture(t, true)
+	recorder := &phoneAuditRecorder{}
+	fx.server.deps.AuditRecorder = recorder
+	for _, captured := range []bool{true, false} {
+		sess := fx.sess
+		sess.AuthVersionSet = captured
+		sess.AuthVersion = 7
+		w := httptest.NewRecorder()
+		fx.server.handlePhoneRemove().ServeHTTP(w, profileHandlerRequest(sess, http.MethodDelete, ""))
+		if w.Code != 401 || recorder.count(audit.EventPhoneRemoved) != 0 || fx.users.removeCalled {
+			t.Fatal("stale/missing authority removed phone or recorded success")
+		}
 	}
 }

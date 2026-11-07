@@ -20,7 +20,8 @@ type holdState struct {
 }
 
 func loadHold(ctx context.Context, tx pgx.Tx, id uuid.UUID, lock bool) (holdState, error) {
-	sql := `SELECT h.id,h.account_ref,h.is_active,h.released_at,COALESCE(r.version,0),r.policy_id,r.next_review_at
+	sql := `SELECT h.id,h.account_ref,h.is_active,h.released_at,COALESCE(r.version,0),r.policy_id,
+        CASE WHEN r.hold_id IS NULL THEN h.review_at ELSE r.next_review_at END
         FROM legal_holds h LEFT JOIN legal_hold_reviews r ON r.hold_id=h.id WHERE h.id=$1`
 	if lock {
 		sql += " FOR UPDATE OF h"

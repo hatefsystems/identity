@@ -27,6 +27,7 @@ func IsLegalWorkflowOperation(operation string) bool {
 		"POST /api/v1/admin/legal-cases/{case_id}/close",
 		"GET /api/v1/admin/legal-reviews",
 		"POST /api/v1/admin/legal-holds/{hold_id}/reviews",
+		"GET /api/v1/admin/legal-holds/{hold_id}/reviews",
 		"POST /api/v1/admin/legal-cases/{case_id}/response",
 		"POST /api/v1/admin/legal-cases/{case_id}/response/approve",
 		"POST /api/v1/admin/legal-cases/{case_id}/response/delivery",

@@ -217,6 +217,25 @@ SET phone_encrypted = NULL,
 WHERE id = $1
   AND deleted_at IS NULL;
 
+-- name: SetUserPhoneIfAuthorized :execrows
+-- Caller holds the subject advisory lock and user row lock.
+UPDATE users
+SET phone_encrypted = $2,
+    phone_blind_index = $3,
+    updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL AND status = 'active'
+  AND auth_version = $4;
+
+-- name: RemoveUserPhoneIfAuthorized :execrows
+-- Row count is the actual change, not the account's presence before an update.
+UPDATE users
+SET phone_encrypted = NULL,
+    phone_blind_index = NULL,
+    updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL AND status = 'active'
+  AND auth_version = $2
+  AND (phone_encrypted IS NOT NULL OR phone_blind_index IS NOT NULL);
+
 -- name: SetUserBackupEmail :execrows
 UPDATE users
 SET backup_email_encrypted = $2,

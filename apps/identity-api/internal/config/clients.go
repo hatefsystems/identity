@@ -83,6 +83,9 @@ func (c clientJSON) publicKeys() (map[string]*keys.PublicKey, error) {
 // returned registry validates each client (see clients.NewStaticRegistry), so
 // malformed configuration fails fast at startup.
 func LoadClients(environment string) (*clients.StaticRegistry, error) {
+	if err := ValidateEnvironment(environment); err != nil {
+		return nil, err
+	}
 	isDev := environment == "development"
 	raw := getEnv(EnvOIDCClients, "")
 
@@ -90,7 +93,7 @@ func LoadClients(environment string) (*clients.StaticRegistry, error) {
 		if !isDev {
 			return nil, fmt.Errorf("config: %s is required outside development", EnvOIDCClients)
 		}
-		return clients.NewStaticRegistry(devDefaultClients())
+		return clients.NewDevelopmentStaticRegistry(devDefaultClients())
 	}
 
 	var decoded []clientJSON
@@ -114,6 +117,9 @@ func LoadClients(environment string) (*clients.StaticRegistry, error) {
 			AllowedScopes:           c.AllowedScopes,
 			PublicKeys:              publicKeys,
 		})
+	}
+	if isDev {
+		return clients.NewDevelopmentStaticRegistry(list)
 	}
 	return clients.NewStaticRegistry(list)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,16 +224,38 @@ func TestLoadPrivacyConfigDrivesService(t *testing.T) {
 }
 
 func TestLoadPrivacyRequiresProductionThirtyDays(t *testing.T) {
-	for _, environment := range []string{"production", "staging", ""} {
-		for _, duration := range []string{"24h", "719h59m59s", "720h", "721h"} {
-			t.Run(environment+"/"+duration, func(t *testing.T) {
-				clearPrivacyEnv(t)
-				t.Setenv(EnvGDPRGracePeriod, duration)
-				_, err := LoadPrivacy(environment)
-				if (err == nil) != (duration == "720h") {
-					t.Fatalf("LoadPrivacy(%q) with %s: %v", environment, duration, err)
-				}
-			})
+	for _, duration := range []string{"24h", "719h59m59s", "720h", "721h"} {
+		t.Run(duration, func(t *testing.T) {
+			clearPrivacyEnv(t)
+			t.Setenv(EnvGDPRGracePeriod, duration)
+			_, err := LoadPrivacy("production")
+			if (err == nil) != (duration == "720h") {
+				t.Fatalf("LoadPrivacy(production) with %s: %v", duration, err)
+			}
+		})
+	}
+}
+
+func TestLoadPrivacyRequiresExactSuppliedEnvironment(t *testing.T) {
+	for _, environment := range []string{"", " ", "\t", "staging", "Production", "production "} {
+		t.Run(environment, func(t *testing.T) {
+			clearPrivacyEnv(t)
+			t.Setenv("APP_ENV", "development")
+			cfg, err := LoadPrivacy(environment)
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.GracePeriod != 0 {
+				t.Fatalf("invalid privacy mode admitted: %+v %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestLoadPrivacyTestModePreservesShortGrace(t *testing.T) {
+	clearPrivacyEnv(t)
+	t.Setenv(EnvGDPRGracePeriod, "24h")
+	for _, environment := range []string{"development", "test"} {
+		cfg, err := LoadPrivacy(environment)
+		if err != nil || cfg.GracePeriod != 24*time.Hour {
+			t.Fatalf("explicit %s short grace rejected: %v", environment, err)
 		}
 	}
 }

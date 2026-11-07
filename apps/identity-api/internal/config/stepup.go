@@ -67,7 +67,22 @@ const (
 // documented defaults for every unset tunable and failing fast on a malformed
 // value or a grant lifetime above the published 5-minute ceiling. The replay
 // HMAC key may be omitted only when environment is explicitly development.
+// One supplied mode is validated directly; no arguments reads APP_ENV.
 func LoadStepUp(environment ...string) (StepUpConfig, error) {
+	var mode string
+	var err error
+	switch len(environment) {
+	case 0:
+		mode, err = LoadEnvironment()
+	case 1:
+		mode = environment[0]
+		err = ValidateEnvironment(mode)
+	default:
+		return StepUpConfig{}, fmt.Errorf("config: step-up requires zero or one environment argument")
+	}
+	if err != nil {
+		return StepUpConfig{}, err
+	}
 	cfg := StepUpConfig{
 		TokenTTL:            defaultStepUpTokenTTL,
 		PerAccountPerMinute: defaultStepUpPerAccountPerMinute,
@@ -77,7 +92,7 @@ func LoadStepUp(environment ...string) (StepUpConfig, error) {
 
 	rawReplayKey, ok := os.LookupEnv(EnvStepUpReplayHMACKey)
 	if !ok || rawReplayKey == "" {
-		if len(environment) == 1 && environment[0] == "development" {
+		if mode == "development" {
 			return loadStepUpPolicy(cfg)
 		}
 		return StepUpConfig{}, fmt.Errorf("config: %s is required", EnvStepUpReplayHMACKey)

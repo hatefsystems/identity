@@ -2,7 +2,37 @@ package smsotp
 
 import "errors"
 
+type sendError struct{ reason string }
+
+func (e *sendError) Error() string { return "smsotp: send failed: " + e.reason }
+func (e *sendError) Unwrap() error { return ErrSendFailed }
+
+// SendFailureReason exposes only the allowlisted provider classification.
+func SendFailureReason(err error) string {
+	var classified interface{ DeliveryReason() string }
+	if errors.As(err, &classified) {
+		switch reason := classified.DeliveryReason(); reason {
+		case "credentials", "account", "egress", "template", "parameters", "credit", "throttle", "recipient", "unavailable", "rejected":
+			return reason
+		}
+	}
+	var sent *sendError
+	if errors.As(err, &sent) {
+		return sent.reason
+	}
+	return "unavailable"
+}
+
 var (
+	// ErrDisabled indicates delivery is off; authorized phone removal remains available.
+	ErrDisabled = errors.New("smsotp: delivery disabled")
+	// ErrUnavailable indicates a required dependency failed or is missing.
+	ErrUnavailable = errors.New("smsotp: dependency unavailable")
+	// ErrStaleSession indicates the captured account authorization is no longer current.
+	ErrStaleSession = errors.New("smsotp: stale session")
+	// ErrRestartRequired means the proof was consumed but persistence failed or
+	// its outcome is unknown. Read current state; otherwise request a fresh proof.
+	ErrRestartRequired = errors.New("smsotp: read current phone state or restart verification")
 	// ErrUserNotFound indicates the target account does not exist or is
 	// soft-deleted.
 	ErrUserNotFound = errors.New("smsotp: user not found")

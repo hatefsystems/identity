@@ -489,8 +489,8 @@ func TestLifecycleLegacyMalformedAndAdminIsolationIntegration(t *testing.T) {
 func TestLifecycleFileStorageBrokerRestartIntegration(t *testing.T) {
 	container := strings.TrimSpace(os.Getenv("LIFECYCLE_TEST_NATS_CONTAINER"))
 	if container == "" {
-		if os.Getenv("REQUIRE_LIFECYCLE_INTEGRATION") == "1" {
-			t.Fatal("mandatory lifecycle acceptance requires a restartable owned NATS container")
+		if os.Getenv("REQUIRE_LIFECYCLE_INTEGRATION") == "1" || os.Getenv("REQUIRE_PORTAL_INTEGRATION") == "1" || os.Getenv("REQUIRE_ADMIN_AUDIT_INTEGRATION") == "1" {
+			t.Fatal("mandatory lifecycle acceptance requires an explicit owned restartable broker")
 		}
 		t.Skip("explicit labeled disposable broker restart is not configured")
 	}

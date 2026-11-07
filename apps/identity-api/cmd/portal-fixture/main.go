@@ -92,16 +92,20 @@ func run(args []string) error {
 	}
 	switch args[0] {
 	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
-	case "admin-policy", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
+	case "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
 	case "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup":
 	default:
 		return errors.New("unsupported fixture action")
 	}
+	environment, err := config.LoadEnvironment()
+	if err != nil {
+		return err
+	}
 	runID := os.Getenv("PORTAL_FIXTURE_RUN_ID")
-	if os.Getenv("PORTAL_FIXTURE_ALLOW") != "1" || !runIDPattern.MatchString(runID) || os.Getenv("APP_ENV") == "production" {
+	if os.Getenv("PORTAL_FIXTURE_ALLOW") != "1" || !runIDPattern.MatchString(runID) || (environment != "development" && environment != "test") {
 		return errors.New("explicit disposable-fixture configuration is required")
 	}
-	if strings.HasPrefix(args[0], "admin-") && (os.Getenv("PORTAL_FIXTURE_ADMIN") != "1" || os.Getenv("APP_ENV") != "test") {
+	if strings.HasPrefix(args[0], "admin-") && (os.Getenv("PORTAL_FIXTURE_ADMIN") != "1" || environment != "test") {
 		return errors.New("explicit test-only administrative fixture mode is required")
 	}
 	var input request

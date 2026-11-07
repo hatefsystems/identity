@@ -1,12 +1,6 @@
 # Hatef Identity Platform - Frontend Pages Structure
 
-The register/password/reset forms remain unavailable. Existing passkey login and authenticated enrollment are implemented; public account creation is not. The planned Unicode signup UI and fragment proof page are not shipped. Never infer account creation from a disabled form, localized message or page existence. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
-
 This document outlines the routing architecture for the Next.js frontend application within the `hatefsystems/identity` monorepo. The application utilizes the **Next.js App Router (`app/` directory)** and relies on **shadcn/ui** for its component system.
-
-## Localization
-
-All implemented owned public/auth, dashboard, admin/legal and fallback surfaces support `en`/`fa-IR` on the same URLs. The request server resolves a bounded Secure/HttpOnly `__Host-hatef-ui` display cookie independently from authentication. English/UTC are initial defaults; explicit Jalali/Gregorian and IANA-zone overrides survive language switches. A state-preserving Server Action updates text, direction and metadata without serializing private drafts or restarting ceremonies. Existing tabs keep their presentation until explicit change or server navigation. Canonical audit/legal UTC evidence, identifiers, wire values and user narratives remain exact. The root-failure fallback is independently bilingual. See [the full localization contract and maintenance guide](localization.md).
 
 ## Route Groups
 
@@ -16,26 +10,64 @@ The routing is logically divided using Next.js Route Groups (e.g., `(auth)`, `(d
 
 ## 1. Authentication & Public Pages: `(auth)`
 
-These pages are accessible to unauthenticated users. Task 7.2 supplied six public screens; Task 7.3 connects only their passkey entry points to the Go API for existing accounts. Password/signup/reset submissions remain deliberately disabled. Recovery-login and email-verification screens remain planned.
+These pages are accessible to unauthenticated users. Passkey login serves existing
+accounts; separately enabled signup has the conditional contract below. Password
+login/reset and neutral TOTP forms remain deliberately disconnected. No source or
+UI description here asserts final browser acceptance or deployed enablement.
 
 - `/login` : Passkey-first login screen with an email/password alternative and links to registration and password reset.
 - `/login/webauthn` : Live discoverable-passkey sign-in, started only by the explicit "Use a passkey" button. The device chooses an existing account; the portal does not ask for an email first.
-- `/login/recovery` (planned; no implemented page) : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
-- `/register` : Email, new password, and password-confirmation form. Account creation is not connected.
+- `/login/recovery` : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
+- `/register` : Existing owned Unicode email and Iranian mobile input, explicit ownership proofs, then resident UV-passkey creation. No password/confirmation, new mailbox, role or session is created; completion links to normal login.
 - `/verify-totp` : Neutral six-digit authenticator-code form. This is not an active login challenge, enrollment confirmation, or Step-up session.
 - `/forgot-password` : Primary-email reset-link request form with an account-enumeration-resistant acknowledgement presentation. Backup Email and Verified Phone (SMS) recovery choices remain planned, outside Task 7.2.
 - `/reset-password` : New-password and confirmation form, with invalid/expired-link presentations. Real reset-link validation and password changes are not connected.
-- `/verify-email` (planned; no implemented page) : Email verification landing page.
+- `/register/verify-email` : Signup-specific fragment landing page. Scrub `/register/verify-email#attempt_id=...&token=...` immediately, then require explicit ownership verification with the original browser JKT; no capability transfer or page-load redemption.
 
 ### Public Form Boundary (Tasks 7.2 and 7.3)
 
-- The six screens use the existing shadcn components exported by `@hatef/ui`, a shared English/Persian auth layout, and application-local field/status compositions. The light default, English system font and existing dark tokens are preserved; Persian uses self-hosted Vazirmatn. Tailwind explicitly retains the `dark` class so production builds do not remove its palette variables. The shared shell exposes language and display preferences without introducing a theme switcher. See [localization](localization.md) for the typed `next-intl` catalogs, server-resolved preferences, RTL/date/font boundaries and manual review gates.
-- `apps/web/app/(auth)/_components/screens.tsx` retains disconnected password/signup/reset/TOTP forms. Those forms show "This form is not connected yet. Do not enter real credentials." and render their submit buttons disabled in initial HTML. Navigation, password visibility and local blur validation remain usable. Passkey entry uses `app/_components/passkey-login.tsx`: a native `type="button"`, disabled before hydration and with JavaScript off. It does not allocate keys, fetch options or call `navigator.credentials` merely on page load.
+- The six screens use the existing shadcn components exported by `@hatef/ui`, an English shared auth layout, and application-local field/status compositions. The light default, system font, and existing dark tokens are preserved; Tailwind explicitly retains the `dark` class so production builds do not remove its palette variables. There is no new theme switcher or localization framework.
+- Disconnected password/reset/neutral-TOTP forms retain truthful warnings and disabled initial-HTML submit buttons. Registration uses its separate passkey flow, not a fake password-success handler. Passkey actions remain disabled before hydration/with JavaScript off and never allocate keys, fetch/send proofs or invoke credentials on page load.
 - Loading, success, cancellation, unsupported-passkey, rate-limit, and reset-link presentations are exercised through test-only handlers/props on the underlying form components. No public fixture route, magic credential, query parameter, or environment flag can simulate authentication or reset delivery. Reset forms default to an unverified link state; tests must explicitly provide a ready state and a handler to enable submission.
 - Inactive form values stay in component state, not URLs, cookies, storage, telemetry or logs. Passkey sign-in checks the authenticated profile before entering the portal. Return paths are restricted to fixed dashboard/admin routes; expired admin detail links return to `/admin/users` without the account reference. Arbitrary redirects and OAuth continuations are unsupported. No public fixture route or magic account simulates login success.
 - Fields have visible labels, stable help/error associations, appropriate autocomplete, keyboard-operable password toggles, and at least 44px control targets. Local errors appear on blur; a test-enabled invalid submission focuses the first invalid field. Submission feedback is announced, duplicate submissions are blocked, and successful completion clears form values. A single text input preserves leading zeroes in TOTP codes, accepts whole-code paste, and requires exactly six ASCII digits without silently normalizing whitespace or non-ASCII digits. It never auto-submits or offers to resend an authenticator code.
-- Password checks intentionally cover presence and, for new passwords, matching confirmation only. Passwords are not trimmed, paste is not blocked, and the UI does not invent a length/complexity policy or claim backend enforcement. Account signup, password login/reset, email verification and authoritative password policy remain separate work. Existing backend TOTP enrollment and Step-up endpoints are not public login verification.
-- Auth HTML remains dynamically rendered and private/no-store under Task 7.1's strict nonce CSP. Styling uses classes and local resources only; the CSP, root rendering boundary, and deployment model are unchanged. Automated unit and production-browser checks cover these UI contracts, including both palettes, keyboard focus, contrast, narrow/short viewport reflow, native TOTP paste, and JavaScript-disabled submission safety. Desktop/mobile screenshots were visually inspected. Manual screen-reader review has not been performed; these checks are not a claim of full assistive-technology or WCAG certification.
+- Disconnected password forms do not invent backend password policy. Signup has no password field or reset authority. Existing backend TOTP enrollment/Step-up endpoints are not public login verification.
+- Auth HTML remains dynamically rendered and private/no-store under strict nonce CSP, with existing tokens/local resources and no new CSP exception. Required acceptance includes both palettes, desktop/mobile reflow, keyboard/focus/status, leading-zero code paste and JavaScript-disabled safety. Historical UI evidence is not signup acceptance; screen-reader/physical-authenticator/native-browser/deployed-ingress checks remain separately evidenced gates.
+
+### Conditional Signup UX
+
+Use a text input with email input mode, not native `type="email"` rejection of
+supported Unicode. Keep the raw input bound and show the server-returned
+`canonical_email` as inert, directionally isolated text; NFC/local lowercase/NFC
+and strict IDNA are server authority, never browser/provider alias rules. Verify
+that passkey `publicKey.user.name`/display name binds to that canonical email and
+the frozen handle is exactly eight bytes, with resident key and UV required.
+
+Start, resend email, send SMS, verify each proof and create a passkey are explicit
+actions. Submission ACK/`email_sent` is not ownership; sandbox SMS.ir sends nothing.
+Resend replaces email proof and clears phone/ceremony progress without extending
+the 15-minute attempt. Email proof lasts 10 minutes, passkey at most 5 minutes
+and completion receipt 1 hour. Codes are six-digit strings with leading zeros,
+never numeric conversion or non-ASCII/whitespace digit normalization.
+
+Retain attempt/capability/token/OTP/credential/nonce state only in bounded memory,
+not URL query/history state, storage, telemetry, snapshots or cross-tab messages.
+The existing non-exportable DPoP key/JWK record is the only persistent credential
+material. Revalidate that original JKT before signing/transmission, after replies
+and on foreground return; key change/loss cannot rebind authority. The email
+landing action must not initialize a replacement key for a foreign-browser link.
+Cancel/navigation/pagehide/key loss clears authority; OTP inputs clear on hide.
+Only bounded in-memory idle intent may survive a tab switch for email handoff;
+never resume a transmitted mutation automatically or claim memory zeroization.
+
+When final delivery is ambiguous, offer explicit protected result checking using
+the same capability/JKT and a fresh DPoP proof. A committed result reports
+`next:"login"`, not dashboard access. New retries are registration-only; other
+portal/admin writes keep their existing no-automatic-replay rule. Lost authority
+requires a new attempt or ordinary login, never capability recovery by email.
+No screenshots/logs/artifacts may retain signup tokens, codes, mail bodies or
+provider credentials. Final immutable-image registration browser acceptance is
+required, not asserted by these UX instructions.
 
 ---
 
@@ -66,7 +98,7 @@ Avatar uploads, password changes, email/phone/backup-contact changes, TOTP enrol
 Tasks 7.5 and 7.6 use the existing web app and shared secure session lifetime. The initial document is a non-sensitive shell; a normal browser-bound session must bootstrap and then pass `GET /api/v1/admin/capabilities` before private children mount. Capabilities are presentation metadata, never cached authorization. Denied access does not sign out an otherwise valid account session. Disabled, unavailable and no-access states remain distinct where the response permits; a false capability alone does not identify the missing permission or deployment prerequisite.
 
 - `/admin`: Elevated-access framing and links only to permitted workspaces, not invented counts, metrics or alerts.
-- `/admin/users`: Explicit bounded account queries with status/page controls. Support sees safe metadata only. Exact email input and body-only lookup exist only with both read and PII capability.
+- `/admin/users`: Explicit bounded account queries with status/page controls. Support sees safe metadata only. Body-only email lookup requires read+PII capability; mandatory returned `canonical_email` must exactly bind the returned row before display/selection/moderation pin, with no raw-input/ASCII-only fallback.
 - `/admin/users/[id]`: Permitted metadata and exact lifecycle revision. Eligible targets can be suspended, banned or reactivated with fresh step-up. Self, deleted, pending-verification and pending-deletion targets are disabled locally and independently rejected by the API. Privileged-target denials remain generic.
 - `/admin/audit-logs`: Explicit UTC search, initially the last 24 hours or a shorter configured bound. Frozen filters drive descending keyset pages; there is no total count. Cursor history is bounded in memory. Payloads are escaped text in a native details dialog, never HTML, links, remote images or exports.
 - `/admin/integrity`: Independent, explicitly advanced canonical-v2 audit/ledger runs. Capture `through_seq` at genesis and carry it with exact cursors and prior hashes. Show checked range, page/cumulative counts, seed provenance and API scope. Partial, interrupted, mismatched, empty and erased-content outcomes never imply complete or independent historical verification.
@@ -101,7 +133,7 @@ Presentation uses the five exact capabilities `legal_holds_read`, `legal_holds_a
 
 **Attribution**
 
-- Start only on explicit action with a bare email (at most 320 UTF-8 bytes), authority/case (each 1..255 bytes), purpose (1..4096 bytes), explicit UTC inclusive bounds and a page size within the effective limits. Use the same potentially fractional `audit_max_window_seconds` as audit search, never a hard-coded 31-day allowance. Legal page size is capped at `min(page_size_max, 50)` with default `min(page_size_default, that cap)`. Do not reuse account-email normalization, hash in the browser or offer phone/backup-email/profile resolution.
+- Start only on explicit action with a bare email (raw at most 1024 UTF-8 bytes, canonical at most 254), authority/case (each 1..255 bytes), purpose (1..4096 bytes), explicit UTC inclusive bounds and a page size within effective limits. Use the same potentially fractional `audit_max_window_seconds`, not a hard-coded 31 days. Legal page size remains capped at `min(page_size_max, 50)`. The server uses shared canonical NFC/lower/NFC+strict IDNA identity and exact email HMAC input; never hash or provider-normalize in the browser or offer phone/backup-email/profile resolution.
 - Class B is **pseudonymized personal data**, not anonymous or non-PII. Show only core `id`, `account_ref`, `event_type`, `timestamp`, `retain_until`, and exact decimal-string `seq` by default. Six unchecked opt-ins request `client_ip`, `ip_subnet`, `user_agent`, `device_fingerprint`, `client_id`, `scope` for the stated purpose. Initially send `fields: []`; never fetch unselected fields for hidden columns. Reject unexpected disclosure fields and project only requested data. The entered email is transient sensitive input, not returned evidence.
 - Freeze the whole query including page size. Explicit next-page actions reuse it with the opaque cursor and fresh verification. Preserve exact string `coverage.through_seq` and original `observed_at`, verify ascending sequence progress within the bound, and display the fresh `eligibility_checked_at` and complete API note. No total or complete-history flag exists. Cursors have no implemented age TTL and are not session-bound on the server; the UI still clears them on session changes. Do not decode them, show an invented expiry countdown or silently restart a rejected cursor.
 - Keep only a bounded current page; no polling, automatic fetch-all, previous-page cache, exports, bulk-copy, uploads or external transfers. Changed input/field scope starts a fresh run and clears prior results. Empty/final results mean no matching indexed, currently eligible records in that scope, not no account or activity. Retention/holds are rechecked on every page, so hold release can remove expired matches and later ingestion above the bound is excluded. Multiple references do not establish one person; sequence positions do not prove inclusion or full historical pepper coverage. Integrity verification remains separate.
@@ -222,8 +254,15 @@ Backgrounding aborts work and clears codes/proofs/challenges. The bounded token 
 
 `web:test-portal-browser` runs `.github/scripts/web-portal.browser.mjs` against production Next.js, two real Go API processes and isolated PostgreSQL/Redis/JetStream through local HTTPS ingress. Deletion/reclaim gets a separate run-owned stack and authenticated TLS SMTP sink, avoiding exhaustion of production subnet limits by unrelated scenarios instead of raising those limits. Test-only build-tagged fixtures supply random accounts and virtual-authenticator credentials; there is no production bootstrap endpoint or magic account. `.github/scripts/web-csp.browser.mjs` remains the independent image/CSP regression suite.
 
-The suite covers login/profile/security/sessions plus UV-only deletion, durable SMTP enqueue/restart/retry/cleanup, cross-session revocation, lost responses/post-send aborts, keyless UV/TOTP reclaim across replicas, bounded token cleanup and used/malformed links. It also covers strict CSP, focus/announcements, six no-JavaScript routes and both-locale light/dark mobile/tablet/desktop plus short-viewport assertions. One-time JSON is observed with bounded capture at the actual upstream connection, not replayed requests or cached browser bodies. Artifacts contain masked screenshots and metadata-only evidence, not tokens, mail bodies, browser traces or plaintext batches. Unobserved native hidden-tab/bfcache behavior remains a manual gate.
+The suite covers login/profile/security/sessions plus UV-only deletion, durable SMTP enqueue/restart/retry/cleanup, cross-session revocation, lost responses/post-send aborts, keyless UV/TOTP reclaim across replicas, bounded token cleanup and used/malformed links. It also covers strict CSP, focus/announcements, six no-JavaScript routes and eighteen light/dark mobile/desktop viewports. One-time JSON is observed with bounded capture at the actual upstream connection, not replayed requests or cached browser bodies. Artifacts contain masked screenshots and metadata-only evidence, not tokens, mail bodies, browser traces or plaintext batches. Unobserved native hidden-tab/bfcache behavior remains a manual gate.
 
 Repository test execution is not deployment approval. Manual assistive-technology/platform-authenticator review, real deployed HTTPS ingress/log-redaction verification and compatible downstream lifecycle consumers remain release gates unless separately evidenced. Follow [portal cutover](devops-operations.md#user-portal-cutover-task-73); do not mark task acceptance or operator gates complete solely because tests exist.
 
 Task 7.6 extends the existing `web:test-admin-browser` gate, not an independent authentication/browser harness or new CI job. Required evidence includes the **real** signer plus `admin-legal --operation=lookup-probe` before/after synthetic-account deletion, two API replicas, fixture omission/mismatch, DPO success and other seeded-role denial, strict contracts/string precision, independent/replayed/released holds, fresh verification per page, opt-in fields, actual audit-failure rollback and committed-but-lost write responses without retransmission. Exercise privacy clearing and late replies, direct routes/revoked capability, no-JavaScript shells, desktop/320px, both palettes, focus/keyboard/dialog escape and strict CSP. Mask legal narrative/result regions explicitly in artifacts; retain only sanitized scenarios/status/counts and masked screenshots, not raw traces or storage snapshots. These are required gates, **not recorded passing results**. Manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks remain unfinished until separately observed; no Task 5.3/5.4/5.5 status or production approval is implied.
+
+## Browser language and display preferences
+
+Owned public, auth, portal and admin interfaces support English and Iranian
+Persian on the same routes. Registration retains its existing email/phone proof
+and passkey-only contract; preference changes do not replay delivery, change
+identity bytes or extend wall/monotonic deadlines. See [localization](localization.md).

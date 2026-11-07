@@ -39,6 +39,7 @@ type fakeRecoveryStore struct {
 	// SQLSTATE 23505 error, to drive the one-shot regeneration retry.
 	uniqueViolations int
 	createCalls      int
+	beforeGet        func()
 }
 
 func newFakeStore() *fakeRecoveryStore {
@@ -63,6 +64,9 @@ func (f *fakeRecoveryStore) addUserWithStatus(status string) uuid.UUID {
 }
 
 func (f *fakeRecoveryStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, error) {
+	if f.beforeGet != nil {
+		f.beforeGet()
+	}
 	if f.getUserErr != nil {
 		return db.User{}, f.getUserErr
 	}
@@ -186,7 +190,7 @@ func TestGenerateProducesDistinctBatch(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	res, err := svc.Generate(context.Background(), userID, "")
+	res, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -222,7 +226,7 @@ func TestGenerateStoresHashesNotPlaintext(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	res, err := svc.Generate(context.Background(), userID, "")
+	res, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -247,11 +251,11 @@ func TestGenerateWipesPreviousBatch(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	first, err := svc.Generate(context.Background(), userID, "")
+	first, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate first: %v", err)
 	}
-	second, err := svc.Generate(context.Background(), userID, "")
+	second, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate second: %v", err)
 	}
@@ -270,11 +274,62 @@ func TestGenerateWipesPreviousBatch(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsRevocationBeforeFinalLookup(t *testing.T) {
+	store := newFakeStore()
+	id := store.addUser()
+	svc, _ := New(Config{}, store)
+	batch, err := svc.Generate(t.Context(), id, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookups := 0
+	store.beforeGet = func() {
+		lookups++
+		if lookups == 2 {
+			u := store.users[id]
+			u.AuthVersion++
+			store.users[id] = u
+		}
+	}
+	result, err := svc.Generate(t.Context(), id, 0, "")
+	if result != nil || !errors.Is(err, ErrAccountNotActive) {
+		t.Fatalf("stale Generate = %v, %v", result, err)
+	}
+	if store.createCalls != 1 || len(store.codes[id]) != batch.Count {
+		t.Fatal("stale generation changed the previous batch")
+	}
+	store.beforeGet = nil
+	if err := svc.Verify(t.Context(), id, batch.Codes[0], ""); err != nil {
+		t.Fatalf("anonymous verification must use the current version: %v", err)
+	}
+	if _, err := svc.Generate(t.Context(), id, 1, ""); err != nil {
+		t.Fatalf("fresh version: %v", err)
+	}
+}
+
+func TestGenerateRejectsDeletedOrInvalidVersion(t *testing.T) {
+	store := newFakeStore()
+	id := store.addUser()
+	svc, _ := New(Config{}, store)
+	if res, err := svc.Generate(t.Context(), id, -1, ""); res != nil || !errors.Is(err, ErrAccountNotActive) {
+		t.Fatalf("negative version = %v, %v", res, err)
+	}
+	u := store.users[id]
+	u.DeletedAt.Valid = true
+	store.users[id] = u
+	if res, err := svc.Generate(t.Context(), id, 0, ""); res != nil || !errors.Is(err, ErrAccountNotActive) {
+		t.Fatalf("deleted = %v, %v", res, err)
+	}
+	if store.createCalls != 0 {
+		t.Fatal("refused request wrote credentials")
+	}
+}
+
 func TestGenerateUnknownUser(t *testing.T) {
 	store := newFakeStore()
 	svc, _ := New(Config{}, store)
 
-	if _, err := svc.Generate(context.Background(), uuid.New(), ""); !errors.Is(err, ErrUserNotFound) {
+	if _, err := svc.Generate(context.Background(), uuid.New(), 0, ""); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("Generate for unknown user = %v, want ErrUserNotFound", err)
 	}
 }
@@ -285,7 +340,7 @@ func TestGenerateRetriesOnUniqueViolation(t *testing.T) {
 	store.uniqueViolations = 1 // first insert collides, second succeeds
 	svc, _ := New(Config{}, store)
 
-	res, err := svc.Generate(context.Background(), userID, "")
+	res, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate with one collision = %v, want nil (retry should recover)", err)
 	}
@@ -303,7 +358,7 @@ func TestGenerateFailsAfterRepeatedUniqueViolation(t *testing.T) {
 	store.uniqueViolations = 5 // every attempt collides
 	svc, _ := New(Config{}, store)
 
-	if _, err := svc.Generate(context.Background(), userID, ""); err == nil {
+	if _, err := svc.Generate(context.Background(), userID, 0, ""); err == nil {
 		t.Fatal("Generate with persistent collisions = nil error, want error")
 	}
 	if len(store.codes[userID]) != 0 {
@@ -318,7 +373,7 @@ func TestVerifyConsumesExactlyOneCode(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	res, err := svc.Generate(context.Background(), userID, "")
+	res, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -340,7 +395,7 @@ func TestVerifyAcceptsFormattedAndMessyInput(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	res, _ := svc.Generate(context.Background(), userID, "")
+	res, _ := svc.Generate(context.Background(), userID, 0, "")
 	// The formatted code the user is shown carries dashes; lowercasing and
 	// spacing it must still verify thanks to Normalize.
 	messy := "  " + strings.ToLower(res.Codes[0]) + "  "
@@ -354,7 +409,7 @@ func TestVerifyReplayIsRejected(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	res, _ := svc.Generate(context.Background(), userID, "")
+	res, _ := svc.Generate(context.Background(), userID, 0, "")
 	code := res.Codes[0]
 
 	if err := svc.Verify(context.Background(), userID, code, ""); err != nil {
@@ -370,7 +425,7 @@ func TestVerifyWrongCode(t *testing.T) {
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	if _, err := svc.Generate(context.Background(), userID, ""); err != nil {
+	if _, err := svc.Generate(context.Background(), userID, 0, ""); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 
@@ -386,7 +441,7 @@ func TestVerifyEmptyCode(t *testing.T) {
 	store := newFakeStore()
 	userID := store.addUser()
 	svc, _ := New(Config{}, store)
-	_, _ = svc.Generate(context.Background(), userID, "")
+	_, _ = svc.Generate(context.Background(), userID, 0, "")
 
 	for _, in := range []string{"", "   ", "----", "!!!"} {
 		if err := svc.Verify(context.Background(), userID, in, ""); !errors.Is(err, ErrInvalidCode) {
@@ -401,7 +456,7 @@ func TestVerifyCrossUserRejected(t *testing.T) {
 	attacker := store.addUser()
 	svc, _ := New(Config{}, store)
 
-	res, err := svc.Generate(context.Background(), victim, "")
+	res, err := svc.Generate(context.Background(), victim, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -448,7 +503,7 @@ func TestStatusReportsRemainingAndLow(t *testing.T) {
 	svc, _ := New(Config{}, store)
 
 	// Fresh batch of 10, threshold 3 → not low.
-	if _, err := svc.Generate(context.Background(), userID, ""); err != nil {
+	if _, err := svc.Generate(context.Background(), userID, 0, ""); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 	st, err := svc.Status(context.Background(), userID)
@@ -512,7 +567,7 @@ func TestGenerateRequiresActiveAccount(t *testing.T) {
 		userID := store.addUserWithStatus(status)
 		svc, _ := New(Config{}, store)
 
-		if _, err := svc.Generate(context.Background(), userID, ""); !errors.Is(err, ErrAccountNotActive) {
+		if _, err := svc.Generate(context.Background(), userID, 0, ""); !errors.Is(err, ErrAccountNotActive) {
 			t.Errorf("Generate for a %s account = %v, want ErrAccountNotActive", status, err)
 		}
 		if got := len(store.codes[userID]); got != 0 {
@@ -530,7 +585,7 @@ func TestVerifyRequiresActiveAccount(t *testing.T) {
 		userID := store.addUser()
 		svc, _ := New(Config{}, store)
 
-		res, err := svc.Generate(context.Background(), userID, "")
+		res, err := svc.Generate(context.Background(), userID, 0, "")
 		if err != nil {
 			t.Fatalf("Generate while active: %v", err)
 		}
@@ -569,7 +624,7 @@ func TestActiveAccountStillSucceeds(t *testing.T) {
 	userID := store.addUserWithStatus("active")
 	svc, _ := New(Config{}, store)
 
-	res, err := svc.Generate(context.Background(), userID, "")
+	res, err := svc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate for an active account = %v, want nil", err)
 	}
@@ -607,7 +662,7 @@ func TestGenerateRateLimited(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if _, err := svc.Generate(context.Background(), userID, "203.0.113.5:1234"); !errors.Is(err, ErrRateLimited) {
+	if _, err := svc.Generate(context.Background(), userID, 0, "203.0.113.5:1234"); !errors.Is(err, ErrRateLimited) {
 		t.Errorf("rate-limited Generate = %v, want ErrRateLimited", err)
 	}
 	if len(store.codes[userID]) != 0 {
@@ -640,7 +695,7 @@ func TestRateLimiterAllowsWhenUnderBudget(t *testing.T) {
 	limiter := &fakeLimiter{allow: true}
 	svc, _ := New(Config{}, store, WithRateLimiter(limiter))
 
-	if _, err := svc.Generate(context.Background(), userID, "203.0.113.5:1234"); err != nil {
+	if _, err := svc.Generate(context.Background(), userID, 0, "203.0.113.5:1234"); err != nil {
 		t.Fatalf("Generate under budget = %v, want nil", err)
 	}
 	// Both dimensions are consulted when the first passes.
@@ -656,7 +711,7 @@ func TestRateLimiterErrorPropagates(t *testing.T) {
 	limiter := &fakeLimiter{err: sentinel}
 	svc, _ := New(Config{}, store, WithRateLimiter(limiter))
 
-	if _, err := svc.Generate(context.Background(), userID, "203.0.113.5:1234"); !errors.Is(err, sentinel) {
+	if _, err := svc.Generate(context.Background(), userID, 0, "203.0.113.5:1234"); !errors.Is(err, sentinel) {
 		t.Errorf("Generate with limiter error = %v, want it to wrap %v", err, sentinel)
 	}
 }
@@ -731,7 +786,7 @@ func TestRunInTxCommitsOnSuccess(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if err := svc.runInTx(context.Background(), func(_ Store) error { return nil }); err != nil {
+	if err := svc.runInTx(context.Background(), uuid.New(), func(_ Store) error { return nil }); err != nil {
 		t.Fatalf("runInTx: %v", err)
 	}
 	if !ft.beginCalled || !ft.commitCalled {
@@ -747,7 +802,7 @@ func TestRunInTxRollsBackOnError(t *testing.T) {
 	svc, _ := New(Config{}, newFakeStore(), WithTransacter(ft))
 
 	sentinel := errors.New("fn failed")
-	if err := svc.runInTx(context.Background(), func(_ Store) error { return sentinel }); !errors.Is(err, sentinel) {
+	if err := svc.runInTx(context.Background(), uuid.New(), func(_ Store) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Errorf("runInTx err = %v, want %v", err, sentinel)
 	}
 	if !ft.rollbackCalled {
@@ -762,7 +817,7 @@ func TestRunInTxBeginError(t *testing.T) {
 	ft := &fakeTransacter{beginErr: errors.New("cannot begin")}
 	svc, _ := New(Config{}, newFakeStore(), WithTransacter(ft))
 
-	if err := svc.runInTx(context.Background(), func(_ Store) error { return nil }); err == nil {
+	if err := svc.runInTx(context.Background(), uuid.New(), func(_ Store) error { return nil }); err == nil {
 		t.Fatal("runInTx with a begin error = nil, want error")
 	}
 	if ft.commitCalled || ft.rollbackCalled {
@@ -776,7 +831,7 @@ func TestRunInTxNilTransacterUsesStore(t *testing.T) {
 
 	// Without a Transacter the closure receives the service's own store.
 	called := false
-	err := svc.runInTx(context.Background(), func(s Store) error {
+	err := svc.runInTx(context.Background(), uuid.New(), func(s Store) error {
 		called = true
 		if s == nil {
 			t.Error("closure received a nil store")

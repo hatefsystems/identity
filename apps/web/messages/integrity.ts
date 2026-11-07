@@ -61,11 +61,11 @@ export const integrityEn = {
     database_predecessor: 'Stored database predecessor',
   },
   erasedCounts:
-    'Authorized erasures checked: {page, number} on the last page; {total, number} cumulative. These are a subset of {checked, number} checked chain nodes, not extra work.',
+    'Erasure annotations checked: {page, number} on the last page; {total, number} cumulative. These are a subset of {checked, number} checked chain nodes, not extra work.',
   retainedCounts:
     'Retained payloads recomputed: {page, number} on the last clean page; {total, number} cumulative.',
   erasureLimits:
-    'Erased payloads retain chain links and erasure authorization, but their original bodies cannot be recomputed. A fully erased ledger can have clean surviving links without verifying its erased content.',
+    'Erased payloads retain chain links and erasure annotations, but their original bodies cannot be recomputed. A fully erased ledger can have clean surviving links without verifying its erased content. An annotation does not establish legal authorization or that the purge operator honored retention and holds.',
   auditCounts:
     'Retained audit payloads were recomputed for the {count, number} checked nodes on this clean page.',
   scope: 'Backend scope',
@@ -74,13 +74,13 @@ export const integrityEn = {
     audit:
       'Verification covers only the stored segment relative to its reported seed. It does not establish complete ingestion, detection of tail truncation, or independent historical authenticity.',
     ledger:
-      'Verification covers database-relative chain links and retained payloads. Erased payloads are authorized by erasure records; their original bodies are not recomputed. It does not establish complete ingestion or independent historical authenticity.',
+      'Verification covers database-relative chain links and retained payloads. Erasure annotations do not prove receipt chaining or legal authorization; original erased bodies are not recomputed. It does not establish complete ingestion or independent historical authenticity.',
   },
   limits: 'Verification limits',
   relativeLimits:
     'Verification is database-relative to the reported seed and bound. It does not prove complete event ingestion, independent historical authenticity, or protection from a coherent privileged rewrite or rollback.',
   snapshotLimits:
-    'Each page uses its own database snapshot, not one multi-page global snapshot or an independently authenticated head. A continued run does not authenticate new tail records. Audit-chain verification does not establish tail-truncation detection; preserve the backend’s reported scope when interpreting any result.',
+    'Each page uses its own database snapshot, not one multi-page global snapshot or an independently authenticated head. A continued run does not authenticate new tail records. A durable-head check does not independently detect a coherent privileged rollback; preserve the backend’s reported scope when interpreting any result.',
   sequenceLimits:
     'Sequence gaps are valid; counts are not percentages. Stop and failures end continuation. Backgrounding, session changes, and navigation discard progress rather than silently restoring a proof. No audit payloads or other accounts are fetched by this view.',
   failures: {
@@ -160,11 +160,11 @@ export const integrityFa = {
     database_predecessor: 'مقدار پیشینِ ذخیره‌شده در پایگاه داده',
   },
   erasedCounts:
-    'حذف‌های مجاز بررسی‌شده: {page, number} در صفحهٔ آخر؛ در مجموع {total, number}. این موارد زیرمجموعهٔ {checked, number} گرهٔ بررسی‌شده‌اند و کار اضافی محسوب نمی‌شوند.',
+    'یادداشت‌های حذف بررسی‌شده: {page, number} در صفحهٔ آخر؛ در مجموع {total, number}. این موارد زیرمجموعهٔ {checked, number} گرهٔ بررسی‌شده‌اند و کار اضافی محسوب نمی‌شوند.',
   retainedCounts:
     'محتواهای نگهداری‌شده که دوباره محاسبه شدند: {page, number} در آخرین صفحهٔ سالم؛ در مجموع {total, number}.',
   erasureLimits:
-    'برای محتواهای حذف‌شده، پیوندهای زنجیره و مجوز حذف باقی می‌مانند، اما بدنهٔ اصلی قابل محاسبهٔ مجدد نیست. دفتر کاملاً پاک‌شده ممکن است پیوندهای باقی‌ماندهٔ سالم داشته باشد، بدون آنکه محتوای حذف‌شده بررسی شود.',
+    'برای محتواهای حذف‌شده، پیوندهای زنجیره و یادداشت حذف باقی می‌مانند، اما بدنهٔ اصلی قابل محاسبهٔ مجدد نیست. دفتر کاملاً پاک‌شده ممکن است پیوندهای باقی‌ماندهٔ سالم داشته باشد، بدون آنکه محتوای حذف‌شده بررسی شود. یادداشت حذف، مجوز قانونی یا رعایت سیاست نگهداری و توقیف قانونی توسط عامل پاک‌سازی را اثبات نمی‌کند.',
   auditCounts:
     'محتوای ممیزی نگهداری‌شده برای {count, number} گرهٔ بررسی‌شده در این صفحهٔ سالم دوباره محاسبه شد.',
   scope: 'دامنهٔ گزارش‌شدهٔ سرور',
@@ -173,13 +173,13 @@ export const integrityFa = {
     audit:
       'بررسی فقط بخش ذخیره‌شده را نسبت به مقدار آغازین گزارش‌شده پوشش می‌دهد. ورود کامل داده، تشخیص قطع‌شدن انتهای زنجیره یا اصالت تاریخی مستقل را اثبات نمی‌کند.',
     ledger:
-      'بررسی، پیوندهای زنجیره و محتوای نگهداری‌شده را نسبت به پایگاه داده پوشش می‌دهد. حذف محتوا با سوابق مجوز حذف تأیید می‌شود؛ بدنهٔ اصلیِ حذف‌شده دوباره محاسبه نمی‌شود. ورود کامل داده یا اصالت تاریخی مستقل اثبات نمی‌شود.',
+      'بررسی، پیوندهای زنجیره و محتوای نگهداری‌شده را نسبت به پایگاه داده پوشش می‌دهد. یادداشت‌های حذف، زنجیره‌شدن رسیدها یا مجوز قانونی را اثبات نمی‌کنند؛ بدنهٔ اصلیِ حذف‌شده دوباره محاسبه نمی‌شود. ورود کامل داده یا اصالت تاریخی مستقل اثبات نمی‌شود.',
   },
   limits: 'محدودیت‌های بررسی',
   relativeLimits:
     'بررسی نسبت به پایگاه داده، مقدار آغازین و مرز گزارش‌شده انجام می‌شود. ورود کامل رویدادها، اصالت تاریخی مستقل یا محافظت در برابر بازنویسی یا بازگردانی منسجم توسط عامل دارای دسترسی ویژه را اثبات نمی‌کند.',
   snapshotLimits:
-    'هر صفحه نمای لحظه‌ای جداگانه‌ای از پایگاه داده دارد؛ نه یک نمای کلی برای همهٔ صفحه‌ها یا سرِ زنجیره‌ای که مستقل احراز اصالت شده باشد. ادامهٔ بررسی، سوابق تازهٔ انتهای زنجیره را احراز اصالت نمی‌کند. بررسی زنجیرهٔ ممیزی، تشخیص قطع انتهای زنجیره را اثبات نمی‌کند؛ هنگام تفسیر نتیجه، دامنهٔ گزارش‌شدهٔ سرور را حفظ کنید.',
+    'هر صفحه نمای لحظه‌ای جداگانه‌ای از پایگاه داده دارد؛ نه یک نمای کلی برای همهٔ صفحه‌ها یا سرِ زنجیره‌ای که مستقل احراز اصالت شده باشد. ادامهٔ بررسی، سوابق تازهٔ انتهای زنجیره را احراز اصالت نمی‌کند. بررسی سرِ پایدار زنجیره، بازگردانی منسجم توسط عامل دارای دسترسی ویژه را مستقل تشخیص نمی‌دهد؛ هنگام تفسیر نتیجه، دامنهٔ گزارش‌شدهٔ سرور را حفظ کنید.',
   sequenceLimits:
     'وجود فاصله در توالی معتبر است؛ شمارش‌ها درصد نیستند. توقف و خطا ادامه را پایان می‌دهند. رفتن به پس‌زمینه، تغییر نشست و جابه‌جایی صفحه، پیشرفت را پاک می‌کنند و اثباتی را بی‌اطلاع بازنمی‌گردانند. این بخش محتوای ممیزی یا حساب‌های دیگر را دریافت نمی‌کند.',
   failures: {

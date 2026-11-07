@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -165,10 +168,25 @@ func TestAdminLegalCoordinatesPreserveSigned64BitPrecision(t *testing.T) {
 type adminAuditPageStore struct {
 	AdminStore
 	page db.ListAuditLogsPageRow
+	err  error
 }
 
 func (s adminAuditPageStore) ListAuditLogsPage(context.Context, db.ListAuditLogsPageParams) (db.ListAuditLogsPageRow, error) {
-	return s.page, nil
+	return s.page, s.err
+}
+
+func TestAdminAuditQueryLogSanitizesSensitiveError(t *testing.T) {
+	const sentinel = "sensitive-audit-query-account-narrative-sentinel"
+	var logs bytes.Buffer
+	s := New(config.Config{Admin: config.AdminConfig{PageSizeDefault: 1, PageSizeMax: 200, AuditMaxWindow: 24 * time.Hour}},
+		slog.New(slog.NewJSONHandler(&logs, nil)), Deps{AdminStore: adminAuditPageStore{err: errors.New(sentinel)}})
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit-logs?start_time=2026-01-01T00:00:00Z&end_time=2026-01-02T00:00:00Z", nil)
+	r = r.WithContext(rbac.WithActor(r.Context(), uuid.New()))
+	w := httptest.NewRecorder()
+	s.handleAdminListAuditLogs().ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError || strings.Contains(logs.String(), sentinel) || strings.Contains(w.Body.String(), sentinel) || !strings.Contains(logs.String(), `"category":"audit_query_failed"`) {
+		t.Fatal("audit query failure did not emit only its fixed sanitized log category")
+	}
 }
 
 func TestAdminAuditPageEncodesExactNextBeforeSeq(t *testing.T) {

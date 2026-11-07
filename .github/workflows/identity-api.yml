@@ -74,11 +74,13 @@ jobs:
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           snapshot=$(mktemp -d)
           cp -R apps/identity-api/internal/db "$snapshot/db"
-          cp -R libs/schemas/gen "$snapshot/schemas"
+          cp -R libs/schemas/gen/go "$snapshot/schema-go"
+          cp -R libs/schemas/gen/ts "$snapshot/schema-ts"
           npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           diff -ru "$snapshot/db" apps/identity-api/internal/db
-          diff -ru "$snapshot/schemas" libs/schemas/gen
+          diff -ru "$snapshot/schema-go" libs/schemas/gen/go
+          diff -ru "$snapshot/schema-ts" libs/schemas/gen/ts
 
       - name: Run fresh tests
         run: npm exec -- nx run identity-api:test --skipNxCache
@@ -112,7 +114,7 @@ jobs:
         run: npm exec -- nx run identity-api:build-lifecycle-publisher --skipNxCache
 
       - name: Build compatible signer, deletion and purge workers
-        run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge,build-deletion-notifier -p identity-api --skipNxCache
+        run: npm exec -- nx run-many -t build-audit-signer,build-purge-worker,build-security-ledger-purge,build-deletion-notifier,build-registration-cleanup -p identity-api --skipNxCache --parallel=1
 
       - name: Build non-root runtime image
         env:
@@ -129,10 +131,25 @@ jobs:
       - name: Smoke-test packaged maintenance entrypoints without credentials
         run: node .github/scripts/smoke-image.mjs api identity-api:ci
 
+      - name: Export exact tested API for all registration acceptance runs
+        run: node .github/scripts/acceptance-report.mjs export-api identity-api:ci "$RUNNER_TEMP/acceptance-api"
+
+      - name: Upload checksum-bound API acceptance artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: acceptance-api
+          path: ${{ runner.temp }}/acceptance-api/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 1
+          overwrite: true
+
       - name: Export tested backend release image
-        run: node .github/scripts/release-images.mjs export-candidate api identity-api:ci "$RUNNER_TEMP/release-api"
+        if: steps.image.outputs.release == 'true'
+        run: node .github/scripts/release-images.mjs export api identity-api:ci "$RUNNER_TEMP/release-api"
 
       - name: Upload tested backend release image
+        if: steps.image.outputs.release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-api
@@ -142,25 +159,28 @@ jobs:
           compression-level: 1
           overwrite: true
 
-  security-db-cells:
-    name: security-db (${{ matrix.cell }})
+  integration-cell:
+    name: Required suite ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       max-parallel: 1
       fail-fast: false
       matrix:
-        cell: [test-security-db, test-admin-integration, test-retention-integration, test-legal-workflow-integration, test-grpc-integration, test-lifecycle-integration, test-portal-integration]
+        target: [test-security-db, test-admin-integration, test-retention-integration, test-legal-workflow-integration, test-grpc-integration, test-lifecycle-integration, test-portal-integration]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
+
       - name: Set up Go 1.26
         uses: actions/setup-go@v7
         with:
@@ -168,157 +188,156 @@ jobs:
           cache-dependency-path: |
             apps/identity-api/go.sum
             libs/schemas/go.sum
-      - name: Install workspace dependencies
+
+      - name: Set up npm 11 and workspace dependencies
         run: |
           npm install --global npm@11.21.0
+          npm --version
           npm ci
-      - name: Generate complete candidate schemas
-        run: npm exec -- nx run schemas:generate --skipNxCache
-      - name: Run bounded owned-service acceptance
+
+      - name: Generate exact acceptance inputs
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+
+      - name: Run one allowlisted zero-skip suite with owned services
         env:
-          ACCEPTANCE_REPORT_DIR: ${{ runner.temp }}/acceptance
-        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-target=${{ matrix.cell }}
-      - name: Upload sanitized acceptance evidence
+          INTEGRATION_ARTIFACT_DIR: ${{ runner.temp }}/integration-evidence
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-target=${{ matrix.target }}
+
+      - name: Upload truthful partial suite result
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: security-db-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/acceptance/*.json
+          name: integration-${{ matrix.target }}
+          path: ${{ runner.temp }}/integration-evidence/
           if-no-files-found: error
           retention-days: 7
 
   security-db:
-    name: Complete security-db release gate
-    needs: [security-db-cells]
+    name: Exactly seven required integration suites
+    needs: [integration-cell]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
-      - name: Set up Go 1.26
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: |
-            apps/identity-api/go.sum
-            libs/schemas/go.sum
-      - name: Install workspace dependencies
+      - name: Prepare identical generated inputs
         run: |
           npm install --global npm@11.21.0
           npm ci
-      - name: Download all cell reports
-        uses: actions/download-artifact@v8
-        with:
-          pattern: security-db-*
-          path: ${{ runner.temp }}/acceptance
-          merge-multiple: true
-      - name: Regenerate exact candidate artifacts
-        run: |
           npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
-      - name: Require every cell and matching final source
-        env:
-          CELL_RESULT: ${{ needs.security-db-cells.result }}
-        run: |
-          test "$CELL_RESULT" = success
-          npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --aggregate-service "$RUNNER_TEMP/acceptance"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: integration-test-*
+          path: ${{ runner.temp }}/integration-evidence
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Require exact seven-source zero-skip aggregate
+        run: node .github/scripts/acceptance-report.mjs aggregate integration "$RUNNER_TEMP/integration-evidence" "$RUNNER_TEMP/integration-aggregate.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-aggregate
+          path: ${{ runner.temp }}/integration-aggregate.json
+          if-no-files-found: error
+          retention-days: 7
 
-  security-race-cells:
-    name: security-race (${{ matrix.cell }})
+  race-cell:
+    name: Required race package ${{ matrix.package }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       max-parallel: 1
       fail-fast: false
       matrix:
-        cell: [recovery, mfa, oidc/clientauth, adminaction, smsotp, registration, audit/signer]
+        include:
+          - { package: './internal/recovery', artifact: recovery }
+          - { package: './internal/mfa', artifact: mfa }
+          - { package: './internal/oidc/clientauth', artifact: clientauth }
+          - { package: './internal/adminaction', artifact: adminaction }
+          - { package: './internal/smsotp', artifact: smsotp }
+          - { package: './internal/registration', artifact: registration }
+          - { package: './internal/audit/signer', artifact: signer }
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
-      - name: Set up Go 1.26
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: |
-            apps/identity-api/go.sum
-            libs/schemas/go.sum
-      - name: Install workspace dependencies
+      - name: Prepare Linux CGO and generated acceptance inputs
         run: |
+          gcc --version
           npm install --global npm@11.21.0
           npm ci
-      - name: Generate complete candidate schemas
-        run: npm exec -- nx run schemas:generate --skipNxCache
-      - name: Run bounded owned-service acceptance
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+      - name: Run exact owned-service race package
         env:
-          ACCEPTANCE_REPORT_DIR: ${{ runner.temp }}/acceptance
-        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/${{ matrix.cell }}
-      - name: Upload sanitized acceptance evidence
+          INTEGRATION_ARTIFACT_DIR: ${{ runner.temp }}/race-evidence
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-race-package=${{ matrix.package }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: security-race-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/acceptance/*.json
+          name: race-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/race-evidence/
           if-no-files-found: error
           retention-days: 7
 
   security-race:
-    name: Complete security-race release gate
-    needs: [security-race-cells]
+    name: Exactly seven affected race packages
+    needs: [race-cell]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
-      - name: Set up Go 1.26
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: |
-            apps/identity-api/go.sum
-            libs/schemas/go.sum
-      - name: Install workspace dependencies
+      - name: Prepare identical generated inputs
         run: |
           npm install --global npm@11.21.0
           npm ci
-      - name: Download all cell reports
-        uses: actions/download-artifact@v8
-        with:
-          pattern: security-race-*
-          path: ${{ runner.temp }}/acceptance
-          merge-multiple: true
-      - name: Regenerate exact candidate artifacts
-        run: |
           npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
-      - name: Require every cell and matching final source
-        env:
-          CELL_RESULT: ${{ needs.security-race-cells.result }}
-        run: |
-          test "$CELL_RESULT" = success
-          npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --aggregate-race "$RUNNER_TEMP/acceptance"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: race-*
+          path: ${{ runner.temp }}/race-evidence
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Require separate exact-seven race aggregate
+        run: node .github/scripts/acceptance-report.mjs aggregate race "$RUNNER_TEMP/race-evidence" "$RUNNER_TEMP/race-aggregate.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-race-aggregate
+          path: ${{ runner.temp }}/race-aggregate.json
+          if-no-files-found: error
+          retention-days: 7
 
   frontend:
     name: Frontend checks and build
@@ -387,7 +406,7 @@ jobs:
       - name: Smoke-test standalone web image and browser CSP
         env:
           WEB_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/auth-browser-evidence
-        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
+        run: npm exec -- nx exec -p web -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
 
       - name: Upload masked public and auth browser evidence
         if: always()
@@ -543,42 +562,55 @@ jobs:
           overwrite: true
 
   registration-browser:
-    name: Registration production browser prerequisite gate
+    name: Exact release API production registration acceptance
     needs: [quality]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
-      - name: Set up Go 1.26
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
-          cache-dependency-path: |
-            apps/identity-api/go.sum
-            libs/schemas/go.sum
-      - name: Install workspace dependencies
+      - name: Prepare identical generated inputs and browser
         run: |
           npm install --global npm@11.21.0
           npm ci
-      - name: Download the quality-tested API candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: release-api
-          path: ${{ runner.temp }}/release-api
-      - name: Generate the candidate schema for identity verification
-        run: |
           npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
-      - name: Check public enrollment acceptance prerequisites
-        run: node .github/scripts/registration-browser.mjs "$RUNNER_TEMP/release-api"
+          npm exec -- playwright install --with-deps chromium
+      - name: Preload declared registration controller and isolated service images
+        run: |
+          docker pull --platform linux/amd64 node:24-bookworm-slim
+          docker pull --platform linux/amd64 postgres:16-alpine
+          docker pull --platform linux/amd64 redis:7-alpine
+          docker pull --platform linux/amd64 nats:2.10-alpine
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: acceptance-api
+          path: ${{ runner.temp }}/acceptance-api
+          digest-mismatch: error
+      - name: Load exact checksum-verified API and run production browser
+        env:
+          REGISTRATION_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/registration-browser-evidence
+          REGISTRATION_BROWSER_API_MANIFEST: ${{ runner.temp }}/acceptance-api/acceptance-api.json
+        run: |
+          export REGISTRATION_BROWSER_CONTROLLER_IMAGE="$(docker image inspect --format '{{.Id}}' node:24-bookworm-slim)"
+          export REGISTRATION_BROWSER_API_IMAGE="$(node .github/scripts/acceptance-report.mjs load-api "$RUNNER_TEMP/acceptance-api")"
+          npm exec -- nx run web:test-registration-browser --skipNxCache
+          node .github/scripts/acceptance-report.mjs verify-registration "$RUNNER_TEMP/registration-browser-evidence/registration-evidence.json" "$RUNNER_TEMP/acceptance-api/acceptance-api.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: registration-browser-evidence
+          path: ${{ runner.temp }}/registration-browser-evidence/
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish release images
@@ -621,6 +653,33 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download registration source/image binding
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: registration-browser-evidence
+          path: ${{ runner.temp }}/registration-browser-evidence
+          digest-mismatch: error
+      - name: Download acceptance image manifest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: acceptance-api
+          path: ${{ runner.temp }}/acceptance-api
+          digest-mismatch: error
+      - name: Download integration publication aggregate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: integration-aggregate
+          path: ${{ runner.temp }}/aggregates
+          digest-mismatch: error
+      - name: Download race publication aggregate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: security-race-aggregate
+          path: ${{ runner.temp }}/aggregates
+          digest-mismatch: error
+      - name: Bind all acceptance reports to published API
+        run: node .github/scripts/acceptance-report.mjs verify-publication "$RUNNER_TEMP/registration-browser-evidence/registration-evidence.json" "$RUNNER_TEMP/acceptance-api/acceptance-api.json" "$RUNNER_TEMP/release/api.json" "$RUNNER_TEMP/aggregates"
 
       - name: Publish verified versions and promote stable aliases
         env:

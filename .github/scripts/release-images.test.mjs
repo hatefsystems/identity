@@ -937,24 +937,3 @@ test('importing the module does not execute its CLI', async () => {
     'import-safe'
   );
 });
-
-test('candidate export supports PR checks with a checksum and source identity while publication remains tag-only', async (t) => {
-  const directory = await temporaryDirectory(t);
-  const env = envFor({ GITHUB_EVENT_NAME: 'pull_request', GITHUB_REF: 'refs/pull/1/merge' });
-  const image = imageFor('api', `sha-${REVISION}`);
-  const run = async (command, args) => {
-    if (command === 'git') return REVISION;
-    if (args[1] === 'inspect') return JSON.stringify([inspectDocument(image)]);
-    assert.deepEqual(args.slice(0, 3), ['image', 'save', '--output']);
-    assert.equal(args[4], image.imageId);
-    await writeFile(args[3], 'owned-candidate-archive');
-    return '';
-  };
-  const artifact = await exportImage('api', 'local:ci', directory, { env, run, candidate: true });
-  assert.equal(artifact.imageId, image.imageId);
-  assert.equal(artifact.sha256, hash('owned-candidate-archive'));
-  assert.match(artifact.identity.source, /^[a-f0-9]{64}$/);
-  assert.match(artifact.identity.generated, /^[a-f0-9]{64}$/);
-  await assert.rejects(publishImages(directory, { env, run: async () => REVISION }), /canonical repository/);
-  await assert.rejects(exportImage('api', 'local:ci', directory, { env: { ...env, GITHUB_RUN_ID: '' }, run, candidate: true }), /workflow run ID/);
-});

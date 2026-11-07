@@ -1,11 +1,9 @@
 # Hatef Identity Platform - API Design
 
-Public signup and its registration-only result/retry contract are proposed in cleanup phases 5/6, not implemented endpoints. No completion receipt, NFC Unicode mailbox identity, SMS.ir provider or additive `canonical_email` lookup echo exists in this checkout. Continue the existing mutation no-retry contract; never treat a proposed result endpoint as a session or attach credentials to an existing account. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
-
-This document outlines the API contracts for the Hatef Identity Platform. As per the architecture, all contracts are defined via **Protocol Buffers (.proto)**. This document serves as a high-level representation of the generated gRPC and REST/OIDC endpoints.
+This document describes the platform's gRPC/protobuf, REST/OIDC and strict first-party JSON contracts. Browser enrollment shapes below are not new protobuf/event versions. Enabled-feature descriptions are conditional contracts, not acceptance results or deployed capability claims.
 
 ## 1. External APIs (REST & OIDC)
-These endpoints are exposed through the Traefik API Gateway and are consumed by the Next.js frontend, mobile applications, and third-party OAuth clients.
+These endpoints use the canonical ingress (host Nginx for MVP; Traefik is a later target) and are consumed by the Next.js frontend and authorized OIDC clients.
 
 ### 1.1 Standard OIDC/OAuth2 Endpoints
 Implemented strictly according to OpenID Connect Core 1.0 and OAuth 2.1 specifications.
@@ -19,16 +17,33 @@ Implemented strictly according to OpenID Connect Core 1.0 and OAuth 2.1 specific
   - **Client Authentication (`private_key_jwt`):** Confidential clients must authenticate by sending a signed client assertion (`client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`) signed with their pre-registered asymmetric private key. The assertion must contain a unique `jti` and an expiration time `exp` no greater than 5 minutes from generation.
 
 ### 1.2 Authentication Flow (Frontend API)
-Used exclusively by the Hatef web platform to authenticate users. Task 7.3 enables discoverable-passkey sign-in for existing accounts, not signup or password login.
-- `POST /api/v1/auth/register`: Planned account registration; not connected by the portal.
-- `POST /api/v1/auth/verify-email/request`: Planned primary-email verification request.
-- `POST /api/v1/auth/verify-email/confirm`: Planned primary-email verification confirmation.
+Discoverable-passkey sign-in issues normal browser sessions. Separately enabled new-account registration verifies an existing owned email/phone and resident UV passkey; it never authenticates the browser or allocates a mailbox. See [registration](#15-new-account-registration).
 - `POST /api/v1/auth/login`: Planned username/password login; its public form remains disabled.
 - `POST /api/v1/auth/logout`: Revokes the current live bound session and clears its cookie. Requires browser proof and matching session intent while a live session exists. Missing/expired-cookie logout remains an idempotent `204`, with exact Origin still required. Dependency failure is not successful revocation.
 
 #### First-Party Browser Boundary (Task 7.3)
 
 Pages/assets go to Next.js and `/api` goes directly to Go through one HTTPS origin. There is no BFF, CORS workaround, bearer token in browser storage, or cookie-only fallback. `PORTAL_ORIGIN` is a canonical origin, matching the `OIDC_ISSUER` origin and one `WEBAUTHN_RP_ORIGINS` entry. HTTP is permitted only for explicit loopback development. Proof target URIs use this trusted origin plus the escaped request path, never caller-controlled Host or forwarding headers.
+
+`APP_ENV` is mandatory and exactly `development`, `test`, or `production`; test
+is not a development exemption. Issuers reject query/fragment markers including
+bare `?`/`#`; configured callbacks are structural HTTPS URLs without userinfo,
+opaque forms, fragments or invalid hosts/ports. Only explicitly selected
+development allows canonical localhost/loopback HTTP callbacks. Request callback
+matching remains exact; no prefix/provider aliases or custom schemes are added.
+
+Mailbox identity is valid UTF-8 with bounded raw input, outer whitespace trim,
+NFC/local lowercase/NFC, and non-transitional strict IDNA lowercase ASCII domain.
+The canonical local part is at most 64 UTF-8 bytes and address at most 254 bytes.
+Malformed dots, lists/quoted forms, literals, invalid/control/bidi/default-ignorable
+characters and embedded whitespace are rejected, not silently stripped. Verify,
+store, deliver and look up the exact canonical address. NFC equivalents converge;
+Persian/Arabic letters, dot/plus variants and NFKC-distinct local parts remain
+distinct. Email-specific HMAC input uses exact canonical bytes; generic BlindIndex
+NFKC behavior remains unchanged. Do not rehash signed history or add fallback
+identity algorithms. Stored notification recipient bindings must already match;
+SMTPUTF8 requires strict post-TLS EHLO before EAI AUTH/envelope/DATA, with no
+transliteration or ASCII downgrade. Sender/auth values remain ASCII.
 
 - Normal authenticated routes require a live `__Host-` Secure/HttpOnly/SameSite=Strict cookie, an active account and a DPoP proof using the session's originally bound key. Restricted recovery-enrollment and old unbound cookies cannot bootstrap the portal. A missing browser key requires fresh passkey authentication, not attaching a replacement key to an old cookie.
 - Every unsafe first-party request, including login/logout, requires one exact `Origin`. Missing, `null`, multiple, sibling and noncanonical origins are rejected. JSON bodies are bounded UTF-8 objects with valid media types; duplicate fields/trailing documents are rejected, and endpoint-specific schemas reject unknown fields where specified. OAuth token and private gRPC protocols retain their separate admission rules; admin RBAC/Origin requirements are not replaced.
@@ -63,14 +78,6 @@ Endpoints for phishing-resistant logins, Multi-Factor Authentication, and short-
 - `POST /api/v1/auth/webauthn/login/verify`: Verify the assertion using the same verified DPoP key that started options generation, issue a bound session cookie and return `204`. The client must then bootstrap `/users/me` before rendering private content.
 
 Every pending WebAuthn challenge is tagged with its ceremony flow and applicable account/session/key bindings. Shared Redis atomically checks bindings before single-use consumption, allowing start on one API replica and completion on another. Wrong bindings do not burn legitimate state; concurrent valid finishes have one winner. The versioned store has native TTLs (configured default five minutes, maximum fifteen), bounded 64-KiB serialized state and two-second operation deadlines. Redis faults fail closed without process-local fallback. Anonymous login options/verification and reclaim-options admission share a 30-request/IP-subnet/minute budget before allocating challenge/nonce state; the explicit nonce retry also counts. Memory storage is for isolated tests/development only.
-
-#### Browser Display and Notification Language
-
-The Next.js page renderer separately accepts a bounded `__Host-hatef-ui` display-preference cookie (Secure/HttpOnly/Path=/, no Domain, SameSite=Lax, one-year maximum). It carries only version/locale/calendar/time-zone, grants no API authority, and does not change the authentication cookie's SameSite=Strict policy. Server Actions retain the framework's same-origin/CSRF checks. Routes, request bodies, OAuth/OIDC URLs, DPoP canonical target URLs, return-path allowlists and response codes remain unchanged. See [localization](localization.md).
-
-Only `DELETE /api/v1/users/me` (including its existing trailing-slash alias) and `POST /api/v1/users/me/phone/send-code` use `X-Hatef-Notification-Locale: en|fa-IR` for presentation. Missing, duplicate, oversized or unsupported values fall back to English without changing admission or response uniformity. Browser deletion snapshots the initiating tab's active locale through a typed route-restricted transport option; a shared cookie changed by another tab is not notification-language authority. The phone UI and production SMS gateway remain separate work.
-
-Encrypted deletion-notification payload v2 freezes validated locale and template version with the existing transactional intent. Legacy v1 notices remain English; invalid new versions/locales fail closed. Both recipients receive the frozen language, each separately, with unchanged delivery identity, token, deadline, retries, bindings and 16 KiB encoded-message limit. Persian subjects use MIME encoded words; text/HTML alternatives remain UTF-8 quoted-printable with explicit HTML language/direction. Each contains exactly one canonical `/recover-account#token=...` link and the authoritative UTC deadline. No locale/token query or redirect is added. A browser opening mail resolves its own saved preference or English. Deploy compatible v1/v2 readers before v2 writers; [rollback rules](devops-operations.md#localized-notification-queue-rollout) prohibit old readers while live v2 work remains.
 
 #### Multi-Factor Authentication (TOTP) & SMS OTP
 - `POST /api/v1/auth/mfa/generate`: Generate a pending TOTP secret and QR code. Requires Step-up authentication in `X-Step-Up-Auth` because adding an authenticator changes who can satisfy future Step-up checks. The response contains `enrollment_id`, `secret`, `otpauth_url`, `issuer`, and `account_name`; keep the secret client-side only until confirmation.
@@ -117,7 +124,7 @@ Task 7.4 adds `/dashboard/privacy` and an independent `/recover-account` page.
 - **Transactional acceptance:** under the account lock, active status and captured `auth_version` are rechecked. Soft deletion, version advancement, reversible lifecycle event, hashed single-use reclaim request, and encrypted per-recipient notification intents commit together. Encryption/enqueue failure rolls back; concurrent suspension/ban must not be overwritten.
 - **Response and revocation:** confirmed acceptance returns empty `204` and clears the current cookie. Live authorization rejects old sessions/grants; revocation cleanup is bounded after commit. No receipt, token, exact deadline or inbox-delivery result is returned. A lost response or post-commit activity failure is an uncertain outcome, not proof of rollback. Never automatically replay DELETE or infer success from a later `401`.
 - **Coalescing, not authenticated resend:** concurrent requests admitted under the original authority share its request, token, deadline and notice set. After deactivation, authenticated admission rejects the account. Automatic SMTP retries operate independently, never mint a token or extend the deadline. The old resend-cooldown setting and public resend promise no longer apply.
-- **Delivery:** `deletion-notifier` sends separate messages to the server-selected primary and configured backup. Identical mailboxes are deduplicated, preserving local-part case. Stable message IDs aid retries, but SMTP is at least once; ambiguous acknowledgements can duplicate mail. Relay acceptance does not prove inbox delivery.
+- **Delivery:** `deletion-notifier` sends separate messages to the server-selected exact canonical primary and configured backup, deduplicated at intent creation. SMTP public origin must equal canonical `PORTAL_ORIGIN`; EAI recipients require strict post-TLS SMTPUTF8. Stable IDs aid retries, but ambiguous acknowledgements can duplicate mail. Relay acceptance does not prove inbox delivery.
 - **Enablement:** `GDPR_DELETION_ENABLED` defaults to false. PostgreSQL transactions, envelope encryption, shared Redis, sessions/token revocation, and WebAuthn/step-up must be configured. Recovery and accepted notice draining remain independent of the switch and SMTP availability. First verify a working supervised SMTP worker and an independently accessible recovery mailbox.
 - **Limits and authority:** the account/day limit defaults to 3 and returns `429 rate_limited` on saturation. Production recovery/purge policy is exactly `720h`. Live account/version validation prevents recovery from reviving old authority; offline JWT-only consumers retain residual authority until expiry, at most ten minutes. Already admitted requests may finish.
 
@@ -133,8 +140,70 @@ A `pending_deletion` account cannot log in at all, so reclamation is a separate 
 
 Reclaim is anonymous, not unprotected: exact Origin, bounded JSON, shared admission/rate limits and token-plus-factor verification apply. No cookie or existing IndexedDB/DPoP key is needed. Mail links use a fixed HTTPS origin and `/recover-account#token=<opaque token>`; the browser immediately scrubs the fragment and retains bounded memory only. Opening/scanning a link performs no redemption. There is no query/path token, email-only fallback or public resend endpoint. Legal holds delay erasure, never token expiry.
 
-### 1.5 Account Verification & Anti-Spam
-To prevent fake account creation (e.g., for the Email Service), the platform uses standard Server-to-Client SMS or Backup Email verification. All phone numbers and backup emails are stored using AES-GCM-256 application-layer Envelope Encryption.
+### 1.5 New-Account Registration
+
+`REGISTRATION_ENABLED=false` is independently opt-in. When enabled with schema,
+shared Redis, private keys, approved finite admission/send budgets, SMS.ir and
+verified TLS SMTP prerequisites, all routes below require exact Origin, bounded
+strict JSON, public DPoP nonce/replay admission, no-store and no-referrer. Each
+transport attempt uses a fresh proof/JTI from the original verified JKT.
+Signup uses public DPoP without access-token `ath`, Authorization or
+`X-Portal-Session`; it does not use an ordinary/recovery session as authority.
+`attempt_id` is not authority: follow-ups also need the returned capability,
+except email verification, which needs its distinct token and original JKT.
+
+| POST route | Exact request fields | Successful result / meaning |
+|---|---|---|
+| `/api/v1/auth/register/start` | `{email,phone}` | `{attempt_id,capability,canonical_email,expires_at,email_sent}`; durable attempt only, no account/availability claim. `email_sent` is submission acceptance, not inbox delivery. |
+| `/api/v1/auth/register/email/resend` | `{attempt_id,capability}` | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send. |
+| `/api/v1/auth/register/email/verify` | `{attempt_id,token}` | Marks only email ownership from the original JKT; no capability/session/role issuance. |
+| `/api/v1/auth/register/phone/send` | `{attempt_id,capability}` | `{verification_id}` for the frozen Iranian phone after verified email; no automatic billed retry. |
+| `/api/v1/auth/register/phone/verify` | `{attempt_id,capability,verification_id,code}` | Consumes the exact signup/JKT/phone OTP and persists phone proof. Code is a six-digit string, including leading zeros. |
+| `/api/v1/auth/register/passkey/options` | `{attempt_id,capability}` | `{publicKey}` for a signup-purpose resident UV-required ceremony after both ownership proofs. |
+| `/api/v1/auth/register` | `{attempt_id,capability,credential}` | `200`; WebAuthn creation JSON completes the ceremony; `{state:"completed",next:"login",receipt_expires_at,email_verified:true,phone_verified:true}`. |
+| `/api/v1/auth/register/result` | `{attempt_id,capability}` | Pending: `{state:"pending",expires_at,email_verified,phone_verified}`. Failed: `{state:"failed",receipt_expires_at,email_verified,phone_verified}`. Completed: same shape as final. Not a login or email-based capability recovery. |
+
+The email link is `/register/verify-email#attempt_id=...&token=...`; the browser
+scrubs the fragment immediately and verifies only after explicit user action.
+Wrong-browser/key links cannot transfer enrollment authority. Attempt/capability/
+token/OTP/credential material never belongs in paths, query strings, logs, browser
+persistent storage, analytics or cross-tab messages. Caller-supplied user IDs,
+handles, roles, status, auth versions or proof flags are not accepted.
+
+Pending state lasts 15 minutes, email proof 10 minutes, passkey challenge at most
+5 minutes (also bounded by pending expiry) and completion receipt 1 hour. Pending
+attempts are not users and cannot log in. Final SQL commit creates exactly one
+active user, canonical email, frozen handle, resident UV credential, encrypted
+verified phone, revision-1 created-event intent and receipt together. No password,
+mailbox, role or session is created; normal discoverable login follows separately.
+Email/phone/pending-deletion/credential uniqueness remains database-authoritative;
+conflict never attaches a credential to an existing account.
+
+For lost/ambiguous final responses, explicitly read `/register/result` using the
+same capability/JKT and a new DPoP proof. Same-authority identical completion can
+return its committed receipt; changed completion data conflicts. This narrow
+registration-only reconciliation does not relax other mutation retry rules,
+resurrect spent phone OTPs or promise exactly-once external delivery. Lost browser
+authority requires restart or ordinary login, never capability lookup by email.
+Hold-aware bounded cleanup does not extend expired proofs/receipts; expiry checks
+alone are not physical erasure or proof of supervised cleanup.
+
+Fixed errors include `invalid_request` (400), `invalid_registration` (401),
+`registration_expired` (410), `registration_conflict`, `restart_registration`,
+`proof_required`, `restart_phone_proof` (409), `result_required`, `send_failed`,
+`temporarily_unavailable` (503), and local `rate_limited` (429 with Retry-After).
+`result_required` directs explicit same-authority outcome checking; failed proof
+commit may require a fresh phone proof rather than restoring a spent OTP. A
+provider throttle is a failed send, not falsely reported as the local limiter.
+
+#### Existing-Account Contact Verification
+
+`SMS_ENABLED=false` leaves DB-only verified-phone removal/recovery independent of
+provider secrets. Enabled sending uses SMS.ir VERIFY's fixed HTTPS POST endpoint,
+Iranian destinations and explicit live/sandbox key mode (production live-only).
+Sandbox success-shaped responses send nothing; neither message ID/cost nor ACK
+proves handset delivery. No SMS login, password reset or provider-switch fallback
+is added. Phone/backup data stays envelope encrypted.
 - `POST /api/v1/users/me/phone/send-code`: Sends a 6-digit verification code via SMS to the provided phone number. Requires Step-up authentication in `X-Step-Up-Auth`, because adding a password-reset/recovery channel changes account authority. Returns `{"status":"sent","verification_id":"..."}`; `verification_id` is a 256-bit opaque base64url handle, not the phone number or an authorization credential.
 - `POST /api/v1/users/me/phone/verify`: Verifies `{"verification_id":"...","code":"123456"}` and marks the server-side pending phone as verified, returning `{"status":"verified"}`. The pending record is bound to the account, exact initiating session, normalized phone, and code hash. The client cannot replace the phone during verification; a foreign account/session sees `no_active_code` and does not consume the challenge or an attempt. The Step-up grant was consumed at `/send-code`, so this endpoint needs the same live session but no second grant.
 - `DELETE /api/v1/users/me/phone`: Removes the verified phone number from the account (Requires Step-up authentication in `X-Step-Up-Auth`). The encrypted payload and its blind index are cleared together so they cannot drift apart. Returns `204` and is idempotent with respect to the phone: removing an absent phone succeeds.
@@ -143,6 +212,9 @@ To prevent fake account creation (e.g., for the Email Service), the platform use
 - `DELETE /api/v1/users/me/backup-email`: Removes the backup email from the account (Requires Step-up authentication in `X-Step-Up-Auth`).
 
 ### 1.6 Password Reset & Account Recovery
+The password/reset interfaces below are future work, unmounted and disabled in
+the public UI. Registration does not add password/SMS login or reset authority;
+existing restricted backup-code and deletion-reclaim flows remain separate.
 - `POST /api/v1/auth/password-reset/request`: Initiates password reset flow. Can be routed to the Primary Email, Backup Email, or Verified Phone (via SMS).
 - `POST /api/v1/auth/password-reset/verify-otp`: Validates the OTP received via SMS or Backup Email to authorize a password change.
 - `POST /api/v1/auth/password-reset/confirm`: Confirms the new password securely.
@@ -155,7 +227,7 @@ Admin routes require an active, non-deleted account, a normal DPoP-bound browser
 |---|---|---|
 | `GET /capabilities` | Any permitted, mounted section 1.7 operation | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes, including legal-only grants. No role catalogue, personal data, or section 1.8 workflow flags in the response. Durably audited before disclosure. |
 | `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary with canonical-string `lifecycle_revision` from the status snapshot; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
-| `POST /users/lookup` | Moderator | Exact normalized email in JSON `{email}`. Legacy `GET /users?email=...` is rejected. |
+| `POST /users/lookup` | Moderator | Exact canonical email in JSON `{email}`; response includes mandatory `canonical_email` bound to the returned user row. Legacy `GET /users?email=...` is rejected. |
 | `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason, expected_revision}` with an exact decimal-string revision. Active/suspended/banned only; no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. Stale pins return `409 account_conflict` under the existing account locks, before status/auth/lifecycle writes. |
 | `GET /audit-logs` | DPO | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes. |
 | `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin | Content-free verification; no actors, network data, payloads or account data. |
@@ -194,11 +266,17 @@ User/hold offset lists use `{items,total,limit,offset}` with effective configure
 
 User-list GET accepts only `limit`, `offset`, and `status`; audit-list GET only `start_time`, `end_time`, `event_type`, `limit`, and `before_seq`; verifier GET only `after_seq`, `through_seq`, `predecessor_hash`, and `limit`. Repeated/unknown keys and malformed query escaping are `400`. Capabilities/detail GET has no query keys. Email lookup and moderation are body-only. Moderation rejects missing/null/numeric/noncanonical/overflow revisions, unknown or duplicate fields, malformed UTF-8/JSON and trailing input. Trim the reason, then require 1..2000 UTF-8 bytes. A matching revision remains required for API-only same-status behavior; the panel presents only actual transitions.
 
+Lookup callers must verify that the returned row's email equals the mandatory
+server `canonical_email` before presentation/target selection, then pin that exact
+canonical identity for moderation. Missing/mismatched binding is invalid output,
+not permission to fall back to raw input or ASCII-only normalization. This additive
+metadata changes neither permissions nor legal attribution's content projection.
+
 #### Legal Holds and Preservation (Task 7.6)
 
 Legal subjects are the original `account_ref` UUID (`users.id`, retained independently after deletion), not a `user_id` alias or a live-account resolver. Each create requires exactly one nonzero UUID `Idempotency-Key` header supplied from the controlled external intake record. The browser uses canonical lowercase hyphenated, nonzero UUIDs for subjects, holds and keys; it never synthesizes a request key. Actor references come from the authenticated session, never the body.
 
-Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); unknown/duplicate fields, malformed input and trailing documents are rejected. The shared browser boundary additionally has a 64-KiB ceiling. All legal POSTs and release reject query strings, including a bare `?`. Release sends no body or idempotency header. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
+Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); exact field spelling/types are required, with unknown fields, case aliases, duplicates, null strings, malformed UTF-8/JSON and trailing documents rejected. Live session and permission checks precede bounded declared/chunked body preflight, which precedes grant consumption; interrupted/oversized input cannot consume the grant or buffer unbounded data. The backend 32-KiB ceiling does not depend on browser enforcement. All legal POSTs and release reject query strings, including bare `?`. Release sends no body or idempotency header; the backend refuses either rather than ignoring it. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
 
 | Operation | JSON request | Success |
 |---|---|---|
@@ -240,7 +318,7 @@ Any independent active hold overrides erasure eligibility until **explicit relea
 | Field | Request contract |
 |---|---|
 | `identifier_type` | Required string, exactly `email`; all other values return `400 unsupported_identifier_type`. |
-| `identifier` | Required nonblank bare-email string, at most 320 UTF-8 bytes before trim; no display-name address. |
+| `identifier` | Required bare-email string; valid UTF-8 raw bound 1024 bytes, canonical bound 254 bytes with local part <=64 bytes. No display-name/list/quoted/literal address. |
 | `requesting_authority`, `case_reference` | Required nonblank strings, each at most 255 UTF-8 bytes before trim. |
 | `purpose` | Required nonblank string, at most 4096 UTF-8 bytes before trim. |
 | `start_time`, `end_time` | Required nonzero timestamps as strings; API accepts RFC3339 or Unix seconds, within years 1..9999. Require `start <= end` and span no greater than the effective `audit_max_window_seconds`. SQL bounds are inclusive after conversion to microsecond precision. The browser requires explicit RFC3339 UTC (`Z`) bounds. |
@@ -248,7 +326,11 @@ Any independent active hold overrides erasure eligibility until **explicit relea
 | `fields` | Optional array of at most six distinct exact names: `client_ip`, `ip_subnet`, `user_agent`, `device_fingerprint`, `client_id`, `scope`. Unknown/duplicate names fail. Omission/empty array gives core fields only; the panel initially sends `[]`. |
 | `cursor` | Optional opaque string, at most 4096 bytes, returned by the prior page. Omit for the first page. Invalid, tampered or scope-mismatched cursors return `400 invalid_request`. |
 
-The server computes HMAC-SHA256 over `lowercase(NFKC(trim(identifier)))` with its configured pepper. The browser validates syntax/length but performs no hashing or provider-specific email normalization. Phone/backup-email lookup, profile resolution and search-as-you-type are not provided.
+The server canonicalizes NFC/local lowercase/NFC plus strict IDNA and computes
+email HMAC-SHA256 over those exact bytes, without generic BlindIndex's unchanged
+NFKC pass. Cursor scope uses that same canonical identity. The browser performs
+no hashing/provider alias normalization. Phone/backup-email/profile resolution and
+search-as-you-type are not provided; old signed history is never rehashed.
 
 Window validation and cursor scope use the parsed UTC instants, while the shared database timestamp conversion truncates query bounds to microseconds. Use microsecond-or-coarser inputs to avoid that sub-microsecond selection difference; a client must withhold an out-of-scope result rather than silently widen the submitted interval.
 
@@ -272,7 +354,8 @@ Legal and shared errors use the JSON `error` code (with the existing step-up cha
 
 | Outcome | Meaning / required handling |
 |---|---|
-| `400 invalid_request` | Invalid body, UUID/key, byte/date/page/field bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. Legal JSON above 32 KiB fails here; above the shared 64-KiB boundary can instead return `413 invalid_request`. |
+| `400 invalid_request` | Invalid body, UUID/key, date/page/field/type bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. |
+| `413 invalid_request` | Backend legal preflight rejects declared or streamed body above 32 KiB before consuming step-up; no browser-only guarantee. |
 | `415 invalid_content_type` | Missing, duplicated or unsupported media type/charset for a nonempty body. |
 | `400 unsupported_identifier_type` | Only email attribution is supported. |
 | `401 use_dpop_nonce` | Explicit pre-handler challenge permits one retry with a fresh proof and the **same** body/key/grant; no handler/grant has been consumed. |
@@ -296,7 +379,13 @@ Canonical-v2 verification defaults to a 1,000-node page (maximum 5,000). Start a
 
 Responses include `chain`, `canonical_version: 2`, `seed_source`, `seed_hash`, `scope`, page counts, `verified`, `complete`, positions, and failure metadata. Hashes are 64-character lowercase SHA-256 hex. Every sequence coordinate (`after_seq`, `through_seq`, nullable `first_seq`, `last_seq`, `broken_at_seq`, and `next_after_seq`) is a canonical decimal string; counts and limits stay numeric. `complete` is authoritative even if a cursor is present. A clean partial page is not a complete-run result.
 
-The API returns explanatory scope text, which the panel validates and displays without inventing shorter scope aliases. Audit scope is relative to its seed and does not claim complete ingestion, tail-truncation detection or independent historical authenticity. Ledger scope is database-relative chain and retained-payload verification, with erased payloads authorized by erasure records rather than recomputed. An unseeded stored-predecessor start proves only local consistency. `checked` counts visited nodes, including nodes with authorized erased payloads; ledger `erased_checked` is a subset, never added to it. Authorized erasure is not erased-content verification. An initialized empty chain reports zero checked records and is not proof that no activity occurred; a missing head is an error. Missing payloads without erasure authorization, invalid leaf/chain data, predecessor mismatch, and head mismatch stop the run without success.
+The API returns exact explanatory scope text, which the panel validates/displays without inventing aliases. Audit scope is `database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization`. Ledger scope is `database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity`. Both are relative to their seed/snapshot; a stored-predecessor start proves local consistency, not independent trust. `checked` includes erased annotated nodes; `erased_checked` is a subset, never added. Annotations do not recompute erased bodies or certify policy compliance by a compromised purge credential. Both durable heads are validated against their own actual terminal/genesis even for empty/historical `through_seq` requests, not compared to an older requested bound. Initialized-empty is not proof of no activity; missing/malformed head, absent payload without annotation, invalid leaf/link or predecessor/head mismatch stops success.
+
+Operational receipt assurance is separate: the bounded read-only `admin-legal --operation=ledger-receipts` uses `LEDGER_RECEIPTS_DATABASE_URL`, not expanded purge grants or a public API/UI. It distinguishes pending intent, manifest-bound chained receipts, legacy/unbound, missing/unavailable, invalid and incomplete coverage. PubAck/`published_at` does not establish chaining; a partial proof is not a full-chain pass. It never rewrites/certifies old signed bytes or independently proves legal authorization.
+
+Its proof flags/counts concern Class C chain linkage in hash-only bounded pages;
+correlated receipt bodies/leaves are checked separately. They do not certify
+unrelated audit narrative bodies or complete ingestion.
 
 Canonical v2 retains separate chain nodes and verifies available payload leaf digests. The erased-span checkpoint protocol, `purged_count`, `proof_steps`, and checkpoint restart rules belong to the retired format and are not current fields. There is no browser-side rehash or claim of independent historical authenticity. A privileged coherent database rewrite remains undetectable without external anchoring, which is explicitly deferred.
 
@@ -326,6 +415,7 @@ fingerprints in audit.
 | `POST /legal-cases/{case_id}/close` | Explicit closure without a response; never releases a hold. |
 | `GET /legal-reviews` | Due review queue requiring both case-read and hold-read permissions. |
 | `POST /legal-holds/{hold_id}/reviews` | Advisory review/history, starting at `expected_version=0`; original hold replay fields are unchanged. |
+| `GET /legal-holds/{hold_id}/reviews` | Gated audited handoff requiring live `legal.holds.read` only, no case-read or step-up. Returns effective schedule, current version and bounded decrypted newest-first history. No query/body/idempotency key. |
 | `POST /legal-cases/{case_id}/response` | Exact content revision, outcome, rationale and encrypted manifest (recipient/evidence/legal basis and exact subject/time/field/artifact selection). |
 | `POST /legal-cases/{case_id}/response/approve` | Exact expected state, content and proposal revisions; different DPO for data-bearing outcomes. |
 | `POST /legal-cases/{case_id}/response/delivery` | Same approved revisions, UTC `delivered_at`, external `receipt_reference`; attests one final delivery and closes the case. |
@@ -351,6 +441,36 @@ policy/storage failures 503, and authorization failures 403. Operator delivery
 attestation is not evidence that the API transferred data. Supplements, reopening,
 external messaging, uploads, public publishing and the UI are not implemented by
 this contract. See [operator procedures](admin-operations.md#legal-review-and-transparency-task-55).
+
+Hold-review GET returns exactly `{version,next_review_at,history,history_truncated}`:
+`version` is the existing numeric workflow version, `next_review_at` nullable UTC,
+`history` an array of `{id,revision,purpose,actor,action_id,created_at,input}`.
+It reuses subject/scope locks and expiry/hold checks before decrypting and durably
+audits disclosure before bytes. Never-reviewed is version 0/history `[]` with the
+original hold `review_at`; after review, the effective override includes explicit
+null (not fallback to the original date). History is newest-first and capped at
+200 events/1 MiB decrypted input with explicit truncation. Erased/expired returns
+`410 legal_record_unavailable`; missing/inconsistent retained history returns
+`503 legal_workflow_unavailable`, not a never-created response. No existing-hold
+replay fields, review/retention clocks or scope permissions change, no narratives
+are resurrected and no workflow UI is supplied. A missing hold is `404 not_found`.
+
+`admin-legal --operation=workflow-status` is a separate bounded read-only operator
+snapshot using installed baseline policy with intake disabled, no keys/actor
+configuration. It reports only cutoff/count/age/lower-bound review/backlog metadata,
+not identifiers. `--limit` is `1..1000` (default 500), cleanup is `1..500` and
+baseline cleanup `1..1000`; operation-specific unsupported flags are rejected
+before connection, including explicitly supplied `--dry-run=false` outside cleanup.
+Workflow expiry uses at-or-after equality; context/baseline released cleanup is
+strict-before. Closed expiry is the minimum of original max age and closure-relative
+retention; reviews and hold release never reset it. Distinct-account approvals
+are not verification of distinct humans, and delivery remains operator attestation.
+
+Here, baseline cleanup means the governance-policy cleanup operation, not migration
+installation. Obsolete legal Backfill/plaintext compatibility is removed.
+Unchanged `00001` plus additive `00002` installation and fail-closed history refusal follow
+[admin operations](admin-operations.md#migration-and-contraction); no HTTP, signed
+canonical, wire-format or operator approval contract changes with consolidation.
 
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
@@ -391,7 +511,7 @@ Task 6.3 uses the canonical [`UserLifecycleEvent`](../libs/schemas/proto/hatef/i
 
 | Subject | Trigger |
 |---|---|
-| `identity.user.created` | Transactional `lifecycle.CreateUser` for a new active/pending-verification account. No new registration HTTP endpoint is provided; passkey enrollment and the synthetic lookup probe are not account creation. |
+| `identity.user.created` | Transactional new-account creation, including enabled registration's final commit only. Start/options/proof failures and existing-account passkey enrollment do not create an account or event; synthetic lookup probes are not operator bootstrap. |
 | `identity.user.updated` | Actual ban/reactivation, pending-deletion or reclamation transition (v1), or a real display-name update (v2). `changed_fields` names the changed shared fields, never their values. Primary-email changes remain reserved; that mutation endpoint is separate work. |
 | `identity.user.suspended` | Actual transition into the literal `suspended` status, including from banned. Repeating the same status does not emit an event even when credentials are invalidated. |
 | `identity.user.deleted` | Exactly one hold-checked physical user DELETE and its terminal intent commit atomically. Soft deletion, dry runs, held subjects, no-row deletes and rolled-back transactions never emit a tombstone. |
@@ -405,3 +525,11 @@ The worker accepts existing exact `{"user_id":"<uuid>"}` deletion payloads, vali
 Delivery is **at least once**. A PubAck followed by an uncertain database commit can replay the same ID, including outside the broker's finite deduplication window. Limits retention enables independent consumers; it is not the audit stream's work queue. A delayed or poisoned per-account head blocks its later revisions while other accounts can progress. Consumers must implement [idempotency, reconciliation and terminal tombstones](client-integration.md#4-user-lifecycle-consumption). Events synchronize projections, not instantaneous access revocation; continue using live authorization checks.
 
 Deploy dual-version publishing/readers and downstream consumers before enabling display-name writers. Downstream deployment is an explicit release prerequisite, not evidence supplied by repository tests. Rollback must retain v2-capable publishing/consumption while any v2 intent or replay remains; see [portal cutover](devops-operations.md#user-portal-cutover-task-73).
+
+## Notification presentation
+
+Only deletion initiation accepts `X-Hatef-Notification-Locale: en` or `fa-IR`.
+Missing, duplicate, oversized or unsupported values use English without changing
+authorization, routing, response codes or deadlines. The queued v2 intent freezes
+locale/template and v1 remains English. SMS.ir VERIFY uses the operator-configured
+provider template. See [localization](localization.md#notification-language-and-compatibility).

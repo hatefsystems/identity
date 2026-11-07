@@ -55,6 +55,7 @@ export type AdminStatusUpdate = {
 };
 export type AdminUsersQuery = { limit?: number; offset?: number; status?: AdminUserStatus };
 export type AdminUsersPage = { items: AdminUser[]; total: number; limit: number; offset: number };
+export type AdminLookupPage = AdminUsersPage & { canonical_email: string };
 
 export type AdminAuditLog = {
   id: string;
@@ -201,6 +202,24 @@ export function usersResponse(value: unknown): AdminUsersPage {
   return result;
 }
 
+export function lookupResponse(value: unknown): AdminLookupPage {
+  const item = record(value);
+  const page = usersResponse(value);
+  const canonical = text(item.canonical_email, 254);
+  if (
+    !/^[^@\s]+@[^@\s]+$/.test(canonical) ||
+    /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\ufffd]/u.test(canonical) ||
+    canonical.normalize('NFC') !== canonical ||
+    page.limit !== 1 ||
+    page.offset !== 0 ||
+    page.total > 1 ||
+    page.total !== page.items.length ||
+    page.items.some((user) => user.email !== canonical)
+  )
+    throw new PortalError('invalid_response');
+  return { ...page, canonical_email: canonical };
+}
+
 export function auditLogResponse(value: unknown): AdminAuditLog {
   const item = record(value);
   const seq = decimalString(item.seq);
@@ -250,8 +269,8 @@ export function verificationResponse(value: unknown): AdminVerification {
   if (item.chain !== 'audit' && item.chain !== 'ledger') throw new PortalError('invalid_response');
   const scope =
     item.chain === 'audit'
-      ? 'stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity'
-      : 'database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity';
+      ? 'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization'
+      : 'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity';
   if (item.scope !== scope) throw new PortalError('invalid_response');
   if (
     !['genesis', 'database_predecessor', 'supplied_predecessor'].includes(

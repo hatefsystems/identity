@@ -1,12 +1,12 @@
-// Integration tests for the Task 2.1 initial schema migration.
+// Integration tests for the consolidated final schema baseline.
 //
 // These tests require a reachable PostgreSQL instance addressed by
-// DATABASE_URL (see .env.example / docker-compose.dev.yml). When DATABASE_URL
-// is unset or the database is unreachable, they skip cleanly so plain
-// `go test ./...` stays green without Docker.
+// DATABASE_URL must identify test provisioning credentials with CREATEDB.
+// Only uniquely named run-owned databases are created and removed. Unset DSNs
+// skip local tests; a configured but unreachable database fails.
 //
 // Coverage:
-//   - goose Up creates all 8 tables + the goose version table.
+//   - Guarded Up creates the final application schema and new lineage.
 //   - Required indexes exist (partial unique indexes included).
 //   - Soft-delete email reuse works (partial unique index semantics).
 //   - users.status CHECK constraint rejects unknown values.
@@ -50,14 +50,15 @@ func openTestDB(ctx context.Context, t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = admin.Close() })
 	name := "migration_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	t.Logf("run-owned migration database: %s", name)
 	quoted := pgx.Identifier{name}.Sanitize()
-	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+quoted); err != nil {
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+quoted+" TEMPLATE template0"); err != nil {
 		t.Fatalf("create disposable migration database: %v", err)
 	}
 	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		if _, err := admin.ExecContext(cleanup, "DROP DATABASE "+quoted+" WITH (FORCE)"); err != nil {
+		if _, err := admin.ExecContext(cleanup, "DROP DATABASE "+quoted); err != nil {
 			t.Errorf("drop disposable migration database: %v", err)
 		}
 	})
@@ -90,10 +91,15 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"users", "roles", "permissions", "role_permissions", "user_roles",
 			"webauthn_credentials", "recovery_codes", "mvp_audit_logs",
 			"security_event_ledger", "security_ledger_head", "security_ledger_retention_settings",
-			// Canonical format v2 (migration 00015): tamper-evidence lives in its
-			// own append-only tables, and security_ledger_checkpoints is gone —
+			// Canonical format v2: tamper-evidence lives in its
+			// own append-only tables, and security_ledger_checkpoints is gone;
 			// erasure no longer breaks a chain, so there is nothing to bridge.
 			"audit_log_chain", "security_ledger_chain", "security_ledger_erasures", "audit_log_head",
+			"legal_holds", "mfa_totp_enrollments", "deletion_requests", "event_outbox", "admin_action_contexts",
+			"legal_governance_policies", "legal_governance_baseline", "legal_cases", "legal_case_subjects", "legal_case_holds",
+			"legal_workflow_events", "legal_hold_reviews", "legal_workflow_replays", "legal_transparency_coverage",
+			"legal_transparency_years", "legal_transparency_months", "legal_transparency_reports", "legal_transparency_replays",
+			"deletion_notifications", "registration_attempts",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -109,6 +115,11 @@ func TestInitialSchemaMigration(t *testing.T) {
 				t.Errorf("expected table %q to exist", table)
 			}
 		}
+		var count int
+		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 35 {
+			t.Fatalf("final application table count: %d, %v", count, err)
+		}
 	})
 
 	t.Run("RequiredIndexesCreated", func(t *testing.T) {
@@ -121,6 +132,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			// Drives the retention worker's candidate scan, which pages by
 			// (retain_until, seq). Replaced idx_security_ledger_retention_seq.
 			"idx_security_ledger_retention",
+			"idx_registration_pending_expiry", "idx_registration_receipt_expiry", "idx_registration_result_user",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -135,6 +147,92 @@ func TestInitialSchemaMigration(t *testing.T) {
 			if !exists {
 				t.Errorf("expected index %q to exist", index)
 			}
+		}
+	})
+
+	t.Run("OnlyReferenceSeedsAndFinalObjects", func(t *testing.T) {
+		for table, want := range map[string]int{"roles": 4, "permissions": 13, "role_permissions": 15,
+			"users": 0, "user_roles": 0, "audit_log_head": 0, "security_ledger_head": 0,
+			"audit_log_chain": 0, "security_ledger_chain": 0, "security_ledger_retention_settings": 0,
+			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0} {
+			var count int
+			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
+				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)
+			}
+		}
+		var functions, sequences int
+		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 11 {
+			t.Fatalf("final function inventory: %d, %v", functions, err)
+		}
+		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+			WHERE n.nspname='public' AND c.relkind='S' AND c.relname<>'identity_schema_version_id_seq'`).Scan(&sequences); err != nil || sequences != 3 {
+			t.Fatalf("final sequence inventory: %d, %v", sequences, err)
+		}
+		for _, table := range []string{"audit_log_chain", "security_ledger_chain"} {
+			var owned, defaultNextval bool
+			if err := sqldb.QueryRowContext(ctx, `SELECT pg_catalog.pg_get_serial_sequence($1,'seq')=$2,
+				a.attidentity='' AND pg_catalog.pg_get_expr(d.adbin,d.adrelid) LIKE 'nextval(%'
+				FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+				WHERE a.attrelid=$1::regclass AND a.attname='seq'`, "public."+table, "public."+table+"_seq").Scan(&owned, &defaultNextval); err != nil || !owned || !defaultNextval {
+				t.Fatalf("%s owned sequence/default changed: %v, %v, %v", table, owned, defaultNextval, err)
+			}
+		}
+		var independent, restricted bool
+		if err := sqldb.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend WHERE classid='pg_catalog.pg_class'::regclass
+			AND objid='public.account_auth_epoch_seq'::regclass AND deptype IN ('a','i'))`).Scan(&independent); err != nil || !independent {
+			t.Fatalf("account epoch sequence lost independence: %v, %v", independent, err)
+		}
+		if err := sqldb.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM public.role_permissions WHERE
+			(role_id='support' AND permission_id='admin.users.read.pii') OR (role_id='super_admin' AND permission_id='admin.users.read'))`).Scan(&restricted); err != nil || !restricted {
+			t.Fatalf("RBAC seed widened private data access: %v, %v", restricted, err)
+		}
+	})
+
+	t.Run("PendingDeletionReservesIdentifier", func(t *testing.T) {
+		execFixture(ctx, t, sqldb, `INSERT INTO public.users(email,status,deleted_at) VALUES('pending@test.local','pending_deletion',now())`)
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO public.users(email) VALUES('pending@test.local')`); err == nil {
+			t.Fatal("pending deletion identifier became reusable")
+		}
+	})
+
+	t.Run("MonotonicAuthenticationVersions", func(t *testing.T) {
+		var id string
+		var version, epoch int64
+		if err := sqldb.QueryRowContext(ctx, `INSERT INTO public.users(email) VALUES('authversion@test.local') RETURNING id,auth_version,auth_epoch`).Scan(&id, &version, &epoch); err != nil || version != 0 || epoch != 0 {
+			t.Fatalf("initial auth state: %d, %d, %v", version, epoch, err)
+		}
+		if err := sqldb.QueryRowContext(ctx, `UPDATE public.users SET status='suspended' WHERE id=$1 RETURNING auth_version,auth_epoch`, id).Scan(&version, &epoch); err != nil || version != 1 || epoch < 1 {
+			t.Fatalf("auth transition: %d, %d, %v", version, epoch, err)
+		}
+		var afterVersion, afterEpoch int64
+		if err := sqldb.QueryRowContext(ctx, `UPDATE public.users SET display_name='Fixture' WHERE id=$1 RETURNING auth_version,auth_epoch`, id).Scan(&afterVersion, &afterEpoch); err != nil || afterVersion != version || afterEpoch != epoch {
+			t.Fatalf("profile update changed auth boundary: %d, %d, %v", afterVersion, afterEpoch, err)
+		}
+		if _, err := sqldb.ExecContext(ctx, `UPDATE public.users SET auth_version=0 WHERE id=$1`, id); err == nil {
+			t.Fatal("auth version decrement accepted")
+		}
+		if err := sqldb.QueryRowContext(ctx, `UPDATE public.users SET auth_version=auth_version+2 WHERE id=$1 RETURNING auth_version,auth_epoch`, id).Scan(&afterVersion, &afterEpoch); err != nil || afterVersion != 3 || afterEpoch <= epoch {
+			t.Fatalf("explicit revocation did not advance epoch: %d, %d, %v", afterVersion, afterEpoch, err)
+		}
+	})
+
+	t.Run("EncryptedLegalHoldsAndReleasedTombstones", func(t *testing.T) {
+		for _, query := range []string{
+			`INSERT INTO public.legal_holds(account_ref,applied_by) VALUES(gen_random_uuid(),gen_random_uuid())`,
+			`INSERT INTO public.legal_holds(account_ref,applied_by,details_encrypted) VALUES(gen_random_uuid(),gen_random_uuid(),'\x')`,
+			`INSERT INTO public.legal_holds(account_ref,applied_by,details_purged_at) VALUES(gen_random_uuid(),gen_random_uuid(),now())`,
+		} {
+			if _, err := sqldb.ExecContext(ctx, query); err == nil {
+				t.Fatal("unencrypted active hold accepted")
+			}
+		}
+		execFixture(ctx, t, sqldb, `INSERT INTO public.legal_holds(account_ref,applied_by,details_encrypted) VALUES(gen_random_uuid(),gen_random_uuid(),'\x01')`)
+		execFixture(ctx, t, sqldb, `UPDATE public.legal_holds SET is_active=false,released_at=now(),details_encrypted=NULL,details_purged_at=now()`)
+		var legacyColumns int
+		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid='public.legal_holds'::regclass
+			AND NOT attisdropped AND attname IN ('reason','requesting_authority','legal_basis')`).Scan(&legacyColumns); err != nil || legacyColumns != 0 {
+			t.Fatalf("plaintext legal columns survived: %d, %v", legacyColumns, err)
 		}
 	})
 

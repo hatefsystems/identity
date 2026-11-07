@@ -84,7 +84,7 @@ function AccountQuery({
   const [accountStatus, setAccountStatus] = useState<AdminUserStatus | ''>('');
   const [size, setSize] = useState(String(limits.page_size_default));
   const [email, setEmail] = useState('');
-  const [page, setPage] = useState<AdminUsersPage | null>(null);
+  const [page, setPage] = useState<(AdminUsersPage & { canonical_email?: string }) | null>(null);
   const [query, setQuery] = useState<AdminUsersQuery | null>(null);
   const [mode, setMode] = useState<'list' | 'lookup' | null>(null);
   const [pending, setPending] = useState(false);
@@ -178,18 +178,18 @@ function AccountQuery({
   function lookup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canLookup || pending || work.blocked) return;
-    const value = email.trim();
+    const value = email.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
     if (
       !/^[^@\s]+@[^@\s]+$/.test(value) ||
-      /[\p{Cc}\p{Cs}]/u.test(value) ||
-      new TextEncoder().encode(value).length > 254
+      /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\ufffd]/u.test(value) ||
+      new TextEncoder().encode(email).length > 1024
     ) {
       setEmailError({ key: 'admin.accounts.emailError' });
       emailInput.current?.focus();
       return;
     }
     setEmailError('');
-    void load(value);
+    void load(email);
   }
 
   if (cleared) return <Feedback status={queryClearedMessage} />;
@@ -270,12 +270,12 @@ function AccountQuery({
               <Input
                 ref={emailInput}
                 id={`${id}-email`}
-                type="email"
+                type="text"
+                inputMode="email"
                 dir="ltr"
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}
-                maxLength={254}
                 value={email}
                 className={inputClass}
                 aria-invalid={Boolean(emailError)}
@@ -320,6 +320,11 @@ function AccountQuery({
         </form>
       )}
       <Feedback error={error} status={status} />
+      {page?.canonical_email && mode === 'lookup' && (
+        <p className="break-all text-sm text-muted-foreground">
+          {t.rich('accounts.canonicalEmail', { email: page.canonical_email, value: (chunks) => <bdi dir="auto">{chunks}</bdi> })}
+        </p>
+      )}
       {pending && (
         <Button
           type="button"

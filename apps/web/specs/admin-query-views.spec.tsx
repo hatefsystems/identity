@@ -13,6 +13,7 @@ import type {
   AdminAuditLog,
   AdminAuditPage,
   AdminCapabilities,
+  AdminLookupPage,
   AdminUser,
   AdminUsersPage,
   AdminVerification,
@@ -89,9 +90,9 @@ const ledgerSeed = '6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea
 const hash = 'b'.repeat(64);
 const lastHash = 'c'.repeat(64);
 const auditScope =
-  'stored_segment_relative_to_seed; not complete ingestion, tail-truncation detection, or independent historical authenticity';
+  'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization';
 const ledgerScope =
-  'database_relative_chain_and_retained_payloads; erased payloads are authorized by erasure records, not recomputed; not complete ingestion or independent historical authenticity';
+  'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity';
 const now = Date.parse('2026-10-28T12:00:00Z');
 
 function context(flags = allFlags, effectiveLimits = limits, currentProfile = profile) {
@@ -227,7 +228,10 @@ beforeEach(() => {
   context();
   jest.mocked(AdminClient).mockImplementation(() => api as unknown as AdminClient);
   api.users.mockResolvedValue(accounts([account(1), account(2)]));
-  api.lookup.mockResolvedValue(accounts([account(3)], 1, 0, 1));
+  api.lookup.mockResolvedValue({
+    ...accounts([account(3)], 1, 0, 1),
+    canonical_email: 'account3@example.test',
+  });
   api.auditLogs.mockResolvedValue(auditPage());
   api.verify.mockResolvedValue(proof());
 });
@@ -370,21 +374,29 @@ describe('bounded accounts and exact lookup', () => {
   });
 
   it('sends lookup only through the explicit body-only method and clears its query and late result', async () => {
-    const late = deferred<AdminUsersPage>();
+    const late = deferred<AdminLookupPage>();
     api.lookup.mockReturnValueOnce(late.promise);
     render(<UsersView />);
     const input = screen.getByLabelText<HTMLInputElement>('Exact email');
+    expect(input.type).toBe('text');
+    expect(input.inputMode).toBe('email');
+    expect(input.hasAttribute('maxlength')).toBe(false);
     fireEvent.change(input, { target: { value: ' person@example.test ' } });
     expect(api.lookup).not.toHaveBeenCalled();
     const form = screen.getByRole('form', { name: 'Exact email lookup' });
     expect(form.getAttribute('method')).toBe('post');
     fireEvent.submit(form);
-    expect(api.lookup).toHaveBeenCalledWith('person@example.test', expect.any(AbortSignal));
+    expect(api.lookup).toHaveBeenCalledWith(' person@example.test ', expect.any(AbortSignal));
     const signal = api.lookup.mock.calls[0][1] as AbortSignal;
     fireEvent.click(button('Clear lookup'));
     expect(input.value).toBe('');
     expect(signal.aborted).toBe(true);
-    await act(async () => late.resolve(accounts([account(3)], 1, 0, 1)));
+    await act(async () =>
+      late.resolve({
+        ...accounts([account(3, { email: 'person@example.test' })], 1, 0, 1),
+        canonical_email: 'person@example.test',
+      })
+    );
     expect(screen.queryByRole('table')).toBeNull();
     expect(window.location.search).not.toContain('person');
     expect(api.users).not.toHaveBeenCalled();
@@ -393,11 +405,29 @@ describe('bounded accounts and exact lookup', () => {
   it('rejects an oversized UTF-8 lookup without a request', () => {
     render(<UsersView />);
     fireEvent.change(screen.getByLabelText('Exact email'), {
-      target: { value: `${'\u00e9'.repeat(125)}@test.test` },
+      target: { value: `${'\u00e9'.repeat(512)}@test.test` },
     });
     fireEvent.submit(screen.getByRole('form', { name: 'Exact email lookup' }));
     expect(screen.getByRole('alert').textContent).toContain('254 UTF-8 bytes');
     expect(api.lookup).not.toHaveBeenCalled();
+  });
+
+  it('displays the backend canonical Unicode email in bidi isolation and clears it with the result', async () => {
+    const canonical = '\u00fcser@xn--bcher-kva.test';
+    const raw = ' U\u0308SER@B\u00dcCHER.test ';
+    api.lookup.mockResolvedValueOnce({
+      ...accounts([account(3, { email: canonical })], 1, 0, 1),
+      canonical_email: canonical,
+    });
+    render(<UsersView />);
+    fireEvent.change(screen.getByLabelText('Exact email'), { target: { value: raw } });
+    expect(api.lookup).not.toHaveBeenCalled();
+    fireEvent.submit(screen.getByRole('form', { name: 'Exact email lookup' }));
+    await screen.findByRole('table');
+    expect(api.lookup).toHaveBeenCalledWith(raw, expect.any(AbortSignal));
+    for (const address of screen.getAllByText(canonical)) expect(address.tagName).toBe('BDI');
+    fireEvent.click(button('Clear lookup'));
+    expect(screen.queryByText(canonical)).toBeNull();
   });
 
   it('ignores stale account responses after a replacement status query', async () => {
@@ -431,7 +461,7 @@ describe('bounded accounts and exact lookup', () => {
   });
 
   it('discards the old account request and draft when the session changes', async () => {
-    const late = deferred<AdminUsersPage>();
+    const late = deferred<AdminLookupPage>();
     api.lookup.mockReturnValueOnce(late.promise);
     const view = render(<UsersView />);
     fireEvent.change(screen.getByLabelText('Exact email'), {
@@ -445,7 +475,12 @@ describe('bounded accounts and exact lookup', () => {
     view.rerender(<UsersView />);
     expect((api.lookup.mock.calls[0][1] as AbortSignal).aborted).toBe(true);
     expect(screen.getByLabelText<HTMLInputElement>('Exact email').value).toBe('');
-    await act(async () => late.resolve(accounts([account(3)], 1, 0, 1)));
+    await act(async () =>
+      late.resolve({
+        ...accounts([account(3, { email: 'private@example.test' })], 1, 0, 1),
+        canonical_email: 'private@example.test',
+      })
+    );
     expect(screen.queryByRole('table')).toBeNull();
   });
 });

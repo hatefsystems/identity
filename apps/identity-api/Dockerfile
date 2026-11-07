@@ -13,6 +13,7 @@
 #   admin-audit-publisher  acknowledged administrative/maintenance outbox publisher
 #   lifecycle-publisher  metadata-only lifecycle broadcast and scoped cleanup
 #   deletion-notifier  encrypted per-recipient SMTP delivery and scoped cleanup
+#   registration-cleanup  bounded pending/receipt expiry and hold-aware cleanup
 #   admin-legal     policy installation and restricted legal metadata maintenance
 #   purge-worker    Class A GDPR erasure worker (host cron/systemd)
 #   security-ledger-purge  Class B retention worker (host cron/systemd)
@@ -71,7 +72,8 @@ RUN go build -trimpath -ldflags='-s -w' -o /out/ ./cmd/...
 RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
     && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
     && test -x /out/security-ledger-purge && test -x /out/admin-legal \
-    && test -x /out/lifecycle-publisher && test -x /out/deletion-notifier
+    && test -x /out/lifecycle-publisher && test -x /out/deletion-notifier \
+    && test -x /out/registration-cleanup
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -98,6 +100,7 @@ COPY --from=builder /out/audit-signer /usr/local/bin/audit-signer
 COPY --from=builder /out/admin-audit-publisher /usr/local/bin/admin-audit-publisher
 COPY --from=builder /out/lifecycle-publisher /usr/local/bin/lifecycle-publisher
 COPY --from=builder /out/deletion-notifier /usr/local/bin/deletion-notifier
+COPY --from=builder /out/registration-cleanup /usr/local/bin/registration-cleanup
 COPY --from=builder /out/security-ledger-purge /usr/local/bin/security-ledger-purge
 COPY --from=builder /out/admin-legal /usr/local/bin/admin-legal
 

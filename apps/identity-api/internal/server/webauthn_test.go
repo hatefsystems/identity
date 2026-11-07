@@ -249,6 +249,8 @@ func newWebAuthnTestServerWithStepUp(t *testing.T, withStepUp bool) *webAuthnTes
 
 	browser := newPortalTestClient(t, "http://localhost:8080")
 	cfg := testConfig(t)
+	// This localhost fixture uses in-memory stores and no shared admission limiter.
+	cfg.Environment = "development"
 	cfg.PortalOrigin = browser.origin
 	return &webAuthnTestServer{
 		t:       t,

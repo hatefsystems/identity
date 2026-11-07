@@ -2,16 +2,18 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
-import { readFileSync } from 'node:fs';
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer } from 'node:net';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startMailSink } from './portal-mail-sink.mjs';
+import { acceptanceIdentity, assertExecutedEvidence, assertIdentity, assertRaceToolchain, identityGoModule, integrationPackages, integrationTargets, racePackages, raceToolchainProfile } from './acceptance-report.mjs';
+export { integrationTargets, racePackages } from './acceptance-report.mjs';
 
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const backend = resolve(workspace, 'apps/identity-api');
@@ -197,7 +199,7 @@ export function fixtureSecretValues(value) {
         return [item];
       }
     }
-    if (/(?:^id$|_id$|(?:^|_)account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|^database_url$|^password$|reason|narrative|payload|^identifier$|^requesting_authority$|^legal_basis$|^case_reference$|^purpose$|cursor$|^seq$|^through_seq$|^client_ip$|^ip_subnet$|^user_agent$|^device_fingerprint$)/i.test(key)) {
+    if (/(?:^id$|_id$|(?:^|_)account_ref$|^actor_spiffe_id$|^credentialId$|^userHandle$|^code$|^secret$|^totp_secret$|^otpauth_url$|^privateKey$|^key$|email$|^recipient$|token$|^link$|^recovery_url$|(?:^|_)database_url$|^password$|reason|narrative|payload|^identifier$|^requesting_authority$|^legal_basis$|^case_reference$|^purpose$|cursor$|^seq$|^through_seq$|^client_ip$|^ip_subnet$|^user_agent$|^device_fingerprint$)/i.test(key)) {
       if (item && typeof item === 'object') return [JSON.stringify(item), ...fixtureSecretValues(item)];
       return typeof item === 'string' && item ? [item] : [];
     }
@@ -231,6 +233,7 @@ export function failureCategories(output) {
   if (typeof output !== 'string') return [];
   const categories = [];
   for (const [category, pattern] of [
+    ['go-build-cache', /build cache is required|GOCACHE.*not defined|LOCALAPPDATA.*not defined/i],
     ['configuration', /\bconfig:/i],
     ['governance', /governance|baseline/i],
     ['key-material', /missing.*key|key.*required|OIDC.*KEY/i],
@@ -293,19 +296,64 @@ export function assertLocalOrigin(value) {
   return origin;
 }
 
-function docker(args, allowFailure = false, timeout = 60_000) {
+function docker(args, allowFailure = false, lifecycle, teardown = false) {
+  lifecycle?.check(teardown);
   const result = spawnSync('docker', args, {
     encoding: 'utf8',
-    timeout,
+    timeout: lifecycle ? Math.max(1, Math.min(120_000, lifecycle.remaining(teardown))) : 120_000,
     maxBuffer: 1024 * 1024,
     windowsHide: true,
   });
   if (result.error || (!allowFailure && result.status !== 0)) {
-    const error = new Error(`Disposable Docker ${args[0]} failed; sensitive process diagnostics suppressed`);
-    error.code = result.error?.code;
-    throw error;
+    throw new Error(`Disposable Docker ${args[0]} failed; sensitive process diagnostics suppressed`);
   }
   return result;
+}
+
+export function acceptanceLifecycle({ timeout = 60 * 60_000, reserve = 120_000 } = {}) {
+  assert(Number.isInteger(timeout) && timeout > reserve && timeout <= 60 * 60_000 && reserve >= 10_000, 'Invalid lifecycle deadline');
+  const started = Date.now(), deadline = started + timeout;
+  const controller = new AbortController();
+  const interrupt = () => controller.abort(new Error('Acceptance interrupted'));
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', interrupt);
+  const timer = setTimeout(() => controller.abort(new Error('Acceptance deadline exceeded')), timeout - reserve);
+  return { started, deadline, signal: controller.signal,
+    remaining: (teardown = false) => deadline - Date.now() - (teardown ? 0 : reserve),
+    check(teardown = false) {
+      if (!teardown) controller.signal.throwIfAborted();
+      assert(deadline - Date.now() - (teardown ? 0 : reserve) > 0, 'Integration runner deadline exceeded');
+    },
+    beginTeardown() { clearTimeout(timer); },
+    release() { clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); },
+  };
+}
+
+export function createOwnedDockerResource(kind, args, runID, lifecycle) {
+  assert(['container', 'network'].includes(kind) && /^[a-f0-9]{32}$/.test(runID), 'Invalid Docker resource ownership');
+  // Create, not run: a failed start still leaves an owned resource to retire. A
+  // rejected name is never registered for cleanup, even if it already exists.
+  const result = docker(kind === 'network' ? ['network', 'create', '--label', `ldp.run=${runID}`, ...args]
+    : ['create', '--label', `ldp.run=${runID}`, ...args], false, lifecycle);
+  const id = result.stdout.trim();
+  assert(/^[a-f0-9]{64}$/.test(id), 'Docker creation returned no immutable owned ID');
+  return { kind, id, runID };
+}
+
+export function removeOwnedDockerResource(resource, lifecycle) {
+  const { kind, id, runID } = resource;
+  assert(['container', 'network'].includes(kind) && /^[a-f0-9]{64}$/.test(id) && /^[a-f0-9]{32}$/.test(runID), 'Invalid Docker resource record');
+  const operation = (args) => docker(args, false, lifecycle, true);
+  const ids = () => operation(kind === 'network' ? ['network', 'ls', '--no-trunc', '--format', '{{.ID}}'] : ['container', 'ls', '--all', '--no-trunc', '--format', '{{.ID}}']).stdout.trim().split(/\r?\n/);
+  if (!ids().includes(id)) return;
+  const [state] = JSON.parse(operation(kind === 'network' ? ['network', 'inspect', id] : ['inspect', id]).stdout);
+  assert.equal(state.Id, id, 'Docker ownership ID changed');
+  assert.equal((kind === 'network' ? state.Labels : state.Config.Labels)['ldp.run'], runID, 'Refusing foreign Docker cleanup');
+  let failure;
+  try { operation(kind === 'network' ? ['network', 'rm', id] : ['rm', '--force', '--volumes', id]); }
+  catch (error) { failure = error; }
+  const absent = !ids().includes(id);
+  assert(!failure && absent, 'Owned Docker resource removal/absence was not confirmed');
 }
 
 export function portalCleanup(resources) {
@@ -322,11 +370,12 @@ export function portalCleanup(resources) {
   });
 }
 
-async function waitFor(check, description, timeout = 60_000) {
+async function waitFor(check, description, timeout = 60_000, lifecycle) {
   const end = Date.now() + timeout;
   while (Date.now() < end) {
+    lifecycle?.check();
     if (await check()) return;
-    await delay(200);
+    await delay(200, undefined, lifecycle ? { signal: lifecycle.signal } : undefined);
   }
   throw new Error(`Timed out waiting for ${description}`);
 }
@@ -343,59 +392,85 @@ async function freePort() {
 function cleanEnvironment() {
   // Do not inherit a developer's DATABASE_URL, signing keys, admin/gRPC flags,
   // proxy settings, peppers, or credential state into acceptance fixtures.
+  // Go requires LOCALAPPDATA to locate its default build cache on Windows.
   return Object.fromEntries(
     Object.entries(process.env).filter(([key]) =>
-      /^(?:path|systemroot|windir|comspec|pathext|temp|tmp|home|userprofile|lang|lc_all)$/i.test(
+      /^(?:path|systemroot|windir|comspec|pathext|temp|tmp|home|userprofile|localappdata|lang|lc_all)$/i.test(
         key
       )
     )
   );
 }
 
-export async function startPortalServices({ integration = false, signal } = {}) {
+export async function probeRaceToolchain(lifecycle) {
+  const outputs = [];
+  for (const [command, args] of [
+    ['go', ['env', '-json', 'GOOS', 'GOHOSTOS', 'GOARCH', 'CGO_ENABLED', 'GOVERSION']],
+    ['gcc', ['--version']],
+    ['gcc', ['-dumpmachine']],
+  ]) {
+    lifecycle.check();
+    // Only fixed words reach cmd.exe. /d disables AutoRun, and no caller can
+    // supply a shell command, selector, executable or capability assertion.
+    const windows = process.platform === 'win32';
+    const result = spawnSync(windows ? 'cmd.exe' : command,
+      windows ? ['/d', '/s', '/c', [command, ...args].join(' ')] : args, {
+        cwd: workspace, encoding: 'utf8', env: { ...cleanEnvironment(), CGO_ENABLED: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsVerbatimArguments: windows, windowsHide: true,
+        timeout: Math.max(1, Math.min(10_000, lifecycle.remaining())), maxBuffer: 16 * 1024,
+      });
+    assert(!result.error && result.status === 0 && result.signal === null &&
+      typeof result.stdout === 'string' && Buffer.byteLength(result.stdout) <= 16 * 1024 &&
+      typeof result.stderr === 'string' && result.stderr.trim() === '', 'Race toolchain probe failed; private diagnostics suppressed');
+    outputs.push(result.stdout);
+    await delay(0, undefined, { signal: lifecycle.signal });
+    lifecycle.check();
+  }
+  let go;
+  try {
+    go = JSON.parse(outputs[0]);
+    const keys = [...outputs[0].matchAll(/"(GOOS|GOHOSTOS|GOARCH|CGO_ENABLED|GOVERSION)"\s*:/g)];
+    assert(keys.length === 5 && new Set(keys.map((match) => match[1])).size === 5);
+  } catch { throw new Error('Race Go capability output is invalid; private diagnostics suppressed'); }
+  const version = outputs[1].split(/\r?\n/, 1)[0].match(/^(?:gcc|x86_64-(?:[a-z0-9_]+-)*gcc)\s+\([^\r\n]{1,512}\)\s+(\d{1,3}\.\d{1,3}\.\d{1,3})$/)?.[1];
+  const toolchain = { schema: 1, profile: raceToolchainProfile, go,
+    compiler: { name: 'gcc', version, target: outputs[2].trim() } };
+  assertRaceToolchain(toolchain);
+  return toolchain;
+}
+
+async function confirmNoDetachedDescendants(child, lifecycle) {
+  if (process.platform === 'win32' || !child.pid) return;
+  const alive = () => {
+    try { process.kill(-child.pid, 0); return true; }
+    catch (error) { assert.equal(error.code, 'ESRCH', 'Cannot inspect owned process group'); return false; }
+  };
+  if (!alive()) return;
+  // close is not descendant-exit evidence when grandchildren discard the pipes.
+  process.kill(-child.pid, 'SIGKILL');
+  const end = Math.min(Date.now() + 10_000, lifecycle?.deadline ?? Infinity);
+  while (alive() && Date.now() < end) await delay(100);
+  assert(!alive(), 'Owned descendants survived process-group teardown');
+  throw new Error('Owned descendants outlived the integration runner');
+}
+
+export async function startPortalServices({ integration = false, lifecycle, internal = false } = {}) {
+  assert(!(internal && integration), 'Private browser services cannot use the restartable integration broker');
   const runID = randomBytes(16).toString('hex');
   const name = `portal-browser-${runID}`;
   const database = `portal_browser_${runID}`;
   const password = randomBytes(24).toString('hex');
   const cleanup = [];
   const close = portalCleanup(cleanup);
-  // Yield between bounded Docker calls so signals during partial startup are observed.
-  const check = async () => { await delay(0); signal?.throwIfAborted(); };
-  const remove = (kind, id) => {
-    // A Docker client timeout can follow successful daemon-side removal. Always
-    // ask the healthy daemon for exact immutable-ID absence before deciding.
-    try { docker(kind === 'network' ? ['network', 'rm', id] : ['rm', '--force', '--volumes', id], false, 60_000); }
-    catch { /* Absence below is authoritative; a failed listing still fails cleanup. */ }
-    const args = kind === 'network' ? ['network', 'ls', '--quiet', '--no-trunc'] : ['ps', '--all', '--quiet', '--no-trunc'];
-    assert(!docker(args, false, 10_000).stdout.trim().split(/\s+/).includes(id), 'Owned Docker resource survived cleanup');
-  };
-  const acquire = (args, kind, name) => {
-    try {
-      const id = docker(args).stdout.trim();
-      assert(id, 'Docker did not return resource ownership');
-      cleanup.push(() => remove(kind, id));
-      return id;
-    } catch (error) {
-      // A timed-out create may have committed on the daemon. Recover only this
-      // invocation's unpredictable run label and exact name into an immutable ID.
-      // A normal name-collision rejection never enters this path.
-      if (error.code === 'ETIMEDOUT') {
-        try {
-          const args = kind === 'network' ? ['network', 'inspect', name] : ['inspect', name];
-          const [state] = JSON.parse(docker(args).stdout);
-          const labels = kind === 'network' ? state.Labels : state.Config?.Labels;
-          if (labels?.['ldp.run'] === runID && state.Name === (kind === 'network' ? name : '/' + name) && state.Id) {
-            cleanup.push(() => remove(kind, state.Id));
-          }
-        } catch { /* Unknown ownership cannot authorize removal or success. */ }
-      }
-      throw error;
-    }
-  };
+  const operation = (args, allowFailure = false) => docker(args, allowFailure, lifecycle);
   try {
-    await check();
-    acquire(['network', 'create', '--label', 'ldp.task=7.5', '--label', `ldp.run=${runID}`, name], 'network', name);
-    await check();
+    // The registration gateway/API reserve addresses with --ip. Docker rejects
+    // those reservations on automatically allocated pools, even when inspect
+    // reports a subnet. Declare a run-scoped private /24 for internal services;
+    // a subnet collision fails acquisition without adopting another network.
+    const privateSubnet = `10.${128 + (parseInt(runID.slice(0, 2), 16) % 64)}.${parseInt(runID.slice(2, 4), 16)}.0/24`;
+    const network = createOwnedDockerResource('network', ['--label', 'ldp.task=7.5', ...(internal ? ['--internal', '--subnet', privateSubnet] : []), name], runID, lifecycle);
+    cleanup.push(() => removeOwnedDockerResource(network, lifecycle));
     const container = async (suffix, ports, image, args = [], environment = {}) => {
       // The existing lifecycle restart test admits only this explicit broker
       // name/label. Never reuse it, or register cleanup before creation succeeds.
@@ -405,30 +480,22 @@ export async function startPortalServices({ integration = false, signal } = {}) 
       // must be owned via create before a potentially failing port-binding start.
       const hostPorts = restartBroker ? await Promise.all(ports.map(() => freePort())) : ports.map(() => '');
       if (restartBroker) assert.equal(new Set(hostPorts).size, ports.length, 'Disposable broker ports overlapped');
-      // A detached run may create the container before its start fails. Acquire
-      // ownership first so every start failure has a registered disposer.
-      await check();
-      if (docker(['image', 'inspect', image], true).status !== 0) {
-        assert.equal(await supervisedAcceptance('docker', ['pull', image], {
-          env: cleanEnvironment(), signal, timeout: 120_000,
-        }), 0, 'Cannot prepare disposable service image');
-      }
-      await check();
-      const ownedID = acquire(['create', '--pull', 'never', '--name', id, '--network', name,
-        '--label', restartBroker ? 'ldp.task=6.3' : 'ldp.task=7.5', '--label', `ldp.run=${runID}`,
-        ...ports.flatMap((port, index) => ['--publish', `127.0.0.1:${hostPorts[index]}:${port}`]),
-        ...Object.entries(environment).flatMap(([key, value]) => ['--env', `${key}=${value}`]), image, ...args], 'container', id);
-      await check();
-      docker(['start', ownedID]);
-      await check();
-      const [state] = JSON.parse(docker(['inspect', ownedID]).stdout);
-      const exposed = Object.fromEntries(ports.map((port, index) => {
+      const owned = createOwnedDockerResource('container', ['--name', id, '--network', name,
+        '--label', restartBroker ? 'ldp.task=6.3' : 'ldp.task=7.5',
+        ...(internal ? [] : ports.flatMap((port, index) => ['--publish', `127.0.0.1:${hostPorts[index]}:${port}`])),
+        ...Object.entries(environment).flatMap(([key, value]) => ['--env', `${key}=${value}`]), image, ...args], runID, lifecycle);
+      cleanup.push(() => removeOwnedDockerResource(owned, lifecycle));
+      operation(['start', owned.id]);
+      const [state] = JSON.parse(operation(['inspect', owned.id]).stdout);
+      // Internal-only Docker networks need no host bindings; Docker Desktop may
+      // report null even if a caller attempts --publish. Use only private handles.
+      const exposed = internal ? {} : Object.fromEntries(ports.map((port, index) => {
         const [binding] = state.NetworkSettings.Ports[`${port}/tcp`];
         assert.equal(binding.HostIp, '127.0.0.1');
         if (restartBroker) assert.equal(Number(binding.HostPort), hostPorts[index]);
         return [port, Number(binding.HostPort)];
       }));
-      return { id: ownedID, name: id, ports: exposed };
+      return { id, containerID: owned.id, ports: exposed };
     };
     const postgres = await container('postgres', [5432], 'postgres:16-alpine', [], {
       POSTGRES_USER: 'portal', POSTGRES_PASSWORD: password, POSTGRES_DB: database,
@@ -437,20 +504,30 @@ export async function startPortalServices({ integration = false, signal } = {}) 
       'redis-server', '--save', '', '--appendonly', 'no', '--maxmemory', '96mb', '--maxmemory-policy', 'noeviction',
     ]);
     const nats = await container('nats', [4222, 8222], 'nats:2.10-alpine', ['-js', '-sd', '/data', '-m', '8222']);
-    await waitFor(async () => { await check(); return docker(['exec', postgres.id, 'pg_isready', '-h', '127.0.0.1', '-U', 'portal', '-d', database], true).status === 0; }, 'disposable PostgreSQL');
-    await waitFor(async () => { await check(); return docker(['exec', redis.id, 'redis-cli', 'ping'], true).stdout.trim() === 'PONG'; }, 'disposable Redis');
+    await waitFor(() => operation(['exec', postgres.id, 'pg_isready', '-h', '127.0.0.1', '-U', 'portal', '-d', database], true).status === 0, 'disposable PostgreSQL', 60_000, lifecycle);
+    await waitFor(() => operation(['exec', redis.id, 'redis-cli', 'ping'], true).stdout.trim() === 'PONG', 'disposable Redis', 60_000, lifecycle);
     await waitFor(async () => {
-      await check();
+      if (internal) return operation(['exec', nats.id, '/bin/busybox', 'wget', '-q', '-O', '-',
+        'http://127.0.0.1:8222/healthz?js-enabled-only=true'], true).status === 0;
       try {
         const response = await fetch(`http://127.0.0.1:${nats.ports[8222]}/healthz?js-enabled-only=true`, { signal: AbortSignal.timeout(1000), redirect: 'error' });
         return response.ok;
       } catch { return false; }
-    }, 'disposable JetStream');
-    return { runID, close, environment: {
+    }, 'disposable JetStream', 60_000, lifecycle);
+    lifecycle?.check();
+    const internalEnvironment = {
+      DATABASE_URL: `postgres://portal:${password}@${postgres.id}:5432/${database}?sslmode=disable`,
+      REDIS_URL: `redis://${redis.id}:6379/0`,
+      NATS_URL: `nats://${nats.id}:4222`,
+    };
+    if (internal) return { runID, close, network: name, internalEnvironment, environment: null,
+      privateServices: Object.fromEntries([['postgres', postgres, 5432], ['redis', redis, 6379], ['nats', nats, 4222]]
+        .map(([kind, value, port]) => [kind, { id: value.containerID, hostname: value.id, port }])) };
+    return { runID, close, network: name, internalEnvironment, environment: {
       DATABASE_URL: `postgres://portal:${password}@127.0.0.1:${postgres.ports[5432]}/${database}?sslmode=disable`,
       REDIS_URL: `redis://127.0.0.1:${redis.ports[6379]}/0`,
       NATS_URL: `nats://127.0.0.1:${nats.ports[4222]}`,
-      LIFECYCLE_TEST_NATS_CONTAINER: nats.name,
+      LIFECYCLE_TEST_NATS_CONTAINER: nats.id,
     } };
   } catch (error) {
     await close();
@@ -458,246 +535,215 @@ export async function startPortalServices({ integration = false, signal } = {}) 
   }
 }
 
-export const integrationTargets = Object.freeze([
-  'test-security-db', 'test-admin-integration', 'test-retention-integration',
-  'test-legal-workflow-integration', 'test-grpc-integration',
-  'test-lifecycle-integration', 'test-portal-integration',
-]);
-
-export const integrationRacePackages = Object.freeze([
-  './internal/recovery', './internal/mfa', './internal/oidc/clientauth',
-  './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer',
-]);
-
-export function integrationSelection(args) {
-  assert.equal(args.length, 1, 'Expected exactly one acceptance mode');
-  const [mode] = args;
-  if (mode === '--integration') return { kind: 'service', partial: false, selections: integrationTargets };
-  if (mode.startsWith('--integration-target=')) {
-    const target = mode.slice('--integration-target='.length);
-    assert(integrationTargets.includes(target), 'Unknown mandatory integration target');
-    return { kind: 'service', partial: true, selections: [target] };
-  }
-  if (mode.startsWith('--integration-race-package=')) {
-    const target = mode.slice('--integration-race-package='.length);
-    assert(integrationRacePackages.includes(target), 'Unknown security race package');
-    return { kind: 'race', partial: true, selections: [target] };
-  }
-  throw new Error('Unknown acceptance mode');
-}
-
-export async function acceptanceIdentity() {
-  const listed = spawnSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: workspace });
-  assert.equal(listed.status, 0, 'Cannot inventory acceptance source');
-  const files = [...new Set(listed.stdout.toString().split('\0').filter(Boolean))].filter((name) =>
-    /^(?:apps\/|libs\/|docs\/|tools\/|\.github\/|[^/]+$)/.test(name)).sort();
-  const source = createHash('sha256');
-  for (const file of files) source.update(file + '\0').update(await readFile(resolve(workspace, file))).update('\0');
-  const generated = createHash('sha256');
-  async function tree(directory, relative = '') {
-    const entries = await readdir(resolve(workspace, directory, relative), { withFileTypes: true });
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en'))) {
-      const path = relative ? relative + '/' + entry.name : entry.name;
-      if (entry.isDirectory()) await tree(directory, path);
-      else {
-        assert(entry.isFile(), 'Generated trees must contain regular files');
-        generated.update(directory + '/' + path + '\0').update(await readFile(resolve(workspace, directory, path))).update('\0');
-      }
-    }
-  }
-  for (const directory of ['apps/identity-api/internal/db', 'libs/schemas/gen']) await tree(directory);
-  return { source: source.digest('hex'), generated: generated.digest('hex') };
-}
-
-// Read Go JSON events only. Output (including assertion bodies/PII) is discarded.
-export function goEvidence(expected) {
-  const packages = new Map();
-  const tests = new Map();
-  let pending = '';
-  let invalid = false;
-  return {
-    record(chunk) {
-      const lines = (pending + String(chunk)).split('\n');
-      pending = lines.pop();
-      if (pending.length > 1024 * 1024) { invalid = true; pending = ''; }
-      for (const line of lines) {
-        if (!line.startsWith('{')) continue; // Nx headers are not Go events.
-        let event;
-        try { event = JSON.parse(line); } catch { invalid = true; continue; }
-        if (!event.Package || !event.Action) continue;
-        if (!expected.includes(event.Package)) { invalid = true; continue; }
-        if (!['pass', 'fail', 'skip'].includes(event.Action)) continue;
-        if (event.Test) {
-          const key = event.Package + ':' + event.Test;
-          if (tests.has(key)) invalid = true;
-          tests.set(key, { package: event.Package, outcome: event.Action });
-        } else {
-          if (packages.has(event.Package)) invalid = true;
-          packages.set(event.Package, event.Action);
+export async function runPortalIntegrationTarget(target, environment, timeout = 30 * 60_000, lifecycle) {
+  const race = racePackages.includes(target);
+  assert(integrationTargets.includes(target) || race, 'Unknown required integration suite');
+  const expectedPackages = race ? [target.slice(2)] : integrationPackages[target];
+  const expectedGoPackages = expectedPackages.map((name) => `${identityGoModule}/${name}`);
+  assert(Number.isInteger(timeout) && timeout > 0 && timeout <= 30 * 60_000, 'Invalid integration deadline');
+  lifecycle?.check();
+  const started = Date.now();
+  const nxCLI = createRequire(resolve(workspace, 'package.json')).resolve('nx/bin/nx.js');
+  const args = race ? [nxCLI, 'exec', '-p', 'schemas', '--', 'go', '-C', backend, 'test', '-json', '-tags=integration', '-race', '-count=1', '-p=1', '-timeout=20m', target]
+    : [nxCLI, 'run', `identity-api:${target}`, '--skipNxCache', '--outputStyle=stream-without-prefixes'];
+  const child = spawn(process.execPath,
+    args, {
+      cwd: workspace, env: {
+        ...cleanEnvironment(), ...environment, NX_DAEMON: 'false', NX_ISOLATE_PLUGINS: 'false', CI: 'true', FORCE_COLOR: '0',
+        GOFLAGS: '-v', GOMAXPROCS: '2', REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1',
+        REQUIRE_LIFECYCLE_INTEGRATION: '1', REQUIRE_PORTAL_INTEGRATION: '1',
+        REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
+        REQUIRE_PHASE2_INTEGRATION: '1', REQUIRE_SMS_INTEGRATION: '1', REQUIRE_REGISTRATION_INTEGRATION: '1',
+        REQUIRE_LEGALHOLD_DUMP_RESTORE: '1',
+        APP_ENV: 'test', SMS_ENABLED: 'false', REGISTRATION_ENABLED: 'false', ...(race ? { CGO_ENABLED: '1' } : {}),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: true,
+    });
+  // Keep streams separate and retain only bounded partial lines and fixed summaries.
+  const outcomes = { packages: 0, tests: 0, failed: 0, skipped: 0 };
+  const packageEvidence = [], passedTests = [], jsonPackages = new Map();
+  const testIdentity = (name) => name.includes('/') ? name.split('/')[0] + '/' + createHash('sha256').update(name).digest('hex') : name;
+  const locations = new Set(), failures = new Set(), categories = new Set();
+  const pending = { stdout: '', stderr: '' };
+  const record = (stream, chunk) => {
+    const lines = (pending[stream] + String(chunk)).split('\n');
+    pending[stream] = lines.pop();
+    if (pending[stream].length > 64 * 1024) { pending[stream] = ''; outcomes.failed++; }
+    for (const line of lines) {
+      for (const category of failureCategories(line)) if (categories.size < 12) categories.add(category);
+      if (race && stream === 'stdout' && line.startsWith('{')) {
+        try {
+          const event = JSON.parse(line);
+          assert(expectedGoPackages.includes(event.Package) && ['start', 'run', 'pause', 'cont', 'output', 'pass', 'fail', 'skip', 'build-output', 'build-fail'].includes(event.Action));
+          let item = jsonPackages.get(event.Package);
+          if (!item) { item = { package: event.Package, tests: [], terminal: false }; jsonPackages.set(event.Package, item); }
+          if (['pass', 'fail', 'skip'].includes(event.Action)) {
+            if (event.Test) {
+              if (event.Action === 'pass') { item.tests.push(testIdentity(event.Test)); outcomes.tests++; }
+            } else { assert(!item.terminal); item.terminal = true; if (event.Action === 'pass') outcomes.packages++; }
+            if (event.Action === 'fail') outcomes.failed++;
+            if (event.Action === 'skip') outcomes.skipped++;
+          }
+        } catch { outcomes.failed++; }
+      } else if (!race) {
+        const packageName = line.match(/^ok\s+([^\s]+)\s/)?.[1];
+        if (packageName) {
+          if (expectedGoPackages.includes(packageName)) { outcomes.packages++; packageEvidence.push({ package: packageName, tests: passedTests.splice(0) }); }
+          else outcomes.failed++;
         }
+        const passed = line.match(/^\s*--- PASS: ((?:Test|Example|Fuzz)[^\s]*)/)?.[1];
+        if (passed) { outcomes.tests++; passedTests.push(testIdentity(passed)); }
+        if (/^\s*--- FAIL:/.test(line)) outcomes.failed++;
+        if (/^\s*--- SKIP:/.test(line)) outcomes.skipped++;
       }
-    },
-    result(exit) {
-      assert(!invalid && !pending.trim(), 'Malformed or duplicate Go test evidence');
-      assert.equal(exit, 0, 'Required integration process failed; diagnostics suppressed');
-      assert.equal(packages.size, expected.length, 'Missing executed package evidence');
-      for (const name of expected) {
-        assert.equal(packages.get(name), 'pass', 'Required package did not pass');
-        assert([...tests.values()].some((t) => t.package === name && t.outcome === 'pass'), 'Missing executed test evidence');
-      }
-      assert([...tests.values()].every((t) => t.outcome === 'pass'), 'Required integration suite failed or skipped a test');
-      return { packages: [...packages.keys()].sort(), tests: tests.size, failed: 0, skipped: 0 };
-    },
-  };
-}
-
-export function aggregateAcceptance(reports, { kind, identity, run = acceptanceRun() }) {
-  const expected = kind === 'service' ? integrationTargets.map((t) => 'identity-api:' + t) :
-    kind === 'race' ? integrationRacePackages : [];
-  assert(expected.length && reports.length === expected.length, 'Missing or duplicate acceptance reports');
-  const seen = new Set();
-  for (const report of reports) {
-    assert.equal(report.version, 1);
-    assert.equal(report.kind, kind);
-    assert.equal(report.run, run, 'Stale acceptance run');
-    assert.deepEqual(report.identity, identity, 'Acceptance source/generated identity mismatch');
-    assert(expected.includes(report.target) && !seen.has(report.target), 'Unknown or duplicate acceptance identity');
-    seen.add(report.target);
-    assert.equal(report.status, 'passed');
-    assert.equal(report.cleanup, true, 'Acceptance cleanup did not complete');
-    const packages = expectedPackages(kind, kind === 'service' ? report.target.split(':')[1] : report.target);
-    assert.deepEqual(report.evidence?.packages, packages.sort(), 'Missing or wrong package evidence');
-    assert(Number.isSafeInteger(report.evidence.tests) && report.evidence.tests >= packages.length, 'Missing executed tests');
-    assert.equal(report.evidence.failed, 0);
-    assert.equal(report.evidence.skipped, 0);
-  }
-  return { version: 1, kind, run, identity, status: 'passed', partial: false, results: seen.size, cleanup: true };
-}
-
-const localAcceptanceRun = process.env.ACCEPTANCE_RUN_ID || randomUUID();
-function acceptanceRun() {
-  return process.env.GITHUB_RUN_ID ? process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT : localAcceptanceRun;
-}
-
-function expectedPackages(kind, target) {
-  const module = /^module (\S+)$/m.exec(readFileSync(resolve(backend, 'go.mod'), 'utf8'))?.[1];
-  assert(module, 'Missing module identity');
-  if (kind === 'race') return [module + target.slice(1)];
-  // Only allowlisted Nx targets supply packages; callers cannot select arbitrary tests.
-  const config = JSON.parse(readFileSync(resolve(backend, 'project.json'), 'utf8'));
-  const options = config.targets[target].options;
-  const command = options.command || options.commands.join(' ');
-  return [...new Set(command.match(/\.\/(?:internal|cmd)\/[a-zA-Z0-9_/-]+/g))].map((path) => module + path.slice(1));
-}
-
-export async function supervisedAcceptance(command, args, { env, cwd = workspace, signal, timeout = 30 * 60_000, record = () => {} }) {
-  signal?.throwIfAborted();
-  const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
-  let aborted = false;
-  const kill = () => {
-    aborted = true;
-    try {
-      if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
-      else child.kill('SIGKILL');
-    } catch (error) { if (error.code !== 'ESRCH') throw error; }
-  };
-  const timer = setTimeout(kill, timeout);
-  signal?.addEventListener('abort', kill, { once: true });
-  child.stdout.on('data', record);
-  child.stderr.on('data', record);
-  try {
-    const [code] = await once(child, 'close');
-    assert(!aborted, 'Acceptance interrupted or deadline exceeded');
-    // A successful wrapper must not leave owned descendants behind.
-    if (process.platform !== 'win32' && child.pid) {
-      try { process.kill(-child.pid, 0); kill(); throw new Error('Acceptance process left owned descendants'); }
-      catch (error) { if (error.code !== 'ESRCH') throw error; }
+      if (passedTests.length > 50_000 || jsonPackages.size > 32) outcomes.failed++;
+      const test = line.match(/^\s*--- FAIL: (Test[A-Za-z0-9_]+)/)?.[1];
+      if (test && failures.size < 30) failures.add(test);
+      const source = line.match(/(?:^|\s)([a-zA-Z0-9_]+\.go:\d+(?::\d+)?):/)?.[1];
+      if (source && locations.size < 30) locations.add(source);
     }
-    return code;
+  };
+  child.stdout.on('data', (chunk) => record('stdout', chunk));
+  child.stderr.on('data', (chunk) => record('stderr', chunk));
+  let closed = false, timer, teardownTimer, forceTimer, runnerFailure;
+  const completion = new Promise((resolve) => child.once('close', (code, signal) => {
+    closed = true;
+    resolve([code, signal]);
+  }));
+  let interrupt;
+  const stopped = new Promise((_, reject) => {
+    const fail = (category) => {
+      runnerFailure ||= category;
+      reject(new Error('Integration process stopped; sensitive diagnostics suppressed'));
+    };
+    child.once('error', () => fail('process-start'));
+    interrupt = () => fail('interrupted');
+    timer = setTimeout(() => fail('deadline'), timeout);
+  });
+  process.on('SIGINT', interrupt);
+  process.on('SIGTERM', interrupt);
+  lifecycle?.signal.addEventListener('abort', interrupt, { once: true });
+  try {
+    const [code, signal] = await Promise.race([completion, stopped]);
+    await confirmNoDetachedDescendants(child, lifecycle);
+    record('stdout', '\n');
+    record('stderr', '\n');
+    console.log(JSON.stringify({ target: `identity-api:${target}`, exit: code, signal, ...outcomes,
+      ...(code !== 0 ? { failures: [...failures], locations: [...locations], categories: [...categories] } : {}),
+    }));
+    assert.equal(code, 0, `Required ${target} failed; sensitive test diagnostics suppressed`);
+    assert(outcomes.packages > 0 && outcomes.tests > 0, 'Integration suite produced no test evidence');
+    assert.equal(outcomes.skipped, 0, 'Required integration suite skipped a test');
+    assert.equal(outcomes.failed, 0, 'Required integration suite reported a failed test');
+    const result = { target: `identity-api:${target}`, exit: code, signal, ...outcomes,
+      packageEvidence: race ? [...jsonPackages.values()].filter((item) => item.terminal).map(({ package: name, tests }) => ({ package: name, tests })) : packageEvidence,
+      duration: Date.now() - started };
+    assertExecutedEvidence(result, expectedPackages);
+    return result;
+  } catch (error) {
+    if (!closed && child.pid) {
+      // Stop the exact owned tree while its root is alive, before removing services.
+      if (process.platform === 'win32') {
+        const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+          stdio: 'ignore', timeout: 10_000, windowsHide: true,
+        });
+        assert(!killed.error && killed.status === 0, 'Integration process-tree teardown failed');
+       } else {
+         // Signal the detached group, not only Nx: a child with closed output
+         // pipes must not keep writing to the services after its parent exits.
+         try { process.kill(-child.pid, 'SIGTERM'); } catch (error) {
+           assert.equal(error.code, 'ESRCH', 'Integration process-group teardown failed');
+         }
+         forceTimer = setTimeout(() => {
+           try { process.kill(-child.pid, 'SIGKILL'); } catch { /* The owned group may already be gone. */ }
+         }, 5000);
+      }
+       await Promise.race([completion, new Promise((_, reject) => {
+         teardownTimer = setTimeout(() => reject(new Error('Integration process-tree teardown was not confirmed')), 10_000);
+       })]);
+       if (process.platform !== 'win32') {
+         try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
+           assert.equal(error.code, 'ESRCH', 'Integration process-group teardown failed');
+         }
+       }
+    }
+    if (runnerFailure) {
+      record('stdout', '\n');
+      record('stderr', '\n');
+      console.log(JSON.stringify({ target, check: 'integration-runner', category: runnerFailure, ...outcomes,
+        failures: [...failures], locations: [...locations], categories: [...categories],
+      }));
+      throw new Error(`Required ${target} ${runnerFailure}; sensitive process diagnostics suppressed`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
-    signal?.removeEventListener('abort', kill);
+    clearTimeout(teardownTimer);
+    clearTimeout(forceTimer);
+    process.off('SIGINT', interrupt);
+    process.off('SIGTERM', interrupt);
+    lifecycle?.signal.removeEventListener('abort', interrupt);
+    pending.stdout = pending.stderr = '';
+    if (closed) await confirmNoDetachedDescendants(child, lifecycle);
   }
 }
 
-export async function runPortalIntegrationSuites(selection = integrationSelection(['--integration'])) {
-  const goVersion = /^go ([0-9]+\.[0-9]+\.[0-9]+)$/m.exec(await readFile(resolve(backend, 'go.mod'), 'utf8'))?.[1];
-  assert(goVersion, 'Missing pinned Go toolchain');
-  const controller = new AbortController();
-  const interrupt = () => controller.abort();
-  for (const event of ['SIGINT', 'SIGTERM']) process.on(event, interrupt);
-  // 50-minute work deadline + 5-minute cleanup reserve fits the 60-minute CI ceiling.
-  const timer = setTimeout(interrupt, 50 * 60_000);
-  const started = Date.now();
-  let services;
-  const reports = [];
-  let identity;
-  let cleanup = false;
-  let succeeded = false;
+export function integrationInvocation(args) {
+  assert(args.length === 1, 'Expected one allowlisted integration mode');
+  if (args[0] === '--integration') return { kind: 'integration', scope: 'full', targets: integrationTargets };
+  const target = args[0].match(/^--integration-target=(.+)$/)?.[1];
+  if (integrationTargets.includes(target)) return { kind: 'integration', scope: 'partial', targets: [target] };
+  const packageName = args[0].match(/^--integration-race-package=(.+)$/)?.[1];
+  assert(racePackages.includes(packageName), 'Unknown integration target/race package');
+  return { kind: 'race', scope: 'partial', targets: [packageName] };
+}
+
+export async function runPortalIntegrationSuites({ invocation = integrationInvocation(['--integration']), directory = process.env.INTEGRATION_ARTIFACT_DIR,
+  identify = acceptanceIdentity, startServices = startPortalServices, lifecycle = acceptanceLifecycle() } = {}) {
+  assert.deepEqual(invocation, integrationInvocation([invocation.scope === 'full' ? '--integration' : invocation.kind === 'race'
+    ? `--integration-race-package=${invocation.targets[0]}` : `--integration-target=${invocation.targets[0]}`]));
+  const report = { schema: 1, kind: invocation.kind, scope: invocation.scope, status: 'failed', results: [], cleanup: { completed: false }, timings: { startup: 0, cleanup: 0 } };
+  const filename = invocation.scope === 'full' ? 'integration-full.json' : `${invocation.kind}-${invocation.targets[0].replaceAll(/[^a-z0-9-]/g, '-')}.json`;
+  let services, failure;
   try {
-    if (selection.kind === 'race') {
-      assert.equal(process.platform, 'linux', 'Security race acceptance requires Linux');
-      assert.equal(await supervisedAcceptance('gcc', ['--version'], {
-        env: cleanEnvironment(), signal: controller.signal, timeout: 15_000,
-      }), 0, 'Security race acceptance requires a C compiler');
+    if (directory) { await mkdir(directory, { recursive: true }); await rm(resolve(directory, filename), { force: true }); }
+    report.identity = await identify();
+    lifecycle.check();
+    const started = Date.now();
+    if (invocation.kind === 'race') {
+      report.toolchain = await probeRaceToolchain(lifecycle);
     }
-    // Generate once, before taking the identity shared by every cell.
-    const generated = await supervisedAcceptance('npm', ['exec', '--', 'nx', 'run', 'identity-api:sqlc-generate', '--skipNxCache'], {
-      env: { ...cleanEnvironment(), NX_DAEMON: 'false', GOTOOLCHAIN: `go${goVersion}` }, signal: controller.signal,
-    });
-    assert.equal(generated, 0, 'Acceptance generation failed');
-    identity = await acceptanceIdentity();
-    services = await startPortalServices({ integration: true, signal: controller.signal });
-    const startup = Date.now() - started;
-    for (const target of selection.selections) {
-      const targetStarted = Date.now();
-      console.log(JSON.stringify({ kind: selection.kind, target, status: 'running', partial: selection.partial }));
-      const evidence = goEvidence(expectedPackages(selection.kind, target));
-      const args = selection.kind === 'service' ? ['run', `identity-api:${target}`, '--skipNxCache'] :
-        ['exec', '-p', 'schemas', '--', 'node', resolve(workspace, '.github/scripts/portal-harness.mjs'), `--race-child=${target}`];
-      const exit = await supervisedAcceptance('npm', ['exec', '--', 'nx', ...args], {
-        env: {
-          ...cleanEnvironment(), ...services.environment, NX_DAEMON: 'false', CI: 'true', FORCE_COLOR: '0',
-          GOTOOLCHAIN: `go${goVersion}`, GOMAXPROCS: '2', CGO_ENABLED: selection.kind === 'race' ? '1' : '0',
-          REQUIRE_ADMIN_AUDIT_INTEGRATION: '1', REQUIRE_RETENTION_INTEGRATION: '1', REQUIRE_LIFECYCLE_INTEGRATION: '1',
-          REQUIRE_PORTAL_INTEGRATION: '1', REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
-        }, signal: controller.signal, record: (chunk) => evidence.record(chunk),
-      });
-      reports.push({ version: 1, kind: selection.kind, run: acceptanceRun(), runID: services.runID,
-        target: selection.kind === 'service' ? `identity-api:${target}` : target,
-        partial: selection.partial, identity, status: 'passed', evidence: evidence.result(exit),
-        timings: { startup, target: Date.now() - targetStarted },
-      });
-      assert.deepEqual(await acceptanceIdentity(), identity, 'Source/generated files changed during acceptance');
-      controller.signal.throwIfAborted();
+    services = await startServices({ integration: true, lifecycle });
+    report.timings.startup = Date.now() - started;
+    // Schema resets and broker outages must never overlap, even with Nx parallelism.
+    for (const target of invocation.targets) {
+      console.log(`Running identity-api:${target} on run-owned disposable services`);
+      lifecycle.check();
+      report.results.push(await runPortalIntegrationTarget(target, services.environment, Math.min(30 * 60_000, lifecycle.remaining()), lifecycle));
     }
-    succeeded = true;
-  } finally {
-    // Signals keep the abort flag set while teardown finishes; they cannot bypass disposers.
-    const cleanupStarted = Date.now();
-    try {
-      if (services) await services.close();
-      cleanup = true;
-    } finally {
-      clearTimeout(timer);
-      for (const event of ['SIGINT', 'SIGTERM']) process.removeListener(event, interrupt);
-      for (const report of reports) {
-        report.cleanup = cleanup;
-        report.timings.cleanup = Date.now() - cleanupStarted;
-        if (!succeeded || !cleanup || controller.signal.aborted) report.status = 'failed';
-        console.log(JSON.stringify(report));
-        if (process.env.ACCEPTANCE_REPORT_DIR) {
-          await mkdir(process.env.ACCEPTANCE_REPORT_DIR, { recursive: true });
-          const filename = report.target.replaceAll(/[^a-zA-Z0-9-]/g, '_') + '.json';
-          await writeFile(resolve(process.env.ACCEPTANCE_REPORT_DIR, filename), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
-        }
-      }
-    }
+  } catch (error) {
+    if (!services) report.timings.startup = Date.now() - lifecycle.started;
+    failure = error;
   }
-  controller.signal.throwIfAborted();
-  assert(cleanup, 'Acceptance cleanup failed');
-  if (!selection.partial) console.log(JSON.stringify(aggregateAcceptance(reports, { kind: selection.kind, identity })));
-  return reports;
+  finally {
+    const started = Date.now();
+    lifecycle.beginTeardown();
+    try {
+      if (services) report.cleanup = await services.close();
+      else report.cleanup = { completed: false };
+      assert.equal(report.cleanup?.completed, true, 'Integration service teardown was not confirmed');
+      lifecycle.check(true);
+      lifecycle.signal.throwIfAborted();
+      assertIdentity(await identify(), report.identity);
+      console.log(JSON.stringify({ check: 'serial-integration-teardown', completed: true }));
+    } catch (error) { failure ||= error; }
+    report.timings.cleanup = Date.now() - started;
+    report.status = failure ? 'failed' : 'passed';
+    lifecycle.release();
+    if (directory && report.identity) await writeFile(resolve(directory, filename), JSON.stringify(report) + '\n');
+  }
+  if (failure) throw failure;
+  return report;
 }
 
 export async function startPortalHarness({ admin = false } = {}) {
@@ -722,6 +768,8 @@ export async function startPortalHarness({ admin = false } = {}) {
 
   const cleanup = [];
   const children = [];
+  const lifecycle = acceptanceLifecycle();
+  const waitForPortal = (check, description, timeout) => waitFor(check, description, timeout, lifecycle);
   const responseCounts = new Map();
   const secrets = [];
   const routeReferences = new Set();
@@ -734,7 +782,23 @@ export async function startPortalHarness({ admin = false } = {}) {
     for (const item of values) legalSecrets.add(item);
     secrets.push(...values);
   };
-  const close = portalCleanup(cleanup);
+  const dispose = portalCleanup(cleanup);
+  let closing, starting = true;
+  const close = () => closing ||= Promise.resolve().then(async () => {
+    lifecycle.beginTeardown();
+    try {
+      const result = await dispose();
+      lifecycle.check(true);
+      lifecycle.signal.throwIfAborted();
+      return result;
+    } finally { lifecycle.release(); }
+  });
+  lifecycle.signal.addEventListener('abort', () => {
+    process.exitCode = 1;
+    // Startup owns its unwind until its awaited allocators have registered their
+    // resources. Draining early could miss a resource still being allocated.
+    if (!starting) void close().catch(() => console.error('Disposable portal interrupted; cleanup did not certify success.'));
+  }, { once: true });
   const diagnostics = () => {
     console.error('Public API response counts:', redactFixtureSecrets(JSON.stringify(Object.fromEntries(responseCounts)), secrets));
     for (const { label, child, output } of children) {
@@ -747,6 +811,7 @@ export async function startPortalHarness({ admin = false } = {}) {
     }
   };
   const start = (label, command, args, env, cwd = workspace) => {
+    lifecycle.check();
     const child = spawn(command, args, {
       cwd,
       env: { ...cleanEnvironment(), ...env },
@@ -799,7 +864,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       publisherBinary = publisherExecutable;
       legalBinary = legalExecutable;
     }
-    const services = await startPortalServices();
+    const services = await startPortalServices({ lifecycle });
     cleanup.push(services.close);
     const { runID } = services;
     const storeEnv = {
@@ -812,6 +877,7 @@ export async function startPortalHarness({ admin = false } = {}) {
     secrets.push(...secretEnvironmentValues(storeEnv));
     secrets.push(...fixtureSecretValues({ database_url: storeEnv.DATABASE_URL }));
     const fixture = (action, input = {}) => {
+      lifecycle.check();
       secrets.push(...fixtureSecretValues(input));
       for (const value of fixtureRouteReferences(input)) routeReferences.add(value);
       const result = spawnSync(fixtureBinary, [action], {
@@ -826,7 +892,7 @@ export async function startPortalHarness({ admin = false } = {}) {
         },
         input: JSON.stringify(input),
         encoding: 'utf8',
-        timeout: 15_000,
+        timeout: Math.max(1, Math.min(120_000, lifecycle.remaining())),
         maxBuffer: 128 * 1024,
         windowsHide: true,
       });
@@ -859,7 +925,7 @@ export async function startPortalHarness({ admin = false } = {}) {
     };
     const waitForNoticeCleanup = async (userID, accepted) => {
       let state;
-      await waitFor(() => {
+      await waitForPortal(() => {
         state = fixture('deletion-state', { user_id: userID });
         return state.accepted === accepted && state.payloads === 0;
       }, 'relay acceptance bookkeeping and ciphertext cleanup', 15_000);
@@ -1035,6 +1101,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       DELETION_SMTP_PASSWORD: smtpPassword,
       DELETION_SMTP_FROM: smtpFrom,
       DELETION_SMTP_PUBLIC_ORIGIN: origin,
+      PORTAL_ORIGIN: origin,
       DELETION_SMTP_CA_BUNDLE: caBundle,
       DELETION_SMTP_TIMEOUT: '2s',
       DELETION_NOTIFIER_POLL_INTERVAL: '1s',
@@ -1082,7 +1149,8 @@ export async function startPortalHarness({ admin = false } = {}) {
       WEBAUTHN_RESIDENT_KEY: 'required',
       WEBAUTHN_MOCK_CHALLENGE_KEY: randomBytes(32).toString('base64'),
       STEPUP_REPLAY_HMAC_KEY: randomBytes(32).toString('base64'),
-      SMS_GATEWAY_API_KEY: randomBytes(32).toString('hex'),
+      SMS_ENABLED: 'false',
+      REGISTRATION_ENABLED: 'false',
       SESSION_COOKIE_NAME: '__Host-session',
       SESSION_COOKIE_SECURE: 'true',
       SESSION_ABSOLUTE_TTL: '2h',
@@ -1104,10 +1172,32 @@ export async function startPortalHarness({ admin = false } = {}) {
     secrets.push(...secretEnvironmentValues(apiEnvironment));
     let lookupFixture;
     let signer;
+    let signerContainer;
     if (admin) {
       const auditEnvironment = { ...apiEnvironment, PORT: '8080', AUDIT_BATCH_SIZE: '20', AUDIT_FLUSH_INTERVAL: '1s' };
-      signer = start('Audit signer', signerBinary, [], auditEnvironment, backend);
-      start('Admin audit publisher', publisherBinary, [], auditEnvironment, backend);
+      const workers = fixture('admin-worker-roles');
+      secrets.push(...fixtureSecretValues({ database_url: workers.signer_database_url }),
+        ...fixtureSecretValues({ database_url: workers.publisher_database_url }));
+      if (process.platform === 'win32') {
+        const image = process.env.ADMIN_BROWSER_SIGNER_IMAGE;
+        assert(/^sha256:[0-9a-f]{64}$/.test(image ?? ''),
+          'Windows admin acceptance requires a fresh immutable production signer image');
+        signerContainer = `portal-signer-${runID}`;
+        const database = new URL(workers.signer_database_url);
+        const internalDatabase = new URL(services.internalEnvironment.DATABASE_URL);
+        database.host = internalDatabase.host;
+        const environment = { ...auditEnvironment, DATABASE_URL: database.href,
+          NATS_URL: services.internalEnvironment.NATS_URL };
+        secrets.push(...fixtureSecretValues({ database_url: database.href }));
+        const ownedSigner = createOwnedDockerResource('container', ['--name', signerContainer, '--network', services.network,
+          '--entrypoint', '/usr/local/bin/audit-signer',
+          ...Object.entries(environment).flatMap(([key, value]) => ['--env', `${key}=${value}`]), image], runID, lifecycle);
+        cleanup.push(() => removeOwnedDockerResource(ownedSigner, lifecycle));
+        signer = start('Audit signer', 'docker', ['start', '--attach', signerContainer], cleanEnvironment(), backend);
+      } else {
+        signer = start('Audit signer', signerBinary, [], { ...auditEnvironment, DATABASE_URL: workers.signer_database_url }, backend);
+      }
+      start('Admin audit publisher', publisherBinary, [], { ...auditEnvironment, DATABASE_URL: workers.publisher_database_url }, backend);
       // stdout includes a synthetic identity and fixture ID. Parse in bounded
       // process-local memory, never send it to child diagnostics or artifacts.
       lookupFixture = lookupProbeFixture(spawnSync(legalBinary, ['--operation=lookup-probe'], {
@@ -1161,7 +1251,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       ['API B', apiPorts[1], '/healthz'],
       ['production Next', nextPort, '/login'],
     ]) {
-      await waitFor(async () => {
+      await waitForPortal(async () => {
         assert(
           children.every(({ child }) => child.exitCode === null),
           'A portal server exited during startup'
@@ -1185,7 +1275,8 @@ export async function startPortalHarness({ admin = false } = {}) {
       assert(admin && signer && !retired.has(signer), 'No live owned signer to retire');
       assertHealthy();
       const exited = once(signer, 'exit');
-      assert(signer.kill('SIGTERM'), 'Owned signer did not accept graceful shutdown');
+      if (signerContainer) docker(['stop', '--time', '10', signerContainer]);
+      else assert(signer.kill('SIGTERM'), 'Owned signer did not accept graceful shutdown');
       const [code, signal] = await Promise.race([exited,
         delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Owned signer did not stop'); })]);
       assert(code === 0 && signal === null, 'Owned signer did not exit cleanly');
@@ -1202,7 +1293,7 @@ export async function startPortalHarness({ admin = false } = {}) {
       if (enabled) apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture;
       else delete apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID;
       startAPIs();
-      for (const port of apiPorts) await waitFor(async () => {
+      for (const port of apiPorts) await waitForPortal(async () => {
         assertHealthy();
         try {
           const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1000), redirect: 'error' });
@@ -1221,13 +1312,15 @@ export async function startPortalHarness({ admin = false } = {}) {
     const waitForAdminDelivery = async () => {
       assert(admin, 'Admin delivery requires explicit harness mode');
       let state;
-      await waitFor(() => {
+      await waitForPortal(() => {
         assertHealthy();
         state = fixture('admin-delivery');
         return state.pending === 0 && state.signed > 0;
       }, 'real admin outbox delivery and canonical-v2 signing', 30_000);
       return state;
     };
+    lifecycle.check();
+    starting = false;
     return { runID, origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, waitForAdminDelivery, assertHealthy, assertPrivateLogs, setLegalLookup, stopSignerForDestructiveFixtures, routeEvidence, originEvidence, close, diagnostics, secrets, routeReferences, legalReferences, legalSecrets };
   } catch (error) {
     try { diagnostics(); } finally { await close(); }
@@ -1236,27 +1329,6 @@ export async function startPortalHarness({ admin = false } = {}) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  try {
-    const args = process.argv.slice(2);
-    if (args.length === 1 && args[0].startsWith('--race-child=')) {
-      const target = args[0].slice('--race-child='.length);
-      assert(integrationRacePackages.includes(target), 'Unknown race child package');
-      const result = spawnSync('go', ['test', '-json', '-tags=integration', '-race', '-count=1', '-p=1', '-timeout=20m', target], {
-        cwd: backend, stdio: 'inherit', env: { ...process.env, CGO_ENABLED: '1' }, timeout: 22 * 60_000,
-      });
-      process.exitCode = result.status ?? 1;
-    } else if (args.length === 2 && ['--aggregate-service', '--aggregate-race'].includes(args[0])) {
-      const reports = [];
-      for (const file of await readdir(args[1])) {
-        assert(file.endsWith('.json'), 'Unexpected acceptance artifact');
-        reports.push(JSON.parse(await readFile(resolve(args[1], file), 'utf8')));
-      }
-      console.log(JSON.stringify(aggregateAcceptance(reports, {
-        kind: args[0] === '--aggregate-service' ? 'service' : 'race', identity: await acceptanceIdentity(),
-      })));
-    } else await runPortalIntegrationSuites(integrationSelection(args));
-  } catch (error) {
-    console.error(browserFailure(error, 'bounded-integration'));
-    process.exitCode = 1;
-  }
+  try { await runPortalIntegrationSuites({ invocation: integrationInvocation(process.argv.slice(2)) }); }
+  catch (error) { console.error(browserFailure(error, 'serial-integration')); process.exitCode = 1; }
 }

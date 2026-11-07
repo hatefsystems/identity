@@ -65,6 +65,9 @@ func runWithDependencies(ctx context.Context, logger *slog.Logger, args []string
 	default:
 		return errors.New("lifecycle worker: unsupported mode")
 	}
+	if _, err := config.LoadEnvironment(); err != nil {
+		return err
+	}
 	if ctx.Err() != nil {
 		return nil
 	}

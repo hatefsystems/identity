@@ -12,6 +12,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 const defaultIssuer = "Hatef Identity"
@@ -132,7 +133,10 @@ func New(cfg Config, users UserStore, encryptor Encryptor, opts ...Option) (*Ser
 // GenerateSetup initiates TOTP MFA setup for an account. It generates a fresh
 // TOTP secret, envelope-encrypts it, persists it in the database, and returns
 // the setup details including the otpauth:// URI for QR code mapping.
-func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, sessionID string) (*SetupResponse, error) {
+func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersion int64, sessionID string) (*SetupResponse, error) {
+	if userID == uuid.Nil || authVersion < 0 {
+		return nil, ErrAccountNotActive
+	}
 	sessionUUID, err := uuid.Parse(sessionID)
 	if err != nil {
 		return nil, ErrMfaNotSetup
@@ -149,7 +153,7 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, sessionID
 
 	var user db.User
 	var enrollment db.MfaTotpEnrollment
-	err = s.runInTx(ctx, func(store UserStore) error {
+	err = s.runInTx(ctx, userID, func(store UserStore) error {
 		user, err = store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -157,7 +161,7 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, sessionID
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.Status != "active" {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
 			return ErrAccountNotActive
 		}
 		if user.IsMfaEnabled {
@@ -195,7 +199,10 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, sessionID
 
 // VerifyAndEnable verifies the submitted 6-digit passcode against the pending
 // stored TOTP secret and flips is_mfa_enabled to true.
-func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, sessionID, enrollmentID, code string) error {
+func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVersion int64, sessionID, enrollmentID, code string) error {
+	if userID == uuid.Nil || authVersion < 0 {
+		return ErrAccountNotActive
+	}
 	sessionUUID, err := uuid.Parse(sessionID)
 	if err != nil {
 		return ErrMfaNotSetup
@@ -205,7 +212,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, session
 		return ErrMfaNotSetup
 	}
 	var outcome error
-	err = s.runInTx(ctx, func(store UserStore) error {
+	err = s.runInTx(ctx, userID, func(store UserStore) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -213,7 +220,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, session
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.Status != "active" {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
 			return ErrAccountNotActive
 		}
 		// An enabled account is rejected before loading or decrypting any
@@ -282,8 +289,11 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, session
 
 // Disable disables TOTP MFA for the user, wiping the encrypted secret and
 // setting is_mfa_enabled to false.
-func (s *Service) Disable(ctx context.Context, userID uuid.UUID) error {
-	return s.runInTx(ctx, func(store UserStore) error {
+func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int64) error {
+	if userID == uuid.Nil || authVersion < 0 {
+		return ErrAccountNotActive
+	}
+	return s.runInTx(ctx, userID, func(store UserStore) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -291,7 +301,7 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID) error {
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.Status != "active" {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
 			return ErrAccountNotActive
 		}
 		if user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0 {
@@ -392,7 +402,7 @@ func (s *Service) VerifyTOTPForReclaim(ctx context.Context, userID uuid.UUID, co
 // accepts.
 const statusPendingDeletion = "pending_deletion"
 
-func (s *Service) runInTx(ctx context.Context, fn func(UserStore) error) error {
+func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserStore) error) error {
 	if s.tx == nil {
 		return fn(s.users)
 	}
@@ -403,9 +413,14 @@ func (s *Service) runInTx(ctx context.Context, fn func(UserStore) error) error {
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback(ctx)
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = tx.Rollback(cleanup)
 		}
 	}()
+	if err := pglock.LockAccount(ctx, tx, userID); err != nil {
+		return fmt.Errorf("mfa: lock subject: %w", err)
+	}
 	if err := fn(db.New(tx)); err != nil {
 		return err
 	}

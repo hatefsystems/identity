@@ -16,7 +16,7 @@ import (
 //   - the exact byte layout of each serialized body, including length prefixes,
 //     NULL tags, field order, and timestamp rendering;
 //   - the four domain prefixes and the two-stage leaf/chain construction;
-//   - both genesis seeds, which migration 00015 hardcodes into the chain tables'
+//   - both genesis seeds, which the baseline hardcodes into the chain tables'
 //     CHECK constraints.
 //
 // A change that breaks this file invalidates every digest already stored, and —

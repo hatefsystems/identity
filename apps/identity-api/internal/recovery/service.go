@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 )
 
@@ -192,8 +193,11 @@ type StatusResult struct {
 // batch first so a regeneration can never leave a mix of old and new codes
 // valid at once (docs/api-design.md §1.3). It returns the plaintext once; only
 // the SHA-256/HMAC hashes are stored. clientIP feeds the optional per-subnet
-// rate limit.
-func (s *Service) Generate(ctx context.Context, userID uuid.UUID, clientIP string) (*GenerateResult, error) {
+// rate limit. authVersion is the version captured by the admitted session.
+func (s *Service) Generate(ctx context.Context, userID uuid.UUID, authVersion int64, clientIP string) (*GenerateResult, error) {
+	if userID == uuid.Nil || authVersion < 0 {
+		return nil, ErrAccountNotActive
+	}
 	if _, err := s.loadUser(ctx, userID); err != nil {
 		return nil, err
 	}
@@ -212,13 +216,18 @@ func (s *Service) Generate(ctx context.Context, userID uuid.UUID, clientIP strin
 			return nil, err
 		}
 
-		err = s.runInTx(ctx, func(store Store) error {
+		err = s.runInTx(ctx, userID, func(store Store) error {
 			// Lock a row that always exists for this account before touching the
 			// replaceable child rows. Locking only recovery_codes is insufficient:
 			// an empty account gives concurrent regenerations nothing to contend
 			// on, allowing both batches to be inserted under READ COMMITTED.
-			if _, err := s.lockUserForRegeneration(ctx, store, userID); err != nil {
+			user, err := s.lockUserForRegeneration(ctx, store, userID)
+			if err != nil {
 				return err
+			}
+			// Use the admitted version, never a snapshot reloaded after revocation.
+			if user.ID != userID || user.DeletedAt.Valid || user.AuthVersion != authVersion {
+				return ErrAccountNotActive
 			}
 			if _, err := store.DeleteAllRecoveryCodesForUser(ctx, userID); err != nil {
 				return fmt.Errorf("recovery: delete existing codes: %w", err)
@@ -295,7 +304,7 @@ func (s *Service) VerifyWithVersion(ctx context.Context, userID uuid.UUID, code,
 	hash := hashCode(s.hashPepper, normalized)
 
 	var version int64
-	err := s.runInTx(ctx, func(store Store) error {
+	err := s.runInTx(ctx, userID, func(store Store) error {
 		user, err := s.lockUserForRegeneration(ctx, store, userID)
 		if err != nil {
 			return err
@@ -367,7 +376,7 @@ func (s *Service) buildBatch(userID uuid.UUID) ([]string, []db.CreateRecoveryCod
 // configured, or directly against s.store otherwise. The commit/rollback
 // bookkeeping mirrors the WebAuthn service so the atomicity guarantee is
 // identical across the codebase.
-func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error {
+func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(store Store) error) error {
 	if s.tx == nil {
 		return fn(s.store)
 	}
@@ -379,10 +388,15 @@ func (s *Service) runInTx(ctx context.Context, fn func(store Store) error) error
 	committed := false
 	defer func() {
 		if !committed {
-			_ = tx.Rollback(ctx)
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = tx.Rollback(cleanup)
 		}
 	}()
 
+	if err := pglock.LockAccount(ctx, tx, userID); err != nil {
+		return fmt.Errorf("recovery: lock subject: %w", err)
+	}
 	txStore := db.New(tx)
 	if err := fn(txStore); err != nil {
 		return err

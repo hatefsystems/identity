@@ -1,3 +1,4 @@
+import { registrationFa } from './registration';
 import type en from './en';
 import type { CatalogShape } from '../i18n/types';
 import { commonFa } from './common';
@@ -14,6 +15,7 @@ import { integrityFa } from './integrity';
 import { legalFa } from './legal';
 
 const fa = {
+  registration: registrationFa,
   common: commonFa,
   preferences: preferencesFa,
   metadata: metadataFa,

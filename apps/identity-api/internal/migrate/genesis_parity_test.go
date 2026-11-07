@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
@@ -8,7 +9,37 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 )
 
-// Migration 00015 hardcodes both genesis digests into the chain heads' CHECK
+func TestBundledBaselineInventory(t *testing.T) {
+	t.Parallel()
+	entries, err := db.Migrations.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name() != "00001_initial_schema.sql" || entries[1].Name() != "00002_registration_attempts.sql" {
+		t.Fatalf("binary must embed the baseline and approved registration migration: %v", entries)
+	}
+	// Provider construction and source listing must not connect to PostgreSQL.
+	database, err := sql.Open("pgx", "postgres://localhost/unused?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	p, err := NewProvider(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := p.runner(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := r.ListSources()
+	if len(sources) != 2 || sources[0].Version != 1 || sources[0].Path != "00001_initial_schema.sql" ||
+		sources[1].Version != 2 || sources[1].Path != "00002_registration_attempts.sql" {
+		t.Fatalf("unexpected bundled runner sources: %+v", sources)
+	}
+}
+
+// The baseline hardcodes both genesis digests into the chain heads' CHECK
 // constraints, because a CHECK cannot call into Go. That duplication is the only
 // place the canonical format is restated outside internal/audit, so it needs a
 // test: a format change that updated the Go constant but not the migration would
@@ -21,7 +52,7 @@ import (
 func TestGenesisMatchesMigration(t *testing.T) {
 	t.Parallel()
 
-	raw, err := db.Migrations.ReadFile("migrations/00015_chain_payload_split.sql")
+	raw, err := db.Migrations.ReadFile("migrations/00001_initial_schema.sql")
 	if err != nil {
 		t.Fatalf("read embedded migration: %v", err)
 	}
@@ -33,7 +64,7 @@ func TestGenesisMatchesMigration(t *testing.T) {
 	} {
 		literal := `'\x` + want + `'::bytea`
 		if !strings.Contains(sql, literal) {
-			t.Errorf("migration 00015 does not contain the %s genesis digest %s;\n"+
+			t.Errorf("baseline does not contain the %s genesis digest %s;\n"+
 				"the schema's CHECK constraint and internal/audit disagree about the canonical format",
 				name, want)
 		}
@@ -43,7 +74,7 @@ func TestGenesisMatchesMigration(t *testing.T) {
 	// all-zero genesis, which a blanked column could satisfy.
 	for _, stale := range []string{"repeat('0', 64)", `'\x` + strings.Repeat("00", 32) + `'::bytea`} {
 		if strings.Contains(sql, stale) {
-			t.Errorf("migration 00015 still accepts the v1 zero genesis via %q", stale)
+			t.Errorf("baseline still accepts the v1 zero genesis via %q", stale)
 		}
 	}
 }

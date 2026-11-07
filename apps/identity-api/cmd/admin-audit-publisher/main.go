@@ -37,9 +37,23 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
+	environment, err := config.LoadEnvironment()
+	if err != nil {
+		return err
+	}
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return errors.New("DATABASE_URL is required")
+	}
+	var cfg config.AuditConfig
+	if !cleanup {
+		cfg, err = config.LoadAudit(environment)
+		if err != nil {
+			return err
+		}
+		if !cfg.HasNATS() {
+			return errors.New("NATS_URL is required")
+		}
 	}
 	startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -52,9 +66,8 @@ func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
 		return err
 	}
 	if cleanup {
-		environment := os.Getenv("APP_ENV")
-		if environment == "" {
-			environment = "development"
+		if err := adminaction.ProbeContextMaintenance(startupCtx, pool); err != nil {
+			return err
 		}
 		if _, err := legalpolicy.LoadBaseline(startupCtx, pool, uuid.Nil, environment); err != nil {
 			return err
@@ -65,16 +78,8 @@ func run(ctx context.Context, logger *slog.Logger, cleanup bool) error {
 		}
 		return err
 	}
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
-	}
-	cfg, err := config.LoadAudit(environment)
-	if err != nil {
+	if err := adminaction.ProbePublisher(startupCtx, pool, cfg.Subject); err != nil {
 		return err
-	}
-	if !cfg.HasNATS() {
-		return errors.New("NATS_URL is required")
 	}
 	nc, js, err := natsjs.Connect(startupCtx, cfg.NATSURL, "admin-audit-publisher", logger)
 	if err != nil {

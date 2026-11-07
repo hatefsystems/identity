@@ -1,9 +1,13 @@
 package blindindex
 
 import (
+	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +18,65 @@ func newTestPepper(t *testing.T) []byte {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	return p
+}
+
+func TestComputeEmailCanonicalExactBytes(t *testing.T) {
+	pepper := bytes.Repeat([]byte{0x42}, PepperSize)
+	idx, err := New(pepper, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ input, canonical string }{
+		{" USER@EXAMPLE.COM ", "user@example.com"},
+		{"JOSE\u0301@b\u00fccher.example", "jos\u00e9@xn--bcher-kva.example"},
+		{"\u0639\u0644\u06cc@\u0645\u062b\u0627\u0644.\u0627\u06cc\u0631\u0627\u0646", "\u0639\u0644\u06cc@xn--mgbh0fb.xn--mgba3a4f16a"},
+		{"\uff35ser@example.com", "\uff55ser@example.com"},
+	} {
+		mac := hmac.New(sha256.New, pepper)
+		_, _ = mac.Write([]byte(tc.canonical))
+		want := hex.EncodeToString(mac.Sum(nil))
+		got, err := idx.ComputeEmail(tc.input)
+		if err != nil || got != want || idx.Version() != 7 {
+			t.Fatal("email digest differs from exact canonical bytes or generation changed")
+		}
+		canonicalDigest, err := idx.ComputeEmail(tc.canonical)
+		if err != nil || canonicalDigest != got {
+			t.Fatal("canonical equivalent digest changed")
+		}
+	}
+	for _, input := range []string{"user@example.com", " USER@EXAMPLE.COM ", "+tag@example.test"} {
+		got, err := idx.ComputeEmail(input)
+		if err != nil || got != idx.Compute(input) {
+			t.Fatal("canonical ASCII index bytes changed")
+		}
+	}
+	const asciiGolden = "2bcb2417758c9b1fdfc518de094b24c710026931c3a52a996975982d8b6a223c"
+	got, err := idx.ComputeEmail(" USER@EXAMPLE.COM ")
+	if err != nil || got != asciiGolden || idx.Compute(" USER@EXAMPLE.COM ") != asciiGolden {
+		t.Fatal("generic or canonical ASCII HMAC golden changed")
+	}
+	for _, pair := range [][2]string{
+		{"user@example.com", "\uff55ser@example.com"},
+		{"ff@example.com", "\ufb00@example.com"},
+		{"\u06cc@example.com", "\u064a@example.com"},
+		{"\u06a9@example.com", "\u0643@example.com"},
+		{"user@example.com", "u.ser@example.com"},
+		{"user@example.com", "user+tag@example.com"},
+	} {
+		a, errA := idx.ComputeEmail(pair[0])
+		b, errB := idx.ComputeEmail(pair[1])
+		if errA != nil || errB != nil || a == b {
+			t.Fatal("distinct email identities merged")
+		}
+	}
+	if idx.Compute("\uff55ser@example.com") != idx.Compute("user@example.com") {
+		t.Fatal("generic NFKC semantics changed")
+	}
+	for _, input := range []string{"bad", "a\u200cb@example.test", "a\xff@example.test", strings.Repeat("a", 1025)} {
+		if got, err := idx.ComputeEmail(input); err == nil || got != "" {
+			t.Fatal("invalid email produced an index")
+		}
+	}
 }
 
 func TestNewInvalidPepper(t *testing.T) {

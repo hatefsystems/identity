@@ -3,7 +3,6 @@ import {
   ForgotPasswordForm,
   LoginForm,
   PasskeyForm,
-  RegistrationForm,
   ResetPasswordForm,
   TotpForm,
 } from '../app/(auth)/_components/forms';
@@ -60,30 +59,30 @@ describe('auth field interaction', () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['registration', <RegistrationForm />],
-    ['password reset', <ResetPasswordForm />],
-  ])('revalidates a previously valid confirmation when the %s password changes', (_name, form) => {
-    render(form);
-    const password = enter('New password', ' original ');
-    const confirmation = enter('Confirm password', ' original ');
-    fireEvent.blur(password);
-    fireEvent.blur(confirmation);
-    expect(confirmation.getAttribute('aria-invalid')).toBe('false');
+  it.each([['password reset', <ResetPasswordForm />]])(
+    'revalidates a previously valid confirmation when the %s password changes',
+    (_name, form) => {
+      render(form);
+      const password = enter('New password', ' original ');
+      const confirmation = enter('Confirm password', ' original ');
+      fireEvent.blur(password);
+      fireEvent.blur(confirmation);
+      expect(confirmation.getAttribute('aria-invalid')).toBe('false');
 
-    enter('New password', 'changed');
-    expect(confirmation.getAttribute('aria-invalid')).toBe('true');
-    expect(
-      document.getElementById(confirmation.getAttribute('aria-describedby') ?? '')?.textContent
-    ).toBe('Passwords do not match.');
+      enter('New password', 'changed');
+      expect(confirmation.getAttribute('aria-invalid')).toBe('true');
+      expect(
+        document.getElementById(confirmation.getAttribute('aria-describedby') ?? '')?.textContent
+      ).toBe('Passwords do not match.');
 
-    enter('Confirm password', 'changed');
-    expect(confirmation.getAttribute('aria-invalid')).toBe('false');
-    expect(confirmation.getAttribute('aria-describedby')).toBeNull();
-  });
+      enter('Confirm password', 'changed');
+      expect(confirmation.getAttribute('aria-invalid')).toBe('false');
+      expect(confirmation.getAttribute('aria-describedby')).toBeNull();
+    }
+  );
 
   it('keeps password guidance associated when an error appears and disappears', () => {
-    render(<RegistrationForm />);
+    render(<ResetPasswordForm />);
     const password = screen.getByLabelText<HTMLInputElement>('New password');
     const id = password.id;
     const hintId = password.getAttribute('aria-describedby') ?? '';
@@ -107,8 +106,7 @@ describe('auth field interaction', () => {
 
   it('reveals each password independently without submitting or losing its value or toggle focus', () => {
     const submit = jest.fn();
-    render(<RegistrationForm submit={submit} />);
-    enter('Email address', 'person@example.test');
+    render(<ResetPasswordForm linkState="ready" submit={submit} />);
     const password = enter('New password', '  exact value  ');
     const confirmation = enter('Confirm password', '  exact value  ');
     const toggle = screen.getByRole<HTMLButtonElement>('button', { name: 'Show new password' });
@@ -334,22 +332,20 @@ describe('test-injected submission', () => {
     }
   );
 
-  it('submits and clears registration without trimming or rejecting a whitespace-only password', async () => {
+  it('submits and clears an injected ready reset without trimming a whitespace-only password', async () => {
     const submit = jest.fn().mockResolvedValue('success');
-    render(<RegistrationForm submit={submit} />);
-    enter('Email address', 'person@example.test');
+    render(<ResetPasswordForm linkState="ready" submit={submit} />);
     enter('New password', ' ');
     enter('Confirm password', ' ');
-    const form = screen.getByRole<HTMLFormElement>('form', { name: 'Create an account' });
+    const form = screen.getByRole<HTMLFormElement>('form', { name: 'Set a new password' });
     fireEvent.submit(form);
 
     await waitFor(() =>
       expect(screen.getByRole('status').textContent).toBe(
-        'Registration completed. Return to sign in to continue.'
+        'Password reset completed. Return to sign in with your new password.'
       )
     );
     expect(submit).toHaveBeenCalledWith({
-      email: 'person@example.test',
       password: ' ',
       confirmation: ' ',
     });

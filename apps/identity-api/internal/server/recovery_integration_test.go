@@ -119,7 +119,7 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 	if err != nil {
 		t.Fatalf("NewFlowService: %v", err)
 	}
-	batch, err := codes.Generate(ctx, user.ID, "203.0.113.8")
+	batch, err := codes.Generate(ctx, user.ID, user.AuthVersion, "203.0.113.8")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}

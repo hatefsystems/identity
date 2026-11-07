@@ -59,10 +59,10 @@ WHERE c.action_id = sqlc.arg('action_id')
 -- Subject-agnostic unpublished gauge.
 --
 -- AdminActionBacklog above filters `admin_action`, so it never counted the
--- deletion events the GDPR purge enqueues (00008 deliberately keeps those out
+-- deletion events the GDPR purge enqueues (the baseline keeps those out
 -- of the admin publisher). Task 5.1's decision record requires an
--- unpublished-row-count alert, and until Task 6.3 ships a drainer for the
--- non-admin subject every hard delete leaves a permanently unpublished row.
+-- unpublished-row-count alert; the lifecycle publisher drains the non-admin
+-- subject independently of administrative audit delivery.
 -- Without this query the first signal would be a DSAR complaint that a
 -- downstream service still holds the subject's data.
 SELECT COUNT(*)::bigint AS pending,

@@ -3,11 +3,91 @@ package audit
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+func TestEnvelopeAdmissionStorageRepresentation(t *testing.T) {
+	e, _, _ := envelopeTestEvent()
+	base, err := NewEnvelope(e, uuid.New(), fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*Envelope)
+		want   error
+	}{
+		{"valid", func(*Envelope) {}, nil},
+		{"zero_actor", func(e *Envelope) { e.ActorID = uuid.Nil.String() }, nil},
+		{"zero_references", func(e *Envelope) { e.SubjectID = uuid.Nil.String(); e.Security.AccountRef = uuid.Nil.String() }, nil},
+		{"missing_actor", func(e *Envelope) { e.ActorID = "" }, ErrEnvelopeActor},
+		{"uppercase_actor", func(e *Envelope) { e.ActorID = strings.ToUpper(e.ActorID) }, ErrEnvelopeActor},
+		{"compact_actor", func(e *Envelope) { e.ActorID = strings.ReplaceAll(e.ActorID, "-", "") }, ErrEnvelopeActor},
+		{"urn_actor", func(e *Envelope) { e.ActorID = "urn:uuid:" + e.ActorID }, ErrEnvelopeActor},
+		{"invalid_actor", func(e *Envelope) { e.ActorID = "private@example.test" }, ErrEnvelopeActor},
+		{"invalid_subject", func(e *Envelope) { e.SubjectID = "secret-token" }, ErrEnvelopeReference},
+		{"uppercase_account", func(e *Envelope) { e.Security.AccountRef = strings.ToUpper(e.ActorID) }, ErrEnvelopeReference},
+		{"missing_account", func(e *Envelope) { e.Security.AccountRef = "" }, ErrEnvelopeReference},
+		{"zero_id", func(e *Envelope) { e.EventID = uuid.Nil }, ErrEnvelopeEventID},
+		{"schema", func(e *Envelope) { e.SchemaVersion-- }, ErrEnvelopeSchema},
+		{"missing_time", func(e *Envelope) { e.OccurredAt = time.Time{} }, ErrEnvelopeTime},
+		{"year_zero", func(e *Envelope) { e.OccurredAt = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC) }, ErrEnvelopeTime},
+		{"year_overflow", func(e *Envelope) { e.OccurredAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) }, ErrEnvelopeTime},
+		{"index_generation", func(e *Envelope) { e.Security.BlindIndexVersion = -1 }, ErrEnvelopeIndex},
+		{"index_short", func(e *Envelope) { s := "abcd"; e.Security.IdentityBlindIndex = &s }, ErrEnvelopeIndex},
+		{"index_uppercase", func(e *Envelope) { s := strings.Repeat("A", 64); e.Security.IdentityBlindIndex = &s }, ErrEnvelopeIndex},
+		{"index_nonhex", func(e *Envelope) { s := strings.Repeat("g", 64); e.Security.IdentityBlindIndex = &s }, ErrEnvelopeIndex},
+		{"generation_without_capture", func(e *Envelope) { e.Security.BlindIndexVersion = 32767 }, nil},
+		{"varchar_character_limits", func(e *Envelope) {
+			e.ActorSPIFFEID = strings.Repeat("\u0627", 255)
+			e.EventType = strings.Repeat("e", 100)
+			e.ActionStatus = strings.Repeat("s", 50)
+			e.ClientIP = strings.Repeat("i", 50)
+			e.Security.ClientID = strings.Repeat("c", 100)
+			e.Security.DeviceFingerprint = strings.Repeat("f", 128)
+		}, nil},
+		{"spiffe_overflow", func(e *Envelope) { e.ActorSPIFFEID = strings.Repeat("s", 256) }, ErrEnvelopeText},
+		{"event_overflow", func(e *Envelope) { e.EventType = strings.Repeat("e", 101) }, ErrEnvelopeText},
+		{"event_missing", func(e *Envelope) { e.EventType = "" }, ErrEnvelopeText},
+		{"status_overflow", func(e *Envelope) { e.ActionStatus = strings.Repeat("s", 51) }, ErrEnvelopeText},
+		{"ip_overflow", func(e *Envelope) { e.ClientIP = strings.Repeat("i", 51) }, ErrEnvelopeText},
+		{"agent_overflow", func(e *Envelope) { e.UserAgent = strings.Repeat("a", 8193) }, ErrEnvelopeText},
+		{"client_overflow", func(e *Envelope) { e.Security.ClientID = strings.Repeat("c", 101) }, ErrEnvelopeText},
+		{"fingerprint_overflow", func(e *Envelope) { e.Security.DeviceFingerprint = strings.Repeat("f", 129) }, ErrEnvelopeText},
+		{"scope_overflow", func(e *Envelope) { e.Security.Scope = strings.Repeat("s", 8193) }, ErrEnvelopeText},
+		{"payload_overflow", func(e *Envelope) { e.Payload = strings.Repeat("p", MaxEnvelopeBytes+1) }, ErrEnvelopeText},
+		{"nul_payload", func(e *Envelope) { e.Payload = "private\x00@example.test" }, ErrEnvelopeText},
+		{"nul_actor_spiffe", func(e *Envelope) { e.ActorSPIFFEID = "spiffe://audit\x00" }, ErrEnvelopeText},
+		{"nul_event", func(e *Envelope) { e.EventType += "\x00" }, ErrEnvelopeText},
+		{"nul_status", func(e *Envelope) { e.ActionStatus += "\x00" }, ErrEnvelopeText},
+		{"nul_ip", func(e *Envelope) { e.ClientIP += "\x00" }, ErrEnvelopeText},
+		{"nul_agent", func(e *Envelope) { e.UserAgent += "\x00" }, ErrEnvelopeText},
+		{"nul_client", func(e *Envelope) { e.Security.ClientID += "\x00" }, ErrEnvelopeText},
+		{"nul_fingerprint", func(e *Envelope) { e.Security.DeviceFingerprint += "\x00" }, ErrEnvelopeText},
+		{"nul_scope", func(e *Envelope) { e.Security.Scope += "\x00" }, ErrEnvelopeText},
+		{"invalid_utf8", func(e *Envelope) { e.UserAgent = string([]byte{0xff}) }, ErrEnvelopeText},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := base
+			security := *base.Security
+			env.Security = &security
+			tc.change(&env)
+			before, _ := SerializeAudit(env.AuditRecord())
+			if got := env.Validate(); !errors.Is(got, tc.want) {
+				t.Fatalf("Validate = %v, want %v", got, tc.want)
+			}
+			after, _ := SerializeAudit(env.AuditRecord())
+			if !bytes.Equal(before, after) {
+				t.Fatal("admission rewrote canonical bytes")
+			}
+		})
+	}
+}
 
 // envelopeTestEvent returns a fully populated Event including a security context.
 func envelopeTestEvent() (Event, uuid.UUID, uuid.UUID) {

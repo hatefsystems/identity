@@ -244,7 +244,13 @@ describe('admin structured-query and one-session transport', () => {
     const { api, fetcher, portal } = await session();
     fetcher
       .mockResolvedValueOnce(
-        json({ items: [{ ...user, email: 'target@example.test' }], total: 1, limit: 1, offset: 0 })
+        json({
+          items: [{ ...user, email: 'target@example.test' }],
+          total: 1,
+          limit: 1,
+          offset: 0,
+          canonical_email: 'target@example.test',
+        })
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     await api.lookup('  TARGET@example.test ');
@@ -260,7 +266,7 @@ describe('admin structured-query and one-session transport', () => {
     const [lookupURL, lookupOptions] = fetcher.mock.calls[0];
     expect(lookupURL).toBe(`${origin}/api/v1/admin/users/lookup`);
     expect(lookupOptions.method).toBe('POST');
-    expect(JSON.parse(lookupOptions.body)).toEqual({ email: 'target@example.test' });
+    expect(JSON.parse(lookupOptions.body)).toEqual({ email: '  TARGET@example.test ' });
     const [statusURL, statusOptions] = fetcher.mock.calls[1];
     expect(statusURL).toBe(`${origin}/api/v1/admin/users/${id}/status`);
     expect(statusOptions.method).toBe('PATCH');
@@ -277,6 +283,84 @@ describe('admin structured-query and one-session transport', () => {
     expect(sent).toHaveBeenCalledTimes(1);
     expect(() => authority.take('session-id')).toThrow('grant_expired');
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves Unicode lookup input and binds returned rows to the authoritative canonical echo', async () => {
+    const { api, fetcher } = await session();
+    const input = ' U\u0308SER@B\u00dcCHER.test ';
+    const canonical = '\u00fcser@xn--bcher-kva.test';
+    fetcher.mockResolvedValue(
+      json({
+        items: [{ ...user, email: canonical }],
+        total: 1,
+        limit: 1,
+        offset: 0,
+        canonical_email: canonical,
+      })
+    );
+    const result = await api.lookup(input);
+    expect(result.canonical_email).toBe(canonical);
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ email: input });
+    expect(fetcher.mock.calls[0][0]).toBe(`${origin}/api/v1/admin/users/lookup`);
+  });
+
+  it('rejects missing, unsafe or mismatched canonical lookup echoes', async () => {
+    const { api, fetcher } = await session();
+    const page = {
+      items: [{ ...user, email: 'target@example.test' }],
+      total: 1,
+      limit: 1,
+      offset: 0,
+    };
+    for (const canonical_email of [
+      undefined,
+      null,
+      '',
+      'other@example.test',
+      'a\u200cb@example.test',
+      'a\u0308@example.test',
+    ]) {
+      fetcher.mockResolvedValue(json({ ...page, canonical_email }));
+      await expect(api.lookup('target@example.test')).rejects.toMatchObject({
+        code: 'invalid_response',
+      });
+    }
+  });
+
+  it('does not remove invisible characters or accept unbounded email input', async () => {
+    const { api, fetcher } = await session();
+    for (const input of [
+      '\ufefftarget@example.test',
+      'a\u200cb@example.test',
+      '\ud800@example.test',
+      'a\ufffdb@example.test',
+      `${'x'.repeat(1025)}@example.test`,
+    ]) {
+      await expect(api.lookup(input)).rejects.toMatchObject({ code: 'invalid_request' });
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects an incomplete exact lookup page and a replacement-character canonical echo', async () => {
+    const { api, fetcher } = await session();
+    fetcher.mockResolvedValueOnce(
+      json({ items: [], total: 1, limit: 1, offset: 0, canonical_email: 'target@example.test' })
+    );
+    await expect(api.lookup('target@example.test')).rejects.toMatchObject({
+      code: 'invalid_response',
+    });
+    fetcher.mockResolvedValueOnce(
+      json({
+        items: [{ ...user, email: 'a\ufffdb@example.test' }],
+        total: 1,
+        limit: 1,
+        offset: 0,
+        canonical_email: 'a\ufffdb@example.test',
+      })
+    );
+    await expect(api.lookup('target@example.test')).rejects.toMatchObject({
+      code: 'invalid_response',
+    });
   });
 
   it('rejects numeric/missing revisions and invalid bodies before consuming authority or sending', async () => {

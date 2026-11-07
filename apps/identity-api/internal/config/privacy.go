@@ -90,6 +90,9 @@ const (
 //
 // Outside development/test, the recovery window is exactly the published 30 days.
 func LoadPrivacy(environment string) (PrivacyConfig, error) {
+	if err := ValidateEnvironment(environment); err != nil {
+		return PrivacyConfig{}, err
+	}
 	cfg := PrivacyConfig{
 		GracePeriod:              defaultGDPRGracePeriod,
 		PurgeBatchSize:           defaultGDPRPurgeBatchSize,

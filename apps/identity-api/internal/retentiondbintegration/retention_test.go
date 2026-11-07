@@ -398,8 +398,10 @@ func TestSearchPathShadowingCannotDeceiveTheGuards(t *testing.T) {
 	if err := f.admin.QueryRow(f.ctx, "SELECT account_ref FROM public.security_event_ledger WHERE seq=$1", seq).Scan(&account); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,reason,requesting_authority,legal_basis,applied_by)
-VALUES($1,'shadowing','court','legal claims',$2)`, account, uuid.New())
+	// Erasure must honor the metadata-only blocker even when its encrypted
+	// details cannot be read; the purge role has neither keys nor narrative need.
+	mustExec(t, f.ctx, f.admin, `INSERT INTO public.legal_holds(account_ref,details_encrypted,applied_by)
+VALUES($1,decode('01','hex'),$2)`, account, uuid.New())
 
 	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE legal_holds(account_ref uuid, is_active boolean)")
 	mustExec(t, f.ctx, f.purge, "CREATE TEMP TABLE security_ledger_head(singleton boolean, seq bigint, chain_hash bytea)")
@@ -449,7 +451,7 @@ WHERE n.nspname='public' AND p.proname IN
 		t.Fatal(err)
 	}
 	if leftovers != 0 {
-		t.Fatalf("%d v1 maintenance routines survived migration 00015", leftovers)
+		t.Fatalf("%d forbidden v1 maintenance routines exist in the final baseline", leftovers)
 	}
 
 	var checkpoints int64
@@ -458,7 +460,7 @@ WHERE n.nspname='public' AND p.proname IN
 		t.Fatal(err)
 	}
 	if checkpoints != 0 {
-		t.Fatal("the v1 checkpoint table survived migration 00015")
+		t.Fatal("the forbidden v1 checkpoint table exists in the final baseline")
 	}
 }
 
@@ -475,16 +477,48 @@ func TestForwardOnlyMigrationIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sqldb.Close() }()
+	snapshot := func() string {
+		t.Helper()
+		var state string
+		if err := f.admin.QueryRow(f.ctx, `SELECT jsonb_build_object(
+ 'history', (SELECT jsonb_agg(to_jsonb(v) ORDER BY id) FROM public.identity_schema_version v),
+ 'audit_head', (SELECT jsonb_agg(to_jsonb(h)) FROM public.audit_log_head h),
+ 'ledger_head', (SELECT jsonb_agg(to_jsonb(h)) FROM public.security_ledger_head h),
+ 'chain', (SELECT jsonb_agg(to_jsonb(c) ORDER BY seq) FROM public.security_ledger_chain c),
+ 'payload', (SELECT jsonb_agg(to_jsonb(l) ORDER BY seq) FROM public.security_event_ledger l),
+ 'chain_sequence', (SELECT jsonb_build_object('last_value',last_value,'is_called',is_called) FROM public.security_ledger_chain_seq),
+ 'audit_sequence', (SELECT jsonb_build_object('last_value',last_value,'is_called',is_called) FROM public.audit_log_chain_seq),
+ 'auth_sequence', (SELECT jsonb_build_object('last_value',last_value,'is_called',is_called) FROM public.account_auth_epoch_seq),
+ 'legacy_history', to_regclass('public.goose_db_version')::text
+)::text`).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	var history string
+	if err := f.admin.QueryRow(f.ctx, `SELECT jsonb_agg(version_id ORDER BY version_id)::text
+FROM public.identity_schema_version WHERE is_applied`).Scan(&history); err != nil || history != "[0, 1, 2]" {
+		t.Fatalf("expected baseline and registration lineage [0, 1, 2], got %s: %v", history, err)
+	}
+	before := snapshot()
 
 	if err := migrate.Down(f.ctx, sqldb); err == nil {
 		t.Fatal("the destructive down migration was not refused")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "forward-only") {
 		t.Fatalf("down migration failed for the wrong reason: %v", err)
 	}
+	if after := snapshot(); after != before {
+		t.Fatal("refused downgrade changed final ledger data, clocks, sequences or raw migration history")
+	}
 	// Forward recovery must still work after the refusal, and must not have lost
 	// anything.
-	if err := migrate.Up(f.ctx, sqldb); err != nil {
-		t.Fatalf("forward recovery after a refused downgrade: %v", err)
+	for range 2 {
+		if err := migrate.Up(f.ctx, sqldb); err != nil {
+			t.Fatalf("forward recovery after a refused downgrade: %v", err)
+		}
+		if after := snapshot(); after != before {
+			t.Fatal("repeated forward retry changed baseline state or raw migration history")
+		}
 	}
 	assertCount(t, f, "public.security_ledger_head", 1)
 	assertCount(t, f, "public.audit_log_head", 1)

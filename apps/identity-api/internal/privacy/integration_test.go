@@ -10,17 +10,17 @@
 // that hard-delete leaves security_event_ledger untouched. Those are properties of
 // the schema, not of the Go code, so only a migrated database can confirm them.
 //
-// They require a reachable PostgreSQL instance addressed by DATABASE_URL (see
-// .env.example / docker-compose.dev.yml). The mandatory Nx security-DB target checks
+// They require a run-owned disposable PostgreSQL instance addressed by DATABASE_URL.
+// The mandatory Nx security-DB target checks
 // the variable before invoking this integration-tagged package.
 //
 // With DATABASE_URL set, run the DB-backed packages serially:
 //
-//	go test -tags=integration -p 1 ./...
+//	npm exec -- nx run identity-api:test-security-db --skipNxCache
 //
-// `go test` runs packages in parallel, and internal/migrate, internal/dbintegration,
-// internal/recovery and this package all drive goose against the one shared schema,
-// so a parallel run has them tearing down each other's tables.
+// Some integration packages still provision or clean shared fixture state, so
+// the mandatory suite keeps packages serial. Migration tests own separate
+// disposable databases; the forward-only baseline cannot be reset by Down.
 //
 // Coverage:
 //   - End-to-end soft-delete -> past cutoff -> purge, asserting exactly which rows
@@ -60,8 +60,6 @@ const integrationTimeout = 2 * time.Minute
 // testGracePeriod is short enough that a test can place a subject on either side of
 // the cutoff by choosing deleted_at, without waiting.
 const testGracePeriod = time.Hour
-
-func legalFixtureString(value string) *string { return &value }
 
 // openTestPool applies the embedded migrations and returns a connection pool.
 //
@@ -537,12 +535,10 @@ func TestIntegrationLegalHoldBlocksPurge(t *testing.T) {
 	}
 	backdateDeletion(ctx, t, pool, user.ID, 2*testGracePeriod)
 
-	hold, err := env.queries.ApplyLegalHold(ctx, db.ApplyLegalHoldParams{
-		AccountRef:          user.ID,
-		Reason:              legalFixtureString("integration test"),
-		RequestingAuthority: legalFixtureString("test-court"),
-		LegalBasis:          legalFixtureString("legal obligation"),
-		AppliedBy:           uuid.New(),
+	hold, err := env.queries.CreateEncryptedLegalHold(ctx, db.CreateEncryptedLegalHoldParams{
+		ID: uuid.New(), RequestKind: "legal_hold", DetailsEncrypted: []byte("fixture ciphertext"),
+		AccountRef: user.ID,
+		AppliedBy:  uuid.New(),
 	})
 	if err != nil {
 		t.Fatalf("ApplyLegalHold: %v", err)
@@ -607,12 +603,10 @@ func TestIntegrationHardDeleteQueryRefusesHeldSubject(t *testing.T) {
 		t.Fatalf("backdate deleted_at: %v", err)
 	}
 
-	hold, err := q.ApplyLegalHold(ctx, db.ApplyLegalHoldParams{
-		AccountRef:          user.ID,
-		Reason:              legalFixtureString("toctou test"),
-		RequestingAuthority: legalFixtureString("test-court"),
-		LegalBasis:          legalFixtureString("legal obligation"),
-		AppliedBy:           uuid.New(),
+	hold, err := q.CreateEncryptedLegalHold(ctx, db.CreateEncryptedLegalHoldParams{
+		ID: uuid.New(), RequestKind: "legal_hold", DetailsEncrypted: []byte("fixture ciphertext"),
+		AccountRef: user.ID,
+		AppliedBy:  uuid.New(),
 	})
 	if err != nil {
 		t.Fatalf("ApplyLegalHold: %v", err)

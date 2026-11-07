@@ -3,9 +3,94 @@ package legalworkflow
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 
 	"github.com/google/uuid"
 )
+
+// GetHoldReviews needs only live hold-read authority. Account and scope locks
+// serialize release, reviews and cleanup before any restricted body is opened.
+func (s *Service) GetHoldReviews(ctx context.Context, a Actor, id uuid.UUID) (HoldReviews, error) {
+	if id == uuid.Nil {
+		return HoldReviews{}, ErrInvalidRequest
+	}
+	op, err := operation(ctx)
+	if err != nil {
+		return HoldReviews{}, err
+	}
+	old, err := loadHold(ctx, op.Tx, id, false)
+	if err != nil {
+		return HoldReviews{}, err
+	}
+	if err = authorized(ctx, op, a, []uuid.UUID{old.Account}, "legal.holds.read"); err != nil {
+		return HoldReviews{}, err
+	}
+	if err = lockScope(ctx, op.Tx, "hold", id); err != nil {
+		return HoldReviews{}, err
+	}
+	h, err := loadHold(ctx, op.Tx, id, true)
+	if err != nil {
+		return HoldReviews{}, err
+	}
+	if !reflect.DeepEqual(old, h) {
+		return HoldReviews{}, ErrConflict
+	}
+	var erased, created bool
+	err = op.Tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM legal_workflow_replays WHERE operation='hold_review' AND scope=$1 AND erased),
+        EXISTS(SELECT 1 FROM legal_workflow_replays WHERE operation='hold_review' AND scope=$1)`, id).Scan(&erased, &created)
+	if err != nil {
+		return HoldReviews{}, ErrUnavailable
+	}
+	if erased {
+		return HoldReviews{}, ErrErased
+	}
+	accessible, err := s.holdAccessible(ctx, op.Tx, h, s.now())
+	if err != nil {
+		return HoldReviews{}, err
+	}
+	if !accessible {
+		return HoldReviews{}, ErrExpired
+	}
+	if (h.Version == 0) != !created {
+		return HoldReviews{}, ErrUnavailable
+	}
+	result := HoldReviews{Version: h.Version, NextReviewAt: h.NextReviewAt, History: []HistoryEntry{}}
+	rows, err := op.Tx.Query(ctx, `SELECT id,revision,purpose,actor,action_id,created_at,body_encrypted FROM legal_workflow_events
+        WHERE scope_kind='hold' AND scope=$1 ORDER BY revision DESC LIMIT 201`, id)
+	if err != nil {
+		return HoldReviews{}, ErrUnavailable
+	}
+	defer rows.Close()
+	historyBytes := 0
+	for rows.Next() {
+		var entry HistoryEntry
+		var blob []byte
+		if rows.Scan(&entry.ID, &entry.Revision, &entry.Purpose, &entry.Actor, &entry.ActionID, &entry.CreatedAt, &blob) != nil ||
+			entry.Revision != h.Version-int64(len(result.History)) || entry.Purpose != "hold_review" {
+			return HoldReviews{}, ErrUnavailable
+		}
+		if len(result.History) == 200 {
+			result.HistoryTruncated = true
+			break
+		}
+		opened, err := s.open(ctx, blob, entry.ID, id, entry.Revision, entry.Purpose)
+		if err != nil {
+			return HoldReviews{}, err
+		}
+		historyBytes += len(opened.Input)
+		if historyBytes > 1024*1024 {
+			result.HistoryTruncated = true
+			break
+		}
+		entry.Input = opened.Input
+		result.History = append(result.History, entry)
+	}
+	if rows.Err() != nil || (!result.HistoryTruncated && int64(len(result.History)) != h.Version) {
+		return HoldReviews{}, ErrUnavailable
+	}
+	auditResult(ctx, a, "hold_read", false)
+	return result, nil
+}
 
 // Get decrypts one accessible case under the same locks used by cleanup.
 func (s *Service) Get(ctx context.Context, a Actor, id uuid.UUID) (Case, error) {

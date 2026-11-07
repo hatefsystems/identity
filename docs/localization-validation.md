@@ -1,3 +1,11 @@
+> Historical validation below describes the original localization snapshot.
+> Synchronization with the newer main registration and security work requires
+> fresh checks. Current integration adds localized passkey-only registration,
+> frozen-descriptor preference tests and the newer Unicode/SMTPUTF8 contracts;
+> the original SMS prose adaptation is superseded by operator-owned SMS.ir VERIFY.
+> Hosted CI results on the synchronized PR and final main are authoritative for
+> this integration. Historical counts are not replacement evidence.
+
 # Persian localization validation
 
 This delivery implements English (`en`) and Iranian Persian (`fa-IR`) on the

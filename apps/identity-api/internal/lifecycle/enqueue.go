@@ -8,13 +8,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 )
 
 // ErrEnqueue is safe to log: database errors may contain identifiers or payloads.
 var ErrEnqueue = errors.New("lifecycle: durable intent unavailable")
+
+// ErrIdentityConflict exposes no database diagnostic or conflicting identity.
+var ErrIdentityConflict = errors.New("lifecycle: identity already reserved")
 
 // EventStore must be bound to the caller's business transaction.
 type EventStore interface {
@@ -33,9 +38,18 @@ func CreateUser(ctx context.Context, tx pgx.Tx, arg db.CreateUserParams) (db.Use
 	if tx == nil || (arg.Status != "active" && arg.Status != "pending_verification") {
 		return db.User{}, ErrInvalidEvent
 	}
+	canonical, err := emailaddress.Canonicalize(arg.Email)
+	if err != nil {
+		return db.User{}, ErrInvalidEvent
+	}
+	arg.Email = canonical
 	q := db.New(tx)
 	user, err := q.CreateUser(ctx, arg)
 	if err != nil {
+		var conflict *pgconn.PgError
+		if errors.As(err, &conflict) && conflict.Code == "23505" {
+			return db.User{}, ErrIdentityConflict
+		}
 		return db.User{}, ErrEnqueue
 	}
 	revision, err := q.AdvanceUserLifecycleRevision(ctx, user.ID)

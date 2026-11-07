@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"encoding/base64"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ var testStepUpReplayHMACKey = bytes.Repeat([]byte{0x5a}, stepup.MinReplayHMACKey
 // replay secret so each policy test starts from a known environment.
 func clearStepUpEnv(t *testing.T) {
 	t.Helper()
+	t.Setenv("APP_ENV", "test")
 	for _, k := range []string{
 		EnvStepUpTokenTTL,
 		EnvStepUpPerAccountPerMinute,
@@ -125,12 +128,60 @@ func TestLoadStepUpAllowsMissingReplayHMACKeyOnlyInDevelopment(t *testing.T) {
 		t.Fatalf("development fallback key = %x, want nil for in-memory guard", cfg.ReplayHMACKey)
 	}
 
-	for _, environment := range []string{"staging", "production"} {
+	for _, environment := range []string{"test", "production"} {
 		t.Run(environment, func(t *testing.T) {
 			if _, err := LoadStepUp(environment); err == nil {
 				t.Fatalf("missing %s must fail in %s", EnvStepUpReplayHMACKey, environment)
 			}
 		})
+	}
+}
+
+func TestLoadStepUpEnvironmentCannotBeBypassedByKey(t *testing.T) {
+	for _, environment := range []string{"unset", "", " ", "\t", "staging", "Development", "development "} {
+		t.Run(environment, func(t *testing.T) {
+			clearStepUpEnv(t)
+			t.Setenv("APP_ENV", environment)
+			if environment == "unset" {
+				if err := os.Unsetenv("APP_ENV"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := LoadStepUp()
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.ReplayHMACKey != nil || cfg.TokenTTL != 0 {
+				t.Fatalf("present key bypassed mode validation: %+v %v", cfg, err)
+			}
+			cfg, err = LoadStepUp(environment)
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.ReplayHMACKey != nil {
+				t.Fatalf("supplied invalid mode accepted: %+v %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestLoadStepUpArgumentCardinalityAndDevelopmentFallback(t *testing.T) {
+	clearStepUpEnv(t)
+	for _, environment := range []string{"development", "test", "production"} {
+		if _, err := LoadStepUp(environment); err != nil {
+			t.Fatalf("explicit %s rejected: %v", environment, err)
+		}
+	}
+	for _, environments := range [][]string{{"development", "development"}, {"production", "test"}, {"development", "test", "production"}} {
+		cfg, err := LoadStepUp(environments...)
+		if err == nil || !strings.Contains(err.Error(), "environment argument") || cfg.ReplayHMACKey != nil {
+			t.Fatalf("multiple modes accepted: %+v %v", cfg, err)
+		}
+	}
+	t.Setenv(EnvStepUpReplayHMACKey, "")
+	t.Setenv("APP_ENV", "development")
+	if cfg, err := LoadStepUp(); err != nil || cfg.ReplayHMACKey != nil {
+		t.Fatalf("zero-argument explicit development fallback changed: %+v %v", cfg, err)
+	}
+	for _, environment := range []string{"test", "production"} {
+		t.Setenv("APP_ENV", environment)
+		if _, err := LoadStepUp(); err == nil || !strings.Contains(err.Error(), EnvStepUpReplayHMACKey) {
+			t.Fatalf("zero-argument %s missing key allowed: %v", environment, err)
+		}
 	}
 }
 

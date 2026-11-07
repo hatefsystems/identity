@@ -50,6 +50,10 @@ const (
 	// SecurityLedgerPurgeKey prevents overlapping ledger-retention worker runs.
 	// It is deliberately separate from both signer and transaction locks.
 	SecurityLedgerPurgeKey int64 = 5200003
+	// AuditCoordinationKey guards audit head advancement and paired bootstrap.
+	AuditCoordinationKey int64 = 5200004
+	// MigrationKey serializes schema changes before worker exclusions are taken.
+	MigrationKey int64 = 5300001
 )
 
 // AdvisoryLocker serialises worker runs across processes.

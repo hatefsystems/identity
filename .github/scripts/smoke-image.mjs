@@ -1,20 +1,23 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { portalCleanup } from './portal-harness.mjs';
+import { acceptanceLifecycle, createOwnedDockerResource, portalCleanup, removeOwnedDockerResource } from './portal-harness.mjs';
 
-function docker(args, allowFailure = false) {
+function docker(args, allowFailure = false, lifecycle) {
+  lifecycle?.check();
   const result = spawnSync('docker', args, {
     encoding: 'utf8',
-    timeout: 15_000,
+    timeout: lifecycle ? Math.max(1, Math.min(45_000, lifecycle.remaining())) : 45_000,
     maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error) throw result.error;
   if (!allowFailure && result.status !== 0) {
-    throw new Error(`docker ${args[0]} failed: ${result.stderr || result.stdout}`);
+    throw new Error(`Image smoke Docker ${args[0]} failed; private diagnostics suppressed`);
   }
   return result;
 }
@@ -29,7 +32,14 @@ export const maintenanceEntrypoints = [
   'lifecycle-publisher',
   'deletion-notifier',
   'admin-legal',
+  'registration-cleanup',
 ];
+
+export function assertRuntimeInventory(files) {
+  const normalized = files.map((path) => path.replace(/^\.\//, '').replace(/^\//, ''));
+  assert.deepEqual(normalized.filter((path) => path.startsWith('usr/local/bin/') && !path.endsWith('/')).map((path) => path.slice('usr/local/bin/'.length)).sort(), [...maintenanceEntrypoints].sort(), 'Unexpected packaged command inventory');
+  assert(!normalized.some((path) => /(?:^|\/)(?:portal-fixture|admin-roles|\.env(?:\.[^/]*)?|[^/]*\.(?:key|p12|pfx)|[^/]*(?:private|signing|secret|key)[^/]*\.pem)$/.test(path)), 'Runtime image contains a fixture, operator binary, environment file or private key');
+}
 
 export function maintenanceSucceeded(result, binary = '') {
   if (result.status !== 1) return false;
@@ -38,7 +48,12 @@ export function maintenanceSucceeded(result, binary = '') {
   }
   return `${result.stdout}\n${result.stderr}`.split('\n').some((line) => {
     try {
-      return JSON.parse(line).level === 'ERROR';
+      const record = JSON.parse(line);
+      if (binary === 'security-ledger-purge') {
+        return record.level === 'ERROR' && record.msg === 'security ledger purge failed' &&
+          record.reason === 'config: SECURITY_LEDGER_PURGE_DATABASE_URL is required; API credentials are not a fallback';
+      }
+      return record.level === 'ERROR';
     } catch {
       return false;
     }
@@ -242,118 +257,138 @@ export async function smokeImage(kind, reference, validateWeb) {
     validateWeb === undefined || typeof validateWeb === 'function',
     'Invalid web validation callback'
   );
-  const [image] = JSON.parse(docker(['image', 'inspect', reference]).stdout);
+  const lifecycle = acceptanceLifecycle({ timeout: 20 * 60_000 });
+  const operation = (args, allowFailure = false) => docker(args, allowFailure, lifecycle);
+  const runID = randomBytes(16).toString('hex');
+  const resources = [];
+  const close = portalCleanup(resources);
+  const create = (args) => {
+    lifecycle.check();
+    const owned = createOwnedDockerResource('container', args, runID, lifecycle);
+    resources.push(() => removeOwnedDockerResource(owned, lifecycle));
+    return owned.id;
+  };
+  let failure, imageID;
+  try {
+  const [image] = JSON.parse(operation(['image', 'inspect', reference]).stdout);
   assert.equal(image.Os, 'linux');
   assert.equal(image.Architecture, 'amd64');
-  const imageID = image.Id;
-
-  const disposers = [];
-  const close = portalCleanup(disposers);
-  let interrupted = false;
-  const onSignal = () => { interrupted = true; };
-  for (const event of ['SIGINT', 'SIGTERM']) process.on(event, onSignal);
-  const create = (args) => {
-    // Acquire immutable ownership before a start/attach can fail. A collision
-    // never registers a disposer and cannot authorize deleting another container.
-    const id = docker(['create', '--name', `ci-${kind}-${randomUUID()}`, '--pull', 'never', ...args]).stdout.trim();
-    assert.match(id, /^[a-f0-9]{64}$/, 'Missing immutable smoke container identity');
-    disposers.push(() => {
-      try { docker(['rm', '--force', '--volumes', id]); } catch { /* Verify daemon-side absence even after a client timeout. */ }
-      const remaining = docker(['ps', '--all', '--quiet', '--no-trunc']).stdout.trim().split(/\s+/);
-      assert(!remaining.includes(id), 'Smoke container survived cleanup');
-    });
-    return id;
-  };
-  try {
-    if (kind === 'api') {
-      assert.equal(image.Config.User, 'nonroot:nonroot');
-      for (const binary of maintenanceEntrypoints) {
-        await setTimeout(0);
-        assert(!interrupted, 'Image smoke interrupted');
-        const id = create(['--network', 'none', '--env', 'APP_ENV=production',
-          '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);
-        const result = docker(['start', '--attach', id], true);
-        assert(maintenanceSucceeded(result, binary), `${binary} must reject missing production configuration with exit 1`);
-      }
-    } else {
-      const uidID = create(['--network', 'none', '--entrypoint', 'node', imageID, '-p', 'process.getuid()']);
-      const uid = docker(['start', '--attach', uidID]).stdout.trim();
-      assert(/^\d+$/.test(uid) && Number(uid) !== 0, 'Web image must run as a non-root UID');
-      const name = create(['--publish', '127.0.0.1::3000', imageID]);
-      try {
-        docker(['start', name]);
-        const [container] = JSON.parse(docker(['inspect', name]).stdout);
-        const [port] = container.NetworkSettings.Ports['3000/tcp'];
-        assert.equal(port.HostIp, '127.0.0.1');
-        const base = `http://127.0.0.1:${port.HostPort}`;
-        const request = (path) =>
-          fetch(base + path, { redirect: 'error', signal: AbortSignal.timeout(5_000) });
-        const deadline = Date.now() + 60_000;
-        let html;
-        let landingResponse;
-        let lastError;
-        while (Date.now() < deadline) {
-          assert(!interrupted, 'Image smoke interrupted');
-          try {
-            const response = await request('/');
-            assert.equal(response.status, 200, 'Landing page HTTP status');
-            html = await response.text();
-            landingResponse = response;
-            break;
-          } catch (error) {
-            lastError = error;
-            await setTimeout(250);
-          }
-        }
-        assert(html, `Web startup timed out: ${lastError}`);
-        assert.match(html, /<h1\b[^>]*>Hatef Identity Platform<\/h1>/);
-        const seenNonces = new Set();
-        webDocumentNonce(landingResponse.headers, html, seenNonces);
-        const assets = new Set(staticAssets(html));
-        const notFoundPaths = [`/__csp-smoke-${randomUUID()}`, `/__csp-smoke-${randomUUID()}.html`];
-        for (const path of ['/', ...notFoundPaths, ...notFoundPaths]) {
-          const response = await request(path);
-          assert.equal(response.status, path === '/' ? 200 : 404, `${path} HTTP status`);
-          const document = await response.text();
-          webDocumentNonce(response.headers, document, seenNonces);
-          assert.match(
-            document,
-            path === '/'
-              ? /<h1\b[^>]*>Hatef Identity Platform<\/h1>/
-              : /<h1\b[^>]*>Page not found<\/h1>/
-          );
-          for (const asset of staticAssets(document)) assets.add(asset);
-        }
-        for (const path of ['/favicon.ico', ...assets]) {
-          const response = await request(path);
-          assert.equal(response.status, 200, `${path} HTTP status`);
-          assertStaticAssetHeaders(response.headers, path);
-          const contentType = response.headers.get('content-type') || '';
-          const pathname = new URL(path, base).pathname;
-          if (pathname.endsWith('.css')) assert.match(contentType, /text\/css/);
-          if (pathname.endsWith('.js')) assert.match(contentType, /(?:java|ecma)script/);
-          if (pathname.endsWith('.ico')) assert.match(contentType, /image\//);
-          assert((await response.arrayBuffer()).byteLength > 0, `${path} is empty`);
-        }
-        if (validateWeb) await validateWeb({ baseURL: base, notFoundPaths });
-        docker(['stop', '--time', '10', name]);
-        const [stopped] = JSON.parse(docker(['inspect', name]).stdout);
-        assert.equal(stopped.State.Running, false);
-        assert.equal(stopped.State.OOMKilled, false);
-        assert(
-          [0, 143].includes(stopped.State.ExitCode),
-          `Web did not stop gracefully: ${stopped.State.ExitCode}`
+  imageID = image.Id;
+  assert(/^sha256:[a-f0-9]{64}$/.test(imageID), 'Missing immutable smoke image ID');
+  if (kind === 'api') {
+    assert.equal(image.Config.User, 'nonroot:nonroot');
+    const inventory = create(['--network', 'none', imageID]);
+    const parent = resolve(tmpdir(), 'kilo');
+    await mkdir(parent, { recursive: true });
+    const temporary = await mkdtemp(resolve(parent, 'image-inventory-'));
+    resources.push(() => rm(temporary, { recursive: true, force: true }));
+    const archive = resolve(temporary, 'runtime.tar');
+    operation(['export', '--output', archive, inventory]);
+    const list = spawnSync('tar', ['--list', '--file', archive], { encoding: 'utf8', timeout: Math.min(60_000, lifecycle.remaining()), maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    assert(!list.error && list.status === 0, 'Actual runtime image inventory failed');
+    assertRuntimeInventory(list.stdout.trim().split(/\r?\n/));
+    for (const binary of maintenanceEntrypoints) {
+      lifecycle.check();
+      const id = create(['--name', `ci-api-${randomUUID()}`, '--pull', 'never', '--network', 'none', '--env', 'APP_ENV=production', '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);
+        const result = operation(
+          ['start', '--attach', id],
+          true
         );
-      } catch (error) {
-        throw new Error('Web smoke validation failed; private diagnostics suppressed', { cause: error });
-      }
+        assert(
+          maintenanceSucceeded(result, binary),
+          `${binary} must reject its missing production configuration with exit 1; diagnostics suppressed`
+        );
     }
-  } finally {
-    try { await close(); }
-    finally { for (const event of ['SIGINT', 'SIGTERM']) process.removeListener(event, onSignal); }
+    const unconfigured = create(['--network', 'none', '--entrypoint', '/usr/local/bin/identity-api', imageID]);
+    const result = operation(['start', '--attach', unconfigured], true);
+    assert(maintenanceSucceeded(result, 'identity-api') && /APP_ENV/.test(result.stdout + result.stderr), 'Actual unconfigured image did not reject missing APP_ENV');
+  } else {
+    const uidContainer = create(['--pull', 'never', '--network', 'none', '--entrypoint', 'node', imageID, '-p', 'process.getuid()']);
+    const uid = operation(['start', '--attach', uidContainer]).stdout.trim();
+    assert(/^\d+$/.test(uid) && Number(uid) !== 0, 'Web image must run as a non-root UID');
+    const name = create([
+        '--name',
+        `ci-web-${randomUUID()}`,
+        '--pull',
+        'never',
+        '--publish',
+        '127.0.0.1::3000',
+        imageID,
+      ]);
+      operation(['start', name]);
+      const [container] = JSON.parse(operation(['inspect', name]).stdout);
+      const [port] = container.NetworkSettings.Ports['3000/tcp'];
+      assert.equal(port.HostIp, '127.0.0.1');
+      const base = `http://127.0.0.1:${port.HostPort}`;
+      const request = (path) =>
+        fetch(base + path, { redirect: 'error', signal: AbortSignal.timeout(5_000) });
+      const deadline = Date.now() + 60_000;
+      let html;
+      let landingResponse;
+      let lastError;
+      while (Date.now() < deadline) {
+        lifecycle.check();
+        try {
+          const response = await request('/');
+          assert.equal(response.status, 200, 'Landing page HTTP status');
+          html = await response.text();
+          landingResponse = response;
+          break;
+        } catch (error) {
+          lastError = error;
+          await setTimeout(250);
+        }
+      }
+      assert(html, `Web startup timed out: ${lastError}`);
+      assert.match(html, /<h1\b[^>]*>Hatef Identity Platform<\/h1>/);
+      const seenNonces = new Set();
+      webDocumentNonce(landingResponse.headers, html, seenNonces);
+      const assets = new Set(staticAssets(html));
+      const notFoundPaths = [`/__csp-smoke-${randomUUID()}`, `/__csp-smoke-${randomUUID()}.html`];
+      for (const path of ['/', ...notFoundPaths, ...notFoundPaths]) {
+        lifecycle.check();
+        const response = await request(path);
+        assert.equal(response.status, path === '/' ? 200 : 404, `${path} HTTP status`);
+        const document = await response.text();
+        webDocumentNonce(response.headers, document, seenNonces);
+        assert.match(
+          document,
+          path === '/'
+            ? /<h1\b[^>]*>Hatef Identity Platform<\/h1>/
+            : /<h1\b[^>]*>Page not found<\/h1>/
+        );
+        for (const asset of staticAssets(document)) assets.add(asset);
+      }
+      for (const path of ['/favicon.ico', ...assets]) {
+        lifecycle.check();
+        const response = await request(path);
+        assert.equal(response.status, 200, `${path} HTTP status`);
+        assertStaticAssetHeaders(response.headers, path);
+        const contentType = response.headers.get('content-type') || '';
+        const pathname = new URL(path, base).pathname;
+        if (pathname.endsWith('.css')) assert.match(contentType, /text\/css/);
+        if (pathname.endsWith('.js')) assert.match(contentType, /(?:java|ecma)script/);
+        if (pathname.endsWith('.ico')) assert.match(contentType, /image\//);
+        assert((await response.arrayBuffer()).byteLength > 0, `${path} is empty`);
+      }
+      if (validateWeb) await validateWeb({ baseURL: base, notFoundPaths });
+      operation(['stop', '--time', '10', name]);
+      const [stopped] = JSON.parse(operation(['inspect', name]).stdout);
+      assert.equal(stopped.State.Running, false);
+      assert.equal(stopped.State.OOMKilled, false);
+      assert(
+        [0, 143].includes(stopped.State.ExitCode),
+        `Web did not stop gracefully: ${stopped.State.ExitCode}`
+      );
   }
-  assert(!interrupted, 'Image smoke interrupted');
-  console.log(`${kind} image smoke checks passed: ${reference}`);
+  } catch (error) { failure = error; }
+  finally {
+    lifecycle.beginTeardown();
+    try { await close(); lifecycle.check(true); lifecycle.signal.throwIfAborted(); } catch (error) { failure ||= error; }
+    lifecycle.release();
+  }
+  if (failure) throw failure;
+  console.log(JSON.stringify({ check: 'image-smoke', kind, imageId: imageID, cleanup: { completed: true }, status: 'passed' }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

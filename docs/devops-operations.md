@@ -1,18 +1,61 @@
 # Hatef Identity Platform - DevOps & Operational Playbook
 
-This playbook provides configuration specifications, deployment practices, secrets-management designs, and monitoring strategies for operating the Hatef Identity Platform in production Kubernetes environments.
+This playbook describes MVP operating requirements and later Kubernetes designs,
+not deployed gates, executed acceptance or production approval.
 
 ---
 
 ## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes, No ClickHouse & No Traefik)
 
-In the current MVP phase, the system is deployed using standard **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. Additionally, **ClickHouse is completely bypassed** in this phase to reduce RAM utilization by ~1.2 GB (using PostgreSQL fallback tables for logging instead).
+The MVP deployment design uses **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. **ClickHouse is bypassed** in this phase (PostgreSQL fallback tables handle logging).
 
 Furthermore, **Traefik is not provisioned in the MVP phase**. Instead, the platform leverages the **existing host-level Nginx** on the Ubuntu host to handle Reverse Proxying, TLS Termination, and path-based routing directly to the Docker containers. Traefik Ingress will be adopted post-MVP when migrating to a production Kubernetes cluster.
 
 The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monitoring configurations documented below are strictly for the post-MVP production deployment and **must not be provisioned in the current MVP phase**.
 
 ---
+
+## Fresh-Baseline Environment Cutover
+
+Current installation uses unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql`, applying through version 2 in
+`public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
+are refused regardless of their version or apparent equivalence; untracked nonempty
+application schemas and contradictory histories also fail closed. There is no
+in-place v1/v2 upgrade, data conversion or automatic history adoption. Generic
+`up-to` is for the new bundled lineage, not the old chain. Baseline Down/reset and
+rollback to zero refuse. Historical acceptance and prior plans remain unchanged;
+they are not evidence that this baseline passed.
+
+1. Record an explicitly scoped **fresh PostgreSQL 16** database and matching fresh
+   Redis 7/NATS JetStream 2.10 resources or isolated namespaces, with exact ownership,
+   names and ports. Default Compose names/volumes are not necessarily fresh. Existing
+   Identity data was confirmed disposable, but any reset of an existing named
+   developer/shared environment needs a separate explicit request naming the exact
+   targets. Do not run broad volume deletion or shared-schema reset commands.
+2. Close affected intake and stop/drain all old API, signer, publisher and maintenance
+   writers before switching. Inventory queued intent and old envelopes separately;
+   do not import old Redis sessions/grants or NATS events/consumer checkpoints into
+   the replacement DB. Keep required backups/keys and original legal/retention clocks.
+   Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
+3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
+   `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
+    fresh `up` records versions 1 and 2, repeated `up` verifies a no-op. Do not stamp, rename
+   or clear metadata after refusal. Verify packaged embedded inventory and final
+   schema before starting compatible binaries.
+4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
+   explicit genesis heads and retention subject settings using
+   [admin operations](admin-operations.md#migration-and-contraction). None of those
+   initialization/approval actions is a migration seed. Complete real key inventory,
+    readiness and separately authorized deployed signer lookup probing. Obsolete
+    legal Backfill/plaintext compatibility is removed, not an install/upgrade step.
+5. Reconcile isolated consumer baselines and require fresh authentication before
+   compatible every-replica/caller activation. Keep intake/destructive schedules off
+   until their existing policy, retention, ingress, manual and production gates pass.
+   Automated suites create/tear down only run-owned resources and run serially. The
+    coordinator records uncached final-source outcomes separately only after actual
+    [required acceptance](admin-operations.md#automated-validation), without reusing
+    historical evidence or certifying production readiness.
 
 ## User Lifecycle Publisher (Task 6.3)
 
@@ -36,9 +79,10 @@ explicit `APP_ENV=development` and are not production policy approval. One repli
 is not broker HA. Size disk/capacity for the approved replay horizon;
 acknowledgements do not free history early under Limits retention.
 
-1. Apply migration `00016_user_lifecycle_events.sql`, drain old mutation writers,
-   and deploy compatible producers, profile RPC and worker together. Existing
-   users start at revision 0; no registrations or historical events are synthesized.
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover), which
+   includes lifecycle revisions/outbox. Drain old mutation writers and deploy
+   compatible producers, profile RPC and worker together. Revision defaults remain
+   0; no registrations or historical events are synthesized by schema setup.
 2. Provision with a separately approved broker identity. Ordinary publishers must
    not mutate topology. Each service needs independent durable/grant permissions.
    API DB roles may insert intent, not mark it delivered; publishers cannot mutate
@@ -62,7 +106,7 @@ acknowledgements do not free history early under Limits retention.
    published rows are retained/reported and require controlled repair, not silent
    erasure to clear a backlog. Never disable holds or manually mark rows delivered
    to hide failures. Cleanup does not purge broker history or legal evidence.
-7. Rollback preserves revisions/accepted intent; migration 00016 is forward-only.
+7. Rollback preserves revisions/accepted intent; the baseline is forward-only.
    Stop incompatible writers, restore related database state consistently, and
    reconcile baselines/deletions before reopening traffic.
 
@@ -71,13 +115,15 @@ deploy consumers or remove earlier tasks' production enablement gates.
 
 ## User Portal Cutover (Task 7.3)
 
-The portal serves existing passkey-enabled accounts. It does not provision users,
-enable password login, add OAuth consent, or deploy downstream services. The
+The portal serves existing passkey-enabled accounts. Separately enabled signup
+can create accounts only after the owned-email/phone/resident-UV proof contract;
+it adds no password login, OAuth consent or downstream deployment. The
 browser and API must be released as one compatible boundary, not a mixed fleet of
 new DPoP-required and old cookie-only replicas.
 
-1. Apply additive `00017_profile_names.sql` first. Existing users/keys have empty
-   names; do not synthesize historical profile events. Verify deployed DB grants
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover) first.
+   Profile/key names default to empty; do not synthesize historical profile events.
+   Verify deployed DB grants
    for profile reads/writes and transactional outbox insertion.
 2. Deploy dual-version lifecycle publishers/readers and upgrade actual downstream
    consumers before deploying writers that emit display-name v2 events. V1 and
@@ -123,18 +169,144 @@ Redis authority/replay snapshots or re-enable cookie-only access. A rollback tha
 requires old auth code must withdraw portal traffic and coordinate reauthentication.
 Existing audit/legal/retention and private-gRPC deployment gates remain in force.
 
+### Registration Enablement and Cleanup
+
+`APP_ENV` is mandatory and exactly `development`, `test`, or `production`.
+Missing/empty/whitespace/unknown modes fail before listeners/connections; test is
+not a development exemption. Only explicit development permits ephemeral signing
+keys, missing-client seeding, local HTTP and selected memory seams. Enabled paths
+never downgrade after dependency failure. The exact public all-zero 32-byte
+KEK/pepper samples are rejected in production, not by arbitrary entropy guesses.
+
+`REGISTRATION_ENABLED=false` and `SMS_ENABLED=false` are independent safe defaults.
+Disabled SMS requires no provider credentials and retains DB-only removal/recovery.
+Enable only after separately approved state, logins, private secrets, budgets and
+operational gates; `.env.example` supplies no usable public registration budgets.
+
+| Required enabled configuration | Contract |
+|---|---|
+| `REGISTRATION_PENDING_CAPACITY` | Explicit `1..10000`; finite SQL pending-state admission, not approved public capacity. |
+| `REGISTRATION_GLOBAL_DAILY_LIMIT` | Explicit `1..100000`, shared finite registration admission budget. |
+| `REGISTRATION_EMAIL_HOURLY_LIMIT` | Explicit `1..10`, canonical-email admission budget. |
+| `SMS_PROVIDER`, `SMS_IR_KEY_MODE` | Exactly `smsir`; enabled registration requires explicit `live`. Standalone nonproduction SMS may explicitly use `sandbox`; production is live-only. |
+| `SMS_GATEWAY_API_KEY`, `SMS_IR_TEMPLATE_ID`, `SMS_IR_CODE_PARAMETER` | Private key, positive integer template, exact case-sensitive parameter without `#`. No sample key/template is operator authorization. |
+| `SMS_OTP_HASH_PEPPER` | Independent private HMAC secret, required when SMS is enabled. |
+| `SMS_OTP_GLOBAL_PER_DAY`, `SMS_OTP_MAX_PENDING_SIGNUP` | Explicit finite send budget and pending cap; cap must equal registration capacity. Shared signup/enrollment phone/subnet/global send bounds apply. |
+| `REGISTRATION_SMTP_HOST`, `PORT`, `TLS_MODE`, `USERNAME`, `PASSWORD`, `FROM`, `TIMEOUT`, `CA_BUNDLE`, `PUBLIC_ORIGIN` | Variable prefix is `REGISTRATION_SMTP_` for each field. Authenticated verified TLS, ASCII system sender/auth, positive timeout at most 5s; canonical public origin exactly equals `PORTAL_ORIGIN`. |
+| `REGISTRATION_CLEANUP_DATABASE_URL` | Dedicated actual non-owner NOINHERIT login, separate from API pool; required for enabled startup's nonmutating privilege/schema probe. |
+| `REGISTRATION_CLEANUP_BATCH_SIZE` | `1..500`, default 100, for the packaged maintenance command. |
+
+These ceilings are engineering safety bounds, **not approved operator budgets**.
+SMS.ir uses fixed POST `https://api.sms.ir/v1/send/verify`, Iranian
+`+989xxxxxxxxx` destinations submitted as `Mobile: "9xxxxxxxxx"` (10 digits), and
+one named six-digit code string preserving leading zeros. No GET fallback,
+redirect/provider override, automatic billed retry or real provider test credential
+is supplied. Sandbox uses the same endpoint and success-shaped replies but sends
+nothing. ID/cost/ACK cannot establish key provenance or handset receipt. Before
+live enablement, approve the key/template/parameter, country routing, public egress
+and spend limits, then separately authorize/attest an actual received message.
+
+Startup/readiness checks for enabled signup require final schema, local key
+round-trip, DB/shared Redis, dedicated cleanup-login admission and verified SMTP
+TLS/post-TLS EHLO/actual authentication. `Check(ctx,true)` requires SMTPUTF8 before
+AUTH and sends no MAIL/RCPT/DATA or test message. Real Unicode-mailbox receipt,
+relay/provider policy and cleanup supervision are external gates; flags or a
+successful capability check cannot attest them. ASCII local parts with IDNA ASCII
+domains can use an ASCII relay outside Unicode signup requirements; never reroute
+a Unicode mailbox to an ASCII approximation.
+
+Packaged `/usr/local/bin/registration-cleanup [once|check]` uses only explicit
+environment, its dedicated DSN and batch setting. `check` validates actual login/
+schema/privileges without mutation; `once` runs one bounded batch. Each invocation
+has a fixed **30s total deadline**, not a polling loop. An externally supervised
+schedule and monitoring are required before enablement. Cleanup login needs only
+SELECT/DELETE on registration attempts and SELECT on legal holds, no membership,
+owner/superuser/API/evidence/role privileges or unrelated secrets. Completed receipt
+cleanup takes the subject lock before rechecking holds; held/contended rows defer
+without blocking unrelated progress. Pending/failed rows have no user subject.
+
+Pending/email/passkey/receipt validity is 15m/10m/at-most-5m/1h. Expiry blocks
+authority even if cleanup is unavailable or a hold retains a receipt; expiry alone
+is not physical deletion. Completion clears transient encrypted contacts/tokens/
+ceremony state; resulting-user FK cascade must not prevent lawful purge. No
+exactly-once email/SMS promise, email-based capability recovery, role/session/
+password/new-mailbox bootstrap or relaxation of general mutation retries is added.
+Preserve registration/migration state in consistent forward restores. Stop signup
+intake before incompatible rollback, retain accepted accounts/events/receipts and
+original clocks; no Down/reset/adoption or automatic laboratory transformation.
+
 ### Automated Portal Acceptance
 
 From the workspace root, with npm dependencies, Go 1.26.5+ and Docker available:
 
 ```bash
+npm exec -- nx show project web --json
+npm exec -- nx show project identity-api --json
 npm exec -- nx run identity-api:test-portal --skipNxCache
 npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
 npm exec -- nx run-many -t build,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache
 npm exec -- nx run web:build --skipNxCache
 npm exec -- playwright install --with-deps chromium
 npm exec -- nx run web:test-portal-browser --skipNxCache
+npm exec -- nx run identity-api:build-registration-cleanup --skipNxCache
+# After an approved owned candidate build, inject its immutable publication API ID
+# and matching acceptance manifest; never silently rebuild the API for this check.
+npm exec -- nx run web:test-registration-browser --skipNxCache
 ```
+
+Registration browser requires `REGISTRATION_BROWSER_API_IMAGE=sha256:<id>`,
+absolute `REGISTRATION_BROWSER_API_MANIFEST` and
+`REGISTRATION_BROWSER_ARTIFACT_DIR` paths, and the matching
+checksum/source/generated-image acceptance manifest. It must use
+that immutable image's packaged migrate/API/cleanup commands, run-owned isolated
+services, a production-configured SMS.ir-contract TLS fixture at internal
+`api.sms.ir` and SMTPUTF8 relay, with external egress blocked. No host DNS/trust
+edits, real provider credentials, production fake-provider flag or seeded fixture
+account substitutes for signup. Required report identity must match publication;
+adding/resolving a target or source-level tests is not browser/image acceptance.
+
+PostgreSQL, Redis, JetStream and the API belong only to the run-owned internal
+network, without published service ports. Docker may report null host bindings
+for these private services; startup uses verified container IDs and private
+addresses, not host-port discovery. Only the fixture Node controller joins the
+separate ingress network. Its gateway accepts fixed authentication/readiness
+routes to the owned API, never caller-selected destinations or CONNECT tunnels;
+SMS and SMTP listeners bind only to its private interface. JetStream provisioning
+uses the controller's owned private broker address. Do not expose backing services
+or relax production transport admission to repair fixture connectivity.
+
+The final normal service gate is exactly seven one-suite cells under
+`max-parallel: 1`, `fail-fast: false`, unchanged target/job deadlines (30m/60m),
+nonzero executed evidence, zero failures/skips and verified run-owned cleanup.
+The [seven-suite inventory](admin-operations.md#automated-validation) is frozen;
+new package coverage is additive and overlapping runs must remain. Seven affected
+Linux CGO race cells/aggregate are separate, with `-json -tags=integration -race
+-count=1 -p=1 -timeout=20m`, never replacements for normal suite evidence.
+
+From the repository root, set `REPO` to the exact absolute checkout directory.
+Use shared explicit `ACCEPTANCE_RUN_ID` across local partial cells and their
+aggregate; use an approved run-owned artifact directory. Example entrypoints:
+
+```bash
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration-target=test-security-db
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/recovery
+```
+
+Partial mode identifies itself as partial and cannot satisfy publication. Require
+exact-seven unique expected normal and race results, source/generated/run identity,
+test/package evidence and cleanup; missing/stale/duplicate/wrong-source reports,
+zero exit without tests or any skip fail. Resolve final targets before running.
+Never overlap independent service or browser harnesses against the same Docker
+daemon: the restartable lifecycle broker intentionally uses `admin-test-nats`.
+On a Windows host using a Linux execution bridge, verify actual native Linux
+Go/CGO/GCC capabilities rather than changing Node's reported platform. Confirm
+owned native descendants have retired before removing backing services; a bridge
+exit alone is not proof. Retain installed tooling and evidence through acceptance,
+and remove only verified run-owned resources, never name-matched foreign state.
+For focused Go commands, Nx exec traverses dependency cwd: use
+`npm exec -- nx exec -p identity-api -- go -C /absolute/path/to/ldp/apps/identity-api test ...`
+with the actual absolute backend path, never `--excludeTaskDependencies`.
 
 `web:test-portal-browser` owns disposable PostgreSQL/Redis/JetStream containers,
 loopback ports and fresh volumes. Each stack starts two real production-configured
@@ -146,6 +318,8 @@ No development cookie/CSP exceptions or inherited database/secrets are used.
 
 `cmd/portal-fixture` is included only with `-tags=portalfixture` and is absent from
 normal builds/runtime images. It refuses unarmed/production invocations,
+missing/invalid modes and any mode other than explicit development/test (admin
+fixtures are test-only),
 non-loopback/run-mismatched databases and unowned/nonempty Redis. The harness
 seeds random accounts, eight-byte anonymized handles and matching real ES256
 COSE/CDP credentials through that private command, never an HTTP endpoint or magic
@@ -160,13 +334,18 @@ The separate focused database target requires explicitly configured disposable
 npm exec -- nx run identity-api:test-portal-integration --skipNxCache
 ```
 
-Run database suites serially; existing migration fixtures reset schema, and
-lifecycle tests can restart their explicitly identified disposable NATS container.
+Run database suites serially using only run-owned disposable resources; never reset
+an existing environment. Lifecycle tests can restart their explicitly identified
+disposable NATS container.
 Never point them at shared development or deployed data. CI keeps the existing
 security, lifecycle, gRPC, generated-code, vet/lint/Linux race, image and CSP suites;
 it adds focused portal integration and a separate `portal-browser` release gate.
 The existing `web-csp.browser.mjs` still validates the actual non-root web image,
 strict parser-inserted attack probes and inactive public forms.
+
+For the changed registration UI, disabled password/reset/neutral-TOTP and
+JavaScript-disabled forms remain required CSP/browser assertions; historical
+inactive-signup evidence does not certify the enabled registration contract.
 
 Set optional `PORTAL_BROWSER_ARTIFACT_DIR` for masked layout screenshots and
 `portal-evidence.json`. The suite does not persist plaintext recovery downloads,
@@ -197,7 +376,9 @@ npm exec -- nx run web:test-admin-browser --skipNxCache
 node .github/scripts/portal-harness.mjs --integration
 ```
 
-The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-lifecycle-integration`, and `test-portal-integration` through Nx, serially on its disposable services; missing configuration or skipped tests fail the run. Never point reset-schema suites at development or deployed databases. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs all seven CI suites in CI order: `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, and `test-portal-integration`, through Nx serially on disposable PostgreSQL 16, Redis 7 and JetStream 2.10; missing configuration or skipped tests fail the run. Its 60-minute total deadline includes startup, with a maximum 30-minute target deadline; interruption/deadline failures terminate the owned process tree before removing services. Migration and retention Go package budgets are explicitly 20 minutes while production transaction/lock limits remain unchanged. `LOCALAPPDATA` is retained solely for the Windows Go build cache; credentials, peppers and feature flags are not inherited. A collision on the reserved restart broker name fails rather than reusing or removing another run's container. Never point reset-schema suites at shared Compose volumes, development or deployed databases. Successful teardown is explicitly confirmed. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+
+Windows cannot deliver a graceful Go `SIGTERM` using Node's process kill. For Windows admin browser acceptance, first build and inspect the fresh production API image, then set `ADMIN_BROWSER_SIGNER_IMAGE` to its immutable `sha256:` image ID before running `web:test-admin-browser`. The harness uses its real non-root `/usr/local/bin/audit-signer` on the private run-owned service network and `docker stop` for graceful retirement; it still requires exit 0 before destructive fixtures. The signer and publisher receive separate restricted real logins, and publisher reads/delivery updates use its exact subject/marker RLS policies. No production image is inferred from a mutable tag and no forced termination is accepted as clean signer shutdown. Linux CI retains the normal locally built signer binary.
 
 CI requires the separate `admin-browser` job before image publication in addition to the existing quality, security, frontend and portal-browser jobs. For acceptance, set `ADMIN_BROWSER_ARTIFACT_DIR` to a fresh run-specific directory under `/tmp/kilo` for masked desktop/320px light/dark screenshots and sanitized `admin-evidence.json`. Do not retain raw traces, storage snapshots, fixture credentials, proofs, grants, account identifiers or audit bodies. Diagnostic output is restricted to route templates, counts, static failure categories and sanitized scenario labels; require confirmed cleanup of all run-owned services.
 
@@ -263,8 +444,9 @@ The live routes are `/dashboard/privacy` and anonymous `/recover-account`.
 not proof supplied by a checkbox or SMTP acknowledgement. Recovery and draining
 accepted notices must remain available when new deletion requests are switched off.
 
-1. Apply additive, forward-only `00018_deletion_notifications.sql` before new API
-   writers/workers. Verify API privileges for transactional request/outbox insertion.
+1. Complete the [fresh-baseline cutover](#fresh-baseline-environment-cutover), including
+   deletion notification storage, before new API writers/workers. Verify API privileges
+   for transactional request/outbox insertion.
    Inventory any legacy pending requests without encrypted delivery intent; hashes
    cannot reconstruct their tokens. Reconcile them through an approved procedure,
    preserving the original deadline, before enabling new requests.
@@ -349,19 +531,6 @@ eighteen viewports. Native bfcache/hidden-tab transitions were not observed; inj
 events/history checks do not close those or manual assistive-technology/authenticator
 and deployed-ingress gates. Dependency installation also reported existing npm audit
 findings; no dependency upgrades or audit-policy changes were made in this task.
-
-## Localized Notification Queue Rollout
-
-English/Persian UI preferences are browser-local, not a new account field. The preference cookie is `__Host-hatef-ui` with Secure, HttpOnly, Path=/, SameSite=Lax, no Domain and a one-year maximum. Keep the authentication cookie SameSite=Strict, the per-request nonce CSP and ordinary Next Server Action origin protections. Verify actual HTTPS ingress, fonts, cookie/action rerender and log redaction before production enablement; do not add permissive allowed origins or CSP font/style exceptions. [Localization](localization.md) describes the full UI/data boundary and remaining manual gates.
-
-1. Roll out v1/v2-capable `deletion-notifier` readers first. Verify compatibility, existing envelope keys and unchanged least-privilege grants on every reader before any API replica emits v2. There is no schema migration or new worker SELECT permission for locale.
-2. Deploy the locale-aware API writer, then the frontend. The encrypted v2 payload freezes the initiating action's locale and template version, so primary/backup recipients and retries/restarts retain the same language, token and original deadline. Legacy v1 stays English.
-3. Monitor sanitized existing queue due-age, lease, retry, rejection and permanent-failure signals. UTF-8/MIME encoding still obeys the 16 KiB final-message limit. Do not retain raw mail, message bodies, codes, addresses, recovery links or request locale payloads as evidence.
-4. Roll back by stopping new v2 writes before replacing writers. Keep compatible readers, keys, recovery routes and the additive schema until all live v2 deliveries are handled under existing expiry/retention rules. Never roll a v1-only reader onto live v2 work. Never rewrite accepted ciphertext or regenerate a token/deadline merely to change language.
-
-No retention, legal-hold, session or factor policy change is authorized. Independent professional Persian security/legal wording review, assistive-technology/physical-authenticator/native-zoom review, native hidden-tab/bfcache observations where absent, mailbox/provider checks and deployed-ingress verification remain explicit release gates. The root-error fallback is deliberately bilingual when request preference resolution itself fails.
-
-The existing portal/admin/CSP programs now exercise both locales with fresh run-owned fixtures. Portal/admin evidence is organized under `en/` and `fa-IR/` inside the configured artifact root. Screenshot names include state, locale, viewport and theme; only structurally masked screenshots and sanitized summaries may be uploaded. Set `WEB_BROWSER_ARTIFACT_DIR` for auth screenshots. Do not upload traces, HARs, raw SMTP mail, response bodies or storage snapshots. The `portal-harness.mjs --integration` helper runs all seven required suites serially, including legal workflow and gRPC; do not substitute historical five-suite results. Current execution status must be recorded separately in delivery evidence/PR, never inferred from this runbook.
 
 ## 1. Kubernetes Deployment & Networking
 
@@ -520,7 +689,7 @@ To repeat the browser check after building an image, from the repository root wi
 
 ```bash
 npm exec -- playwright install --with-deps chromium
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/web-csp.browser.mjs" identity-web:ci
+npm exec -- nx exec -p web -- node "$PWD/.github/scripts/web-csp.browser.mjs" identity-web:ci
 ```
 
 ### 1.0.1 Private IdentityService Runtime (Task 6.2)
@@ -551,7 +720,11 @@ instances, drain process-local sessions and require reauthentication. New user
 tokens bind to their browser session, OAuth grant and captured account version.
 Legacy unlinked JWTs cannot pass the RPC. Task 7.3 additionally shares WebAuthn
 ceremonies and enforces bound browser sessions across API replicas. Client-assertion
-replay remains a separate single-process boundary. Independent offline grants and
+claims use shared Redis outside development, scoped client/audience/JTI through the
+entire accepted exp+60s leeway window with no memory fallback. Temporal admission
+and atomic absolute expiry use Redis `TIME`; permit `TIME` directly and inside
+the replay Lua script in the authorized Redis ACL. A denied or malformed clock
+reply fails authentication rather than using a replica-local clock. Independent offline grants and
 consent UI completion remain separate tasks.
 
 Operate Redis as security authority: use appropriate ACLs/TLS and an eviction
@@ -696,7 +869,20 @@ Workloads access the SPIFFE Workload API by mounting the local folder hosting `/
 
 ## 2. Secrets Injection & Configuration
 
-The runtime loads environment-injected secrets and holds one KEK/version and one pepper/version. It does not fetch, refresh or rotate external-vault keys. The following Infisical/ESO configuration is a proposed Kubernetes deployment example, not evidence of an installed integration. Preserve independently recoverable retained keys and rehearse recovery before rotation.
+Current application crypto uses operator-injected environment values: one loaded
+`ENVELOPE_MASTER_KEK`/version and one blind-index pepper/version in process-local
+custody, with real AES-GCM and exact email/generic HMAC input profiles. There is no
+live Infisical fetch/cache/offline fallback, automatic retired-key retrieval or
+hot-rotation subscription. Infisical/SOPS/Sealed Secrets are provisioning options;
+the ESO example below is a post-MVP deployment design, not implemented application
+KMS behavior or evidence of deployed synchronization.
+
+Inventory and protect all retired keys needed for retained ciphertext/backups.
+Changing the one loaded KEK/version or pepper cannot transparently rotate existing
+data; plan controlled draining, inventory/re-encryption/recovery and consistent
+rollout separately. Do not rehash signed history or assume a version byte provides
+a multi-key reader. Restore drills, private key custody and actual secret injection
+are operational gates, not established by primitive unit tests.
 
 ```
 +------------------+         +----------------------------+         +-------------------+
@@ -707,7 +893,7 @@ The runtime loads environment-injected secrets and holds one KEK/version and one
 
 ### 2.1 ExternalSecret Definition
 
-If separately installed, ESO may poll Infisical and update Kubernetes Secrets. Updating a Secret does not hot-reload this application or make ciphertext encrypted with retired keys readable.
+The ESO Controller polls Infisical at a set interval (e.g., 5 minutes) and updates the Kubernetes Secret objects dynamically.
 
 ```yaml
 apiVersion: external-secrets.io/v1beta1
@@ -738,7 +924,8 @@ spec:
         key: /production/crypto/stepup_replay_hmac_key
 ```
 
-Application Pods bind this generated secret as standard environment variables or files:
+In that later design, pods bind the generated secret as environment variables or
+files; process restart/coordinated rollout is still required to load changes:
 
 ```yaml
 env:
@@ -833,106 +1020,103 @@ groups:
 
 ### Admin deployment gate
 
-Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including role separation, approved retention, encrypted backfill, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
+Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md): forward-only bundle, role separation, approved retention, actual key/data inventory, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress validation. Obsolete legal Backfill is unavailable. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method/template/status/duration. Request paths/lines, queries, bodies, cookies, proofs, grants and referrers must not reach logs. Test body-only canonical-email lookup and rejected legacy GET with synthetic identities; this example does not certify a deployed collector.
 
-## Pre-production acceptance and bootstrap gates
+## Phase 5 Technical Closure (2026-11-05)
 
-This checkout does not match the cleanup plan's assumed completed baseline:
-migrations `00001`–`00018` and the expanded legal-hold compatibility layout remain.
-Do not consolidate, reset, adopt or delete existing environments as an acceptance
-step. The selected phases 7/8 do not implement phases 1–6, remove a CLI, enable a
-feature or authorize production actions.
+Fresh local automated acceptance of the Phase 5 closure plan passed on
+2026-11-05. It is separate from production enablement and the unchecked
+[operator checklist](admin-operations.md#production-checklist). The final
+seven-suite run produced 6,462 passing test/subtest records over 49 package runs,
+zero failures/skips and confirmed teardown; the detailed suite counts and
+restore/trust limitations are recorded in
+[admin operations](admin-operations.md#phase-5-technical-closure-2026-11-05).
 
-Use Node 24, npm 11.21.0, the Go version in `apps/identity-api/go.mod`, Linux CGO
-and a C compiler for race cells. Run all mutable service suites serially; independent
-harnesses on the same Docker daemon must not overlap because the explicitly admitted
-restartable broker is `admin-test-nats`. A collision is failure, never ownership.
+The actual host toolchain was Node 24.18.0, npm 11.16.0, Go 1.26.5 and
+golangci-lint 2.12.2. Linux unit/race execution used Go 1.26.9 and Alpine GCC
+15.2.0; race execution had `CGO_ENABLED=1` and current source/module-cache mounts
+were read-only. The existing POSIX spool-permission test fails on Windows and
+was not weakened: the complete named unit and race targets passed on Linux.
+Only dependency generation was excluded after its explicit successful fresh
+run, not test execution or cache misses. All test gates were uncached.
 
-```sh
-# Exhaustive local service acceptance (seven suite identities).
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration
-# One bounded CI/local cell, explicitly partial.
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-target=test-security-db
-# Separate owned-service tagged race cell, one of seven allowlisted packages.
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/recovery
+These exact final commands exited 0:
+
+```powershell
+npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+npm exec -- nx run schemas:lint --skipNxCache
+npm exec -- nx run-many -t lint,vet,test-portal-fixture,sqlc-vet -p identity-api --skipNxCache --excludeTaskDependencies
+npm exec -- nx run identity-api:lint --skipNxCache --excludeTaskDependencies --args="--build-tags=integration"
+$env:GOFLAGS='-tags=integration'; npm exec -- nx run identity-api:vet --skipNxCache --excludeTaskDependencies
+npm exec -- nx run-many -t build,build-admin-audit-publisher,build-admin-roles,build-admin-legal,build-lifecycle-publisher,build-audit-signer,build-purge-worker,build-security-ledger-purge,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache --excludeTaskDependencies
+npm exec -- nx run-many -t lint,typecheck,build -p web,ui --skipNxCache --parallel=1
+npm exec -- nx run web:test --skipNxCache --ci --runInBand
+npm exec -- nx run ui:test --skipNxCache --ci --runInBand
+npm exec -- nx exec -p schemas -- node --test "D:/Projects/hatef.ir/ldp/.github/scripts/*.test.mjs"
+npm exec -- nx exec -p schemas -- node "D:/Projects/hatef.ir/ldp/.github/scripts/portal-harness.mjs" --integration
 ```
 
-For separate local cells, set the same unique `ACCEPTANCE_RUN_ID` and an empty
-`ACCEPTANCE_REPORT_DIR` outside the source tree (or under ignored `.kilo/`), then
-use the two-argument aggregate command below.
-Do not reuse an acceptance run ID. CI binds reports to its workflow run/attempt.
+The complete named Linux unit/race commands also exited 0 and removed their
+owned containers:
 
-```sh
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --aggregate-service "$ACCEPTANCE_REPORT_DIR"
-# Repeat for all seven race-package reports in a separate directory.
-npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --aggregate-race "$ACCEPTANCE_REPORT_DIR"
+```powershell
+npm exec -- nx run identity-api:test --skipNxCache --excludeTaskDependencies --command='docker run --rm --name ldp-phase5-unit-final2-20261105T165058Z --network none --volume D:/Projects/hatef.ir/ldp:/workspace:ro --volume C:/Users/Hatef/go/pkg/mod:/go/pkg/mod:ro --env CGO_ENABLED=0 --env GOFLAGS=-mod=readonly --entrypoint sh identity-api-race:ci -c "go test -count=1 ./..."'
+npm exec -- nx run identity-api:test-race --skipNxCache --excludeTaskDependencies --command='docker run --rm --name ldp-phase5-race-final2-20261105T165058Z --network none --volume D:/Projects/hatef.ir/ldp:/workspace:ro --volume C:/Users/Hatef/go/pkg/mod:/go/pkg/mod:ro --env CGO_ENABLED=1 --env GOFLAGS=-mod=readonly --entrypoint sh identity-api-race:ci -c "go test -race -count=1 ./..."'
 ```
 
-Each report carries source/generated SHA-256 identities, exact package evidence,
-executed test count, zero skips/failures, startup/target/cleanup timings and verified
-teardown. Assertion bodies and provider credentials are discarded. Single-cell
-reports identify themselves as partial; only the all-seven aggregate is complete.
-Missing, duplicate, wrong-source, stale-run or failed-cleanup reports block release.
-The 30-minute normal-target cap and 20-minute race-test cap remain. The runner
-reserves cleanup inside the 60-minute CI ceiling. All seven targets disallow Nx
-parallelism within one invocation; that setting is not a cross-process lock.
+Fresh API and web builds used `--platform linux/amd64 --pull --network=host`;
+no inline proxy credentials, push or publication was performed. Immutable
+accepted image IDs were:
 
-CI uses serial seven-cell service and race matrices (`max-parallel: 1`,
-`fail-fast: false`), and publication requires both aggregate gates plus quality,
-frontend, portal/admin browser and registration-browser gates. Frontend lint treats
-warnings as failure. API smoke uses immutable owned container IDs and certifies
-success only after every disposer and absence check succeeds.
+- API/maintenance: `sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8`.
+- Web: `sha256:b7539e32e78ee3c7f85f14f709ea63f98575831724c52674e0e9d7fa8961b5eb`.
 
-**Registration remains blocked.** `web:test-registration-browser` currently reports
-prerequisites and exits nonzero; it is not the production enrollment browser harness.
-The registration service, production SMS.ir adapter, SMTPUTF8 transport, additive
-signup migration and cleanup worker/build target are absent. The normal portal
-suite now includes existing `oidc/clientauth`, `mfa` and `smsotp` packages. Missing
-registration/SMS.ir/SMTPUTF8/cleanup packages cannot be counted as executed coverage.
-The race matrix deliberately retains the required registration cell, so absence
-blocks the aggregate. Complete phases 5/6 and replace the registration blocker
-with the real immutable-image harness before claiming phase 7 complete.
+```powershell
+docker build --platform linux/amd64 --pull --network=host --file apps/identity-api/Dockerfile --tag identity-api:phase5-20261105T165058Z .
+docker build --platform linux/amd64 --pull --network=host --file apps/web/Dockerfile --tag identity-web:phase5-20261105T165058Z .
+npm exec -- nx exec -p schemas -- node "D:/Projects/hatef.ir/ldp/.github/scripts/smoke-image.mjs" api sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8
+npm exec -- nx exec -p web -- node "D:/Projects/hatef.ir/ldp/.github/scripts/web-csp.browser.mjs" sha256:b7539e32e78ee3c7f85f14f709ea63f98575831724c52674e0e9d7fa8961b5eb
+$env:PORTAL_BROWSER_ARTIFACT_DIR='C:/Users/Hatef/AppData/Local/Temp/kilo/phase5-20261105T165058Z/portal-browser'; npm exec -- nx run web:test-portal-browser --skipNxCache
+$env:ADMIN_BROWSER_SIGNER_IMAGE='sha256:a1b533cffdc7d6a16de13a240b75080f0ee6ff860826b42047c2123c97ed41b8'; $env:ADMIN_BROWSER_ARTIFACT_DIR='C:/Users/Hatef/AppData/Local/Temp/kilo/phase5-20261105T165058Z/admin-browser'; npm exec -- nx run web:test-admin-browser --skipNxCache
+```
 
-Future enabled signup acceptance must consume the checksum-verified API artifact
-from `quality`, record exactly its image ID/source/generated identities, use only
-that image's packaged API/migrate/cleanup commands, and match the publication
-manifest. Keep `APP_ENV=production`; isolate provider fixtures on an internal
-network with the `api.sms.ir` alias, mounted ephemeral CA and SMTPUTF8 relay. Block
-external egress. Do not alter host DNS/trust, switch production to development,
-seed a privileged account or substitute a fake production-provider flag.
+All four smoke/browser commands exited 0. Helpers passed 177 tests with zero
+skips, web passed 586, UI passed 17, and the real browsers produced 18 portal
+viewports/six no-JavaScript routes and 42 masked admin/legal layouts. Signer
+retirement used the immutable production binary and required clean exit before
+destructive fixtures. All browser and integration resources were confirmed
+removed, and `docker ps -a --filter label=ldp.run` returned no owned containers.
 
-Before an independently authorized fresh deployment, require these explicit gates:
+Repeated SQL/protobuf generation preserved every byte in all 24 generated SQL
+Go files and four protobuf Go files. Their ordered `git hash-object --no-filters`
+vector has SHA-256
+`79c724165e0057fd93d4795a8e742524fa0775092c3947f4fededd4c37367991`;
+complete filename/object vectors are in the sanitized external acceptance JSON.
+Tracked migrations 00001-00018 and canonical schema sources were unchanged.
 
-1. Attest owner/environment and newly provisioned isolated DB/Redis/JetStream
-   namespaces; identify real-data discovery and stop/replan on it.
-2. Approve separate actual-login, nonowner/nonsuperuser runtime, migrator, policy,
-   publisher, signer, notifier and purge roles. Verify effective grants and role
-   membership with actual logins. Deliver the checksum-attested `admin-roles`
-   operator artifact separately through the trusted MFA launcher.
-3. Inject independent production secrets and retain a custody/version/recovery
-   inventory. The sample file contains no working KEK/pepper. Explicitly set the
-   environment: the current omitted-APP_ENV development fallback is still a launch
-   blocker. Never treat configuration flags as key/provider provenance.
-4. Review migration status and approve applying the reviewed schema to the named
-   target separately. This branch still uses numbered migrations, not the plan's
-   final-only baseline. No reset/down, lab adoption or automatic plaintext conversion.
-5. Approve/install immutable legal policy, retention/replay/tombstone inventory and
-   first binding. Initialize genesis only after independent fresh-chain proof;
-   supervise signer/publishers and verify drain, durability and broker failures.
-6. Verify canonical origin/callbacks, proxy redaction, strict cookies and effective
-   transport authentication/TLS for every off-host/untrusted dependency hop.
-7. Before signup exists/enables: approve live SMS.ir key/template/parameter,
-   Iranian destination policy, egress/spend limits and authorized handset receipt.
-   Sandbox ACK is not delivery. Approve authenticated TLS SMTP with post-TLS
-   SMTPUTF8 and independent Unicode-mailbox delivery/recovery; approve transient
-   retention/capacity and supervised cleanup. Keep the feature unavailable until then.
-8. Enroll an ordinary first operator through a future approved production flow;
-   authorize its role grant separately. Schema creation does not create accounts,
-   privilege, governance policy or heads. Verify negative RBAC and no legal bypass.
-9. Authorize the synthetic lookup probe and each workflow/notifier/retention/purge
-   schedule independently. Keep purge disabled until deadline/contention gates pass.
-   Ordinary audit's best-effort loss/drain policy and private gRPC gates remain explicit.
-10. Rehearse forward backup/filestore-independent database recovery, signer heads,
-    retained keys and delivery draining in a separately approved recovery environment.
-    Local tests do not close legal, physical-authenticator, assistive-technology,
-    live ingress, Redis continuity or actual provider-delivery gates.
+The accepted implementation snapshot was dirty, based on
+`fedbe1ebee53be2bfd3dfeb5d66ef6ee2e8749d7`, with empty staged diff,
+unstaged-diff SHA-256
+`6bf21a0e22bac832dcf3d848d8d7a00b286ca8365dba24a7949f3f2f013633e8`
+and untracked-content SHA-256
+`f865a882e6bf71f00b6963355a17e8292658fdd0d0da48f91f3a84b5ebac9866`.
+After validation only acceptance/task bookkeeping was changed; the resulting
+final worktree fingerprint is recorded externally to avoid a self-referential
+hash in these runbooks. The earlier post-browser changes were a test-only
+contracted-schema shadowing fixture and POSIX-only integration interruption
+teardown, checked by the full fresh serial retry and strengthened helpers;
+the successful Windows/browser/runtime-image paths were unchanged.
+
+Run-specific evidence is under
+`C:\Users\Hatef\AppData\Local\Temp\kilo\phase5-20261105T165058Z`:
+`acceptance.json`, `admin-browser/admin-evidence.json` and
+`portal-browser/portal-evidence.json`, with masked captures only. Raw diagnostic
+traces, private keys, account/operation identifiers, proofs and legal narratives
+were not retained. Earlier prerequisite/concurrent-generation/fixture failures
+were corrected and retried, not counted as passing evidence. Existing non-lint
+Next project-reference/toolchain and npm dependency advisories (62 reported by
+the image install) remain recorded caveats; dependency remediation was not
+silently added to this plan and no lint negatives or test failures were waived.
+Production release still requires its separate dependency/security review and
+all manual/operator gates. No commit, push, deployed governance or production
+enablement occurred.

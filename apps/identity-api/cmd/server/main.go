@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/server"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp/smsir"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
@@ -75,12 +77,14 @@ func run(logger *slog.Logger) (runErr error) {
 		return err
 	}
 
-	keyManager, err := buildKeyManager(oidcCfg, cfg.Environment, logger)
+	clientRegistry, err := config.LoadClients(cfg.Environment)
 	if err != nil {
 		return err
 	}
-
-	clientRegistry, err := config.LoadClients(cfg.Environment)
+	if err := validateStartupInputs(cfg); err != nil {
+		return err
+	}
+	keyManager, err := buildKeyManager(oidcCfg, cfg.Environment, logger)
 	if err != nil {
 		return err
 	}
@@ -111,7 +115,7 @@ func run(logger *slog.Logger) (runErr error) {
 	if cfg.GRPC.Enabled && (pool == nil || redisClient == nil) {
 		return errors.New("main: enabled gRPC requires DATABASE_URL and REDIS_URL")
 	}
-	sessionManager, err := buildSessionManager(accounts, redisClient)
+	sessionManager, err := buildSessionManager(cfg.Environment, accounts, redisClient)
 	if err != nil {
 		return err
 	}
@@ -129,11 +133,11 @@ func run(logger *slog.Logger) (runErr error) {
 		}
 		return sessionManager.RevokeAllForUser(ctx, userID)
 	}
-	tokenService, refreshTokenStore, err := buildTokenService(oidcCfg, keyManager, clientRegistry, logger, accounts, sessionManager, redisClient, revokeUser)
+	tokenService, refreshTokenStore, err := buildTokenService(cfg.Environment, oidcCfg, keyManager, clientRegistry, logger, accounts, sessionManager, redisClient, revokeUser)
 	if err != nil {
 		return err
 	}
-	dpopValidator, err := buildDPoPValidator(redisClient)
+	dpopValidator, err := buildDPoPValidator(cfg.Environment, redisClient)
 	if err != nil {
 		return err
 	}
@@ -145,11 +149,13 @@ func run(logger *slog.Logger) (runErr error) {
 		}
 	}
 
-	// The SMS OTP service shares the WebAuthn database pool (it persists the
-	// verified phone) and the Redis client (rate limiting + code store). When
-	// either backing store is absent in development the service is skipped and
-	// its routes are left unmounted.
+	// Phone removal remains DB-only when delivery is disabled. Enabled delivery
+	// requires shared Redis and the configured SMS.ir adapter, never log success.
 	smsotpService, err := buildSMSOTPService(cfg.Environment, pool, redisClient, logger)
+	if err != nil {
+		return err
+	}
+	registrationService, registrationReady, err := buildRegistrationService(cfg.Environment, pool, redisClient, webauthnService, smsotpService)
 	if err != nil {
 		return err
 	}
@@ -199,15 +205,7 @@ func run(logger *slog.Logger) (runErr error) {
 
 	// Capture attribution before ordinary security events cross the async boundary.
 	if pool != nil && os.Getenv(config.EnvBlindIndexPepper) != "" {
-		pepper, err := config.LoadBlindIndexPepper()
-		if err != nil {
-			return err
-		}
-		pepperVersion, err := config.LoadBlindIndexPepperVersion()
-		if err != nil {
-			return err
-		}
-		indexer, err := blindindex.New(pepper, pepperVersion)
+		indexer, err := buildAuditIndexer()
 		if err != nil {
 			return err
 		}
@@ -254,8 +252,10 @@ func run(logger *slog.Logger) (runErr error) {
 	}
 
 	srv := server.New(cfg, logger, server.Deps{
-		AdminActions: adminDeps.AdminActions,
-		AdminReady:   adminDeps.AdminReady,
+		Registration:      registrationService,
+		RegistrationReady: registrationReady,
+		AdminActions:      adminDeps.AdminActions,
+		AdminReady:        adminDeps.AdminReady,
 		AdminRevoke: func(ctx context.Context, userID string) error {
 			return errors.Join(sessionManager.RevokeAllForUser(ctx, userID), refreshTokenStore.RevokeAllForUser(ctx, userID))
 		},
@@ -309,6 +309,69 @@ func run(logger *slog.Logger) (runErr error) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
+}
+
+// Validate mode-dependent settings before constructing adapters or dialing any
+// service. A dependency outage must not hide a configuration admission failure.
+func validateStartupInputs(cfg config.Config) error {
+	if _, err := config.LoadSession(); err != nil {
+		return err
+	}
+	if _, err := config.LoadAudit(cfg.Environment); err != nil {
+		return err
+	}
+	privacyCfg, err := config.LoadPrivacy(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	smsCfg, err := config.LoadSMS(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	registrationCfg, err := config.LoadRegistration(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
+	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled {
+		if !hasDB {
+			return errors.New("main: DATABASE_URL is required")
+		}
+		if !hasRedis {
+			return errors.New("main: REDIS_URL is required")
+		}
+	}
+	if smsCfg.Enabled || registrationCfg.Enabled {
+		if _, err := config.LoadCrypto(); err != nil {
+			return err
+		}
+	}
+	if registrationCfg.Enabled {
+		if _, err := config.LoadRegistrationCleanup(); err != nil {
+			return err
+		}
+	}
+	if hasDB {
+		if _, err := config.LoadEnvelopeCrypto(); err != nil {
+			return err
+		}
+		if _, err := config.LoadRecovery(); err != nil {
+			return err
+		}
+		if _, err := config.LoadStepUp(cfg.Environment); err != nil {
+			return err
+		}
+	}
+	if os.Getenv(config.EnvBlindIndexPepper) != "" {
+		if _, err := config.LoadBlindIndexPepper(); err != nil {
+			return err
+		}
+		if _, err := config.LoadBlindIndexPepperVersion(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shutdownServers(ctx context.Context, httpServer *server.Server, grpcServer *privateGRPC) error {
@@ -407,6 +470,7 @@ func buildKeyManager(cfg config.OIDCConfig, environment string, logger *slog.Log
 // handing out the same instance is what keeps that revocation effective; building a
 // second store for the privacy service would revoke tokens nobody holds.
 func buildTokenService(
+	environment string,
 	oidcCfg config.OIDCConfig,
 	keyManager *keys.Manager,
 	clientRegistry *clients.StaticRegistry,
@@ -416,8 +480,21 @@ func buildTokenService(
 	redisClient *redis.Client,
 	revokeUser func(context.Context, string) error,
 ) (*token.Service, token.RefreshTokenStore, error) {
+	if err := config.ValidateEnvironment(environment); err != nil {
+		return nil, nil, err
+	}
+	var replay clientauth.JTIReplayGuard = clientauth.NewMemoryJTIGuard()
+	if redisClient != nil {
+		shared, err := clientauth.NewRedisJTIGuard(redisClient)
+		if err != nil {
+			return nil, nil, err
+		}
+		replay = shared
+	} else if environment != "development" {
+		return nil, nil, errors.New("main: shared Redis token authority is required outside development")
+	}
 	tokenEndpoint := oidcCfg.Issuer + "/oauth2/token"
-	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, clientauth.NewMemoryJTIGuard())
+	authenticator, err := clientauth.New(clientRegistry, tokenEndpoint, replay)
 	if err != nil {
 		return nil, nil, fmt.Errorf("main: build client authenticator: %w", err)
 	}
@@ -452,7 +529,13 @@ func buildTokenService(
 
 // buildDPoPValidator shares replay and nonce authority across HTTP and gRPC.
 // Memory stores are used only for development without Redis and without gRPC.
-func buildDPoPValidator(redisClient *redis.Client) (*dpop.Validator, error) {
+func buildDPoPValidator(environment string, redisClient *redis.Client) (*dpop.Validator, error) {
+	if err := config.ValidateEnvironment(environment); err != nil {
+		return nil, err
+	}
+	if redisClient == nil && environment != "development" {
+		return nil, errors.New("main: shared Redis DPoP authority is required outside development")
+	}
 	var replay dpop.ReplayGuard = dpop.NewMemoryReplayGuard()
 	var nonces dpop.NonceStore = dpop.NewMemoryNonceStore()
 	var err error
@@ -479,7 +562,13 @@ func buildDPoPValidator(redisClient *redis.Client) (*dpop.Validator, error) {
 // name/Secure and the two TTLs) is loaded from the environment; the
 // __Host-/Secure invariant is enforced inside NewCookieCodec so a misconfigured
 // dev override fails fast at startup.
-func buildSessionManager(accounts session.AccountState, redisClient *redis.Client) (*session.Manager, error) {
+func buildSessionManager(environment string, accounts session.AccountState, redisClient *redis.Client) (*session.Manager, error) {
+	if err := config.ValidateEnvironment(environment); err != nil {
+		return nil, err
+	}
+	if redisClient == nil && environment != "development" {
+		return nil, errors.New("main: shared Redis session authority is required outside development")
+	}
 	sc, err := config.LoadSession()
 	if err != nil {
 		return nil, err
@@ -639,31 +728,32 @@ func buildRedisClient(environment string, logger *slog.Logger) (*redis.Client, e
 	return client, nil
 }
 
-// buildSMSOTPService assembles the SMS OTP phone-verification service (Task
-// 4.5). It needs both a database (to persist the verified, envelope-encrypted
-// phone and its blind index) and Redis (for the independent-dimension sliding
-// window rate limits and the pending-code / lockout store), plus the crypto
-// module secrets.
-//
-// When either backing store is absent — which only happens in development,
-// since buildWebAuthnService/buildRedisClient already make them mandatory
-// elsewhere — the service is skipped (nil return) and its routes are left
-// unmounted, matching the WebAuthn precedent. In development the log-only
-// sender is used so no real SMS gateway credential is required.
+// Disabled delivery retains fenced phone removal without gateway or OTP secrets.
+// Enabling delivery requires real SMS.ir, encryption and shared OTP/rate authority.
 func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *redis.Client, logger *slog.Logger) (*smsotp.Service, error) {
-	if pool == nil || redisClient == nil {
-		logger.Warn("SMS OTP service disabled (requires both DATABASE_URL and REDIS_URL)")
-		return nil, nil
-	}
-
 	smsCfg, err := config.LoadSMS(environment)
 	if err != nil {
 		return nil, err
 	}
-
-	if os.Getenv(config.EnvBlindIndexPepper) == "" {
-		logger.Warn("SMS OTP service disabled (requires ENVELOPE_BLIND_INDEX_PEPPER)")
+	if pool == nil {
+		if smsCfg.Enabled {
+			return nil, errors.New("main: enabled SMS requires DATABASE_URL")
+		}
 		return nil, nil
+	}
+	users, err := smsotp.NewUserStore(pool)
+	if err != nil {
+		return nil, err
+	}
+	if !smsCfg.Enabled {
+		return smsotp.NewDisabled(users)
+	}
+	if redisClient == nil {
+		return nil, errors.New("main: enabled SMS requires REDIS_URL")
+	}
+	registrationCfg, err := config.LoadRegistration(environment)
+	if err != nil {
+		return nil, err
 	}
 
 	cryptoCfg, err := config.LoadCrypto()
@@ -693,9 +783,12 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		return nil, fmt.Errorf("main: build OTP store: %w", err)
 	}
 
-	// Development uses the log-only sender (no real gateway/toll cost). A real
-	// gateway client is wired here in production once the provider is chosen.
-	sender := smsotp.NewLogSender(logger)
+	sender, err := smsir.New(smsir.Config{
+		APIKey: smsCfg.GatewayAPIKey, TemplateID: smsCfg.TemplateID, CodeParameter: smsCfg.CodeParameter,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
 		CodeTTL:           smsCfg.CodeTTL,
@@ -705,7 +798,10 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		PerPhonePerHour:   smsCfg.PerPhonePerHour,
 		PerSubnetPerHour:  smsCfg.PerSubnetPerHour,
 		HashPepper:        smsCfg.HashPepper,
-	}, db.New(pool), encryptor, indexer, limiter, otpStore, sender)
+		SignupEnabled:     registrationCfg.Enabled,
+		GlobalPerDay:      smsCfg.GlobalPerDay,
+		MaxPendingSignup:  smsCfg.MaxPendingSignup,
+	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)
 	}
@@ -1041,6 +1137,18 @@ func buildPrivacyService(
 		slog.Bool("rate_limited", redisClient != nil),
 	)
 	return svc, pc.DeletionEnabled, nil
+}
+
+func buildAuditIndexer() (*blindindex.Indexer, error) {
+	pepper, err := config.LoadBlindIndexPepper()
+	if err != nil {
+		return nil, err
+	}
+	version, err := config.LoadBlindIndexPepperVersion()
+	if err != nil {
+		return nil, err
+	}
+	return blindindex.New(pepper, version)
 }
 
 // buildAuditRecorder assembles the audit transport shared by the HTTP handlers and

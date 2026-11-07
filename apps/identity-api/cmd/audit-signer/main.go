@@ -60,6 +60,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -109,12 +110,16 @@ func main() {
 // run wires the worker and drains until signalled. It is separated from main so it
 // can return errors instead of calling os.Exit directly.
 func run(logger *slog.Logger) error {
-	cfg, err := config.Load()
+	return runWithPoolOpener(logger, openPool)
+}
+
+func runWithPoolOpener(logger *slog.Logger, open func(context.Context, string) (*pgxpool.Pool, error)) error {
+	environment, err := config.LoadEnvironment()
 	if err != nil {
 		return err
 	}
 
-	auditCfg, err := config.LoadAudit(cfg.Environment)
+	auditCfg, err := config.LoadAudit(environment)
 	if err != nil {
 		return err
 	}
@@ -125,7 +130,7 @@ func run(logger *slog.Logger) error {
 		return errors.New("audit-signer: NATS_URL is required")
 	}
 
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
 		return errors.New("audit-signer: DATABASE_URL is required")
 	}
@@ -136,7 +141,7 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := openPool(ctx, dsn)
+	pool, err := open(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -195,7 +200,7 @@ func run(logger *slog.Logger) error {
 		signer.WithLogger(logger),
 		signer.WithAdvisoryLocker(locker),
 	}
-	if indexer, ok := buildBlindIndexer(cfg.Environment, logger); ok {
+	if indexer, ok := buildBlindIndexer(environment, logger); ok {
 		opts = append(opts, signer.WithBlindIndexer(indexer))
 	}
 
@@ -209,7 +214,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info("audit signer starting",
-		slog.String("env", cfg.Environment),
+		slog.String("env", environment),
 		slog.String("stream", auditCfg.StreamName),
 		slog.String("subject", auditCfg.Subject),
 		slog.String("consumer", auditCfg.ConsumerName),
@@ -241,6 +246,10 @@ func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	if err := pool.Ping(connectCtx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := signer.ProbePrivileges(connectCtx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}

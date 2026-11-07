@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"time"
 
@@ -29,7 +30,8 @@ type Store interface {
 	ObserveLegalSubject(context.Context, uuid.UUID) (db.ObserveLegalSubjectRow, error)
 	LookupLegalAttribution(context.Context, db.LookupLegalAttributionParams) ([]db.LookupLegalAttributionRow, error)
 	LegalAttributionHighWater(context.Context) (int64, error)
-	CountUnencryptedLegalHolds(context.Context) (int64, error)
+	CountInvalidLegalHolds(context.Context) (int64, error)
+	GetLegalHoldSchema(context.Context) (db.GetLegalHoldSchemaRow, error)
 }
 
 // Encryptor is implemented by the existing envelope Encryptor. Record identity
@@ -39,8 +41,11 @@ type Encryptor interface {
 	Decrypt(context.Context, []byte) ([]byte, error)
 }
 
-// BlindIndexer uses the existing shared normalization and HMAC key.
-type BlindIndexer interface{ Compute(string) string }
+// BlindIndexer separates canonical email identity from generic normalization.
+type BlindIndexer interface {
+	Compute(string) string
+	ComputeEmail(string) (string, error)
+}
 
 // Legal request kinds and input bounds form the persisted API contract.
 const (
@@ -111,23 +116,59 @@ func (s *Service) LookupEnabled() bool {
 	return s.IntakeEnabled() && s.indexer != nil && s.lookupVerified
 }
 
-// CheckCrypto fails readiness on inaccessible keys or legacy plaintext. Run the
-// controlled Backfill first; no runtime path falls back to reading plaintext.
+// CheckCrypto requires final constrained storage and accessible, row-bound keys.
+// No runtime path reads plaintext columns or repairs invalid retained records.
 func (s *Service) CheckCrypto(ctx context.Context) error {
+	if !s.CryptoReady() || s.store == nil {
+		return ErrUnavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := legalHoldSchema(ctx, s.store); err != nil {
+		return err
+	}
 	probe := []byte(uuid.NewString())
 	enc, err := s.encryptor.Encrypt(ctx, probe)
 	if err != nil {
 		return ErrUnavailable
 	}
 	dec, err := s.encryptor.Decrypt(ctx, enc)
+	defer clear(dec)
+	defer clear(probe)
 	if err != nil || string(dec) != string(probe) {
 		return ErrUnavailable
 	}
-	n, err := s.store.CountUnencryptedLegalHolds(ctx)
+	n, err := s.store.CountInvalidLegalHolds(ctx)
 	if err != nil || n != 0 {
-		return ErrBackfillRequired
+		return ErrUnavailable
 	}
-	return nil
+	// A freshly encrypted probe alone cannot detect inaccessible old key
+	// generations or ciphertext transplanted between existing rows.
+	for offset := int32(0); ; {
+		page, err := s.store.ListLegalHolds(ctx, db.ListLegalHoldsParams{Status: "all", PageLimit: 200, PageOffset: offset})
+		if err != nil {
+			return ErrUnavailable
+		}
+		var rows []db.LegalHold
+		if json.Unmarshal(page.Items, &rows) != nil {
+			return ErrUnavailable
+		}
+		for _, row := range rows {
+			if _, err := s.openHold(ctx, row); err != nil {
+				return err
+			}
+			if offset == math.MaxInt32 {
+				return ErrUnavailable
+			}
+			offset++
+		}
+		if int64(offset) >= page.Total {
+			return nil
+		}
+		if len(rows) == 0 {
+			return ErrUnavailable
+		}
+	}
 }
 
 // queries never falls back to pool-bound queries in production. The request
@@ -281,11 +322,11 @@ func (s *Service) seal(ctx context.Context, details Details) ([]byte, error) {
 
 func (s *Service) openHold(ctx context.Context, row db.LegalHold) (Hold, error) {
 	h := Hold{Record: row, DetailsPurged: row.DetailsPurgedAt.Valid}
-	if row.Reason != nil || row.RequestingAuthority != nil || row.LegalBasis != nil {
-		return Hold{}, ErrBackfillRequired
-	}
-	if h.DetailsPurged && !row.IsActive && len(row.DetailsEncrypted) == 0 {
+	if h.DetailsPurged && !row.IsActive && row.ReleasedAt.Valid && row.DetailsEncrypted == nil {
 		return h, nil
+	}
+	if h.DetailsPurged || len(row.DetailsEncrypted) == 0 {
+		return Hold{}, ErrUnavailable
 	}
 	plain, err := s.encryptor.Decrypt(ctx, row.DetailsEncrypted)
 	if err != nil {

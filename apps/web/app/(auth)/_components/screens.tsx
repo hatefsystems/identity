@@ -2,23 +2,18 @@
 
 import { useTranslations } from 'next-intl';
 
-import {
-  ForgotPasswordForm,
-  LoginForm,
-  RegistrationForm,
-  ResetPasswordForm,
-  TotpForm,
-} from './forms';
+import { ForgotPasswordForm, LoginForm, ResetPasswordForm, TotpForm } from './forms';
 import { PasskeyLogin } from '../../_components/passkey-login';
+import { Registration } from '../../_components/registration';
 
-// Only passkey sign-in is live. Other Task 7.2 forms remain disconnected.
+// Password and reset forms remain unavailable; signup is passkey-only.
 export function LoginScreen() {
   const t = useTranslations();
   return <LoginForm passkeyAction={<PasskeyLogin label={t('auth.passkey.continue')} />} />;
 }
 
 export function RegistrationScreen() {
-  return <RegistrationForm />;
+  return <Registration />;
 }
 
 export function PasskeyScreen() {
