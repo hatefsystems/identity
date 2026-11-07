@@ -4,11 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { portalCleanup } from './portal-harness.mjs';
 
 function docker(args, allowFailure = false) {
   const result = spawnSync('docker', args, {
     encoding: 'utf8',
-    timeout: 45_000,
+    timeout: 15_000,
     maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error) throw result.error;
@@ -246,134 +247,112 @@ export async function smokeImage(kind, reference, validateWeb) {
   assert.equal(image.Architecture, 'amd64');
   const imageID = image.Id;
 
-  if (kind === 'api') {
-    assert.equal(image.Config.User, 'nonroot:nonroot');
-    for (const binary of maintenanceEntrypoints) {
-      const name = `ci-api-${randomUUID()}`;
+  const disposers = [];
+  const close = portalCleanup(disposers);
+  let interrupted = false;
+  const onSignal = () => { interrupted = true; };
+  for (const event of ['SIGINT', 'SIGTERM']) process.on(event, onSignal);
+  const create = (args) => {
+    // Acquire immutable ownership before a start/attach can fail. A collision
+    // never registers a disposer and cannot authorize deleting another container.
+    const id = docker(['create', '--name', `ci-${kind}-${randomUUID()}`, '--pull', 'never', ...args]).stdout.trim();
+    assert.match(id, /^[a-f0-9]{64}$/, 'Missing immutable smoke container identity');
+    disposers.push(() => {
+      try { docker(['rm', '--force', '--volumes', id]); } catch { /* Verify daemon-side absence even after a client timeout. */ }
+      const remaining = docker(['ps', '--all', '--quiet', '--no-trunc']).stdout.trim().split(/\s+/);
+      assert(!remaining.includes(id), 'Smoke container survived cleanup');
+    });
+    return id;
+  };
+  try {
+    if (kind === 'api') {
+      assert.equal(image.Config.User, 'nonroot:nonroot');
+      for (const binary of maintenanceEntrypoints) {
+        await setTimeout(0);
+        assert(!interrupted, 'Image smoke interrupted');
+        const id = create(['--network', 'none', '--env', 'APP_ENV=production',
+          '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);
+        const result = docker(['start', '--attach', id], true);
+        assert(maintenanceSucceeded(result, binary), `${binary} must reject missing production configuration with exit 1`);
+      }
+    } else {
+      const uidID = create(['--network', 'none', '--entrypoint', 'node', imageID, '-p', 'process.getuid()']);
+      const uid = docker(['start', '--attach', uidID]).stdout.trim();
+      assert(/^\d+$/.test(uid) && Number(uid) !== 0, 'Web image must run as a non-root UID');
+      const name = create(['--publish', '127.0.0.1::3000', imageID]);
       try {
-        const result = docker(
-          [
-            'run',
-            '--name',
-            name,
-            '--pull',
-            'never',
-            '--network',
-            'none',
-            '--env',
-            'APP_ENV=production',
-            '--entrypoint',
-            `/usr/local/bin/${binary}`,
-            imageID,
-            ...(binary === 'migrate' ? ['status'] : []),
-          ],
-          true
-        );
-        assert(
-          maintenanceSucceeded(result, binary),
-          `${binary} must reject missing production configuration with exit 1: ${result.stdout}${result.stderr}`
-        );
-      } finally {
-        docker(['rm', '--force', name], true);
-      }
-    }
-  } else {
-    const uid = docker([
-      'run',
-      '--rm',
-      '--pull',
-      'never',
-      '--network',
-      'none',
-      '--entrypoint',
-      'node',
-      imageID,
-      '-p',
-      'process.getuid()',
-    ]).stdout.trim();
-    assert(/^\d+$/.test(uid) && Number(uid) !== 0, 'Web image must run as a non-root UID');
-    const name = `ci-web-${randomUUID()}`;
-    try {
-      docker([
-        'run',
-        '--detach',
-        '--name',
-        name,
-        '--pull',
-        'never',
-        '--publish',
-        '127.0.0.1::3000',
-        imageID,
-      ]);
-      const [container] = JSON.parse(docker(['inspect', name]).stdout);
-      const [port] = container.NetworkSettings.Ports['3000/tcp'];
-      assert.equal(port.HostIp, '127.0.0.1');
-      const base = `http://127.0.0.1:${port.HostPort}`;
-      const request = (path) =>
-        fetch(base + path, { redirect: 'error', signal: AbortSignal.timeout(5_000) });
-      const deadline = Date.now() + 60_000;
-      let html;
-      let landingResponse;
-      let lastError;
-      while (Date.now() < deadline) {
-        try {
-          const response = await request('/');
-          assert.equal(response.status, 200, 'Landing page HTTP status');
-          html = await response.text();
-          landingResponse = response;
-          break;
-        } catch (error) {
-          lastError = error;
-          await setTimeout(250);
+        docker(['start', name]);
+        const [container] = JSON.parse(docker(['inspect', name]).stdout);
+        const [port] = container.NetworkSettings.Ports['3000/tcp'];
+        assert.equal(port.HostIp, '127.0.0.1');
+        const base = `http://127.0.0.1:${port.HostPort}`;
+        const request = (path) =>
+          fetch(base + path, { redirect: 'error', signal: AbortSignal.timeout(5_000) });
+        const deadline = Date.now() + 60_000;
+        let html;
+        let landingResponse;
+        let lastError;
+        while (Date.now() < deadline) {
+          assert(!interrupted, 'Image smoke interrupted');
+          try {
+            const response = await request('/');
+            assert.equal(response.status, 200, 'Landing page HTTP status');
+            html = await response.text();
+            landingResponse = response;
+            break;
+          } catch (error) {
+            lastError = error;
+            await setTimeout(250);
+          }
         }
-      }
-      assert(html, `Web startup timed out: ${lastError}`);
-      assert.match(html, /<h1\b[^>]*>Hatef Identity Platform<\/h1>/);
-      const seenNonces = new Set();
-      webDocumentNonce(landingResponse.headers, html, seenNonces);
-      const assets = new Set(staticAssets(html));
-      const notFoundPaths = [`/__csp-smoke-${randomUUID()}`, `/__csp-smoke-${randomUUID()}.html`];
-      for (const path of ['/', ...notFoundPaths, ...notFoundPaths]) {
-        const response = await request(path);
-        assert.equal(response.status, path === '/' ? 200 : 404, `${path} HTTP status`);
-        const document = await response.text();
-        webDocumentNonce(response.headers, document, seenNonces);
-        assert.match(
-          document,
-          path === '/'
-            ? /<h1\b[^>]*>Hatef Identity Platform<\/h1>/
-            : /<h1\b[^>]*>Page not found<\/h1>/
+        assert(html, `Web startup timed out: ${lastError}`);
+        assert.match(html, /<h1\b[^>]*>Hatef Identity Platform<\/h1>/);
+        const seenNonces = new Set();
+        webDocumentNonce(landingResponse.headers, html, seenNonces);
+        const assets = new Set(staticAssets(html));
+        const notFoundPaths = [`/__csp-smoke-${randomUUID()}`, `/__csp-smoke-${randomUUID()}.html`];
+        for (const path of ['/', ...notFoundPaths, ...notFoundPaths]) {
+          const response = await request(path);
+          assert.equal(response.status, path === '/' ? 200 : 404, `${path} HTTP status`);
+          const document = await response.text();
+          webDocumentNonce(response.headers, document, seenNonces);
+          assert.match(
+            document,
+            path === '/'
+              ? /<h1\b[^>]*>Hatef Identity Platform<\/h1>/
+              : /<h1\b[^>]*>Page not found<\/h1>/
+          );
+          for (const asset of staticAssets(document)) assets.add(asset);
+        }
+        for (const path of ['/favicon.ico', ...assets]) {
+          const response = await request(path);
+          assert.equal(response.status, 200, `${path} HTTP status`);
+          assertStaticAssetHeaders(response.headers, path);
+          const contentType = response.headers.get('content-type') || '';
+          const pathname = new URL(path, base).pathname;
+          if (pathname.endsWith('.css')) assert.match(contentType, /text\/css/);
+          if (pathname.endsWith('.js')) assert.match(contentType, /(?:java|ecma)script/);
+          if (pathname.endsWith('.ico')) assert.match(contentType, /image\//);
+          assert((await response.arrayBuffer()).byteLength > 0, `${path} is empty`);
+        }
+        if (validateWeb) await validateWeb({ baseURL: base, notFoundPaths });
+        docker(['stop', '--time', '10', name]);
+        const [stopped] = JSON.parse(docker(['inspect', name]).stdout);
+        assert.equal(stopped.State.Running, false);
+        assert.equal(stopped.State.OOMKilled, false);
+        assert(
+          [0, 143].includes(stopped.State.ExitCode),
+          `Web did not stop gracefully: ${stopped.State.ExitCode}`
         );
-        for (const asset of staticAssets(document)) assets.add(asset);
+      } catch (error) {
+        throw new Error('Web smoke validation failed; private diagnostics suppressed', { cause: error });
       }
-      for (const path of ['/favicon.ico', ...assets]) {
-        const response = await request(path);
-        assert.equal(response.status, 200, `${path} HTTP status`);
-        assertStaticAssetHeaders(response.headers, path);
-        const contentType = response.headers.get('content-type') || '';
-        const pathname = new URL(path, base).pathname;
-        if (pathname.endsWith('.css')) assert.match(contentType, /text\/css/);
-        if (pathname.endsWith('.js')) assert.match(contentType, /(?:java|ecma)script/);
-        if (pathname.endsWith('.ico')) assert.match(contentType, /image\//);
-        assert((await response.arrayBuffer()).byteLength > 0, `${path} is empty`);
-      }
-      if (validateWeb) await validateWeb({ baseURL: base, notFoundPaths });
-      docker(['stop', '--time', '10', name]);
-      const [stopped] = JSON.parse(docker(['inspect', name]).stdout);
-      assert.equal(stopped.State.Running, false);
-      assert.equal(stopped.State.OOMKilled, false);
-      assert(
-        [0, 143].includes(stopped.State.ExitCode),
-        `Web did not stop gracefully: ${stopped.State.ExitCode}`
-      );
-    } catch (error) {
-      const logs = docker(['logs', name], true);
-      console.error(logs.stdout + logs.stderr);
-      throw error;
-    } finally {
-      docker(['rm', '--force', name], true);
     }
+  } finally {
+    try { await close(); }
+    finally { for (const event of ['SIGINT', 'SIGTERM']) process.removeListener(event, onSignal); }
   }
+  assert(!interrupted, 'Image smoke interrupted');
   console.log(`${kind} image smoke checks passed: ${reference}`);
 }
 

@@ -70,14 +70,15 @@ jobs:
       - name: Check generated-code reproducibility
         shell: bash
         run: |
+          npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           snapshot=$(mktemp -d)
           cp -R apps/identity-api/internal/db "$snapshot/db"
-          cp -R libs/schemas/gen/go "$snapshot/schema-go"
-          npm exec -- nx run schemas:generate-go --skipNxCache
+          cp -R libs/schemas/gen "$snapshot/schemas"
+          npm exec -- nx run schemas:generate --skipNxCache
           npm exec -- nx run identity-api:sqlc-generate --skipNxCache
           diff -ru "$snapshot/db" apps/identity-api/internal/db
-          diff -ru "$snapshot/schema-go" libs/schemas/gen/go
+          diff -ru "$snapshot/schemas" libs/schemas/gen
 
       - name: Run fresh tests
         run: npm exec -- nx run identity-api:test --skipNxCache
@@ -129,11 +130,9 @@ jobs:
         run: node .github/scripts/smoke-image.mjs api identity-api:ci
 
       - name: Export tested backend release image
-        if: steps.image.outputs.release == 'true'
-        run: node .github/scripts/release-images.mjs export api identity-api:ci "$RUNNER_TEMP/release-api"
+        run: node .github/scripts/release-images.mjs export-candidate api identity-api:ci "$RUNNER_TEMP/release-api"
 
       - name: Upload tested backend release image
-        if: steps.image.outputs.release == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-api
@@ -143,55 +142,25 @@ jobs:
           compression-level: 1
           overwrite: true
 
-  security-db:
-    name: PostgreSQL security integration tests
+  security-db-cells:
+    name: security-db (${{ matrix.cell }})
     runs-on: ubuntu-24.04
-    # Includes the serial legal-workflow and real-role suites; local runs of the
-    # complete sequence exceed the former 20-minute budget.
     timeout-minutes: 60
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: identity
-          POSTGRES_PASSWORD: identity_test_password
-          POSTGRES_DB: identity
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U identity -d identity"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: postgres://identity:identity_test_password@127.0.0.1:5432/identity?sslmode=disable
-      REDIS_URL: redis://127.0.0.1:6379/0
-      NATS_URL: nats://127.0.0.1:4222
-
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        cell: [test-security-db, test-admin-integration, test-retention-integration, test-legal-workflow-integration, test-grpc-integration, test-lifecycle-integration, test-portal-integration]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
-
       - name: Set up Go 1.26
         uses: actions/setup-go@v7
         with:
@@ -199,62 +168,157 @@ jobs:
           cache-dependency-path: |
             apps/identity-api/go.sum
             libs/schemas/go.sum
-
-      - name: Set up npm 11 and workspace dependencies
+      - name: Install workspace dependencies
         run: |
           npm install --global npm@11.21.0
-          npm --version
           npm ci
-
-      - name: Start disposable NATS JetStream
-        run: |
-          docker run --detach --name admin-test-nats --label ldp.task=6.3 \
-            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
-            nats:2.10-alpine -js -sd /data -m 8222
-          curl --fail --silent --show-error --retry 30 --retry-delay 1 \
-            --retry-connrefused --max-time 2 --retry-max-time 60 \
-            'http://127.0.0.1:8222/healthz?js-enabled-only=true'
-
-      - name: Run serial database security tests
-        run: npm exec -- nx run identity-api:test-security-db --skipNxCache
-
-      - name: Run mandatory admin and audit integration tests
-        run: npm exec -- nx run identity-api:test-admin-integration --skipNxCache
-
-      # Serial with the other suites: migration fixtures reset the shared schema.
-      - name: Run mandatory retention and real-role integration tests
-        run: npm exec -- nx run identity-api:test-retention-integration --skipNxCache
-
-      - name: Run mandatory legal workflow and transparency integration tests
-        run: npm exec -- nx run identity-api:test-legal-workflow-integration --skipNxCache
-
-      - name: Run mandatory gRPC and shared-credential integration tests
-        run: npm exec -- nx run identity-api:test-grpc-integration --skipNxCache
-
-      - name: Run mandatory lifecycle broadcast integration tests
+      - name: Generate complete candidate schemas
+        run: npm exec -- nx run schemas:generate --skipNxCache
+      - name: Run bounded owned-service acceptance
         env:
-          LIFECYCLE_TEST_NATS_CONTAINER: admin-test-nats
-        run: npm exec -- nx run identity-api:test-lifecycle-integration --skipNxCache
-
-      # Serial: existing database fixtures reset schema and exercise NATS outages.
-      - name: Run mandatory portal profile and real-Redis integration tests
-        env:
-          LIFECYCLE_TEST_NATS_CONTAINER: admin-test-nats
-        run: npm exec -- nx run identity-api:test-portal-integration --skipNxCache
-
-      - name: Collect disposable service diagnostics
-        if: failure()
-        env:
-          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
-          REDIS_CONTAINER: ${{ job.services.redis.id }}
-        run: |
-          docker logs "$POSTGRES_CONTAINER" || true
-          docker logs "$REDIS_CONTAINER" || true
-          docker logs admin-test-nats || true
-
-      - name: Remove disposable NATS container
+          ACCEPTANCE_REPORT_DIR: ${{ runner.temp }}/acceptance
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-target=${{ matrix.cell }}
+      - name: Upload sanitized acceptance evidence
         if: always()
-        run: docker rm --force admin-test-nats || true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-db-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/acceptance/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  security-db:
+    name: Complete security-db release gate
+    needs: [security-db-cells]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+      - name: Install workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+      - name: Download all cell reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: security-db-*
+          path: ${{ runner.temp }}/acceptance
+          merge-multiple: true
+      - name: Regenerate exact candidate artifacts
+        run: |
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+      - name: Require every cell and matching final source
+        env:
+          CELL_RESULT: ${{ needs.security-db-cells.result }}
+        run: |
+          test "$CELL_RESULT" = success
+          npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --aggregate-service "$RUNNER_TEMP/acceptance"
+
+  security-race-cells:
+    name: security-race (${{ matrix.cell }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        cell: [recovery, mfa, oidc/clientauth, adminaction, smsotp, registration, audit/signer]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+      - name: Install workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+      - name: Generate complete candidate schemas
+        run: npm exec -- nx run schemas:generate --skipNxCache
+      - name: Run bounded owned-service acceptance
+        env:
+          ACCEPTANCE_REPORT_DIR: ${{ runner.temp }}/acceptance
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/${{ matrix.cell }}
+      - name: Upload sanitized acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-race-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/acceptance/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  security-race:
+    name: Complete security-race release gate
+    needs: [security-race-cells]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+      - name: Install workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+      - name: Download all cell reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: security-race-*
+          path: ${{ runner.temp }}/acceptance
+          merge-multiple: true
+      - name: Regenerate exact candidate artifacts
+        run: |
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+      - name: Require every cell and matching final source
+        env:
+          CELL_RESULT: ${{ needs.security-race-cells.result }}
+        run: |
+          test "$CELL_RESULT" = success
+          npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/portal-harness.mjs" --aggregate-race "$RUNNER_TEMP/acceptance"
 
   frontend:
     name: Frontend checks and build
@@ -287,7 +351,7 @@ jobs:
         run: npm exec -- nx exec -p schemas -- node --test "$GITHUB_WORKSPACE"/.github/scripts/*.test.mjs
 
       - name: Lint web and shared UI
-        run: npm exec -- nx run-many -t lint -p web,ui --skipNxCache
+        run: npm exec -- nx run-many -t lint -p web,ui --skipNxCache --args='--max-warnings=0'
 
       - name: Type-check shared UI
         run: npm exec -- nx run ui:typecheck --skipNxCache
@@ -323,7 +387,7 @@ jobs:
       - name: Smoke-test standalone web image and browser CSP
         env:
           WEB_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/auth-browser-evidence
-        run: npm exec -- nx exec -p web -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/.github/scripts/web-csp.browser.mjs" identity-web:ci
 
       - name: Upload masked public and auth browser evidence
         if: always()
@@ -478,9 +542,47 @@ jobs:
           retention-days: 7
           overwrite: true
 
+  registration-browser:
+    name: Registration production browser prerequisite gate
+    needs: [quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+      - name: Install workspace dependencies
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+      - name: Download the quality-tested API candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: release-api
+          path: ${{ runner.temp }}/release-api
+      - name: Generate the candidate schema for identity verification
+        run: |
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+      - name: Check public enrollment acceptance prerequisites
+        run: node .github/scripts/registration-browser.mjs "$RUNNER_TEMP/release-api"
+
   publish:
     name: Publish release images
-    needs: [quality, security-db, frontend, portal-browser, admin-browser]
+    needs: [quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser]
     if: >-
       github.repository == 'hatefsystems/identity' &&
       github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

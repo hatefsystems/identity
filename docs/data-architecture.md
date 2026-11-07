@@ -330,10 +330,10 @@ To comply with high-security privacy directives, Personal Identifiable Informati
 
 ```
                            +--------------------------------------+
-                           |          Infisical (KMS)             |
+                           |          Environment-injected key custody             |
                            +--------------------------------------+
                                               |
-                                              | Retrieves master KEK (Key Encryption Key)
+                                              | Loads one master KEK/version at startup
                                               v
 +------------------+       +--------------------------------------+
 | Plaintext PII    | ----> |       Go Application Layer           |
@@ -370,7 +370,7 @@ Each encrypted record has a composite structure serialized into a binary payload
 1. **Version (1 byte):** Enables key rotation and cryptopackage schema upgrades.
 2. **DEK-Wrap Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for wrapping the DEK with the Master KEK.
 3. **PII-Enc Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for encrypting the PII with the local DEK.
-4. **Encrypted DEK:** The Data Encryption Key (DEK) used to encrypt the payload, wrapped by the Master Key Encryption Key (KEK) fetched from Infisical.
+4. **Encrypted DEK:** The Data Encryption Key (DEK) used to encrypt the payload, wrapped by the Master Key Encryption Key (KEK) loaded from the environment.
 5. **Encrypted Ciphertext:** The GCM-authenticated ciphertext of the PII value.
 
 ### 2.2 Cryptographic Blind Indexes for Secure Exact-Match Searches
@@ -382,7 +382,7 @@ $$\text{blind\_index} = \text{HMAC-SHA256}_{\text{secret\_pepper}}(\text{lowerca
 This is the existing server-side keyed construction, not plain concatenation or anonymous data. Legal email attribution uses the same normalization; callers must not introduce provider-specific normalization or send the digest/pepper material to the browser. This documentation does not add phone attribution or historical multi-pepper search.
 
 - **Uniqueness & Indexing:** Blind indexes are stored in separate database columns (`phone_blind_index`, `backup_email_blind_index`) and indexed via B-tree. This enables $O(1)$ fast lookups without revealing plain text.
-- **Salt/Pepper Management:** The secret pepper is retrieved dynamically at application bootstrap from Infisical and kept strictly in memory. Non-exact queries (such as wildcards or substring matches) on PII columns are prohibited to ensure data minimization.
+- **Salt/Pepper Management:** One secret pepper/version is loaded from the environment at bootstrap and kept in process memory; dynamic retrieval and historical-generation lookup are not implemented. Non-exact queries (such as wildcards or substring matches) on PII columns are prohibited to ensure data minimization.
 
 ---
 

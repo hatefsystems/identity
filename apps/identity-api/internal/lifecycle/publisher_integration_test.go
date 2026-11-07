@@ -489,6 +489,9 @@ func TestLifecycleLegacyMalformedAndAdminIsolationIntegration(t *testing.T) {
 func TestLifecycleFileStorageBrokerRestartIntegration(t *testing.T) {
 	container := strings.TrimSpace(os.Getenv("LIFECYCLE_TEST_NATS_CONTAINER"))
 	if container == "" {
+		if os.Getenv("REQUIRE_LIFECYCLE_INTEGRATION") == "1" {
+			t.Fatal("mandatory lifecycle acceptance requires a restartable owned NATS container")
+		}
 		t.Skip("explicit labeled disposable broker restart is not configured")
 	}
 	if container != "ldp-task63-nats" && container != "admin-test-nats" {

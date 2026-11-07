@@ -78,6 +78,14 @@
           }
         ],
         "cache": false
+      },
+      "test-registration-browser": {
+        "dependsOn": [
+          "build"
+        ],
+        "cache": false,
+        "parallelism": false,
+        "command": "node .github/scripts/registration-browser.mjs"
       }
     }
   },

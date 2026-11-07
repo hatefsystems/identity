@@ -1,5 +1,7 @@
 # Hatef Identity Platform - Frontend Pages Structure
 
+The register/password/reset forms remain unavailable. Existing passkey login and authenticated enrollment are implemented; public account creation is not. The planned Unicode signup UI and fragment proof page are not shipped. Never infer account creation from a disabled form, localized message or page existence. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
+
 This document outlines the routing architecture for the Next.js frontend application within the `hatefsystems/identity` monorepo. The application utilizes the **Next.js App Router (`app/` directory)** and relies on **shadcn/ui** for its component system.
 
 ## Localization

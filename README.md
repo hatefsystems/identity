@@ -20,7 +20,7 @@ LDP is architected as a decentralized, highly scalable client-agnostic system co
 * **Mutual TLS (mTLS) with SPIFFE/SPIRE:** Dynamic, certificate-less service-to-service communication within the microservices grid, with method-level gRPC RBAC verified via SAN checks.
 * **OAuth 2.1 & OpenID Connect Compliance:** Enforces Proof Key for Code Exchange (PKCE S256), Refresh Token Rotation (RTR), and sender-constrained access tokens via **DPoP (RFC 9449)**.
 * **Phishing-Resistant Passwordless (WebAuthn / FIDO2):** Primary secure path using passkeys, platform authenticators, and discoverable credentials.
-* **Advanced Cryptography:** NIST-compliant Argon2id password hashing, AES-GCM-256 Application-Layer Envelope Encryption for sensitive PII (via Infisical KMS), and SHA-256 for database-indexed recovery codes to prevent CPU DoS.
+* **Advanced Cryptography:** NIST-compliant Argon2id password hashing, AES-GCM-256 Application-Layer Envelope Encryption for sensitive PII (environment-injected local key custody), and SHA-256 for database-indexed recovery codes to prevent CPU DoS.
 * **Restricted Recovery:** A backup code is physically deleted in the same ACID transaction that verifies it and yields only a ten-minute `recovery_enrollment` session, limited to one UV-required replacement passkey before normal login.
 * **Single-Use Step-up Authorization:** High-risk factor and contact operations consume short-lived ACR grants bound to the authenticated session. Redis enforces replay claims cluster-wide under opaque HMAC-derived keys.
 
@@ -120,16 +120,18 @@ Ensure the following prerequisites are installed locally:
    ```bash
    # Generate TypeScript and Go contracts from Proto definitions
    # (buf, pinned as a go tool in libs/schemas)
-   nx generate schemas
+   npm exec -- nx run schemas:generate
 
    # Generate type-safe SQL queries from raw SQL definitions
    # (sqlc, pinned as a go tool in apps/identity-api)
-   nx run identity-api:sqlc-generate
+   npm exec -- nx run identity-api:sqlc-generate
    ```
 
 6. **Start frontend and backend development servers simultaneously:**
    ```bash
-   nx run-many --target=serve --all
+   # Run in separate terminals after explicitly loading your local environment.
+   npm exec -- nx run identity-api:serve
+   npm exec -- nx run web:dev
    ```
 
 ---
@@ -139,3 +141,17 @@ Ensure the following prerequisites are installed locally:
 * **Go Code:** Formatted using `gofmt` and linted with `golangci-lint`. Avoid manual database manipulation or inline SQL; define queries in `.sql` files and let `sqlc` build type-safe abstractions.
 * **TypeScript/React:** Enforce strict ESLint rules and Prettier formats defined in the workspace root.
 * **Security Checks:** Every pull request is subject to static security analysis. Secret commits, plain-text PII storage, or insecure hashing algorithms (e.g., MD5, SHA-1, or raw bcrypt for passwords) are strictly rejected.
+
+## Pre-production acceptance and launch boundary
+
+The selected cleanup plan's reference state differs from this checkout: numbered
+migrations 1–18, plaintext legal-hold compatibility and development environment
+fallbacks remain. Public signup, SMS.ir, NFC internationalized-email identity,
+SMTPUTF8 delivery and durable signup receipts are not implemented here. Existing
+passkey login/enrollment is not public account creation. Do not infer launch
+readiness from a migration, historical test result or localized form.
+
+The bounded seven-suite runner and separate security race matrix are described in
+[acceptance and bootstrap gates](docs/devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
+Registration acceptance fails closed until its missing implementation and real
+production-image browser harness are delivered. No deployment is authorized.

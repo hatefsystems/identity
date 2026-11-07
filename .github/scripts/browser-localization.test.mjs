@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { once } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { createServer } from 'node:http';
 import { get } from 'node:https';
+import { createConnection } from 'node:net';
 import { fetchPinnedCspDocument } from './web-csp.browser.mjs';
 import {
   assertOnlyPreferenceCookies,
@@ -10,6 +12,7 @@ import {
   configureBrowserPreferences,
   decodePreferenceCookieValue,
   expectedPageTitle,
+  exercisePreferenceSwitch,
   localizedText,
   localHTTPSProxy,
   preferenceActionInput,
@@ -243,6 +246,80 @@ test('CSP attack probe retrieves its real document only through the pinned local
     );
   } finally {
     await proxy?.close();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
+
+for (const initialLocale of ['en', 'fa-IR']) {
+  test(`preference round-trip waits for late streamed ${initialLocale} metadata without replaying API work`, async () => {
+    const url = 'https://localhost:43210/dashboard/profile';
+    const listeners = new Set();
+    const document = {
+      title: expectedPageTitle('/dashboard/profile', initialLocale), cookie: '',
+      documentElement: { lang: initialLocale, dir: initialLocale === 'en' ? 'ltr' : 'rtl' },
+      fonts: { ready: Promise.resolve() },
+      querySelector: () => ({ disabled: false }), querySelectorAll: () => [],
+    };
+    let fontChecks = 0, delayedTitle = null, observedDelayedTitle = false;
+    const realm = { document, crypto: { randomUUID: () => 'owned-document-marker' }, requestAnimationFrame: (done) => done() };
+    const page = {
+      url: () => url,
+      title: async () => document.title,
+      locator: () => ({ getAttribute: async (name) => document.documentElement[name] }),
+      on: (_event, callback) => listeners.add(callback), off: (_event, callback) => listeners.delete(callback),
+      getByRole: () => ({
+        waitFor: async () => {},
+        selectOption: async (locale) => {
+          for (const callback of listeners) callback({ method: () => 'POST', headers: () => ({ 'next-action': 'owned-action' }), url: () => url });
+          document.documentElement = { lang: locale, dir: locale === 'en' ? 'ltr' : 'rtl' };
+          document.title = expectedPageTitle('/dashboard/profile', locale);
+        },
+      }),
+      context: () => ({ cookies: async () => [{
+        name: '__Host-hatef-ui', value: `1~${document.documentElement.lang}~auto~UTC`,
+        secure: true, httpOnly: true, sameSite: 'Lax', path: '/', domain: 'localhost',
+      }] }),
+      evaluate: async (callback, argument) => {
+        const value = await runInNewContext(`(${callback})(argument)`, { ...realm, argument });
+        if (String(callback).includes('document.fonts.ready') && ++fontChecks === 2) {
+          delayedTitle = document.title;
+          document.title = 'metadata still streaming';
+          observedDelayedTitle = true;
+        }
+        return value;
+      },
+      waitForFunction: async (callback, argument) => {
+        if (delayedTitle) { document.title = delayedTitle; delayedTitle = null; }
+        assert(await runInNewContext(`(${callback})(argument)`, { ...realm, argument }));
+      },
+    };
+    await exercisePreferenceSwitch(page);
+    assert(observedDelayedTitle, 'The regression must exercise metadata after the control transition');
+    assert.equal(document.title, expectedPageTitle('/dashboard/profile', initialLocale));
+    assert.equal(listeners.size, 0);
+  });
+}
+
+test('image TLS proxy closes an owned preconnect before it sends a TLS handshake or HTTP request', { timeout: 10000 }, async () => {
+  const upstream = createServer((_request, response) => response.end('owned'));
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  let ingress, socket, timer;
+  try {
+    ingress = await localHTTPSProxy(`http://127.0.0.1:${upstream.address().port}`);
+    socket = createConnection({ host: '127.0.0.1', port: Number(new URL(ingress.origin).port) });
+    await once(socket, 'connect');
+    await new Promise((resolve) => setImmediate(resolve));
+    const closed = once(socket, 'close');
+    const first = ingress.close();
+    assert.strictEqual(ingress.close(), first, 'Concurrent proxy close must share one teardown');
+    const timeout = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Owned TLS preconnect prevented teardown')), 2000); });
+    assert.deepEqual(await Promise.race([first, timeout]), { completed: true });
+    await closed;
+  } finally {
+    clearTimeout(timer);
+    socket?.destroy();
+    await ingress?.close();
     await new Promise((resolve) => upstream.close(resolve));
   }
 });

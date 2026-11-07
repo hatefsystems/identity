@@ -21,6 +21,12 @@ import {
   fixtureSecretValues,
   fixtureRouteReferences,
   integrationTargets,
+  integrationRacePackages,
+  integrationSelection,
+  acceptanceIdentity,
+  aggregateAcceptance,
+  goEvidence,
+  supervisedAcceptance,
   failureCategories,
   legalCoordinateRequest,
   legalIdempotencyKey,
@@ -426,7 +432,7 @@ test('portal evidence never certifies startup, assertion, cleanup, callback or p
   }
 });
 
-function mockPortalDocker(t, { failCleanup, failCreate, failStart } = {}) {
+function mockPortalDocker(t, { failCleanup, failCreate, failStart, timeoutCreate } = {}) {
   const state = { created: [], started: [], removed: [], reservedPorts: 0, releasedPorts: 0, ownershipViolation: false, rejectedName: null };
   const owned = new Set();
   const bindings = new Map();
@@ -450,8 +456,9 @@ function mockPortalDocker(t, { failCleanup, failCreate, failStart } = {}) {
     if (args[0] === 'network' && args[1] === 'create') {
       network = args.at(-1);
       assert.match(network, /^portal-browser-[a-f0-9]{32}$/);
-      return result();
+      return result(0, network);
     }
+    if (args[0] === 'image' && args[1] === 'inspect') return result();
     if (args[0] === 'run' || args[0] === 'create') {
       const id = args[args.indexOf('--name') + 1];
       const kind = id.split('-').at(-1);
@@ -469,7 +476,8 @@ function mockPortalDocker(t, { failCleanup, failCreate, failStart } = {}) {
       owned.add(id);
       bindings.set(id, ports);
       state.created.push({ id, kind, operation: args[0], ports });
-      return result();
+      if (kind === timeoutCreate) return { ...result(), error: { code: 'ETIMEDOUT' } };
+      return result(0, id);
     }
     if (args[0] === 'start') {
       const id = args[1];
@@ -489,8 +497,10 @@ function mockPortalDocker(t, { failCleanup, failCreate, failStart } = {}) {
       assert(owned.has(args[1]));
       const Ports = Object.fromEntries(Object.entries(bindings.get(args[1])).map(([port, binding]) =>
         [`${port}/tcp`, [{ HostIp: '127.0.0.1', HostPort: String(binding.actual) }]]));
-      return result(0, JSON.stringify([{ NetworkSettings: { Ports } }]));
+      return result(0, JSON.stringify([{ Id: args[1], Name: '/' + args[1], Config: { Labels: { 'ldp.run': network.slice('portal-browser-'.length) } }, NetworkSettings: { Ports } }]));
     }
+    if (args[0] === 'ps') return result(0, state.created.filter((entry) => entry.kind === failCleanup).map((entry) => entry.id).join('\n'));
+    if (args[0] === 'network' && args[1] === 'ls') return result(0, failCleanup === 'network' ? network : '');
     if (args[0] === 'exec') { assert(owned.has(args[1])); return result(0, 'PONG'); }
     if (args[0] === 'rm' || (args[0] === 'network' && args[1] === 'rm')) {
       const id = args.at(-1);
@@ -1306,9 +1316,9 @@ test('CI preserves image/CSP coverage and gates release on the real portal suite
   assert.match(workflow, /web-csp\.browser\.mjs/);
   assert.match(workflow, /smoke-image\.mjs api identity-api:ci/);
   assert.match(workflow, /nx run web:test-portal-browser --skipNxCache/);
-  assert.match(workflow, /nx run identity-api:test-portal-integration --skipNxCache/);
+  assert.match(workflow, /--integration-target=/);
   assert.match(workflow, /nx run web:test-admin-browser --skipNxCache/);
-  assert.match(workflow, /needs: \[quality, security-db, frontend, portal-browser, admin-browser\]/);
+  assert.match(workflow, /needs: \[quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser\]/);
 });
 
 test('admin browser is uncached, builds its production dependencies and uses armed fixtures', () => {
@@ -1385,4 +1395,138 @@ test('credential fixture is opt-in and not packaged into the production API imag
   assert.match(fixture, /PORTAL_FIXTURE_ALLOW/);
   assert.match(fixture, /portal_browser_/);
   assert(!dockerfile.includes('portal-fixture') && !dockerfile.includes('portalfixture'));
+});
+
+test('acceptance modes admit only frozen complete suite and race identities', () => {
+  assert.equal(integrationSelection(['--integration']).partial, false);
+  for (const target of integrationTargets)
+    assert.deepEqual(integrationSelection([`--integration-target=${target}`]).selections, [target]);
+  for (const target of integrationRacePackages)
+    assert.equal(integrationSelection([`--integration-race-package=${target}`]).kind, 'race');
+  for (const args of [[], ['--integration', '--integration'], ['--integration-target=./internal/server'],
+    ['--integration-race-package=./cmd/server'], ['--integration-target=test'], ['--integration-race-package=./internal/recovery/..']])
+    assert.throws(() => integrationSelection(args));
+});
+
+function events(evidence, entries) {
+  const data = entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n';
+  evidence.record(data.slice(0, 7));
+  evidence.record(data.slice(7));
+}
+
+test('zero exit plus a skip, duplicate, missing, wrong package or failure cannot pass Go evidence', () => {
+  const pass = [{ Package: 'owned', Test: 'TestOne', Action: 'pass' }, { Package: 'owned', Action: 'pass' }];
+  const valid = goEvidence(['owned']);
+  events(valid, pass);
+  assert.deepEqual(valid.result(0), { packages: ['owned'], tests: 1, failed: 0, skipped: 0 });
+  for (const entries of [
+    [...pass, { Package: 'owned', Test: 'TestSkip', Action: 'skip' }],
+    [...pass, pass[0]], [pass[1]], [pass[0]],
+    [...pass, { Package: 'foreign', Action: 'pass' }],
+    [...pass, { Package: 'owned', Test: 'TestFailed', Action: 'fail' }],
+  ]) {
+    const evidence = goEvidence(['owned']); events(evidence, entries);
+    assert.throws(() => evidence.result(0));
+  }
+  const failed = goEvidence(['owned']); events(failed, pass);
+  assert.throws(() => failed.result(1));
+});
+
+function serviceReports(identity) {
+  const config = JSON.parse(readFileSync(new URL('../../apps/identity-api/project.json', import.meta.url)));
+  const module = /^module (\S+)$/m.exec(readFileSync(new URL('../../apps/identity-api/go.mod', import.meta.url), 'utf8'))[1];
+  return integrationTargets.map((target) => {
+    const opts = config.targets[target].options;
+    const packages = [...new Set((opts.command || opts.commands.join(' ')).match(/\.\/(?:internal|cmd)\/[a-zA-Z0-9_/-]+/g))]
+      .map((path) => module + path.slice(1)).sort();
+    return { version: 1, kind: 'service', run: 'owned-run', target: 'identity-api:' + target,
+      partial: true, identity, status: 'passed', cleanup: true,
+      evidence: { packages, tests: packages.length, failed: 0, skipped: 0 } };
+  });
+}
+
+test('release aggregation requires all seven distinct final-source cells with test and cleanup evidence', () => {
+  const identity = { source: 'a'.repeat(64), generated: 'b'.repeat(64) };
+  const options = { kind: 'service', identity, run: 'owned-run' };
+  const reports = serviceReports(identity);
+  const result = aggregateAcceptance(reports, options);
+  assert.equal(result.partial, false);
+  assert.equal(result.results, 7);
+  assert.throws(() => aggregateAcceptance(reports.slice(1), options));
+  assert.throws(() => aggregateAcceptance([...reports, reports[0]], options));
+  for (const mutate of [
+    (r) => { r[0] = r[1]; }, (r) => { r[0].run = 'stale'; },
+    (r) => { r[0].target = 'unknown'; }, (r) => { r[0].identity.source = 'c'.repeat(64); },
+    (r) => { r[0].identity.generated = 'c'.repeat(64); }, (r) => { r[0].cleanup = false; },
+    (r) => { r[0].evidence.tests = 0; }, (r) => { r[0].evidence.skipped = 1; },
+    (r) => { r[0].evidence.failed = 1; }, (r) => { r[0].evidence.packages.pop(); },
+  ]) {
+    const changed = structuredClone(reports); mutate(changed);
+    assert.throws(() => aggregateAcceptance(changed, options));
+  }
+});
+
+test('bounded supervisor kills a stubborn descendant on deadline and handles an early abort', { timeout: 5000 }, async () => {
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(supervisedAcceptance(process.execPath, ['-e', 'process.exit(0)'], { signal: controller.signal }));
+  await assert.rejects(supervisedAcceptance(process.execPath, ['-e', `
+    const {spawn} = require('node:child_process');
+    spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'], {stdio:'inherit'});
+    process.on('SIGTERM',()=>{});setInterval(()=>{},1000);
+  `], { timeout: 200 }), /interrupted|deadline/);
+  assert.equal(await supervisedAcceptance(process.execPath, ['-e', 'process.exit(0)'], {}), 0);
+});
+
+test('signal during partial startup still removes every acquired resource', async (t) => {
+  const state = mockPortalDocker(t);
+  const controller = new AbortController();
+  const original = childProcess.spawnSync;
+  t.mock.method(childProcess, 'spawnSync', (...args) => {
+    const result = original(...args);
+    if (args[1][0] === 'create' && args[1].includes('postgres:16-alpine')) controller.abort();
+    return result;
+  });
+  syncBuiltinESMExports();
+  await assert.rejects(startPortalServices({ integration: true, signal: controller.signal }));
+  assert.equal(state.created.length, 1);
+  assert.deepEqual(state.removed, ['postgres', 'network']);
+  assert.equal(state.ownershipViolation, false);
+});
+
+test('all mandatory service targets serialize and retain bounded JSON Go execution', () => {
+  const { targets } = JSON.parse(readFileSync(new URL('../../apps/identity-api/project.json', import.meta.url)));
+  for (const name of integrationTargets) {
+    assert.equal(targets[name].parallelism, false);
+    const opts = targets[name].options;
+    const command = opts.command || opts.commands.join(' ');
+    for (const flag of ['-json', '-timeout=30m', '-count=1', '-p=1', '-tags=integration']) assert(command.includes(flag));
+  }
+});
+
+test('mandatory suite package inventory preserves overlapping original coverage and existing phase-7 additions', () => {
+  const required = {
+    'test-security-db': ['dbintegration','recovery','webauthn','privacy','server','audit/signer','natsjs','pglock','rbac','legalhold','adminaction','session','legalpolicy','legalworkflow','legalreport'],
+    'test-admin-integration': ['adminaction','legalhold','rbac','session','server','audit/signer','pglock'],
+    'test-retention-integration': ['audit/retention','audit/ledgerproof','retentiondbintegration'],
+    'test-legal-workflow-integration': ['legalpolicy','legalworkflow','legalreport','server'],
+    'test-grpc-integration': ['identitygrpc','session','oidc/token','oidc/dpop'],
+    'test-lifecycle-integration': ['lifecycle'],
+    'test-portal-integration': ['profile','privacy','session','server','webauthn','recovery','stepup','oidc/dpop','oidc/token','lifecycle','identitygrpc','oidc/clientauth','mfa','smsotp'],
+  };
+  const { targets } = JSON.parse(readFileSync(new URL('../../apps/identity-api/project.json', import.meta.url)));
+  assert.deepEqual(Object.keys(required).sort(), [...integrationTargets].sort());
+  for (const [name, packages] of Object.entries(required)) {
+    const opts = targets[name].options;
+    const command = opts.command || opts.commands.join(' ');
+    const actual = new Set(command.match(/\.\/internal\/[a-zA-Z0-9_/-]+/g));
+    for (const entry of packages) assert(actual.has('./internal/' + entry), `${name} lost ${entry}`);
+  }
+});
+
+test('a timed-out committed create is recovered by exact run label and disposed by immutable ID', async (t) => {
+  const state = mockPortalDocker(t, { timeoutCreate: 'redis' });
+  await assert.rejects(startPortalServices(), /Docker create failed/);
+  assert.deepEqual(state.created.map((r) => r.kind), ['postgres', 'redis']);
+  assert.deepEqual(state.removed, ['redis', 'postgres', 'network']);
+  assert.equal(state.ownershipViolation, false);
 });

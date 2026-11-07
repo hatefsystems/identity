@@ -1398,9 +1398,6 @@ export async function validateWebCsp({
       assert.equal(violation.policy, fixturePolicy);
     }
     assert.deepEqual(attackErrors, [], 'Unexpected attack-fixture errors');
-    console.log(
-      'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
-    );
   } finally {
     try {
       await browser?.close();
@@ -1408,6 +1405,9 @@ export async function validateWebCsp({
       await ingress.close();
     }
   }
+  console.log(
+    'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
+  );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

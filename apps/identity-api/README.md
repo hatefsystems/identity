@@ -279,7 +279,7 @@ Do not run schema-resetting suites concurrently. The same non-root image package
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at
-runtime (via Infisical/KMS or the container environment) and never committed.
+runtime through environment injection and never committed. The application does not fetch or rotate Infisical keys.
 
 | Variable                              | Default       | Description                                                              |
 | :------------------------------------ | :------------ | :----------------------------------------------------------------------- |
@@ -378,3 +378,12 @@ Never enable deletion with an old signer or downgrade a verifier after proof
 state exists. Database-relative checkpoints are not external trust anchors;
 that follow-up, Task 5.3 production sign-off and Task 5.5 narrative-retention
 approval remain open.
+
+### Cleanup plan status
+
+Phases 7/8 add bounded owned-service acceptance and reconcile instructions. This
+branch still has migrations 1–18, development environment defaults and legacy
+legal-hold conversion support. Public signup, SMS.ir, NFC Unicode identity,
+SMTPUTF8 delivery, durable result receipts and `registration-cleanup` are absent.
+`web:test-registration-browser` fails closed on those prerequisites; it does not
+certify browser coverage. See [acceptance/bootstrap gates](../../docs/devops-operations.md#pre-production-acceptance-and-bootstrap-gates).

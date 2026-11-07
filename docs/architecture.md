@@ -51,7 +51,7 @@ The Identity Provider (IdP) is custom-built in Go, designed with a Zero-Trust, p
 ### Advanced Cryptographic Controls & Data Protection
 To guarantee extreme safety and satisfy rigorous privacy requirements:
 - **NIST-Compliant Password Hashing:** User passwords are hashed using **Argon2id** with secure parameters: $m=64\text{MB}$ (memory cost), $t=3\text{ iterations}$ (time cost), and $p=4\text{ parallelism}$, generating a cryptographically secure salt per user.
-- **Application-Layer Envelope Encryption:** Sensitive Personal Identifiable Information (PII) such as phone numbers, backup emails, and MFA secrets is never stored in plain text in PostgreSQL. It is encrypted in-transit in the application layer using **AES-GCM-256** for Data Encryption Keys (DEKs). The DEKs are encrypted (wrapped) by a master Key Encryption Key (KEK) managed in our central KMS (Infisical).
+- **Application-Layer Envelope Encryption:** Sensitive Personal Identifiable Information (PII) such as phone numbers, backup emails, and MFA secrets is never stored in plain text in PostgreSQL. It is encrypted in-transit in the application layer using **AES-GCM-256** for Data Encryption Keys (DEKs). The DEKs are encrypted (wrapped) by one active master Key Encryption Key (KEK), supplied through environment injection and held locally in memory. No live KMS fetch or automatic retired-key selection is implemented.
 - **Timing Attack Resistance:** All cryptographic matching (including OTP verification, token comparison, and credentials validation) is executed via constant-time comparison algorithms (`crypto/subtle.ConstantTimeCompare`) to eliminate timing side-channels.
 
 ### Account Security & Advanced Authentication
@@ -137,7 +137,7 @@ A comprehensive observability stack is critical for a distributed, privacy-first
 - **Tracing:** **OpenTelemetry** is used to trace requests as they flow from the Ingress Gateway, through the Go APIs, and down to other dependent microservices. This allows developers to pinpoint latency bottlenecks without logging user PII.
 
 ### Secret Management
-- **Centralized Vault:** Secrets (e.g., mTLS certificates, OIDC signing keys, PostgreSQL credentials) are never stored in the source code or environment variables directly. They are managed via a secure KMS (Key Management Service) such as **Infisical** or **Kubernetes Sealed Secrets / SOPS** for a lightweight, self-hosted, and cloud-agnostic approach. Kubernetes injects these secrets into containers at runtime.
+- **Implemented custody:** Runtime configuration and cryptographic material are environment-injected, with one loaded KEK/version and one pepper/version. No secrets belong in source or logs. External vault/ESO/SOPS integration is a deployment option, not a runtime fetch, cache, fallback or rotation service. Retained-key recovery and coordinated replay-key cutover remain operator obligations.
 
 ## 4. Monorepo Strategy
 ### Development Workflow

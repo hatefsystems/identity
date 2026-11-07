@@ -1,5 +1,7 @@
 # Hatef Identity Platform - Client Integration Guide
 
+The planned registration-only result read and identical-completion recovery do not relax existing uncertain-mutation retry rules. Public signup, additive canonical-email lookup metadata and NFC/SMTPUTF8 identity support are not implemented in this branch. Do not normalize identities differently, retry enrollment writes or bootstrap privileges based on planned contracts. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
+
 This document is an integration handbook for client applications and microservices (e.g., Search Core and Email Service) within the Hatef ecosystem. It details public client integration (using OAuth 2.1 / OIDC and DPoP), confidential client authentication, and internal gRPC communication secured via SPIFFE/SPIRE.
 
 ---

@@ -89,48 +89,27 @@ To prevent token validation and rate-limiting outages, Redis is deployed in a hi
 
 ---
 
-## 2. Key Management Service (KMS) Fallback Protocols
+## 2. Key Custody and Recovery
 
-Because the platform depends on **Infisical** for application-layer envelope encryption keys (Master Key Encryption Key - KEK) and configuration secrets, any communication failure with Infisical would block database writes and reads of encrypted PII.
+The implemented crypto provider reads environment-injected material at startup:
+one active `ENVELOPE_MASTER_KEK`/version and one blind-index pepper/version in
+process memory. Infisical retrieval, one-hour caches, rotation subscriptions,
+sealed contingency fallback and retired-key fetching are not implemented. An
+external secret manager may deliver environment values; that deployment is not
+established by this repository or a primitive encryption unit test.
 
-### 2.1 KMS Offline Contingency Fallback
+Retain an approved inventory of key versions, independently recoverable backups,
+access-controlled custody and the material required by retained database backups.
+Do not replace the active KEK and assume old ciphertext remains readable. Before
+rotation, implement and rehearse the required decrypt/rewrap/verification path in
+an independently approved recovery environment. The current single loaded pepper
+cannot automatically search every retained historical generation. Signed evidence
+is immutable; do not rehash history to hide a normalization/key change.
 
-To prevent a hard lock of the authentication flow during a regional cloud network split or complete Infisical unavailability, the Go IdP utilizes a secure offline key fallback mechanism.
-
-```
-                  +-----------------------------------+
-                  | Retrieve Master KEK (Infisical)   |
-                  +-----------------------------------+
-                                    |
-                    Success? ----+--+--+---- No?
-                             |         |
-                             v         v
-             +-----------------+     +-----------------------------------+
-             | Cache KEK in    |     |  Read Sealed Contingency Key      |
-             | Memory (1 Hour) |     |  from Local K8s Secrets volume    |
-             +-----------------+     +-----------------------------------+
-                                                       |
-                                                       v
-                                     +-----------------------------------+
-                                     | Validate HMAC Signature of Key    |
-                                     +-----------------------------------+
-                                                       |
-                                                       v
-                                     +-----------------------------------+
-                                     | Decrypt DEKs using Contingency Key|
-                                     +-----------------------------------+
-```
-
-1. **In-Memory Cache & Active Invalidation:** The active Master KEK is cached securely in-memory inside the Go application for up to 1 hour to reduce network traffic. To ensure that on-demand forced key rotations take effect immediately and do not leave compromised keys active, the Go IdP instances subscribe to a NATS JetStream/Redis pub-sub key rotation channel (e.g., `identity.crypto.kek-rotated`). Upon receiving a rotation signal, the in-memory cache is instantly invalidated and flushed.
-2. **Sealed Local Contingency Key:** If the application starts up or needs to reload the KEK while Infisical is offline, it reads a sealed backup configuration payload from a local, dedicated Kubernetes volume (bound only to the application's service account).
-3. **Decryption Logic:** This sealed payload can be decrypted using an emergency private key stored in Kubernetes Secrets. Once decrypted, it yields the temporary contingency KEK.
-4. **Log Warning:** A high-severity system alert `IDP_CRITICAL_KMS_OFFLINE` is pushed to monitoring indicating that the platform has downgraded to local contingency key storage.
-
-### 2.2 Master Key Encryption Key (KEK) Rotation Schedule
-
-* **Regular Key Rotation:** Master KEKs are rotated automatically every 180 days via Infisical's integrated key rotation pipelines.
-* **On-Demand Key Rotation:** In the event of an operational leakage or suspected administrator key compromise, a forced rotation is initiated via the administrative console.
-* **Backward Compatibility:** All past rotated keys are kept in Infisical's secure version history. The application-layer encryption payload retains the `Version` byte. When reading older database rows, the Go backend uses the version byte to fetch the corresponding retired KEK from Infisical's version tree to decrypt the DEK.
+Coordinate step-up replay-key rotation across every replica with revoked old
+authority, preserved replay-domain semantics and a documented cutover. Redis
+restart/loss and unknown SQL commits require separate recovery evidence. Schema
+creation, local crypto tests and historical acceptance do not prove these controls.
 
 ---
 
@@ -159,7 +138,7 @@ A backup is only as good as its recovery validation. The operations team execute
    * Fetch the latest physical base backup via WAL-G.
    * Replay WAL files up to a targeted Point-In-Time recovery (PITR) coordinate.
 3. **MFA Encryption Validation:**
-   * Validate that the restored databases can successfully decrypt user PII using the contingency and production KEK retrieved from the test Infisical mock server.
+   * Validate that the restored databases can successfully decrypt user PII using the approved retained KEK/version inventory in the isolated recovery environment. No automatic Infisical or contingency retrieval is implemented.
 4. **Redis Cache Reconstruction:**
    * Restore the latest RDB file. Validate that the rate limiting sliding window sets are parsed correctly.
 5. **Ledger Integrity Audit (MVP PostgreSQL / Post-MVP ClickHouse):**

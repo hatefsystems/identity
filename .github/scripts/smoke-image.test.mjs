@@ -301,3 +301,59 @@ test('rejects unsupported kinds and unsafe references without starting Docker', 
   await assert.rejects(smokeImage('api', 'not a reference'), /reference/);
   await assert.rejects(smokeImage('web', 'identity-web:test', true), /callback/);
 });
+
+test('image smoke owns immutable create IDs, tries every disposer and withholds success on cleanup failure', async (t) => {
+  const childProcess = await import('node:child_process');
+  const { syncBuiltinESMExports } = await import('node:module');
+  const entries = new Map();
+  const removals = [];
+  let created = 0;
+  let success = false;
+  t.mock.method(console, 'log', () => { success = true; });
+  t.mock.method(childProcess.default, 'spawnSync', (_command, args) => {
+    const result = (status = 0, stdout = '', stderr = '') => ({ status, stdout, stderr });
+    if (args[0] === 'image') return result(0, JSON.stringify([{ Id: 'sha256:' + 'a'.repeat(64), Os: 'linux', Architecture: 'amd64', Config: { User: 'nonroot:nonroot' } }]));
+    if (args[0] === 'create') {
+      const id = (++created).toString(16).padStart(64, '0');
+      entries.set(id, args[args.indexOf('--entrypoint') + 1]);
+      return result(0, id);
+    }
+    if (args[0] === 'start') {
+      const binary = entries.get(args.at(-1));
+      return result(1, '', binary.endsWith('/migrate') ? 'migrate: migrate: DATABASE_URL is empty' : '{"level":"ERROR"}');
+    }
+    if (args[0] === 'rm') {
+      const id = args.at(-1);
+      assert(entries.has(id));
+      removals.push(id);
+      if (Number.parseInt(id, 16) === 2) return result(1);
+      entries.delete(id);
+      return result();
+    }
+    if (args[0] === 'ps') return result(0, [...entries.keys()].join('\n'));
+    throw new Error('Unexpected smoke operation');
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  await assert.rejects(smokeImage('api', 'owned:candidate'), /cleanup/);
+  assert.equal(created, maintenanceEntrypoints.length);
+  assert.equal(removals.length, created, 'A failed disposer must not prevent remaining disposers');
+  assert.equal(entries.size, 1);
+  assert.equal(success, false);
+});
+
+test('a smoke name collision does not acquire removal authority', async (t) => {
+  const childProcess = await import('node:child_process');
+  const { syncBuiltinESMExports } = await import('node:module');
+  const operations = [];
+  t.mock.method(childProcess.default, 'spawnSync', (_command, args) => {
+    operations.push(args[0]);
+    if (args[0] === 'image') return { status: 0, stdout: JSON.stringify([{ Id: 'sha256:' + 'a'.repeat(64), Os: 'linux', Architecture: 'amd64', Config: { User: 'nonroot:nonroot' } }]) };
+    assert.equal(args[0], 'create');
+    return { status: 125, stdout: '', stderr: 'collision' };
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  await assert.rejects(smokeImage('api', 'owned:candidate'), /create failed/);
+  assert.deepEqual(operations, ['image', 'create']);
+});

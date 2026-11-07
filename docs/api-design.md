@@ -1,5 +1,7 @@
 # Hatef Identity Platform - API Design
 
+Public signup and its registration-only result/retry contract are proposed in cleanup phases 5/6, not implemented endpoints. No completion receipt, NFC Unicode mailbox identity, SMS.ir provider or additive `canonical_email` lookup echo exists in this checkout. Continue the existing mutation no-retry contract; never treat a proposed result endpoint as a session or attach credentials to an existing account. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
+
 This document outlines the API contracts for the Hatef Identity Platform. As per the architecture, all contracts are defined via **Protocol Buffers (.proto)**. This document serves as a high-level representation of the generated gRPC and REST/OIDC endpoints.
 
 ## 1. External APIs (REST & OIDC)

@@ -1,5 +1,7 @@
 # Hatef Identity Platform - Compliance & Data Governance
 
+Public enrollment, SMS.ir live/Sandbox selection, canonical NFC Unicode identity and temporary signup-data retention are proposed controls, not deployed processing. Legal approval of actual retention, destination/template/spend policy and independent mailbox/handset delivery remains required. The current runtime holds one environment-injected KEK/version and pepper/version; external-vault rotation and retained-key recovery are not established by unit tests. See [acceptance/bootstrap gates](devops-operations.md#pre-production-acceptance-and-bootstrap-gates).
+
 This document is the single authoritative reference for the legal, privacy, and data-governance posture of the Hatef Identity Platform (IdP). It defines what data we retain, for how long, on what basis, and how we respond to lawful requests, account-deletion requests, and abuse investigations.
 
 Principles in this document are written to be **law-agnostic** (they hold regardless of jurisdiction). Where a specific statute reinforces a principle, it is cited inline as a supporting reference (e.g., GDPR Article 17, Iran Computer Crimes Law). The platform launches first in Iran and expands to other jurisdictions afterward; the governance model is designed so that entering a new jurisdiction adds obligations without rewriting these principles.

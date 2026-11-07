@@ -290,6 +290,8 @@ export async function exercisePreferenceSwitch(page, { privateSelector = '', set
       await page.waitForFunction(() => !document.querySelector('[data-ui-preferences] select')?.disabled);
       await summary.click();
     } else await chooseLanguage(initialLocale);
+    // Calendar/time-zone actions can finish their controls before streamed metadata.
+    await page.waitForFunction((title) => document.title === title, initialTitle);
     assert.equal(await page.title(), initialTitle);
     assert.deepEqual(calls, [], 'Display preferences reauthenticated, rebootstrapped or replayed API work');
   } finally {
@@ -321,6 +323,9 @@ export async function localHTTPSProxy(baseURL) {
   } finally { await rm(directory, { recursive: true, force: true }); }
   const tlsSPKI = createHash('sha256').update(new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64');
   let origin;
+  const sockets = new Set();
+  const forwards = new Set();
+  let closing;
   const ingress = httpsServer({ key, cert, minVersion: 'TLSv1.2' }, (request, response) => {
     const forwarded = httpRequest({ hostname: upstream.hostname, port: upstream.port,
       method: request.method, path: request.url,
@@ -330,6 +335,8 @@ export async function localHTTPSProxy(baseURL) {
       response.writeHead(result.statusCode, result.headers);
       result.pipe(response);
     });
+    forwards.add(forwarded);
+    forwarded.once('close', () => forwards.delete(forwarded));
     forwarded.on('timeout', () => forwarded.destroy());
     forwarded.on('error', () => {
       if (!response.headersSent) response.writeHead(502, { 'Cache-Control': 'private, no-store' });
@@ -338,14 +345,26 @@ export async function localHTTPSProxy(baseURL) {
     request.on('aborted', () => forwarded.destroy());
     request.pipe(forwarded);
   });
+  ingress.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
   ingress.on('tlsClientError', () => {});
   ingress.listen(0, '127.0.0.1');
   await once(ingress, 'listening');
   origin = `https://localhost:${ingress.address().port}`;
   return { origin, tlsSPKI, certificate: cert,
-    async close() {
-      await new Promise((resolve) => { ingress.close(resolve); ingress.closeAllConnections(); });
-      key.fill(0);
+    close() {
+      return closing ||= (async () => {
+        const stopped = new Promise((resolve, reject) => ingress.close((error) => error ? reject(error) : resolve()));
+        // HTTPS preconnects may never reach the HTTP parser. Own raw sockets
+        // as well as HTTP requests so teardown cannot wait for their timeout.
+        ingress.closeAllConnections();
+        for (const request of forwards) request.destroy();
+        for (const socket of sockets) socket.destroy();
+        try { await stopped; } finally { key.fill(0); }
+        return { completed: true };
+      })();
     },
   };
 }

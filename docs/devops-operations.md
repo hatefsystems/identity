@@ -520,7 +520,7 @@ To repeat the browser check after building an image, from the repository root wi
 
 ```bash
 npm exec -- playwright install --with-deps chromium
-npm exec -- nx exec -p web -- node "$PWD/.github/scripts/web-csp.browser.mjs" identity-web:ci
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/web-csp.browser.mjs" identity-web:ci
 ```
 
 ### 1.0.1 Private IdentityService Runtime (Task 6.2)
@@ -696,7 +696,7 @@ Workloads access the SPIFFE Workload API by mounting the local folder hosting `/
 
 ## 2. Secrets Injection & Configuration
 
-To prevent hardcoding of credentials or exposure of raw configuration strings, secrets are injected from **Infisical** via the **Kubernetes External Secrets Operator (ESO)**.
+The runtime loads environment-injected secrets and holds one KEK/version and one pepper/version. It does not fetch, refresh or rotate external-vault keys. The following Infisical/ESO configuration is a proposed Kubernetes deployment example, not evidence of an installed integration. Preserve independently recoverable retained keys and rehearse recovery before rotation.
 
 ```
 +------------------+         +----------------------------+         +-------------------+
@@ -707,7 +707,7 @@ To prevent hardcoding of credentials or exposure of raw configuration strings, s
 
 ### 2.1 ExternalSecret Definition
 
-The ESO Controller polls Infisical at a set interval (e.g., 5 minutes) and updates the Kubernetes Secret objects dynamically.
+If separately installed, ESO may poll Infisical and update Kubernetes Secrets. Updating a Secret does not hot-reload this application or make ciphertext encrypted with retired keys readable.
 
 ```yaml
 apiVersion: external-secrets.io/v1beta1
@@ -834,3 +834,105 @@ groups:
 ### Admin deployment gate
 
 Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including role separation, approved retention, encrypted backfill, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
+
+## Pre-production acceptance and bootstrap gates
+
+This checkout does not match the cleanup plan's assumed completed baseline:
+migrations `00001`–`00018` and the expanded legal-hold compatibility layout remain.
+Do not consolidate, reset, adopt or delete existing environments as an acceptance
+step. The selected phases 7/8 do not implement phases 1–6, remove a CLI, enable a
+feature or authorize production actions.
+
+Use Node 24, npm 11.21.0, the Go version in `apps/identity-api/go.mod`, Linux CGO
+and a C compiler for race cells. Run all mutable service suites serially; independent
+harnesses on the same Docker daemon must not overlap because the explicitly admitted
+restartable broker is `admin-test-nats`. A collision is failure, never ownership.
+
+```sh
+# Exhaustive local service acceptance (seven suite identities).
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration
+# One bounded CI/local cell, explicitly partial.
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-target=test-security-db
+# Separate owned-service tagged race cell, one of seven allowlisted packages.
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/recovery
+```
+
+For separate local cells, set the same unique `ACCEPTANCE_RUN_ID` and an empty
+`ACCEPTANCE_REPORT_DIR` outside the source tree (or under ignored `.kilo/`), then
+use the two-argument aggregate command below.
+Do not reuse an acceptance run ID. CI binds reports to its workflow run/attempt.
+
+```sh
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --aggregate-service "$ACCEPTANCE_REPORT_DIR"
+# Repeat for all seven race-package reports in a separate directory.
+npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --aggregate-race "$ACCEPTANCE_REPORT_DIR"
+```
+
+Each report carries source/generated SHA-256 identities, exact package evidence,
+executed test count, zero skips/failures, startup/target/cleanup timings and verified
+teardown. Assertion bodies and provider credentials are discarded. Single-cell
+reports identify themselves as partial; only the all-seven aggregate is complete.
+Missing, duplicate, wrong-source, stale-run or failed-cleanup reports block release.
+The 30-minute normal-target cap and 20-minute race-test cap remain. The runner
+reserves cleanup inside the 60-minute CI ceiling. All seven targets disallow Nx
+parallelism within one invocation; that setting is not a cross-process lock.
+
+CI uses serial seven-cell service and race matrices (`max-parallel: 1`,
+`fail-fast: false`), and publication requires both aggregate gates plus quality,
+frontend, portal/admin browser and registration-browser gates. Frontend lint treats
+warnings as failure. API smoke uses immutable owned container IDs and certifies
+success only after every disposer and absence check succeeds.
+
+**Registration remains blocked.** `web:test-registration-browser` currently reports
+prerequisites and exits nonzero; it is not the production enrollment browser harness.
+The registration service, production SMS.ir adapter, SMTPUTF8 transport, additive
+signup migration and cleanup worker/build target are absent. The normal portal
+suite now includes existing `oidc/clientauth`, `mfa` and `smsotp` packages. Missing
+registration/SMS.ir/SMTPUTF8/cleanup packages cannot be counted as executed coverage.
+The race matrix deliberately retains the required registration cell, so absence
+blocks the aggregate. Complete phases 5/6 and replace the registration blocker
+with the real immutable-image harness before claiming phase 7 complete.
+
+Future enabled signup acceptance must consume the checksum-verified API artifact
+from `quality`, record exactly its image ID/source/generated identities, use only
+that image's packaged API/migrate/cleanup commands, and match the publication
+manifest. Keep `APP_ENV=production`; isolate provider fixtures on an internal
+network with the `api.sms.ir` alias, mounted ephemeral CA and SMTPUTF8 relay. Block
+external egress. Do not alter host DNS/trust, switch production to development,
+seed a privileged account or substitute a fake production-provider flag.
+
+Before an independently authorized fresh deployment, require these explicit gates:
+
+1. Attest owner/environment and newly provisioned isolated DB/Redis/JetStream
+   namespaces; identify real-data discovery and stop/replan on it.
+2. Approve separate actual-login, nonowner/nonsuperuser runtime, migrator, policy,
+   publisher, signer, notifier and purge roles. Verify effective grants and role
+   membership with actual logins. Deliver the checksum-attested `admin-roles`
+   operator artifact separately through the trusted MFA launcher.
+3. Inject independent production secrets and retain a custody/version/recovery
+   inventory. The sample file contains no working KEK/pepper. Explicitly set the
+   environment: the current omitted-APP_ENV development fallback is still a launch
+   blocker. Never treat configuration flags as key/provider provenance.
+4. Review migration status and approve applying the reviewed schema to the named
+   target separately. This branch still uses numbered migrations, not the plan's
+   final-only baseline. No reset/down, lab adoption or automatic plaintext conversion.
+5. Approve/install immutable legal policy, retention/replay/tombstone inventory and
+   first binding. Initialize genesis only after independent fresh-chain proof;
+   supervise signer/publishers and verify drain, durability and broker failures.
+6. Verify canonical origin/callbacks, proxy redaction, strict cookies and effective
+   transport authentication/TLS for every off-host/untrusted dependency hop.
+7. Before signup exists/enables: approve live SMS.ir key/template/parameter,
+   Iranian destination policy, egress/spend limits and authorized handset receipt.
+   Sandbox ACK is not delivery. Approve authenticated TLS SMTP with post-TLS
+   SMTPUTF8 and independent Unicode-mailbox delivery/recovery; approve transient
+   retention/capacity and supervised cleanup. Keep the feature unavailable until then.
+8. Enroll an ordinary first operator through a future approved production flow;
+   authorize its role grant separately. Schema creation does not create accounts,
+   privilege, governance policy or heads. Verify negative RBAC and no legal bypass.
+9. Authorize the synthetic lookup probe and each workflow/notifier/retention/purge
+   schedule independently. Keep purge disabled until deadline/contention gates pass.
+   Ordinary audit's best-effort loss/drain policy and private gRPC gates remain explicit.
+10. Rehearse forward backup/filestore-independent database recovery, signer heads,
+    retained keys and delivery draining in a separately approved recovery environment.
+    Local tests do not close legal, physical-authenticator, assistive-technology,
+    live ingress, Redis continuity or actual provider-delivery gates.
