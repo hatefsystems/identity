@@ -22,6 +22,7 @@ import {
   gatewayForwardTarget,
   gatewayProvisioningTarget,
   registrationGatewayTargets,
+  registrationControllerUser,
   registrationChecks,
   registrationFailureDetails,
   registrationFailureMessage,
@@ -1049,3 +1050,14 @@ for (const { failure, reply } of [
     else await operation;
     assert.equal(requestObserved, true);
   });
+
+
+test('private controller follows the host credential owner without DAC override or permissive TLS files', () => {
+  assert.equal(registrationControllerUser(1001, 1001), '1001:1001');
+  assert.equal(registrationControllerUser(0, 0), '0:0');
+  assert.equal(registrationControllerUser(), `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`);
+  for (const invalid of [-1, NaN, Infinity, 1.5, '1001', 4294967295]) {
+    assert.throws(() => registrationControllerUser(invalid, 1001));
+    assert.throws(() => registrationControllerUser(1001, invalid));
+  }
+});
