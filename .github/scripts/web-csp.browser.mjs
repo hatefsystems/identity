@@ -149,14 +149,9 @@ async function waitForExternalCss(page, dark = false) {
     );
   }, dark);
   // Palette changes can transition button colors; measure their final colors, not an intermediate frame.
-  await page.evaluate(() =>
-    Promise.all(
-      document
-        .getAnimations()
-        .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
-        .map((animation) => animation.finished.catch(() => {}))
-    )
-  );
+  await page.waitForFunction(() => document.getAnimations()
+    .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
+    .every((animation) => animation.playState === 'finished' || animation.playState === 'idle'));
 }
 
 async function waitForReactHandler(locator, handler) {
@@ -1090,6 +1085,7 @@ export async function validateWebCsp({
       await page.evaluate((value) => {
         document.__cspNavigationMarker = value;
       }, marker);
+      console.log(JSON.stringify({ check: 'auth-navigation', locale: browserLocale(), route: path, stage: 'click' }));
       await Promise.all([page.waitForURL(new URL(path, baseURL).href), link.click()]);
       const route = authRoutes.find((route) => route.path === path);
       await page
@@ -1104,7 +1100,9 @@ export async function validateWebCsp({
         marker,
         `${name} must navigate without replacing the document`
       );
+      console.log(JSON.stringify({ check: 'auth-navigation', locale: browserLocale(), route: path, stage: 'loaded' }));
       await waitForExternalCss(page);
+      console.log(JSON.stringify({ check: 'auth-navigation', locale: browserLocale(), route: path, stage: 'css-ready' }));
       if (route) await assertUnavailable(page, route);
       await assertCleanBaseline();
     };
