@@ -692,12 +692,15 @@ export function registrationStartupSummary(output) {
 
 // Public diagnostics must never copy exception messages, request bodies or URLs.
 export function registrationBrowserDiagnostic(error, observed = {}) {
+  const message = String(error?.message ?? '');
   const frames = String(error?.stack ?? '').split('\n').filter((frame) => !/^\s+at fixed[ (]/.test(frame)).join('\n');
   const line = Number(/registration-browser\.mjs:(\d+):\d+/.exec(frames)?.[1]);
   const paths = new Set([root, ...['start', 'email/resend', 'email/verify', 'result',
     'phone/send', 'phone/verify', 'passkey/options'].map((suffix) => `${root}/${suffix}`)]);
   return {
-    kind: error?.name === 'TimeoutError' ? 'timeout' : error?.code === 'ERR_ASSERTION' ? 'assertion' : 'other',
+    kind: /strict mode violation/.test(message) ? 'ambiguous-locator'
+      : error?.name === 'TimeoutError' || /\bTimeout [0-9]+ms exceeded\b/.test(message) ? 'timeout'
+      : error?.code === 'ERR_ASSERTION' ? 'assertion' : 'other',
     line: Number.isSafeInteger(line) && line > 0 && line < 10000 ? line : null,
     replies: (Array.isArray(observed.replies) ? observed.replies : []).flatMap((reply) =>
       paths.has(reply?.path) && Number.isInteger(reply.status) && reply.status >= 100 && reply.status <= 599
@@ -2142,6 +2145,7 @@ async function newBrowserContext(browser, harness, options = {}) {
   return { context, page, observed };
 }
 const button = (page, label) => page.getByRole('button', { name: label, exact: true });
+const registrationAlert = (page) => page.locator('[data-registration-feedback]').getByRole('alert');
 async function startAttempt(page, observed, harness, suffix) {
   const raw = `  آزمايش${suffix}@BÜCHER.example  `,
     email = `آزمايش${suffix}@xn--bcher-kva.example`;
@@ -2241,7 +2245,7 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
     const wrong = await foreign.newPage();
     await wrong.goto(proof.link);
     await button(wrong, 'Verify email ownership').click();
-    await wrong.getByRole('alert').waitFor();
+    await registrationAlert(wrong).waitFor();
     fixed(new URL(wrong.url()).hash === '', 'Wrong-browser proof fragment remained');
     const initializedKey = await wrong.evaluate(async () => {
       if (!(await indexedDB.databases()).some((entry) => entry.name === 'hatef-portal-dpop'))
@@ -2380,7 +2384,7 @@ async function exerciseSuccessfulSignup(
         (await (await wrongReply).json()).error === 'proof_required',
         'Wrong OTP was not a definitive proof_required rejection'
       );
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       await waitUntil(
         () => page.getByLabel('SMS verification code', { exact: true }).isEnabled(),
         harness.lifecycle
@@ -2407,7 +2411,7 @@ async function exerciseSuccessfulSignup(
     }
     if (rateResend) {
       await button(page, 'Send a new SMS code').click();
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       await waitUntil(async () => {
         await Promise.all(observed.pending);
         return observed.replies.some(
@@ -2507,7 +2511,7 @@ async function exerciseSuccessfulSignup(
           Promise.reject(new DOMException('User canceled authenticator', 'NotAllowedError'));
       });
       await button(page, 'Create passkey and complete registration').click();
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       fixed(
         optionsSeen && harness.inspect(authority.email).accounts === 0,
         'Canceled passkey created an account'
@@ -2777,7 +2781,7 @@ async function exerciseBoundaries(browser, harness, mark) {
       .fill(`unsupported${randomBytes(6).toString('hex')}@example.test`);
     await page.getByLabel('Iranian mobile number', { exact: true }).fill('09123456789');
     await button(page, 'Start registration and send email').click();
-    await page.getByRole('alert').waitFor();
+    await registrationAlert(page).waitFor();
     fixed(observed.starts.length === 0, 'Unsupported passkey allocated an attempt');
   } finally {
     await unsupported.close();

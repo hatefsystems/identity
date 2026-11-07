@@ -102,6 +102,7 @@ function Feedback({
   return (
     <div
       ref={feedback}
+      data-registration-feedback
       tabIndex={-1}
       className="rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
