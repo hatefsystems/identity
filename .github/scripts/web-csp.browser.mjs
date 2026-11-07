@@ -913,11 +913,18 @@ async function checkExpandedDisplaySettings(page, route) {
   }
 }
 
-async function storageSnapshot(page) {
-  return {
-    persistent: await page.context().storageState({ indexedDB: true }),
-    session: await page.evaluate(() => Object.entries(sessionStorage).sort()),
-  };
+export async function storageSnapshot(page, timeout = 15000) {
+  assert(Number.isInteger(timeout) && timeout > 0 && timeout <= 30000);
+  let timer;
+  try {
+    return await Promise.race([
+      (async () => ({
+        persistent: await page.context().storageState({ indexedDB: true }),
+        session: await page.evaluate(() => Object.entries(sessionStorage).sort()),
+      }))(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('CSP storage snapshot timed out')), timeout); }),
+    ]);
+  } finally { clearTimeout(timer); }
 }
 
 async function assertInertInteraction(page, route, observed, beforeStorage, noScript = false) {
@@ -1132,6 +1139,7 @@ export async function validateWebCsp({
     await navigate('Hatef Identity home', '/');
 
     for (const route of authRoutes) {
+      console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'visit' }));
       await visit(route.path, 200, route.heading);
       await assertUnavailable(page, route);
       await waitForReactHandler(
@@ -1175,6 +1183,7 @@ export async function validateWebCsp({
       if (route.registration) {
         // Registration has its own baseline before invalid submissions; the
         // disconnected-form baseline below is outside this branch's lifetime.
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-baseline' }));
         const beforeStorage = await storageSnapshot(page);
         // Valid signup sends mail and belongs to the separately gated real-API
         // suite. Here only explicit invalid submissions may run: no API work,
@@ -1194,15 +1203,18 @@ export async function validateWebCsp({
           await assertCleanBaseline();
         }
         await checkAuthViewports(page, route);
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-layouts' }));
         for (const field of route.fields)
           await form.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
         assert(await submit.isEnabled(), 'Hydrated signup requires explicit contact submission');
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-storage' }));
         assert.deepEqual(
           await storageSnapshot(page),
           beforeStorage,
           'Invalid signup must not allocate persistent proof authority'
         );
         await assertCleanBaseline();
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-navigation' }));
         await navigate(route.back, route.backPath || '/login');
         await navigate('Hatef Identity home', '/');
         assert.deepEqual(
@@ -1210,6 +1222,7 @@ export async function validateWebCsp({
           beforeStorage,
           'Leaving signup must not persist contacts'
         );
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-complete' }));
         continue;
       }
       for (const field of route.fields) await assertFieldError(page, field);
@@ -1492,7 +1505,11 @@ export async function validateWebCsp({
       assert.equal(violation.policy, fixturePolicy);
     }
     assert.deepEqual(attackErrors, [], 'Unexpected attack-fixture errors');
+  } catch (error) {
+    console.error(browserFailure(error, 'csp-probe'));
+    throw error;
   } finally {
+    console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), stage: 'closing' }));
     try {
       await browser?.close();
     } finally {

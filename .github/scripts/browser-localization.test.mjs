@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm';
 import { createServer } from 'node:http';
 import { get } from 'node:https';
 import { createConnection } from 'node:net';
-import { fetchPinnedCspDocument } from './web-csp.browser.mjs';
+import { fetchPinnedCspDocument, storageSnapshot } from './web-csp.browser.mjs';
 import {
   assertOnlyPreferenceCookies,
   browserLocale,
@@ -322,4 +322,16 @@ test('image TLS proxy closes an owned preconnect before it sends a TLS handshake
     await ingress?.close();
     await new Promise((resolve) => upstream.close(resolve));
   }
+});
+
+
+test('public auth storage snapshots have a bounded deadline and never retry a stalled browser probe', async () => {
+  let calls = 0;
+  const stalled = { context: () => ({ storageState: () => { calls++; return new Promise(() => {}); } }) };
+  await assert.rejects(storageSnapshot(stalled, 10), /snapshot timed out/);
+  assert.equal(calls, 1);
+  const complete = { context: () => ({ storageState: async () => ({ cookies: [], origins: [] }) }), evaluate: async () => [] };
+  assert.deepEqual(await storageSnapshot(complete), { persistent: { cookies: [], origins: [] }, session: [] });
+  const failure = new Error('unit-private-diagnostic');
+  await assert.rejects(storageSnapshot({ context: () => ({ storageState: async () => { throw failure; } }) }), (error) => error === failure);
 });

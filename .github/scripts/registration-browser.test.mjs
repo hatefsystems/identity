@@ -23,6 +23,9 @@ import {
   gatewayProvisioningTarget,
   registrationGatewayTargets,
   registrationControllerUser,
+  assertRegistrationAPINetwork,
+  registrationStartupSummary,
+  registrationPasskeyEnvironment,
   registrationChecks,
   registrationFailureDetails,
   registrationFailureMessage,
@@ -1060,4 +1063,40 @@ test('private controller follows the host credential owner without DAC override 
     assert.throws(() => registrationControllerUser(invalid, 1001));
     assert.throws(() => registrationControllerUser(1001, invalid));
   }
+});
+
+
+test('API admission binds immutable network identity independent of inspect map keys', () => {
+  const image = 'sha256:' + 'a'.repeat(64), network = 'b'.repeat(64), address = '10.128.20.16';
+  for (const key of ['owned-network-name', network]) {
+    const state = { State: { Running: true }, Image: image, NetworkSettings: { Networks: { [key]: { NetworkID: network, IPAddress: address } } } };
+    assert.doesNotThrow(() => assertRegistrationAPINetwork(state, image, network, address));
+    assert.throws(() => assertRegistrationAPINetwork(state, image, 'c'.repeat(64), address));
+    assert.throws(() => assertRegistrationAPINetwork(state, image, network, '10.128.20.17'));
+    state.NetworkSettings.Networks.extra = { NetworkID: 'd'.repeat(64), IPAddress: '10.129.20.16' };
+    assert.throws(() => assertRegistrationAPINetwork(state, image, network, address));
+  }
+  assert.throws(() => assertRegistrationAPINetwork({ State: { Running: false } }, image, network, address),
+    (error) => registrationFailureDetails(error).failure_check === 'api-running');
+});
+
+test('startup summaries expose only fixed settings and categories, never raw credentials or exceptions', () => {
+  const summary = registrationStartupSummary('config: OIDC_CLIENTS_JSON invalid PRIVATE_TOKEN https://private.invalid?secret=private SQLSTATE 42501');
+  assert.deepEqual(summary, { settings: ['OIDC_CLIENTS_JSON'], categories: ['configuration', 'database', 'permission'] });
+  assert(!JSON.stringify(summary).includes('PRIVATE_TOKEN'));
+  assert(!JSON.stringify(summary).includes('private'));
+});
+
+
+test('registration supplies independent production WebAuthn decoy keys without weakening resident UV policy', () => {
+  const a = registrationPasskeyEnvironment('https://localhost:8443');
+  const b = registrationPasskeyEnvironment('https://localhost:8443');
+  assert.equal(a.WEBAUTHN_RP_ID, 'localhost');
+  assert.equal(a.WEBAUTHN_RP_ORIGINS, 'https://localhost:8443');
+  assert.equal(a.WEBAUTHN_RESIDENT_KEY, 'required');
+  assert.equal(a.WEBAUTHN_USER_VERIFICATION, 'required');
+  assert.equal(Buffer.from(a.WEBAUTHN_MOCK_CHALLENGE_KEY, 'base64').length, 32);
+  assert.notEqual(a.WEBAUTHN_MOCK_CHALLENGE_KEY, b.WEBAUTHN_MOCK_CHALLENGE_KEY);
+  for (const origin of ['http://localhost:8443', 'https://foreign.invalid:8443', 'https://localhost:8443/'])
+    assert.throws(() => registrationPasskeyEnvironment(origin));
 });
