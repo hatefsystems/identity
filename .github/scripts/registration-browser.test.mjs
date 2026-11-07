@@ -58,6 +58,14 @@ test('browser diagnostics expose only fixed routes, HTTP statuses and numeric so
     replies: [{ path: '/api/v1/auth/register/start', status: 503 }],
     failures: ['browser-response-privacy'] });
   assert(!JSON.stringify(result).includes(privateValue));
+  for (const [message, kind] of [
+    [`strict mode violation: ${privateValue}`, 'ambiguous-locator'],
+    [`locator.waitFor: Timeout 15000ms exceeded. ${privateValue}`, 'timeout'],
+  ]) {
+    const safe = registrationBrowserDiagnostic({ message, stack: privateValue });
+    assert.equal(safe.kind, kind);
+    assert(!JSON.stringify(safe).includes(privateValue));
+  }
   assert.deepEqual(registrationBrowserDiagnostic({ stack: privateValue }),
     { kind: 'other', line: null, replies: [], failures: [] });
 });
