@@ -27,6 +27,7 @@ import {
 } from './acceptance-report.mjs';
 import {
   acceptanceLifecycle,
+  assertLocalOrigin,
   createOwnedDockerResource,
   removeOwnedDockerResource,
   portalCleanup,
@@ -81,6 +82,7 @@ const failureStages = Object.freeze({
   'api-create': 'api',
   'api-start': 'api',
   'api-network': 'api',
+  'api-running': 'api',
   'api-ready': 'api',
   'web-start': 'startweb',
   'web-ready': 'startweb',
@@ -649,6 +651,43 @@ export async function startRegistrationGateway(config, track) {
     if (gateway.listening) await closeServer(gateway);
     throw new RegistrationFailure('controller-start', false);
   }
+}
+
+// This is the production-required anti-enumeration decoy key, not a mock
+// authentication/provider switch. Keep it independent from every other secret.
+export function registrationPasskeyEnvironment(origin) {
+  assertLocalOrigin(origin);
+  return {
+    WEBAUTHN_RP_ID: 'localhost',
+    WEBAUTHN_RP_ORIGINS: origin,
+    WEBAUTHN_RP_DISPLAY_NAME: 'Registration acceptance',
+    WEBAUTHN_RESIDENT_KEY: 'required',
+    WEBAUTHN_USER_VERIFICATION: 'required',
+    WEBAUTHN_MOCK_CHALLENGE_KEY: randomBytes(32).toString('base64'),
+  };
+}
+
+// Inspect records may use a network name or ID as their map key. Identity is
+// the immutable NetworkID, plus the exact count and reserved address.
+export function assertRegistrationAPINetwork(state, image, networkID, address) {
+  if (!state.State?.Running) throw new RegistrationFailure('api-running', false);
+  const peers = Object.values(state.NetworkSettings?.Networks ?? {});
+  fixed(state.Image === image && peers.length === 1 && peers[0].NetworkID === networkID &&
+    peers[0].IPAddress === address, 'API escaped the owned internal network');
+}
+
+// Emit only fixed public setting names/categories, never exception text/values.
+export function registrationStartupSummary(output) {
+  const settings = ['APP_ENV', 'OIDC_CLIENTS_JSON', 'OIDC_ISSUER', 'SESSION_COOKIE_NAME', 'WEBAUTHN_MOCK_CHALLENGE_KEY',
+    'ENVELOPE_MASTER_KEK', 'ENVELOPE_BLIND_INDEX_PEPPER', 'STEPUP_REPLAY_HMAC_KEY',
+    'RECOVERY_CODES_HASH_PEPPER', 'SMS_IR_KEY_MODE', 'SMS_GATEWAY_API_KEY',
+    'REGISTRATION_CLEANUP_DATABASE_URL', 'REGISTRATION_SMTP_HOST'];
+  const text = String(output).slice(-65536);
+  return { settings: settings.filter((name) => text.includes(name)),
+    categories: ['configuration', 'database', 'redis', 'registration', 'permission', 'smtp', 'nats'].filter((name) =>
+      ({ configuration: /config:/i, database: /database|postgres|sqlstate/i, redis: /redis/i,
+        registration: /registration/i, permission: /permission denied|42501|EACCES/i,
+        smtp: /smtp/i, nats: /nats|jetstream/i })[name].test(text)) };
 }
 
 // Owner-only bind-mounted TLS material must be read by its creating host UID.
@@ -1401,7 +1440,7 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
       imageID = inputs.image,
       env = {},
       command = [],
-      containerNetwork = network.Id
+      containerNetwork = services.network
     ) => {
       const owned = createOwnedDockerResource(
         'container',
@@ -1641,11 +1680,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
           allowed_scopes: ['openid', 'profile'],
         },
       ]),
-      WEBAUTHN_RP_ID: 'localhost',
-      WEBAUTHN_RP_ORIGINS: origin,
-      WEBAUTHN_RP_DISPLAY_NAME: 'Registration acceptance',
-      WEBAUTHN_RESIDENT_KEY: 'required',
-      WEBAUTHN_USER_VERIFICATION: 'required',
+      ...registrationPasskeyEnvironment(origin),
       ENVELOPE_MASTER_KEK: randomBytes(32).toString('base64'),
       ENVELOPE_MASTER_KEK_VERSION: '1',
       ENVELOPE_BLIND_INDEX_PEPPER: randomBytes(32).toString('base64'),
@@ -1713,13 +1748,11 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
     docker(['start', api.id], lifecycle);
     const [apiState] = JSON.parse(docker(['inspect', api.id], lifecycle));
     failureCheck = 'api-network';
-    fixed(
-      apiState.Image === inputs.image &&
-        Object.keys(apiState.NetworkSettings.Networks).length === 1 &&
-        apiState.NetworkSettings.Networks[services.network]?.NetworkID === network.Id &&
-        apiState.NetworkSettings.Networks[services.network]?.IPAddress === gatewayTargets.apiHost,
-      'API escaped the owned internal network'
-    );
+    if (!apiState.State.Running) {
+      const output = docker(['logs', '--tail', '20', api.id], lifecycle, { includeStderr: true });
+      console.log(JSON.stringify({ check: 'registration-api-startup', ...registrationStartupSummary(output) }));
+    }
+    assertRegistrationAPINetwork(apiState, inputs.image, network.Id, gatewayTargets.apiHost);
     failureCheck = 'web-start';
     web = await startProductionWeb(nextPort, lifecycle);
     cleanup.push(web.close);
