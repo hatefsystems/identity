@@ -337,8 +337,9 @@ func (f *fakeFetcher) Fetch(_ int, _ ...jetstream.FetchOpt) (jetstream.MessageBa
 }
 
 type fakeBlindIndexer struct {
-	pepper  string
-	version int16
+	pepper   string
+	version  int16
+	emailErr error
 }
 
 func (b *fakeBlindIndexer) Compute(pii string) string {
@@ -347,6 +348,13 @@ func (b *fakeBlindIndexer) Compute(pii string) string {
 }
 
 func (b *fakeBlindIndexer) Version() int16 { return b.version }
+
+func (b *fakeBlindIndexer) ComputeEmail(email string) (string, error) {
+	if b.emailErr != nil {
+		return "", b.emailErr
+	}
+	return b.Compute(email), nil
+}
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -730,6 +738,8 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 	envDup := audit.Envelope{
 		EventID:       dupID,
 		SchemaVersion: audit.EnvelopeSchemaVersion,
+		ActorID:       uuid.Nil.String(),
+		OccurredAt:    time.Now(),
 		EventType:     audit.EventSessionLoggedOut,
 	}
 	dataDup, _ := json.Marshal(envDup)
@@ -737,6 +747,8 @@ func TestSignerDuplicateFiltering(t *testing.T) {
 	envNew := audit.Envelope{
 		EventID:       newID,
 		SchemaVersion: audit.EnvelopeSchemaVersion,
+		ActorID:       uuid.Nil.String(),
+		OccurredAt:    time.Now(),
 		EventType:     audit.EventSessionLoggedOut,
 	}
 	dataNew, _ := json.Marshal(envNew)
@@ -787,6 +799,8 @@ func TestSignerCommitFailureRollsBackAndNaks(t *testing.T) {
 	env := audit.Envelope{
 		EventID:       uuid.New(),
 		SchemaVersion: audit.EnvelopeSchemaVersion,
+		ActorID:       uuid.Nil.String(),
+		OccurredAt:    time.Now(),
 		EventType:     audit.EventSessionLoggedOut,
 	}
 	data, _ := json.Marshal(env)

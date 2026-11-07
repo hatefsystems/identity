@@ -179,7 +179,7 @@ func setupRecoveryTestFixture(t *testing.T) *recoveryTestFixture {
 	sessMgr := newRecoverySessionManager(t)
 	browser := newPortalTestClient(t, testPortalOrigin)
 	sess, cookies := browser.issueSession(t, sessMgr, session.IssueParams{
-		UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+		UserID: userID.String(), AuthVersionSet: true, IP: "127.0.0.1", UserAgent: "test-agent",
 	})
 
 	// POST /generate is step-up gated, so the fixture always wires a step-up
@@ -592,7 +592,7 @@ func TestRecoveryVerifyFailuresAreIndistinguishable(t *testing.T) {
 
 	// A second account with its own live batch, to supply a foreign code.
 	otherID := fx.store.addUser()
-	otherBatch, err := fx.svc.Generate(context.Background(), otherID, "")
+	otherBatch, err := fx.svc.Generate(context.Background(), otherID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate for the second account: %v", err)
 	}
@@ -771,7 +771,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	sessMgr := newRecoverySessionManager(t)
 	browser := newPortalTestClient(t, testPortalOrigin)
 	sess, cookies := browser.issueSession(t, sessMgr, session.IssueParams{
-		UserID: userID.String(), IP: "127.0.0.1", UserAgent: "test-agent",
+		UserID: userID.String(), AuthVersionSet: true, IP: "127.0.0.1", UserAgent: "test-agent",
 	})
 
 	// A step-up service is wired so the gated routes participate in the mount,
@@ -833,7 +833,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 
 	// The deeper static mount wins its own path: only the recovery handler
 	// answers verify-recovery-code, and only it can mint a batch that verifies.
-	batch, err := recoverySvc.Generate(context.Background(), userID, "")
+	batch, err := recoverySvc.Generate(context.Background(), userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -854,5 +854,24 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	}
 	if got := len(recoveryStore.codes[userID]); got != batch.Count-1 {
 		t.Errorf("stored codes = %d, want %d; the code was not consumed", got, batch.Count-1)
+	}
+}
+
+func TestRecoveryGenerateRejectsStaleOrUncapturedSession(t *testing.T) {
+	for _, captured := range []bool{true, false} {
+		fx := setupRecoveryTestFixture(t)
+		user := fx.store.users[fx.userID]
+		user.AuthVersion = 1
+		fx.store.users[fx.userID] = user
+		fx.sess.AuthVersionSet = captured
+		recorder := &profileAuditRecorder{}
+		fx.server.deps.AuditRecorder = recorder
+		req := httptest.NewRequest(http.MethodPost, recoveryGeneratePath, nil)
+		req = req.WithContext(session.WithSession(req.Context(), fx.sess))
+		response := httptest.NewRecorder()
+		fx.server.handleRecoveryGenerate()(response, req)
+		if response.Code != http.StatusUnauthorized || len(fx.store.codes[fx.userID]) != 0 || len(recorder.events) != 0 {
+			t.Fatalf("stale/uncaptured generation succeeded: status %d", response.Code)
+		}
 	}
 }

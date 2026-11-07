@@ -166,6 +166,9 @@ func (c AuditConfig) MaxAckPending() int { return 2 * c.BatchSize }
 // across environments, because an audit pipeline that batches or retains
 // differently in staging is not a rehearsal of production.
 func LoadAudit(environment string) (AuditConfig, error) {
+	if err := ValidateEnvironment(environment); err != nil {
+		return AuditConfig{}, err
+	}
 	cfg := AuditConfig{
 		NATSURL:         strings.TrimSpace(getEnv(EnvNATSURL, "")),
 		StreamName:      getEnv(EnvAuditStreamName, defaultAuditStreamName),

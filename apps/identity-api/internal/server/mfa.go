@@ -74,7 +74,11 @@ func (s *Server) handleMFAGenerate() http.HandlerFunc {
 		}
 
 		current, _ := session.FromContext(r.Context())
-		resp, err := s.deps.MFA.GenerateSetup(r.Context(), userID, current.ID)
+		if !current.AuthVersionSet {
+			s.writeMFAError(w, "generate mfa setup", mfa.ErrAccountNotActive)
+			return
+		}
+		resp, err := s.deps.MFA.GenerateSetup(r.Context(), userID, current.AuthVersion, current.ID)
 		if err != nil {
 			s.writeMFAError(w, "generate mfa setup", err)
 			return
@@ -109,7 +113,11 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 		}
 
 		current, _ := session.FromContext(r.Context())
-		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, current.ID, req.EnrollmentID, req.Code); err != nil {
+		if !current.AuthVersionSet {
+			s.writeMFAError(w, "verify and enable mfa", mfa.ErrAccountNotActive)
+			return
+		}
+		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, current.AuthVersion, current.ID, req.EnrollmentID, req.Code); err != nil {
 			s.record(r, audit.Event{
 				EventType:    audit.EventMFAVerifyFailed,
 				ActionStatus: audit.StatusFailure,
@@ -149,7 +157,12 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 			return
 		}
 
-		if err := s.deps.MFA.Disable(r.Context(), userID); err != nil {
+		current, _ := session.FromContext(r.Context())
+		if !current.AuthVersionSet {
+			s.writeMFAError(w, "disable mfa", mfa.ErrAccountNotActive)
+			return
+		}
+		if err := s.deps.MFA.Disable(r.Context(), userID, current.AuthVersion); err != nil {
 			s.writeMFAError(w, "disable mfa", err)
 			return
 		}

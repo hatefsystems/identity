@@ -43,6 +43,16 @@
       "outputs": ["{projectRoot}/bin/deletion-notifier"],
       "cache": true
     },
+    "build-registration-cleanup": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/identity-api",
+        "command": "go build -o bin/registration-cleanup ./cmd/registration-cleanup"
+      },
+      "dependsOn": ["sqlc-generate"],
+      "outputs": ["{projectRoot}/bin/registration-cleanup"],
+      "cache": true
+    },
     "deletion-notifier": {
       "executor": "nx:run-commands",
       "options": {
@@ -102,7 +112,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "apps/identity-api",
-        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/profile','./internal/privacy','./internal/session','./internal/server','./internal/webauthn','./internal/recovery','./internal/stepup','./internal/oidc/dpop','./internal/oidc/token','./internal/lifecycle','./internal/identitygrpc'], {stdio:'inherit',env:{...process.env,REQUIRE_PORTAL_INTEGRATION:'1',REQUIRE_PROFILE_INTEGRATION:'1',REQUIRE_GRPC_INTEGRATION:'1',REQUIRE_LIFECYCLE_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
+        "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/profile','./internal/privacy','./internal/session','./internal/server','./internal/webauthn','./internal/recovery','./internal/stepup','./internal/oidc/dpop','./internal/oidc/token','./internal/lifecycle','./internal/identitygrpc','./internal/oidc/clientauth','./internal/mfa','./internal/smsotp','./internal/registration'], {stdio:'inherit',env:{...process.env,REQUIRE_PORTAL_INTEGRATION:'1',REQUIRE_PROFILE_INTEGRATION:'1',REQUIRE_GRPC_INTEGRATION:'1',REQUIRE_LIFECYCLE_INTEGRATION:'1',REQUIRE_PHASE2_INTEGRATION:'1',REQUIRE_SMS_INTEGRATION:'1',REQUIRE_REGISTRATION_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
       "cache": false,
@@ -290,12 +300,13 @@
         "cwd": "apps/identity-api",
         "commands": [
           "node -e \"if (!process.env.DATABASE_URL) { throw new Error('DATABASE_URL is required') }\"",
-          "go test -tags=integration -count=1 -timeout=20m -p=1 ./internal/dbintegration ./internal/migrate ./cmd/migrate ./cmd/admin-roles ./cmd/admin-legal ./internal/recovery ./internal/webauthn ./internal/privacy ./internal/server ./internal/audit/signer ./internal/natsjs ./internal/pglock ./internal/rbac ./internal/legalhold ./internal/adminaction ./internal/session ./internal/legalpolicy ./internal/legalworkflow ./internal/legalreport"
+          "go test -tags=integration -count=1 -timeout=20m -p=1 ./internal/dbintegration ./internal/migrate ./cmd/migrate ./cmd/admin-roles ./cmd/admin-legal ./internal/recovery ./internal/webauthn ./internal/privacy ./internal/server ./internal/audit/signer ./internal/natsjs ./internal/pglock ./internal/rbac ./internal/legalhold ./internal/adminaction ./internal/session ./internal/legalpolicy ./internal/legalworkflow ./internal/legalreport ./internal/smsotp/smsir ./internal/smtptransport ./cmd/registration-cleanup"
         ],
         "parallel": false
       },
       "dependsOn": ["sqlc-generate"],
-      "cache": false
+      "cache": false,
+      "parallelism": false
     },
     "test-admin-integration": {
       "executor": "nx:run-commands",
@@ -304,7 +315,8 @@
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/adminaction','./internal/legalhold','./internal/rbac','./internal/session','./internal/server','./internal/audit/signer','./internal/pglock'], {stdio:'inherit',env:{...process.env,REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
-      "cache": false
+      "cache": false,
+      "parallelism": false
     },
     "test-grpc-integration": {
       "executor": "nx:run-commands",
@@ -313,7 +325,8 @@
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/identitygrpc','./internal/session','./internal/oidc/token','./internal/oidc/dpop'], {stdio:'inherit',env:{...process.env,REQUIRE_GRPC_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
-      "cache": false
+      "cache": false,
+      "parallelism": false
     },
     "test-retention-integration": {
       "executor": "nx:run-commands",
@@ -322,7 +335,8 @@
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-timeout=20m','-p=1','./internal/audit/retention','./internal/audit/ledgerproof','./internal/retentiondbintegration'], {stdio:'inherit',env:{...process.env,REQUIRE_RETENTION_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
-      "cache": false
+      "cache": false,
+      "parallelism": false
     },
     "test-legal-workflow-integration": {
       "executor": "nx:run-commands",
@@ -331,7 +345,8 @@
         "command": "node -e \"for (const k of ['DATABASE_URL','REDIS_URL','NATS_URL']) if (!process.env[k]?.trim()) throw new Error(k + ' is required'); const r = require('child_process').spawnSync('go', ['test','-tags=integration','-count=1','-p=1','./internal/legalpolicy','./internal/legalworkflow','./internal/legalreport','./internal/server'], {stdio:'inherit',env:{...process.env,REQUIRE_LEGAL_WORKFLOW_INTEGRATION:'1',REQUIRE_ADMIN_AUDIT_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\""
       },
       "dependsOn": ["sqlc-generate"],
-      "cache": false
+      "cache": false,
+      "parallelism": false
     },
     "lint": {
       "executor": "nx:run-commands",

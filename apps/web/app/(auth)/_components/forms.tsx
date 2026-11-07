@@ -7,12 +7,10 @@ import {
   validateEmail,
   validateLogin,
   validatePassword,
-  validateRegistration,
   validateTotp,
   type EmailValues,
   type LoginValues,
   type PasswordValues,
-  type RegistrationValues,
   type TotpValues,
 } from '../_lib/validation';
 import { AuthLink } from './auth-card';
@@ -73,52 +71,6 @@ export function LoginForm({
         </div>
       </AuthForm>
     </>
-  );
-}
-
-export function RegistrationForm({ submit }: { submit?: FormSubmit<RegistrationValues> }) {
-  const form = useAuthForm(
-    { email: '', password: '', confirmation: '' },
-    validateRegistration,
-    submit
-  );
-
-  return (
-    <AuthForm
-      {...form}
-      label="Create an account"
-      submitLabel="Create account"
-      messages={{
-        pending: 'Creating your account...',
-        success: 'Registration completed. Return to sign in to continue.',
-        error: 'We could not complete registration. Please try again.',
-      }}
-    >
-      <AuthField
-        {...form.field('email')}
-        label="Email address"
-        type="email"
-        autoComplete="email"
-        autoCapitalize="none"
-        spellCheck={false}
-        required
-      />
-      <AuthField
-        {...form.field('password')}
-        label="New password"
-        type="password"
-        autoComplete="new-password"
-        hint="Use a long, unique password. You can include spaces."
-        required
-      />
-      <AuthField
-        {...form.field('confirmation')}
-        label="Confirm password"
-        type="password"
-        autoComplete="new-password"
-        required
-      />
-    </AuthForm>
   );
 }
 

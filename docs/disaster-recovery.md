@@ -89,48 +89,35 @@ To prevent token validation and rate-limiting outages, Redis is deployed in a hi
 
 ---
 
-## 2. Key Management Service (KMS) Fallback Protocols
+## 2. Key Custody and Recovery
 
-Because the platform depends on **Infisical** for application-layer envelope encryption keys (Master Key Encryption Key - KEK) and configuration secrets, any communication failure with Infisical would block database writes and reads of encrypted PII.
+The current adapter loads one environment-injected KEK/version and one blind-index
+pepper/version into process-local custody at startup. It uses real AES-GCM/HMAC
+primitives, but performs no live Infisical fetch, expiring cache, offline fallback,
+pub-sub invalidation or hot rotation. Infisical/SOPS/Sealed Secrets are operator
+delivery options, not an automatic application recovery mechanism.
 
-### 2.1 KMS Offline Contingency Fallback
+### 2.1 Process-Local Key Recovery
 
-To prevent a hard lock of the authentication flow during a regional cloud network split or complete Infisical unavailability, the Go IdP utilizes a secure offline key fallback mechanism.
+Already-running processes use their loaded material; provider availability is not
+a per-record fetch dependency. New/restarted processes still need the correct
+approved secret injection. Missing/wrong keys fail encrypted reads and admission,
+not an alternate secret, plaintext downgrade or silently generated production key.
+Exactly configured environment modes are required; test is not development.
 
-```
-                  +-----------------------------------+
-                  | Retrieve Master KEK (Infisical)   |
-                  +-----------------------------------+
-                                    |
-                    Success? ----+--+--+---- No?
-                             |         |
-                             v         v
-             +-----------------+     +-----------------------------------+
-             | Cache KEK in    |     |  Read Sealed Contingency Key      |
-             | Memory (1 Hour) |     |  from Local K8s Secrets volume    |
-             +-----------------+     +-----------------------------------+
-                                                       |
-                                                       v
-                                     +-----------------------------------+
-                                     | Validate HMAC Signature of Key    |
-                                     +-----------------------------------+
-                                                       |
-                                                       v
-                                     +-----------------------------------+
-                                     | Decrypt DEKs using Contingency Key|
-                                     +-----------------------------------+
-```
-
-1. **In-Memory Cache & Active Invalidation:** The active Master KEK is cached securely in-memory inside the Go application for up to 1 hour to reduce network traffic. To ensure that on-demand forced key rotations take effect immediately and do not leave compromised keys active, the Go IdP instances subscribe to a NATS JetStream/Redis pub-sub key rotation channel (e.g., `identity.crypto.kek-rotated`). Upon receiving a rotation signal, the in-memory cache is instantly invalidated and flushed.
-2. **Sealed Local Contingency Key:** If the application starts up or needs to reload the KEK while Infisical is offline, it reads a sealed backup configuration payload from a local, dedicated Kubernetes volume (bound only to the application's service account).
-3. **Decryption Logic:** This sealed payload can be decrypted using an emergency private key stored in Kubernetes Secrets. Once decrypted, it yields the temporary contingency KEK.
-4. **Log Warning:** A high-severity system alert `IDP_CRITICAL_KMS_OFFLINE` is pushed to monitoring indicating that the platform has downgraded to local contingency key storage.
+Keep a protected independent inventory/backup of every original KEK/version and
+pepper generation needed by retained ciphertext and consistent backups. An
+envelope version byte does not provide a retired-key reader. Restore matching
+key material under controlled authorization before compatible readers resume;
+investigate wrong bindings/authentication failures without rewriting data.
+Secret-provider recovery, launcher controls and independent key restoration must
+be demonstrated separately. Primitive unit tests do not prove any of these gates.
 
 ### 2.2 Master Key Encryption Key (KEK) Rotation Schedule
 
-* **Regular Key Rotation:** Master KEKs are rotated automatically every 180 days via Infisical's integrated key rotation pipelines.
-* **On-Demand Key Rotation:** In the event of an operational leakage or suspected administrator key compromise, a forced rotation is initiated via the administrative console.
-* **Backward Compatibility:** All past rotated keys are kept in Infisical's secure version history. The application-layer encryption payload retains the `Version` byte. When reading older database rows, the Go backend uses the version byte to fetch the corresponding retired KEK from Infisical's version tree to decrypt the DEK.
+* **Controlled Rotation:** Operators own the approved schedule and compromise-response procedure. Drain affected writes/readers and inventory retained versions before replacing the single loaded key; current code does not automatically rewrap data or fetch retired keys.
+* **Retired-Key Custody:** Retain protected original keys with backup recovery obligations. Key erasure, backup rotation and lawful erasure require coordinated policy; changing the active KEK alone does not preserve old-row readability.
+* **Pepper and Replay Keys:** Exact canonical-email capture/fallback/lookup must share one declared pepper generation. Generic BlindIndex NFKC behavior is unchanged; no signed-history rehash or dual-normalization/multi-pepper lookup is supplied. Coordinate replay-key cutover across replicas rather than splitting replay domains. See [secret rollout](devops-operations.md#2-secrets-injection--configuration).
 
 ---
 
@@ -159,7 +146,7 @@ A backup is only as good as its recovery validation. The operations team execute
    * Fetch the latest physical base backup via WAL-G.
    * Replay WAL files up to a targeted Point-In-Time recovery (PITR) coordinate.
 3. **MFA Encryption Validation:**
-   * Validate that the restored databases can successfully decrypt user PII using the contingency and production KEK retrieved from the test Infisical mock server.
+   * Validate retained PII/envelope bindings with the exact separately recovered original KEK/version, not a fictitious contingency key or live/mock Infisical fetch. Record private-key recovery independently of primitive crypto tests.
 4. **Redis Cache Reconstruction:**
    * Restore the latest RDB file. Validate that the rate limiting sliding window sets are parsed correctly.
 5. **Ledger Integrity Audit (MVP PostgreSQL / Post-MVP ClickHouse):**
@@ -182,7 +169,7 @@ rotates out; restoration is not a mechanism to bypass erasure or active holds.
    tables (`security_event_ledger`, `mvp_audit_logs`), both
    chains (`security_ledger_chain`, `audit_log_chain`), both heads, chain sequence
    allocation state, `security_ledger_erasures`, `security_ledger_retention_settings`,
-   legal holds/governance/workflow state and `event_outbox` from one consistent
+   legal holds/governance/workflow state, `registration_attempts` and `event_outbox` from one consistent
    backup/WAL point. Never mix a chain/head, payload, erasure or receipt inventory
    from different points. The retired checkpoint table is not v2 proof state.
    Restore protected ownership/grants through the controlled provisioning
@@ -216,8 +203,8 @@ work, retain both chains/heads/payloads/erasures/holds/settings/outbox, and repa
 with compatible code. A pre-v2 signer or verifier is
 not a safe downgrade. Exact provisioning, revocation and rollout commands are
 in [admin operations](admin-operations.md#security-ledger-retention-task-54).
-The single fresh `00001_initial_schema.sql` baseline refuses Down unconditionally;
-reset/rollback to zero refuse even after later migrations. Use forward recovery,
+The unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`
+bundle is forward-only; reset/rollback to zero refuse even after later migrations. Use forward recovery,
 not an up/down/up drill, even when payload tables appear empty. Recovery restores
 matching new-lineage metadata and application state consistently; it is not an
 in-place upgrade or adoption of legacy backups. Supported migration entrypoints
@@ -235,13 +222,12 @@ reset: any reset of an existing named environment needs a separate explicit requ
 identifying its exact targets. No broad volume deletion or shared-schema reset is
 part of these instructions. Follow [active setup](admin-operations.md#migration-and-contraction).
 
-Optional standalone backfill retains bounded encryption, binding/read-back and
-atomicity/error contracts only as a separately scoped focused compatibility
-operation, not a new-lineage upgrade or fresh-install step. Operator-only genesis,
+Obsolete legal Backfill/plaintext compatibility is removed, not a recovery,
+new-lineage upgrade or fresh-install step. Operator-only genesis,
 restricted provisioning, real key inventory, policy approval, original retention
 clocks and manual/production restore gates remain unchanged. Historical acceptance
-and prior plans retain their original evidence; the coordinator records new outcomes
-only in the [fresh-baseline placeholder](admin-operations.md#fresh-baseline-acceptance-placeholder).
+and prior plans retain their original evidence; new outcomes may be recorded only
+after actual [final-source acceptance](admin-operations.md#automated-validation).
 
 No procedure promises restoration of erased payloads. Database-relative chains,
 erasure annotations
@@ -263,3 +249,28 @@ replay keys to bypass conflicts. Reapply erasure subject to current holds; delet
 ciphertext cannot be reconstructed from the aggregate counters. Preserve the
 independent backup-rotation policy. A restored database is not an external trust
 anchor or proof of complete external-response history.
+
+### 3.5 Registration Recovery
+
+Keep signup intake and cleanup scheduling disabled while restoring migration
+versions 1+2, users/credentials, `registration_attempts`, created-event intent and
+holds from one consistent point with matching private KEK/pepper generations.
+Preserve original attempt/proof/receipt clocks and current authoritative hold/
+deletion instructions. Restoring a snapshot never extends 15m pending, 10m email,
+at-most-5m passkey or 1h receipt validity, resurrects a spent OTP, rebinds a JKT or
+recreates an erased account. Completed receipts remain subject to user cascade.
+
+External email/SMS acknowledgement is not exactly-once delivery. A restored
+missing marker cannot prove that a message was never sent; do not automatically
+resend, recreate an account or issue a capability from an email. Only the original
+capability/JKT may query the bounded durable result with a fresh DPoP proof; lost
+authority requires ordinary login or a new approved attempt. Reconcile created
+event/outbox state without synthesizing duplicate user birth.
+
+Before reopening, verify compatible schema/readers, actual dedicated cleanup
+login with nonmutating `registration-cleanup check`, supervised bounded `once`
+scheduling, key recovery, shared Redis and message-free SMTPUTF8/TLS/auth readiness.
+Live SMS.ir provenance, billing/egress/handset receipt, Unicode-mailbox delivery,
+retention budgets and deployed restore evidence remain independently approved
+gates, not supplied by these instructions or local primitive tests. No reset,
+legacy adoption, automatic target replacement or new live permission is granted.

@@ -26,6 +26,8 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
+
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -89,10 +91,25 @@ func (i *Indexer) Version() int16 { return i.version }
 // Callers remain responsible for domain-specific canonicalization
 // (e.g. E.164 phone formatting) before calling Compute.
 func (i *Indexer) Compute(pii string) string {
-	normalized := normalize(pii)
+	return i.computeBytes(normalize(pii))
+}
+
+// ComputeEmail canonicalizes an email identity and hashes those exact NFC/IDNA
+// bytes. Generic Compute retains its NFKC semantics; using it for email would
+// merge distinct supported compatibility letters in the local part. Callers
+// must capture Version together with this digest and fail closed on error.
+func (i *Indexer) ComputeEmail(email string) (string, error) {
+	canonical, err := emailaddress.Canonicalize(email)
+	if err != nil {
+		return "", err
+	}
+	return i.computeBytes(canonical), nil
+}
+
+func (i *Indexer) computeBytes(value string) string {
 	mac := hmac.New(sha256.New, i.pepper)
 	// Write never returns an error for hash.Hash implementations.
-	_, _ = mac.Write([]byte(normalized))
+	_, _ = mac.Write([]byte(value))
 	sum := mac.Sum(nil)
 	return hex.EncodeToString(sum)
 }
@@ -104,15 +121,8 @@ func Equal(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// normalize applies consistent canonicalization to index inputs.
-//
-// NFKC runs before case folding, not after, and is not optional: an identifier
-// typed as a decomposed sequence (e.g. "é" as e + U+0301) and the same
-// identifier in composed form are the same address to a human and to a mail
-// server, but different byte strings to HMAC. Without normalization the two
-// produce different indexes, so a lawful-inquiry lookup silently misses rows
-// whose attribution material was captured in the other form — a false negative
-// that looks exactly like "no such subject".
+// normalize preserves the generic index contract: NFKC before simple lowercase.
+// Email identities must use ComputeEmail instead of this compatibility folding.
 func normalize(s string) string {
 	return strings.ToLower(norm.NFKC.String(strings.TrimSpace(s)))
 }

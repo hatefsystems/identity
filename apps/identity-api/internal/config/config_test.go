@@ -10,7 +10,7 @@ func TestLoadDefaults(t *testing.T) {
 	// Ensure no relevant env vars leak in from the host running the tests.
 	t.Setenv("HOST", "")
 	t.Setenv("PORT", "")
-	t.Setenv("APP_ENV", "")
+	t.Setenv("APP_ENV", "development")
 	t.Setenv(EnvTrustedProxyCIDRs, "")
 
 	cfg, err := Load()
@@ -32,6 +32,25 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != defaultShutdownTimeout {
 		t.Errorf("ShutdownTimeout = %v, want %v", cfg.ShutdownTimeout, defaultShutdownTimeout)
+	}
+}
+
+func TestAuditSubjectIndependentOfTransportAndSecrets(t *testing.T) {
+	for _, key := range []string{EnvNATSURL, EnvAuditBatchSize, EnvMasterKEK, EnvBlindIndexPepper, EnvOIDCClients, "SMS_GATEWAY_API_KEY"} {
+		t.Setenv(key, "unrelated-invalid-setting")
+	}
+	for _, raw := range []string{"", "identity.audit.logs", "identity.audit.admin.roles"} {
+		t.Setenv(EnvAuditSubject, raw)
+		got, err := LoadAuditSubject()
+		if err != nil || got == "" {
+			t.Fatalf("DB intent subject depends on transport: %v", err)
+		}
+	}
+	for _, raw := range []string{"unrelated.logs", "identity.audit.", "identity.audit.*", "identity.audit.>", "identity.audit.bad subject", "identity.audit..logs"} {
+		t.Setenv(EnvAuditSubject, raw)
+		if _, err := LoadAuditSubject(); err == nil {
+			t.Fatalf("invalid subject %q accepted", raw)
+		}
 	}
 }
 
@@ -71,6 +90,7 @@ func TestLoadFromEnv(t *testing.T) {
 }
 
 func TestLoadInvalidPort(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvTrustedProxyCIDRs, "")
 	cases := map[string]string{
 		"non-numeric":  "abc",
@@ -88,6 +108,7 @@ func TestLoadInvalidPort(t *testing.T) {
 }
 
 func TestLoadTrustedProxyCIDRsDeduplicatesMaskedPrefixes(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvTrustedProxyCIDRs, "10.1.2.3/8, 10.0.0.0/8, 2001:db8::42/32")
 	cfg, err := Load()
 	if err != nil {
@@ -108,6 +129,7 @@ func TestLoadTrustedProxyCIDRsDeduplicatesMaskedPrefixes(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidTrustedProxyCIDRs(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	tests := map[string]string{
 		"malformed":         "not-a-cidr",
 		"host without CIDR": "127.0.0.1",
@@ -134,6 +156,7 @@ func TestAddr(t *testing.T) {
 }
 
 func TestDefaultTimeoutsArePositive(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv(EnvTrustedProxyCIDRs, "")
 	cfg, err := Load()
 	if err != nil {

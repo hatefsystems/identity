@@ -22,10 +22,11 @@ import (
 )
 
 type mfaTestUser struct {
-	id     uuid.UUID
-	email  string
-	secret []byte
-	mfaOn  bool
+	id      uuid.UUID
+	email   string
+	secret  []byte
+	mfaOn   bool
+	version int64
 }
 
 type mfaFakeStore struct {
@@ -44,7 +45,53 @@ func (f *mfaFakeStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, er
 		MfaTotpSecretEncrypted: u.secret,
 		IsMfaEnabled:           u.mfaOn,
 		Status:                 "active",
+		AuthVersion:            u.version,
 	}, nil
+}
+
+func TestMFAMutationsRejectStaleOrUncapturedSessions(t *testing.T) {
+	for _, operation := range []string{"setup", "enable", "disable"} {
+		for _, captured := range []bool{true, false} {
+			t.Run(operation+"/"+map[bool]string{true: "stale", false: "uncaptured"}[captured], func(t *testing.T) {
+				fx := setupMFATestFixtureWithStepUp(t)
+				setup, err := fx.server.deps.MFA.GenerateSetup(t.Context(), fx.user.id, 0, fx.sess.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fx.user.version = 1
+				if operation == "disable" {
+					fx.user.mfaOn = true
+					fx.user.secret = []byte("active-secret")
+				}
+				fx.sess.AuthVersionSet = captured
+				recorder := &profileAuditRecorder{}
+				fx.server.deps.AuditRecorder = recorder
+				body, err := json.Marshal(mfaVerifyRequest{EnrollmentID: setup.EnrollmentID, Code: "123456"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa", bytes.NewReader(body))
+				req = req.WithContext(session.WithSession(req.Context(), fx.sess))
+				response := httptest.NewRecorder()
+				switch operation {
+				case "setup":
+					fx.server.handleMFAGenerate()(response, req)
+				case "enable":
+					fx.server.handleMFAVerify()(response, req)
+				case "disable":
+					fx.server.handleMFADisable()(response, req)
+				}
+				if response.Code != http.StatusUnauthorized || len(fx.store.enrollments) != 1 || fx.user.mfaOn != (operation == "disable") {
+					t.Fatalf("refused mutation changed credentials: status %d", response.Code)
+				}
+				for _, event := range recorder.events {
+					if event.ActionStatus == "success" {
+						t.Fatal("refused mutation recorded success")
+					}
+				}
+			})
+		}
+	}
 }
 
 func (f *mfaFakeStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error) {
@@ -240,10 +287,11 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 	// Pre-issue a session bound to the fixture's real browser key.
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
-		UserID:    u.id.String(),
-		IP:        "127.0.0.1",
-		UserAgent: "test-agent",
-		DPoPJKT:   browser.jkt,
+		UserID:         u.id.String(),
+		AuthVersionSet: true,
+		IP:             "127.0.0.1",
+		UserAgent:      "test-agent",
+		DPoPJKT:        browser.jkt,
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)

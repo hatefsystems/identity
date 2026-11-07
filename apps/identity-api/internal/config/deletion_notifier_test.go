@@ -15,10 +15,12 @@ func deletionNotifierEnvironment(t *testing.T) {
 		EnvDeletionSMTPCABundle, EnvDeletionNotifierDatabaseURL, EnvDeletionNotifierBatchSize,
 		EnvDeletionNotifierConcurrency, EnvDeletionNotifierLeaseDuration, EnvDeletionNotifierRetryBase,
 		EnvDeletionNotifierRetryMax, EnvDeletionNotifierPollInterval, EnvDeletionNotifierStartupTimeout,
-		"APP_ENV", EnvGDPRGracePeriod, EnvGDPRReclaimMaxAttempts,
+		"APP_ENV", EnvPortalOrigin, EnvGDPRGracePeriod, EnvGDPRReclaimMaxAttempts,
 	} {
 		t.Setenv(key, "")
 	}
+	t.Setenv("APP_ENV", "production")
+	t.Setenv(EnvPortalOrigin, "https://identity.example.test")
 	t.Setenv(EnvDeletionSMTPHost, "relay.example.test")
 	t.Setenv(EnvDeletionSMTPUsername, "notifier")
 	t.Setenv(EnvDeletionSMTPPassword, "private-password")
@@ -51,6 +53,7 @@ func TestDeletionNotifierOverrides(t *testing.T) {
 	for key, value := range map[string]string{
 		EnvDeletionSMTPHost: "::1", EnvDeletionSMTPPort: "2465", EnvDeletionSMTPTLSMode: DeletionSMTPImplicit,
 		EnvDeletionSMTPFrom: "support+deletion@example.test", EnvDeletionSMTPPublicOrigin: "https://[::1]:8443",
+		EnvPortalOrigin:        "https://[::1]:8443",
 		EnvDeletionSMTPTimeout: "2s", EnvDeletionSMTPCABundle: "/run/secrets/relay-ca.pem",
 		EnvDeletionNotifierBatchSize: "17", EnvDeletionNotifierConcurrency: "2", EnvDeletionNotifierLeaseDuration: "20s",
 		EnvDeletionNotifierRetryBase: "3s", EnvDeletionNotifierRetryMax: "8s",
@@ -202,7 +205,7 @@ func TestDeletionNotifierSharedPolicyAndAPIIndependence(t *testing.T) {
 				t.Setenv("APP_ENV", environment)
 				t.Setenv(EnvGDPRGracePeriod, grace)
 				_, err := LoadDeletionNotifier()
-				wantValid := grace == "720h" || environment == "development" || environment == "test"
+				wantValid := environment == "production" && grace == "720h" || environment == "development" || environment == "test"
 				if (err == nil) != wantValid {
 					t.Fatal("worker recovery window diverged from production policy")
 				}
@@ -220,5 +223,24 @@ func TestDeletionNotifierSharedPolicyAndAPIIndependence(t *testing.T) {
 				t.Fatal("invalid shared policy accepted or disclosed")
 			}
 		})
+	}
+}
+
+func TestDeletionNotifierRequiresMatchingPortalOrigin(t *testing.T) {
+	for _, origin := range []string{"", " ", "https://other.example.test", "https://identity.example.test:8443", "https://identity.example.test/", "https://identity.example.test?", "https://identity.example.test#"} {
+		t.Run(origin, func(t *testing.T) {
+			deletionNotifierEnvironment(t)
+			t.Setenv(EnvPortalOrigin, origin)
+			if _, err := LoadDeletionNotifier(); err == nil || !strings.Contains(err.Error(), EnvPortalOrigin) {
+				t.Fatalf("invalid or mismatched portal accepted: %v", err)
+			}
+		})
+	}
+	deletionNotifierEnvironment(t)
+	for _, key := range []string{EnvOIDCIssuer, EnvOIDCSigningKey, EnvOIDCSigningKeyNext, EnvOIDCClients, EnvBlindIndexPepper, "SMS_GATEWAY_API_KEY", "DATABASE_URL"} {
+		t.Setenv(key, "unrelated-private-invalid-setting")
+	}
+	if _, err := LoadDeletionNotifier(); err != nil {
+		t.Fatalf("notifier depends on unrelated API settings: %v", err)
 	}
 }

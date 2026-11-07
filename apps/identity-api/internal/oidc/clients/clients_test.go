@@ -22,6 +22,67 @@ func testPublicKey(t *testing.T) *keys.PublicKey {
 	return pub
 }
 
+func TestRegistryCallbackStructure(t *testing.T) {
+	for _, uri := range []string{
+		"", " ", "/callback", "//client.example/callback", "https:client.example/callback", "https:///callback",
+		"javascript:alert(1)", "custom://client/callback", "ftp://client.example/callback",
+		"https://user@client.example/callback", "https://client.example#", "https://client.example/#token",
+		"https://client.example:", "https://client.example:0/callback", "https://client.example:65536/callback",
+		"https://client.example:abc/callback", "https://*.example/callback", "https://bad_host.example/callback",
+		"https://client.example/call back", "https://client.example\\callback", "https://client.example/\x7f",
+		"https://127.1/callback", "https://0177.0.0.1/callback", "https://0x7f000001/callback",
+		"https://[::ffff:127.0.0.1]/callback", "http://localhost.evil.example/callback", "http://10.0.0.1/callback",
+		"http://[fe80::1%25eth0]/callback",
+		"https://[localhost]/callback", "http://[localhost]/callback", "https://[127.0.0.1]/callback",
+		"https://client.99999999999999999999999999999999/callback", "https://client.0x/callback",
+		"https://client.example/call\u00a0back", "https://client.example/call\u0085back", "https://client.example/\xff",
+	} {
+		t.Run(uri, func(t *testing.T) {
+			c := validClient()
+			c.RedirectURIs = []string{uri}
+			if _, err := NewStaticRegistry([]Client{c}); err == nil {
+				t.Fatal("invalid callback accepted")
+			}
+			if _, err := NewDevelopmentStaticRegistry([]Client{c}); err == nil {
+				t.Fatal("development bypassed callback structure")
+			}
+		})
+	}
+}
+
+func TestRegistryLocalCallbacksRequireExplicitDevelopment(t *testing.T) {
+	for _, uri := range []string{"http://localhost:3000/callback", "http://127.0.0.1:3000/callback", "http://[::1]:3000/callback"} {
+		c := validClient()
+		c.RedirectURIs = []string{uri}
+		if _, err := NewStaticRegistry([]Client{c}); err == nil {
+			t.Fatal("default registry allows HTTP")
+		}
+		r, err := NewDevelopmentStaticRegistry([]Client{c})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := r.Lookup(c.ID)
+		if err != nil || !got.HasRedirectURI(uri) || got.HasRedirectURI(uri+"/") {
+			t.Fatal("development exact matching changed")
+		}
+	}
+}
+
+func TestRegistryHTTPSCallbacksRemainExact(t *testing.T) {
+	for _, uri := range []string{"https://client.example/callback", "https://client.example:8443/nested/callback?fixed=1", "https://[::1]:8443/callback", "https://client.example/call%20back", "https://client.0xample/callback"} {
+		c := validClient()
+		c.RedirectURIs = []string{uri}
+		r, err := NewStaticRegistry([]Client{c})
+		if err != nil {
+			t.Fatalf("structural HTTPS callback rejected: %v", err)
+		}
+		got, err := r.Lookup(c.ID)
+		if err != nil || !got.HasRedirectURI(uri) || got.HasRedirectURI(uri+"/") {
+			t.Fatal("exact matching changed")
+		}
+	}
+}
+
 func validClient() Client {
 	return Client{
 		ID:                      "hatef-nextjs-app",

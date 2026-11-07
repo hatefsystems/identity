@@ -14,7 +14,7 @@ The platform manages several categories of sensitive assets. Compromise of any o
 | :--- | :--- | :--- | :--- |
 | **Password Hashes** | PostgreSQL | Argon2id ($m=64\text{MB}$, $t=3$, $p=4$) with a cryptographically secure salt per user. | High: Offline brute-force risk if weak hashing was used; neutralized by Argon2id parameters. |
 | **Recovery Codes** | PostgreSQL | SHA-256 hashes ($O(1)$ fast indexed database lookup), high entropy (minimum 128-bit random value), atomic single-use destruction. | High: Account takeover. Implemented SHA-256 database index lookup to eliminate Argon2id CPU DoS vectors. |
-| **PII (Phone, Backup Email, MFA secrets)** | PostgreSQL | Envelope Encryption: AES-GCM-256 with dynamic Data Encryption Keys (DEKs) wrapped by a Master Key Encryption Key (KEK) managed in Infisical. | High: Privacy violation (GDPR/compliance audit failure). Protected via application-layer envelope encryption. |
+| **PII (Phone, Backup Email, MFA secrets, pending signup)** | PostgreSQL | Real AES-GCM-256, random per-record DEKs and one environment-injected KEK/version in process-local custody. | High: Privacy violation; no live Infisical fetch/cache/fallback/hot rotation or automatic retired-key retrieval. Protected backup/key inventory remains an operator obligation. |
 | **DPoP Private Keys** | Browser (IndexedDB) | WebCrypto API with `extractable: false` constraint. Strict Content Security Policy (CSP) with Strict-Nonce to prevent XSS-based extraction. | Medium: Request spoofing. Mitigated by sender-constrained tokens and non-extractable client-side storage. |
 | **Session & Refresh Tokens** | Redis / Client Cookie | Next.js and Go session cookies with `__Host-` secure prefix, `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`. Refresh Token Rotation (RTR). | High: Active session hijacking. |
 | **Step-up Replay HMAC Key** | Infisical / process memory | Base64-encoded key of at least 32 decoded bytes, identical on every replica, used to derive opaque Redis replay keys. | High: Inconsistent or exposed key material can split the replay domain or reveal replay-key inputs. |
@@ -58,7 +58,7 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 1. **Client Boundary (Browser / Next.js SPA):** Regarded as untrusted. Host-level cookies are sealed using cryptographic flags. All script executions are limited by Strict-Nonce Content Security Policy (CSP).
 2. **Ingress Insecure Boundary (HTTP):** Completely untrusted. Automatically redirected to HTTPS by the active edge ingress (Nginx in the MVP, Traefik in the post-MVP target).
 3. **Ingress Secure Boundary (HTTPS):** Semi-trusted edge terminating public TLS. Routes path-based requests directly to Next.js or Go IdP. Only explicitly configured immediate proxy CIDRs may assert `X-Forwarded-For`; the edge overwrites inbound forwarding headers and the backend is not exposed directly.
-4. **Go IdP Core Boundary:** High-trust internal backend. Houses local cryptographic keys (retrieved from Infisical) and performs identity verification.
+4. **Go IdP Core Boundary:** Holds operator-injected local cryptographic keys and performs bounded proofs. Infisical/SOPS/Sealed Secrets are provisioning options, not a live runtime KMS integration. Exact `APP_ENV=development|test|production` is mandatory; test is not a development exemption.
 5. **Internal gRPC Mesh Boundary:** Zero-Trust boundary. Every microservice within the Hatef ecosystem (e.g., Go Email Service, C++ Search Core) must authenticate via mutual TLS (mTLS) with dynamically rotated SPIFFE SVIDs issued by SPIRE.
 
 ---
@@ -95,6 +95,9 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
   * *Description:* Concurrent passkey deletion and TOTP-disable requests race their independent factor counts and leave an account without a browser login credential.
   * *Mitigation:* Both mutations begin a database transaction and lock the user row first. Passkey deletion then locks that user's credentials in stable credential-ID order before counting and deleting. The final passkey is always retained because WebAuthn is currently the only session-issuing browser login surface; TOTP disablement likewise refuses to remove the last factor when no passkey remains.
 
+* **Threat T6: Credential Mutation After Session Revocation**
+  * *Mitigation:* Factor/recovery changes carry the admitted auth version, take the shared subject lock and lock/recheck the active nondeleted user before pending/attempt/credential writes. A stale session snapshot cannot finish enrollment or replace codes after revocation. Already admitted work is not retrospectively cancelled; deciding transaction order matters.
+
 ### 2.3 Repudiation (Denying Actions)
 
 * **Threat R1: Admin Denies Performing Unauthorized Account Ban or Deletion**
@@ -120,7 +123,7 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
   * *Mitigation:* High-entropy backup codes ($128$-bit minimum) are immune to dictionary attacks and are stored as SHA-256 hashes instead of Argon2id. This allows direct indexed database lookups ($O(1)$ lookup time) and prevents CPU exhaustion DoS.
 * **Threat D2: SMS OTP Gateway Toll Fraud and Bombing**
   * *Description:* Attackers execute a script to trigger thousands of SMS OTP requests, causing massive financial costs and service degradation.
-  * *Mitigation:* Independent rate limiting in Redis. SMS triggers are limited independently per phone number (e.g., max 1/minute and 5/hour) and per IP subnet range (e.g., max 10/hour). Failed OTP verification is capped at 3 attempts; on the 3rd fail, the OTP is purged and the number is locked out for 15 minutes.
+  * *Mitigation:* Enabled SMS uses shared atomic phone/subnet/global limits and finite outstanding-signup capacity, plus bounded attempts/expiry/lockout. Disabled mode needs no provider key and retains DB-only removal. SMS.ir VERIFY is fixed HTTPS POST, Iranian-only destination policy and explicit live/sandbox mode; production live-only. Six-digit string codes preserve zeros. Provider throttle is a failed send, not falsely reported local throttling. Sandbox success sends nothing; approved spend/egress/key/template/handset receipt remain operational gates, not guarantees from engineering ceilings.
 
 ### 2.6 Elevation of Privilege (Privilege Escalation)
 
@@ -165,7 +168,8 @@ sentinels, report/transparency replay and governance provenance, chain event UUI
 digests and erasure/receipt material. Minimization is not unconditional anonymity
 or blanket approval of permanent retention. See the [exact retained inventory](data-architecture.md#retained-metadata-inventory)
 and unchecked [production checklist](admin-operations.md#production-checklist).
-Fresh installation uses only `00001_initial_schema.sql` and
+Fresh installation uses unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql`, tracked through version 2 in
 `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked
 nonempty application schemas and contradictory histories refuse without mutation,
 even if old storage appears equivalent. There is no in-place upgrade/adoption,
@@ -174,8 +178,27 @@ explicitly scoped fresh PostgreSQL target with matching isolated Redis/NATS stat
 so stale authority, queued events and checkpoints cannot enter the new database.
 Baseline Down/reset refuse; disposable-data confirmation does not authorize an
 existing-environment reset, which needs separately explicit scoped targets.
-Optional standalone backfill retains cryptographic/read-back/error contracts only
-as a focused compatibility operation, not a new-lineage upgrade path. Operator
+Obsolete legal Backfill/plaintext compatibility is removed, not a new-lineage
+upgrade path. Operator
 genesis/provisioning, legal retention, approval and production/manual gates remain
 unchanged; historical evidence does not certify fresh-baseline acceptance.
 In-flight work must stop before emergency revocation is declared effective.
+
+### 2.9 Conditional Signup, Unicode and Delivery
+
+| Risk | Required boundary / residual risk |
+|---|---|
+| Identity aliases or misdelivery | Canonical NFC/local lowercase/NFC plus strict non-transitional IDNA; exact canonical verify/store/deliver/lookup and email HMAC input. Generic BlindIndex NFKC remains unchanged. NFC equivalents converge; Persian/Arabic, dot/plus and NFKC-distinct mailboxes remain distinct. Reject malformed/invisible inputs instead of stripping them; no signed-history rehash or fallback normalization. |
+| EAI downgrade / secret leakage | Strict post-TLS EHLO must advertise SMTPUTF8 before EAI AUTH/envelope/DATA. System sender/auth stays ASCII; no transliteration/address rerouting. Message-free readiness probes do not prove independent mailbox access or actual inbox delivery. |
+| Stolen/transplanted enrollment | Attempt capability hash, original verified DPoP JKT, distinct email token, signup-purpose phone reference and frozen resident UV ceremony. Email link fragment is scrubbed before explicit verification; it cannot mint a capability/session/role. Capability cannot authorize account, recovery, Step-up, OAuth or admin operations. |
+| Unbounded PII or delivery costs | Explicit finite admission/send/pending budgets; 15m pending, 10m email, <=5m passkey and 1h receipt; separate actual-login bounded cleanup with holds/subject locks. Holds retain expired evidence, not renewed authority. Cleanup outage cannot bypass pending capacity; ceilings are not operator budget approval. |
+| Duplicate account birth / lost completion response | Final user/credential/encrypted-phone/created-event/receipt commit together. DB uniqueness protects active/pending-deletion identifiers and credentials. Same-capability/JKT result reconciliation uses a fresh proof; no existing-account attachment, email-only capability recovery or speculative duplicate creation. External mail/SMS acceptance remains ambiguous and not exactly once. |
+| Fake provider or production development mode | Exact mode allowlist, positive development-only conveniences and no fallback on errors. SMS.ir fixed VERIFY POST/verified TLS/Iranian-only policy; production live-only, no runtime fake-provider switch. Controlled internal DNS/trust fixtures exercise the immutable image without external egress and are not real sandbox/handset evidence. |
+| Audit or lookup mismatch | Capture preserves canonical-email digest+generation; storage admission rejects invalid actor/time/shape/index metadata before hashing with fixed redacted quarantine reasons. Moderator lookup requires mandatory returned `canonical_email` bound to its selected row; no raw-input/ASCII-only fallback. Neither metadata field grants additional disclosure authority. |
+
+Registration/SMS default disabled. These contracts do not certify final service,
+race, immutable-image browser or cleanup acceptance. Live provider/billing/egress,
+mailbox access, private key custody/recovery, approved retention/budgets, effective
+deployed logins and supervision remain separate enablement gates. No mailbox,
+password, role or session bootstrap, laboratory reset/adoption or live-target
+permission is supplied.

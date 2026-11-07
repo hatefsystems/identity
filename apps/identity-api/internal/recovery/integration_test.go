@@ -43,6 +43,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 // testTimeout bounds the whole lifecycle per test run.
@@ -114,12 +115,8 @@ func createTestUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email
 	t.Helper()
 
 	q := db.New(pool)
-	// A previous aborted run may have left this fixture behind; the email is
-	// unique among non-deleted rows, so clear it first.
-	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE email = $1`, email); err != nil {
-		t.Fatalf("clear stale fixture %s: %v", email, err)
-	}
-
+	// Allocate run-owned identities; never adopt or clear a previous fixture.
+	email = uuid.NewString() + "." + email
 	user, err := q.CreateUser(ctx, db.CreateUserParams{Email: email, Status: "active"})
 	if err != nil {
 		t.Fatalf("CreateUser %s: %v", email, err)
@@ -157,7 +154,7 @@ func TestIntegrationVerifyPhysicallyDeletesOneRow(t *testing.T) {
 	q := db.New(pool)
 	userID := createTestUser(ctx, t, pool, "recovery-consume@test.local")
 
-	batch, err := svc.Generate(ctx, userID, "")
+	batch, err := svc.Generate(ctx, userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -207,7 +204,7 @@ func TestIntegrationConcurrentVerifyAllowsOneWinner(t *testing.T) {
 	svc := newIntegrationService(t, pool)
 	userID := createTestUser(ctx, t, pool, "recovery-race@test.local")
 
-	batch, err := svc.Generate(ctx, userID, "")
+	batch, err := svc.Generate(ctx, userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -267,11 +264,11 @@ func TestIntegrationRegenerateInvalidatesPreviousBatch(t *testing.T) {
 	svc := newIntegrationService(t, pool)
 	userID := createTestUser(ctx, t, pool, "recovery-regen@test.local")
 
-	first, err := svc.Generate(ctx, userID, "")
+	first, err := svc.Generate(ctx, userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate first batch: %v", err)
 	}
-	second, err := svc.Generate(ctx, userID, "")
+	second, err := svc.Generate(ctx, userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate second batch: %v", err)
 	}
@@ -316,7 +313,7 @@ func TestIntegrationConcurrentGenerateLeavesOneWholeBatch(t *testing.T) {
 		go func(idx int) {
 			defer done.Done()
 			start.Wait()
-			results[idx], errs[idx] = svc.Generate(ctx, userID, "")
+			results[idx], errs[idx] = svc.Generate(ctx, userID, 0, "")
 		}(i)
 	}
 	start.Done()
@@ -392,7 +389,7 @@ func TestIntegrationGenerateContendsOnUserRow(t *testing.T) {
 	}
 
 	blockedCtx, blockedCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	_, err = svc.Generate(blockedCtx, userID, "")
+	_, err = svc.Generate(blockedCtx, userID, 0, "")
 	blockedCancel()
 	if err == nil {
 		t.Fatal("Generate completed while another transaction held the user row lock")
@@ -404,7 +401,7 @@ func TestIntegrationGenerateContendsOnUserRow(t *testing.T) {
 	if err := blocker.Commit(ctx); err != nil {
 		t.Fatalf("release user row lock: %v", err)
 	}
-	if _, err := svc.Generate(ctx, userID, ""); err != nil {
+	if _, err := svc.Generate(ctx, userID, 0, ""); err != nil {
 		t.Fatalf("Generate after releasing user row lock: %v", err)
 	}
 	if got := countRows(ctx, t, pool, userID); got != defaultCount {
@@ -425,11 +422,11 @@ func TestIntegrationCrossUserCodeRefused(t *testing.T) {
 	victimID := createTestUser(ctx, t, pool, "recovery-victim@test.local")
 	attackerID := createTestUser(ctx, t, pool, "recovery-attacker@test.local")
 
-	victimBatch, err := svc.Generate(ctx, victimID, "")
+	victimBatch, err := svc.Generate(ctx, victimID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate for the victim: %v", err)
 	}
-	if _, err := svc.Generate(ctx, attackerID, ""); err != nil {
+	if _, err := svc.Generate(ctx, attackerID, 0, ""); err != nil {
 		t.Fatalf("Generate for the attacker: %v", err)
 	}
 
@@ -459,7 +456,7 @@ func TestIntegrationNonActiveAccountRefused(t *testing.T) {
 	q := db.New(pool)
 	userID := createTestUser(ctx, t, pool, "recovery-suspended@test.local")
 
-	batch, err := svc.Generate(ctx, userID, "")
+	batch, err := svc.Generate(ctx, userID, 0, "")
 	if err != nil {
 		t.Fatalf("Generate while active: %v", err)
 	}
@@ -469,7 +466,7 @@ func TestIntegrationNonActiveAccountRefused(t *testing.T) {
 			t.Fatalf("UpdateUserStatus %s: %v", status, err)
 		}
 
-		if _, err := svc.Generate(ctx, userID, ""); !errors.Is(err, ErrAccountNotActive) {
+		if _, err := svc.Generate(ctx, userID, 0, ""); !errors.Is(err, ErrAccountNotActive) {
 			t.Errorf("Generate for a %s account = %v, want ErrAccountNotActive", status, err)
 		}
 		if _, err := svc.Status(ctx, userID); !errors.Is(err, ErrAccountNotActive) {
@@ -489,5 +486,81 @@ func TestIntegrationNonActiveAccountRefused(t *testing.T) {
 	}
 	if err := svc.Verify(ctx, userID, batch.Codes[0], ""); err != nil {
 		t.Errorf("Verify after reinstatement = %v, want nil", err)
+	}
+}
+
+type regenerationAdmissionStore struct {
+	Store
+	admitted chan struct{}
+}
+
+func (s *regenerationAdmissionStore) GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error) {
+	user, err := s.Store.GetUserByID(ctx, id)
+	close(s.admitted)
+	return user, err
+}
+
+func TestIntegrationGenerationFencesAdmittedVersionAfterRevocation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	pool := openTestPool(ctx, t)
+	id := createTestUser(ctx, t, pool, "version-fence@test.local")
+	initial := newIntegrationService(t, pool)
+	oldBatch, err := initial.Generate(ctx, id, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revocation, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = revocation.Rollback(context.Background()) }()
+	if err := pglock.LockAccount(ctx, revocation, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.New(revocation).GetUserByIDForUpdate(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	store := &regenerationAdmissionStore{Store: db.New(pool), admitted: make(chan struct{})}
+	svc, err := New(Config{}, store, WithTransacter(pool))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type outcome struct {
+		result *GenerateResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() { res, err := svc.Generate(ctx, id, 0, ""); done <- outcome{res, err} }()
+	select {
+	case <-store.admitted:
+	case <-ctx.Done():
+		t.Fatal("generation was never admitted")
+	}
+	if err := db.New(revocation).RevokeUserCredentials(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := revocation.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var result outcome
+	select {
+	case result = <-done:
+	case <-ctx.Done():
+		t.Fatal("generation did not finish after revocation")
+	}
+	if result.result != nil || !errors.Is(result.err, ErrAccountNotActive) {
+		t.Fatalf("stale Generate = %v, %v", result.result, result.err)
+	}
+	if got := countRows(ctx, t, pool, id); got != oldBatch.Count {
+		t.Fatalf("stale Generate changed row count: %d", got)
+	}
+	for _, code := range oldBatch.Codes {
+		if err := initial.Verify(ctx, id, code, ""); err != nil {
+			t.Fatalf("old batch was changed: %v", err)
+		}
+	}
+	if _, err := initial.Generate(ctx, id, 1, ""); err != nil {
+		t.Fatalf("fresh version rejected: %v", err)
 	}
 }

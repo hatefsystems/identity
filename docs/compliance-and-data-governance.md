@@ -23,8 +23,14 @@ Personal data that exists to serve the user and is erased when the user is delet
 - Phone number, backup email, MFA/TOTP secrets (stored envelope-encrypted).
 - Password hash, WebAuthn credentials, recovery codes.
 - Active sessions and refresh tokens.
+- Durable registration attempts: encrypted frozen email/phone/handle/ceremony,
+  capability/token hashes, original browser JKT and bounded proof/outcome metadata.
+  Pending state is not an account or login; possession proofs do not identify a
+  legal person or confer any privileged role.
 
 **Lifecycle:** Removed during hard-delete (see Section 5). Erasure is the default.
+Pending signup has no user subject and expires via its separate bounded cleanup;
+completed receipt retains the original-subject FK cascade and hold-aware policy.
 
 ### 2.2 Class B - Minimal Security Metadata (Platform-Owned), Pseudonymized Personal Data
 Non-content, minimized metadata retained to attribute abusive or security-relevant actions even after an account is deleted. This is the class that answers "who did this, and when" after the fact.
@@ -64,12 +70,23 @@ Retention is purpose-bound and time-boxed. Expiry-driven purges run after their 
 | :--- | :--- | :--- | :--- | :--- |
 | Active account PII & credentials | A | Life of account | Contract / consent | Hard-delete on erasure |
 | Sessions & refresh tokens | A | Until logout / expiry | Contract | TTL + revocation |
+| Pending registration | A | 15m; email proof <=10m, passkey <=5m, capped by original deadline | Account enrollment / abuse prevention, subject to approved notices and lawful basis | Dedicated bounded cleanup; expiry checks alone are not physical erasure |
+| Registration completion receipt | A | 1h after completion, subject to current original-subject holds | Bounded outcome reconciliation | Dedicated hold-aware cleanup; user FK cascade cannot prevent lawful account purge |
 | Deletion grace record | A | 30 days | Contract / user recovery | Cron after grace window |
 | Security event ledger | B | 365 days (`8760h`; validated `4320h..13140h` range) | Legitimate interest / legal obligation | Separately credentialed hourly worker after rollout gates |
 | Admin/system audit logs | C | Long-term (policy-defined) | Legal obligation / accountability | Append-only; no ad-hoc delete |
 | Backups (PostgreSQL) | Mixed | Per backup retention (e.g., 14-30 days) | Operational continuity | Backup rotation |
 
 The configured security-ledger policy is `SECURITY_LEDGER_RETENTION=8760h` (365 days). Changes within the validated range require a documented policy decision. The signer derives expiry from event occurrence, not ingestion time. The worker honors persisted `retain_until`; it neither rewrites signed timestamps nor restarts retention after a hold release. A shorter window is more privacy-protective; a longer window reduces the risk of being unable to answer a late-arriving lawful request. There is no "keep everything indefinitely" fallback.
+
+Registration/SMS default disabled. Transient windows and finite admission/send
+ceilings are not production budget/legal-basis approval. Complete ROPA/DPIA/notices,
+vendor terms, country-routing/spend approval and supervised cleanup before
+enablement. Completed attempts clear transient contact/token/ceremony payloads;
+retained receipts need only bounded capability/JKT-bound outcome metadata. Current
+holds can retain a completed receipt, never extend an expired proof or capability.
+Pending/failed attempts have no user subject; expiry alone does not erase stored
+PII, and protected backups retain their independent rotation/recovery obligations.
 
 ---
 
@@ -372,9 +389,28 @@ Each right is exposed through user-facing endpoints and dashboard controls, and 
 
 ## 15. Vendor / Sub-processor Management
 
-- Third-party processors (e.g., SMS gateway, Infisical KMS) are inventoried.
+- Inventory proposed/enabled SMS.ir and SMTP processors and operator secret-delivery
+  tools. Current crypto loads environment-injected local keys; it does not fetch
+  live Infisical material or supply cached/offline/hot-rotation guarantees.
 - Each has a data-processing agreement (DPA) defining scope, security obligations, and data handling.
 - Sub-processors are reviewed before onboarding and periodically thereafter.
+
+SMS.ir VERIFY sends only to the supported Iranian mobile policy with explicit
+key/template/parameter and budget approval. Sandbox shares the endpoint and
+success-shaped responses but sends nothing; ID/cost/ACK does not prove live key
+provenance or handset delivery. A live received-message test needs separate
+billing/target authorization. SMTP must use verified authenticated TLS and strict
+post-TLS SMTPUTF8 before EAI AUTH/envelope/DATA; no ASCII mailbox downgrade. Relay
+acceptance and durable send intent are not inbox receipt or exactly-once delivery.
+
+New account email is an existing owned mailbox, not a mailbox supplied by the IdP.
+NFC/local lowercase/NFC plus strict IDNA is the declared identity profile; verify,
+store, deliver and lookup exact canonical bytes. Persian/Arabic letters, dot/plus
+variants and NFKC-distinct addresses stay distinct. Generic BlindIndex's NFKC
+construction is unchanged; email capture/fallback/attribution shares its explicit
+canonical input and pepper generation, without rehashing signed history or adding
+historical dual-normalization lookup. Private retired-key backup/recovery and
+coordinated rotation remain operator obligations, not primitive-test assurance.
 
 ---
 
@@ -398,6 +434,6 @@ These are stated as posture and targets; formal certification is pursued as the 
 
 ### Task 5.3 implementation boundary
 
-Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes identifiers, blind indexes and legal narratives. Reviewed dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup; opaque replay tombstones prevent cleaned requests from reapplying holds. Fresh baseline storage has no plaintext narratives. Optional standalone backfill preserves encryption/read-back/binding and error contracts only as a separately scoped focused compatibility operation, not a new-lineage upgrade path. See [admin operations](admin-operations.md#standalone-compatibility-backfill).
+Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives deletion. Restricted narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but remains personal data. Review dates are advisory. Approved retention and hold-aware cleanup retain replay tombstones without reapplying cleaned holds. Fresh storage has no plaintext narratives; obsolete legal Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 owns separately credentialed ledger payload retention, structural chain/leaf/annotation verification and independent read-only receipt reconciliation, not legal erasure certification. External anchors, phone attribution and pepper rotation remain separate work. Task 5.5 narrative/inventory approval is not satisfied by the worker. API must not get ledger DELETE, head EXECUTE or trigger bypass. Install only the single fresh `00001_initial_schema.sql` baseline tracked in `public.identity_schema_version`; all legacy `public.goose_db_version`, untracked nonempty application schemas and contradictory histories refuse without upgrade/adoption. Stop old writers and isolate matching PostgreSQL/Redis/NATS state. Baseline Down/reset refuse. Existing data was confirmed disposable, not legally erased or approved for reset: any existing-environment reset requires separate explicit scoped authorization and does not waive retention/hold/backup obligations. Historical evidence and prior plans remain unchanged, not acceptance of the new baseline. All three tasks remain unchecked pending fresh local automated acceptance; production/manual gates remain open in [admin operations](admin-operations.md#production-checklist).
+Task 5.4 owns separately credentialed payload retention, structural verification and read-only receipt reconciliation, not erasure certification or Task 5.5 approval. External anchors, phone attribution and pepper rotation remain separate. API must not get ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002_registration_attempts.sql` through `public.identity_schema_version`; legacy/untracked/contradictory histories refuse without adoption. Stop incompatible writers and isolate matching PostgreSQL/Redis/NATS. Down/reset refuse; any existing-environment reset requires separate explicit scoped authorization and never waives retention/hold/backup obligations. Historical statuses/evidence/plans remain unchanged and do not certify this bundle. Fresh final-source acceptance and [production/manual gates](admin-operations.md#production-checklist) remain independently required.

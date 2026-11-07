@@ -10,8 +10,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"math/big"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,6 +255,99 @@ func TestAuthenticateReplayedJTI(t *testing.T) {
 	// Same assertion again -> replay.
 	if _, err := h.auth.Authenticate(context.Background(), form(assertion)); !errors.Is(err, ErrReplay) {
 		t.Fatalf("err = %v, want ErrReplay", err)
+	}
+}
+
+func TestAuthenticateReplayRetainedThroughoutLeeway(t *testing.T) {
+	h := newHarness(t, es256Signer(t))
+	now := h.now
+	h.auth.now = func() time.Time { return now }
+	h.auth.jti.(*MemoryJTIGuard).now = func() time.Time { return now }
+	claims := standardClaims(now)
+	exp := now.Add(time.Second)
+	claims["exp"] = exp.Unix()
+	assertion := h.sk.sign(t, h.header(), claims)
+	if _, err := h.auth.Authenticate(t.Context(), form(assertion)); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []time.Time{exp.Add(-time.Nanosecond), exp, exp.Add(time.Nanosecond), exp.Add(clockSkewLeeway - time.Nanosecond)} {
+		now = at
+		if _, err := h.auth.Authenticate(t.Context(), form(assertion)); !errors.Is(err, ErrReplay) {
+			t.Fatalf("replay at %s = %v", at, err)
+		}
+	}
+	for _, at := range []time.Time{exp.Add(clockSkewLeeway), exp.Add(clockSkewLeeway + time.Nanosecond)} {
+		now = at
+		if _, err := h.auth.Authenticate(t.Context(), form(assertion)); !errors.Is(err, ErrExpired) {
+			t.Fatalf("expired at %s = %v", at, err)
+		}
+	}
+}
+
+func TestAuthenticateFirstUseInsideLeeway(t *testing.T) {
+	h := newHarness(t, es256Signer(t))
+	claims := standardClaims(h.now)
+	claims["exp"] = h.now.Add(-clockSkewLeeway + time.Second).Unix()
+	assertion := h.sk.sign(t, h.header(), claims)
+	if _, err := h.auth.Authenticate(t.Context(), form(assertion)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.auth.Authenticate(t.Context(), form(assertion)); !errors.Is(err, ErrReplay) {
+		t.Fatalf("replay = %v", err)
+	}
+}
+
+func TestAuthenticateBoundedAndMalformedClaims(t *testing.T) {
+	h := newHarness(t, es256Signer(t))
+	for _, value := range []any{1.5, "123", json.Number("9223372036854775808"), json.Number("1e999")} {
+		claims := standardClaims(h.now)
+		claims["exp"] = value
+		if _, err := h.auth.Authenticate(t.Context(), form(h.sk.sign(t, h.header(), claims))); !errors.Is(err, ErrInvalidAssertionClaims) {
+			t.Fatalf("malformed exp = %v", err)
+		}
+	}
+	for _, value := range []any{math.NaN(), math.Inf(1), math.Inf(-1), -1.0, 1.5, 1e30} {
+		if _, ok := timeClaim(map[string]any{"exp": value}, "exp"); ok {
+			t.Fatal("invalid NumericDate accepted")
+		}
+	}
+	for _, jti := range []string{strings.Repeat("j", maxJTIBytes+1), "\x00", "   "} {
+		claims := standardClaims(h.now)
+		claims["jti"] = jti
+		if _, err := h.auth.Authenticate(t.Context(), form(h.sk.sign(t, h.header(), claims))); !errors.Is(err, ErrInvalidAssertionClaims) {
+			t.Fatalf("invalid JTI = %v", err)
+		}
+	}
+	if _, err := h.auth.Authenticate(t.Context(), form(strings.Repeat("a", 16*1024+1))); !errors.Is(err, ErrMalformedAssertion) {
+		t.Fatalf("oversized assertion = %v", err)
+	}
+}
+
+func TestAuthenticateRedisTemporalAdmissionUsesServerClock(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		exp       time.Duration
+		localSkew time.Duration
+		want      error
+	}{
+		{"valid_with_fast_local_clock", time.Minute, time.Hour, nil},
+		{"expired_with_slow_local_clock", -clockSkewLeeway, -time.Hour, ErrExpired},
+		{"excessive_with_fast_local_clock", DefaultMaxAssertionLifetime + clockSkewLeeway + time.Second, 2 * time.Minute, ErrExcessiveLifetime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, es256Signer(t))
+			guard, _, _ := newRedisClockGuard(t, h.now)
+			auth, err := New(h.auth.registry, testAudience, guard, WithClock(func() time.Time { return h.now.Add(tc.localSkew) }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims := standardClaims(h.now)
+			claims["exp"], claims["iat"] = h.now.Add(tc.exp).Unix(), h.now.Add(-2*time.Minute).Unix()
+			result, err := auth.Authenticate(t.Context(), form(h.sk.sign(t, h.header(), claims)))
+			if !errors.Is(err, tc.want) || (err == nil && result.ID != testClientID) {
+				t.Fatalf("shared temporal admission = %v", err)
+			}
+		})
 	}
 }
 

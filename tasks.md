@@ -4,8 +4,9 @@ This document outlines the complete step-by-step roadmap for implementing the Ha
 
 ## Active Installation Contract
 
-Install only the single fresh `00001_initial_schema.sql` baseline with `migrate up`,
-tracked as version 1 in `public.identity_schema_version`. All legacy
+Install unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql` with `migrate up`, tracked through version 2
+in `public.identity_schema_version`. The bundle is forward-only. All legacy
 `public.goose_db_version` targets, untracked nonempty application schemas and
 contradictory histories are refused, not upgraded, stamped or adopted. Stop old
 writers and select explicitly scoped fresh PostgreSQL plus matching fresh/isolated
@@ -13,11 +14,11 @@ Redis/NATS state. Existing Identity data was confirmed disposable; resetting any
 existing environment still requires separate explicit authorization naming its
 exact targets. Baseline rollback/reset is unavailable.
 
-Optional standalone backfill is a focused compatibility operation, not an install
-or new-lineage upgrade path. Operator-only roles/genesis, policy approval, key
+Obsolete legal Backfill/plaintext compatibility is absent from active installation;
+dated records and prior plans retain historical meaning. Operator-only roles/genesis, policy approval, key
 inventory, legal retention and manual/production gates remain separate. See
 [active setup](docs/admin-operations.md#migration-and-contraction) and the
-[fresh-baseline acceptance placeholder](docs/admin-operations.md#fresh-baseline-acceptance-placeholder).
+[active validation requirements](docs/admin-operations.md#automated-validation).
 The task statuses, original implementation descriptions/migration names and dated
 acceptance records below are unchanged historical records, not current install
 instructions or evidence for this new baseline. Prior plans remain unchanged.
@@ -30,9 +31,28 @@ A task is considered complete only when it meets the following criteria:
 
 1. **Unit Test Coverage:** All business logic methods, utility functions, and architectural layers must have comprehensive unit tests covering both happy paths and edge cases.
 2. **Integration Tests:** API endpoints, gRPC services, workers and privilege boundaries must be verified against disposable real backing services wherever the acceptance inventory requires PostgreSQL, Redis, JetStream or mTLS. Mocks belong in unit tests and failure-injection tests; they do not substitute for mandatory real-service integration or actual non-owner login tests. Missing dependencies and skipped mandatory tests block completion.
-3. **No Hardcoded Secrets:** No sensitive credentials or secrets are permitted in the source code; everything must utilize the centralized Key Management Service (KMS/Secrets) and environment variables.
+3. **No Hardcoded Secrets:** No sensitive credentials or secrets are permitted in source. Operators inject private secrets through environment configuration; the current crypto adapter has process-local custody of one KEK/version and one pepper/version, not live Infisical fetch/cache/hot rotation. Retired key backup, recovery and coordinated rotation remain operator obligations.
 4. **Validation and Linting:** All automated tests, type-checks, and code-quality linters (such as `golangci-lint` or ESLint/Prettier) must run and pass without any warnings or errors.
 5. **Acceptance Boundary:** A checked implementation task certifies its defined local automated acceptance against the final source, with dated commands, final exits, source/generated-code and image fingerprints, sanitized results and confirmed teardown. It does not authorize production processing or certify governance, deployed grants/ingress, deployed backup/key recovery or unobserved manual accessibility/authenticator/native-browser checks. Those gates remain explicitly open in the relevant runbook. Historical passes and test source alone do not certify new changes.
+
+Active preproduction completion additionally requires exact `APP_ENV` admission
+(`development|test|production`, test not development) and fail-closed disabled-
+feature composition. Registration/SMS remain disabled until complete explicit
+configuration and approved operator budgets are supplied. Enabled registration
+verifies an existing owned Unicode email and Iranian phone, then creates a
+resident UV-required passkey, without issuing a role/password/mailbox/session.
+Pending/email/passkey/receipt validity is 15m/10m/at-most-5m/1h, with hold-aware
+bounded cleanup and capability+original-DPoP-key result reconciliation, not email-
+based capability recovery or exactly-once external delivery.
+
+Required final acceptance resolves fresh Nx targets and uses npm-prefixed Nx:
+seven one-suite service cells with `max-parallel: 1`, fail-fast disabled,
+unchanged deadlines, exactly seven aggregate results, nonzero test evidence,
+zero skips and verified run-owned cleanup. Seven affected race packages run
+separately; registration browser acceptance uses the immutable built image.
+These are requirements, not outcomes. No new final acceptance record or task
+completion is asserted here; all historical statuses and dated notes below are
+preserved. See [active validation](docs/admin-operations.md#automated-validation).
 
 ---
 

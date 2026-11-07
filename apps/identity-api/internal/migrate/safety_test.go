@@ -195,7 +195,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 		// when the provisioning role owns every object.
 		execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 		statuses, err := p.Status(ctx)
-		if err != nil || len(statuses) != 1 || statuses[0].State != goose.StatePending {
+		if err != nil || len(statuses) != 2 || statuses[0].State != goose.StatePending || statuses[1].State != goose.StatePending {
 			t.Fatalf("fresh status: %+v, %v", statuses, err)
 		}
 		if version, err := p.GetDBVersion(ctx); err != nil || version != 0 {
@@ -212,17 +212,18 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	before := metadataSnapshot(ctx, t, database)
 	execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 	statuses, err := p.Status(ctx)
-	if err != nil || len(statuses) != 1 || statuses[0].State != goose.StateApplied || statuses[0].AppliedAt.IsZero() {
+	if err != nil || len(statuses) != 2 || statuses[0].State != goose.StateApplied || statuses[0].AppliedAt.IsZero() ||
+		statuses[1].State != goose.StateApplied || statuses[1].AppliedAt.IsZero() {
 		t.Fatalf("installed read-only status: %+v, %v", statuses, err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 1 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
 		t.Fatalf("installed read-only version: %d, %v", version, err)
 	}
 	execFixture(ctx, t, database, `SET default_transaction_read_only=off`)
 	for _, run := range []func() error{
 		func() error { _, err := p.Up(ctx); return err },
 		func() error { _, err := p.UpTo(ctx, 1); return err },
-		func() error { _, err := p.DownTo(ctx, 1); return err },
+		func() error { _, err := p.DownTo(ctx, 2); return err },
 		func() error { _, err := p.Status(ctx); return err },
 	} {
 		if err := run(); err != nil {
@@ -232,7 +233,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	if _, err := p.UpByOne(ctx); !errors.Is(err, goose.ErrNoNextVersion) {
 		t.Fatalf("up-by-one noop: %v", err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 1 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
 		t.Fatalf("installed version: %d, %v", version, err)
 	}
 	if after := metadataSnapshot(ctx, t, database); before != after {
@@ -250,8 +251,13 @@ func testSources(t *testing.T, database *sql.DB, future bool) *Provider {
 		t.Fatal(err)
 	}
 	files := fstest.MapFS{"00001_initial_schema.sql": &fstest.MapFile{Data: raw}}
+	registration, err := db.Migrations.ReadFile("migrations/00002_registration_attempts.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files["00002_registration_attempts.sql"] = &fstest.MapFile{Data: registration}
 	if future {
-		files["00002_future.sql"] = &fstest.MapFile{Data: []byte(`-- +goose Up
+		files["00003_future.sql"] = &fstest.MapFile{Data: []byte(`-- +goose Up
 CREATE TABLE public.future_fixture(id integer PRIMARY KEY);
 -- +goose Down
 DROP TABLE public.future_fixture;
@@ -267,7 +273,7 @@ func TestFutureSourcesAndForwardOnlyReset(t *testing.T) {
 	database.SetMaxOpenConns(1)
 	p := testSources(t, database, true)
 	before := metadataSnapshot(ctx, t, database)
-	if _, err := p.ApplyVersion(ctx, 2, true); err == nil || !strings.Contains(err.Error(), "baseline") {
+	if _, err := p.ApplyVersion(ctx, 3, true); err == nil || !strings.Contains(err.Error(), "baseline") {
 		t.Fatalf("exact future application without baseline: %v", err)
 	}
 	if _, err := p.UpTo(ctx, 19); err == nil {
@@ -276,14 +282,14 @@ func TestFutureSourcesAndForwardOnlyReset(t *testing.T) {
 	if after := metadataSnapshot(ctx, t, database); before != after {
 		t.Fatal("invalid target initialized metadata")
 	}
-	if _, err := p.UpTo(ctx, 2); err != nil {
+	if _, err := p.UpTo(ctx, 3); err != nil {
 		t.Fatal(err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 3 {
 		t.Fatalf("future version: %d, %v", version, err)
 	}
 	statuses, err := p.Status(ctx)
-	if err != nil || len(statuses) != 2 || statuses[1].State != goose.StateApplied {
+	if err != nil || len(statuses) != 3 || statuses[2].State != goose.StateApplied {
 		t.Fatalf("future status: %+v, %v", statuses, err)
 	}
 	before = metadataSnapshot(ctx, t, database)
@@ -302,10 +308,10 @@ func TestFutureSourcesAndForwardOnlyReset(t *testing.T) {
 	if _, err := p.Down(ctx); err != nil {
 		t.Fatalf("legitimate future down: %v", err)
 	}
-	if _, err := p.ApplyVersion(ctx, 2, true); err != nil {
+	if _, err := p.ApplyVersion(ctx, 3, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.DownTo(ctx, 1); err != nil {
+	if _, err := p.DownTo(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.UpByOne(ctx); err != nil {
@@ -348,6 +354,59 @@ SELECT 1;
 	p.files = files
 	if _, err := p.Up(ctx); err != nil {
 		t.Fatalf("safe retry on same wrapper: %v", err)
+	}
+}
+
+func TestRegistrationMigrationFromBaselineAndAtomicFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	database := openTestDB(ctx, t)
+	database.SetMaxOpenConns(1)
+	p := testSources(t, database, false)
+	if _, err := p.UpTo(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err := database.QueryRowContext(ctx, `SELECT to_regclass('public.registration_attempts') IS NOT NULL`).Scan(&exists); err != nil || exists {
+		t.Fatalf("baseline-only fixture unexpectedly has attempts: %v, %v", exists, err)
+	}
+	raw, err := db.Migrations.ReadFile("migrations/00002_registration_attempts.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := strings.Replace(string(raw), "-- +goose Down", "SELECT 1/0;\n-- +goose Down", 1)
+	p.files.(fstest.MapFS)["00002_registration_attempts.sql"] = &fstest.MapFile{Data: []byte(broken)}
+	if _, err := p.Up(ctx); err == nil {
+		t.Fatal("broken registration migration succeeded")
+	}
+	if err := database.QueryRowContext(ctx, `SELECT to_regclass('public.registration_attempts') IS NOT NULL`).Scan(&exists); err != nil || exists {
+		t.Fatalf("registration table survived failed migration: %v, %v", exists, err)
+	}
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 1 {
+		t.Fatalf("failed migration damaged baseline lineage: %d, %v", version, err)
+	}
+	fresh, err := NewProvider(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fresh.Up(ctx); err != nil {
+		t.Fatalf("baseline-only retry to registration schema: %v", err)
+	}
+	if version, err := fresh.GetDBVersion(ctx); err != nil || version != 2 {
+		t.Fatalf("retry version: %d, %v", version, err)
+	}
+	before := metadataSnapshot(ctx, t, database)
+	for _, run := range []func() error{
+		func() error { _, err := fresh.Down(ctx); return err },
+		func() error { _, err := fresh.ApplyVersion(ctx, 2, false); return err },
+		func() error { _, err := fresh.DownTo(ctx, 1); return err },
+	} {
+		if err := run(); err == nil || !strings.Contains(err.Error(), "forward-only") {
+			t.Fatalf("registration destructive down accepted: %v", err)
+		}
+		if before != metadataSnapshot(ctx, t, database) {
+			t.Fatal("registration down failure modified storage or migration metadata")
+		}
 	}
 }
 
@@ -477,7 +536,7 @@ func TestLockedCompleteHistoryInventoryEvenOnNoop(t *testing.T) {
 			defer cancel()
 			database := openTestDB(ctx, t)
 			p := testSources(t, database, true)
-			if _, err := p.UpTo(ctx, 1); err != nil {
+			if _, err := p.UpTo(ctx, 2); err != nil {
 				t.Fatal(err)
 			}
 			writer, err := database.Conn(ctx)
@@ -491,10 +550,10 @@ func TestLockedCompleteHistoryInventoryEvenOnNoop(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				if exact {
-					_, err := p.ApplyVersion(ctx, 2, true)
+					_, err := p.ApplyVersion(ctx, 3, true)
 					done <- err
 				} else {
-					_, err := p.UpTo(ctx, 1)
+					_, err := p.UpTo(ctx, 2)
 					done <- err
 				}
 			}()
@@ -535,8 +594,8 @@ func TestCompetingFreshMigratorsSerialize(t *testing.T) {
 		t.Fatal("no competing migrator completed successfully")
 	}
 	var count int
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 2 {
-		t.Fatalf("baseline not installed exactly once: %d, %v", count, err)
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 3 {
+		t.Fatalf("approved migrations not installed exactly once: %d, %v", count, err)
 	}
 	database.SetMaxOpenConns(1)
 	if err := Up(ctx, database); err != nil {

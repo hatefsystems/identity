@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +25,76 @@ type roleBaselineStore struct {
 	id       uuid.UUID
 	artifact []byte
 	err      error
+}
+
+func TestRoleCommandRequiresEnvironmentBeforeConfiguration(t *testing.T) {
+	for _, raw := range []string{"missing", "", " ", "staging", "development ", "TEST"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("APP_ENV", raw)
+			if raw == "missing" {
+				if err := os.Unsetenv("APP_ENV"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := run(t.Context(), "invalid-user", "support", false)
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") {
+				t.Fatalf("mode not rejected first: %v", err)
+			}
+		})
+	}
+}
+
+func TestRoleCommandValidatesOnlyOwnedDependenciesBeforePool(t *testing.T) {
+	key := make([]byte, 32)
+	key[0] = 1
+	t.Setenv("ADMIN_OPERATOR_ID", uuid.NewString())
+	t.Setenv("ADMIN_OPERATOR_SPIFFE_ID", "spiffe://identity.test/operator")
+	t.Setenv("DATABASE_URL", "invalid-owned-role-dsn")
+	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(key))
+	t.Setenv(config.EnvMasterKEKVersion, "")
+	t.Setenv(config.EnvAuditSubject, "identity.audit.logs")
+	for _, field := range []string{config.EnvBlindIndexPepper, config.EnvBlindIndexPepperVersion, config.EnvOIDCIssuer, config.EnvOIDCClients, config.EnvOIDCSigningKey, "SMS_GATEWAY_API_KEY", config.EnvAuditBatchSize, config.EnvAuditAckWait} {
+		t.Setenv(field, "unrelated-invalid-setting")
+	}
+	t.Setenv(config.EnvNATSURL, "")
+	for _, environment := range []string{"development", "test", "production"} {
+		t.Run(environment, func(t *testing.T) {
+			t.Setenv("APP_ENV", environment)
+			err := run(t.Context(), uuid.NewString(), "support", false)
+			if err == nil || !strings.Contains(err.Error(), "invalid-owned-role-dsn") {
+				t.Fatalf("DB-only command blocked by unrelated settings: %v", err)
+			}
+		})
+	}
+	t.Setenv("APP_ENV", "production")
+	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	err := run(t.Context(), uuid.NewString(), "support", false)
+	if err == nil || !strings.Contains(err.Error(), config.EnvMasterKEK) {
+		t.Fatalf("public key not rejected before pool: %v", err)
+	}
+}
+
+func TestRoleCommandHelpIndependentOfEnvironmentAndSecrets(t *testing.T) {
+	if os.Getenv("ROLE_HELP_TEST") == "1" {
+		flag.CommandLine = flag.NewFlagSet("admin-roles", flag.ExitOnError)
+		os.Args = []string{"admin-roles", "-h"}
+		main()
+		return
+	}
+	t.Setenv("APP_ENV", "")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv(config.EnvMasterKEK, "")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("current test executable is unavailable")
+	}
+	// #nosec G204 -- Relaunch the system-resolved test binary with a fixed selector.
+	cmd := exec.CommandContext(t.Context(), executable, "-test.run=^TestRoleCommandHelpIndependentOfEnvironmentAndSecrets$")
+	cmd.Env = append(os.Environ(), "ROLE_HELP_TEST=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "target account UUID") {
+		t.Fatalf("help requires runtime settings: %s, %v", output, err)
+	}
 }
 
 type roleBaselineRow func(...any) error

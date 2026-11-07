@@ -174,7 +174,7 @@ func TestLoadWebAuthnRequiresRPIDOutsideDevelopment(t *testing.T) {
 	clearWebAuthnEnv(t)
 	t.Setenv(EnvWebAuthnRPOrigins, "https://identity.hatef.ir")
 
-	for _, env := range []string{"staging", "production"} {
+	for _, env := range []string{"test", "production"} {
 		t.Run(env, func(t *testing.T) {
 			_, err := LoadWebAuthn(env)
 			if err == nil {
@@ -411,7 +411,7 @@ func TestLoadWebAuthnNamedLoginFloorBounds(t *testing.T) {
 // without it would make every decoy locally computable, quietly restoring the
 // account-enumeration oracle the mock ceremony exists to close.
 func TestLoadWebAuthnRequiresMockKeyOutsideDevelopment(t *testing.T) {
-	for _, env := range []string{"staging", "production"} {
+	for _, env := range []string{"test", "production"} {
 		t.Run(env, func(t *testing.T) {
 			clearWebAuthnEnv(t)
 			t.Setenv(EnvWebAuthnRPID, "identity.hatef.ir")
@@ -426,6 +426,36 @@ func TestLoadWebAuthnRequiresMockKeyOutsideDevelopment(t *testing.T) {
 				t.Errorf("error = %q, want it to name %s", err.Error(), EnvWebAuthnMockChallengeKey)
 			}
 		})
+	}
+}
+
+func TestLoadWebAuthnRequiresExactSuppliedEnvironment(t *testing.T) {
+	for _, environment := range []string{"", " ", "\t", "staging", "Development", "development "} {
+		t.Run(environment, func(t *testing.T) {
+			clearWebAuthnEnv(t)
+			t.Setenv("APP_ENV", "development")
+			t.Setenv(EnvWebAuthnRPID, "identity.example.test")
+			t.Setenv(EnvWebAuthnRPOrigins, "https://identity.example.test")
+			t.Setenv(EnvWebAuthnMockChallengeKey, testMockChallengeKey)
+			cfg, err := LoadWebAuthn(environment)
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.RPID != "" || cfg.MockChallengeKey != nil {
+				t.Fatalf("invalid WebAuthn mode admitted: %+v %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestLoadWebAuthnTestModeDoesNotPermitHTTP(t *testing.T) {
+	clearWebAuthnEnv(t)
+	t.Setenv(EnvWebAuthnRPID, "localhost")
+	t.Setenv(EnvWebAuthnRPOrigins, "http://localhost:3000")
+	t.Setenv(EnvWebAuthnMockChallengeKey, testMockChallengeKey)
+	if _, err := LoadWebAuthn("test"); err == nil || !strings.Contains(err.Error(), "https origin") {
+		t.Fatalf("test inherited development origin relaxation: %v", err)
+	}
+	t.Setenv(EnvWebAuthnRPOrigins, "https://localhost:3000")
+	if _, err := LoadWebAuthn("test"); err != nil {
+		t.Fatalf("valid explicit test RP rejected: %v", err)
 	}
 }
 

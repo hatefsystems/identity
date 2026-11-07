@@ -41,6 +41,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,17 +71,21 @@ func main() {
 // run wires the worker and performs exactly one pass. It is separated from main so
 // it can return errors instead of calling os.Exit directly.
 func run(logger *slog.Logger) error {
-	cfg, err := config.Load()
+	return runWithPoolOpener(logger, pgxpool.New)
+}
+
+func runWithPoolOpener(logger *slog.Logger, open func(context.Context, string) (*pgxpool.Pool, error)) error {
+	environment, err := config.LoadEnvironment()
 	if err != nil {
 		return fmt.Errorf("purge-worker: load config: %w", err)
 	}
 
-	privacyCfg, err := config.LoadPrivacy(cfg.Environment)
+	privacyCfg, err := config.LoadPrivacy(environment)
 	if err != nil {
 		return fmt.Errorf("purge-worker: load privacy config: %w", err)
 	}
 
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
 		return fmt.Errorf("purge-worker: DATABASE_URL is required")
 	}
@@ -94,7 +99,7 @@ func run(logger *slog.Logger) error {
 	connectCtx, cancel := context.WithTimeout(ctx, dbConnectTimeout)
 	defer cancel()
 
-	pool, err := pgxpool.New(connectCtx, dsn)
+	pool, err := open(connectCtx, dsn)
 	if err != nil {
 		return fmt.Errorf("purge-worker: open database pool: %w", err)
 	}
@@ -133,7 +138,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info("purge worker starting",
-		slog.String("env", cfg.Environment),
+		slog.String("env", environment),
 		slog.Duration("grace_period", privacyCfg.GracePeriod),
 		slog.Int("batch_size", privacyCfg.PurgeBatchSize),
 		slog.Bool("dry_run", privacyCfg.PurgeDryRun),

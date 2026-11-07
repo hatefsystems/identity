@@ -349,6 +349,67 @@ func TestAdminActionConcurrentClaimsAndRetryIntegration(t *testing.T) {
 	}
 }
 
+func TestAdminActionDelayedPublisherPersistenceIntegration(t *testing.T) {
+	pool, enc := integrationPool(t)
+	ctx := context.Background()
+	subject := "identity.audit.test." + uuid.NewString()
+	var ids []uuid.UUID
+	for range 4 {
+		op := integrationOperation(t, pool, enc, subject)
+		if err := op.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, op.ID)
+	}
+	js := &delayedPublisher{delay: 250 * time.Millisecond, failAt: 2}
+	worker, err := NewPublisher(pool, js, subject, PublisherConfig{BatchTimeout: 800 * time.Millisecond, PublishTimeout: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if n, err := worker.RunOnce(ctx); n != 1 || !errors.Is(err, ErrPublish) {
+		t.Fatalf("partial delayed outcomes not committed: %d %v", n, err)
+	}
+	if time.Since(started) >= 800*time.Millisecond || js.calls != 2 {
+		t.Fatal("delayed publisher exhausted batch deadline")
+	}
+	for i, id := range ids {
+		var published, scheduled bool
+		var attempts int32
+		var lastError *string
+		if err := pool.QueryRow(ctx, "SELECT published_at IS NOT NULL,attempts,next_attempt_at>created_at,last_error FROM event_outbox WHERE id=$1", id).Scan(&published, &attempts, &scheduled, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		switch i {
+		case 0:
+			if !published || attempts != 1 || lastError != nil {
+				t.Fatal("delayed success lost durable delivery marker")
+			}
+		case 1:
+			if published || attempts != 1 || !scheduled || lastError == nil || *lastError != "publish_unacknowledged" {
+				t.Fatal("delayed failure lost durable backoff or leaked raw error")
+			}
+		default:
+			if published || attempts != 0 || scheduled || lastError != nil {
+				t.Fatal("unattempted claim metadata changed")
+			}
+		}
+	}
+	// A distinct transaction can immediately claim exactly the untouched rows.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(ctx, tx)
+	rows, err := db.New(tx).ClaimAdminActionOutbox(ctx, db.ClaimAdminActionOutboxParams{Subject: subject, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].ID != ids[2] || rows[1].ID != ids[3] {
+		t.Fatal("unattempted claims not released after incremental commit")
+	}
+}
+
 func expiredContext(t *testing.T, pool *pgxpool.Pool, enc Encryptor, account uuid.UUID) *Operation {
 	t.Helper()
 	op := integrationOperation(t, pool, enc, "identity.audit.test."+uuid.NewString())

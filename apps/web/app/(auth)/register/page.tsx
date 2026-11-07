@@ -7,7 +7,7 @@ export default function RegistrationPage() {
   return (
     <AuthCard
       title="Create your account"
-      description="Start with your email and a password that you do not use anywhere else."
+      description="Verify your existing email and Iranian mobile number, then create a passkey."
       footer={
         <>
           <span>Already have an account?</span>

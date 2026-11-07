@@ -23,11 +23,13 @@
 package clientauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 	"time"
@@ -70,16 +72,18 @@ var (
 	ErrInvalidAssertionClaims = errors.New("clientauth: invalid assertion claims")
 )
 
-// JTIReplayGuard provides single-use enforcement of assertion jti values. The
-// in-memory implementation here backs the MVP; the interface is intentionally
-// small so a Redis-backed guard (shared across instances) can replace it
-// without touching the Authenticator.
+// JTIReplayGuard provides single-use enforcement across an assertion's complete
+// acceptance window. Redis is shared authority; memory is only a local/test seam.
 type JTIReplayGuard interface {
-	// Remember records jti as used until expiresAt and reports whether it was
-	// previously unseen. It returns false when jti has already been recorded
-	// (i.e. a replay). expiresAt lets the guard reclaim storage once the
-	// assertion could no longer be valid anyway.
-	Remember(ctx context.Context, jti string, expiresAt time.Time) (bool, error)
+	// Remember claims a client/audience/JTI tuple until the exclusive end of
+	// its acceptance window (exp plus leeway), not merely the nominal expiry.
+	Remember(ctx context.Context, clientID, audience, jti string, expiresAt time.Time) (bool, error)
+}
+
+// Shared replay authority supplies the admission clock as well as storage.
+// Memory guards deliberately retain the explicit local test/development clock.
+type assertionClock interface {
+	ServerTime(context.Context) (time.Time, error)
 }
 
 // assertionHeader is the protected JOSE header of a client assertion.
@@ -101,7 +105,8 @@ type Authenticator struct {
 // Option customizes an Authenticator.
 type Option func(*Authenticator)
 
-// WithClock overrides the time source (tests inject a deterministic clock).
+// WithClock overrides the local time source for memory-backed tests/development.
+// Shared replay authority always supplies its own clock instead.
 func WithClock(now func() time.Time) Option {
 	return func(a *Authenticator) {
 		if now != nil {
@@ -126,7 +131,7 @@ func New(registry clients.Registry, audience string, guard JTIReplayGuard, opts 
 	if registry == nil {
 		return nil, errors.New("clientauth: registry is required")
 	}
-	if strings.TrimSpace(audience) == "" {
+	if !validReplayPart(audience, maxAudienceBytes) {
 		return nil, errors.New("clientauth: audience is required")
 	}
 	if guard == nil {
@@ -142,12 +147,18 @@ func New(registry clients.Registry, audience string, guard JTIReplayGuard, opts 
 	for _, opt := range opts {
 		opt(a)
 	}
+	if a.maxLifetime > maxReplayRetention-2*clockSkewLeeway {
+		return nil, ErrInvalidAssertionClaims
+	}
 	return a, nil
 }
 
 // Authenticate implements token.ClientAuthenticator. It resolves and verifies
 // the requesting client from the client_assertion form parameters.
 func (a *Authenticator) Authenticate(ctx context.Context, form url.Values) (clients.Client, error) {
+	if err := ctx.Err(); err != nil {
+		return clients.Client{}, err
+	}
 	if got := form.Get("client_assertion_type"); got != AssertionType {
 		return clients.Client{}, fmt.Errorf("%w: %q", ErrUnsupportedType, got)
 	}
@@ -174,6 +185,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, form url.Values) (clie
 	sub := stringClaim(claims, "sub")
 	if iss == "" || sub == "" || iss != sub {
 		return clients.Client{}, ErrIssuerSubjectMismatch
+	}
+	if !validReplayPart(iss, maxClientIDBytes) {
+		return clients.Client{}, ErrInvalidAssertionClaims
 	}
 	// When the client also sends client_id (allowed by RFC 6749), it must not
 	// contradict the assertion's self-asserted identity.
@@ -220,12 +234,22 @@ func (a *Authenticator) validateClaims(ctx context.Context, claims map[string]an
 		return ErrBadAudience
 	}
 
-	now := a.now()
 	exp, ok := timeClaim(claims, "exp")
 	if !ok {
 		return fmt.Errorf("%w: missing exp", ErrInvalidAssertionClaims)
 	}
-	if !now.Add(-clockSkewLeeway).Before(exp) {
+	var now time.Time
+	if clock, ok := a.jti.(assertionClock); ok {
+		var err error
+		now, err = clock.ServerTime(ctx)
+		if err != nil {
+			return fmt.Errorf("clientauth: replay clock: %w", err)
+		}
+	} else {
+		now = a.now()
+	}
+	expiresAt := exp.Add(clockSkewLeeway)
+	if !now.Before(expiresAt) {
 		return ErrExpired
 	}
 	if exp.After(now.Add(a.maxLifetime + clockSkewLeeway)) {
@@ -236,7 +260,10 @@ func (a *Authenticator) validateClaims(ctx context.Context, claims map[string]an
 	if jti == "" {
 		return ErrMissingJTI
 	}
-	fresh, err := a.jti.Remember(ctx, jti, exp)
+	if !validReplayPart(jti, maxJTIBytes) {
+		return ErrInvalidAssertionClaims
+	}
+	fresh, err := a.jti.Remember(ctx, stringClaim(claims, "iss"), a.audience, jti, expiresAt)
 	if err != nil {
 		return fmt.Errorf("clientauth: jti replay guard: %w", err)
 	}
@@ -249,6 +276,9 @@ func (a *Authenticator) validateClaims(ctx context.Context, claims map[string]an
 // parseAssertion splits a compact JWS and decodes its header and claims,
 // returning the raw signing input and signature for verification.
 func parseAssertion(assertion string) (assertionHeader, map[string]any, string, []byte, error) {
+	if len(assertion) > 16*1024 {
+		return assertionHeader{}, nil, "", nil, ErrMalformedAssertion
+	}
 	parts := strings.Split(assertion, ".")
 	if len(parts) != 3 {
 		return assertionHeader{}, nil, "", nil, fmt.Errorf("%w: expected 3 segments", ErrMalformedAssertion)
@@ -266,7 +296,12 @@ func parseAssertion(assertion string) (assertionHeader, map[string]any, string, 
 		return assertionHeader{}, nil, "", nil, fmt.Errorf("%w: bad payload encoding", ErrMalformedAssertion)
 	}
 	var claims map[string]any
-	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(claimsBytes))
+	decoder.UseNumber()
+	if !json.Valid(claimsBytes) {
+		return assertionHeader{}, nil, "", nil, fmt.Errorf("%w: bad payload JSON", ErrMalformedAssertion)
+	}
+	if err := decoder.Decode(&claims); err != nil {
 		return assertionHeader{}, nil, "", nil, fmt.Errorf("%w: bad payload JSON", ErrMalformedAssertion)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
@@ -290,9 +325,12 @@ func stringClaim(claims map[string]any, name string) string {
 func timeClaim(claims map[string]any, name string) (time.Time, bool) {
 	switch v := claims[name].(type) {
 	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) || v < 0 || v > maxUnixSeconds {
+			return time.Time{}, false
+		}
 		return time.Unix(int64(v), 0), true
 	case json.Number:
-		if n, err := v.Int64(); err == nil {
+		if n, err := v.Int64(); err == nil && n >= 0 && n <= maxUnixSeconds {
 			return time.Unix(n, 0), true
 		}
 	}

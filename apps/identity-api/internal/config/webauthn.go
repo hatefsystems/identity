@@ -108,6 +108,9 @@ type WebAuthnConfig struct {
 // misconfiguration that makes browsers reject every ceremony) or a user
 // verification value the spec does not define.
 func LoadWebAuthn(environment string) (WebAuthnConfig, error) {
+	if err := ValidateEnvironment(environment); err != nil {
+		return WebAuthnConfig{}, err
+	}
 	isDev := environment == "development"
 
 	cfg := WebAuthnConfig{

@@ -326,7 +326,8 @@ func (s *Server) handleWebAuthnLoginOptions() http.HandlerFunc {
 
 		var req webauthnLoginOptionsRequest
 		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(body))
+			if !utf8.Valid(body) || !json.Valid(body) || !uniqueJSONFields(body) || decoder.Decode(&req) != nil {
 				writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
 				return
 			}

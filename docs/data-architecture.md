@@ -12,10 +12,11 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 
 The following is a selected schema illustration, not executable production
 provisioning or a substitute for the applied migrations in
-`apps/identity-api/db/migrations`. Current storage is created by the single fresh
-`00001_initial_schema.sql` baseline, tracked as version 1 in
-`public.identity_schema_version`; additional account/auth/outbox/workflow columns
-are described below and in that baseline. Canonical-v2 payloads do not contain their
+`apps/identity-api/db/migrations`. The active forward-only bundle is unchanged
+`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`, tracked
+through version 2 in `public.identity_schema_version`. No legacy history adoption,
+baseline rewrite or Down/reset is implied. Additional columns/state are described
+below and in the bundle. Canonical-v2 payloads do not contain their
 own event UUID or chain digest, and contracted legal requests have no plaintext
 narrative columns.
 
@@ -227,7 +228,7 @@ CREATE UNIQUE INDEX legal_holds_request_identity ON legal_holds(account_ref, req
 
 ### 1.1.2 Retention Proof and Durable Head (Task 5.4)
 
-The single fresh baseline creates permanently retained canonical-v2 chains and
+The unchanged `00001` baseline creates permanently retained canonical-v2 chains and
 separate erasable payloads directly, with exact terminal head advancement and
 audit coordination separate from purge-run locking. It contains no v1 checkpoint/
 routine transition or historical data repair. Supported entrypoints refuse all
@@ -354,6 +355,29 @@ remain readable. Unknown versions/fields still fail validation. Retain additive
 columns and v2-compatible publisher/readers during rollback, and upgrade downstream
 consumers before deploying name writers.
 
+### 1.1.5 Durable Registration Attempts
+
+Migration 2 adds `registration_attempts`, not users or privileged seeds. Pending
+attempts cannot log in and have no resulting account. The durable contract is:
+
+| Material | Binding / lifetime |
+|---|---|
+| Attempt ID, capability SHA-256 hash, browser JKT | Independent opaque ID and 256-bit capability, hashed at rest; exact original JKT. ID/email alone cannot resume or recover authority. |
+| Pending envelope | Existing AES-GCM format binds attempt/JKT/signup purpose and freezes exact canonical email, Iranian E.164 phone, random eight-byte WebAuthn handle and ceremony revision. No raw capability/email token/OTP/private authenticator key is persisted. |
+| Token/proof/challenge metadata | Hashes, bounded references/revisions and verification timestamps are separate from delivery ACKs. Email proof at most 10m; passkey challenge at most 5m, each capped by immutable pending expiry. |
+| Pending/failed state | Original pending lifetime 15m; resends/holds/retries do not restart it. Failed outcomes retain their bounded stored terminal/receipt metadata. Finite SQL capacity/admission bounds cannot be bypassed by cleanup failure. |
+| Completion fingerprint and resulting-user FK | Final caller-owned commit creates user+resident UV credential+encrypted verified phone+revision-1 created intent+receipt atomically. Transient envelope/token/challenge fields clear. No role/password/mailbox/session; existing-user attachment is never conflict recovery. |
+| Completed receipt / cleanup | One hour from completion, subject to current holds and original-user FK `ON DELETE CASCADE`. Receipt access remains capability+JKT-bound and cannot authenticate or prevent lawful purge. |
+
+Dedicated cleanup has only registration SELECT/DELETE and legal-hold SELECT with
+actual non-owner login checks. It takes the subject lock before completed-row
+hold checks, defers held/contended rows and preserves bounded progress. Pending/
+failed rows have no user subject. A held expired receipt remains evidence, not
+renewed authority; expiry checks alone are not physical erasure. Restore this
+relation and migration metadata consistently with users/credentials/outbox/holds.
+No new global active-user-requires-passkey constraint is added: legitimate
+credential-free lookup probes are not signup bootstrap.
+
 ### 1.2 `sqlc` & `pgx` Configurations
 
 To generate the idiomatic, type-safe Go code, the database queries must be defined inside `.sql` files.
@@ -380,6 +404,12 @@ WHERE id = $1;
 
 Passkey deletion and TOTP disablement both begin a transaction and acquire `GetUserByIDForUpdate` first. Passkey deletion then locks that user's WebAuthn rows in stable credential-ID order before it counts and deletes. TOTP disablement counts passkeys while holding the same user-row mutex before clearing the secret. This common lock order serializes cross-factor races and guarantees at least one passkey remains, reflecting that WebAuthn is currently the only browser session-issuing login surface.
 
+Credential/recovery/SMS mutations also carry the session's admitted auth version,
+take the subject lock and recheck locked active/nondeleted user state before
+child/proof writes. Revocation-first execution refuses stale mutations; already
+committed work is not retrospectively cancelled. Client assertion replay is a
+separate shared Redis tuple claim through the full accepted leeway window.
+
 ---
 
 ## 2. PII Storage & Application-Layer Encryption
@@ -388,10 +418,10 @@ To comply with high-security privacy directives, Personal Identifiable Informati
 
 ```
                            +--------------------------------------+
-                           |          Infisical (KMS)             |
+                           |     Operator secret provisioning     |
                            +--------------------------------------+
                                               |
-                                              | Retrieves master KEK (Key Encryption Key)
+                                              | Injects one KEK/version at process startup
                                               v
 +------------------+       +--------------------------------------+
 | Plaintext PII    | ----> |       Go Application Layer           |
@@ -428,7 +458,7 @@ Each encrypted record has a composite structure serialized into a binary payload
 1. **Version (1 byte):** Enables key rotation and cryptopackage schema upgrades.
 2. **DEK-Wrap Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for wrapping the DEK with the Master KEK.
 3. **PII-Enc Nonce (12 bytes) & Tag (16 bytes):** Cryptographically secure nonce and GCM authentication tag generated for encrypting the PII with the local DEK.
-4. **Encrypted DEK:** The Data Encryption Key (DEK) used to encrypt the payload, wrapped by the Master Key Encryption Key (KEK) fetched from Infisical.
+4. **Encrypted DEK:** The per-record DEK wrapped by the one runtime-loaded KEK/version in process-local custody. Real AES-GCM primitives do not imply a live Infisical fetch/cache/fallback/rotation integration or automatic retired-key selection.
 5. **Encrypted Ciphertext:** The GCM-authenticated ciphertext of the PII value.
 
 ### 2.2 Cryptographic Blind Indexes for Secure Exact-Match Searches
@@ -437,10 +467,26 @@ To prevent $O(N)$ full-table decryptions when performing user queries by phone n
 
 $$\text{blind\_index} = \text{HMAC-SHA256}_{\text{secret\_pepper}}(\text{lowercase}(\text{NFKC}(\text{trim}(\text{identity}))))$$
 
-This is the existing server-side keyed construction, not plain concatenation or anonymous data. Legal email attribution uses the same normalization; callers must not introduce provider-specific normalization or send the digest/pepper material to the browser. This documentation does not add phone attribution or historical multi-pepper search.
+This generic construction remains unchanged for phone/generic callers and is not
+plain concatenation or anonymous data. **Mailbox identity has an explicit separate
+input seam:** NFC/local lowercase/NFC plus strict non-transitional IDNA lowercase
+ASCII domain; `ComputeEmail` HMACs those exact canonical bytes without a second
+NFKC pass. Verification, new storage, delivery, real/decoy lookup, producer capture,
+signer fallback and legal attribution share that profile. NFC equivalents converge;
+Persian/Arabic letters, dot/plus variants and NFKC-distinct mailboxes stay distinct.
+Malformed/invalid/invisible inputs fail rather than being stripped/aliased.
+
+Producer capture preserves digest and `blind_index_version` generation together;
+explicit generation 0 is valid, not missing metadata. Signer storage admission
+rejects invalid declared metadata before canonical hashing, with fixed redacted
+quarantine categories rather than parser/PII text. Missing capture has its bounded
+live-email fallback, not a generic-NFKC algorithm fallback. External producers must
+use the same profile/generation before acceptance. Do not send digest/pepper to the
+browser, rewrite signed history, rehash old Unicode records or add dual-normalized/
+historical multi-pepper search. Existing ASCII and generic-index bytes remain intact.
 
 - **Uniqueness & Indexing:** Blind indexes are stored in separate database columns (`phone_blind_index`, `backup_email_blind_index`) and indexed via B-tree. This enables $O(1)$ fast lookups without revealing plain text.
-- **Salt/Pepper Management:** The secret pepper is retrieved dynamically at application bootstrap from Infisical and kept strictly in memory. Non-exact queries (such as wildcards or substring matches) on PII columns are prohibited to ensure data minimization.
+- **Key Custody:** Operators inject one KEK/version and one pepper/version into local process memory. There is no live Infisical fetch/cache/hot rotation, historical key retrieval or transparent multi-generation reader. Retired backup keys, controlled rotation/re-encryption and verified recovery remain operator obligations. Non-exact PII queries remain prohibited.
 
 ---
 
@@ -503,8 +549,13 @@ Redis eviction/reset fails closed and requires reauthentication or a new ceremon
 ACLs/TLS and an eviction/availability policy suitable for authority, not a
 disposable performance cache. Never restore stale session/grant/replay snapshots
 after revocation; invalidate the namespace and require new authentication instead.
-Client-assertion replay storage remains a separate single-process boundary; shared
-portal/WebAuthn state does not claim unrelated OAuth client-assertion scaling.
+Client-assertion replay is separately scoped to canonical client/audience/JTI and
+shared Redis outside development. Claims survive through the complete accepted
+`exp + 60s` leeway window. Redis `TIME` is the common authority for temporal
+admission and the atomic expiration check; local replica clocks cannot shorten
+another replica's replay window. Claims use rounded absolute `NX PXAT` expiry,
+never extend on replay, and fail closed without memory fallback on clock errors.
+Atomic replay authority does not by itself certify fleet rollout or Redis operation.
 
 ### 3.2 OTP Rate Limiting Structure
 
@@ -607,6 +658,8 @@ truth; restore their state consistently and include them in notices/ROPA/DPIA/DS
 
 | Relation / material | Retained fields and linkage | Actual lifetime / cleanup |
 |---|---|---|
+| `registration_attempts` pending/failed | Opaque attempt, capability hash, original JKT, encrypted frozen contacts/handle/ceremony, proof hashes/times/references and immutable expiry/revisions. Transient Class A personal data, not an account or authentication session. | Pending 15m, email <=10m, passkey <=5m; proof checks expire independently of physical cleanup. Dedicated bounded cleanup; finite admission capacity prevents unbounded allocation. |
+| `registration_attempts` completed receipt | Capability/JKT-bound outcome, fingerprint, proof/terminal timestamps and resulting-user reference; transient envelope/token/challenge material cleared. | Receipt 1h after completion, current-subject-hold aware. Hold never renews authority; resulting-user FK cascade cannot block lawful purge. Backups keep their independent protected rotation policy. |
 | `admin_action_contexts` | `action_id`, nullable `account_ref`, `details_encrypted`, `created_at`, `retain_until`; encrypted moderation/inquiry context is still personal data. | Original `created_at +` approved context duration; strict `retain_until < cutoff`, hold-aware physical cleanup. No clock rewriting. |
 | Contracted `legal_holds` | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives. | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns in the fresh baseline. |
 | Live workflow/case associations | `legal_cases` original clocks, policy/state/revision and preparer/approver/auth-version fields; `legal_case_subjects(case_id,account_ref,current)`; `legal_case_holds(case_id,hold_id,account_ref,current)`. Historical associations remain even when not current. | Expiry is `min(created_at + max_age, closed_at + closed_retention)` where closed; at-or-after equality cleanup only without any historically associated subject hold. Reviews/retries/releases do not reset it. |
@@ -632,9 +685,9 @@ remain separate work; no additional permanent inventory is silently certified.
 
 Legal requests are independent encrypted rows, unique by `(account_ref, request_kind, idempotency_key)`, not actor or globally unique operation ID. The original account reference survives account deletion. Restricted moderation/inquiry narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but **is still personal data**. Baseline section 1.7 auditing retains actor/network metadata, action/hold IDs, timestamps and response digests; section 1.8's narrower workflow projection must not be generalized to it.
 
-Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Fresh storage has no plaintext narrative columns. Optional standalone backfill retains encryption/read-back/binding and error contracts only as a separately scoped focused compatibility operation, not a new-lineage upgrade path. See [admin operations](admin-operations.md#standalone-compatibility-backfill).
+Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Fresh storage has no plaintext narrative columns; obsolete Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 adds separately credentialed ledger payload retention, structural chain/leaf/annotation verification and separate read-only receipt reconciliation under the rollout gates above. It does not close Task 5.3 deployment approval or Task 5.5 restricted-narrative retention. External anchors, phone attribution and pepper rotation remain separate work. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install only the fresh `00001` baseline in `public.identity_schema_version`, stop old writers and isolate PostgreSQL/Redis/NATS state before compatible cutover. Baseline Down/reset refuse; any reset of an existing environment requires separate explicit scoped authorization.
+Task 5.4 adds separately credentialed ledger payload retention, structural verification and read-only receipt reconciliation, not Task 5.3 deployment approval or Task 5.5 narrative-retention approval. External anchors, phone attribution and pepper rotation remain separate. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002` through `public.identity_schema_version`, stop incompatible writers and isolate PostgreSQL/Redis/NATS before approved cutover. Down/reset refuse; any existing-environment reset needs separate explicit scoped authorization.
 
 ### Task 7.6 Legal Disclosure Boundary
 

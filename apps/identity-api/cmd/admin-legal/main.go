@@ -35,6 +35,10 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	opts, err := parseOptions(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		_, _ = fmt.Fprintln(os.Stdout, "admin-legal --operation=<cleanup|lookup-probe|policy-install|workflow-cleanup|workflow-status|ledger-receipts>")
+		return
+	}
 	if err != nil {
 		slog.Error("legal maintenance options invalid")
 		os.Exit(1)
@@ -58,12 +62,15 @@ func parseOptions(args []string) (options, error) {
 	opts := options{supplied: make(map[string]bool)}
 	flags := flag.NewFlagSet("admin-legal", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.StringVar(&opts.operation, "operation", "", "backfill, cleanup, lookup-probe, policy-install, workflow-cleanup, workflow-status, or ledger-receipts")
+	flags.StringVar(&opts.operation, "operation", "", "cleanup, lookup-probe, policy-install, workflow-cleanup, workflow-status, or ledger-receipts")
 	flags.IntVar(&opts.limit, "limit", 500, "maximum records: workflow-cleanup 1..500; maintenance/status/receipts 1..1000")
 	flags.StringVar(&opts.policyFile, "policy-file", "", "approved JSON artifact for policy-install only")
 	flags.BoolVar(&opts.dryRun, "dry-run", false, "workflow-cleanup only: roll back eligible cleanup")
 	flags.IntVar(&opts.proofLimit, "receipt-proof-limit", 1000, "ledger-receipts only: Class C proof nodes (1..10000)")
-	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+	if err := flags.Parse(args); err != nil {
+		return opts, err
+	}
+	if flags.NArg() != 0 {
 		return opts, errors.New("invalid options")
 	}
 	flags.Visit(func(f *flag.Flag) { opts.supplied[f.Name] = true })
@@ -82,7 +89,7 @@ func validateOptions(opts options) error {
 		return errors.New("invalid batch size")
 	}
 	switch opts.operation {
-	case "backfill", "cleanup", "lookup-probe", "policy-install", "workflow-cleanup", "workflow-status", "ledger-receipts":
+	case "cleanup", "lookup-probe", "policy-install", "workflow-cleanup", "workflow-status", "ledger-receipts":
 	default:
 		return errors.New("invalid operation")
 	}
@@ -105,6 +112,14 @@ func run(ctx context.Context, opts options) error {
 	if err := validateOptions(opts); err != nil {
 		return err
 	}
+	var environment string
+	if opts.operation != "ledger-receipts" {
+		var err error
+		environment, err = config.LoadEnvironment()
+		if err != nil {
+			return err
+		}
+	}
 	dsn := os.Getenv("DATABASE_URL")
 	if opts.operation == "ledger-receipts" {
 		dsn = os.Getenv("LEDGER_RECEIPTS_DATABASE_URL")
@@ -115,6 +130,27 @@ func run(ctx context.Context, opts options) error {
 	if dsn == "" {
 		return errors.New("DATABASE_URL required")
 	}
+	var crypto config.CryptoConfig
+	if opts.operation != "ledger-receipts" && opts.operation != "workflow-status" {
+		var err error
+		crypto, err = config.LoadEnvelopeCrypto()
+		if err != nil {
+			return err
+		}
+	}
+	if opts.operation == "lookup-probe" {
+		if _, err := config.LoadCrypto(); err != nil {
+			return err
+		}
+		if _, err := config.LoadAudit(environment); err != nil {
+			return err
+		}
+	}
+	if opts.operation == "workflow-cleanup" || opts.operation == "policy-install" {
+		if _, err := config.LoadAuditSubject(); err != nil {
+			return err
+		}
+	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return err
@@ -124,7 +160,7 @@ func run(ctx context.Context, opts options) error {
 		return err
 	}
 	if opts.operation == "lookup-probe" {
-		return lookupProbe(ctx, pool)
+		return lookupProbe(ctx, pool, environment)
 	}
 	if opts.operation == "ledger-receipts" {
 		if err := receiptreconcile.ProbePrivileges(ctx, pool); err != nil {
@@ -135,10 +171,6 @@ func run(ctx context.Context, opts options) error {
 			slog.Info("ledger receipt reconciliation complete", "summary", result)
 		}
 		return err
-	}
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
 	}
 	if opts.operation == "workflow-status" {
 		result, err := legalworkflow.StatusSnapshot(ctx, pool, environment, opts.limit, time.Now())
@@ -156,10 +188,6 @@ func run(ctx context.Context, opts options) error {
 		if err := legalpolicy.ProbeMetadataMaintenance(ctx, pool); err != nil {
 			return err
 		}
-	}
-	crypto, err := config.LoadEnvelopeCrypto()
-	if err != nil {
-		return err
 	}
 	provider, err := kms.NewMockProvider(crypto.MasterKEK, crypto.MasterKEKVersion)
 	if err != nil {
@@ -182,13 +210,6 @@ func run(ctx context.Context, opts options) error {
 	}
 	holds, err := legalhold.New(db.New(pool), enc, legalhold.WithReleasedMetadataRetention(releasedRetention))
 	if err != nil {
-		return err
-	}
-	if opts.operation == "backfill" {
-		n, err := holds.Backfill(ctx, pool, opts.limit)
-		if err == nil {
-			slog.Info("legal backfill batch committed", slog.Int("records", n)) //nolint:gosec // G706: a typed integer count cannot inject log text.
-		}
 		return err
 	}
 	n, err := holds.CleanupReleased(ctx, pool, opts.limit)
@@ -237,11 +258,11 @@ func runWorkflowOperation(ctx context.Context, pool *pgxpool.Pool, enc *envelope
 			return err
 		}
 	}
-	auditCfg, err := config.LoadAudit(environment)
+	auditSubject, err := config.LoadAuditSubject()
 	if err != nil {
 		return err
 	}
-	actions, err := adminaction.New(pool, enc, auditCfg.Subject, policy.ContextRetention())
+	actions, err := adminaction.New(pool, enc, auditSubject, policy.ContextRetention())
 	if err != nil {
 		return err
 	}
@@ -263,7 +284,7 @@ func runWorkflowOperation(ctx context.Context, pool *pgxpool.Pool, enc *envelope
 	return err
 }
 
-func lookupProbe(ctx context.Context, pool *pgxpool.Pool) error {
+func lookupProbe(ctx context.Context, pool *pgxpool.Pool, environment string) error {
 	pepper, err := config.LoadBlindIndexPepper()
 	if err != nil {
 		return err
@@ -275,10 +296,6 @@ func lookupProbe(ctx context.Context, pool *pgxpool.Pool) error {
 	indexer, err := blindindex.New(pepper, pepperVersion)
 	if err != nil {
 		return err
-	}
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
 	}
 	cfg, err := config.LoadAudit(environment)
 	if err != nil {

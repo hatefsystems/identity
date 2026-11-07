@@ -23,7 +23,7 @@ func clearLifecycleEnvironment(t *testing.T) {
 }
 
 func TestLifecycleDevelopmentDefaultsRequireExplicitEnvironment(t *testing.T) {
-	for _, environment := range []string{"", "production", "staging", "test", "Development", " development", "development "} {
+	for _, environment := range []string{"production", "test"} {
 		t.Run(environment, func(t *testing.T) {
 			clearLifecycleEnvironment(t)
 			t.Setenv("APP_ENV", environment)
@@ -55,6 +55,32 @@ func TestLifecycleDevelopmentDefaultsRequireExplicitEnvironment(t *testing.T) {
 	t.Setenv(EnvNATSURL, " \t")
 	if _, err := LoadLifecycle(); err == nil {
 		t.Fatal("missing broker accepted even in development")
+	}
+}
+
+func TestLifecycleExplicitRetentionCannotBypassEnvironment(t *testing.T) {
+	for _, environment := range []string{"unset", "", " ", "\t", "staging", "Development", " development", "development "} {
+		t.Run(environment, func(t *testing.T) {
+			clearLifecycleEnvironment(t)
+			t.Setenv("APP_ENV", environment)
+			if environment == "unset" {
+				if err := os.Unsetenv("APP_ENV"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv(EnvLifecycleStreamMaxAge, "168h")
+			t.Setenv(EnvLifecycleOutboxRetention, "24h")
+			t.Setenv(EnvLifecycleCleanupDatabaseURL, "postgres://maintenance@localhost/db")
+			for _, load := range []func() error{
+				func() error { _, err := LoadLifecycleProvision(); return err },
+				func() error { _, err := LoadLifecycle(); return err },
+				func() error { _, err := LoadLifecycleCleanup(); return err },
+			} {
+				if err := load(); err == nil || !strings.Contains(err.Error(), "APP_ENV") {
+					t.Fatalf("explicit policy bypassed mode admission: %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -114,17 +140,20 @@ func TestLifecycleExplicitConfigurationAndLimits(t *testing.T) {
 }
 
 func TestLifecycleProvisionLoadsOnlyBrokerPolicy(t *testing.T) {
-	for _, retention := range []string{"", "private-invalid-retention"} {
-		t.Run(retention, func(t *testing.T) {
+	for _, tc := range []struct{ environment, retention string }{
+		{"production", ""}, {"production", "private-invalid-retention"},
+		{"test", ""}, {"test", "private-invalid-retention"},
+	} {
+		t.Run(tc.environment+"/"+tc.retention, func(t *testing.T) {
 			clearLifecycleEnvironment(t)
-			t.Setenv("APP_ENV", "production")
+			t.Setenv("APP_ENV", tc.environment)
 			t.Setenv("DATABASE_URL", "invalid-private-database")
 			t.Setenv(EnvLifecycleCleanupDatabaseURL, "invalid-private-cleanup-database")
-			t.Setenv(EnvLifecycleOutboxRetention, retention)
+			t.Setenv(EnvLifecycleOutboxRetention, tc.retention)
 			t.Setenv(EnvLifecycleBatchSize, "invalid-private-batch")
 			t.Setenv(EnvLifecyclePublishTimeout, "invalid-private-timeout")
 			if _, err := LoadLifecycleProvision(); err == nil {
-				t.Fatal("provision silently chose production stream retention")
+				t.Fatal("provision silently chose non-development stream retention")
 			}
 			t.Setenv(EnvLifecycleStreamMaxAge, "48h")
 			cfg, err := LoadLifecycleProvision()
@@ -156,16 +185,19 @@ func TestLifecycleCleanupIsSeparatelyCredentialedAndBrokerIndependent(t *testing
 	if err != nil || cfg.DatabaseURL != strings.TrimSpace(os.Getenv(EnvLifecycleCleanupDatabaseURL)) || cfg.Retention != 168*time.Hour || cfg.BatchSize != 500 || cfg.StartupTimeout != 15*time.Second {
 		t.Fatalf("cleanup loaded unrelated broker config or wrong defaults: %v", err)
 	}
-	t.Setenv("APP_ENV", "production")
-	if _, err := LoadLifecycleCleanup(); err == nil {
-		t.Fatal("cleanup silently chose a production retention")
-	}
-	t.Setenv(EnvLifecycleOutboxRetention, "72h")
-	t.Setenv(EnvLifecycleCleanupBatchSize, "7")
-	t.Setenv(EnvLifecycleStartupTimeout, "2s")
-	cfg, err = LoadLifecycleCleanup()
-	if err != nil || cfg.Retention != 72*time.Hour || cfg.BatchSize != 7 || cfg.StartupTimeout != 2*time.Second {
-		t.Fatalf("explicit cleanup settings rejected: %v", err)
+	for _, environment := range []string{"test", "production"} {
+		t.Setenv("APP_ENV", environment)
+		t.Setenv(EnvLifecycleOutboxRetention, "")
+		if _, err := LoadLifecycleCleanup(); err == nil {
+			t.Fatal("cleanup silently chose a non-development retention")
+		}
+		t.Setenv(EnvLifecycleOutboxRetention, "72h")
+		t.Setenv(EnvLifecycleCleanupBatchSize, "7")
+		t.Setenv(EnvLifecycleStartupTimeout, "2s")
+		cfg, err = LoadLifecycleCleanup()
+		if err != nil || cfg.Retention != 72*time.Hour || cfg.BatchSize != 7 || cfg.StartupTimeout != 2*time.Second {
+			t.Fatalf("explicit %s cleanup settings rejected: %v", environment, err)
+		}
 	}
 }
 

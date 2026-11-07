@@ -126,10 +126,12 @@ func (f *fakeStore) LegalAttributionHighWater(context.Context) (int64, error) {
 	}
 	return maxSeq, f.err
 }
-func (f *fakeStore) CountUnencryptedLegalHolds(context.Context) (int64, error) {
+func (f *fakeStore) CountInvalidLegalHolds(context.Context) (int64, error) {
 	var count int64
 	for _, h := range f.holds {
-		if len(h.DetailsEncrypted) == 0 && (!h.DetailsPurgedAt.Valid || h.IsActive || !h.ReleasedAt.Valid) {
+		current := len(h.DetailsEncrypted) > 0 && !h.DetailsPurgedAt.Valid
+		tombstone := h.DetailsEncrypted == nil && h.DetailsPurgedAt.Valid && !h.IsActive && h.ReleasedAt.Valid
+		if !current && !tombstone {
 			count++
 		}
 	}
@@ -137,7 +139,7 @@ func (f *fakeStore) CountUnencryptedLegalHolds(context.Context) (int64, error) {
 }
 
 func (f *fakeStore) GetLegalHoldSchema(context.Context) (db.GetLegalHoldSchemaRow, error) {
-	return db.GetLegalHoldSchemaRow{ColumnCount: 12, CurrentCount: 12}, f.err
+	return db.GetLegalHoldSchemaRow{ColumnCount: 12, CurrentCount: 12, ConstraintsValid: true}, f.err
 }
 
 func testEncryptor(t *testing.T) *envelope.Encryptor {
@@ -260,8 +262,8 @@ func TestValidationAndReadiness(t *testing.T) {
 		t.Fatal("intake without policy")
 	}
 	store.holds[uuid.New()] = db.LegalHold{}
-	if err := s.CheckCrypto(ctx); !errors.Is(err, ErrBackfillRequired) {
-		t.Fatal("plaintext readiness accepted")
+	if err := s.CheckCrypto(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("invalid storage readiness accepted")
 	}
 	prod, err := New(db.New(nil), testEncryptor(t), WithReleasedMetadataRetention(time.Hour))
 	if err != nil {
@@ -353,6 +355,90 @@ func TestCryptoReadinessChecksExistingKeysAndBinding(t *testing.T) {
 	}
 	if err := s.CheckCrypto(ctx); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("inaccessible old key passed readiness: %v", err)
+	}
+}
+
+type readinessStore struct {
+	Store
+	schema                       db.GetLegalHoldSchemaRow
+	schemaErr, countErr, listErr error
+}
+
+func (f readinessStore) GetLegalHoldSchema(context.Context) (db.GetLegalHoldSchemaRow, error) {
+	return f.schema, f.schemaErr
+}
+func (f readinessStore) CountInvalidLegalHolds(ctx context.Context) (int64, error) {
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
+	return f.Store.CountInvalidLegalHolds(ctx)
+}
+func (f readinessStore) ListLegalHolds(ctx context.Context, p db.ListLegalHoldsParams) (db.ListLegalHoldsRow, error) {
+	if f.listErr != nil {
+		return db.ListLegalHoldsRow{}, f.listErr
+	}
+	return f.Store.ListLegalHolds(ctx, p)
+}
+
+func TestCryptoReadinessRejectsSchemaAndSanitizesQueryErrors(t *testing.T) {
+	for _, failure := range []string{"missing", "expanded", "partial", "constraints", "schema-query", "row-query", "list-query"} {
+		t.Run(failure, func(t *testing.T) {
+			s, store := testService(t)
+			q := readinessStore{Store: store, schema: db.GetLegalHoldSchemaRow{ColumnCount: 12, CurrentCount: 12, ConstraintsValid: true}}
+			raw := errors.New("database sentinel email@example.test private legal narrative")
+			switch failure {
+			case "missing":
+				q.schema.ColumnCount, q.schema.CurrentCount = 0, 0
+			case "expanded":
+				q.schema.ColumnCount = 15
+			case "partial":
+				q.schema.CurrentCount = 11
+			case "constraints":
+				q.schema.ConstraintsValid = false
+			case "schema-query":
+				q.schemaErr = raw
+			case "row-query":
+				q.countErr = raw
+			case "list-query":
+				q.listErr = raw
+			}
+			s.store = q
+			if err := s.CheckCrypto(context.Background()); err != ErrUnavailable {
+				t.Fatalf("readiness did not return sanitized fixed error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCryptoReadinessRejectsMalformedTombstones(t *testing.T) {
+	for _, failure := range []string{"active", "unreleased", "unpurged", "ciphertext", "empty-bytea"} {
+		t.Run(failure, func(t *testing.T) {
+			s, store := testService(t)
+			row := db.LegalHold{ID: uuid.New(), AccountRef: uuid.New(), RequestKind: KindHold,
+				ReleasedAt: timestamptz(s.now()), DetailsPurgedAt: timestamptz(s.now())}
+			if _, err := s.openHold(context.Background(), row); err != nil {
+				t.Fatal("valid tombstone rejected")
+			}
+			switch failure {
+			case "active":
+				row.IsActive = true
+			case "unreleased":
+				row.ReleasedAt = timestamptz(time.Time{})
+			case "unpurged":
+				row.DetailsPurgedAt = timestamptz(time.Time{})
+			case "ciphertext":
+				row.DetailsEncrypted = []byte{1}
+			case "empty-bytea":
+				row.DetailsEncrypted = []byte{}
+			}
+			store.holds[row.ID] = row
+			if _, err := s.openHold(context.Background(), row); err != ErrUnavailable {
+				t.Fatalf("malformed tombstone opened: %v", err)
+			}
+			if err := s.CheckCrypto(context.Background()); err != ErrUnavailable {
+				t.Fatalf("malformed tombstone passed readiness: %v", err)
+			}
+		})
 	}
 }
 
@@ -472,7 +558,7 @@ func TestLookupBoundsAndEffectiveFractionalWindow(t *testing.T) {
 	s, _, req := lookupFixture(t)
 	WithMaxQueryWindow(1500 * time.Millisecond)(s)
 	req.StartTime = req.EndTime.Add(-1500 * time.Millisecond)
-	req.Identifier = strings.Repeat("x", 320-len("@example.test")) + "@example.test"
+	req.Identifier = strings.Repeat("x", 64) + "@" + strings.Repeat("d", 63) + "." + strings.Repeat("d", 63) + "." + strings.Repeat("d", 61)
 	req.RequestingAuthority = strings.Repeat("a", MaxContextBytes)
 	req.CaseReference = strings.Repeat("\u00e9", 127) + "x"
 	req.Purpose = strings.Repeat("\u00e9", MaxReasonBytes/2)
@@ -481,7 +567,7 @@ func TestLookupBoundsAndEffectiveFractionalWindow(t *testing.T) {
 	}
 	for _, mutate := range []func(*LookupRequest){
 		func(r *LookupRequest) { r.StartTime = r.StartTime.Add(-time.Nanosecond) },
-		func(r *LookupRequest) { r.Identifier = " " + r.Identifier },
+		func(r *LookupRequest) { r.Identifier += "x" },
 		func(r *LookupRequest) { r.Identifier = "Alice <alice@example.test>" },
 		func(r *LookupRequest) { r.RequestingAuthority += " " },
 		func(r *LookupRequest) { r.CaseReference += "x" },

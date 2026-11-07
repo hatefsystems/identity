@@ -80,7 +80,7 @@ function AccountQuery({
   const [accountStatus, setAccountStatus] = useState<AdminUserStatus | ''>('');
   const [size, setSize] = useState(String(limits.page_size_default));
   const [email, setEmail] = useState('');
-  const [page, setPage] = useState<AdminUsersPage | null>(null);
+  const [page, setPage] = useState<(AdminUsersPage & { canonical_email?: string }) | null>(null);
   const [query, setQuery] = useState<AdminUsersQuery | null>(null);
   const [mode, setMode] = useState<'list' | 'lookup' | null>(null);
   const [pending, setPending] = useState(false);
@@ -173,18 +173,20 @@ function AccountQuery({
   function lookup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canLookup || pending || work.blocked) return;
-    const value = email.trim();
+    const value = email.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
     if (
       !/^[^@\s]+@[^@\s]+$/.test(value) ||
-      /[\p{Cc}\p{Cs}]/u.test(value) ||
-      new TextEncoder().encode(value).length > 254
+      /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\ufffd]/u.test(value) ||
+      new TextEncoder().encode(email).length > 1024
     ) {
-      setEmailError('Enter one complete email address, at most 254 UTF-8 bytes.');
+      setEmailError(
+        'Enter one complete email address. The canonical address must fit 254 UTF-8 bytes.'
+      );
       emailInput.current?.focus();
       return;
     }
     setEmailError('');
-    void load(value);
+    void load(email);
   }
 
   if (cleared) return <Feedback status={queryClearedMessage} />;
@@ -268,11 +270,11 @@ function AccountQuery({
               <Input
                 ref={emailInput}
                 id={`${id}-email`}
-                type="email"
+                type="text"
+                inputMode="email"
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}
-                maxLength={254}
                 value={email}
                 className={inputClass}
                 aria-invalid={Boolean(emailError)}
@@ -318,6 +320,11 @@ function AccountQuery({
         </form>
       )}
       <Feedback error={error} status={status} />
+      {page?.canonical_email && mode === 'lookup' && (
+        <p className="break-all text-sm text-muted-foreground">
+          Canonical email: <bdi>{page.canonical_email}</bdi>
+        </p>
+      )}
       {pending && (
         <Button
           type="button"
@@ -382,7 +389,7 @@ function AccountQuery({
                   </td>
                   {canPII && (
                     <td className={`${queryCellClass} max-w-64 break-all`}>
-                      {account.email ?? 'Not provided'}
+                      <bdi>{account.email ?? 'Not provided'}</bdi>
                     </td>
                   )}
                   <td className={`${queryCellClass} hidden sm:table-cell`}>

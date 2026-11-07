@@ -34,6 +34,9 @@ func TestNewPgAdvisoryLockerRequiresPool(t *testing.T) {
 func TestPgAdvisoryLockerMutualExclusion(t *testing.T) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
+		if os.Getenv("REQUIRE_ADMIN_AUDIT_INTEGRATION") == "1" || os.Getenv("REQUIRE_PORTAL_INTEGRATION") == "1" {
+			t.Fatal("PostgreSQL is required for mandatory advisory lock acceptance")
+		}
 		t.Skip("DATABASE_URL is not set; skipping live PostgreSQL advisory lock test")
 	}
 
@@ -47,7 +50,7 @@ func TestPgAdvisoryLockerMutualExclusion(t *testing.T) {
 	defer pool.Close()
 
 	if err := pool.Ping(ctx); err != nil {
-		t.Skipf("cannot ping database at %s: %v; skipping", dsn, err)
+		t.Fatal("configured PostgreSQL advisory lock dependency is unavailable")
 	}
 
 	key := int64(9999001) // unique test key

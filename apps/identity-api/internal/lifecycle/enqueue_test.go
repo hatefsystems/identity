@@ -4,15 +4,71 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 )
+
+type birthTx struct {
+	pgx.Tx
+	email     string
+	createErr error
+	writes    int
+}
+type birthRow struct {
+	value any
+	err   error
+}
+
+func (r birthRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	value := reflect.ValueOf(r.value)
+	for i := range dest {
+		if value.Kind() == reflect.Struct {
+			reflect.ValueOf(dest[i]).Elem().Set(value.Field(i))
+		} else {
+			reflect.ValueOf(dest[i]).Elem().Set(value)
+		}
+	}
+	return nil
+}
+func (tx *birthTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: CreateUser") {
+		tx.email = args[0].(string)
+		tx.writes++
+		return birthRow{db.User{ID: uuid.New(), Email: tx.email, Status: "active"}, tx.createErr}
+	}
+	return birthRow{value: int64(1)}
+}
+func (tx *birthTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	tx.writes++
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+func TestCreateUserCanonicalActualInsertionAndTypedConflict(t *testing.T) {
+	tx := &birthTx{}
+	user, err := lifecycle.CreateUser(t.Context(), tx, db.CreateUserParams{Email: " Person@EXAMPLE.COM ", Status: "active"})
+	if err != nil || user.Email != "person@example.com" || tx.email != user.Email || user.LifecycleRevision != 1 {
+		t.Fatal("canonical identity not used in actual insert")
+	}
+	tx = &birthTx{createErr: &pgconn.PgError{Code: "23505", Detail: "secret@example.com"}}
+	if _, err := lifecycle.CreateUser(t.Context(), tx, db.CreateUserParams{Email: "person@example.com", Status: "active"}); !errors.Is(err, lifecycle.ErrIdentityConflict) || strings.Contains(err.Error(), "secret") || tx.writes != 1 {
+		t.Fatal("unique conflict flattened/leaked or intent written")
+	}
+	tx = &birthTx{}
+	if _, err := lifecycle.CreateUser(t.Context(), tx, db.CreateUserParams{Email: "bad mailbox", Status: "active"}); !errors.Is(err, lifecycle.ErrInvalidEvent) || tx.writes != 0 {
+		t.Fatal("invalid real account inserted")
+	}
+}
 
 type intentStore struct {
 	revision int64

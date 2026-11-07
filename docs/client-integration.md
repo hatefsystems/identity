@@ -12,6 +12,13 @@ Third-party public clients and mobile applications use the OIDC/OAuth 2.1 mechan
 
 Every public authorization flow must utilize the Authorization Code flow with Proof Key for Code Exchange (PKCE) according to RFC 7636. Use of the `plain` code challenge method is explicitly blocked.
 
+Configured callbacks require structural HTTPS with valid host/port and no userinfo,
+opaque scheme or fragment (including bare `#`); request matching remains exact.
+Only explicit development permits canonical localhost/loopback HTTP. Test is not
+a development exemption. `OIDC_ISSUER` likewise rejects query/fragment markers,
+including bare `?`/`#`, while preserving supported issuer paths. No custom-scheme,
+wildcard/prefix or provider-alias exception is added.
+
 #### Flow Sequence:
 1. Generate a high-entropy random cryptographically secure string (minimum 43 characters) known as the `code_verifier`.
 2. Generate the `code_challenge` by hashing the verifier using SHA-256 and base64url-encoding the result:
@@ -158,6 +165,59 @@ invalidated the previous batch; only a new explicit generation can replace it.
 
 For full HTTP shapes and failure handling, see the [browser boundary](api-design.md#first-party-browser-boundary-task-73).
 
+### 1.4 Conditional New-Account Registration
+
+Registration and SMS default disabled. Enabled signup uses the
+[eight fixed POST routes](api-design.md#15-new-account-registration), exact Origin,
+bounded strict JSON and public DPoP nonce/replay, without session cookies as
+authority, Authorization, `ath` or `X-Portal-Session`. Start accepts only existing
+owned email/phone and returns `{attempt_id,capability,canonical_email,expires_at,
+email_sent}`. Submission acceptance is not mailbox ownership; use explicit proof
+verification and bounded resend, never automatic mail/SMS sends.
+
+Keep the original verified non-exportable browser key/JKT and transient attempt
+authority. Follow-ups require `{attempt_id,capability}`; email verification alone
+requires `{attempt_id,token}` from the original JKT. Scrub
+`/register/verify-email#attempt_id=...&token=...` immediately before explicit verify;
+a different browser cannot mint a capability/session by opening the link.
+Phone send returns `verification_id`; verify adds it plus a six-digit string code
+preserving zeros. Passkey options returns `publicKey` for the frozen canonical
+email/handle, resident key and UV required. Final adds standard creation JSON.
+
+Pending/email/passkey/receipt validity is 15m/10m/at-most-5m/1h. Final result is
+`{state:"completed",next:"login",receipt_expires_at,email_verified:true,
+phone_verified:true}`; no user ID, role, password, mailbox or session is returned.
+Normal discoverable login follows separately. Start/options/proof failure cannot
+create an account or created-event intent. Resend replaces proof and clears phone/
+ceremony progress without resetting attempt expiry or abuse counters.
+
+After an ambiguous final response, explicitly query `/api/v1/auth/register/result`
+with the same capability/JKT and a new proof/JTI. Pending returns `expires_at`,
+failed returns `receipt_expires_at`, completed returns the final shape, all with
+proof flags. Identical authorized completion can return the same receipt; changed
+completion conflicts. This narrow result/retry contract does not relax ordinary
+portal/admin mutation rules, resurrect a consumed OTP or recover capability by
+email. Lost memory/key authority requires restart or normal login. No exactly-once
+external delivery or inbox/handset receipt is implied by relay/provider ACK.
+
+Use text/email-input-mode controls for supported Unicode, not native ASCII-only
+email admission. Server identity is NFC/local lowercase/NFC plus strict IDNA
+lowercase ASCII domain; verify/store/deliver/lookup exact canonical bytes.
+NFC equivalents converge; Persian/Arabic letters, dot/plus and NFKC-distinct local
+parts remain distinct. Generic BlindIndex NFKC stays unchanged; email HMAC input
+and captured generation share the explicit canonical profile. No browser hashing,
+provider-specific aliases, historical rehash or dual-normalized lookup. SMTPUTF8
+must be strictly advertised after verified TLS before EAI AUTH/envelope/DATA;
+sender/auth stays ASCII and no mailbox downgrade is permitted.
+
+Moderator `/users/lookup` clients must validate mandatory returned
+`canonical_email` against the selected user row before presentation and moderation
+pinning. Missing/mismatched binding is invalid output, not an ASCII/raw-input
+fallback; the additive field grants no new permission. Enablement, fixed SMS.ir
+VERIFY/live-versus-sandbox rules and dedicated cleanup gates are in
+[operations](devops-operations.md#registration-enablement-and-cleanup), not asserted
+by these integration instructions or historical acceptance.
+
 ---
 
 ## 2. Confidential Clients Integration (`private_key_jwt`)
@@ -190,6 +250,15 @@ To authenticate, the client generates a JWT signed with its local private key.
 * `jti` (JWT ID): A cryptographically secure random string unique to this request (validated by the server to prevent replay attacks).
 * `exp` (Expiration Time): Unix epoch timestamp. Must not be longer than 5 minutes in the future.
 * `iat` (Issued At): Unix epoch timestamp of creation.
+
+Replay claims are scoped to the canonical client/audience/JTI tuple and atomically
+shared in Redis outside explicit development. Retention covers the entire accepted
+`exp + 60s` leeway window with rounded absolute expiry. Redis `TIME`, not each
+replica's wall clock, governs admission and the atomic claim's deadline check.
+A recognized replay, corrupt/no-TTL state, clock failure or storage outage fails
+authentication, never memory fallback. Different
+replicas must share the same replay authority. This is a runtime contract, not
+evidence of deployed Redis/fleet acceptance.
 
 #### Exchange Request:
 ```http
@@ -321,6 +390,7 @@ The guard emits `grpc.access.denied` through the existing best-effort recorder f
 Use shared PostgreSQL/Redis and an authorized local Workload API. This example uses reserved domains and grants only the named methods:
 
 ```dotenv
+APP_ENV=production
 GRPC_ENABLED=true
 GRPC_ADDR=127.0.0.1:9090
 GRPC_TRUST_DOMAIN=example.test
@@ -336,7 +406,7 @@ The runtime bounds initial dependency/SVID acquisition to ten seconds, handshake
 
 Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
 
-The single fresh `00001_initial_schema.sql` install uses
+The unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql` install uses
 `public.identity_schema_version`, refusing all legacy `public.goose_db_version`,
 untracked nonempty application schemas and contradictory histories without
 upgrade/adoption. Stop all old writers before switching to explicitly scoped fresh
@@ -362,7 +432,7 @@ Send the exact raw access token, observed authorization scheme and expected audi
 
 Browser logout, individual session revocation, idle expiry and absolute expiry end all linked user access/refresh authority. Validation and refresh do not count as browser activity. The existing `offline_access` scope name remains accepted, but does not extend that browser lifetime. Client-credentials tokens have no browser or user identity. Read-only permission/profile RPCs are independently workload-authorized queries: a returned profile is not an authorization decision. Profiles disclose email and display name only for active/pending-verification accounts, omit both for suspended/banned accounts, and return NotFound for deleting/deleted accounts. Name and lifecycle revision come from the same snapshot.
 
-Task 7.3 shares WebAuthn challenges, browser nonce/replay and bound-session state through Redis across API instances. Client-assertion replay remains a separate single-process boundary; portal readiness does not claim unrelated OAuth scaling. See [API design](api-design.md#22-identityservice) for account freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifecycle/TTL details.
+WebAuthn challenges, browser nonce/replay, bound sessions and independently scoped client-assertion claims use shared Redis outside development. Missing authority/corrupt state fails closed; no readiness/source change certifies fleet rollout. See [API design](api-design.md#22-identityservice) for freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifetime details.
 
 ## 4. User Lifecycle Consumption
 

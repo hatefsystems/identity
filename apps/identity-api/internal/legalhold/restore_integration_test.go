@@ -48,14 +48,10 @@ func restoreDatabase(t *testing.T) (context.Context, *pgxpool.Pool) {
 // This local drill certifies neither deployed backup/key recovery nor independent
 // historical authenticity. Dumps, keys, rows and proofs stay in process memory.
 func TestForwardRecoveryConsistentRestoreIntegration(t *testing.T) {
-	for _, expanded := range []bool{false, true} {
-		t.Run(map[bool]string{false: "baseline", true: "expanded_backfill"}[expanded], func(t *testing.T) {
-			consistentRestoreIntegration(t, expanded)
-		})
-	}
+	t.Run("baseline", consistentRestoreIntegration)
 }
 
-func consistentRestoreIntegration(t *testing.T, expanded bool) {
+func consistentRestoreIntegration(t *testing.T) {
 	t.Helper()
 	ctx, source := restoreDatabase(t)
 	metadata := holdMigrationMetadata(ctx, t, source)
@@ -63,24 +59,10 @@ func consistentRestoreIntegration(t *testing.T, expanded bool) {
 	if err := source.QueryRow(ctx, `SELECT 'public.legal_holds'::regclass::oid`).Scan(&originalTable); err != nil {
 		t.Fatal(err)
 	}
-	if expanded {
-		// Alter the real baseline table so workflow foreign keys survive backfill.
-		if _, err := source.Exec(ctx, `ALTER TABLE public.legal_holds
-DROP CONSTRAINT legal_holds_encrypted_or_purged,
-ADD COLUMN reason TEXT,
-ADD COLUMN requesting_authority VARCHAR(255),
-ADD COLUMN legal_basis VARCHAR(255),`+expandedHoldChecks); err != nil {
-			t.Fatal("expand baseline hold storage failed")
-		}
-	}
 	svc, _ := testService(t)
 	svc.store = db.New(source)
 	var ids []uuid.UUID
 	for _, kind := range []string{KindHold, KindPreservation} {
-		if expanded {
-			ids = append(ids, insertLegacyHold(ctx, t, source, false, kind))
-			continue
-		}
 		details := Details{RecordID: uuid.New(), AccountRef: uuid.New(), Kind: kind,
 			Reason: "fixture reason", RequestingAuthority: "fixture court", LegalBasis: "fixture basis"}
 		blob, err := svc.seal(ctx, details)
@@ -107,30 +89,8 @@ is_active,released_at,released_by,applied_at,review_at) VALUES($1,$2,$3,$4,$5,fa
 	}
 	ids = append(ids, converted.RecordID)
 	seedRestoreChains(ctx, t, source)
-	if expanded {
-		before := restoreInventory(ctx, t, source)
-		defer clearRestoreInventory(before)
-		if err := contractHoldStorage(ctx, source); err == nil {
-			t.Fatal("premature contraction accepted populated legacy holds")
-		}
-		afterRefusal := restoreInventory(ctx, t, source)
-		compareRestoreInventory(t, before, afterRefusal)
-		clearRestoreInventory(afterRefusal)
-		compareRestoreInventory(t, metadata, holdMigrationMetadata(ctx, t, source))
-		if err := svc.CheckCrypto(ctx); !errors.Is(err, ErrBackfillRequired) {
-			t.Fatal("expanded baseline did not require backfill")
-		}
-		for range ids[:2] {
-			if n, err := svc.Backfill(ctx, source, 1); err != nil || n != 1 {
-				t.Fatal("bounded forward-recovery backfill failed")
-			}
-		}
-	}
-	for range 2 {
-		if n, err := svc.Backfill(ctx, source, 1); err != nil || n != 0 {
-			t.Fatal("completed or baseline backfill was not a repeatable no-op")
-		}
-	}
+	registrationFixture := seedRegistrationRestoreFixture(ctx, t, source, svc.encryptor, svc.indexer)
+	defer registrationFixture.clear()
 	for _, id := range ids {
 		row, err := db.New(source).GetLegalHold(ctx, id)
 		if err != nil {
@@ -146,14 +106,9 @@ is_active,released_at,released_by,applied_at,review_at) VALUES($1,$2,$3,$4,$5,fa
 	if err := svc.CheckCrypto(ctx); err != nil {
 		t.Fatal("forward-recovery crypto readiness failed")
 	}
-	if expanded {
-		if err := contractHoldStorage(ctx, source); err != nil {
-			t.Fatal("test storage contraction failed after verified backfill")
-		}
-	}
 	var finalTable uint32
 	if err := source.QueryRow(ctx, `SELECT 'public.legal_holds'::regclass::oid`).Scan(&finalTable); err != nil || finalTable != originalTable {
-		t.Fatal("compatibility fixture replaced the baseline hold table")
+		t.Fatal("fixture replaced the baseline hold table")
 	}
 	compareRestoreInventory(t, metadata, holdMigrationMetadata(ctx, t, source))
 	if n, err := svc.CleanupReleased(ctx, source, 1); err != nil || n != 1 {
@@ -162,6 +117,10 @@ is_active,released_at,released_by,applied_at,review_at) VALUES($1,$2,$3,$4,$5,fa
 	expected := restoreInventory(ctx, t, source)
 	defer clearRestoreInventory(expected)
 	checkRestoredState(ctx, t, source, svc, ids)
+	checkRegistrationRestoredState(ctx, t, source, svc.encryptor, registrationFixture)
+	sourceAfterChecks := restoreInventory(ctx, t, source)
+	defer clearRestoreInventory(sourceAfterChecks)
+	compareRestoreInventory(t, expected, sourceAfterChecks)
 
 	admin, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -219,6 +178,9 @@ is_active,released_at,released_by,applied_at,review_at) VALUES($1,$2,$3,$4,$5,fa
 	} else {
 		t.Log("pg_dump/pg_restore unavailable: local frozen TEMPLATE clone drill only; not deployed backup restoration certification")
 	}
+	if os.Getenv("REQUIRE_LEGALHOLD_DUMP_RESTORE") == "1" && len(dump) == 0 {
+		t.Fatal("mandatory legal hold dump/restore requires matching pg_dump and pg_restore clients")
+	}
 	if _, err := admin.Exec(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" ALLOW_CONNECTIONS false"); err != nil {
 		t.Fatal("freeze run-owned source failed")
 	}
@@ -275,7 +237,11 @@ is_active,released_at,released_by,applied_at,review_at) VALUES($1,$2,$3,$4,$5,fa
 			defer clearRestoreInventory(actual)
 			compareRestoreInventory(t, expected, actual)
 			checkRestoredState(ctx, t, restored, svc, ids)
-			t.Log("exact all-table and sequence data/digest, both full proofs, receipt reconciliation, crypto, replay and signer recovery checks passed; local drill only")
+			checkRegistrationRestoredState(ctx, t, restored, svc.encryptor, registrationFixture)
+			afterChecks := restoreInventory(ctx, t, restored)
+			defer clearRestoreInventory(afterChecks)
+			compareRestoreInventory(t, expected, afterChecks)
+			t.Log("exact all-table and sequence data/digest, both full proofs, receipt reconciliation, crypto, replay, signer recovery and signup-state checks passed; local drill only")
 		})
 	}
 }
@@ -388,9 +354,6 @@ AND conrelid IN ('public.legal_case_holds'::regclass,'public.legal_hold_reviews'
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM public.identity_schema_version WHERE version_id=1 AND is_applied`).Scan(&appliedBaseline); err != nil || appliedBaseline != 1 {
 		t.Fatal("restored full baseline metadata is missing")
-	}
-	if n, err := svc.Backfill(ctx, pool, 1); err != nil || n != 0 {
-		t.Fatal("restored contracted backfill was not a no-op")
 	}
 	var columns int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_schema='public'

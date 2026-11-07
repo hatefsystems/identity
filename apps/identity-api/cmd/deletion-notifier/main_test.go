@@ -128,6 +128,7 @@ func commandEnvironment(t *testing.T) {
 	t.Setenv(config.EnvDeletionSMTPPassword, "private-password")
 	t.Setenv(config.EnvDeletionSMTPFrom, "accounts@example.test")
 	t.Setenv(config.EnvDeletionSMTPPublicOrigin, "https://identity.example.test")
+	t.Setenv(config.EnvPortalOrigin, "https://identity.example.test")
 	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x71}, 32)))
 	t.Setenv(config.EnvMasterKEKVersion, "7")
 }

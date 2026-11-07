@@ -150,32 +150,28 @@ export function validateLegalLookupQuery(
       'limit',
       'fields',
     ]);
-    const identifier = normalizedText(query.identifier, 320);
+    if (
+      typeof query.identifier !== 'string' ||
+      new TextEncoder().encode(query.identifier).length > 1024
+    )
+      throw new PortalError('invalid_request');
+    const identifier = normalizedText(query.identifier, 1024);
     const parts = identifier.split('@');
-    // Validate a bare address without lowercasing, NFKC, or provider-specific rules.
-    const atom = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~\u0080-\u{10ffff}]+$/u;
+    // Preserve input for the backend's NFC/IDNA identity authority. Domain
+    // literals and invisible exceptions are not supported signup identities.
+    const atom = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~\p{L}\p{N}\p{M}]+$/u;
     const dotAtom = (value: string) => value.split('.').every((piece) => atom.test(piece));
     const domain = parts[1] ?? '';
-    let validDomain = dotAtom(domain);
-    if (/^\[[0-9a-fA-F:.]+\]$/.test(domain)) {
-      if (domain.includes(':')) {
-        try {
-          validDomain = new URL(`http://${domain}`).hostname.startsWith('[');
-        } catch {
-          validDomain = false;
-        }
-      } else {
-        const octets = domain.slice(1, -1).split('.');
-        validDomain =
-          octets.length === 4 &&
-          octets.every((octet) => /^(0|[1-9][0-9]{0,2})$/.test(octet) && Number(octet) <= 255);
-      }
-    }
+    const domainDots = domain.replace(/[\u3002\uff0e\uff61]/gu, '.');
     if (
       parts.length !== 2 ||
-      /[\p{White_Space}\p{Cc}\p{Cs}]/u.test(identifier) ||
+      /[\p{White_Space}\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}]/u.test(identifier) ||
       !dotAtom(parts[0]) ||
-      !validDomain
+      !domain ||
+      domainDots.startsWith('.') ||
+      domainDots.endsWith('.') ||
+      domainDots.includes('..') ||
+      /[[\]<>"\\]/u.test(domain)
     )
       throw new PortalError('invalid_request');
     const startTime = utc(query.startTime);

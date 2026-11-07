@@ -45,7 +45,7 @@ type Config struct {
 	// Port is the TCP port the HTTP server listens on.
 	Port int
 	// Environment identifies the deployment environment (e.g. "development",
-	// "production"). It is informational and used for readiness reporting.
+	// "production"). It controls security policy and readiness reporting.
 	Environment string
 	// PortalOrigin is the canonical first-party browser origin. Composition
 	// validates it against the issuer and WebAuthn origins before serving traffic.
@@ -100,6 +100,10 @@ type SessionConfig struct {
 // the absolute window; the __Host-/Secure invariant itself is enforced when the
 // cookie codec is constructed.
 func LoadSession() (SessionConfig, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return SessionConfig{}, err
+	}
 	secure, err := getEnvBool("SESSION_COOKIE_SECURE", defaultSessionCookieSecure)
 	if err != nil {
 		return SessionConfig{}, err
@@ -120,7 +124,6 @@ func LoadSession() (SessionConfig, error) {
 			"config: SESSION_IDLE_TTL %v must not exceed SESSION_ABSOLUTE_TTL %v", idleTTL, absoluteTTL)
 	}
 	name := getEnv("SESSION_COOKIE_NAME", defaultSessionCookieName)
-	environment := getEnv("APP_ENV", "development")
 	if !secure || !strings.HasPrefix(name, "__Host-") {
 		origin := getEnv(EnvPortalOrigin, getEnv(EnvOIDCIssuer, defaultDevIssuer))
 		if environment != "development" || !strings.HasPrefix(origin, "http://") {
@@ -139,15 +142,17 @@ func LoadSession() (SessionConfig, error) {
 	}, nil
 }
 
-// Load builds a Config from environment variables, applying sane defaults for
-// any value that is not set. It returns an error only when a provided value is
-// malformed (e.g. a non-numeric PORT), so that misconfiguration fails fast at
-// startup rather than surfacing as confusing runtime behavior.
+// Load requires an explicit environment and applies defaults only to settings
+// that do not select the security mode.
 func Load() (Config, error) {
+	environment, err := LoadEnvironment()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Host:            getEnv("HOST", defaultHost),
 		Port:            defaultPort,
-		Environment:     getEnv("APP_ENV", "development"),
+		Environment:     environment,
 		ReadTimeout:     defaultReadTimeout,
 		WriteTimeout:    defaultWriteTimeout,
 		IdleTimeout:     defaultIdleTimeout,
@@ -180,6 +185,21 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadAuditSubject loads only the destination stored in DB-backed audit intents,
+// without requiring transport, signer settings, or unrelated service secrets.
+func LoadAuditSubject() (string, error) {
+	subject := getEnv(EnvAuditSubject, defaultAuditSubject)
+	if !strings.HasPrefix(subject, auditSubjectPrefix) || strings.ContainsAny(subject, "*>") {
+		return "", fmt.Errorf("config: %s requires a concrete subject under %s", EnvAuditSubject, StreamSubjectPattern)
+	}
+	for _, token := range strings.Split(subject, ".") {
+		if token == "" || strings.ContainsAny(token, " \t\r\n\x00") {
+			return "", fmt.Errorf("config: %s requires nonempty subject tokens", EnvAuditSubject)
+		}
+	}
+	return subject, nil
 }
 
 // parseTrustedProxyCIDRs parses the explicit trust boundary for forwarded

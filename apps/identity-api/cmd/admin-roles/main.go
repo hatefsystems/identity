@@ -37,6 +37,10 @@ func main() {
 }
 
 func run(ctx context.Context, user, role string, revoke bool) error {
+	environment, err := config.LoadEnvironment()
+	if err != nil {
+		return err
+	}
 	target, err := uuid.Parse(user)
 	if err != nil {
 		return err
@@ -51,6 +55,10 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 		return errors.New("operator database and identity required")
 	}
 	cfg, err := config.LoadAdmin()
+	if err != nil {
+		return err
+	}
+	subject, err := config.LoadAuditSubject()
 	if err != nil {
 		return err
 	}
@@ -71,19 +79,11 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 		return err
 	}
 	defer pool.Close()
-	environment := os.Getenv("APP_ENV")
-	if environment == "" {
-		environment = "development"
-	}
-	auditCfg, err := config.LoadAudit(environment)
-	if err != nil {
-		return err
-	}
 	baseline, err := loadOperatorBaseline(ctx, pool, cfg, environment)
 	if err != nil {
 		return err
 	}
-	actions, err := adminaction.New(pool, enc, auditCfg.Subject, baseline.ContextRetention())
+	actions, err := adminaction.New(pool, enc, subject, baseline.ContextRetention())
 	if err != nil {
 		return err
 	}

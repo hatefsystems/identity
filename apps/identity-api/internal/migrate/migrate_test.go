@@ -99,7 +99,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"legal_governance_policies", "legal_governance_baseline", "legal_cases", "legal_case_subjects", "legal_case_holds",
 			"legal_workflow_events", "legal_hold_reviews", "legal_workflow_replays", "legal_transparency_coverage",
 			"legal_transparency_years", "legal_transparency_months", "legal_transparency_reports", "legal_transparency_replays",
-			"deletion_notifications",
+			"deletion_notifications", "registration_attempts",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -117,7 +117,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var count int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 34 {
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 35 {
 			t.Fatalf("final application table count: %d, %v", count, err)
 		}
 	})
@@ -132,6 +132,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			// Drives the retention worker's candidate scan, which pages by
 			// (retain_until, seq). Replaced idx_security_ledger_retention_seq.
 			"idx_security_ledger_retention",
+			"idx_registration_pending_expiry", "idx_registration_receipt_expiry", "idx_registration_result_user",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -153,7 +154,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		for table, want := range map[string]int{"roles": 4, "permissions": 13, "role_permissions": 15,
 			"users": 0, "user_roles": 0, "audit_log_head": 0, "security_ledger_head": 0,
 			"audit_log_chain": 0, "security_ledger_chain": 0, "security_ledger_retention_settings": 0,
-			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0} {
+			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0} {
 			var count int
 			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
 				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)

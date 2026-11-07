@@ -11,5 +11,4 @@ var (
 	ErrIdempotencyConflict       = errors.New("legalhold: idempotency conflict")
 	ErrUnavailable               = errors.New("legalhold: unavailable")
 	ErrTransactionRequired       = errors.New("legalhold: request transaction required")
-	ErrBackfillRequired          = errors.New("legalhold: encrypted backfill required")
 )

@@ -251,6 +251,10 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	// Both services share this barrier and the production users-row mutex. The
 	// final passkey is the only factor currently capable of issuing a login
 	// session, so deletion must be refused even while TOTP teardown is racing.
+	admitted, err := q.GetUserByID(ctx, userID)
+	if err != nil {
+		t.Fatal("read admitted MFA version failed")
+	}
 	barrier := newFactorBeginBarrier(pool, 2)
 	webAuthnService := newFactorIntegrationWebAuthn(t, q, barrier)
 	mfaService, err := mfa.New(mfa.Config{}, q, factorTestEncryptor{}, mfa.WithTransacter(barrier))
@@ -267,7 +271,7 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	}()
 	go func() {
 		<-start
-		disableResult <- mfaService.Disable(ctx, userID)
+		disableResult <- mfaService.Disable(ctx, userID, admitted.AuthVersion)
 	}()
 	close(start)
 

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import {
   assertStaticAssetHeaders,
   maintenanceEntrypoints,
@@ -7,7 +9,9 @@ import {
   smokeImage,
   staticAssets,
   webDocumentNonce,
+  assertRuntimeInventory,
 } from './smoke-image.mjs';
+import { portalCleanup, removeOwnedDockerResource } from './portal-harness.mjs';
 
 const nonce = Buffer.alloc(32, 255).toString('base64');
 const otherNonce = Buffer.alloc(32, 1).toString('base64');
@@ -57,7 +61,7 @@ test('maintenance smoke requires structured ERROR logging and exit one', () => {
 test('all packaged entrypoints are covered by the production-configuration smoke', () => {
   assert.deepEqual(maintenanceEntrypoints, [
     'identity-api', 'audit-signer', 'purge-worker', 'migrate', 'security-ledger-purge',
-    'admin-audit-publisher', 'lifecycle-publisher', 'deletion-notifier', 'admin-legal',
+    'admin-audit-publisher', 'lifecycle-publisher', 'deletion-notifier', 'admin-legal', 'registration-cleanup',
   ]);
 });
 
@@ -312,4 +316,81 @@ test('rejects unsupported kinds and unsafe references without starting Docker', 
   await assert.rejects(smokeImage('web', '--help'), /reference/);
   await assert.rejects(smokeImage('api', 'not a reference'), /reference/);
   await assert.rejects(smokeImage('web', 'identity-web:test', true), /callback/);
+});
+
+test('actual runtime inventory is exact and excludes fixture, private key and environment files', () => {
+  const inventory = ['etc/ssl/certs/ca-certificates.crt', ...maintenanceEntrypoints.map((name) => `usr/local/bin/${name}`)];
+  assertRuntimeInventory(inventory);
+  for (const file of ['usr/local/bin/portal-fixture', 'usr/local/bin/admin-roles', '.env', 'etc/.env.production', 'etc/signing.key', 'usr/local/bin/unknown']) assert.throws(() => assertRuntimeInventory([...inventory, file]));
+  assert.throws(() => assertRuntimeInventory(inventory.filter((name) => !name.endsWith('/registration-cleanup'))));
+});
+
+test('smoke ownership cleanup attempts every resource, verifies absence and never removes a foreign ID', async (t) => {
+  for (const problem of ['none', 'remove-failed', 'still-present', 'foreign', 'inspection-failed', 'list-failed']) await t.test(problem, async (t) => {
+    const runID = 'a'.repeat(32), ids = ['1'.repeat(64), '2'.repeat(64)], present = new Set(ids), removed = [];
+    t.mock.method(childProcess, 'spawnSync', (command, args) => {
+      assert.equal(command, 'docker');
+      if (args[0] === 'container') return { status: problem === 'list-failed' ? 1 : 0, stdout: [...present].join('\n') };
+      if (args[0] === 'inspect') return { status: problem === 'inspection-failed' && args[1] === ids[1] ? 1 : 0,
+        stdout: JSON.stringify([{ Id: args[1], Config: { Labels: { 'ldp.run': problem === 'foreign' && args[1] === ids[1] ? 'foreign' : runID } } }]) };
+      assert.equal(args[0], 'rm');
+      const id = args.at(-1);
+      removed.push(id);
+      if (problem !== 'still-present' || id !== ids[1]) present.delete(id);
+      return { status: problem === 'remove-failed' && id === ids[1] ? 1 : 0, stdout: '' };
+    });
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const close = portalCleanup(ids.map((id) => () => removeOwnedDockerResource({ kind: 'container', id, runID })));
+    if (problem === 'none') { assert.deepEqual(await close(), { completed: true }); assert.equal(present.size, 0); }
+    else await assert.rejects(close(), /cleanup did not complete/);
+    if (['foreign', 'inspection-failed'].includes(problem)) assert.deepEqual(removed, [ids[0]]);
+    if (['remove-failed', 'still-present'].includes(problem)) assert.deepEqual(removed, [ids[1], ids[0]]);
+    if (problem === 'list-failed') assert.deepEqual(removed, []);
+  });
+});
+
+test('image smoke publishes success only after every actual owned ID is retired', async (t) => {
+  for (const problem of ['none', 'cleanup', 'collision', 'inventory']) await t.test(problem, async (t) => {
+    const present = new Map(), created = [], removed = [], messages = [];
+    t.mock.method(console, 'log', (message) => messages.push(message));
+    t.mock.method(childProcess, 'spawnSync', (command, args) => {
+      if (command === 'tar') return { status: 0, stdout: maintenanceEntrypoints.map((name) => `usr/local/bin/${name}`).join('\n') + (problem === 'inventory' ? '\n.env' : '') };
+      assert.equal(command, 'docker');
+      if (args[0] === 'image') return { status: 0, stdout: JSON.stringify([{ Id: `sha256:${'f'.repeat(64)}`, Os: 'linux', Architecture: 'amd64', Config: { User: 'nonroot:nonroot' } }]) };
+      if (args[0] === 'create') {
+        if (problem === 'collision' && created.length === 2) return { status: 125, stdout: '' };
+        const id = String(created.length + 1).padStart(64, '0');
+        const runID = args.find((item) => item.startsWith('ldp.run=')).slice('ldp.run='.length);
+        const binary = args.includes('--entrypoint') ? args[args.indexOf('--entrypoint') + 1].split('/').at(-1) : 'inventory';
+        present.set(id, { runID, binary }); created.push(id);
+        return { status: 0, stdout: id };
+      }
+      if (args[0] === 'export') return { status: 0, stdout: '' };
+      if (args[0] === 'start') {
+        const { binary } = present.get(args.at(-1));
+        if (binary === 'migrate') return { status: 1, stdout: '', stderr: 'migrate: migrate: DATABASE_URL is empty\n' };
+        return { status: 1, stdout: JSON.stringify({ level: 'ERROR', msg: binary === 'security-ledger-purge' ? 'security ledger purge failed' : 'config: APP_ENV is required', reason: 'config: SECURITY_LEDGER_PURGE_DATABASE_URL is required; API credentials are not a fallback' }), stderr: '' };
+      }
+      if (args[0] === 'container') return { status: 0, stdout: [...present.keys()].join('\n') };
+      if (args[0] === 'inspect') return { status: 0, stdout: JSON.stringify([{ Id: args[1], Config: { Labels: { 'ldp.run': present.get(args[1]).runID } } }]) };
+      assert.equal(args[0], 'rm');
+      const id = args.at(-1); removed.push(id); present.delete(id);
+      return { status: problem === 'cleanup' && id === created.at(-1) ? 1 : 0, stdout: '' };
+    });
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    if (problem === 'none') {
+      await smokeImage('api', 'identity-api:owned');
+      assert.equal(messages.length, 1);
+      const report = JSON.parse(messages[0]);
+      assert.equal(report.cleanup.completed, true);
+      assert.equal(report.status, 'passed');
+      assert.equal(present.size, 0);
+    } else {
+      await assert.rejects(smokeImage('api', 'identity-api:owned'));
+      assert.deepEqual(messages, []);
+    }
+    assert.deepEqual(removed, [...created].reverse(), 'Every owned resource must be attempted, never a colliding foreign name');
+  });
 });

@@ -269,12 +269,11 @@ describe('legal capabilities and input boundaries', () => {
     expect(
       validateLegalLookupQuery({ ...query, identifier: `  ${identifier}\u0085` }).identifier
     ).toBe(identifier);
-    const exact = `${'\u00e9'.repeat(153)}@example.test`;
-    expect(new TextEncoder().encode(exact).length).toBe(319);
-    expect(validateLegalLookupQuery({ ...query, identifier: `a${exact}` }).identifier).toBe(
-      `a${exact}`
-    );
-    for (const identifier of ['Subject@[192.0.2.1]', 'Subject@[2001:db8::1]'])
+    const size = new TextEncoder().encode(identifier).length;
+    const exact = `${' '.repeat(1024 - size)}${identifier}`;
+    expect(new TextEncoder().encode(exact).length).toBe(1024);
+    expect(validateLegalLookupQuery({ ...query, identifier: exact }).identifier).toBe(identifier);
+    for (const identifier of ['User@\u4f8b\u3048.test', 'User@EXAMPLE\u3002test'])
       expect(validateLegalLookupQuery({ ...query, identifier }).identifier).toBe(identifier);
     for (const identifier of [
       '',
@@ -292,10 +291,15 @@ describe('legal capabilities and input boundaries', () => {
       'subject\u0000@example.test',
       'sub ject@example.test',
       'subject@\ud800',
-      `aa${exact}`,
+      ` ${exact}`,
+      'Subject@[192.0.2.1]',
+      'Subject@[2001:db8::1]',
       'subject@[256.0.0.1]',
       'subject@[192.00.2.1]',
       'subject@[2001:::1]',
+      'subject\u200c@example.test',
+      '\ufeffsubject@example.test',
+      'subject\ufffd@example.test',
     ])
       expect(() => validateLegalLookupQuery({ ...query, identifier })).toThrow('invalid_request');
   });

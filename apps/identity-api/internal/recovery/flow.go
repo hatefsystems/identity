@@ -7,13 +7,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 )
 
 const recoveryTransactionBytes = 32
@@ -87,7 +87,10 @@ func (s *FlowService) Start(ctx context.Context, email string) (*StartResult, er
 		}
 	}()
 
-	normalized := strings.ToLower(strings.TrimSpace(email))
+	normalized, err := emailaddress.Canonicalize(email)
+	if err != nil {
+		return nil, ErrInvalidCode
+	}
 	userID := decoyRecoverySubject(normalized)
 	user, err := s.users.GetUserByEmail(ctx, normalized)
 	switch {

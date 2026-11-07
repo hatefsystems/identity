@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -98,7 +99,7 @@ func (s *Service) enqueueNotices(ctx context.Context, store Store, request db.De
 // swapping envelopes between rows must never reroute a token to another mailbox.
 func decodeNotificationPayload(plaintext []byte, row db.DeletionNotification, request db.DeletionRequest) (DeletionNotice, error) {
 	invalid := errors.New("privacy: notification payload binding invalid")
-	if len(plaintext) == 0 || len(plaintext) > 4096 {
+	if len(plaintext) == 0 || len(plaintext) > 4096 || !utf8.Valid(plaintext) {
 		return DeletionNotice{}, invalid
 	}
 	var payload notificationPayload

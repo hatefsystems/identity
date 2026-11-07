@@ -18,6 +18,7 @@ type fakeUserStore struct {
 	users       map[uuid.UUID]db.User
 	enrollments map[uuid.UUID]db.MfaTotpEnrollment
 	passkeys    int64
+	beforeLock  func()
 }
 
 func newFakeUserStore() *fakeUserStore {
@@ -29,6 +30,9 @@ func newFakeUserStore() *fakeUserStore {
 }
 
 func (f *fakeUserStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) (db.User, error) {
+	if f.beforeLock != nil {
+		f.beforeLock()
+	}
 	return f.GetUserByID(ctx, id)
 }
 
@@ -191,7 +195,7 @@ func TestGenerateSetupHappyPath(t *testing.T) {
 	ctx := context.Background()
 
 	sessionID := uuid.NewString()
-	resp, err := svc.GenerateSetup(ctx, user.ID, sessionID)
+	resp, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
@@ -223,7 +227,7 @@ func TestGenerateSetupAlreadyEnabled(t *testing.T) {
 	u.IsMfaEnabled = true
 	store.users[user.ID] = u
 
-	_, err := svc.GenerateSetup(ctx, user.ID, uuid.NewString())
+	_, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, uuid.NewString())
 	if !errors.Is(err, ErrMfaAlreadyEnabled) {
 		t.Errorf("expected ErrMfaAlreadyEnabled, got %v", err)
 	}
@@ -234,7 +238,7 @@ func TestVerifyAndEnableHappyPath(t *testing.T) {
 	ctx := context.Background()
 
 	sessionID := uuid.NewString()
-	setupResp, err := svc.GenerateSetup(ctx, user.ID, sessionID)
+	setupResp, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
@@ -247,7 +251,7 @@ func TestVerifyAndEnableHappyPath(t *testing.T) {
 		t.Fatalf("GenerateCode: %v", err)
 	}
 
-	if err := svc.VerifyAndEnable(ctx, user.ID, sessionID, setupResp.EnrollmentID, code); err != nil {
+	if err := svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, setupResp.EnrollmentID, code); err != nil {
 		t.Fatalf("VerifyAndEnable: %v", err)
 	}
 
@@ -262,12 +266,12 @@ func TestVerifyAndEnableInvalidCode(t *testing.T) {
 	ctx := context.Background()
 
 	sessionID := uuid.NewString()
-	setupResp, err := svc.GenerateSetup(ctx, user.ID, sessionID)
+	setupResp, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
 
-	err = svc.VerifyAndEnable(ctx, user.ID, sessionID, setupResp.EnrollmentID, "000000")
+	err = svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, setupResp.EnrollmentID, "000000")
 	if !errors.Is(err, ErrInvalidCode) {
 		t.Errorf("expected ErrInvalidCode, got %v", err)
 	}
@@ -277,7 +281,7 @@ func TestVerifyAndEnableIsBoundToInitiatingSessionWithoutBurningEnrollment(t *te
 	svc, store, _, user := setupTestService()
 	ctx := context.Background()
 	initiatingSession := uuid.NewString()
-	setup, err := svc.GenerateSetup(ctx, user.ID, initiatingSession)
+	setup, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, initiatingSession)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
@@ -288,7 +292,7 @@ func TestVerifyAndEnableIsBoundToInitiatingSessionWithoutBurningEnrollment(t *te
 		t.Fatalf("GenerateCode: %v", err)
 	}
 
-	if err := svc.VerifyAndEnable(ctx, user.ID, uuid.NewString(), setup.EnrollmentID, code); !errors.Is(err, ErrMfaNotSetup) {
+	if err := svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, uuid.NewString(), setup.EnrollmentID, code); !errors.Is(err, ErrMfaNotSetup) {
 		t.Fatalf("foreign-session VerifyAndEnable = %v, want ErrMfaNotSetup", err)
 	}
 	enrollmentID, err := uuid.Parse(setup.EnrollmentID)
@@ -298,7 +302,7 @@ func TestVerifyAndEnableIsBoundToInitiatingSessionWithoutBurningEnrollment(t *te
 	if _, ok := store.enrollments[enrollmentID]; !ok {
 		t.Fatal("foreign session burned the legitimate pending enrollment")
 	}
-	if err := svc.VerifyAndEnable(ctx, user.ID, initiatingSession, setup.EnrollmentID, code); err != nil {
+	if err := svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, initiatingSession, setup.EnrollmentID, code); err != nil {
 		t.Fatalf("legitimate VerifyAndEnable after foreign probe: %v", err)
 	}
 }
@@ -307,7 +311,7 @@ func TestVerifyAndEnableRejectsEnabledAccountBeforeInspectingPendingSecret(t *te
 	svc, store, encryptor, user := setupTestService()
 	ctx := context.Background()
 	sessionID := uuid.NewString()
-	setup, err := svc.GenerateSetup(ctx, user.ID, sessionID)
+	setup, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
@@ -317,7 +321,7 @@ func TestVerifyAndEnableRejectsEnabledAccountBeforeInspectingPendingSecret(t *te
 	store.users[user.ID] = u
 	encryptor.decryptErr = errors.New("decrypt must not be called")
 
-	err = svc.VerifyAndEnable(ctx, user.ID, sessionID, setup.EnrollmentID, "123456")
+	err = svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, setup.EnrollmentID, "123456")
 	if !errors.Is(err, ErrMfaAlreadyEnabled) {
 		t.Fatalf("VerifyAndEnable = %v, want ErrMfaAlreadyEnabled", err)
 	}
@@ -331,7 +335,7 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 	ctx := context.Background()
 
 	sessionID := uuid.NewString()
-	setupResp, err := svc.GenerateSetup(ctx, user.ID, sessionID)
+	setupResp, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
 	if err != nil {
 		t.Fatalf("GenerateSetup: %v", err)
 	}
@@ -340,7 +344,7 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	code, _ := totp.GenerateCode(setupResp.Secret, now)
-	if err := svc.VerifyAndEnable(ctx, user.ID, sessionID, setupResp.EnrollmentID, code); err != nil {
+	if err := svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, setupResp.EnrollmentID, code); err != nil {
 		t.Fatalf("VerifyAndEnable: %v", err)
 	}
 
@@ -350,7 +354,7 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 	}
 
 	// Disable MFA
-	if err := svc.Disable(ctx, user.ID); err != nil {
+	if err := svc.Disable(ctx, user.ID, user.AuthVersion); err != nil {
 		t.Fatalf("Disable: %v", err)
 	}
 
@@ -366,5 +370,66 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 	err = svc.VerifyEnabledCode(ctx, user.ID, code)
 	if !errors.Is(err, ErrMfaNotSetup) {
 		t.Errorf("expected ErrMfaNotSetup, got %v", err)
+	}
+}
+
+func TestMutationsFenceSessionBeforePendingOrFactorChanges(t *testing.T) {
+	for _, operation := range []string{"setup", "enable", "disable"} {
+		for _, state := range []string{"revoked", "deleted", "suspended", "negative_version"} {
+			t.Run(operation+"/"+state, func(t *testing.T) {
+				svc, store, encryptor, user := setupTestService()
+				sessionID := uuid.NewString()
+				setup, err := svc.GenerateSetup(t.Context(), user.ID, user.AuthVersion, sessionID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if operation == "disable" {
+					u := store.users[user.ID]
+					u.IsMfaEnabled, u.MfaTotpSecretEncrypted = true, []byte("active-secret")
+					store.users[user.ID] = u
+				}
+				admittedVersion := user.AuthVersion
+				store.beforeLock = func() {
+					u := store.users[user.ID]
+					switch state {
+					case "revoked":
+						u.AuthVersion++
+					case "deleted":
+						u.DeletedAt.Valid = true
+					case "suspended":
+						u.Status = "suspended"
+					case "negative_version":
+						admittedVersion = -1
+					}
+					store.users[user.ID] = u
+				}
+				if state == "negative_version" {
+					admittedVersion = -1
+				}
+				encryptor.decryptErr = errors.New("must not inspect pending secret")
+				switch operation {
+				case "setup":
+					var result *SetupResponse
+					result, err = svc.GenerateSetup(t.Context(), user.ID, admittedVersion, sessionID)
+					if result != nil {
+						t.Fatal("refused setup returned a secret")
+					}
+				case "enable":
+					err = svc.VerifyAndEnable(t.Context(), user.ID, admittedVersion, sessionID, setup.EnrollmentID, "123456")
+				case "disable":
+					err = svc.Disable(t.Context(), user.ID, admittedVersion)
+				}
+				if !errors.Is(err, ErrAccountNotActive) {
+					t.Fatalf("mutation = %v", err)
+				}
+				pending := store.enrollments[uuid.MustParse(setup.EnrollmentID)]
+				if len(store.enrollments) != 1 || pending.ID.String() != setup.EnrollmentID || pending.FailedAttempts != 0 {
+					t.Fatal("refused mutation replaced, deleted or burned pending enrollment")
+				}
+				if store.users[user.ID].IsMfaEnabled != (operation == "disable") {
+					t.Fatal("refused mutation changed active factor")
+				}
+			})
+		}
 	}
 }

@@ -1,3 +1,4 @@
+import { TextEncoder } from 'node:util';
 import {
   validateEmail,
   validateLogin,
@@ -5,6 +6,15 @@ import {
   validateRegistration,
   validateTotp,
 } from '../app/(auth)/_lib/validation';
+
+const encoder = Object.getOwnPropertyDescriptor(globalThis, 'TextEncoder');
+beforeAll(() =>
+  Object.defineProperty(globalThis, 'TextEncoder', { configurable: true, value: TextEncoder })
+);
+afterAll(() => {
+  if (encoder) Object.defineProperty(globalThis, 'TextEncoder', encoder);
+  else Reflect.deleteProperty(globalThis, 'TextEncoder');
+});
 
 describe('local auth validation', () => {
   it('requires an email without claiming whether an account exists', () => {
@@ -37,13 +47,10 @@ describe('local auth validation', () => {
       email: 'Enter your email address.',
       password: 'Enter your password.',
     });
-    expect(validateRegistration({ email: 'not-an-email', password: '', confirmation: '' })).toEqual(
-      {
-        email: 'Enter a valid email address.',
-        password: 'Enter a new password.',
-        confirmation: 'Confirm your password.',
-      }
-    );
+    expect(validateRegistration({ email: 'not-an-email', phone: '' })).toEqual({
+      email: 'Enter a valid email address without invisible characters (at most 1024 UTF-8 bytes).',
+      phone: 'Enter an Iranian mobile number, such as +989123456789.',
+    });
   });
 
   it.each(['x', ' ', '\t', '  keep my spaces  ', 'p\u00e4ss\u00a0word'])(
@@ -57,7 +64,6 @@ describe('local auth validation', () => {
 
       expect(validateLogin(values)).toEqual({});
       expect(validatePassword(values)).toEqual({});
-      expect(validateRegistration(values)).toEqual({});
       expect(values.password).toBe(password);
       expect(values.confirmation).toBe(password);
     }

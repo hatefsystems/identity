@@ -200,7 +200,7 @@ func TestFlowVerifyConcurrentSubmissionHasOnePhysicalDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFlowService: %v", err)
 	}
-	batch, err := codes.Generate(context.Background(), user.ID, "")
+	batch, err := codes.Generate(context.Background(), user.ID, user.AuthVersion, "")
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}

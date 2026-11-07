@@ -34,11 +34,10 @@ const routes = [
     metadata: registrationMetadata,
     title: 'Create an account | Hatef Identity',
     heading: 'Create your account',
-    action: 'Create account',
+    action: 'Start registration and send email',
     fields: [
-      ['Email address', 'email', 'email'],
-      ['New password', 'password', 'new-password'],
-      ['Confirm password', 'password', 'new-password'],
+      ['Email address', 'text', 'email'],
+      ['Iranian mobile number', 'tel', 'tel'],
     ],
     links: [['Sign in', '/login']],
   },
@@ -132,8 +131,8 @@ describe('public auth routes', () => {
       expect(screen.getAllByRole('link')).toHaveLength(links.length + 1);
       const submit = screen.getByRole<HTMLButtonElement>('button', { name: action });
       expect(submit.type).toBe(Page === PasskeyPage ? 'button' : 'submit');
-      expect(submit.disabled).toBe(Page !== PasskeyPage);
-      if (Page !== PasskeyPage)
+      expect(submit.disabled).toBe(Page !== PasskeyPage && Page !== RegistrationPage);
+      if (Page !== PasskeyPage && Page !== RegistrationPage)
         expect(
           document.getElementById(submit.getAttribute('aria-describedby') ?? '')?.textContent
         ).toContain(notice);
@@ -149,7 +148,7 @@ describe('public auth routes', () => {
     }
   );
 
-  it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
+  it.each(routes.filter(({ Page }) => Page !== PasskeyPage && Page !== RegistrationPage))(
     '$path is disconnected in the initial server HTML, before hydration or JavaScript',
     ({ Page }) => {
       const html = renderToStaticMarkup(
@@ -214,7 +213,7 @@ describe('disconnected route interaction', () => {
     jest.clearAllMocks();
   });
 
-  it.each(routes.filter(({ Page }) => Page !== PasskeyPage))(
+  it.each(routes.filter(({ Page }) => Page !== PasskeyPage && Page !== RegistrationPage))(
     '$path keeps the notice and prevents submission without network, WebAuthn, storage, or navigation',
     ({ Page, action, fields }) => {
       const requests = [

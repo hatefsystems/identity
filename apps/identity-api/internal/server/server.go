@@ -30,6 +30,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
@@ -80,6 +81,10 @@ type Deps struct {
 	// SessionManager, since a passkey may only be added to an account the
 	// caller already holds a live session for.
 	WebAuthn *webauthn.Service
+	// Registration is separate purpose-bound authority, never a session issuer.
+	// Parent composition only supplies it after enabled/readiness prerequisites.
+	Registration      *registration.Service
+	RegistrationReady func(context.Context) error
 	// WebAuthnLimiter bounds anonymous ceremony allocation by trusted subnet.
 	WebAuthnLimiter ratelimit.Limiter
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
@@ -252,6 +257,9 @@ func (s *Server) registerRoutes() {
 	// been provisioned (it requires a database).
 	if s.deps.WebAuthn != nil {
 		s.registerWebAuthnRoutes()
+	}
+	if s.deps.Registration != nil {
+		s.registerRegistrationRoutes()
 	}
 
 	// TOTP MFA routes are mounted when an MFA service is provisioned.

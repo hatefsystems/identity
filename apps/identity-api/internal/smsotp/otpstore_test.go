@@ -3,255 +3,237 @@ package smsotp
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
 func newTestOTPStore(t *testing.T) (*RedisOTPStore, *miniredis.Miniredis) {
 	t.Helper()
-
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis.Run: %v", err)
-	}
-	t.Cleanup(mr.Close)
-
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
 	t.Cleanup(func() { _ = client.Close() })
-
-	store, err := NewRedisOTPStore(client)
+	s, err := NewRedisOTPStore(client)
 	if err != nil {
-		t.Fatalf("NewRedisOTPStore: %v", err)
+		t.Fatal(err)
 	}
-	return store, mr
+	return s, mr
 }
-
-func TestNewRedisOTPStoreRejectsNilClient(t *testing.T) {
-	if _, err := NewRedisOTPStore(nil); err == nil {
-		t.Fatal("expected error for nil client, got nil")
-	}
+func boundOTPRecord() OTPRecord {
+	return OTPRecord{OTPBinding: OTPBinding{PurposeEnrollment, uuid.New().String(), "session-a"}, Phone: testPhone, CodeHash: strings.Repeat("a", 64)}
 }
-
-func boundOTPRecord(phone, codeHash string) OTPRecord {
-	return OTPRecord{
-		UserID:    "f387725d-728f-4de1-8be0-519172b37cc4",
-		SessionID: "session-a",
-		Phone:     phone,
-		CodeHash:  codeHash,
+func storeRecord(t *testing.T, s *RedisOTPStore, id string, rec OTPRecord) {
+	t.Helper()
+	if err := s.Store(context.Background(), id, rec, 3*time.Minute, 10); err != nil {
+		t.Fatal(err)
 	}
 }
-
-func TestOTPStoreStoreAndGet(t *testing.T) {
-	store, _ := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(11)
-	want := boundOTPRecord("+15551230000", "hash-abc")
-
-	if err := store.Store(ctx, verificationID, want, 3*time.Minute); err != nil {
-		t.Fatalf("Store: %v", err)
-	}
-
-	rec, err := store.Get(ctx, verificationID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if rec.CodeHash != "hash-abc" {
-		t.Errorf("CodeHash = %q, want %q", rec.CodeHash, "hash-abc")
-	}
-	if rec.Attempts != 0 {
-		t.Errorf("Attempts = %d, want 0 on a fresh record", rec.Attempts)
-	}
-	if rec.UserID != want.UserID || rec.SessionID != want.SessionID || rec.Phone != want.Phone {
-		t.Errorf("binding = %+v, want %+v", rec, want)
-	}
+func consumeRecord(s *RedisOTPStore, id string, rec OTPRecord, hash string) error {
+	return s.Consume(context.Background(), id, rec, hash, 3, 15*time.Minute)
 }
-
-func TestOTPStoreGetMissingReturnsNoActiveCode(t *testing.T) {
-	store, _ := newTestOTPStore(t)
-	ctx := context.Background()
-
-	_, err := store.Get(ctx, testVerificationID(12))
-	if !errors.Is(err, ErrNoActiveCode) {
-		t.Errorf("Get on missing phone: error = %v, want ErrNoActiveCode", err)
+func TestOTPStoreAtomicConsumeHasOneWinner(t *testing.T) {
+	s, _ := newTestOTPStore(t)
+	id := testVerificationID(10)
+	rec := boundOTPRecord()
+	storeRecord(t, s, id, rec)
+	var wg sync.WaitGroup
+	results := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); results <- consumeRecord(s, id, rec, rec.CodeHash) }()
 	}
-}
-
-func TestOTPStoreStoreResetsAttempts(t *testing.T) {
-	store, _ := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(13)
-	record := boundOTPRecord("+15551231111", "hash-1")
-
-	if err := store.Store(ctx, verificationID, record, time.Minute); err != nil {
-		t.Fatalf("Store: %v", err)
-	}
-	if _, err := store.IncrementAttempts(ctx, verificationID); err != nil {
-		t.Fatalf("IncrementAttempts: %v", err)
-	}
-	if _, err := store.IncrementAttempts(ctx, verificationID); err != nil {
-		t.Fatalf("IncrementAttempts: %v", err)
-	}
-
-	// Re-issuing a code must start a clean attempt budget.
-	record.CodeHash = "hash-2"
-	if err := store.Store(ctx, verificationID, record, time.Minute); err != nil {
-		t.Fatalf("Store (re-issue): %v", err)
-	}
-	rec, err := store.Get(ctx, verificationID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if rec.Attempts != 0 {
-		t.Errorf("Attempts = %d after re-issue, want 0", rec.Attempts)
-	}
-	if rec.CodeHash != "hash-2" {
-		t.Errorf("CodeHash = %q after re-issue, want %q", rec.CodeHash, "hash-2")
-	}
-}
-
-func TestOTPStoreIncrementAttempts(t *testing.T) {
-	store, _ := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(14)
-
-	if err := store.Store(ctx, verificationID, boundOTPRecord("+15551232222", "hash"), time.Minute); err != nil {
-		t.Fatalf("Store: %v", err)
-	}
-
-	for want := 1; want <= 3; want++ {
-		got, err := store.IncrementAttempts(ctx, verificationID)
-		if err != nil {
-			t.Fatalf("IncrementAttempts: %v", err)
-		}
-		if got != want {
-			t.Errorf("IncrementAttempts returned %d, want %d", got, want)
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if !errors.Is(err, ErrNoActiveCode) {
+			t.Fatal(err)
 		}
 	}
-
-	rec, err := store.Get(ctx, verificationID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if rec.Attempts != 3 {
-		t.Errorf("persisted Attempts = %d, want 3", rec.Attempts)
+	if winners != 1 {
+		t.Fatalf("consume winners=%d", winners)
 	}
 }
-
-func TestOTPStoreDelete(t *testing.T) {
-	store, _ := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(15)
-
-	if err := store.Store(ctx, verificationID, boundOTPRecord("+15551233333", "hash"), time.Minute); err != nil {
-		t.Fatalf("Store: %v", err)
+func TestOTPStoreWrongBindingDoesNotBurnOrExtend(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	id := testVerificationID(11)
+	rec := boundOTPRecord()
+	storeRecord(t, s, id, rec)
+	for _, field := range []string{"purpose", "owner", "binding", "phone", "hash"} {
+		foreign := rec
+		switch field {
+		case "purpose":
+			foreign.Purpose = PurposeSignup
+			foreign.BindingID = testVerificationID(12)
+		case "owner":
+			foreign.OwnerID = uuid.New().String()
+		case "binding":
+			foreign.BindingID = "foreign"
+		case "phone":
+			foreign.Phone = "+989123456780"
+		case "hash":
+			foreign.CodeHash = strings.Repeat("b", 64)
+		}
+		if err := consumeRecord(s, id, foreign, rec.CodeHash); !errors.Is(err, ErrNoActiveCode) {
+			t.Fatal(err)
+		}
 	}
-	if err := store.Delete(ctx, verificationID); err != nil {
-		t.Fatalf("Delete: %v", err)
+	if got, err := s.Get(context.Background(), id); err != nil || got.Attempts != 0 || mr.TTL(otpKey(id)) != 3*time.Minute {
+		t.Fatal("foreign request burned/extended")
 	}
-	if _, err := store.Get(ctx, verificationID); !errors.Is(err, ErrNoActiveCode) {
-		t.Errorf("Get after Delete: error = %v, want ErrNoActiveCode", err)
+	mr.FastForward(time.Minute)
+	if err := consumeRecord(s, id, rec, strings.Repeat("b", 64)); !errors.Is(err, ErrInvalidCode) {
+		t.Fatal(err)
+	}
+	if mr.TTL(otpKey(id)) != 2*time.Minute {
+		t.Fatal("wrong attempt extends expiry")
+	}
+	if err := consumeRecord(s, id, rec, rec.CodeHash); err != nil {
+		t.Fatal(err)
 	}
 }
-
-func TestOTPStoreLockoutLifecycle(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-	const phone = "+15551234444"
-
-	locked, err := store.IsLockedOut(ctx, phone)
-	if err != nil {
-		t.Fatalf("IsLockedOut: %v", err)
+func TestOTPStoreAtomicAttemptsAndLockout(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	id := testVerificationID(13)
+	rec := boundOTPRecord()
+	storeRecord(t, s, id, rec)
+	for i := 0; i < 3; i++ {
+		want := ErrInvalidCode
+		if i == 2 {
+			want = ErrLockedOut
+		}
+		if err := consumeRecord(s, id, rec, strings.Repeat("b", 64)); !errors.Is(err, want) {
+			t.Fatal(err)
+		}
 	}
-	if locked {
-		t.Fatal("expected not locked out initially")
+	if mr.Exists(otpKey(id)) || mr.TTL(lockoutKey(testPhone)) != 15*time.Minute {
+		t.Fatal("non-atomic lockout")
 	}
-
-	if err := store.Lockout(ctx, phone, 15*time.Minute); err != nil {
-		t.Fatalf("Lockout: %v", err)
-	}
-	locked, err = store.IsLockedOut(ctx, phone)
-	if err != nil {
-		t.Fatalf("IsLockedOut: %v", err)
-	}
-	if !locked {
-		t.Fatal("expected locked out after Lockout")
-	}
-
-	// The lockout must expire with its TTL.
 	mr.FastForward(16 * time.Minute)
-	locked, err = store.IsLockedOut(ctx, phone)
-	if err != nil {
-		t.Fatalf("IsLockedOut: %v", err)
-	}
-	if locked {
-		t.Fatal("expected lockout to expire after its TTL elapsed")
+	if locked, err := s.IsLockedOut(context.Background(), testPhone); err != nil || locked {
+		t.Fatal("lockout does not expire")
 	}
 }
-
-func TestOTPStoreCodeExpires(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(16)
-
-	if err := store.Store(ctx, verificationID, boundOTPRecord("+15551235555", "hash"), 3*time.Minute); err != nil {
-		t.Fatalf("Store: %v", err)
+func TestOTPStoreMalformedStateFailsClosed(t *testing.T) {
+	for _, tc := range []struct{ field, value string }{{"attempts", ""}, {"attempts", "-1"}, {"attempts", "1junk"}, {"attempts", "01"}, {"attempts", "1.0"}, {"attempts", "3"}, {"attempts", "99999999999999999999999"}, {"code_hash", "invalid"}, {"phone", "not-phone"}, {"purpose", "other"}, {"expires_at", "bad"}, {"expires_at", "1"}} {
+		t.Run(tc.field+tc.value, func(t *testing.T) {
+			s, mr := newTestOTPStore(t)
+			id := testVerificationID(14)
+			rec := boundOTPRecord()
+			storeRecord(t, s, id, rec)
+			mr.HSet(otpKey(id), tc.field, tc.value)
+			if err := consumeRecord(s, id, rec, rec.CodeHash); !errors.Is(err, ErrNoActiveCode) {
+				t.Fatal(err)
+			}
+			if _, err := s.Get(context.Background(), id); !errors.Is(err, ErrNoActiveCode) {
+				t.Fatal("Get accepted malformed state")
+			}
+		})
 	}
-
+}
+func TestOTPStoreExpiryNeverRecreatesOrRefreshesChallenge(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	id := testVerificationID(15)
+	rec := boundOTPRecord()
+	storeRecord(t, s, id, rec)
+	if err := s.Store(context.Background(), id, rec, 3*time.Minute, 10); !errors.Is(err, ErrNoActiveCode) {
+		t.Fatal("challenge overwrite resets attempts/deadline")
+	}
 	mr.FastForward(4 * time.Minute)
-
-	if _, err := store.Get(ctx, verificationID); !errors.Is(err, ErrNoActiveCode) {
-		t.Errorf("Get after TTL: error = %v, want ErrNoActiveCode", err)
+	if err := consumeRecord(s, id, rec, rec.CodeHash); !errors.Is(err, ErrNoActiveCode) || mr.Exists(otpKey(id)) {
+		t.Fatal("expired challenge recreated")
+	}
+	storeRecord(t, s, id, rec)
+	if err := s.client.Persist(context.Background(), otpKey(id)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(context.Background(), id); !errors.Is(err, ErrNoActiveCode) {
+		t.Fatal("no-expiry challenge accepted")
+	}
+	if err := consumeRecord(s, id, rec, rec.CodeHash); !errors.Is(err, ErrNoActiveCode) {
+		t.Fatal("no-expiry consume accepted")
+	}
+}
+func TestOTPStoreLockoutCorruptionAndCancellation(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	id := testVerificationID(16)
+	rec := boundOTPRecord()
+	storeRecord(t, s, id, rec)
+	if err := mr.Set(lockoutKey(testPhone), "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.IsLockedOut(context.Background(), testPhone); err != ErrUnavailable {
+		t.Fatal("malformed lockout accepted")
+	}
+	if err := consumeRecord(s, id, rec, rec.CodeHash); err != ErrUnavailable {
+		t.Fatal("corrupt lockout consumed code")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Consume(ctx, id, rec, rec.CodeHash, 3, 15*time.Minute); err != ErrUnavailable {
+		t.Fatal("cancelled consume accepted")
+	}
+	if !mr.Exists(otpKey(id)) {
+		t.Fatal("failure consumed OTP")
+	}
+}
+func TestOTPStoreSignupCapacityAndDelete(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	rec := boundOTPRecord()
+	rec.Purpose = PurposeSignup
+	rec.BindingID = testVerificationID(17)
+	id := testVerificationID(18)
+	if err := s.Store(context.Background(), id, rec, time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store(context.Background(), testVerificationID(19), rec, time.Minute, 1); err != ErrRateLimited {
+		t.Fatal("capacity exceeded")
+	}
+	if err := s.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if mr.Exists(otpKey(id)) {
+		t.Fatal("delete did not remove challenge")
+	}
+	if err := s.Store(context.Background(), testVerificationID(19), rec, time.Minute, 1); err != nil {
+		t.Fatal("capacity not released")
 	}
 }
 
-func TestOTPStoreRejectsIncompleteBinding(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(17)
-
-	if err := store.Store(ctx, verificationID, OTPRecord{CodeHash: "hash"}, time.Minute); err == nil {
-		t.Fatal("Store accepted a record without account/session/phone binding")
+func TestOTPStoreInvalidPolicyLockoutAndDeleteFailure(t *testing.T) {
+	s, mr := newTestOTPStore(t)
+	rec := boundOTPRecord()
+	id := testVerificationID(30)
+	for _, ttl := range []time.Duration{0, -1, time.Millisecond, 4 * time.Minute} {
+		if err := s.Store(context.Background(), id, rec, ttl, 0); err != ErrNoActiveCode || mr.Exists(otpKey(id)) {
+			t.Fatal("invalid expiry created challenge")
+		}
 	}
-	if mr.Exists(otpKey(verificationID)) {
-		t.Fatal("incomplete record was written to Redis")
+	storeRecord(t, s, id, rec)
+	for _, max := range []int{0, 4, 1000000} {
+		if err := s.Consume(context.Background(), id, rec, rec.CodeHash, max, 15*time.Minute); err != ErrNoActiveCode {
+			t.Fatal("invalid attempt policy accepted")
+		}
 	}
-}
-
-func TestOTPStoreRejectsInvalidVerificationID(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-
-	if err := store.Store(ctx, "phone-controlled-key", boundOTPRecord("+15551230000", "hash"), time.Minute); err == nil {
-		t.Fatal("Store accepted a non-random verification ID")
+	if err := mr.Set(signupCapacityKey, "wrong-type"); err != nil {
+		t.Fatal(err)
 	}
-	if mr.Exists(otpKey("phone-controlled-key")) {
-		t.Fatal("invalid verification ID was written to Redis")
+	if err := s.Delete(context.Background(), id); err != ErrUnavailable || !mr.Exists(otpKey(id)) {
+		t.Fatal("failed delete did not fail closed")
 	}
-}
-
-func TestOTPStoreGetMalformedBindingFailsClosed(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(18)
-	mr.HSet(otpKey(verificationID), fieldCodeHash, "hash", fieldAttempts, "0")
-
-	if _, err := store.Get(ctx, verificationID); !errors.Is(err, ErrNoActiveCode) {
-		t.Fatalf("Get malformed binding: error = %v, want ErrNoActiveCode", err)
+	mr.Del(signupCapacityKey)
+	if err := mr.Set(lockoutKey(testPhone), "1"); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestOTPStoreIncrementMissingDoesNotCreateRecord(t *testing.T) {
-	store, mr := newTestOTPStore(t)
-	ctx := context.Background()
-	verificationID := testVerificationID(19)
-
-	if _, err := store.IncrementAttempts(ctx, verificationID); !errors.Is(err, ErrNoActiveCode) {
-		t.Fatalf("IncrementAttempts missing: error = %v, want ErrNoActiveCode", err)
-	}
-	if mr.Exists(otpKey(verificationID)) {
-		t.Fatal("incrementing an expired challenge recreated its Redis key")
+	mr.SetTTL(lockoutKey(testPhone), 15*time.Minute)
+	if err := s.Store(context.Background(), testVerificationID(31), rec, time.Minute, 0); err != ErrLockedOut {
+		t.Fatal("atomic store bypassed lockout")
 	}
 }

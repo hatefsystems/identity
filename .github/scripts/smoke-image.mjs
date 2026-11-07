@@ -1,19 +1,23 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { acceptanceLifecycle, createOwnedDockerResource, portalCleanup, removeOwnedDockerResource } from './portal-harness.mjs';
 
-function docker(args, allowFailure = false) {
+function docker(args, allowFailure = false, lifecycle) {
+  lifecycle?.check();
   const result = spawnSync('docker', args, {
     encoding: 'utf8',
-    timeout: 45_000,
+    timeout: lifecycle ? Math.max(1, Math.min(45_000, lifecycle.remaining())) : 45_000,
     maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error) throw result.error;
   if (!allowFailure && result.status !== 0) {
-    throw new Error(`docker ${args[0]} failed: ${result.stderr || result.stdout}`);
+    throw new Error(`Image smoke Docker ${args[0]} failed; private diagnostics suppressed`);
   }
   return result;
 }
@@ -28,7 +32,14 @@ export const maintenanceEntrypoints = [
   'lifecycle-publisher',
   'deletion-notifier',
   'admin-legal',
+  'registration-cleanup',
 ];
+
+export function assertRuntimeInventory(files) {
+  const normalized = files.map((path) => path.replace(/^\.\//, '').replace(/^\//, ''));
+  assert.deepEqual(normalized.filter((path) => path.startsWith('usr/local/bin/') && !path.endsWith('/')).map((path) => path.slice('usr/local/bin/'.length)).sort(), [...maintenanceEntrypoints].sort(), 'Unexpected packaged command inventory');
+  assert(!normalized.some((path) => /(?:^|\/)(?:portal-fixture|admin-roles|\.env(?:\.[^/]*)?|[^/]*\.(?:key|p12|pfx)|[^/]*(?:private|signing|secret|key)[^/]*\.pem)$/.test(path)), 'Runtime image contains a fixture, operator binary, environment file or private key');
+}
 
 export function maintenanceSucceeded(result, binary = '') {
   if (result.status !== 1) return false;
@@ -246,71 +257,66 @@ export async function smokeImage(kind, reference, validateWeb) {
     validateWeb === undefined || typeof validateWeb === 'function',
     'Invalid web validation callback'
   );
-  const [image] = JSON.parse(docker(['image', 'inspect', reference]).stdout);
+  const lifecycle = acceptanceLifecycle({ timeout: 20 * 60_000 });
+  const operation = (args, allowFailure = false) => docker(args, allowFailure, lifecycle);
+  const runID = randomBytes(16).toString('hex');
+  const resources = [];
+  const close = portalCleanup(resources);
+  const create = (args) => {
+    lifecycle.check();
+    const owned = createOwnedDockerResource('container', args, runID, lifecycle);
+    resources.push(() => removeOwnedDockerResource(owned, lifecycle));
+    return owned.id;
+  };
+  let failure, imageID;
+  try {
+  const [image] = JSON.parse(operation(['image', 'inspect', reference]).stdout);
   assert.equal(image.Os, 'linux');
   assert.equal(image.Architecture, 'amd64');
-  const imageID = image.Id;
-
+  imageID = image.Id;
+  assert(/^sha256:[a-f0-9]{64}$/.test(imageID), 'Missing immutable smoke image ID');
   if (kind === 'api') {
     assert.equal(image.Config.User, 'nonroot:nonroot');
+    const inventory = create(['--network', 'none', imageID]);
+    const parent = resolve(tmpdir(), 'kilo');
+    await mkdir(parent, { recursive: true });
+    const temporary = await mkdtemp(resolve(parent, 'image-inventory-'));
+    resources.push(() => rm(temporary, { recursive: true, force: true }));
+    const archive = resolve(temporary, 'runtime.tar');
+    operation(['export', '--output', archive, inventory]);
+    const list = spawnSync('tar', ['--list', '--file', archive], { encoding: 'utf8', timeout: Math.min(60_000, lifecycle.remaining()), maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    assert(!list.error && list.status === 0, 'Actual runtime image inventory failed');
+    assertRuntimeInventory(list.stdout.trim().split(/\r?\n/));
     for (const binary of maintenanceEntrypoints) {
-      const name = `ci-api-${randomUUID()}`;
-      try {
-        const result = docker(
-          [
-            'run',
-            '--name',
-            name,
-            '--pull',
-            'never',
-            '--network',
-            'none',
-            '--env',
-            'APP_ENV=production',
-            '--entrypoint',
-            `/usr/local/bin/${binary}`,
-            imageID,
-            ...(binary === 'migrate' ? ['status'] : []),
-          ],
+      lifecycle.check();
+      const id = create(['--name', `ci-api-${randomUUID()}`, '--pull', 'never', '--network', 'none', '--env', 'APP_ENV=production', '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);
+        const result = operation(
+          ['start', '--attach', id],
           true
         );
         assert(
           maintenanceSucceeded(result, binary),
           `${binary} must reject its missing production configuration with exit 1; diagnostics suppressed`
         );
-      } finally {
-        docker(['rm', '--force', name], true);
-      }
     }
+    const unconfigured = create(['--network', 'none', '--entrypoint', '/usr/local/bin/identity-api', imageID]);
+    const result = operation(['start', '--attach', unconfigured], true);
+    assert(maintenanceSucceeded(result, 'identity-api') && /APP_ENV/.test(result.stdout + result.stderr), 'Actual unconfigured image did not reject missing APP_ENV');
   } else {
-    const uid = docker([
-      'run',
-      '--rm',
-      '--pull',
-      'never',
-      '--network',
-      'none',
-      '--entrypoint',
-      'node',
-      imageID,
-      '-p',
-      'process.getuid()',
-    ]).stdout.trim();
+    const uidContainer = create(['--pull', 'never', '--network', 'none', '--entrypoint', 'node', imageID, '-p', 'process.getuid()']);
+    const uid = operation(['start', '--attach', uidContainer]).stdout.trim();
     assert(/^\d+$/.test(uid) && Number(uid) !== 0, 'Web image must run as a non-root UID');
-    const name = `ci-web-${randomUUID()}`;
-    try {
-      docker([
-        'run',
-        '--detach',
+    const name = create([
         '--name',
-        name,
+        `ci-web-${randomUUID()}`,
         '--pull',
         'never',
         '--publish',
         '127.0.0.1::3000',
         imageID,
       ]);
-      const [container] = JSON.parse(docker(['inspect', name]).stdout);
+      operation(['start', name]);
+      const [container] = JSON.parse(operation(['inspect', name]).stdout);
       const [port] = container.NetworkSettings.Ports['3000/tcp'];
       assert.equal(port.HostIp, '127.0.0.1');
       const base = `http://127.0.0.1:${port.HostPort}`;
@@ -321,6 +327,7 @@ export async function smokeImage(kind, reference, validateWeb) {
       let landingResponse;
       let lastError;
       while (Date.now() < deadline) {
+        lifecycle.check();
         try {
           const response = await request('/');
           assert.equal(response.status, 200, 'Landing page HTTP status');
@@ -339,6 +346,7 @@ export async function smokeImage(kind, reference, validateWeb) {
       const assets = new Set(staticAssets(html));
       const notFoundPaths = [`/__csp-smoke-${randomUUID()}`, `/__csp-smoke-${randomUUID()}.html`];
       for (const path of ['/', ...notFoundPaths, ...notFoundPaths]) {
+        lifecycle.check();
         const response = await request(path);
         assert.equal(response.status, path === '/' ? 200 : 404, `${path} HTTP status`);
         const document = await response.text();
@@ -352,6 +360,7 @@ export async function smokeImage(kind, reference, validateWeb) {
         for (const asset of staticAssets(document)) assets.add(asset);
       }
       for (const path of ['/favicon.ico', ...assets]) {
+        lifecycle.check();
         const response = await request(path);
         assert.equal(response.status, 200, `${path} HTTP status`);
         assertStaticAssetHeaders(response.headers, path);
@@ -363,23 +372,23 @@ export async function smokeImage(kind, reference, validateWeb) {
         assert((await response.arrayBuffer()).byteLength > 0, `${path} is empty`);
       }
       if (validateWeb) await validateWeb({ baseURL: base, notFoundPaths });
-      docker(['stop', '--time', '10', name]);
-      const [stopped] = JSON.parse(docker(['inspect', name]).stdout);
+      operation(['stop', '--time', '10', name]);
+      const [stopped] = JSON.parse(operation(['inspect', name]).stdout);
       assert.equal(stopped.State.Running, false);
       assert.equal(stopped.State.OOMKilled, false);
       assert(
         [0, 143].includes(stopped.State.ExitCode),
         `Web did not stop gracefully: ${stopped.State.ExitCode}`
       );
-    } catch (error) {
-      const logs = docker(['logs', name], true);
-      console.error(logs.stdout + logs.stderr);
-      throw error;
-    } finally {
-      docker(['rm', '--force', name], true);
-    }
   }
-  console.log(`${kind} image smoke checks passed: ${reference}`);
+  } catch (error) { failure = error; }
+  finally {
+    lifecycle.beginTeardown();
+    try { await close(); lifecycle.check(true); lifecycle.signal.throwIfAborted(); } catch (error) { failure ||= error; }
+    lifecycle.release();
+  }
+  if (failure) throw failure;
+  console.log(JSON.stringify({ check: 'image-smoke', kind, imageId: imageID, cleanup: { completed: true }, status: 'passed' }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

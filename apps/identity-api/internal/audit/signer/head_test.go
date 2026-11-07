@@ -47,7 +47,7 @@ func TestSignerHeadFailsClosed(t *testing.T) {
 			if err := s.seedChainTips(context.Background()); !errors.Is(err, ErrLedgerStateInvalid) {
 				t.Fatalf("startup accepted bad state: %v", err)
 			}
-			msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), EventType: audit.EventSessionLoggedOut})
+			msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut})
 			if err := s.processBatch(context.Background(), []jetstream.Msg{msg}); !errors.Is(err, ErrLedgerStateInvalid) {
 				t.Fatalf("batch accepted bad state: %v", err)
 			}
@@ -97,10 +97,10 @@ func TestSignerBatchUsesFreshHeadAndActualTerminalID(t *testing.T) {
 	s.ledgerTip, _ = audit.DecodeDigest(fakeDigest(0xcc))
 	var msgs []jetstream.Msg
 	for range 2 {
-		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), SubjectID: subject.String(),
+		msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), SubjectID: subject.String(),
 			OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: account.String()}}))
 	}
-	msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), EventType: audit.EventSessionLoggedOut}))
+	msgs = append(msgs, integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut}))
 	if err := s.processBatch(context.Background(), msgs); err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +157,8 @@ func TestSignerAuditOnlyAndPurgedDuplicateDoNotAdvanceHead(t *testing.T) {
 	store := &fakeStore{head: db.GetSecurityLedgerHeadRow{Seq: 91, ChainHash: fakeDigest(0xbb), StateValid: true}, existingAuditIDs: []uuid.UUID{id}}
 	tx := &fakeBatchTx{store: store}
 	s := newHeadTestSigner(t, store, tx)
-	duplicate := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: id, EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: uuid.NewString()}})
-	fresh := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), EventType: audit.EventSessionLoggedOut})
+	duplicate := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: id, ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: uuid.NewString()}})
+	fresh := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut})
 	if err := s.processBatch(context.Background(), []jetstream.Msg{duplicate, fresh}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestSignerHeadAdvanceFailureRollsBackBeforeAck(t *testing.T) {
 	}
 	auditBefore, ledgerBefore := s.auditTip, s.ledgerTip
 
-	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: uuid.NewString()}})
+	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: uuid.NewString()}})
 	if err := s.processBatch(context.Background(), []jetstream.Msg{msg}); err == nil {
 		t.Fatal("head advancement failure accepted")
 	}
@@ -211,7 +211,7 @@ func TestSignerUncertainCommitReseedsDurableHead(t *testing.T) {
 		store.head = db.GetSecurityLedgerHeadRow{Seq: 107, ChainHash: fakeDigest(0xdd), StateValid: true}
 	}
 	s := newHeadTestSigner(t, store, tx)
-	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), EventType: audit.EventSessionLoggedOut})
+	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut})
 	if err := s.processBatch(context.Background(), []jetstream.Msg{msg}); err == nil || errors.Is(err, ErrChainTipsUnknown) {
 		t.Fatalf("expected recoverable commit failure after successful reseed, got %v", err)
 	}

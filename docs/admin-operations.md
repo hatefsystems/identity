@@ -1,20 +1,20 @@
 # Admin and Ledger Retention Operations
 
-The implementation remains opt-in. This document describes the current runtime and outstanding release gates; it is not production sign-off. The current technical-closure inventory is `.kilo/plans/1793893850853-phase-5-technical-closure.md`; the inherited matrix is `.kilo/plans/1789692893214-task-5-3-admin-rbac-legal-holds.md`, and the Task 7.6 panel boundary is `.kilo/plans/1793529257288-dpo-legal-compliance-panel.md`. Plans, historical acceptance and test source do not certify the current closure changes. Tasks 5.3-5.5 remain unchecked pending fresh final-source local acceptance; production/manual gates remain independently unchecked below.
+The implementation remains opt-in. This document describes conditional runtime contracts and outstanding release gates, not production sign-off. The active inventory is `.kilo/plans/1793976266705-preproduction-cleanup-launch-hardening.md`; prior technical-closure and panel plans and their dated evidence remain historical. Existing task statuses are unchanged; they do not certify the current bundle. Fresh final-source evidence and the independently unchecked production/manual gates below remain required.
 
-Active schema installation follows the single fresh-baseline contract below and
-`.kilo/plans/1793914256582-single-migration-baseline.md`. Dated acceptance records
+Active schema installation follows the unchanged baseline plus additive registration
+migration contract below. Dated acceptance records
 and prior plans retain their original migration evidence unchanged; they do not
-certify the new lineage. Record its actual outcomes only in the separate
-[fresh-baseline acceptance placeholder](#fresh-baseline-acceptance-placeholder).
+certify this bundle. New acceptance must be recorded separately only after actual
+final runs satisfy [current requirements](#automated-validation).
 This documentation update changes no task status or production authorization.
 
 ## Enablement
 
-1. Inventory schema/history first using the migration identity and follow [fresh-baseline setup](#migration-and-contraction). Install `00001_initial_schema.sql` only on an explicitly scoped fresh target, tracked in `public.identity_schema_version`. All legacy `public.goose_db_version` databases, untracked nonempty application schemas and contradictory histories are refused. Do not adopt old history, reset genesis or rewrite hashes to conceal defects. Identify an explicit verification boundary if historical segments fail.
+1. Inventory schema/history first using the migration identity and follow [setup](#migration-and-contraction). Apply unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql` only to a separately approved scoped target, tracked through version 2 in `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked nonempty schemas and contradictory histories are refused. No instruction here authorizes live mutation, resets, adoption, genesis reset or hash rewriting.
 2. Deploy account-version-aware issuers on **every** instance and restart old process-local credential stores before moderation is enabled. Ban, suspension, deletion and reactivation advance persistent versions. Old sessions, codes, refresh tokens and step-up grants cannot regain validity. Task 6.2's `ValidateToken` checks that version and live Redis authority; downstream clients using offline JWT verification still retain the configured lifetime, at most ten minutes.
-3. Inject the envelope key/version and shared blind-index pepper through the existing secret delivery mechanism. Hold management uses envelope encryption independently of attribution. Without a pepper, SMS OTP and producer-side capture are unavailable; legal attribution stays unmounted without a verified fixture.
-4. Verify final encrypted-or-legitimately-purged legal storage and actual key/data inventory before intake. Fresh baseline storage has no plaintext narrative columns and needs no backfill. The optional [standalone compatibility backfill](#standalone-compatibility-backfill) retains its bounded encryption/read-back/binding and atomic plaintext-clear contracts, but does not upgrade or adopt a legacy database. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory. Partial layouts fail closed.
+3. Inject one KEK/version and one blind-index pepper/version through the approved secret delivery mechanism. The adapter holds loaded keys locally, with no live Infisical fetch/cache/hot rotation or historical multi-key reader. Hold encryption is independent of attribution; SMS uses its separate required OTP HMAC pepper only when enabled. Preserve retired backup keys and coordinated recovery/rotation obligations. Exact `APP_ENV=development|test|production` is mandatory; test is not development.
+4. Verify final encrypted-or-legitimately-purged legal storage and actual key/data inventory before intake. Obsolete legal Backfill/plaintext compatibility is removed; unexpected layouts fail closed. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory or restore proof.
 5. Obtain approved numeric `ADMIN_CONTEXT_RETENTION` and `ADMIN_LEGAL_RELEASED_RETENTION` durations and approval for opaque replay tombstones. There are no policy defaults. Schedule `admin-audit-publisher --cleanup-contexts` and `admin-legal --operation=cleanup` with separate maintenance credentials. Both use hold-aware deletion; released holds resume original clocks. Neither command deletes ledger evidence.
 6. Run the signer and `admin-audit-publisher` on the same configured audit subject with separately scoped non-owner logins. Publication requires JetStream acknowledgement; it is not proof of chaining. Signer event-ID deduplication covers redelivery after uncertain acknowledgement. The separate Task 6.3 lifecycle publisher owns deletion-event delivery, not the admin publisher.
 7. With affected intake closed, run `NX_DAEMON=false npm exec -- nx run identity-api:admin-legal -- --operation=lookup-probe` against the **real deployed signer**, actual schema and configured keys. It creates a credential-free synthetic account, publishes a legacy envelope without a producer index, verifies the signer's stored index, deletes only that synthetic account, and verifies the fixture again after deletion. Canonical v2 resolves the fixture event UUID through `security_ledger_chain.event_id`, joining the payload by `seq`, while retaining the synthetic client/event checks and constant-time expected-index comparison. Capture the printed `ADMIN_LOOKUP_FIXTURE_ID` privately and configure every API replica with it. A timeout leaves the identified synthetic account for controlled diagnosis; never substitute a real person's identifier or delete unrelated evidence. A supplied absent/wrong fixture or mismatched key fails startup/readiness; omitting the setting explicitly keeps attribution unavailable while hold/preservation may remain independently usable. Repeat after signer/key deployment changes and keep the existing pepper pinned. Injecting `WithLookup(..., true)` is not equivalent evidence. The probe is neither a chain trust anchor nor proof of complete historical indexing.
@@ -23,10 +23,10 @@ This documentation update changes no task status or production authorization.
 ## Migration and Contraction
 
 The heading is retained for existing links; installation no longer performs a
-staged legacy contraction. The only fresh-install source is
-`00001_initial_schema.sql`, representing the complete final `public` schema.
-`migrate up` applies version 1 in **`public.identity_schema_version`**, not
-`public.goose_db_version`. Future changes use `00002`, `00003` and later bundled
+staged legacy contraction. The active bundle is unchanged
+`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`.
+`migrate up` applies through version 2 in **`public.identity_schema_version`**, not
+`public.goose_db_version`. Future changes use `00003` and later bundled
 migrations in this new lineage; generic `up-to` is not an old-lineage escape hatch.
 
 Before any migration mutation, the guarded wrapper performs fail-closed read-only
@@ -61,9 +61,10 @@ credentials:
 3. Set the scoped migration `DATABASE_URL`; run `migrate status` then `migrate up`
    (Nx: `identity-api:migrate-status`, `identity-api:migrate-up`). Public status/version
    inspection is read-only and creates no bookkeeping on a fresh target. Verify
-   applied version 1 and the new history table; repeated `up` must be a verified
+   applied version 2 and the new history table; repeated `up` must be a verified
    no-op. A failed baseline transaction leaves no partial application objects or
-   applied version-1 record. Do not bypass an inventory refusal to force a retry.
+   applied version-1 record. Migration-2 failure must leave version 1 valid/retryable
+   without partial registration objects. Do not bypass refusal to force a retry.
 4. Verify final constraints, indexes, effective privileges and exact head advancement:
    observed terminal sequence equals declared `last_seq`, pinned search path/PUBLIC
    revocation remain, audit coordination is `5200004`, ledger coordination `5200002`,
@@ -85,30 +86,11 @@ and prior plan files unchanged; they are evidence for their original sources, no
 this baseline. Automated tests provision and clean up only run-owned resources,
 never named developer/shared environments.
 
-### Standalone Compatibility Backfill
-
-`admin-legal --operation=backfill` is retained as an optional, separately scoped
-**focused compatibility operation**, not a supported legacy schema upgrade or
-new-lineage adoption path. It does not alter migration metadata, authorize
-contraction DDL or make a legacy database acceptable to the migration runner.
-Do not recreate plaintext columns in baseline runtime storage to use it.
-
-```sh
-npm exec -- nx run identity-api:admin-legal -- --operation=backfill --limit=500
-```
-
-Use separately controlled compatibility credentials with affected writers stopped.
-Limits remain `1..1000`; repeat bounded batches until zero only within the explicitly
-scoped operation. Each row is encrypted, read back, decrypted and record/account/kind
-binding-verified before all plaintext clears in the same transaction. Original IDs,
-references, request kinds, replay keys, clocks and legitimately released/purged
-tombstones remain intact. Wrong keys/bindings, corruption, failed updates or commit
-errors are failures, not evidence of conversion; uncertain outcomes require
-read-back/reconciliation. Fully contracted storage is recognized as no work; partial
-or unexpected layouts fail closed. `ErrBackfillRequired` remains the fail-closed
-unconverted-storage contract, not permission to adopt history or serve plaintext.
-Verify actual ciphertext/key-version inventory and recoverable backups, not only
-zero count or startup crypto readiness. No runtime plaintext fallback is allowed.
+Legacy Backfill commands in dated records are not supported operations in this
+bundle. Do not recreate plaintext columns, convert legacy history, stamp metadata
+or reset a laboratory environment to make it acceptable. Existing version-1
+new-lineage state may advance to reviewed migration 2 only with separately scoped
+authorization; this is not permission to adopt an old lineage.
 
 ## Production Checklist
 
@@ -118,9 +100,9 @@ implementation task, never these production/governance/manual authorizations.
 - [ ] Approve numeric baseline/workflow/Class B/Class C policies and the actual
   personal/pseudonymous inventories and lifetimes, including `no_expiry` residuals,
   legal basis, privacy notices, ROPA/DPIA and truthful DSAR responses.
-- [ ] Inventory real data, legacy requests, ciphertext/key versions and recovery
-  material; scope any focused compatibility backfill/read-back separately and verify
-  final encrypted storage. Fresh setup never adopts legacy history.
+- [ ] Inventory real data, ciphertext/key versions, retained backup keys and recovery
+  material; verify final encrypted storage and consistent forward recovery. Fresh
+  setup never adopts legacy history or exposes obsolete Backfill.
 - [ ] Install real externally approved policy through the restricted trusted
   installer and provision operators from an authenticated MFA-protected launcher.
   Environment actor/SPIFFE strings alone are not authentication.
@@ -143,6 +125,10 @@ implementation task, never these production/governance/manual authorizations.
   scheduling only after the other gates are satisfied.
 - [ ] Complete manual assistive-technology, physical-authenticator, native-browser
   zoom/hidden-tab/bfcache and actual-ingress checks not observed by automated suites.
+- [ ] Approve live SMS.ir key/template/parameter, Iranian routing, egress/spend limits
+  and an explicitly authorized handset receipt; sandbox success is not delivery.
+- [ ] Approve Unicode-mailbox SMTPUTF8 submission, temporary registration retention
+  and admission budgets; verify dedicated cleanup supervision before enablement.
 
 ## Operator role provisioning
 
@@ -150,11 +136,25 @@ Use `npm exec -- nx run identity-api:admin-roles -- --user-id=<uuid> --role=<rol
 
 Run from an authenticated, MFA-protected operator environment with separately scoped `DATABASE_URL`. Its trusted launcher supplies `ADMIN_OPERATOR_ID` and `ADMIN_OPERATOR_SPIFFE_ID` from the authenticated identity. These environment values are **attribution, not authentication**; arbitrary callers must not control the launcher or database credentials. Provisioning approval remains an organizational control. No HTTP route assigns roles, no unaudited one-row bootstrap is documented, and no two-person HTTP workflow is claimed.
 
+Initial operator enrollment uses the ordinary approved registration/passkey flow,
+which grants no role or session. Policy installation and an approved role grant
+under the trusted launcher are separate actions, never migration seeds or a default
+admin account. `admin-roles` is a separately built/checksum-attested operator
+artifact, not assumed present in the application image. DB-only operator/cleanup
+paths must not require unrelated OIDC/SMS/NATS secrets; help remains independent.
+
 ## Admin Control Panel (Task 7.5)
 
 Task 7.5 supplies `/admin`, `/admin/users`, `/admin/users/[id]`, `/admin/audit-logs`, and `/admin/integrity` within the existing Next app. Task 7.6 adds the separate `/admin/legal` workspace described below. Neither enables production admin access, alters approved retention, or adds password-reset, role-management, bulk, administrative account-deletion or section 1.8 legal-workflow controls. The neutral dashboard entry performs no admin discovery until visited.
 
 Session bootstrap precedes a durably audited capability read. Support gets safe account metadata; Moderator adds PII, exact body-only lookup and status changes; DPO gets audit search and both verifiers; Super Admin gets only the two content-free verifiers. Combined grants expose their union. The fixed capability response is presentation metadata, not authority: every operation checks current primary-database permissions, and every disclosure remains behind the durable-audit boundary. A denied admin capability must not sign out a valid ordinary account session.
+
+`POST /api/v1/admin/users/lookup` additionally returns mandatory
+`canonical_email` with its selected user. The browser must validate the returned
+row's email against that exact server canonical value before displaying/selecting
+it, and use it for the lookup-to-moderation pin. No ASCII-only or raw-input fallback
+is permitted. This additive response field is sensitive display metadata, not a
+new disclosure permission, profile resolver or browser blind-index input.
 
 Moderation is an explicit fresh-read, verification, reason and confirmation sequence. List/detail/lookup revisions and `expected_revision` are canonical decimal strings. The API compares the pin under existing account locks before status, auth-version, revision or success-intent writes. A conflict requires rereading, reviewing and reverifying; never retry with a silently substituted revision. The panel requires a trimmed 1..2000-byte UTF-8 reason after verification for suspension, ban and reactivation. Grants expire at the earlier grant/session deadline and are never retained after the confirmation lifetime.
 
@@ -186,7 +186,7 @@ Class B and baseline administrative audit are **personal data**. The ledger is p
 
 ### Attribution and Scope
 
-- Enter the bare email, authority, case reference, purpose, explicit UTC bounds and selected fields only after fresh verification. Server-side HMAC-SHA256 uses lowercase NFKC/trimmed identity; do not hash locally or introduce account/provider-specific email normalization. Phone/backup-email and live-profile resolution are not offered. The entered email is transient sensitive input, not returned evidence.
+- Enter the bare email, authority, case reference, purpose, explicit UTC bounds and selected fields only after fresh verification. Server canonical identity is NFC/local lowercase/NFC plus strict IDNA lowercase domain; the email-specific HMAC input uses those exact bytes, without generic BlindIndex's second NFKC pass. Do not hash locally or introduce provider alias rules. Phone/backup-email and live-profile resolution are not offered. The entered email is transient sensitive input, not returned evidence.
 - Request core event/reference UUIDs, event type, timestamp, retain-until and exact string sequence only by default. The six optional metadata fields are unchecked opt-ins for the inquiry purpose, not values silently fetched for hidden columns. No blind index/version, credentials, raw identity, full audit payload, action content or chain hash is returned. Missing selected fields mean not present in this projection, not that they never existed.
 - Freeze the entire query, including page size and field selection. Each explicit next page requires fresh step-up with the same body plus opaque cursor. Preserve exact string `coverage.through_seq` and original observation time, and display fresh eligibility time and the full coverage note. Use the effective configured `audit_max_window_seconds`, including a smaller/fractional value. Cursors have no implemented age TTL and are not session-bound, but the browser clears them on session changes. Do not decode them, invent an expiry, broaden rejected scope or automatically fetch all pages.
 - A final/empty page means no matching **indexed, currently eligible records within scope**, not no historical activity or no account. Later ingestion above the fixed bound is excluded and current hold/retention eligibility is checked per page. Releasing a hold can remove expired matches from later pages. Multiple original references do not establish one real-world person, and no complete-history, historical-pepper coverage or verified inclusion proof is returned. Use the independent integrity tool for its own explicitly limited verification scope.
@@ -206,7 +206,7 @@ The view clears inputs, selected targets, operation IDs, results, cursors and gr
 
 Coordinate the panel, API and other attribution callers under closed/drained affected old admin ingress. Retire incompatible callers/open forms and deploy canonical-string legal `seq`/`coverage.through_seq` support to **every replica** before reopening, with no numeric fallback or fixture bypass. Run the real signer probe above and separately exercise authenticated post-deletion lookup; a fake verified service is not browser acceptance. Rollback closes affected ingress first, removes new UI entries, then coordinates compatible API/UI versions. Preserve holds, encrypted contexts, request tombstones, accepted audit/outbox intent, signed data and existing retention/cleanup; never reset clocks, downgrade storage or rewrite chains. Restore access only with compatible callers and verified prerequisites.
 
-The [Task 7.6 validation inventory](devops-operations.md#dpolegal-panel-task-76) requires source-specific automated results, sanitized evidence and confirmed cleanup. The local acceptance below does not close manual or production gates. Manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks remain open when unobserved. Keep production `ADMIN_ENABLED` and governance unchanged; do not enable `LEGAL_WORKFLOW_ENABLED` to ship this panel. Baseline approval, encrypted backfill, real non-owner DB grants, approved narrative/replay/ledger retention, signer/publisher delivery, exact-origin/APM redaction, privacy notices, ROPA/DPIA/DSAR duties and Task 5.3/5.4/5.5 statuses remain separate operator gates. Phone attribution, multi-pepper rotation, Class C purge policy and external anchoring are not added.
+The [Task 7.6 validation inventory](devops-operations.md#dpolegal-panel-task-76) requires source-specific automated results, sanitized evidence and confirmed cleanup. The local acceptance below does not close manual or production gates. Manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks remain open when unobserved. Keep production `ADMIN_ENABLED` and governance unchanged; do not enable `LEGAL_WORKFLOW_ENABLED` to ship this panel. Baseline approval, encrypted storage/key inventory, real non-owner DB grants, approved narrative/replay/ledger retention, signer/publisher delivery, exact-origin/APM redaction, privacy notices, ROPA/DPIA/DSAR duties and Task 5.3/5.4/5.5 statuses remain separate operator gates. Phone attribution, multi-pepper rotation, Class C purge policy and external anchoring are not added.
 
 ### Local Acceptance (2026-11-02)
 
@@ -279,11 +279,52 @@ material or give that login delivery/evidence mutation rights.
 
 ## Audit, logging and monitoring
 
-Every successful privileged response is buffered until audit intent commits. Pre-commit audit failure withholds disclosure and rolls back business changes; `503 audit_unavailable` does not provide a usable result. If the store itself is down, durable recording of the rejection cannot be guaranteed. A lost/invalid response or post-commit `503 temporarily_unavailable` during session renewal can still follow accepted work: treat a transmitted write as unconfirmed, not guaranteed rollback. Alert on sanitized `admin audit storage unavailable` / `admin durable audit failed` diagnostics. Page on publisher backlog growth/age, increasing attempts, delivery deferrals, signer reseed failures, missing-index capture, and key/backfill failures. The publisher emits `pending`, `attempts`, and `oldest_age_seconds`; deployment must connect these signals to its monitoring system and choose operational thresholds.
+Every successful privileged response is buffered until audit intent commits. Pre-commit audit failure withholds disclosure and rolls back business changes; `503 audit_unavailable` does not provide a usable result. If the store itself is down, durable recording of the rejection cannot be guaranteed. A lost/invalid response or post-commit `503 temporarily_unavailable` during session renewal can still follow accepted work: treat a transmitted write as unconfirmed, not guaranteed rollback. Alert on sanitized audit-storage categories, publisher pending count/age, increasing attempts/deferrals, signer reseed failures and invalid capture/key metadata. Diagnostics are fixed categories/counts, never raw upstream/DB errors, identifiers, narrative contents or rejected payloads. Claimed delivery is marked only after the expected JetStream acknowledgement; deferred/poison work must not prevent unrelated bounded progress. Approved quarantine/spool policy and alert thresholds remain operational gates.
 
 Never capture admin query strings, bodies, cookies, DPoP proofs, step-up/`Idempotency-Key` headers, cursors, legal narratives/results or referrers in proxy/APM traces. Use static route templates for both `/admin` pages and `/api/v1/admin`, including rejected URLs and lookup requests; template account/hold identifiers rather than logging raw paths. The `account_ref` filter, hold-ID path and operation-ID header are allowed only on their exact authorized API requests, never diagnostics or navigation. The MVP Nginx example in the deployment guide uses an admin-specific log format and suppresses unsanitized error records. For the Traefik successor, disable access/debug/tracing capture unless its collector demonstrably emits only allowlisted method, template, status and duration. Verify synthetic sensitive values are absent from ingress, API, worker and artifact output; capture synthetic probe IDs only through the controlled private provisioning channel. Local route-template tests do not establish deployed collector compliance.
 
 ## Automated validation
+
+### Current Bundle Requirements
+
+Resolve fresh targets from the repository root using `npm exec -- nx show project
+identity-api --json` and `npm exec -- nx show project web --json`. The mandatory
+normal service matrix has exactly these seven identities:
+
+| Required suite |
+|---|
+| `identity-api:test-security-db` |
+| `identity-api:test-admin-integration` |
+| `identity-api:test-retention-integration` |
+| `identity-api:test-legal-workflow-integration` |
+| `identity-api:test-grpc-integration` |
+| `identity-api:test-lifecycle-integration` |
+| `identity-api:test-portal-integration` |
+
+Run one suite per owned-service cell with `max-parallel: 1`, `fail-fast: false`,
+unchanged 30-minute target and 60-minute job deadlines, `-count=1`, `-p=1` and
+mandatory dependency flags. Local exhaustive `--integration` and allowlisted
+partial `--integration-target=<unqualified-target>` modes do not alter the frozen
+seven identities. Only the exact-seven aggregate can satisfy the normal release
+gate: matching source/generated fingerprints, nonzero package/test evidence,
+zero failures/skips and verified cleanup are mandatory. Missing/stale/duplicate/
+wrong-source/partial reports or zero exit without evidence fail the gate.
+
+Seven affected race packages are a separate serial inventory: `internal/recovery`,
+`internal/mfa`, `internal/oidc/clientauth`, `internal/adminaction`, `internal/smsotp`,
+`internal/registration` and `internal/audit/signer`. Owned-service race mode uses
+Linux CGO, `-json -tags=integration -race -count=1 -p=1 -timeout=20m` and a separate
+exact-seven race aggregate; it cannot replace normal suite evidence.
+
+Require final generated-tree reproducibility, lint/vet/typechecks/builds,
+image/entrypoint/fixture-exclusion smoke and existing portal/admin/CSP browsers,
+plus `web:test-registration-browser` against the checksum-attested immutable
+`REGISTRATION_BROWSER_API_IMAGE=sha256:<id>` intended for publication. Retain
+sanitized source/generation/image identities and actual exits/counts/cleanup only
+after real runs; no current acceptance record is asserted here. See
+[commands and image boundaries](devops-operations.md#automated-portal-acceptance).
+
+### Historical 2026-10-01 Record
 
 The following gates passed on 2026-10-01 against the implemented Task 5.3 code:
 
@@ -299,9 +340,9 @@ The new regressions cover hold/purge locking in both orders, independent legal r
 
 Run the Nx `sqlc-vet`, `lint`, `vet`, `test`, `test-race`, `build`, worker/operator builds, `test-security-db`, and `test-admin-integration` targets. Integration runs require run-owned disposable PostgreSQL 16, Redis and NATS JetStream, serialized and isolated from developer/shared environments. The mandatory admin target fails on missing service configuration.
 
-The single `00001` baseline is forward-only; `Down`, reset and rollback to zero refuse. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, auth versions, outbox intent and evidence. A clean up/down/up is deliberately unavailable; test downgrade refusal and forward recovery only on run-owned disposable fixtures. Fresh-baseline acceptance is separate from historical upgrade evidence.
+The unchanged `00001` plus additive `00002` bundle is forward-only; `Down`, reset and rollback to zero refuse. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, auth versions, outbox intent, registration state and evidence. A clean up/down/up is unavailable; test refusal and forward recovery only on run-owned disposable fixtures. Current-bundle acceptance is separate from historical upgrade evidence.
 
-Tasks 5.3-5.5 remain unchecked until the current closure plan's complete fresh local automated acceptance passes against final source, including all seven serial real-service suites with zero mandatory skips, forward recovery/consistent local restore, generated outputs, images and browser gates. Historical October/November results above do not certify these changes. Production ingress/privacy, policy, deployed privilege/restore and manual checks remain independently open in the [production checklist](#production-checklist). Task 5.4 structural annotations and separate receipt reconciliation are database-relative, not legal-policy proof or protection against coherent privileged rewrite. Task 6.2 does not close those gates or change offline-JWT residual authority. Phone attribution and historical key rotation remain separate work.
+Existing task statuses and historical October/November results are unchanged and do not certify this bundle. Fresh final-source acceptance, forward recovery/consistent local restore, generated outputs, images and browser gates remain required. Production ingress/privacy, policy, deployed privilege/restore and manual checks remain independently open in the [production checklist](#production-checklist). Task 5.4 annotations and receipt reconciliation are database-relative, not legal-policy proof or protection against coherent privileged rewrite. Task 6.2 does not close those gates or change offline-JWT residual authority. Phone attribution and historical key rotation remain separate work.
 
 ## Legal Review and Transparency (Task 5.5)
 
@@ -311,7 +352,7 @@ installed by the controlled operator. The baseline must match both existing
 retention durations exactly. `LEGAL_WORKFLOW_ENABLED=false` remains the default;
 enabling it additionally requires `LEGAL_WORKFLOW_POLICY_ID` with an approved
 workflow extension. A baseline-only deployment can retain Task 5.3 preservation
-without enabling case intake. Backfill and the synthetic lookup probe remain
+without enabling case intake. The separately authorized synthetic lookup probe remains
 available before approval; cleanup loads approved persisted policy independently
 of intake flags.
 
@@ -467,7 +508,7 @@ is not cleanup's per-run `Held`, which only counts candidates actually rechecked
 after locking. Status needs only SELECT on cases/subjects/hold-review/hold/policy/
 baseline metadata, no keys, intake enablement, mutation or outbox rights.
 
-Validate CLI options before connecting: backfill/baseline cleanup `1..1000`,
+Validate CLI options before connecting: baseline cleanup `1..1000`,
 workflow cleanup `1..500`, status `1..1000`; `--dry-run` only for workflow cleanup
 and `--policy-file` only for policy installation. Status/cleanup use persisted
 policy independently of intake flags. Context/released baseline cleanup is
@@ -526,11 +567,12 @@ claim that production provisioning, verification or deployment has passed.
    to drain acknowledged work and verify signer shutdown; account for queued
    envelopes rather than silently discarding them. The initial cutover is not a
    routine hourly shutdown requirement. Keep all old signer instances stopped.
-3. Install `00001_initial_schema.sql` in an explicitly scoped fresh PostgreSQL
+3. Install unchanged `00001_initial_schema.sql` plus additive
+   `00002_registration_attempts.sql` in an explicitly scoped fresh PostgreSQL
    environment with matching isolated Redis/NATS through the
    [baseline procedure](#migration-and-contraction). All legacy
    `public.goose_db_version`, untracked nonempty application schemas and contradictory
-   histories refuse without mutation. There is no in-place v1/v2 upgrade/adoption;
+   histories refuse without mutation. No old proof-format/lineage conversion or adoption is supplied;
    do not reset a named environment or infer genesis from empty payloads. Baseline
    Down/reset refuse; signed bytes and compatible v2 history are never rehashed.
 4. Provision the separate runtime roles and narrowly scoped grants (First-Time
@@ -624,7 +666,7 @@ the chain rows are the only surviving record of what was already erased.
 ### First-Time Provisioning SQL
 
 Run the following in an authenticated `psql` operator session connected to the
-fresh-baseline target after version 1 in `public.identity_schema_version`, with
+separately authorized new-lineage target after bundle version 2 in `public.identity_schema_version`, with
 writers stopped and the schedule disabled.
 The operator must be authorized to create roles and transfer function ownership;
 these are not runtime privileges. Replace the four uppercase role placeholders
@@ -643,7 +685,7 @@ publisher subject-scoped outbox permissions remain required.
 \set reconciler_role 'DEPLOYED_RECEIPT_RECONCILIATION_ROLE'
 SELECT current_database() AS ledger_database \gset
 
--- Canonical format v2 (single fresh 00001 baseline).
+-- Canonical format v2 remains from unchanged 00001; additive 00002 adds registration.
 --
 -- There is no maintenance-owner role here and no SECURITY DEFINER purge routine
 -- to own. Erasure is an ordinary DELETE on the payload table, so the authority
@@ -1063,11 +1105,11 @@ Keep signer and verifier binaries compatible with canonical-v2 storage throughou
 rollback. Pre-v2 binaries expect the retired payload/`chain_hash` layout and are
 not a recovery path. Treat initialized proof state and erasure as forward-only;
 repair with a compatible release, never downgrade storage or rewrite stored
-hashes. The single `00001` baseline refuses Down unconditionally, including against
+hashes. The unchanged `00001` plus additive `00002` bundle refuses Down, including against
 a seemingly empty database; reset and rollback to zero are not recovery paths.
 
 Restore `public.identity_schema_version`, both chain/payload tables and sequence
-state, both heads, erasure index, holds, governance/workflow, retention settings
+state, both heads, erasure index, holds, governance/workflow, registration attempts, retention settings
 and outbox from one
 consistent backup, validate before reopening ingestion or purge, reconcile
 authoritative holds/deletions, then resume eligible expiry without resetting clocks

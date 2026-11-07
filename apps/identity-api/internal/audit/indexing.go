@@ -17,7 +17,8 @@ type IdentitySource interface {
 
 // IdentityIndexer computes the shared email blind index.
 type IdentityIndexer interface {
-	Compute(string) string
+	ComputeEmail(string) (string, error)
+	Version() int16
 }
 
 // IndexingRecorder captures available Class B attribution before enqueueing an
@@ -63,8 +64,14 @@ func (r *IndexingRecorder) Record(ctx context.Context, e Event) error {
 			r.logger.Warn("audit: identity capture unavailable; signer fallback required",
 				slog.String("marker", "audit_index_capture_missing"), slog.String("event_type", e.EventType))
 		} else {
-			digest := r.indexer.Compute(email)
-			security.IdentityBlindIndex = &digest
+			digest, err := r.indexer.ComputeEmail(email)
+			if err != nil {
+				r.logger.Warn("audit: identity capture invalid; signer fallback required",
+					slog.String("marker", "audit_index_capture_missing"), slog.String("reason", "invalid_email"))
+			} else {
+				security.IdentityBlindIndex = &digest
+				security.BlindIndexVersion = r.indexer.Version()
+			}
 		}
 	} else {
 		digest := *security.IdentityBlindIndex

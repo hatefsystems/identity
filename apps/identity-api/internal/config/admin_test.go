@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,5 +135,45 @@ func TestAdminOrigins(t *testing.T) {
 	t.Setenv(EnvAdminAllowedOrigins, "http://example.test")
 	if _, err := LoadAdmin(); err == nil {
 		t.Fatal("accepted cleartext production origin")
+	}
+}
+
+func TestAdminRequiresExactEnvironmentBeforeSettings(t *testing.T) {
+	for _, environment := range []string{"unset", "", " ", "\t", "staging", "Development", "production "} {
+		t.Run(environment, func(t *testing.T) {
+			cleanAdminEnv(t)
+			t.Setenv("APP_ENV", environment)
+			if environment == "unset" {
+				if err := os.Unsetenv("APP_ENV"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv(EnvAdminAllowedOrigins, "http://localhost:3000")
+			t.Setenv(EnvAdminPageSizeMax, "invalid-private-setting")
+			cfg, err := LoadAdmin()
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.AllowedOrigins != nil || cfg.RequestTimeout != 0 {
+				t.Fatalf("invalid mode reached admin configuration: %+v %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestAdminModeAdmissionDoesNotLoadOtherConfiguration(t *testing.T) {
+	for _, environment := range []string{"development", "test", "production"} {
+		t.Run(environment, func(t *testing.T) {
+			cleanAdminEnv(t)
+			t.Setenv("APP_ENV", environment)
+			t.Setenv("PORT", "-1")
+			t.Setenv(EnvNATSURL, "invalid-unrelated-broker")
+			t.Setenv(EnvAdminAllowedOrigins, "http://localhost:3000")
+			_, err := LoadAdmin()
+			if environment == "development" && err != nil || environment != "development" && (err == nil || !strings.Contains(err.Error(), "HTTPS")) {
+				t.Fatalf("HTTP origin exemption changed: %v", err)
+			}
+			t.Setenv(EnvAdminAllowedOrigins, "https://identity.example.test")
+			if _, err := LoadAdmin(); err != nil {
+				t.Fatalf("admin loaded unrelated settings: %v", err)
+			}
+		})
 	}
 }

@@ -1,21 +1,16 @@
 'use client';
 
-import {
-  ForgotPasswordForm,
-  LoginForm,
-  RegistrationForm,
-  ResetPasswordForm,
-  TotpForm,
-} from './forms';
+import { ForgotPasswordForm, LoginForm, ResetPasswordForm, TotpForm } from './forms';
 import { PasskeyLogin } from '../../_components/passkey-login';
+import { Registration } from '../../_components/registration';
 
-// Only passkey sign-in is live. Other Task 7.2 forms remain disconnected.
+// Password and reset forms remain unavailable; signup is passkey-only.
 export function LoginScreen() {
   return <LoginForm passkeyAction={<PasskeyLogin label="Continue with a passkey" />} />;
 }
 
 export function RegistrationScreen() {
-  return <RegistrationForm />;
+  return <Registration />;
 }
 
 export function PasskeyScreen() {

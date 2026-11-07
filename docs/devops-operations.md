@@ -1,12 +1,13 @@
 # Hatef Identity Platform - DevOps & Operational Playbook
 
-This playbook provides configuration specifications, deployment practices, secrets-management designs, and monitoring strategies for operating the Hatef Identity Platform in production Kubernetes environments.
+This playbook describes MVP operating requirements and later Kubernetes designs,
+not deployed gates, executed acceptance or production approval.
 
 ---
 
 ## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes, No ClickHouse & No Traefik)
 
-In the current MVP phase, the system is deployed using standard **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. Additionally, **ClickHouse is completely bypassed** in this phase to reduce RAM utilization by ~1.2 GB (using PostgreSQL fallback tables for logging instead).
+The MVP deployment design uses **Docker Compose** on a single node instead of Kubernetes (K8s) to minimize resource and memory overhead. **ClickHouse is bypassed** in this phase (PostgreSQL fallback tables handle logging).
 
 Furthermore, **Traefik is not provisioned in the MVP phase**. Instead, the platform leverages the **existing host-level Nginx** on the Ubuntu host to handle Reverse Proxying, TLS Termination, and path-based routing directly to the Docker containers. Traefik Ingress will be adopted post-MVP when migrating to a production Kubernetes cluster.
 
@@ -16,7 +17,8 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ## Fresh-Baseline Environment Cutover
 
-Current installation uses only `00001_initial_schema.sql`, applying version 1 in
+Current installation uses unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql`, applying through version 2 in
 `public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
 are refused regardless of their version or apparent equivalence; untracked nonempty
 application schemas and contradictory histories also fail closed. There is no
@@ -38,23 +40,22 @@ they are not evidence that this baseline passed.
    Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
 3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
    `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
-   fresh `up` records baseline 1, repeated `up` verifies a no-op. Do not stamp, rename
+    fresh `up` records versions 1 and 2, repeated `up` verifies a no-op. Do not stamp, rename
    or clear metadata after refusal. Verify packaged embedded inventory and final
    schema before starting compatible binaries.
 4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
    explicit genesis heads and retention subject settings using
    [admin operations](admin-operations.md#migration-and-contraction). None of those
    initialization/approval actions is a migration seed. Complete real key inventory,
-   readiness and deployed signer lookup probing. Optional standalone backfill retains
-   its encryption/read-back/binding/error contracts as a focused compatibility
-   operation, **not** a new-lineage upgrade path or fresh-install prerequisite.
+    readiness and separately authorized deployed signer lookup probing. Obsolete
+    legal Backfill/plaintext compatibility is removed, not an install/upgrade step.
 5. Reconcile isolated consumer baselines and require fresh authentication before
    compatible every-replica/caller activation. Keep intake/destructive schedules off
    until their existing policy, retention, ingress, manual and production gates pass.
    Automated suites create/tear down only run-owned resources and run serially. The
-   coordinator records uncached final-source outcomes in the separate
-   [acceptance placeholder](admin-operations.md#fresh-baseline-acceptance-placeholder),
-   without changing task statuses or certifying production readiness.
+    coordinator records uncached final-source outcomes separately only after actual
+    [required acceptance](admin-operations.md#automated-validation), without reusing
+    historical evidence or certifying production readiness.
 
 ## User Lifecycle Publisher (Task 6.3)
 
@@ -114,8 +115,9 @@ deploy consumers or remove earlier tasks' production enablement gates.
 
 ## User Portal Cutover (Task 7.3)
 
-The portal serves existing passkey-enabled accounts. It does not provision users,
-enable password login, add OAuth consent, or deploy downstream services. The
+The portal serves existing passkey-enabled accounts. Separately enabled signup
+can create accounts only after the owned-email/phone/resident-UV proof contract;
+it adds no password login, OAuth consent or downstream deployment. The
 browser and API must be released as one compatible boundary, not a mixed fleet of
 new DPoP-required and old cookie-only replicas.
 
@@ -167,18 +169,144 @@ Redis authority/replay snapshots or re-enable cookie-only access. A rollback tha
 requires old auth code must withdraw portal traffic and coordinate reauthentication.
 Existing audit/legal/retention and private-gRPC deployment gates remain in force.
 
+### Registration Enablement and Cleanup
+
+`APP_ENV` is mandatory and exactly `development`, `test`, or `production`.
+Missing/empty/whitespace/unknown modes fail before listeners/connections; test is
+not a development exemption. Only explicit development permits ephemeral signing
+keys, missing-client seeding, local HTTP and selected memory seams. Enabled paths
+never downgrade after dependency failure. The exact public all-zero 32-byte
+KEK/pepper samples are rejected in production, not by arbitrary entropy guesses.
+
+`REGISTRATION_ENABLED=false` and `SMS_ENABLED=false` are independent safe defaults.
+Disabled SMS requires no provider credentials and retains DB-only removal/recovery.
+Enable only after separately approved state, logins, private secrets, budgets and
+operational gates; `.env.example` supplies no usable public registration budgets.
+
+| Required enabled configuration | Contract |
+|---|---|
+| `REGISTRATION_PENDING_CAPACITY` | Explicit `1..10000`; finite SQL pending-state admission, not approved public capacity. |
+| `REGISTRATION_GLOBAL_DAILY_LIMIT` | Explicit `1..100000`, shared finite registration admission budget. |
+| `REGISTRATION_EMAIL_HOURLY_LIMIT` | Explicit `1..10`, canonical-email admission budget. |
+| `SMS_PROVIDER`, `SMS_IR_KEY_MODE` | Exactly `smsir`; enabled registration requires explicit `live`. Standalone nonproduction SMS may explicitly use `sandbox`; production is live-only. |
+| `SMS_GATEWAY_API_KEY`, `SMS_IR_TEMPLATE_ID`, `SMS_IR_CODE_PARAMETER` | Private key, positive integer template, exact case-sensitive parameter without `#`. No sample key/template is operator authorization. |
+| `SMS_OTP_HASH_PEPPER` | Independent private HMAC secret, required when SMS is enabled. |
+| `SMS_OTP_GLOBAL_PER_DAY`, `SMS_OTP_MAX_PENDING_SIGNUP` | Explicit finite send budget and pending cap; cap must equal registration capacity. Shared signup/enrollment phone/subnet/global send bounds apply. |
+| `REGISTRATION_SMTP_HOST`, `PORT`, `TLS_MODE`, `USERNAME`, `PASSWORD`, `FROM`, `TIMEOUT`, `CA_BUNDLE`, `PUBLIC_ORIGIN` | Variable prefix is `REGISTRATION_SMTP_` for each field. Authenticated verified TLS, ASCII system sender/auth, positive timeout at most 5s; canonical public origin exactly equals `PORTAL_ORIGIN`. |
+| `REGISTRATION_CLEANUP_DATABASE_URL` | Dedicated actual non-owner NOINHERIT login, separate from API pool; required for enabled startup's nonmutating privilege/schema probe. |
+| `REGISTRATION_CLEANUP_BATCH_SIZE` | `1..500`, default 100, for the packaged maintenance command. |
+
+These ceilings are engineering safety bounds, **not approved operator budgets**.
+SMS.ir uses fixed POST `https://api.sms.ir/v1/send/verify`, Iranian
+`+989xxxxxxxxx` destinations submitted as `Mobile: "9xxxxxxxxx"` (10 digits), and
+one named six-digit code string preserving leading zeros. No GET fallback,
+redirect/provider override, automatic billed retry or real provider test credential
+is supplied. Sandbox uses the same endpoint and success-shaped replies but sends
+nothing. ID/cost/ACK cannot establish key provenance or handset receipt. Before
+live enablement, approve the key/template/parameter, country routing, public egress
+and spend limits, then separately authorize/attest an actual received message.
+
+Startup/readiness checks for enabled signup require final schema, local key
+round-trip, DB/shared Redis, dedicated cleanup-login admission and verified SMTP
+TLS/post-TLS EHLO/actual authentication. `Check(ctx,true)` requires SMTPUTF8 before
+AUTH and sends no MAIL/RCPT/DATA or test message. Real Unicode-mailbox receipt,
+relay/provider policy and cleanup supervision are external gates; flags or a
+successful capability check cannot attest them. ASCII local parts with IDNA ASCII
+domains can use an ASCII relay outside Unicode signup requirements; never reroute
+a Unicode mailbox to an ASCII approximation.
+
+Packaged `/usr/local/bin/registration-cleanup [once|check]` uses only explicit
+environment, its dedicated DSN and batch setting. `check` validates actual login/
+schema/privileges without mutation; `once` runs one bounded batch. Each invocation
+has a fixed **30s total deadline**, not a polling loop. An externally supervised
+schedule and monitoring are required before enablement. Cleanup login needs only
+SELECT/DELETE on registration attempts and SELECT on legal holds, no membership,
+owner/superuser/API/evidence/role privileges or unrelated secrets. Completed receipt
+cleanup takes the subject lock before rechecking holds; held/contended rows defer
+without blocking unrelated progress. Pending/failed rows have no user subject.
+
+Pending/email/passkey/receipt validity is 15m/10m/at-most-5m/1h. Expiry blocks
+authority even if cleanup is unavailable or a hold retains a receipt; expiry alone
+is not physical deletion. Completion clears transient encrypted contacts/tokens/
+ceremony state; resulting-user FK cascade must not prevent lawful purge. No
+exactly-once email/SMS promise, email-based capability recovery, role/session/
+password/new-mailbox bootstrap or relaxation of general mutation retries is added.
+Preserve registration/migration state in consistent forward restores. Stop signup
+intake before incompatible rollback, retain accepted accounts/events/receipts and
+original clocks; no Down/reset/adoption or automatic laboratory transformation.
+
 ### Automated Portal Acceptance
 
 From the workspace root, with npm dependencies, Go 1.26.5+ and Docker available:
 
 ```bash
+npm exec -- nx show project web --json
+npm exec -- nx show project identity-api --json
 npm exec -- nx run identity-api:test-portal --skipNxCache
 npm exec -- nx run identity-api:test-portal-fixture --skipNxCache
 npm exec -- nx run-many -t build,build-deletion-notifier,build-portal-fixture -p identity-api --skipNxCache
 npm exec -- nx run web:build --skipNxCache
 npm exec -- playwright install --with-deps chromium
 npm exec -- nx run web:test-portal-browser --skipNxCache
+npm exec -- nx run identity-api:build-registration-cleanup --skipNxCache
+# After an approved owned candidate build, inject its immutable publication API ID
+# and matching acceptance manifest; never silently rebuild the API for this check.
+npm exec -- nx run web:test-registration-browser --skipNxCache
 ```
+
+Registration browser requires `REGISTRATION_BROWSER_API_IMAGE=sha256:<id>`,
+absolute `REGISTRATION_BROWSER_API_MANIFEST` and
+`REGISTRATION_BROWSER_ARTIFACT_DIR` paths, and the matching
+checksum/source/generated-image acceptance manifest. It must use
+that immutable image's packaged migrate/API/cleanup commands, run-owned isolated
+services, a production-configured SMS.ir-contract TLS fixture at internal
+`api.sms.ir` and SMTPUTF8 relay, with external egress blocked. No host DNS/trust
+edits, real provider credentials, production fake-provider flag or seeded fixture
+account substitutes for signup. Required report identity must match publication;
+adding/resolving a target or source-level tests is not browser/image acceptance.
+
+PostgreSQL, Redis, JetStream and the API belong only to the run-owned internal
+network, without published service ports. Docker may report null host bindings
+for these private services; startup uses verified container IDs and private
+addresses, not host-port discovery. Only the fixture Node controller joins the
+separate ingress network. Its gateway accepts fixed authentication/readiness
+routes to the owned API, never caller-selected destinations or CONNECT tunnels;
+SMS and SMTP listeners bind only to its private interface. JetStream provisioning
+uses the controller's owned private broker address. Do not expose backing services
+or relax production transport admission to repair fixture connectivity.
+
+The final normal service gate is exactly seven one-suite cells under
+`max-parallel: 1`, `fail-fast: false`, unchanged target/job deadlines (30m/60m),
+nonzero executed evidence, zero failures/skips and verified run-owned cleanup.
+The [seven-suite inventory](admin-operations.md#automated-validation) is frozen;
+new package coverage is additive and overlapping runs must remain. Seven affected
+Linux CGO race cells/aggregate are separate, with `-json -tags=integration -race
+-count=1 -p=1 -timeout=20m`, never replacements for normal suite evidence.
+
+From the repository root, set `REPO` to the exact absolute checkout directory.
+Use shared explicit `ACCEPTANCE_RUN_ID` across local partial cells and their
+aggregate; use an approved run-owned artifact directory. Example entrypoints:
+
+```bash
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration-target=test-security-db
+npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs" --integration-race-package=./internal/recovery
+```
+
+Partial mode identifies itself as partial and cannot satisfy publication. Require
+exact-seven unique expected normal and race results, source/generated/run identity,
+test/package evidence and cleanup; missing/stale/duplicate/wrong-source reports,
+zero exit without tests or any skip fail. Resolve final targets before running.
+Never overlap independent service or browser harnesses against the same Docker
+daemon: the restartable lifecycle broker intentionally uses `admin-test-nats`.
+On a Windows host using a Linux execution bridge, verify actual native Linux
+Go/CGO/GCC capabilities rather than changing Node's reported platform. Confirm
+owned native descendants have retired before removing backing services; a bridge
+exit alone is not proof. Retain installed tooling and evidence through acceptance,
+and remove only verified run-owned resources, never name-matched foreign state.
+For focused Go commands, Nx exec traverses dependency cwd: use
+`npm exec -- nx exec -p identity-api -- go -C /absolute/path/to/ldp/apps/identity-api test ...`
+with the actual absolute backend path, never `--excludeTaskDependencies`.
 
 `web:test-portal-browser` owns disposable PostgreSQL/Redis/JetStream containers,
 loopback ports and fresh volumes. Each stack starts two real production-configured
@@ -190,6 +318,8 @@ No development cookie/CSP exceptions or inherited database/secrets are used.
 
 `cmd/portal-fixture` is included only with `-tags=portalfixture` and is absent from
 normal builds/runtime images. It refuses unarmed/production invocations,
+missing/invalid modes and any mode other than explicit development/test (admin
+fixtures are test-only),
 non-loopback/run-mismatched databases and unowned/nonempty Redis. The harness
 seeds random accounts, eight-byte anonymized handles and matching real ES256
 COSE/CDP credentials through that private command, never an HTTP endpoint or magic
@@ -212,6 +342,10 @@ security, lifecycle, gRPC, generated-code, vet/lint/Linux race, image and CSP su
 it adds focused portal integration and a separate `portal-browser` release gate.
 The existing `web-csp.browser.mjs` still validates the actual non-root web image,
 strict parser-inserted attack probes and inactive public forms.
+
+For the changed registration UI, disabled password/reset/neutral-TOTP and
+JavaScript-disabled forms remain required CSP/browser assertions; historical
+inactive-signup evidence does not certify the enabled registration contract.
 
 Set optional `PORTAL_BROWSER_ARTIFACT_DIR` for masked layout screenshots and
 `portal-evidence.json`. The suite does not persist plaintext recovery downloads,
@@ -586,7 +720,11 @@ instances, drain process-local sessions and require reauthentication. New user
 tokens bind to their browser session, OAuth grant and captured account version.
 Legacy unlinked JWTs cannot pass the RPC. Task 7.3 additionally shares WebAuthn
 ceremonies and enforces bound browser sessions across API replicas. Client-assertion
-replay remains a separate single-process boundary. Independent offline grants and
+claims use shared Redis outside development, scoped client/audience/JTI through the
+entire accepted exp+60s leeway window with no memory fallback. Temporal admission
+and atomic absolute expiry use Redis `TIME`; permit `TIME` directly and inside
+the replay Lua script in the authorized Redis ACL. A denied or malformed clock
+reply fails authentication rather than using a replica-local clock. Independent offline grants and
 consent UI completion remain separate tasks.
 
 Operate Redis as security authority: use appropriate ACLs/TLS and an eviction
@@ -731,7 +869,20 @@ Workloads access the SPIFFE Workload API by mounting the local folder hosting `/
 
 ## 2. Secrets Injection & Configuration
 
-To prevent hardcoding of credentials or exposure of raw configuration strings, secrets are injected from **Infisical** via the **Kubernetes External Secrets Operator (ESO)**.
+Current application crypto uses operator-injected environment values: one loaded
+`ENVELOPE_MASTER_KEK`/version and one blind-index pepper/version in process-local
+custody, with real AES-GCM and exact email/generic HMAC input profiles. There is no
+live Infisical fetch/cache/offline fallback, automatic retired-key retrieval or
+hot-rotation subscription. Infisical/SOPS/Sealed Secrets are provisioning options;
+the ESO example below is a post-MVP deployment design, not implemented application
+KMS behavior or evidence of deployed synchronization.
+
+Inventory and protect all retired keys needed for retained ciphertext/backups.
+Changing the one loaded KEK/version or pepper cannot transparently rotate existing
+data; plan controlled draining, inventory/re-encryption/recovery and consistent
+rollout separately. Do not rehash signed history or assume a version byte provides
+a multi-key reader. Restore drills, private key custody and actual secret injection
+are operational gates, not established by primitive unit tests.
 
 ```
 +------------------+         +----------------------------+         +-------------------+
@@ -773,7 +924,8 @@ spec:
         key: /production/crypto/stepup_replay_hmac_key
 ```
 
-Application Pods bind this generated secret as standard environment variables or files:
+In that later design, pods bind the generated secret as environment variables or
+files; process restart/coordinated rollout is still required to load changes:
 
 ```yaml
 env:
@@ -868,7 +1020,7 @@ groups:
 
 ### Admin deployment gate
 
-Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md), including fresh-baseline installation, role separation, approved retention, actual key/data inventory, separately scoped compatibility backfill only where applicable, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress log validation. Backfill is not a lineage upgrade path. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method, router/template, status and duration. RequestPath/RequestLine, query strings, bodies, cookies, step-up headers and referrers must never reach log sinks. Test both the new POST and rejected legacy GET with synthetic identity values. Do not claim a deployed collector is safe from this example alone.
+Before enabling `/api/v1/admin`, follow [admin operations](admin-operations.md): forward-only bundle, role separation, approved retention, actual key/data inventory, version-aware issuers, acknowledged outbox delivery, signer lookup probe and ingress validation. Obsolete legal Backfill is unavailable. The Traefik successor must disable admin access/debug/tracing capture or allowlist only method/template/status/duration. Request paths/lines, queries, bodies, cookies, proofs, grants and referrers must not reach logs. Test body-only canonical-email lookup and rejected legacy GET with synthetic identities; this example does not certify a deployed collector.
 
 ## Phase 5 Technical Closure (2026-11-05)
 

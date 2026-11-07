@@ -143,7 +143,12 @@ func (s *Server) handleRecoveryGenerate() http.HandlerFunc {
 			return
 		}
 
-		result, err := s.deps.Recovery.Generate(r.Context(), userID, clientip.FromRequest(r))
+		current, _ := session.FromContext(r.Context())
+		if !current.AuthVersionSet {
+			s.writeRecoveryError(w, "generate recovery codes", recovery.ErrAccountNotActive)
+			return
+		}
+		result, err := s.deps.Recovery.Generate(r.Context(), userID, current.AuthVersion, clientip.FromRequest(r))
 		if err != nil {
 			s.writeRecoveryError(w, "generate recovery codes", err)
 			return

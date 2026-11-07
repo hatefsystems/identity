@@ -55,6 +55,7 @@ export type AdminStatusUpdate = {
 };
 export type AdminUsersQuery = { limit?: number; offset?: number; status?: AdminUserStatus };
 export type AdminUsersPage = { items: AdminUser[]; total: number; limit: number; offset: number };
+export type AdminLookupPage = AdminUsersPage & { canonical_email: string };
 
 export type AdminAuditLog = {
   id: string;
@@ -199,6 +200,24 @@ export function usersResponse(value: unknown): AdminUsersPage {
   )
     throw new PortalError('invalid_response');
   return result;
+}
+
+export function lookupResponse(value: unknown): AdminLookupPage {
+  const item = record(value);
+  const page = usersResponse(value);
+  const canonical = text(item.canonical_email, 254);
+  if (
+    !/^[^@\s]+@[^@\s]+$/.test(canonical) ||
+    /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\ufffd]/u.test(canonical) ||
+    canonical.normalize('NFC') !== canonical ||
+    page.limit !== 1 ||
+    page.offset !== 0 ||
+    page.total > 1 ||
+    page.total !== page.items.length ||
+    page.items.some((user) => user.email !== canonical)
+  )
+    throw new PortalError('invalid_response');
+  return { ...page, canonical_email: canonical };
 }
 
 export function auditLogResponse(value: unknown): AdminAuditLog {

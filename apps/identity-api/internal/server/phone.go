@@ -65,14 +65,18 @@ func (s *Server) registerPhoneRoutes() {
 	s.router.Route("/api/v1/users/me/phone", func(r chi.Router) {
 		r.Use(guard.Handler)
 
-		r.Post("/verify", s.handlePhoneVerify())
+		if s.deps.SMSOTP.DeliveryEnabled() {
+			r.Post("/verify", s.handlePhoneVerify())
+		}
 
 		if !hasStepUp {
 			return
 		}
 		r.Group(func(pr chi.Router) {
 			pr.Use(stepGuard.Handler)
-			pr.Post("/send-code", s.handlePhoneSendCode())
+			if s.deps.SMSOTP.DeliveryEnabled() {
+				pr.Post("/send-code", s.handlePhoneSendCode())
+			}
 			pr.Delete("/", s.handlePhoneRemove())
 		})
 	})
@@ -89,9 +93,9 @@ func (s *Server) handlePhoneSendCode() http.HandlerFunc {
 			return
 		}
 		current, ok := session.FromContext(r.Context())
-		if !ok {
+		if !ok || !current.AuthVersionSet {
 			s.logger.Error("smsotp: send-code handler reached without a session in context")
-			writeJSON(w, http.StatusInternalServerError, phoneErrorResponse{Error: "server_error"})
+			writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
 			return
 		}
 
@@ -102,14 +106,16 @@ func (s *Server) handlePhoneSendCode() http.HandlerFunc {
 
 		var req phoneSendCodeRequest
 		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(body))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&req); err != nil {
 				writeJSON(w, http.StatusBadRequest, phoneErrorResponse{Error: "invalid_request"})
 				return
 			}
 		}
 
 		verificationID, err := s.deps.SMSOTP.SendCode(
-			r.Context(), userID, current.ID, req.Phone, clientip.FromRequest(r),
+			r.Context(), userID, current.AuthVersion, current.ID, req.Phone, clientip.FromRequest(r),
 		)
 		if err != nil {
 			s.writePhoneError(w, "send phone code", err)
@@ -135,9 +141,9 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 			return
 		}
 		current, ok := session.FromContext(r.Context())
-		if !ok {
+		if !ok || !current.AuthVersionSet {
 			s.logger.Error("smsotp: verify handler reached without a session in context")
-			writeJSON(w, http.StatusInternalServerError, phoneErrorResponse{Error: "server_error"})
+			writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
 			return
 		}
 
@@ -148,13 +154,15 @@ func (s *Server) handlePhoneVerify() http.HandlerFunc {
 
 		var req phoneVerifyRequest
 		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(body))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&req); err != nil {
 				writeJSON(w, http.StatusBadRequest, phoneErrorResponse{Error: "invalid_request"})
 				return
 			}
 		}
 
-		if err := s.deps.SMSOTP.Verify(r.Context(), userID, current.ID, req.VerificationID, req.Code); err != nil {
+		if err := s.deps.SMSOTP.Verify(r.Context(), userID, current.AuthVersion, current.ID, req.VerificationID, req.Code); err != nil {
 			s.writePhoneError(w, "verify phone code", err)
 			return
 		}
@@ -187,7 +195,12 @@ func (s *Server) handlePhoneRemove() http.HandlerFunc {
 			return
 		}
 
-		removed, err := s.deps.SMSOTP.RemovePhone(r.Context(), userID)
+		current, ok := session.FromContext(r.Context())
+		if !ok || !current.AuthVersionSet {
+			writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
+			return
+		}
+		removed, err := s.deps.SMSOTP.RemovePhone(r.Context(), userID, current.AuthVersion)
 		if err != nil {
 			s.writePhoneError(w, "remove phone", err)
 			return
@@ -216,7 +229,7 @@ func (s *Server) handlePhoneRemove() http.HandlerFunc {
 // return 400; a missing account maps to 401.
 func (s *Server) writePhoneError(w http.ResponseWriter, op string, err error) {
 	switch {
-	case errors.Is(err, smsotp.ErrUserNotFound), errors.Is(err, smsotp.ErrAccountNotActive):
+	case errors.Is(err, smsotp.ErrUserNotFound), errors.Is(err, smsotp.ErrAccountNotActive), errors.Is(err, smsotp.ErrStaleSession):
 		writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
 	case errors.Is(err, smsotp.ErrInvalidPhone):
 		writeJSON(w, http.StatusBadRequest, phoneErrorResponse{Error: "invalid_phone"})
@@ -229,7 +242,17 @@ func (s *Server) writePhoneError(w http.ResponseWriter, op string, err error) {
 	case errors.Is(err, smsotp.ErrInvalidCode):
 		writeJSON(w, http.StatusBadRequest, phoneErrorResponse{Error: "invalid_code"})
 	default:
-		s.logger.Error("smsotp: "+op+" failed", "error", err.Error())
+		// Dependency errors may contain SQL identities or provider credentials.
+		// Keep the public error code and only log a fixed internal classification.
+		reason := "unavailable"
+		if errors.Is(err, smsotp.ErrRestartRequired) {
+			reason = "restart_verification_or_read_current_state"
+		} else if errors.Is(err, smsotp.ErrSendFailed) {
+			reason = "send_" + smsotp.SendFailureReason(err)
+		} else if errors.Is(err, smsotp.ErrDisabled) {
+			reason = "disabled"
+		}
+		s.logger.Error("smsotp: "+op+" failed", "reason", reason)
 		writeJSON(w, http.StatusInternalServerError, phoneErrorResponse{Error: "server_error"})
 	}
 }

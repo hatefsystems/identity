@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -162,7 +163,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	}
 
 	pepper := []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-	indexer, err := blindindex.New(pepper, 0)
+	indexer, err := blindindex.New(pepper, 7)
 	if err != nil {
 		t.Fatalf("blindindex.New: %v", err)
 	}
@@ -185,11 +186,13 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 		FlushInterval:   100 * time.Millisecond,
 		LedgerRetention: 180*24*time.Hour + 789*time.Nanosecond,
 	}
+	var signerLogs bytes.Buffer
 
 	signingWorker, err := signer.New(cfg, store, opener, consumer,
 		signer.WithAdvisoryLocker(locker),
 		signer.WithBlindIndexer(indexer),
 		signer.WithClock(func() time.Time { return time.Now().Truncate(time.Second).Add(123456789 * time.Nanosecond) }),
+		signer.WithLogger(slog.New(slog.NewTextHandler(&signerLogs, nil))),
 	)
 	if err != nil {
 		t.Fatalf("signer.New: %v", err)
@@ -281,7 +284,8 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	if _, err := js.Publish(ctx, subject, raw, jetstream.WithMsgID(event3ID.String())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.Publish(ctx, subject, []byte("malformed envelope")); err != nil {
+	sensitiveSentinel := "private@example.test-secret-token"
+	if _, err := js.Publish(ctx, subject, []byte(`{"occurred_at":"`+sensitiveSentinel+`"}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -308,6 +312,9 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	cancelWorker()
 	if err := <-workerDone; err != nil {
 		t.Fatalf("signing worker error: %v", err)
+	}
+	if strings.Contains(signerLogs.String(), sensitiveSentinel) {
+		t.Fatal("sensitive parser input leaked to signer logs")
 	}
 
 	// Verify records in mvp_audit_logs.
@@ -366,7 +373,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 		if row.UserID.Valid {
 			t.Fatal("late subject attached a missing FK")
 		}
-		if payload := derefString(row.Payload); strings.Contains(payload, testEmail) || strings.Contains(payload, index) {
+		if payload := derefString(row.Payload); strings.Contains(payload, testEmail) || strings.Contains(payload, index) || strings.Contains(payload, sensitiveSentinel) {
 			t.Fatal("raw identity/index leaked to Class C payload")
 		}
 	}
@@ -421,6 +428,9 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	}
 
 	row := ledgerRows[0]
+	if row.BlindIndexVersion != 7 {
+		t.Fatalf("captured generation = %d, want 7", row.BlindIndexVersion)
+	}
 	if row.AccountRef != testUser.ID {
 		t.Errorf("ledger row AccountRef = %v, want %v", row.AccountRef, testUser.ID)
 	}
@@ -445,6 +455,83 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	diff := row.RetainUntil.Time.Sub(expectedRetain)
 	if diff < -time.Second || diff > time.Second {
 		t.Errorf("ledger retain_until %v differs from expected %v by %v", row.RetainUntil.Time, expectedRetain, diff)
+	}
+}
+
+func TestSignerCanonicalStorageAdmissionIntegration(t *testing.T) {
+	ctx, pool := signerFixture(t)
+	actor := uuid.MustParse("abcdefab-1234-4321-8123-123456789012")
+	sentinel := "sensitive@example.test-secret-token"
+	valid := audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: actor.String(), ActorSPIFFEID: audit.APIActorSPIFFEID, OccurredAt: time.Now(), EventType: audit.EventSessionLoggedOut, ActionStatus: audit.StatusSuccess, Payload: "{}"}
+	zero := valid
+	zero.EventID, zero.ActorID = uuid.New(), uuid.Nil.String()
+	envs := []audit.Envelope{valid, zero}
+	var rejected []uuid.UUID
+	for _, change := range []func(*audit.Envelope){
+		func(e *audit.Envelope) { e.ActorID = "" },
+		func(e *audit.Envelope) { e.ActorID = strings.ToUpper(actor.String()) },
+		func(e *audit.Envelope) { e.ActorID = sentinel },
+		func(e *audit.Envelope) { e.Payload = sentinel + "\x00" },
+		func(e *audit.Envelope) { e.EventType = strings.Repeat("x", 101) },
+		func(e *audit.Envelope) {
+			e.Security = &audit.EnvelopeSecurity{AccountRef: actor.String(), BlindIndexVersion: -1}
+		},
+	} {
+		env := valid
+		env.EventID = uuid.New()
+		change(&env)
+		envs = append(envs, env)
+		rejected = append(rejected, env.EventID)
+	}
+	// The same rejected bytes must produce one durable incident on redelivery.
+	envs = append(envs, envs[2])
+	if err := runSignerFixture(t, ctx, pool, envs...); err != nil {
+		t.Fatal(err)
+	}
+	q := db.New(pool)
+	if ids, err := q.FilterExistingAuditLogIDs(ctx, rejected); err != nil || len(ids) != 0 {
+		t.Fatalf("rejected event IDs signed: %v %v", ids, err)
+	}
+	through, err := q.GetAuditLogHighWaterSeq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := q.ListAuditLogChainForVerification(ctx, db.ListAuditLogChainForVerificationParams{ThroughSeq: through, PageLimit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 8 {
+		t.Fatalf("got %d rows, want two accepted actors and six quarantine incidents", len(rows))
+	}
+	tip := audit.Genesis()
+	quarantined, accepted := 0, 0
+	for _, row := range rows {
+		record := audit.AuditRecord{ID: row.EventID.String(), ActorID: row.ActorID.UUID.String(), ActorSPIFFEID: derefString(row.ActorSpiffeID), EventType: derefString(row.EventType), ActionStatus: derefString(row.ActionStatus), ClientIP: derefString(row.ClientIp), UserAgent: derefString(row.UserAgent), Payload: derefString(row.Payload), Timestamp: row.Timestamp.Time}
+		leaf, err := audit.LeafAudit(record)
+		if err != nil || !bytes.Equal(leaf.Bytes(), row.LeafHash) {
+			t.Fatalf("PostgreSQL canonical actor leaf mismatch at %d: %v", row.Seq, err)
+		}
+		tip = audit.ChainAudit(tip, leaf)
+		if !bytes.Equal(tip.Bytes(), row.ChainHash) {
+			t.Fatal("stored chain mismatch")
+		}
+		if strings.Contains(record.Payload, sentinel) {
+			t.Fatal("rejected sensitive metadata leaked to quarantine")
+		}
+		if record.EventType == audit.EventPipelineUndecodable {
+			quarantined++
+		} else {
+			accepted++
+			if row.EventID == valid.EventID && row.ActorID.UUID != actor {
+				t.Fatal("nonzero actor changed in storage")
+			}
+			if row.EventID == zero.EventID && row.ActorID.UUID != uuid.Nil {
+				t.Fatal("permitted zero actor changed in storage")
+			}
+		}
+	}
+	if quarantined != 6 || accepted != 2 {
+		t.Fatal("invalid batch blocked valid actor progress")
 	}
 }
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -278,7 +280,11 @@ func (s *Server) parsePagination(r *http.Request) (limit, offset int32, err erro
 // "reason" on a legal-hold request would otherwise store an empty justification
 // for a court order and report success.
 func decodeJSONBody(r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 64*1024))
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 64*1024))
+	if err != nil || !utf8.Valid(raw) || !json.Valid(raw) || !uniqueJSONFields(raw) {
+		return errors.New("invalid JSON request")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return err

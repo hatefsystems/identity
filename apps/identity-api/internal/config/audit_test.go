@@ -156,7 +156,7 @@ func TestLoadAuditNATSURLRequirement(t *testing.T) {
 		}
 	})
 
-	for _, env := range []string{"production", "staging", ""} {
+	for _, env := range []string{"production", "test"} {
 		t.Run("Rejected/"+env, func(t *testing.T) {
 			clearAuditEnv(t)
 
@@ -181,6 +181,20 @@ func TestLoadAuditNATSURLRequirement(t *testing.T) {
 			t.Fatal("LoadAudit with a blank NATS_URL = nil error, want error")
 		}
 	})
+}
+
+func TestLoadAuditRequiresExactSuppliedEnvironment(t *testing.T) {
+	for _, environment := range []string{"", " ", "\t", "staging", "Development", "development "} {
+		t.Run(environment, func(t *testing.T) {
+			clearAuditEnv(t)
+			t.Setenv("APP_ENV", "development")
+			t.Setenv(EnvNATSURL, "nats://localhost:4222")
+			cfg, err := LoadAudit(environment)
+			if err == nil || !strings.Contains(err.Error(), "APP_ENV") || cfg.NATSURL != "" || cfg.BatchSize != 0 {
+				t.Fatalf("invalid supplied mode admitted: %+v %v", cfg, err)
+			}
+		})
+	}
 }
 
 // TestLoadAuditSubjectMustBeBoundToStream guards the pipeline's quietest failure

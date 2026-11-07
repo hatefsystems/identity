@@ -52,6 +52,9 @@ func (c OIDCConfig) HasKeys() bool {
 // development a localhost issuer is defaulted and missing keys are tolerated
 // (the caller falls back to ephemeral dev keys).
 func LoadOIDC(environment string) (OIDCConfig, error) {
+	if err := ValidateEnvironment(environment); err != nil {
+		return OIDCConfig{}, err
+	}
 	cfg := OIDCConfig{
 		Issuer:         strings.TrimSuffix(os.Getenv(EnvOIDCIssuer), "/"),
 		ActiveKeyPEM:   []byte(os.Getenv(EnvOIDCSigningKey)),
@@ -67,10 +70,10 @@ func LoadOIDC(environment string) (OIDCConfig, error) {
 		}
 		cfg.Issuer = defaultDevIssuer
 	}
-	if !isDev && !strings.HasPrefix(cfg.Issuer, "https://") {
-		return OIDCConfig{}, fmt.Errorf("config: %s must be an https URL outside development", EnvOIDCIssuer)
+	if _, err := issuerOrigin(cfg.Issuer, environment); err != nil {
+		return OIDCConfig{}, err
 	}
-	if !isDev && !cfg.HasKeys() {
+	if !isDev && (strings.TrimSpace(string(cfg.ActiveKeyPEM)) == "" || strings.TrimSpace(string(cfg.NextKeyPEM)) == "") {
 		return OIDCConfig{}, fmt.Errorf(
 			"config: %s and %s are required outside development",
 			EnvOIDCSigningKey, EnvOIDCSigningKeyNext,
