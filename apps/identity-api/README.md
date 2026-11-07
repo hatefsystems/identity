@@ -322,7 +322,7 @@ Do not run schema-resetting suites concurrently. The same non-root image package
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at
-runtime (via Infisical/KMS or the container environment) and never committed.
+runtime through environment injection and never committed. The application does not fetch or rotate Infisical keys.
 
 | Variable                              | Default       | Description                                                              |
 | :------------------------------------ | :------------ | :----------------------------------------------------------------------- |
