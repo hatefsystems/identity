@@ -631,6 +631,29 @@ export function trustRegistrationFixtureCA(caPEM, caPath) {
   };
 }
 
+// HTTP/1.1 hop-by-hop framing belongs to each individual socket, never to a
+// forwarded request. In particular, a browser's Connection nominations may
+// not be replayed toward the API; Node must calculate outbound body framing.
+export function registrationForwardHeaders(incoming, origin) {
+  const headers = { ...incoming };
+  const hop = new Set([
+    'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization',
+    'proxy-authenticate', 'upgrade', 'te', 'trailer', 'transfer-encoding',
+  ]);
+  if (typeof incoming.connection === 'string')
+    for (const name of incoming.connection.split(','))
+      if (/^[a-z0-9-]{1,128}$/i.test(name.trim())) hop.add(name.trim().toLowerCase());
+  for (const name of Object.keys(headers))
+    if (hop.has(name.toLowerCase())) delete headers[name];
+  return {
+    ...headers,
+    host: new URL(origin).host,
+    'x-forwarded-proto': 'https',
+    'x-forwarded-for': '127.0.0.1',
+    'x-forwarded-host': new URL(origin).host,
+  };
+}
+
 export async function startRegistrationGateway(config, track) {
   const targets = validateGatewayTargets(config.gateway);
   const gateway = httpServer((request, response) => {
@@ -642,24 +665,7 @@ export async function startRegistrationGateway(config, track) {
       response.end();
       return;
     }
-    const headers = {
-      ...request.headers,
-      host: new URL(config.origin).host,
-      'x-forwarded-proto': 'https',
-      'x-forwarded-for': '127.0.0.1',
-      'x-forwarded-host': new URL(config.origin).host,
-    };
-    for (const key of [
-      'connection',
-      'proxy-connection',
-      'proxy-authorization',
-      'proxy-authenticate',
-      'upgrade',
-      'te',
-      'trailer',
-      'transfer-encoding',
-    ])
-      delete headers[key];
+    const headers = registrationForwardHeaders(request.headers, config.origin);
     const upstream = httpRequest({ ...target, headers, timeout: 15000 }, (result) => {
       response.writeHead(result.statusCode, result.headers);
       result.pipe(response);
@@ -1418,13 +1424,7 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
             method: request.method,
             path: request.url,
             timeout: 15000,
-            headers: {
-              ...request.headers,
-              host: new URL(origin).host,
-              'x-forwarded-for': '127.0.0.1',
-              'x-forwarded-proto': 'https',
-              'x-forwarded-host': new URL(origin).host,
-            },
+            headers: registrationForwardHeaders(request.headers, origin),
           },
           (result) => {
             response.writeHead(result.statusCode, result.headers);
