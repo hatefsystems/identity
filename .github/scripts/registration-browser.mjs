@@ -16,7 +16,11 @@ import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer, connect as tcpConnect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { createServer as tlsServer } from 'node:tls';
+import {
+  createServer as tlsServer,
+  getCACertificates,
+  setDefaultCACertificates,
+} from 'node:tls';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -597,6 +601,28 @@ export function gatewayProvisioningTarget(targets, body) {
     'Provisioning accepts no caller-selected targets'
   );
   return { address: `nats://${targets.natsHost}:4222`, runID: targets.runID };
+}
+
+// Playwright route.fetch() runs through Node's TLS client, not Chromium's SPKI
+// exception. Trust only this run's private CA, and restore the default trust
+// store and child-process environment after the acceptance run.
+export function trustRegistrationFixtureCA(caPEM, caPath) {
+  fixed(
+    typeof caPEM === 'string' && new X509Certificate(caPEM).ca &&
+      typeof caPath === 'string' && isAbsolute(caPath),
+    'Invalid run-owned browser TLS authority'
+  );
+  const originalCAs = getCACertificates('default');
+  const originalExtraCA = process.env.NODE_EXTRA_CA_CERTS;
+  setDefaultCACertificates([...originalCAs, caPEM]);
+  // Also cover a Playwright driver that launches its own Node.js child.
+  // NODE_EXTRA_CA_CERTS is read only when that child starts.
+  process.env.NODE_EXTRA_CA_CERTS = caPath;
+  return () => {
+    setDefaultCACertificates(originalCAs);
+    if (originalExtraCA === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+    else process.env.NODE_EXTRA_CA_CERTS = originalExtraCA;
+  };
 }
 
 export async function startRegistrationGateway(config, track) {
@@ -1821,6 +1847,8 @@ phone_verified_at=phone_verified_at-interval '20 minutes',passkey_created_at=pas
       identity,
       origin,
       tlsSPKI: tls.spki,
+      tlsCA: tls.ca,
+      tlsCAPath: resolve(temporary, 'ca.pem'),
       control,
       inspect,
       expire,
@@ -2873,7 +2901,8 @@ export async function runRegistrationBrowser() {
     cleanup = { completed: false },
     failed = true,
     failureCheck = 'inputs',
-    failure;
+    failure,
+    restoreFixtureCA = () => {};
   const mark = (check) => {
     lifecycle.check();
     fixed(registrationChecks.includes(check), 'Unknown executed registration check');
@@ -2898,6 +2927,7 @@ export async function runRegistrationBrowser() {
     lifecycle.check();
     failureCheck = 'manifest-read';
     harness = await startRegistrationHarness(inputs, lifecycle, identity);
+    restoreFixtureCA = trustRegistrationFixtureCA(harness.tlsCA, harness.tlsCAPath);
     mark('immutable-quality-image');
     mark('isolated-production-services');
     mark('packaged-migration-cleanup');
@@ -2989,6 +3019,7 @@ export async function runRegistrationBrowser() {
       teardownFailed = true;
     }
     lifecycle.signal.removeEventListener('abort', interrupted);
+    restoreFixtureCA();
     lifecycle.release();
     if (failed && inputs && identity) {
       const detail = failure ?? registrationFailureDetails(undefined, failureCheck);
