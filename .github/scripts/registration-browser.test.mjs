@@ -23,11 +23,13 @@ import {
   gatewayProvisioningTarget,
   registrationGatewayTargets,
   registrationForwardHeaders,
+  captureRegistrationResponse,
   registrationControllerUser,
   assertRegistrationAPINetwork,
   registrationStartupSummary,
   registrationBrowserDiagnostic,
   registrationPasskeyEnvironment,
+  registrationSecretEnvironmentValues,
   registrationChecks,
   registrationFailureDetails,
   registrationFailureMessage,
@@ -42,6 +44,74 @@ import {
 import { portalCleanup } from './portal-harness.mjs';
 
 const token = randomBytes(32).toString('base64url');
+
+test('registration log guard excludes public resident-key policy but retains every secret environment field', () => {
+  const environment = {
+    WEBAUTHN_RESIDENT_KEY: 'required',
+    WEBAUTHN_RP_ID: 'localhost',
+    WEBAUTHN_MOCK_CHALLENGE_KEY: 'private-decoy-key',
+    ENVELOPE_MASTER_KEK: 'private-kek',
+    ENVELOPE_BLIND_INDEX_PEPPER: 'private-index-pepper',
+    OIDC_SIGNING_KEY_ACTIVE_PEM: 'private-signing-key',
+    REGISTRATION_SMTP_USERNAME: 'private-smtp-user',
+    REGISTRATION_SMTP_PASSWORD: 'private-smtp-password',
+    DATABASE_URL: 'private-database-url',
+    REGISTRATION_CLEANUP_DATABASE_URL: 'private-cleanup-url',
+    SMS_GATEWAY_API_KEY: 'private-provider-key',
+  };
+  assert.deepEqual(registrationSecretEnvironmentValues(environment), Object.values(environment).slice(2));
+});
+
+test('registration evidence retains the original streamed ingress bytes without replay', async () => {
+  const upstream = new PassThrough();
+  upstream.statusCode = 201;
+  const body = Buffer.from(JSON.stringify({ canonical_email: 'آزمايش@example.test' }));
+  const original = [];
+  upstream.on('data', (chunk) => original.push(chunk));
+  const captured = captureRegistrationResponse(upstream);
+  // Split inside a multibyte UTF-8 character, as a real socket may do.
+  const split = body.indexOf(Buffer.from('آ')) + 1;
+  upstream.write(body.subarray(0, split));
+  upstream.end(body.subarray(split));
+  assert.deepEqual(await captured, { status: 201, value: { canonical_email: 'آزمايش@example.test' } });
+  assert.deepEqual(Buffer.concat(original), body);
+});
+
+test('registration evidence retains nonce denials and empty 204 responses', async () => {
+  for (const [status, body, value] of [
+    [401, '{"error":"use_dpop_nonce"}', { error: 'use_dpop_nonce' }],
+    [409, '{"error":"proof_required"}', { error: 'proof_required' }],
+    [204, '', undefined],
+  ]) {
+    const upstream = new PassThrough();
+    upstream.statusCode = status;
+    const captured = captureRegistrationResponse(upstream);
+    upstream.end(body);
+    assert.deepEqual(await captured, { status, value });
+  }
+});
+
+test('registration evidence rejects oversized, malformed and incomplete ingress responses privately', async () => {
+  for (const [status, body] of [
+    [200, Buffer.alloc(256 * 1024 + 1, 120)],
+    [200, Buffer.from('{"private-token":')],
+    [200, Buffer.from([0xff])],
+    [204, Buffer.from('private-token')],
+  ]) {
+    const upstream = new PassThrough();
+    upstream.statusCode = status;
+    const captured = captureRegistrationResponse(upstream);
+    upstream.end(body);
+    await assert.rejects(captured, (error) => !error.message.includes('private-token'));
+  }
+  const upstream = new PassThrough();
+  upstream.statusCode = 201;
+  const captured = captureRegistrationResponse(upstream);
+  upstream.write('{"private-token":');
+  upstream.emit('aborted');
+  upstream.destroy();
+  await assert.rejects(captured, /incomplete/);
+});
 
 test('registration ingress forwards browser security context but not connection framing', () => {
   const incoming = {
@@ -97,6 +167,7 @@ test('browser diagnostics expose only fixed routes, HTTP statuses and numeric so
   for (const [message, kind] of [
     [`strict mode violation: ${privateValue}`, 'ambiguous-locator'],
     [`locator.waitFor: Timeout 15000ms exceeded. ${privateValue}`, 'timeout'],
+    [`Protocol error (Network.getResponseBody): No resource with given identifier found ${privateValue}`, 'response-body-unavailable'],
   ]) {
     const safe = registrationBrowserDiagnostic({ message, stack: privateValue });
     assert.equal(safe.kind, kind);
@@ -196,6 +267,14 @@ test('gateway forwards only fixed API routes and never accepts selected hosts or
     gatewayForwardTarget(privateTargets, 'GET', '/readyz').hostname,
     privateTargets.apiHost
   );
+  assert.equal(
+    gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me').hostname,
+    privateTargets.apiHost
+  );
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'PATCH', '/api/v1/users/me'));
+  assert.equal(gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions').hostname, privateTargets.apiHost);
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'DELETE', '/api/v1/users/me/sessions'));
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions/foreign'));
   for (const path of [
     'http://external.invalid/',
     '//external.invalid/',
