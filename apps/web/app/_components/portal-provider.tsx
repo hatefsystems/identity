@@ -1,5 +1,13 @@
 'use client';
 
+import type { Message } from '../../i18n/messages';
+import { useMessage } from '../../i18n/use-message';
+
+import { useTranslations } from 'next-intl';
+import { PreferenceControls } from '../../i18n/preferences';
+import { useDisplayPreferences } from '../../i18n/provider';
+import type { Locale } from '../../i18n/config';
+
 import { Button, cn } from '@hatef/ui';
 import { ShieldCheck } from 'lucide-react';
 import Link from 'next/link';
@@ -41,7 +49,7 @@ type PortalContextValue = Omit<PortalState, 'route'> & {
   moderationInterrupted?: boolean;
   updateProfile: (profile: Profile) => void;
   signOut: (currentID?: string) => Promise<void>;
-  deleteAccount: (grant: StepUpGrant, signal: AbortSignal) => Promise<void>;
+  deleteAccount: (grant: StepUpGrant, signal: AbortSignal, locale?: Locale) => Promise<void>;
   rememberStepUp: (intent: StepUpIntent) => void;
   reportPermissionLoss: () => void;
   reportModerationInterruption: () => void;
@@ -63,11 +71,14 @@ export function PortalProvider({
   children: ReactNode;
   surface?: 'account' | 'admin';
 }) {
+  const t = useTranslations();
+  const message = useMessage();
+  const preferences = useDisplayPreferences();
   const [state, setState] = useState<PortalState | null>(null);
   const [phase, setPhase] = useState<
     'checking' | 'ready' | 'failed' | 'signing-out' | 'no-access' | 'disabled'
   >('checking');
-  const [error, setError] = useState('');
+  const [error, setError] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   const [deletionOutcome, setDeletionOutcome] = useState<DeletionOutcome | null>(null);
   const [moderationInterrupted, setModerationInterrupted] = useState(false);
@@ -152,9 +163,9 @@ export function PortalProvider({
       setPhase(denied ? 'no-access' : disabled ? 'disabled' : 'failed');
       setError(
         denied
-          ? 'This session has no access to this administrative workspace. Your account session has not been signed out.'
+          ? { key: 'portal.shell.noAccess' }
           : disabled
-            ? 'The administrative surface is not available on this deployment.'
+            ? { key: 'portal.shell.disabled' }
             : errorMessage(failure)
       );
       // Do not echo received broadcasts; only detected authority changes notify.
@@ -317,16 +328,18 @@ export function PortalProvider({
       client.dispose();
       active.current = null;
       setPhase('failed');
-      setError(
-        `Sign-out could not be confirmed. The server session may still be active. ${errorMessage(failure)}`
-      );
+      setError(errorMessage(failure));
       invalidateOtherTabs();
     } finally {
       signingOut.current = false;
     }
   }
 
-  async function deleteAccount(grant: StepUpGrant, signal: AbortSignal) {
+  async function deleteAccount(
+    grant: StepUpGrant,
+    signal: AbortSignal,
+    locale: Locale = preferences.locale
+  ) {
     const client = active.current;
     if (!client || signingOut.current || deleting.current || terminal.current) {
       grant.clear();
@@ -353,10 +366,15 @@ export function PortalProvider({
       if (!client.assertSession().deletion_enabled) throw new PortalError('deletion_disabled');
       deleting.current = operation;
       signal.addEventListener('abort', operation.interrupt, { once: true });
-      await client.deleteAccount(grant, signal, () => {
-        throwIfAborted(signal);
-        operation.sent = true;
-      });
+      await client.deleteAccount(
+        grant,
+        signal,
+        () => {
+          throwIfAborted(signal);
+          operation.sent = true;
+        },
+        locale
+      );
       if (signal.aborted || active.current !== client) settle('unconfirmed');
       else settle('confirmed');
     } catch (failure) {
@@ -421,9 +439,7 @@ export function PortalProvider({
     if (!admin) return;
     clear();
     setPhase('no-access');
-    setError(
-      'Administrative access was denied. Private data and pending actions were cleared. Check access again before continuing; your normal account session has not been signed out.'
-    );
+    setError({ key: 'portal.shell.permissionLost' });
   }, [admin, clear]);
 
   const reportModerationInterruption = useCallback(() => {
@@ -437,34 +453,36 @@ export function PortalProvider({
   const permissions = ready ? state?.capabilities?.capabilities : undefined;
   const navigation = admin
     ? [
-        ['/admin', 'Workspaces'],
-        ...(permissions?.users_read ? [['/admin/users', 'Accounts']] : []),
-        ...(permissions?.audit_logs_read ? [['/admin/audit-logs', 'Audit logs']] : []),
+        ['/admin', t('portal.navigation.workspaces')],
+        ...(permissions?.users_read ? [['/admin/users', t('portal.navigation.accounts')]] : []),
+        ...(permissions?.audit_logs_read
+          ? [['/admin/audit-logs', t('portal.navigation.audit')]]
+          : []),
         ...(permissions?.audit_chain_verify || permissions?.ledger_verify
-          ? [['/admin/integrity', 'Integrity']]
+          ? [['/admin/integrity', t('portal.navigation.integrity')]]
           : []),
         ...(permissions?.legal_holds_read ||
         permissions?.legal_holds_apply ||
         permissions?.legal_holds_release ||
         permissions?.preservation_requests_create ||
         permissions?.legal_inquiry_lookup
-          ? [['/admin/legal', 'DPO and Legal']]
+          ? [['/admin/legal', t('portal.navigation.legal')]]
           : []),
       ]
     : [
-        ['/dashboard', 'Overview'],
-        ['/dashboard/profile', 'Profile'],
-        ['/dashboard/security', 'Security'],
-        ['/dashboard/sessions', 'Sessions'],
-        ['/dashboard/privacy', 'Privacy'],
+        ['/dashboard', t('portal.navigation.overview')],
+        ['/dashboard/profile', t('portal.profile.title')],
+        ['/dashboard/security', t('security.title')],
+        ['/dashboard/sessions', t('portal.sessions.title')],
+        ['/dashboard/privacy', t('privacy.title')],
       ];
   return (
     <div className="min-h-svh bg-muted/20">
       <a
         href="#portal-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-background focus:p-3 focus:ring-2 focus:ring-ring"
+        className="sr-only focus:not-sr-only focus:absolute focus:start-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-background focus:p-3 focus:ring-2 focus:ring-ring"
       >
-        {admin ? 'Skip to admin content' : 'Skip to account content'}
+        {admin ? t('portal.shell.skipAdmin') : t('portal.shell.skipAccount')}
       </a>
       <header className={cn('border-b bg-background', admin && 'border-t-4 border-t-primary')}>
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-6">
@@ -473,18 +491,17 @@ export function PortalProvider({
             prefetch={false}
             onClick={clearSensitiveViews}
             className="flex min-h-11 items-center gap-3 rounded-md px-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label="Hatef Identity home"
+            aria-label={t('portal.shell.home')}
           >
             <span className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <ShieldCheck aria-hidden="true" className="size-5" />
             </span>
-            <span className="font-semibold tracking-tight">
-              Hatef <span className="font-normal text-muted-foreground">Identity</span>
-            </span>
+            <span className="font-semibold tracking-tight">{t('auth.brand')}</span>
           </Link>
+          <PreferenceControls />
           {admin && (
             <span className="rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-wider">
-              Elevated access
+              {t('portal.shell.elevated')}
             </span>
           )}
           {ready && !deletionOutcome && (
@@ -494,7 +511,7 @@ export function PortalProvider({
               className={controlClass}
               onClick={() => signOut()}
             >
-              Sign out
+              {t('portal.shell.signOut')}
             </Button>
           )}
         </div>
@@ -506,12 +523,14 @@ export function PortalProvider({
         )}
       >
         <nav
-          aria-label={admin ? 'Admin navigation' : 'Account navigation'}
+          aria-label={
+            admin ? t('portal.shell.adminNavigation') : t('portal.shell.accountNavigation')
+          }
           className="min-w-0"
           hidden={Boolean(deletionOutcome)}
         >
           <p className="mb-3 px-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
-            {admin ? 'Admin control panel' : 'Your account'}
+            {admin ? t('portal.shell.adminTitle') : t('portal.shell.accountTitle')}
           </p>
           <ul className="grid grid-cols-2 gap-1 sm:grid-cols-5 lg:grid-cols-1">
             {navigation.map(([href, label]) => (
@@ -547,22 +566,22 @@ export function PortalProvider({
             onClick={clearSensitiveViews}
             className={`${linkClass} mt-4`}
           >
-            {admin ? 'Return to account' : 'Admin'}
+            {admin ? t('portal.shell.returnAccount') : t('portal.shell.admin')}
           </Link>
         </nav>
         <main id="portal-content" tabIndex={-1} className="min-w-0 space-y-6 focus:outline-none">
           {admin && moderationInterrupted && (
-            <Feedback status="Outcome unconfirmed; the action was not retried. Read current account state explicitly before starting another action. A matching status proves only current state, not that the interrupted action succeeded." />
+            <Feedback status={t('portal.shell.moderationInterrupted')} />
           )}
           {admin && legalInterrupted && (
             <div data-testid="legal-interruption">
               <Feedback
                 status={
                   legalInterrupted === 'lookup'
-                    ? 'Attribution was interrupted. No result was accepted; this does not mean no match. Private query data was cleared. Start a new inquiry with fresh verification; nothing was retried.'
+                    ? t('portal.shell.lookupInterrupted')
                     : legalInterrupted === 'release'
-                      ? 'Legal release outcome unconfirmed; the request was not retried. Private data was cleared. Read Legal Holds explicitly and select the original request again. A current released state does not prove who released it.'
-                      : 'Legal creation outcome unconfirmed; the request was not retried. Private data was cleared. Reenter the exact original target, kind, operation UUID, and normalized inputs from controlled external intake, then verify afresh. Do not replace the operation UUID or infer rollback.'
+                      ? t('portal.shell.releaseInterrupted')
+                      : t('portal.shell.creationInterrupted')
                 }
               />
             </div>
@@ -579,39 +598,26 @@ export function PortalProvider({
                 className="text-2xl font-semibold tracking-tight focus:outline-none"
               >
                 {deletionOutcome === 'confirmed'
-                  ? 'Account deletion requested'
-                  : 'Deletion outcome unconfirmed'}
+                  ? t('privacy.confirmedTitle')
+                  : t('privacy.unconfirmedTitle')}
               </h1>
               <Feedback
                 status={
                   deletionOutcome === 'confirmed'
-                    ? 'Your identity account has been deactivated and deletion is scheduled. Your identity sessions have been revoked.'
-                    : 'The request was sent, but its outcome could not be confirmed. Your account may already be deactivated. The request has not been retried.'
+                    ? t('privacy.confirmed')
+                    : t('privacy.unconfirmed')
                 }
               />
               {deletionOutcome === 'confirmed' ? (
-                <p className="text-sm leading-relaxed">
-                  A recovery notification is queued for your primary email and any configured backup
-                  email. Queued mail does not confirm inbox delivery. To cancel deletion, open the
-                  recovery link in that email and complete verification within the original 30-day
-                  recovery window. The email contains the exact deadline.
-                </p>
+                <p className="text-sm leading-relaxed">{t('privacy.confirmedMail')}</p>
               ) : (
-                <p className="text-sm leading-relaxed">
-                  Private data has been cleared from this view. Check your primary and configured
-                  backup mailboxes for a recovery message. If it arrives, use its recovery link
-                  before the deadline in the email. This page cannot confirm an account change or
-                  email delivery; a missing message or a failed sign-in is not proof of the outcome.
-                </p>
+                <p className="text-sm leading-relaxed">{t('privacy.unconfirmedMail')}</p>
               )}
               <p className="text-sm leading-relaxed text-muted-foreground">
-                Recovery requires the emailed link and strong verification, not a current session.
-                Recovery does not restore old sessions. Data subject to lawful preservation,
-                separately retained security records, backups, and downstream services may follow
-                different retention schedules.
+                {t('privacy.recoveryPolicy')}
               </p>
               <Link href="/" className={linkClass}>
-                Return home
+                {t('privacy.home')}
               </Link>
             </section>
           ) : ready && state ? (
@@ -635,8 +641,8 @@ export function PortalProvider({
                 {state.revalidated && (
                   <p role="status" className="text-sm text-muted-foreground">
                     {admin && pathname === '/admin/legal'
-                      ? 'Your session and administrative access were checked again. Legal inputs and results were cleared. An interrupted write may have committed; recover only from the original external intake record with fresh verification.'
-                      : 'Your session was checked again. If a change was interrupted, it may have completed; review the saved state before trying again.'}
+                      ? t('portal.shell.legalRevalidated')
+                      : t('portal.shell.revalidated')}
                   </p>
                 )}
                 {children}
@@ -645,39 +651,40 @@ export function PortalProvider({
           ) : (
             <section className="space-y-5 rounded-xl border bg-card p-6 sm:p-8">
               <h1 className="text-2xl font-semibold tracking-tight">
-                {admin ? 'Admin control panel' : 'Your account'}
+                {admin ? t('portal.shell.adminTitle') : t('portal.shell.accountTitle')}
               </h1>
               <Feedback
                 status={
                   phase === 'checking' || (phase === 'ready' && !ready)
                     ? admin
-                      ? 'Checking your secure browser session and administrative access...'
-                      : 'Checking your secure browser session...'
+                      ? t('portal.shell.checkingAdmin')
+                      : t('portal.shell.checking')
                     : phase === 'signing-out'
-                      ? 'Signing out. Private data has been cleared.'
+                      ? t('portal.shell.signingOut')
                       : ''
                 }
-                error={error}
+                error={
+                  requireReconciliation.current && error
+                    ? `${t('portal.shell.signOutUnconfirmed')} ${message(error)}`
+                    : error
+                }
               />
               {(phase === 'failed' || phase === 'no-access' || phase === 'disabled') && (
                 <div className="flex flex-wrap gap-3">
                   <Button type="button" className={controlClass} onClick={checkSession}>
-                    {admin ? 'Check access again' : 'Check current session'}
+                    {admin ? t('portal.shell.checkAccess') : t('portal.shell.checkSession')}
                   </Button>
                   <Link
                     href={`/login?returnTo=${encodeURIComponent(safeReturnPath(pathname))}`}
                     prefetch={false}
                     className={linkClass}
                   >
-                    Sign in with a passkey
+                    {t('portal.shell.signIn')}
                   </Link>
                 </div>
               )}
               <noscript>
-                <p className="text-sm">
-                  JavaScript is required to verify your browser-bound session. No private account
-                  data is included in this page.
-                </p>
+                <p className="text-sm">{t('portal.shell.noScript')}</p>
               </noscript>
             </section>
           )}

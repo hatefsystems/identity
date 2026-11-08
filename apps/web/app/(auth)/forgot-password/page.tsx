@@ -1,14 +1,19 @@
+import { getTranslations } from 'next-intl/server';
 import { AuthCard, AuthLink } from '../_components/auth-card';
 import { ForgotPasswordScreen } from '../_components/screens';
 
-export const metadata = { title: 'Reset your password | Hatef Identity' };
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('forgot.metadata') };
+}
 
-export default function ForgotPasswordPage() {
+export default async function ForgotPasswordPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Reset your password"
-      description="Enter your primary email address to request a password reset link."
-      footer={<AuthLink href="/login">Return to sign in</AuthLink>}
+      title={t('pages.forgot.title')}
+      description={t('pages.forgot.description')}
+      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
     >
       <ForgotPasswordScreen />
     </AuthCard>

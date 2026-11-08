@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 )
 
 type notificationFake struct {
@@ -231,6 +232,43 @@ func newTestWorker(t *testing.T, h *harness, cfg NotificationConfig) (*Notificat
 	return w, store
 }
 
+func TestNotificationWorkerDeliversLegacyV1AsEnglish(t *testing.T) {
+	h := newHarness(t, Config{})
+	requestDeletionAndToken(t, h, "legacy-queue@example.test")
+	id := h.store.notificationIDs[0]
+	row := h.store.notifications[id]
+	plaintext, err := h.cipher.Decrypt(t.Context(), row.PayloadEncrypted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(plaintext)
+	var payload notificationPayload
+	if err := json.Unmarshal(plaintext, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload.Version, payload.Locale, payload.TemplateVersion = 1, "", 0
+	legacy, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(legacy)
+	row.PayloadEncrypted, err = h.cipher.Encrypt(t.Context(), legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.store.notifications[id] = row
+	w, _ := newTestWorker(t, h, NotificationConfig{Concurrency: 1})
+	var delivered DeletionNotice
+	w.notifier = notifierFunc(func(_ context.Context, notice DeletionNotice) error {
+		delivered = notice
+		return nil
+	})
+	stats, err := w.RunOnce(t.Context())
+	if err != nil || stats.Accepted != 1 || delivered.Locale != notification.English || delivered.TemplateVersion != notification.Version1 || delivered.DeliveryID != payload.DeliveryID || delivered.ReclaimToken != payload.Token || !delivered.ExpiresAt.Equal(payload.ExpiresAt) {
+		t.Fatal("v1 queue could not deliver unchanged recovery authority with English presentation")
+	}
+}
+
 func TestNotificationWorkerLimits(t *testing.T) {
 	h := newHarness(t, Config{})
 	store := &notificationFake{fakeStore: h.store}
@@ -252,7 +290,7 @@ func TestNotificationRecipientsRetryIndependently(t *testing.T) {
 	u := h.store.addActiveUser("primary@example.test")
 	u.BackupEmailEncrypted, _ = h.cipher.Encrypt(t.Context(), []byte("backup@example.test"))
 	h.store.users[u.ID] = u
-	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err != nil {
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, "", "fa-IR"); err != nil {
 		t.Fatal(err)
 	}
 	w, store := newTestWorker(t, h, NotificationConfig{Concurrency: 1})
@@ -273,6 +311,9 @@ func TestNotificationRecipientsRetryIndependently(t *testing.T) {
 		t.Fatalf("independent delivery failed: %+v, %v", stats, err)
 	}
 	firstBackup := attempts[1]
+	if firstBackup.Locale != "fa-IR" || attempts[0].Locale != "fa-IR" || firstBackup.TemplateVersion != 1 {
+		t.Fatal("initiating locale/template not frozen for both recipients")
+	}
 	failBackup = false
 	h.clock.advance(time.Hour)
 	stats, err = w.RunOnce(t.Context())

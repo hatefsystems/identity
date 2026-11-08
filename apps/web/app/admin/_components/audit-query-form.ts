@@ -1,3 +1,4 @@
+import type { MessageDescriptor } from '../../../i18n/messages';
 import type { AdminAuditQuery, AdminLimits } from '../../_lib/admin/contracts';
 import { adminTimestamp, validateAuditQuery } from '../../_lib/admin/validation';
 import { queryPageSize } from './query-view-state';
@@ -21,7 +22,7 @@ export function auditQueryFromDraft(
   limits: AdminLimits
 ):
   | { query: AdminAuditQuery; error?: never }
-  | { query?: never; error: { field: AuditQueryField; message: string } } {
+  | { query?: never; error: { field: AuditQueryField; message: MessageDescriptor } } {
   const times: string[] = [];
   for (const field of ['start', 'end'] as const) {
     try {
@@ -35,18 +36,20 @@ export function auditQueryFromDraft(
         new Date(adminTimestamp(`${value}${value.length === 16 ? ':00' : ''}Z`)).toISOString()
       );
     } catch {
-      return { error: { field, message: `Enter a valid ${field} time in UTC.` } };
+      return { error: { field, message: { key: `audit.validation.${field}` } } };
     }
   }
   const [start_time, end_time] = times;
   const duration = Date.parse(end_time) - Date.parse(start_time);
-  if (duration < 0)
-    return { error: { field: 'end', message: 'End time must be at or after start time.' } };
+  if (duration < 0) return { error: { field: 'end', message: { key: 'audit.validation.order' } } };
   if (duration > limits.audit_max_window_seconds * 1000)
     return {
       error: {
         field: 'start',
-        message: `Use a UTC window no longer than ${limits.audit_max_window_seconds} seconds.`,
+        message: {
+          key: 'audit.validation.window',
+          values: { seconds: limits.audit_max_window_seconds },
+        },
       },
     };
   const event_type = draft.event.trim();
@@ -54,8 +57,7 @@ export function auditQueryFromDraft(
     return {
       error: {
         field: 'event',
-        message:
-          'Use 1-100 lowercase letters, digits, periods, or underscores for an exact event type.',
+        message: { key: 'audit.validation.event' },
       },
     };
   const limit = queryPageSize(draft.size, limits.page_size_max);
@@ -63,7 +65,7 @@ export function auditQueryFromDraft(
     return {
       error: {
         field: 'size',
-        message: `Enter a whole page size from 1 to ${limits.page_size_max}.`,
+        message: { key: 'audit.validation.size', values: { maximum: limits.page_size_max } },
       },
     };
   return {

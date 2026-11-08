@@ -10,6 +10,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 )
 
@@ -97,7 +98,7 @@ func (s *Server) handlePrivacyRequestDeletion() http.HandlerFunc {
 			return
 		}
 
-		if _, err := s.deps.Privacy.RequestDeletion(r.Context(), userID, sess.AuthVersion, clientip.FromRequest(r)); err != nil {
+		if _, err := s.deps.Privacy.RequestDeletion(r.Context(), userID, sess.AuthVersion, clientip.FromRequest(r), notification.RequestLocale(r.Header.Values(notification.LocaleHeader))); err != nil {
 			switch {
 			case errors.Is(err, privacy.ErrRateLimited):
 				writeJSON(w, http.StatusTooManyRequests, privacyErrorResponse{Error: "rate_limited"})

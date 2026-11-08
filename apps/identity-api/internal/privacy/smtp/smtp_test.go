@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"net/textproto"
@@ -29,10 +30,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smtptransport"
 )
@@ -328,6 +331,7 @@ func testNotice() privacy.DeletionNotice {
 		DeliveryID: uuid.New(), PrimaryEmail: "private-recipient@example.test",
 		ReclaimToken: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x7b}, 32)),
 		ExpiresAt:    time.Now().Add(720 * time.Hour).Truncate(time.Second),
+		Locale:       "en", TemplateVersion: 1,
 	}
 }
 
@@ -419,6 +423,94 @@ func TestSMTPVerifiedTLSAcceptanceAndStableMessages(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSMTPLocalizedMIMEPreservesRecoveryContract(t *testing.T) {
+	for _, locale := range []notification.Locale{notification.English, notification.Persian} {
+		t.Run(string(locale), func(t *testing.T) {
+			relay := newTestRelay(t, relayOptions{})
+			notifier, err := New(relay.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notice := testNotice()
+			notice.Locale = locale
+			notice.ExpiresAt = notice.ExpiresAt.Add(123456789 * time.Nanosecond).In(time.FixedZone("original", 3*60*60+30*60))
+			catalog, _ := notification.Catalog(locale, notification.Version1)
+			if err := notifier.NotifyDeletionRequested(t.Context(), notice); err != nil {
+				t.Fatal(err)
+			}
+			capture := relay.capture(t)
+			if !capture.authenticated || !capture.secured || len(capture.recipients) != 1 || len(capture.message) > maxMessageBytes {
+				t.Fatal("localized delivery changed secure per-recipient transport or encoded-size bound")
+			}
+			message, err := mail.ReadMessage(bytes.NewReader(capture.message))
+			if err != nil {
+				t.Fatal("invalid localized MIME message")
+			}
+			subject, err := new(mime.WordDecoder).DecodeHeader(message.Header.Get("Subject"))
+			if err != nil || subject != catalog.Deletion.Subject || locale == notification.Persian && !strings.Contains(message.Header.Get("Subject"), "=?UTF-8?q?") {
+				t.Fatal("localized subject was not correctly MIME encoded")
+			}
+			_, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+			if err != nil {
+				t.Fatal("invalid MIME boundary")
+			}
+			parts := multipart.NewReader(message.Body, params["boundary"])
+			for _, expectedMedia := range []string{"text/plain", "text/html"} {
+				part, err := parts.NextRawPart()
+				if err != nil || part.Header.Get("Content-Transfer-Encoding") != "quoted-printable" {
+					t.Fatal("localized MIME alternative lost quoted-printable encoding")
+				}
+				media, parameters, err := mime.ParseMediaType(part.Header.Get("Content-Type"))
+				if err != nil || media != expectedMedia || parameters["charset"] != "UTF-8" {
+					t.Fatal("localized MIME alternative lost UTF-8 content type")
+				}
+				body, err := io.ReadAll(quotedprintable.NewReader(part))
+				if err != nil || !utf8.Valid(body) {
+					t.Fatal("localized MIME body did not decode to UTF-8")
+				}
+				text := string(body)
+				link := relay.config.PublicOrigin + "/recover-account#token=" + notice.ReclaimToken
+				deadline := notice.ExpiresAt.UTC().Format(time.RFC3339Nano) + " (UTC)"
+				if strings.Count(text, link) != 1 || strings.Count(text, notice.ReclaimToken) != 1 || strings.Count(text, deadline) != 1 || strings.Contains(text, "?token=") || strings.Contains(text, "?locale=") {
+					t.Fatal("localization changed exact link/deadline or duplicated recovery authority")
+				}
+				for _, explanation := range []string{catalog.Deletion.Deactivated, catalog.Deletion.Recovery, catalog.Deletion.Retention} {
+					if !strings.Contains(text, explanation) {
+						t.Fatal("localized security or retention explanation missing")
+					}
+				}
+				if expectedMedia == "text/html" && (!strings.Contains(text, `<html lang="`+string(locale)+`" dir="`+catalog.Direction+`">`) || !strings.Contains(text, `<bdi dir="ltr">`+deadline+`</bdi>`) || strings.Count(text, "<a ") != 1 || strings.Contains(text, "<img") || strings.Contains(text, "<script")) {
+					t.Fatal("localized HTML lost language/direction/isolation or added active content")
+				}
+			}
+			if _, err := parts.NextRawPart(); !errors.Is(err, io.EOF) {
+				t.Fatal("unexpected extra MIME part")
+			}
+		})
+	}
+}
+
+func TestSMTPLocalizedFinalEncodedSizeLimit(t *testing.T) {
+	relay := newTestRelay(t, relayOptions{})
+	notifier, err := New(relay.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Defense in depth: even a later internal/configuration regression cannot
+	// send an oversized, quoted-printable-expanded message to the SMTP relay.
+	notifier.cfg.PublicOrigin = "https://" + strings.Repeat("x", maxMessageBytes)
+	for _, locale := range []notification.Locale{notification.English, notification.Persian} {
+		notice := testNotice()
+		notice.Locale = locale
+		err := notifier.NotifyDeletionRequested(t.Context(), notice)
+		var failure interface{ Permanent() bool }
+		if err == nil || !errors.As(err, &failure) || !failure.Permanent() || relay.count.Load() != 0 {
+			t.Fatal("oversized encoded message reached SMTP or was retried")
+		}
+		assertRedacted(t, err, notice)
 	}
 }
 
@@ -576,6 +668,11 @@ func TestSMTPRecipientIsolationAndNoticeValidation(t *testing.T) {
 		name   string
 		mutate func(*privacy.DeletionNotice)
 	}{
+		{"missing locale", func(n *privacy.DeletionNotice) { n.Locale = "" }},
+		{"unknown locale", func(n *privacy.DeletionNotice) { n.Locale = "ar" }},
+		{"locale header injection", func(n *privacy.DeletionNotice) { n.Locale = "fa-IR\r\nBcc: private-backup@example.test" }},
+		{"missing template version", func(n *privacy.DeletionNotice) { n.TemplateVersion = 0 }},
+		{"unknown template version", func(n *privacy.DeletionNotice) { n.TemplateVersion = 2 }},
 		{"missing delivery identity", func(n *privacy.DeletionNotice) { n.DeliveryID = uuid.Nil }},
 		{"backup recipient", func(n *privacy.DeletionNotice) { b := "private-backup@example.test"; n.BackupEmail = &b }},
 		{"empty backup still rejected", func(n *privacy.DeletionNotice) { b := ""; n.BackupEmail = &b }},

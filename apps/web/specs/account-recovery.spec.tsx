@@ -1,8 +1,17 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { StrictMode } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (...args: unknown[]) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(...args),
+}));
+
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
+import { StrictMode, useEffect } from 'react';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+import type { ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+const renderToStaticMarkup = (element: ReactElement) =>
+  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import AuthLayout from '../app/(auth)/layout';
-import RecoverAccountPage, { metadata } from '../app/(auth)/recover-account/page';
+import RecoverAccountPage, { generateMetadata } from '../app/(auth)/recover-account/page';
 import {
   ReclaimClient,
   type ReclaimOptions,
@@ -26,7 +35,8 @@ const api = {
   complete: jest.fn<Promise<void>, [ReclaimProof, AbortSignal, (() => void)?]>(),
 };
 let originalVisibility: PropertyDescriptor | undefined;
-beforeEach(() => {
+let pageElement: ReactElement;
+beforeEach(async () => {
   jest.resetAllMocks();
   window.history.replaceState(null, '', `/recover-account#token=${token}`);
   originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
@@ -37,6 +47,7 @@ beforeEach(() => {
     sent?.();
   });
   jest.mocked(usePasskey).mockResolvedValue(assertion);
+  pageElement = await AuthLayout({ children: await RecoverAccountPage() });
 });
 afterEach(() => {
   if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility);
@@ -54,11 +65,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 function page() {
-  return (
-    <AuthLayout>
-      <RecoverAccountPage />
-    </AuthLayout>
-  );
+  return pageElement;
 }
 function start() {
   fireEvent.click(screen.getByRole('button', { name: 'Start account recovery' }));
@@ -84,13 +91,17 @@ function show() {
 }
 
 describe('recovery link capture', () => {
-  it('server-renders a noindex, nonsensitive, non-submitting auth shell without accessing the fragment', () => {
+  it('server-renders a noindex, nonsensitive, non-submitting auth shell without accessing the fragment', async () => {
     const html = renderToStaticMarkup(page());
     const document = new DOMParser().parseFromString(html, 'text/html');
-    expect(metadata.robots).toEqual({ index: false, follow: false });
+    expect((await generateMetadata()).robots).toEqual({ index: false, follow: false });
     expect(document.querySelector('h1')?.textContent).toBe('Recover your account');
-    expect(document.querySelector<HTMLButtonElement>('button')?.disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button')?.type).toBe('button');
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="account-recovery"] button')?.disabled
+    ).toBe(true);
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="account-recovery"] button')?.type
+    ).toBe('button');
     expect(document.forms).toHaveLength(0);
     expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
     expect(html).toContain('No recovery request is submitted without it');
@@ -99,7 +110,7 @@ describe('recovery link capture', () => {
     expect(ReclaimClient).not.toHaveBeenCalled();
   });
 
-  it('captures and scrubs exactly once through StrictMode without auto-redemption or any persistent secret writes', async () => {
+  it('captures once and synchronizes the clean router URL through StrictMode without auto-redemption or persistent secret writes', async () => {
     const history = jest.spyOn(window.history, 'replaceState');
     const storage = jest.spyOn(Storage.prototype, 'setItem');
     const cookie = jest.spyOn(document, 'cookie', 'set');
@@ -109,7 +120,7 @@ describe('recovery link capture', () => {
     await act(async () => undefined);
     expect(window.location.hash).toBe('');
     expect(window.location.search).toBe('');
-    expect(history).toHaveBeenCalledTimes(1);
+    expect(history).toHaveBeenCalledTimes(2);
     expect(history).toHaveBeenCalledWith(null, '', '/recover-account');
     expect(JSON.stringify(window.history.state)).not.toContain(token);
     expect(view.container.innerHTML).not.toContain(token);
@@ -125,6 +136,30 @@ describe('recovery link capture', () => {
     expect(api.options).toHaveBeenCalledTimes(1);
     expect(api.options).toHaveBeenCalledWith(token, expect.any(AbortSignal));
     expect(api.complete).not.toHaveBeenCalled();
+  });
+
+  it('synchronizes a parent router installed after child effects so later rerenders cannot restore the bearer fragment', async () => {
+    let canonical = window.location.href;
+    const original = window.history.replaceState;
+    function LateRouter() {
+      useEffect(() => {
+        window.history.replaceState = (data, title, url) => {
+          original.call(window.history, data, title, url);
+          canonical = window.location.href;
+        };
+        return () => { window.history.replaceState = original; };
+      }, []);
+      return page();
+    }
+    render(<LateRouter />);
+    await act(async () => undefined);
+    expect(new URL(canonical).hash).toBe('');
+    original.call(window.history, null, '', canonical);
+    expect(window.location.hash).toBe('');
+    expect(JSON.stringify(window.history.state)).not.toContain(token);
+    expect(api.options).not.toHaveBeenCalled();
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Start account recovery' }).disabled).toBe(false);
   });
 
   it.each([
@@ -200,6 +235,20 @@ describe('explicit factor verification', () => {
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(document.activeElement).toBe(input);
     expect(api.complete).not.toHaveBeenCalled();
+    for (const value of [
+      '۰۱۲۳۴۵',
+      '٠١٢٣٤٥',
+      '０１２３４５',
+      '01۲345',
+      '\u202e012345',
+      '012345\u2069',
+    ]) {
+      fireEvent.change(input, { target: { value } });
+      fireEvent.submit(form);
+      expect(input.value).toBe(value);
+      expect(input.getAttribute('aria-invalid')).toBe('true');
+      expect(api.complete).not.toHaveBeenCalled();
+    }
     fireEvent.change(input, { target: { value: '012345' } });
     expect(api.complete).not.toHaveBeenCalled();
     act(() => {
@@ -496,4 +545,43 @@ describe('uncertain completion', () => {
       expect(api.complete).toHaveBeenCalledTimes(1);
     }
   );
+});
+
+describe('recovery presentation changes', () => {
+  it('retains an active token, pending read and ASCII code without resetting its original memory deadline', async () => {
+    jest.useFakeTimers();
+    const options = deferred<ReclaimOptions>();
+    api.options.mockReturnValueOnce(options.promise);
+    const AccountRecovery = (await import('../app/(auth)/_components/account-recovery'))
+      .AccountRecovery;
+    const view = (locale: 'en' | 'fa-IR') => (
+      <I18nTestProvider locale={locale}>
+        <AccountRecovery />
+      </I18nTestProvider>
+    );
+    const result = render(view('en'));
+    start();
+    const signal = api.options.mock.calls[0][1];
+    result.rerender(view('fa-IR'));
+    expect(signal.aborted).toBe(false);
+    expect(ReclaimClient).toHaveBeenCalledTimes(1);
+    expect(api.options).toHaveBeenCalledTimes(1);
+    expect(api.complete).not.toHaveBeenCalled();
+    await act(async () => options.resolve({ factor: 'totp' }));
+    const input = screen.getByLabelText<HTMLInputElement>('کد رمزساز');
+    fireEvent.change(input, { target: { value: '012345' } });
+    result.rerender(view('en'));
+    expect(screen.getByLabelText('Authenticator code')).toBe(input);
+    expect(input.value).toBe('012345');
+    act(() => jest.advanceTimersByTime(299000));
+    result.rerender(view('fa-IR'));
+    act(() => jest.advanceTimersByTime(1001));
+    expect(screen.queryByLabelText('کد رمزساز')).toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'آغاز بازیابی حساب' }).disabled
+    ).toBe(true);
+    expect(api.complete).not.toHaveBeenCalled();
+    expect(JSON.stringify(window.history.state)).not.toContain(token);
+    expect(window.location.hash).toBe('');
+  });
 });

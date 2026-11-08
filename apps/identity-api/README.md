@@ -322,7 +322,7 @@ Do not run schema-resetting suites concurrently. The same non-root image package
 ## Configuration
 
 All configuration comes from environment variables. Secrets must be injected at
-runtime (via Infisical/KMS or the container environment) and never committed.
+runtime through environment injection and never committed. The application does not fetch or rotate Infisical keys.
 
 | Variable                              | Default       | Description                                                              |
 | :------------------------------------ | :------------ | :----------------------------------------------------------------------- |
@@ -479,3 +479,12 @@ Never enable deletion with an old signer or downgrade a verifier after proof
 state exists. Database-relative chains, erasure annotations and receipts are not external trust anchors;
 that follow-up, Task 5.3 production sign-off and Task 5.5 narrative-retention
 approval remain open.
+
+## Browser localization
+
+English and Iranian Persian share the existing routes, including passkey-only
+registration. Explicit browser preferences control language, calendar and time
+zone without changing authentication or operation deadlines. Deletion notification
+queue v2 freezes its locale; deploy compatible v1/v2 readers before v2 writers.
+The configured SMS.ir VERIFY template remains operator-owned. See the
+[localization contract](../../docs/localization.md) for maintenance and rollout gates.

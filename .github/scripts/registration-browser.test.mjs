@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { connect as tcpConnect, createServer } from 'node:net';
 import { request } from 'node:https';
 import { resolve } from 'node:path';
-import { connect } from 'node:tls';
+import { connect, getCACertificates } from 'node:tls';
 import { PassThrough, Readable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +22,14 @@ import {
   gatewayForwardTarget,
   gatewayProvisioningTarget,
   registrationGatewayTargets,
+  registrationForwardHeaders,
+  captureRegistrationResponse,
+  registrationControllerUser,
+  assertRegistrationAPINetwork,
+  registrationStartupSummary,
+  registrationBrowserDiagnostic,
+  registrationPasskeyEnvironment,
+  registrationSecretEnvironmentValues,
   registrationChecks,
   registrationFailureDetails,
   registrationFailureMessage,
@@ -29,12 +37,145 @@ import {
   runtimeInputs,
   startRegistrationController,
   startRegistrationGateway,
+  trustRegistrationFixtureCA,
   validateGatewayTargets,
   validateSMSIRRequest,
 } from './registration-browser.mjs';
 import { portalCleanup } from './portal-harness.mjs';
 
 const token = randomBytes(32).toString('base64url');
+
+test('registration log guard excludes public resident-key policy but retains every secret environment field', () => {
+  const environment = {
+    WEBAUTHN_RESIDENT_KEY: 'required',
+    WEBAUTHN_RP_ID: 'localhost',
+    WEBAUTHN_MOCK_CHALLENGE_KEY: 'private-decoy-key',
+    ENVELOPE_MASTER_KEK: 'private-kek',
+    ENVELOPE_BLIND_INDEX_PEPPER: 'private-index-pepper',
+    OIDC_SIGNING_KEY_ACTIVE_PEM: 'private-signing-key',
+    REGISTRATION_SMTP_USERNAME: 'private-smtp-user',
+    REGISTRATION_SMTP_PASSWORD: 'private-smtp-password',
+    DATABASE_URL: 'private-database-url',
+    REGISTRATION_CLEANUP_DATABASE_URL: 'private-cleanup-url',
+    SMS_GATEWAY_API_KEY: 'private-provider-key',
+  };
+  assert.deepEqual(registrationSecretEnvironmentValues(environment), Object.values(environment).slice(2));
+});
+
+test('registration evidence retains the original streamed ingress bytes without replay', async () => {
+  const upstream = new PassThrough();
+  upstream.statusCode = 201;
+  const body = Buffer.from(JSON.stringify({ canonical_email: 'آزمايش@example.test' }));
+  const original = [];
+  upstream.on('data', (chunk) => original.push(chunk));
+  const captured = captureRegistrationResponse(upstream);
+  // Split inside a multibyte UTF-8 character, as a real socket may do.
+  const split = body.indexOf(Buffer.from('آ')) + 1;
+  upstream.write(body.subarray(0, split));
+  upstream.end(body.subarray(split));
+  assert.deepEqual(await captured, { status: 201, value: { canonical_email: 'آزمايش@example.test' } });
+  assert.deepEqual(Buffer.concat(original), body);
+});
+
+test('registration evidence retains nonce denials and empty 204 responses', async () => {
+  for (const [status, body, value] of [
+    [401, '{"error":"use_dpop_nonce"}', { error: 'use_dpop_nonce' }],
+    [409, '{"error":"proof_required"}', { error: 'proof_required' }],
+    [204, '', undefined],
+  ]) {
+    const upstream = new PassThrough();
+    upstream.statusCode = status;
+    const captured = captureRegistrationResponse(upstream);
+    upstream.end(body);
+    assert.deepEqual(await captured, { status, value });
+  }
+});
+
+test('registration evidence rejects oversized, malformed and incomplete ingress responses privately', async () => {
+  for (const [status, body] of [
+    [200, Buffer.alloc(256 * 1024 + 1, 120)],
+    [200, Buffer.from('{"private-token":')],
+    [200, Buffer.from([0xff])],
+    [204, Buffer.from('private-token')],
+  ]) {
+    const upstream = new PassThrough();
+    upstream.statusCode = status;
+    const captured = captureRegistrationResponse(upstream);
+    upstream.end(body);
+    await assert.rejects(captured, (error) => !error.message.includes('private-token'));
+  }
+  const upstream = new PassThrough();
+  upstream.statusCode = 201;
+  const captured = captureRegistrationResponse(upstream);
+  upstream.write('{"private-token":');
+  upstream.emit('aborted');
+  upstream.destroy();
+  await assert.rejects(captured, /incomplete/);
+});
+
+test('registration ingress forwards browser security context but not connection framing', () => {
+  const incoming = {
+    host: 'untrusted.example',
+    connection: 'keep-alive, x-portal-session, x-hop-secret',
+    'x-portal-session': 'forbidden-hop-value',
+    'x-hop-secret': 'forbidden-hop-value',
+    'proxy-connection': 'keep-alive',
+    'transfer-encoding': 'chunked',
+    te: 'trailers',
+    trailer: 'x-hint',
+    upgrade: 'websocket',
+    dpop: 'public-test-proof',
+    cookie: '__Host-session=opaque-browser-token',
+    'content-type': 'application/json',
+    'x-forwarded-proto': 'http',
+    'x-forwarded-for': '8.8.8.8',
+  };
+  const forwarded = registrationForwardHeaders(incoming, 'https://localhost:43123');
+  assert.equal(forwarded.host, 'localhost:43123');
+  assert.equal(forwarded['x-forwarded-proto'], 'https');
+  assert.equal(forwarded['x-forwarded-for'], '127.0.0.1');
+  assert.equal(forwarded['x-forwarded-host'], 'localhost:43123');
+  assert.equal(forwarded.cookie, incoming.cookie);
+  assert.equal(forwarded.dpop, incoming.dpop);
+  assert.equal(forwarded['content-type'], 'application/json');
+  for (const name of [
+    'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
+    'te', 'trailer', 'upgrade', 'x-portal-session', 'x-hop-secret',
+  ]) assert(!Object.hasOwn(forwarded, name), 'Forwarded hop-by-hop header: ' + name);
+  assert.equal(incoming['x-portal-session'], 'forbidden-hop-value');
+});
+
+
+
+test('browser diagnostics expose only fixed routes, HTTP statuses and numeric source lines', () => {
+  const privateValue = 'private-email-token-cookie';
+  const error = Object.assign(new Error(privateValue), { name: 'TimeoutError',
+    stack: `TimeoutError: ${privateValue}\n at startAttempt (/private/path/registration-browser.mjs:123:7)` });
+  const result = registrationBrowserDiagnostic(error, {
+    replies: [
+      { path: '/api/v1/auth/register/start', status: 503, value: { token: privateValue } },
+      { path: `/api/v1/auth/register/start?${privateValue}`, status: 401 },
+      { path: '/api/v1/auth/register', status: privateValue },
+      { path: '/api/v1/auth/register', status: 999 },
+      null,
+    ], failures: new Set(['browser-response-privacy', privateValue]),
+  });
+  assert.deepEqual(result, { kind: 'timeout', line: 123,
+    replies: [{ path: '/api/v1/auth/register/start', status: 503 }],
+    failures: ['browser-response-privacy'] });
+  assert(!JSON.stringify(result).includes(privateValue));
+  for (const [message, kind] of [
+    [`strict mode violation: ${privateValue}`, 'ambiguous-locator'],
+    [`locator.waitFor: Timeout 15000ms exceeded. ${privateValue}`, 'timeout'],
+    [`Protocol error (Network.getResponseBody): No resource with given identifier found ${privateValue}`, 'response-body-unavailable'],
+  ]) {
+    const safe = registrationBrowserDiagnostic({ message, stack: privateValue });
+    assert.equal(safe.kind, kind);
+    assert(!JSON.stringify(safe).includes(privateValue));
+  }
+  assert.deepEqual(registrationBrowserDiagnostic({ stack: privateValue }),
+    { kind: 'other', line: null, replies: [], failures: [] });
+});
 const expected = {
   apiKey: 'controller-key-not-a-provider-credential',
   templateId: 1793984,
@@ -126,6 +267,14 @@ test('gateway forwards only fixed API routes and never accepts selected hosts or
     gatewayForwardTarget(privateTargets, 'GET', '/readyz').hostname,
     privateTargets.apiHost
   );
+  assert.equal(
+    gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me').hostname,
+    privateTargets.apiHost
+  );
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'PATCH', '/api/v1/users/me'));
+  assert.equal(gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions').hostname, privateTargets.apiHost);
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'DELETE', '/api/v1/users/me/sessions'));
+  assert.throws(() => gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions/foreign'));
   for (const path of [
     'http://external.invalid/',
     '//external.invalid/',
@@ -768,6 +917,40 @@ test('ephemeral Node TLS certificates bind only declared fixture names and verif
   assert.throws(() => createFixtureTLS('foreign-resource'), /ownership/);
 });
 
+test('registration browser trusts only its run-owned CA and restores TLS defaults', () => {
+  const ca = createFixtureTLS(randomBytes(16).toString('hex')).ca;
+  const originalCAs = getCACertificates('default');
+  const originalEnv = process.env.NODE_EXTRA_CA_CERTS;
+  const path = '/tmp/registration-test-owned-ca.pem';
+  const restore = trustRegistrationFixtureCA(ca, path);
+  try {
+    const fingerprint = new X509Certificate(ca).fingerprint256;
+    assert(
+      getCACertificates('default').some(
+        (candidate) => new X509Certificate(candidate).fingerprint256 === fingerprint
+      )
+    );
+    assert.equal(process.env.NODE_EXTRA_CA_CERTS, path);
+    assert.notEqual(process.env.NODE_TLS_REJECT_UNAUTHORIZED, '0');
+  } finally {
+    restore();
+  }
+  // Node normalizes its default CA lists after setDefaultCACertificates().
+  // Compare trust semantics, rather than order/PEM encoding of system roots.
+  const originalFingerprints = new Set(
+    originalCAs.map((pem) => new X509Certificate(pem).fingerprint256)
+  );
+  const restoredFingerprints = new Set(
+    getCACertificates('default').map((pem) => new X509Certificate(pem).fingerprint256)
+  );
+  assert(!restoredFingerprints.has(new X509Certificate(ca).fingerprint256));
+  for (const fingerprint of originalFingerprints)
+    assert(restoredFingerprints.has(fingerprint), 'Existing default CA was lost on restore');
+  assert.equal(process.env.NODE_EXTRA_CA_CERTS, originalEnv);
+  assert.throws(() => trustRegistrationFixtureCA('not-a-certificate', path));
+  assert.throws(() => trustRegistrationFixtureCA(ca, 'relative-ca.pem'));
+});
+
 function providerRequest(port, tls, body, override = {}) {
   return new Promise((yes, no) => {
     const req = request(
@@ -1049,3 +1232,50 @@ for (const { failure, reply } of [
     else await operation;
     assert.equal(requestObserved, true);
   });
+
+
+test('private controller follows the host credential owner without DAC override or permissive TLS files', () => {
+  assert.equal(registrationControllerUser(1001, 1001), '1001:1001');
+  assert.equal(registrationControllerUser(0, 0), '0:0');
+  assert.equal(registrationControllerUser(), `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`);
+  for (const invalid of [-1, NaN, Infinity, 1.5, '1001', 4294967295]) {
+    assert.throws(() => registrationControllerUser(invalid, 1001));
+    assert.throws(() => registrationControllerUser(1001, invalid));
+  }
+});
+
+
+test('API admission binds immutable network identity independent of inspect map keys', () => {
+  const image = 'sha256:' + 'a'.repeat(64), network = 'b'.repeat(64), address = '10.128.20.16';
+  for (const key of ['owned-network-name', network]) {
+    const state = { State: { Running: true }, Image: image, NetworkSettings: { Networks: { [key]: { NetworkID: network, IPAddress: address } } } };
+    assert.doesNotThrow(() => assertRegistrationAPINetwork(state, image, network, address));
+    assert.throws(() => assertRegistrationAPINetwork(state, image, 'c'.repeat(64), address));
+    assert.throws(() => assertRegistrationAPINetwork(state, image, network, '10.128.20.17'));
+    state.NetworkSettings.Networks.extra = { NetworkID: 'd'.repeat(64), IPAddress: '10.129.20.16' };
+    assert.throws(() => assertRegistrationAPINetwork(state, image, network, address));
+  }
+  assert.throws(() => assertRegistrationAPINetwork({ State: { Running: false } }, image, network, address),
+    (error) => registrationFailureDetails(error).failure_check === 'api-running');
+});
+
+test('startup summaries expose only fixed settings and categories, never raw credentials or exceptions', () => {
+  const summary = registrationStartupSummary('config: OIDC_CLIENTS_JSON invalid PRIVATE_TOKEN https://private.invalid?secret=private SQLSTATE 42501');
+  assert.deepEqual(summary, { settings: ['OIDC_CLIENTS_JSON'], categories: ['configuration', 'database', 'permission'] });
+  assert(!JSON.stringify(summary).includes('PRIVATE_TOKEN'));
+  assert(!JSON.stringify(summary).includes('private'));
+});
+
+
+test('registration supplies independent production WebAuthn decoy keys without weakening resident UV policy', () => {
+  const a = registrationPasskeyEnvironment('https://localhost:8443');
+  const b = registrationPasskeyEnvironment('https://localhost:8443');
+  assert.equal(a.WEBAUTHN_RP_ID, 'localhost');
+  assert.equal(a.WEBAUTHN_RP_ORIGINS, 'https://localhost:8443');
+  assert.equal(a.WEBAUTHN_RESIDENT_KEY, 'required');
+  assert.equal(a.WEBAUTHN_USER_VERIFICATION, 'required');
+  assert.equal(Buffer.from(a.WEBAUTHN_MOCK_CHALLENGE_KEY, 'base64').length, 32);
+  assert.notEqual(a.WEBAUTHN_MOCK_CHALLENGE_KEY, b.WEBAUTHN_MOCK_CHALLENGE_KEY);
+  for (const origin of ['http://localhost:8443', 'https://foreign.invalid:8443', 'https://localhost:8443/'])
+    assert.throws(() => registrationPasskeyEnvironment(origin));
+});

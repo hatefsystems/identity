@@ -1,5 +1,9 @@
 'use client';
 
+import type { Message, MessageDescriptor } from '../../../i18n/messages';
+
+import { useTranslations } from 'next-intl';
+
 import { Button } from '@hatef/ui';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RecoveryStatus, StepUpGrant } from '../../_lib/portal/contracts';
@@ -15,23 +19,23 @@ type VisibleBatch = {
   deadline: number;
   monotonicDeadline: number;
 };
-const uncertainGeneration =
-  'The generation response was lost. Previous recovery codes may already be invalid. No codes were recovered or automatically regenerated. Start a new generation explicitly with fresh verification when you are ready.';
+const uncertainGeneration: MessageDescriptor = { key: 'security.recovery.uncertain' };
 
-function generationError(failure: unknown): string {
+function generationError(failure: unknown): MessageDescriptor {
   if (failure instanceof PortalError && failure.uncertain) return uncertainGeneration;
   if (failure instanceof PortalError && failure.code === 'viewer_expired')
-    return 'New codes were generated, but this one-time view expired before they could be displayed. Previous codes are invalid. Start a new generation with fresh verification when you are ready.';
+    return { key: 'security.recovery.expiredBeforeDisplay' };
   return errorMessage(failure);
 }
 
 export function RecoveryPanel() {
+  const t = useTranslations();
   const { client, resumedAction } = usePortal();
   const [remaining, setRemaining] = useState<RecoveryStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState('');
-  const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
+  const [loadError, setLoadError] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
+  const [status, setStatus] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   const [confirm, setConfirm] = useState(resumedAction?.kind === 'recovery');
   const [resumeTotp, setResumeTotp] = useState(resumedAction?.kind === 'recovery');
@@ -55,7 +59,7 @@ export function RecoveryPanel() {
   }, []);
 
   const clearBatch = useCallback(
-    (message = '') => {
+    (message: Message = '') => {
       // Hide synchronously before a pagehide/bfcache snapshot; React then removes
       // the nodes. This is an HTML attribute, not an inline style or CSP exception.
       if (viewer.current) viewer.current.hidden = true;
@@ -95,7 +99,7 @@ export function RecoveryPanel() {
   useEffect(() => {
     alive.current = true;
     function clearView() {
-      clearBatch('The one-time view has closed. Saved codes remain valid until used or replaced.');
+      clearBatch({ key: 'security.recovery.closed' });
       activeAction.current = false;
       setConfirm(false);
     }
@@ -129,10 +133,7 @@ export function RecoveryPanel() {
     if (!confirm) heading.current?.focus();
     const wait = Math.min(batch.deadline - Date.now(), batch.monotonicDeadline - performance.now());
     const timer = setTimeout(
-      () =>
-        clearBatch(
-          'The one-time view has expired. Saved codes remain valid until used or replaced.'
-        ),
+      () => clearBatch({ key: 'security.recovery.expired' }),
       Math.max(0, wait)
     );
     return () => clearTimeout(timer);
@@ -176,9 +177,7 @@ export function RecoveryPanel() {
       current.current = visible;
       setBatch(visible);
       setError('');
-      setStatus(
-        'New recovery codes generated. Save them privately now; they cannot be retrieved later.'
-      );
+      setStatus({ key: 'security.recovery.generated' });
       setRemaining(null);
       setAttempt((value) => value + 1);
     } catch (failure) {
@@ -208,7 +207,7 @@ export function RecoveryPanel() {
       performance.now() >= value.monotonicDeadline ||
       document.visibilityState === 'hidden'
     ) {
-      clearBatch('The one-time view has expired. Saved codes remain valid until used or replaced.');
+      clearBatch({ key: 'security.recovery.expired' });
       return null;
     }
     return value;
@@ -220,17 +219,15 @@ export function RecoveryPanel() {
     exporting.current = value;
     setExportBusy(true);
     setError('');
-    setStatus('Copying codes...');
+    setStatus({ key: 'security.recovery.copying' });
     try {
       if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
       await navigator.clipboard.writeText(`${value.codes.join('\n')}\n`);
       if (alive.current && current.current === value && validBatch())
-        setStatus('Codes copied. Store them privately and clear your clipboard when finished.');
+        setStatus({ key: 'security.recovery.copied' });
     } catch {
       if (alive.current && current.current === value) {
-        setError(
-          'Copy failed. This browser did not allow clipboard access. Try Download codes or copy the displayed codes manually.'
-        );
+        setError({ key: 'security.recovery.copyFailed' });
         setStatus('');
       }
     } finally {
@@ -263,14 +260,10 @@ export function RecoveryPanel() {
         downloads.current.delete(createdURL);
       }, 1000);
       downloads.current.set(createdURL, timer);
-      setStatus(
-        'Download requested. Check your browser downloads; this page cannot confirm that the file was saved.'
-      );
+      setStatus({ key: 'security.recovery.downloaded' });
     } catch {
       if (url) URL.revokeObjectURL(url);
-      setError(
-        'The download could not be started. Try Copy codes or save the displayed codes manually.'
-      );
+      setError({ key: 'security.recovery.downloadFailed' });
       setStatus('');
     } finally {
       anchor.remove();
@@ -278,18 +271,20 @@ export function RecoveryPanel() {
   }
 
   return (
-    <Panel title="Recovery codes" id="recovery-heading">
+    <Panel title={t('security.recovery.title')} id="recovery-heading">
       <p className="text-sm leading-relaxed text-muted-foreground">
-        Recovery codes provide account recovery when your normal factors are unavailable. Old
-        plaintext codes cannot be retrieved.
+        {t('security.recovery.description')}
       </p>
       {remaining && (
         <p className="text-sm" data-testid="recovery-status">
-          <strong className="text-lg tabular-nums">{remaining.remaining}</strong> unused codes
-          remaining.{remaining.low ? ' Your supply is running low.' : ''}
+          {t.rich('security.recovery.remaining', {
+            count: remaining.remaining,
+            amount: (chunks) => <strong className="text-lg tabular-nums">{chunks}</strong>,
+          })}
+          {remaining.low ? ` ${t('security.recovery.low')}` : ''}
         </p>
       )}
-      <Feedback error={loadError} status={loading ? 'Checking remaining recovery codes...' : ''} />
+      <Feedback error={loadError} status={loading ? t('security.recovery.loading') : ''} />
       <Feedback error={error} status={status} />
       <div className="flex flex-wrap gap-3">
         <Button
@@ -305,7 +300,7 @@ export function RecoveryPanel() {
             setResumeTotp(false);
           }}
         >
-          Generate new recovery codes
+          {t('security.recovery.generate')}
         </Button>
         <Button
           type="button"
@@ -314,7 +309,7 @@ export function RecoveryPanel() {
           disabled={loading}
           onClick={() => setAttempt((value) => value + 1)}
         >
-          Refresh recovery status
+          {t('security.recovery.refresh')}
         </Button>
       </div>
       {batch && (
@@ -324,17 +319,18 @@ export function RecoveryPanel() {
           className="space-y-4 rounded-lg border-2 border-foreground bg-background p-4 sm:p-5"
         >
           <h3 ref={heading} tabIndex={-1} className="font-semibold focus:outline-none">
-            Save your new recovery codes
+            {t('security.recovery.save')}
           </h3>
-          <p className="text-sm leading-relaxed">
-            Every previous code is now invalid. These codes are shown once and clear within five
-            minutes, at session expiry, or when you leave or hide this page.
-          </p>
-          <ol aria-label="New recovery codes" className="grid min-w-0 gap-2 sm:grid-cols-2">
+          <p className="text-sm leading-relaxed">{t('security.recovery.viewerWarning')}</p>
+          <ol
+            aria-label={t('security.recovery.list')}
+            className="grid min-w-0 gap-2 sm:grid-cols-2"
+          >
             {batch.codes.map((code, index) => (
               <li key={index} className="min-w-0 rounded-md border bg-muted/40 p-3">
                 <code
                   data-testid="recovery-code"
+                  dir="ltr"
                   className="break-all font-mono text-sm leading-relaxed"
                 >
                   {code}
@@ -343,8 +339,7 @@ export function RecoveryPanel() {
             ))}
           </ol>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Keep the codes in private storage, such as a password manager. Anyone who obtains a code
-            may recover your account. Do not share or email them.
+            {t('security.recovery.storageWarning')}
           </p>
           <div className="flex flex-wrap gap-3">
             <Button
@@ -354,7 +349,7 @@ export function RecoveryPanel() {
               disabled={exportBusy}
               onClick={copy}
             >
-              Copy codes
+              {t('security.recovery.copy')}
             </Button>
             <Button
               type="button"
@@ -363,30 +358,25 @@ export function RecoveryPanel() {
               disabled={exportBusy}
               onClick={download}
             >
-              Download codes
+              {t('security.recovery.download')}
             </Button>
             <Button
               type="button"
               className={controlClass}
-              onClick={() =>
-                clearBatch(
-                  'Codes cleared from this view. Saved codes remain valid until used or replaced.'
-                )
-              }
+              onClick={() => clearBatch({ key: 'security.recovery.cleared' })}
             >
-              Done
+              {t('security.recovery.done')}
             </Button>
           </div>
           <p className="text-xs leading-relaxed text-muted-foreground">
-            Clearing this view does not erase your clipboard or downloaded files and cannot
-            guarantee browser-memory zeroization.
+            {t('security.recovery.clearWarning')}
           </p>
         </div>
       )}
       {confirm && (
         <StepUpDialog
-          title="Replace recovery codes"
-          description="Generating a new batch immediately invalidates every previous recovery code. The new codes will be displayed once. Continue only when you are ready to save them privately."
+          title={t('security.recovery.replace')}
+          description={t('security.recovery.replaceDescription')}
           onCancel={closeConfirmation}
           onAuthorized={generate}
           actionError={generationError}

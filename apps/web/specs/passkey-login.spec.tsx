@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
 import { PasskeyLogin } from '../app/_components/passkey-login';
 import { PortalClient } from '../app/_lib/portal/client';
 import { browserKey } from '../app/_lib/portal/dpop';
@@ -142,4 +142,39 @@ describe('live discoverable passkey entry', () => {
       );
     }
   );
+});
+
+it('translates an active passkey ceremony without rotating the key, aborting or replaying API work', async () => {
+  const { I18nTestProvider } = await import('../i18n/testing');
+  let resolve!: (value: Awaited<ReturnType<typeof usePasskey>>) => void;
+  jest.mocked(usePasskey).mockImplementationOnce(
+    () =>
+      new Promise((finish) => {
+        resolve = finish;
+      })
+  );
+  const view = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider locale={locale}>
+      <PasskeyLogin />
+    </I18nTestProvider>
+  );
+  const result = render(view('en'));
+  fireEvent.click(screen.getByRole('button', { name: 'Use a passkey' }));
+  await waitFor(() => expect(usePasskey).toHaveBeenCalledTimes(1));
+  const signal = jest.mocked(usePasskey).mock.calls[0][1];
+  result.rerender(view('fa-IR'));
+  expect(screen.getByRole('button', { name: 'لغو ورود' })).toBeTruthy();
+  expect(signal?.aborted).toBe(false);
+  expect(browserKey).toHaveBeenCalledTimes(1);
+  expect(PortalClient).toHaveBeenCalledTimes(1);
+  expect(api.loginOptions).toHaveBeenCalledTimes(1);
+  expect(api.loginVerify).not.toHaveBeenCalled();
+  await act(async () =>
+    resolve({ response: 'binary-adapted-assertion' } as unknown as Awaited<
+      ReturnType<typeof usePasskey>
+    >)
+  );
+  expect(api.loginVerify).toHaveBeenCalledTimes(1);
+  expect(api.bootstrap).toHaveBeenCalledTimes(1);
+  expect(replace).toHaveBeenCalledWith('/dashboard');
 });

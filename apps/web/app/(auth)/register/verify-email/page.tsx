@@ -1,17 +1,19 @@
+import { getTranslations } from 'next-intl/server';
 import { RegistrationEmailVerification } from '../../../_components/registration';
 import { AuthCard, AuthLink } from '../../_components/auth-card';
 
-export const metadata = {
-  title: 'Verify registration email | Hatef Identity',
-  referrer: 'no-referrer' as const,
-};
+export async function generateMetadata() {
+  const t = await getTranslations('registration');
+  return { title: t('verifyMetadata'), referrer: 'no-referrer' as const };
+}
 
-export default function VerifyRegistrationEmailPage() {
+export default async function VerifyRegistrationEmailPage() {
+  const t = await getTranslations('registration');
   return (
     <AuthCard
-      title="Verify your email ownership"
-      description="Confirm your registration link in the original browser."
-      footer={<AuthLink href="/register">Restart registration</AuthLink>}
+      title={t('verifyTitle')}
+      description={t('verifyDescription')}
+      footer={<AuthLink href="/register">{t('restartLink')}</AuthLink>}
     >
       <RegistrationEmailVerification />
     </AuthCard>

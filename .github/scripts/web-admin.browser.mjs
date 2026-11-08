@@ -1,3 +1,4 @@
+import { assertOnlyPreferenceCookies, browserLocale, browserLocales, configureBrowserPreferences, exercisePreferenceSwitch, localizedText, screenshotName, setBrowserLocale, waitForFonts } from './browser-localization.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -366,29 +367,29 @@ async function open(page, harness, path) {
 }
 
 async function confirmForm(page, action = 'Suspend', method = 'passkey', harness, fixture) {
-  await page.getByRole('button', { name: action, exact: true }).click();
+  await page.getByRole('button', { name: localizedText(action), exact: true }).click();
   const dialog = page.getByTestId('stepup-dialog');
   await dialog.waitFor({ state: 'visible' });
   assert(await dialog.evaluate((element) => element instanceof HTMLDialogElement && element.open));
-  assert.equal(await dialog.getByLabel('Moderation reason', { exact: true }).count(), 0);
-  await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
+  assert.equal(await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).count(), 0);
+  await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
   if (method === 'totp') {
-    await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
+    await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
     const current = harness.fixture('totp-code', { user_id: fixture.user_id });
-    await dialog.getByLabel('Authenticator code', { exact: true }).fill(current.code);
-    await dialog.getByRole('button', { name: 'Verify code', exact: true }).click();
+    await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill(current.code);
+    await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
   } else {
-    await dialog.getByRole('button', { name: 'Verify with a passkey', exact: true }).click();
+    await dialog.getByRole('button', { name: localizedText('Verify with a passkey'), exact: true }).click();
   }
-  await dialog.getByLabel('Moderation reason', { exact: true }).waitFor({ state: 'visible' });
-  assert(await dialog.getByLabel('Moderation reason', { exact: true }).evaluate((element) => element === document.activeElement));
+  await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).waitFor({ state: 'visible' });
+  assert(await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).evaluate((element) => element === document.activeElement));
   return dialog;
 }
 
 async function finalSubmit(dialog, reason, action = 'suspend') {
-  await dialog.getByLabel('Moderation reason', { exact: true }).fill(reason);
-  await dialog.getByRole('checkbox', { name: /I reviewed the account/ }).check();
-  await dialog.getByRole('button', { name: `Confirm ${action}`, exact: true }).click();
+  await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).fill(reason);
+  await dialog.getByRole('checkbox', { name: localizedText(/I reviewed the account/) }).check();
+  await dialog.getByRole('button', { name: localizedText(`Confirm ${action}`), exact: true }).click();
 }
 
 export function adminAppearance({ focusedOnly = false } = {}) {
@@ -485,10 +486,11 @@ export function adminAppearance({ focusedOnly = false } = {}) {
 }
 
 async function layout(page, name, evidence, artifactDirectory) {
-  for (const viewport of [{ width: 1280, height: 900 }, { width: 320, height: 900 }, { width: 320, height: 256 }]) {
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 768, height: 1024 }, { width: 390, height: 844 }, { width: 320, height: 900 }, { width: 320, height: 256 }]) {
     for (const dark of [false, true]) {
       await page.setViewportSize(viewport);
       await page.evaluate((enabled) => document.documentElement.classList.toggle('dark', enabled), dark);
+      await waitForFonts(page);
       assert.deepEqual(await page.evaluate(adminAppearance), [], 'Admin pointer targets, contrast or reflow regressed');
       const modal = page.locator('dialog[open]');
       if (await modal.count()) {
@@ -523,7 +525,7 @@ async function layout(page, name, evidence, artifactDirectory) {
       }
       if (artifactDirectory) {
         await page.screenshot({
-          path: resolve(artifactDirectory, `${name}-${viewport.width}x${viewport.height}-${dark ? 'dark' : 'light'}.png`),
+          path: resolve(artifactDirectory, screenshotName(name, viewport, dark)),
           fullPage: true,
           animations: 'disabled',
           mask: [page.locator('tbody, main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')],
@@ -609,7 +611,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
       await actor.page.bringToFront();
       await actor.page.getByTestId('admin-ready').waitFor();
     }
-    const button = actor.page.getByRole('button', { name, exact: true });
+    const button = actor.page.getByRole('button', { name: localizedText(name), exact: true });
     await button.click();
     assert.equal(await button.getAttribute('aria-pressed'), 'true');
     assert.equal(new URL(actor.page.url()).search + new URL(actor.page.url()).hash, '');
@@ -629,18 +631,18 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     await button.click();
     const dialog = page.getByTestId('stepup-dialog');
     await dialog.waitFor({ state: 'visible' });
-    assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
-    assert.equal(await dialog.getByLabel('Email for attribution', { exact: true }).count(), 0);
-    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
+    assert.equal(await dialog.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
+    assert.equal(await dialog.getByLabel(localizedText('Email for attribution'), { exact: true }).count(), 0);
+    await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
     const captured = harness.captureJSON('/api/v1/auth/stepup/verify', 'POST', 200);
     times.push(Date.now());
     verificationTimes.set(actor, times);
     verificationCount++;
     if (method === 'totp') {
-      await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
-      await dialog.getByLabel('Authenticator code', { exact: true }).fill(harness.fixture('totp-code', { user_id: actor.fixture.user_id }).code);
-      await dialog.getByRole('button', { name: 'Verify code', exact: true }).click();
-    } else await dialog.getByRole('button', { name: 'Verify with a passkey', exact: true }).click();
+      await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
+      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill(harness.fixture('totp-code', { user_id: actor.fixture.user_id }).code);
+      await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
+    } else await dialog.getByRole('button', { name: localizedText('Verify with a passkey'), exact: true }).click();
     const grant = await captured;
     assert(typeof grant.token === 'string' && grant.token.length > 0, 'Missing real verification grant');
     harness.secrets.push(grant.token);
@@ -649,23 +651,23 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     return { dialog, token: grant.token };
   };
   const fillCreate = async (dialog, payload, key, pinned = false) => {
-    const target = dialog.getByLabel('Original account reference', { exact: true });
+    const target = dialog.getByLabel(localizedText('Original account reference'), { exact: true });
     if (pinned) {
       assert.equal(await target.inputValue(), payload.account_ref);
       assert(await target.isDisabled(), 'Selected attribution reference was not pinned');
     } else await target.fill(payload.account_ref);
-    const operation = dialog.getByLabel('Operation UUID', { exact: true });
+    const operation = dialog.getByLabel(localizedText('Operation UUID'), { exact: true });
     assert.equal(await operation.inputValue(), '', 'A legal operation UUID was generated or recovered in the browser');
     await operation.fill(key);
-    await dialog.getByLabel('Reason', { exact: true }).fill(`  ${payload.reason}  `);
-    await dialog.getByLabel('Requesting authority', { exact: true }).fill(payload.requesting_authority);
-    if ('legal_basis' in payload) await dialog.getByLabel('Legal basis', { exact: true }).fill(payload.legal_basis);
-    await dialog.getByLabel('legal_basis' in payload ? 'Review at (UTC)' : 'Expires at (UTC)', { exact: true })
+    await dialog.getByLabel(localizedText('Reason'), { exact: true }).fill(`  ${payload.reason}  `);
+    await dialog.getByLabel(localizedText('Requesting authority'), { exact: true }).fill(payload.requesting_authority);
+    if ('legal_basis' in payload) await dialog.getByLabel(localizedText('Legal basis'), { exact: true }).fill(payload.legal_basis);
+    await dialog.getByLabel(localizedText('legal_basis' in payload ? 'Review at (UTC)' : 'Expires at (UTC)'), { exact: true })
       .fill(payload.review_at || payload.expires_at || '');
     const detached = await dialog.locator('input:not([type=checkbox]), textarea').elementHandles();
     try {
-      await dialog.getByRole('button', { name: 'Review request', exact: true }).click();
-      assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
+      await dialog.getByRole('button', { name: localizedText('Review request'), exact: true }).click();
+      assert.equal(await dialog.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
       assert((await Promise.all(detached.map((control) => control.evaluate((element) =>
         element.value === '' && element.defaultValue === '' &&
         (element instanceof HTMLTextAreaElement ? element.textContent === '' : !element.getAttribute('value')))))).every(Boolean),
@@ -673,8 +675,8 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     } finally { await Promise.all(detached.map((control) => control.dispose())); }
   };
   const confirm = async (dialog, label, double = false) => {
-    await dialog.getByRole('checkbox', { name: /^I reviewed / }).check();
-    const button = dialog.getByRole('button', { name: label, exact: true });
+    await dialog.getByRole('checkbox', { name: localizedText(/^I reviewed /) }).check();
+    const button = dialog.getByRole('button', { name: localizedText(label), exact: true });
     if (double) await button.evaluate((element) => { element.click(); element.click(); });
     else await button.click();
   };
@@ -682,7 +684,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     const kind = 'legal_basis' in payload ? 'hold' : 'preservation';
     if (!pinned) await section(actor, kind === 'hold' ? 'Legal Holds' : 'Preservation');
     const { dialog } = await verify(actor, actor.page.getByRole('button', {
-      name: kind === 'hold' ? 'Apply Legal Hold' : 'Record preservation', exact: true,
+      name: localizedText(kind === 'hold' ? 'Apply Legal Hold' : 'Record preservation'), exact: true,
     }), { method });
     await fillCreate(dialog, payload, key, pinned);
     const received = response(actor.page, kind === 'hold' ? holdsPath : preservePath, 'POST', status);
@@ -700,16 +702,16 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   };
   const readHolds = async (actor, account, limit = 20) => {
     await section(actor, 'Legal Holds');
-    const form = actor.page.getByRole('form', { name: 'Read Legal Holds', exact: true });
-    if (account === undefined) await form.getByRole('checkbox', { name: 'All original references', exact: true }).check();
+    const form = actor.page.getByRole('form', { name: localizedText('Read Legal Holds'), exact: true });
+    if (account === undefined) await form.getByRole('checkbox', { name: localizedText('All original references'), exact: true }).check();
     else {
-      await form.getByRole('checkbox', { name: 'All original references', exact: true }).uncheck();
-      await form.getByLabel('Original account reference', { exact: true }).fill(account);
+      await form.getByRole('checkbox', { name: localizedText('All original references'), exact: true }).uncheck();
+      await form.getByLabel(localizedText('Original account reference'), { exact: true }).fill(account);
     }
-    await form.getByLabel('Hold status', { exact: true }).selectOption('all');
-    await form.getByLabel('Page size', { exact: true }).fill(String(limit));
+    await form.getByLabel(localizedText('Hold status'), { exact: true }).selectOption('all');
+    await form.getByLabel(localizedText('Page size'), { exact: true }).fill(String(limit));
     const received = response(actor.page, holdsPath, 'GET', 200);
-    await form.getByRole('button', { name: 'Read Legal Holds', exact: true }).click();
+    await form.getByRole('button', { name: localizedText('Read Legal Holds'), exact: true }).click();
     const result = await received;
     assert.equal(new URL(result.response.url()).searchParams.get('account_ref'), account ?? null);
     if (result.body.items.length) await actor.page.getByTestId('legal-hold-row').first().waitFor();
@@ -717,10 +719,10 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   };
   const prepareRelease = async (actor, account, id) => {
     await readHolds(actor, account);
-    const row = actor.page.getByTestId('legal-hold-row').filter({ hasText: id });
-    const { dialog } = await verify(actor, row.getByRole('button', { name: 'Release request', exact: true }));
+    const row = actor.page.getByTestId('legal-hold-row').filter({ hasText: localizedText(id) });
+    const { dialog } = await verify(actor, row.getByRole('button', { name: localizedText('Release request'), exact: true }));
     assert((await dialog.textContent()).includes(id), 'Release did not pin the immutable request UUID');
-    assert.equal(await dialog.getByLabel('Reason', { exact: true }).count(), 0);
+    assert.equal(await dialog.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
     return dialog;
   };
   const release = async (actor, account, id, status = 204) => {
@@ -734,16 +736,16 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   };
   const prepareLookup = async (actor, query = inquiry) => {
     await section(actor, 'Attribution');
-    const verified = await verify(actor, actor.page.getByRole('button', { name: 'Start attribution inquiry', exact: true }));
+    const verified = await verify(actor, actor.page.getByRole('button', { name: localizedText('Start attribution inquiry'), exact: true }));
     for (const [key, label] of Object.entries(fields)) {
-      const checkbox = verified.dialog.getByRole('checkbox', { name: label, exact: true });
+      const checkbox = verified.dialog.getByRole('checkbox', { name: localizedText(label), exact: true });
       assert(!(await checkbox.isChecked()), 'Disclosure opt-in was restored or enabled by default');
       if (query.fields.includes(key)) await checkbox.check();
     }
     for (const [key, label] of [['identifier', 'Email for attribution'], ['requesting_authority', 'Requesting authority'],
       ['case_reference', 'Case reference'], ['purpose', 'Inquiry purpose'], ['start_time', 'Start time (UTC)'], ['end_time', 'End time (UTC)'], ['limit', 'Page size']])
-      await verified.dialog.getByLabel(label, { exact: true }).fill(String(query[key]));
-    await verified.dialog.getByRole('button', { name: 'Review request', exact: true }).click();
+      await verified.dialog.getByLabel(localizedText(label), { exact: true }).fill(String(query[key]));
+    await verified.dialog.getByRole('button', { name: localizedText('Review request'), exact: true }).click();
     return verified;
   };
   const lookup = async (actor, query = inquiry, status = 200) => {
@@ -808,8 +810,8 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   for (const role of ['support', 'moderator', 'super_admin']) {
     const actor = actors[role];
     await open(actor.page, harness, '/admin/legal');
-    await actor.page.getByRole('main').getByRole('alert').filter({ hasText: /No legal operation/ }).waitFor();
-    assert.equal(await actor.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).count(), 0);
+    await actor.page.getByRole('main').getByRole('alert').filter({ hasText: localizedText(/No legal operation/) }).waitFor();
+    assert.equal(await actor.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }).count(), 0);
     const sessionID = (await api(actor.page, '/api/v1/users/me')).body.session.id;
     for (const [path, options] of [
       [holdsPath, {}], [holdsPath, { method: 'POST', body: hold, idempotencyKey: recordedOperation }],
@@ -820,9 +822,9 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   }
   await open(dpo.page, harness, '/admin/legal');
   const before = harness.originEvidence.legal;
-  const holdForm = dpo.page.getByRole('form', { name: 'Read Legal Holds', exact: true });
-  await holdForm.getByLabel('Original account reference', { exact: true }).fill('invalid');
-  await holdForm.getByRole('button', { name: 'Read Legal Holds', exact: true }).click();
+  const holdForm = dpo.page.getByRole('form', { name: localizedText('Read Legal Holds'), exact: true });
+  await holdForm.getByLabel(localizedText('Original account reference'), { exact: true }).fill('invalid');
+  await holdForm.getByRole('button', { name: localizedText('Read Legal Holds'), exact: true }).click();
   await holdForm.getByRole('alert').waitFor();
   assert.equal(harness.originEvidence.legal, before, 'Invalid legal reference became an unfiltered request');
   for (const query of ['account_ref=', 'account_ref=%zz', 'limit=1&limit=2', 'email=not-an-identity'])
@@ -839,7 +841,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   const replayed = await create(dpo, hold, recordedOperation, { replay: true });
   assert.equal(replayed.id, created.id);
   await create(dpo, { ...hold, reason: `${markers.reason} changed input` }, recordedOperation, { status: 409 });
-  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: /original operation conflicts/ }).waitFor();
+  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: localizedText(/original operation conflicts/) }).waitFor();
   assert.equal(state(deleted).total, 1, 'Changed-input conflict silently replaced the original request');
   const preservation = await create(dpo, preserve(deleted), recordedOperation, { method: 'totp' });
   assert.notEqual(preservation.hold.id, created.id);
@@ -847,6 +849,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   assert((await dpo.page.getByTestId('legal-outcome').textContent()).includes(preservation.note));
   const preservedReplay = await create(dpo, preserve(deleted), recordedOperation, { replay: true });
   assert(preservedReplay.replayed && !preservedReplay.hold.replayed, 'Top-level preservation replay must be authoritative');
+  await exercisePreferenceSwitch(dpo.page, { privateSelector: '[data-legal-private] input, [data-legal-private] textarea' });
   const currentPreservation = await create(dpo, preserve(current), recordedOperation);
   assert(currentPreservation.account_present && currentPreservation.ledger_evidence_present);
   assert.notEqual(currentPreservation.hold.id, preservation.hold.id, 'A reused UUID incorrectly merged distinct account references');
@@ -861,10 +864,10 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   assert.equal(page.total, 2);
   assert.equal(page.items.length, 1);
   const nextRead = response(dpo.page, holdsPath, 'GET', 200);
-  await dpo.page.getByRole('button', { name: 'Next hold page', exact: true }).click();
+  await dpo.page.getByRole('button', { name: localizedText('Next hold page'), exact: true }).click();
   assert.equal((await nextRead).body.offset, 1);
   await layout(dpo.page, 'legal-holds', evidence, artifactDirectory);
-  await dpo.page.getByTestId('legal-hold-row').first().getByRole('button', { name: 'View restricted details', exact: true }).click();
+  await dpo.page.getByTestId('legal-hold-row').first().getByRole('button', { name: localizedText('View restricted details'), exact: true }).click();
   const details = dpo.page.getByTestId('legal-hold-details');
   await details.waitFor();
   assert((await details.textContent()).includes(markers.reason));
@@ -892,8 +895,8 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     assert(!JSON.stringify(core.body).includes(`"${key}"`), 'Forbidden attribution projection escaped the real API');
   assert.equal((await api(dpo.page, legalLookup, { method: 'POST', sessionID,
     stepUpToken: core.response.request().headers()['x-step-up-auth'], body: inquiry })).status, 403, 'A consumed lookup grant was reusable');
-  await dpo.page.getByTestId('legal-result-row').filter({ hasText: deleted }).first()
-    .getByRole('button', { name: 'Select reference', exact: true }).click();
+  await dpo.page.getByTestId('legal-result-row').filter({ hasText: localizedText(deleted) }).first()
+    .getByRole('button', { name: localizedText('Select reference'), exact: true }).click();
   assert.equal(await dpo.page.getByTestId('legal-selected-reference').count(), 1);
   const inline = await create(dpo, hold, randomUUID(), { pinned: true });
   assert.equal(inline.account_ref, deleted);
@@ -927,7 +930,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   assert.equal(state(current).eligible_records, 0, 'Released expired evidence stayed eligible');
   const appended = harness.fixture('admin-legal-append', { account_ref: deleted });
   assert(BigInt(appended.through_seq) > BigInt(first.body.coverage.through_seq));
-  const nextButton = dpo.page.getByRole('button', { name: 'Next attribution page', exact: true });
+  const nextButton = dpo.page.getByRole('button', { name: localizedText('Next attribution page'), exact: true });
   await nextButton.waitFor();
   const { dialog: nextDialog } = await verify(dpo, nextButton);
   const continued = response(dpo.page, legalLookup, 'POST', 200);
@@ -946,7 +949,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
 
   checkpoint = 'legal-audit-rollback';
   await section(second, 'Legal Holds');
-  let verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  let verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
   const failedKey = randomUUID();
   await fillCreate(verified.dialog, { ...hold, account_ref: current }, failedKey);
   const beforeFailure = state(current);
@@ -982,7 +985,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   const lostKey = randomUUID();
   const lostPayload = { ...hold, account_ref: current };
   await section(dpo, 'Legal Holds');
-  verified = await verify(dpo, dpo.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  verified = await verify(dpo, dpo.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
   await fillCreate(verified.dialog, lostPayload, lostKey);
   let lostID;
   evidence.legalLostCreate = await lostWrite(dpo, holdsPath, 201,
@@ -1004,7 +1007,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     });
   harness.fixture('admin-legal-cleanup', { account_ref: current });
   await create(dpo, lostPayload, lostKey, { status: 409 });
-  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: /original operation conflicts/ }).waitFor();
+  await dpo.page.getByRole('main').getByRole('alert').filter({ hasText: localizedText(/original operation conflicts/) }).waitFor();
   assert(state(current).purged > 0 && state(current).active === 0);
   await readHolds(dpo, current);
   for (const failure of [
@@ -1013,7 +1016,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     { status: 429, headers: { 'Retry-After': '2' }, body: '{"error":"rate_limit_exceeded"}' },
     { status: 503, body: '{"error":"audit_unavailable"}' },
   ]) {
-    await queryFault(dpo.page, holdsPath, () => dpo.page.getByRole('button', { name: 'Read Legal Holds', exact: true }).click(), failure);
+    await queryFault(dpo.page, holdsPath, () => dpo.page.getByRole('button', { name: localizedText('Read Legal Holds'), exact: true }).click(), failure);
     assert.equal(await dpo.page.getByTestId('legal-hold-row').count(), 0);
   }
   evidence.checks.push('real committed-but-lost create and release responses with every outgoing attempt observed through read-only reconciliation; explicit same-tuple fresh-grant recovery, no automatic/fresh-key replay, cleaned narrative tombstone conflict without recreation');
@@ -1022,17 +1025,17 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   await section(second, 'Legal Holds');
   const unsent = observeLegalWrites(second.authenticator.cdp, harness.origin);
   try {
-    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
-    const input = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
+    const input = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
     const draftKey = randomUUID();
     harness.secrets.push(draftKey);
     harness.legalSecrets.add(draftKey);
-    await verified.dialog.getByLabel('Original account reference', { exact: true }).fill(deleted);
-    await verified.dialog.getByLabel('Operation UUID', { exact: true }).fill(draftKey);
-    await verified.dialog.getByLabel('Requesting authority', { exact: true }).fill(markers.requesting_authority);
-    await verified.dialog.getByLabel('Legal basis', { exact: true }).fill(markers.legal_basis);
+    await verified.dialog.getByLabel(localizedText('Original account reference'), { exact: true }).fill(deleted);
+    await verified.dialog.getByLabel(localizedText('Operation UUID'), { exact: true }).fill(draftKey);
+    await verified.dialog.getByLabel(localizedText('Requesting authority'), { exact: true }).fill(markers.requesting_authority);
+    await verified.dialog.getByLabel(localizedText('Legal basis'), { exact: true }).fill(markers.legal_basis);
     await input.fill('\u00e9'.repeat(2049));
-    await verified.dialog.getByRole('button', { name: 'Review request', exact: true }).click();
+    await verified.dialog.getByRole('button', { name: localizedText('Review request'), exact: true }).click();
     await verified.dialog.getByRole('alert').waitFor();
     assert.equal(unsent.count, 0, 'Oversized UTF-8 legal narrative reached a write');
     await input.fill(markers.cancelledDraft);
@@ -1041,28 +1044,28 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     assert(await input.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
       'Legal cancellation left detached narrative input');
     await input.dispose();
-    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
-    const expired = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
+    const expired = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
     await expired.fill(markers.expiredDraft);
-    await second.page.getByRole('main').getByRole('alert').filter({ hasText: /Verification expired/ }).waitFor({ timeout: 30_000 });
+    await second.page.getByRole('main').getByRole('alert').filter({ hasText: localizedText(/Verification expired/) }).waitFor({ timeout: 30_000 });
     assert(await expired.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
       'Grant expiry left a detached legal narrative');
     await expired.dispose();
-    await second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).click();
+    await second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }).click();
     let dialog = second.page.getByTestId('stepup-dialog');
-    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-    await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
-    await dialog.getByLabel('Authenticator code', { exact: true }).fill('123');
+    await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+    await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
+    await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill('123');
     const resume = await hidePortal(second.page, second.context, evidence, 'admin-ready');
     await resume();
     await second.page.getByTestId('admin-ready').waitFor();
     dialog = second.page.getByTestId('stepup-dialog');
     await dialog.waitFor();
-    await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-    assert.equal(await dialog.getByLabel('Authenticator code', { exact: true }).inputValue(), '');
+    await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+    assert.equal(await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).inputValue(), '');
     await second.page.keyboard.press('Escape');
-    verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
-    const hidden = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+    verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
+    const hidden = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
     await hidden.fill(markers.backgroundDraft);
     const returnToPage = await hidePortal(second.page, second.context, evidence, 'admin-ready');
     await returnToPage();
@@ -1120,7 +1123,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
 
   checkpoint = 'legal-revocation';
   await section(combined, 'Legal Holds');
-  verified = await verify(combined, combined.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
+  verified = await verify(combined, combined.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
   await fillCreate(verified.dialog, hold, randomUUID());
   harness.fixture('admin-revoke', { user_id: combined.fixture.user_id, role: 'dpo' });
   const denied = response(combined.page, holdsPath, 'POST', 403);
@@ -1129,11 +1132,11 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   await combined.page.getByTestId('stepup-dialog').waitFor({ state: 'hidden' });
   assert.equal((await api(combined.page, '/api/v1/users/me')).status, 200);
   await open(combined.page, harness, '/admin/legal');
-  assert.equal(await combined.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }).count(), 0);
+  assert.equal(await combined.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }).count(), 0);
 
   await section(second, 'Legal Holds');
-  verified = await verify(second, second.page.getByRole('button', { name: 'Apply Legal Hold', exact: true }));
-  const expiring = await verified.dialog.getByLabel('Reason', { exact: true }).elementHandle();
+  verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
+  const expiring = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
   await expiring.fill(markers.sessionDraft);
   const active = (await api(second.page, '/api/v1/users/me')).body.session.id;
   harness.fixture('expire-session', { user_id: second.fixture.user_id, session_id: active });
@@ -1142,15 +1145,15 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   // Navigation destroys the old execution context; privacy of detached controls
   // within one context is checked above, and the replacement shell is inspected.
   await expiring.dispose();
-  assert.equal(await second.page.getByLabel('Reason', { exact: true }).count(), 0);
+  assert.equal(await second.page.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
   assert.equal(await second.page.getByTestId('legal-outcome').count(), 0);
-  assert.equal(await second.page.getByRole('link', { name: 'Sign in with a passkey', exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Flegal');
+  assert.equal(await second.page.getByRole('link', { name: localizedText('Sign in with a passkey'), exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Flegal');
   evidence.legalVerifications = verificationCount;
   evidence.checks.push('live legal capability revocation after fresh verification clears privileged controls without normal logout; real legal-session expiry drops pending input and returns only the fixed legal path');
 }
 
 export async function validateAdmin(harness, { artifactDirectory } = {}) {
-  const evidence = { checks: [], layouts: 0, nativeHiddenTabObserved: false, nativeBfcacheRestoreObserved: false };
+  const evidence = { locale: browserLocale(), checks: [], layouts: 0, nativeHiddenTabObserved: false, nativeBfcacheRestoreObserved: false };
   const markerID = randomBytes(16).toString('hex');
   const markers = Object.fromEntries(['reason', 'cancelledDraft', 'backgroundDraft', 'expiredDraft']
     .map((kind) => [kind, `admin-private-${kind}-${markerID}`]));
@@ -1218,8 +1221,8 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       for (const flag of ['legal_holds_read', 'legal_holds_apply', 'legal_holds_release', 'preservation_requests_create', 'legal_inquiry_lookup'])
         assert.equal(access[flag], ['dpo', 'combined'].includes(role));
       assert.equal(caps.body.limits.chain_verify_max_limit, 5);
-      if (!access.users_read) assert.equal(await page.getByRole('link', { name: 'Accounts', exact: true }).count(), 0);
-      if (!access.audit_logs_read) assert.equal(await page.getByRole('link', { name: 'Audit logs', exact: true }).count(), 0);
+      if (!access.users_read) assert.equal(await page.getByRole('link', { name: localizedText('Accounts'), exact: true }).count(), 0);
+      if (!access.audit_logs_read) assert.equal(await page.getByRole('link', { name: localizedText('Audit logs'), exact: true }).count(), 0);
       if (!access.legal_holds_read) assert.equal(await page.locator('a[href="/admin/legal"]').count(), 0);
     }
     await visit(ordinary, harness.origin, '/admin');
@@ -1254,22 +1257,22 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
 
     checkpoint = 'admin-directory';
     await open(support, harness, '/admin/users');
-    assert.equal(await support.getByLabel('Exact email', { exact: true }).count(), 0);
+    assert.equal(await support.getByLabel(localizedText('Exact email'), { exact: true }).count(), 0);
     const list = operationResponse(support, '/api/v1/admin/users', 'GET');
-    await support.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await support.getByRole('button', { name: localizedText('Apply filters'), exact: true }).click();
     const supportBody = await (await list).json();
     assert(supportBody.items.length > 0 && supportBody.items.length <= 5);
     assert(supportBody.items.every((item) => !('email' in item) && typeof item.lifecycle_revision === 'string'));
     await support.getByTestId('admin-account-row').first().waitFor();
-    assert.equal(await support.getByRole('columnheader', { name: 'Email', exact: true }).count(), 0);
+    assert.equal(await support.getByRole('columnheader', { name: localizedText('Email'), exact: true }).count(), 0);
     const next = operationResponse(support, '/api/v1/admin/users', 'GET');
-    await support.getByRole('button', { name: 'Next page', exact: true }).click();
+    await support.getByRole('button', { name: localizedText('Next page'), exact: true }).click();
     const nextAccounts = await (await next).json();
     assert.equal(nextAccounts.offset, 5);
     for (const account of nextAccounts.items)
-      await support.getByRole('link', { name: `View account ${account.id}`, exact: true }).waitFor();
+      await support.getByRole('link', { name: localizedText(`View account ${account.id}`), exact: true }).waitFor();
     await layout(support, 'accounts', evidence, artifactDirectory);
-    const skip = support.getByRole('link', { name: 'Skip to admin content', exact: true });
+    const skip = support.getByRole('link', { name: localizedText('Skip to admin content'), exact: true });
     await skip.focus();
     await support.keyboard.press('Tab');
     await support.keyboard.press('Shift+Tab');
@@ -1286,15 +1289,15 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
 
     await open(moderator, harness, '/admin/users');
     const lookup = operationResponse(moderator, '/api/v1/admin/users/lookup', 'POST');
-    await moderator.getByLabel('Exact email', { exact: true }).fill(target.email);
-    await moderator.getByRole('button', { name: 'Find account', exact: true }).click();
+    await moderator.getByLabel(localizedText('Exact email'), { exact: true }).fill(target.email);
+    await moderator.getByRole('button', { name: localizedText('Find account'), exact: true }).click();
     const found = await lookup;
     assert.equal(new URL(found.url()).search, '');
     assert.deepEqual(found.request().postDataJSON(), { email: target.email });
     assert.equal((await found.json()).items[0].id, target.user_id);
-    await moderator.getByRole('link', { name: `View account ${target.user_id}`, exact: true }).click();
+    await moderator.getByRole('link', { name: localizedText(`View account ${target.user_id}`), exact: true }).click();
     await moderator.getByTestId('admin-ready').waitFor();
-    await moderator.getByRole('heading', { name: target.user_id, exact: true }).waitFor();
+    await moderator.getByRole('heading', { name: localizedText(target.user_id), exact: true }).waitFor();
     const supportSession = (await api(support, '/api/v1/users/me')).body.session.id;
     assert.equal((await api(support, '/api/v1/admin/users/lookup', { method: 'POST', body: { email: target.email }, sessionID: supportSession })).status, 403);
     assert.equal((await api(moderator, '/api/v1/admin/users?limit=1&limit=2')).status, 400);
@@ -1311,7 +1314,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
         await moderator.keyboard.press('Tab');
         assert(await dialog.evaluate((element) => element.contains(document.activeElement)), 'Native modal lost its focus trap');
       }
-      const reason = await dialog.getByLabel('Moderation reason', { exact: true }).elementHandle();
+      const reason = await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).elementHandle();
       await reason.fill(markers.cancelledDraft);
       await assertAdminPrivacy(moderator, actors.moderator.observed, markers);
       await layout(moderator, 'confirmation', evidence, artifactDirectory);
@@ -1319,7 +1322,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       await dialog.waitFor({ state: 'hidden' });
       assert(await reason.evaluate((element) => element.value === ''), 'Cancelled reason remained on the detached input');
       await reason.dispose();
-      assert(await moderator.getByRole('button', { name: 'Suspend', exact: true }).evaluate((element) => element === document.activeElement));
+      assert(await moderator.getByRole('button', { name: localizedText('Suspend'), exact: true }).evaluate((element) => element === document.activeElement));
       assert.equal(harness.fixture('admin-state', { user_id: target.user_id }).status, 'active');
       assert.equal(cancelledPatches.count, 0, 'Pre-send cancellation transmitted a status PATCH');
     } finally { cancelledPatches.close(); }
@@ -1330,10 +1333,10 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const conflict = operationResponse(moderator, statusPath, 'PATCH');
     await finalSubmit(dialog, markers.reason);
     assert.equal((await conflict).status(), 409);
-    await moderator.getByRole('alert').filter({ hasText: /account changed/i }).waitFor();
-    assert.equal(await moderator.getByLabel('Moderation reason', { exact: true }).count(), 0);
-    await moderator.getByRole('button', { name: 'Read current state', exact: true }).click();
-    await moderator.getByRole('button', { name: 'Suspend', exact: true }).waitFor();
+    await moderator.getByRole('alert').filter({ hasText: localizedText(/account changed/i) }).waitFor();
+    assert.equal(await moderator.getByLabel(localizedText('Moderation reason'), { exact: true }).count(), 0);
+    await moderator.getByRole('button', { name: localizedText('Read current state'), exact: true }).click();
+    await moderator.getByRole('button', { name: localizedText('Suspend'), exact: true }).waitFor();
 
     dialog = await confirmForm(moderator);
     const changed = operationResponse(moderator, statusPath, 'PATCH');
@@ -1342,14 +1345,14 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(changedResponse.status(), 204);
     assert.deepEqual(Object.keys(changedResponse.request().postDataJSON()).sort(), ['expected_revision', 'reason', 'status']);
     assert.equal(typeof changedResponse.request().postDataJSON().expected_revision, 'string');
-    await moderator.getByText('Status change confirmed. Current account state loaded.', { exact: true }).waitFor();
+    await moderator.getByText(localizedText('Status change confirmed. Current account state loaded.'), { exact: true }).waitFor();
     assert.equal(harness.fixture('admin-state', { user_id: target.user_id }).status, 'suspended');
     assert.equal((await api(ordinary, '/api/v1/users/me')).status, 401, 'Suspension left an old normal session usable');
     dialog = await confirmForm(moderator, 'Reactivate', 'totp', harness, actors.moderator.fixture);
     const restored = operationResponse(moderator, statusPath, 'PATCH');
     await finalSubmit(dialog, markers.reason, 'reactivate');
     assert.equal((await restored).status(), 204);
-    await moderator.getByText('Status change confirmed. Current account state loaded.', { exact: true }).waitFor();
+    await moderator.getByText(localizedText('Status change confirmed. Current account state loaded.'), { exact: true }).waitFor();
     assert.equal((await api(ordinary, '/api/v1/users/me')).status, 401, 'Reactivation resurrected an old normal session');
     evidence.checks.push('native modal keyboard loop/Escape return, no pre-verification reason, real UV and TOTP, revision conflict, suspension cuts off a live session and reactivation never restores it');
 
@@ -1388,19 +1391,19 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       await cdp.send('Fetch.enable', { patterns: [{ urlPattern: `${harness.origin}/api/v1/admin/users/*/status*`, requestStage: 'Response' }] });
       dialog = await confirmForm(moderator, 'Ban');
       await finalSubmit(dialog, markers.reason, 'ban');
-      await moderator.getByText(/Outcome unconfirmed; the action was not retried/).waitFor();
+      await moderator.getByText(localizedText(/Outcome unconfirmed; the action was not retried/)).waitFor();
       await Promise.all(interceptions);
       assert.equal(interceptionFailed, false, 'Native response interception failed');
       assert.equal(committed, 1);
       lostPatches.assertLostResponse();
       assert.equal(harness.fixture('admin-state', { user_id: target.user_id }).status, 'banned');
-      assert.equal(await moderator.getByRole('heading', { name: target.user_id, exact: true }).count(), 0);
+      assert.equal(await moderator.getByRole('heading', { name: localizedText(target.user_id), exact: true }).count(), 0);
       lostPatches.reconcile();
       const reread = operationResponse(moderator, `/api/v1/admin/users/${target.user_id}`, 'GET');
-      await moderator.getByRole('button', { name: 'Read current state', exact: true }).click();
+      await moderator.getByRole('button', { name: localizedText('Read current state'), exact: true }).click();
       assert.equal((await reread).status(), 200);
-      await moderator.getByRole('heading', { name: target.user_id, exact: true }).waitFor();
-      assert(await moderator.getByText(/matching status proves only current state/).isVisible());
+      await moderator.getByRole('heading', { name: localizedText(target.user_id), exact: true }).waitFor();
+      assert(await moderator.getByText(localizedText(/matching status proves only current state/)).isVisible());
       await Promise.all(interceptions);
       evidence.uncertainMutation = lostPatches.assertLostResponse();
       reconciled = true;
@@ -1423,7 +1426,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const combined = actors.combined.page;
     for (const account of [pending, deleting, actors.combined.fixture]) {
       await open(combined, harness, `/admin/users/${account.user_id}`);
-      const button = combined.getByRole('button', { name: 'Suspend', exact: true });
+      const button = combined.getByRole('button', { name: localizedText('Suspend'), exact: true });
       await button.waitFor();
       assert(await button.isDisabled());
     }
@@ -1432,7 +1435,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const protectedResponse = operationResponse(combined, `/api/v1/admin/users/${actors.dpo.fixture.user_id}/status`, 'PATCH');
     await finalSubmit(dialog, markers.reason);
     assert.equal((await protectedResponse).status(), 403);
-    await combined.getByText('The status change was not permitted. No change was confirmed.', { exact: true }).waitFor();
+    await combined.getByText(localizedText('The status change was not permitted. No change was confirmed.'), { exact: true }).waitFor();
     assert.equal((await api(combined, '/api/v1/users/me')).status, 200);
     evidence.checks.push('known self/deleting/unverified targets are disabled; privileged targets stay generic server-side denials');
 
@@ -1448,20 +1451,20 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const unsentPatches = observeStatusPatches(actors.combined.authenticator.cdp, harness.origin);
     try {
       await open(combined, harness, `/admin/users/${actors.ordinary.fixture.user_id}`);
-      await combined.getByRole('button', { name: 'Suspend', exact: true }).click();
+      await combined.getByRole('button', { name: localizedText('Suspend'), exact: true }).click();
       dialog = combined.getByTestId('stepup-dialog');
-      await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-      await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
-      await dialog.getByLabel('Authenticator code', { exact: true }).fill('123');
+      await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+      await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
+      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill('123');
       const resume = await hidePortal(combined, actors.combined.context, evidence, 'admin-ready');
       await resume();
       await combined.getByTestId('admin-ready').waitFor();
-      await dialog.getByText(/Your pending action was restored/).waitFor();
-      await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-      assert.equal(await dialog.getByLabel('Authenticator code', { exact: true }).inputValue(), '');
-      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.getByText(localizedText(/Your pending action was restored/)).waitFor();
+      await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+      assert.equal(await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).inputValue(), '');
+      await dialog.getByRole('button', { name: localizedText('Cancel'), exact: true }).click();
       dialog = await confirmForm(combined);
-      const backgroundReason = await dialog.getByLabel('Moderation reason', { exact: true }).elementHandle();
+      const backgroundReason = await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).elementHandle();
       await backgroundReason.fill(markers.backgroundDraft);
       await assertAdminPrivacy(combined, actors.combined.observed, markers);
       const returnToPage = await hidePortal(combined, actors.combined.context, evidence, 'admin-ready');
@@ -1475,9 +1478,9 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
 
       checkpoint = 'admin-grant-expiry';
       dialog = await confirmForm(combined);
-      const expiredReason = await dialog.getByLabel('Moderation reason', { exact: true }).elementHandle();
+      const expiredReason = await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).elementHandle();
       await expiredReason.fill(markers.expiredDraft);
-      await combined.getByRole('alert').filter({ hasText: /Verification expired/ }).waitFor({ timeout: 30_000 });
+      await combined.getByRole('alert').filter({ hasText: localizedText(/Verification expired/) }).waitFor({ timeout: 30_000 });
       assert.equal(await combined.getByTestId('stepup-dialog').count(), 0);
       assert(await expiredReason.evaluate((element) => element.value === ''), 'Expired reason remained on the detached input');
       await expiredReason.dispose();
@@ -1493,16 +1496,16 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     await finalSubmit(dialog, markers.reason);
     assert.equal((await revoked).status(), 403);
     await combined.getByTestId('admin-ready').waitFor({ state: 'hidden' });
-    assert.equal(await combined.getByLabel('Moderation reason', { exact: true }).count(), 0);
+    assert.equal(await combined.getByLabel(localizedText('Moderation reason'), { exact: true }).count(), 0);
     assert.equal((await api(combined, '/api/v1/users/me')).status, 200);
     evidence.checks.push('permission revocation after grant clears private state without logging out the normal session');
 
     checkpoint = 'admin-audit';
     await open(dpo, harness, '/admin/audit-logs');
-    await dpo.getByLabel('Event type (exact)', { exact: true }).fill(audit.event_type);
-    await dpo.getByLabel('Page size', { exact: true }).fill('20');
+    await dpo.getByLabel(localizedText('Event type (exact)'), { exact: true }).fill(audit.event_type);
+    await dpo.getByLabel(localizedText('Page size'), { exact: true }).fill('20');
     const logs = operationResponse(dpo, '/api/v1/admin/audit-logs', 'GET');
-    await dpo.getByRole('button', { name: 'Search audit logs', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Search audit logs'), exact: true }).click();
     const logsResponse = await logs;
     const logBody = await logsResponse.json();
     const logText = JSON.stringify(logBody);
@@ -1512,22 +1515,22 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert(logBody.items.some((row) => BigInt(row.seq) > BigInt(Number.MAX_SAFE_INTEGER)));
     const initialQuery = new URL(logsResponse.url()).searchParams;
     assert(initialQuery.get('start_time').endsWith('Z') && initialQuery.get('end_time').endsWith('Z'));
-    await dpo.getByRole('button', { name: /^View details for sequence / }).first().click();
-    const details = dpo.getByRole('dialog', { name: 'Audit record details', exact: true });
+    await dpo.getByRole('button', { name: localizedText(/^View details for sequence /) }).first().click();
+    const details = dpo.getByRole('dialog', { name: localizedText('Audit record details'), exact: true });
     await details.waitFor();
     assert((await details.textContent()).includes(markers.auditPayload), 'Audit details did not render the controlled payload as text');
     assert.equal(await details.locator('img, script, iframe, a[href]').count(), 0);
     assert.equal(await dpo.evaluate(() => Boolean(globalThis.__adminPayloadExecuted)), false);
     await assertAdminPrivacy(dpo, actors.dpo.observed, markers);
     await dpo.keyboard.press('Escape');
-    await dpo.getByLabel('Page size', { exact: true }).fill('2');
+    await dpo.getByLabel(localizedText('Page size'), { exact: true }).fill('2');
     const firstPage = operationResponse(dpo, '/api/v1/admin/audit-logs', 'GET');
-    await dpo.getByRole('button', { name: 'Search audit logs', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Search audit logs'), exact: true }).click();
     const firstResponse = await firstPage;
     const first = await firstResponse.json();
     assert(first.has_more && typeof first.next_before_seq === 'string');
     const older = operationResponse(dpo, '/api/v1/admin/audit-logs', 'GET');
-    await dpo.getByRole('button', { name: 'Older records', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Older records'), exact: true }).click();
     const olderResponse = await older;
     const olderQuery = new URL(olderResponse.url()).searchParams;
     assert.equal(olderQuery.get('before_seq'), first.next_before_seq);
@@ -1537,7 +1540,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert(olderBody.items.every((row) => BigInt(row.seq) < BigInt(first.next_before_seq)));
     // An upstream capture finishes before React accepts and renders that page.
     for (const row of olderBody.items)
-      await dpo.getByRole('button', { name: `View details for sequence ${row.seq}`, exact: true }).waitFor();
+      await dpo.getByRole('button', { name: localizedText(`View details for sequence ${row.seq}`), exact: true }).waitFor();
     await layout(dpo, 'audit', evidence, artifactDirectory);
     evidence.checks.push('real signed audit list exceeds 256KiB within its 4MiB budget, exact high-int64 keyset pages, UTC frozen filters, inert payload dialog');
 
@@ -1548,8 +1551,8 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       { status: 200, body: '{"items":' },
       { status: 200, body: JSON.stringify({ padding: 'x'.repeat(4 * 1024 * 1024) }) },
     ]) {
-      await queryFault(dpo, '/api/v1/admin/audit-logs', () => dpo.getByRole('button', { name: 'Search audit logs', exact: true }).click(), failure);
-      assert.equal(await dpo.getByRole('button', { name: /^View details for sequence / }).count(), 0);
+      await queryFault(dpo, '/api/v1/admin/audit-logs', () => dpo.getByRole('button', { name: localizedText('Search audit logs'), exact: true }).click(), failure);
+      assert.equal(await dpo.getByRole('button', { name: localizedText(/^View details for sequence /) }).count(), 0);
     }
     // A real outbox failure, not a fulfilled fake response, must withhold data.
     harness.fixture('admin-audit-failure', { scenario: 'on' });
@@ -1564,7 +1567,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     checkpoint = 'admin-integrity';
     await open(dpo, harness, '/admin/integrity');
     const firstProof = operationResponse(dpo, '/api/v1/admin/audit-logs/verify', 'GET');
-    await dpo.getByRole('button', { name: 'Start new run', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     const initial = await (await firstProof).json();
     assert.equal(initial.canonical_version, 2, 'Verifier must declare its canonical format');
     assert.equal(initial.verified, true, 'Untampered fixture chain must verify');
@@ -1574,22 +1577,22 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(initial.scope, 'database_relative_chain_and_retained_leaves; not complete ingestion, independent historical authenticity, or legal authorization');
     harness.fixture('admin-audit', { user_id: target.user_id });
     const continuation = operationResponse(dpo, '/api/v1/admin/audit-logs/verify', 'GET');
-    await dpo.getByRole('button', { name: 'Continue verification', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).click();
     const continuedResponse = await continuation;
     const continuedQuery = new URL(continuedResponse.url()).searchParams;
     assert.equal(continuedQuery.get('through_seq'), initial.through_seq);
     assert.equal(continuedQuery.get('after_seq'), initial.next_after_seq);
     assert.equal(continuedQuery.get('predecessor_hash'), initial.last_hash);
-    await dpo.getByRole('button', { name: 'Stop verification', exact: true }).click();
-    await dpo.getByText(/No complete-run conclusion was reached/).waitFor();
+    await dpo.getByRole('button', { name: localizedText('Stop verification'), exact: true }).click();
+    await dpo.getByText(localizedText(/No complete-run conclusion was reached/)).waitFor();
     await layout(dpo, 'integrity', evidence, artifactDirectory);
     const verifier = actors.super_admin.page;
     await open(verifier, harness, '/admin/integrity');
     assert.equal((await api(verifier, '/api/v1/admin/users')).status, 403);
     assert.equal((await api(verifier, '/api/v1/admin/audit-logs')).status, 403);
-    await verifier.getByLabel('Chain', { exact: true }).selectOption('ledger');
+    await verifier.getByLabel(localizedText('Chain'), { exact: true }).selectOption('ledger');
     const ledgerProof = operationResponse(verifier, '/api/v1/admin/ledger/verify', 'GET');
-    await verifier.getByRole('button', { name: 'Start new run', exact: true }).click();
+    await verifier.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     const ledgerResult = await (await ledgerProof).json();
     assert.equal(ledgerResult.chain, 'ledger');
     assert.equal(ledgerResult.scope, 'database_relative_chain_retained_leaves_and_erasure_annotations; annotations do not prove receipt chaining or legal authorization; not complete ingestion or independent historical authenticity');
@@ -1611,21 +1614,21 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     // Next.js also exposes a route-announcement alert in a shadow root. Scope
     // this assertion to the application's session feedback.
     await support.getByRole('main').getByRole('alert').filter({
-      hasText: 'Your session is no longer available. Sign in again to continue.',
+      hasText: localizedText('Your session is no longer available. Sign in again to continue.'),
     }).waitFor();
     assert.equal(await support.getByTestId('admin-ready').count(), 0);
-    assert.equal(await support.getByRole('link', { name: 'Sign in with a passkey', exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Fusers');
+    assert.equal(await support.getByRole('link', { name: localizedText('Sign in with a passkey'), exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Fusers');
     evidence.checks.push('background/history discard proof progress; real session expiry clears private data and strips detail identifiers from login returnTo');
 
     await open(moderator, harness, detailPath);
     const sibling = await actors.moderator.context.newPage();
     await visit(sibling, harness.origin, '/dashboard');
     await sibling.getByTestId('portal-ready').waitFor();
-    await sibling.getByRole('button', { name: 'Sign out', exact: true }).click();
+    await sibling.getByRole('button', { name: localizedText('Sign out'), exact: true }).click();
     await sibling.waitForURL(harness.origin + '/login');
     await moderator.bringToFront();
     await moderator.getByTestId('admin-ready').waitFor({ state: 'hidden' });
-    assert.equal(await moderator.getByRole('heading', { name: target.user_id, exact: true }).count(), 0);
+    assert.equal(await moderator.getByRole('heading', { name: localizedText(target.user_id), exact: true }).count(), 0);
     await sibling.close();
     evidence.checks.push('real cross-tab logout removes the admin view and broadcasts only the neutral invalidation marker');
 
@@ -1638,7 +1641,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const withoutLookup = (await api(dpo, '/api/v1/admin/capabilities')).body.capabilities;
     assert(withoutLookup.legal_holds_read && withoutLookup.legal_holds_apply && withoutLookup.legal_holds_release &&
       withoutLookup.preservation_requests_create && !withoutLookup.legal_inquiry_lookup);
-    assert.equal(await dpo.getByRole('button', { name: 'Attribution', exact: true }).count(), 0);
+    assert.equal(await dpo.getByRole('button', { name: localizedText('Attribution'), exact: true }).count(), 0);
     assert.equal((await api(dpo, legalLookup, { method: 'POST', body: {},
       sessionID: (await api(dpo, '/api/v1/users/me')).body.session.id })).status, 404);
     evidence.checks.push('real signer/operator lookup probe before both API replicas, missing/wrong/key-mismatch rejection and explicit fixture-omitted replica restart keeps holds independent while attribution is unmounted');
@@ -1650,19 +1653,19 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     evidence.checks.push('real signer delivery completes before a verified clean signer retirement for isolated destructive ledger fixtures; all other supervised processes remain health-checked');
     harness.fixture('admin-tamper', { scenario: 'ledger-payload-absent' });
     await open(dpo, harness, '/admin/integrity');
-    await dpo.getByLabel('Chain', { exact: true }).selectOption('ledger');
+    await dpo.getByLabel(localizedText('Chain'), { exact: true }).selectOption('ledger');
     const tampered = operationResponse(dpo, '/api/v1/admin/ledger/verify', 'GET');
-    await dpo.getByRole('button', { name: 'Start new run', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     const broken = await (await tampered).json();
     assert.equal(broken.verified, false);
     assert.equal(broken.failure_reason, 'payload_absent_without_erasure_record');
     await dpo.getByRole('main').getByRole('alert').waitFor();
-    assert(await dpo.getByRole('button', { name: 'Continue verification', exact: true }).isDisabled());
+    assert(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).isDisabled());
     harness.fixture('admin-chain-state', { scenario: 'erased' });
     let allErased = 0;
     for (let page = 0; page < 32; page++) {
       const nextProof = operationResponse(dpo, '/api/v1/admin/ledger/verify', 'GET');
-      await dpo.getByRole('button', { name: page === 0 ? 'Start new run' : 'Continue verification', exact: true }).click();
+      await dpo.getByRole('button', { name: localizedText(page === 0 ? 'Start new run' : 'Continue verification'), exact: true }).click();
       const result = await (await nextProof).json();
       assert(result.verified && result.checked > 0 && result.checked === result.erased_checked);
       allErased += result.checked;
@@ -1670,20 +1673,20 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       assert(page < 31, 'Fixture proof exceeded its bounded page budget');
     }
     assert(allErased > 0);
-    await dpo.getByText(/without verifying its erased content/).waitFor();
+    await dpo.getByText(localizedText(/without verifying its erased content/)).waitFor();
     harness.fixture('admin-chain-state', { scenario: 'empty' });
     const empty = operationResponse(dpo, '/api/v1/admin/ledger/verify', 'GET');
-    await dpo.getByRole('button', { name: 'Start new run', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     const emptyBody = await (await empty).json();
     assert(emptyBody.verified && emptyBody.complete && emptyBody.checked === 0);
-    await dpo.getByText('No records checked.', { exact: true }).waitFor();
-    await dpo.getByText(/not proof that no activity occurred/).waitFor();
+    await dpo.getByText(localizedText('No records checked.'), { exact: true }).waitFor();
+    await dpo.getByText(localizedText(/not proof that no activity occurred/)).waitFor();
     harness.fixture('admin-chain-state', { scenario: 'missing-head' });
     const missing = operationResponse(dpo, '/api/v1/admin/ledger/verify', 'GET');
-    await dpo.getByRole('button', { name: 'Start new run', exact: true }).click();
+    await dpo.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     assert.equal((await missing).status(), 400);
     await dpo.getByRole('main').getByRole('alert').waitFor();
-    assert(await dpo.getByRole('button', { name: 'Continue verification', exact: true }).isDisabled());
+    assert(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).isDisabled());
     evidence.checks.push('real tampered ledger stops; database-relative erasure annotations never claim content verification, receipt chaining or legal authorization; initialized empty and missing head stay distinct');
 
     checkpoint = 'admin-final';
@@ -1714,8 +1717,12 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    const evidence = await runAdminBrowser();
-    console.log(JSON.stringify(evidence, null, 2));
+    for (const locale of browserLocales) {
+      setBrowserLocale(locale);
+      const root = process.env.ADMIN_BROWSER_ARTIFACT_DIR;
+      const evidence = await runAdminBrowser({ directory: root ? resolve(root, locale) : undefined });
+      console.log(JSON.stringify(evidence, null, 2));
+    }
     console.log('Focused real-API admin browser checks and teardown passed');
   } catch (error) {
     console.error(browserFailure(error, checkpoint));

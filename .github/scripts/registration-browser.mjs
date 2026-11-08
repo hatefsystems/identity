@@ -16,7 +16,11 @@ import { createServer as httpsServer } from 'node:https';
 import { createServer as tcpServer, connect as tcpConnect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { createServer as tlsServer } from 'node:tls';
+import {
+  createServer as tlsServer,
+  getCACertificates,
+  setDefaultCACertificates,
+} from 'node:tls';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -27,9 +31,11 @@ import {
 } from './acceptance-report.mjs';
 import {
   acceptanceLifecycle,
+  assertLocalOrigin,
   createOwnedDockerResource,
   removeOwnedDockerResource,
   portalCleanup,
+  privateLogSummary,
   startPortalServices,
 } from './portal-harness.mjs';
 import { hashFile } from './release-images.mjs';
@@ -37,6 +43,13 @@ import { hashFile } from './release-images.mjs';
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const script = fileURLToPath(import.meta.url);
 const root = '/api/v1/auth/register';
+const safeLoginResponsePaths = new Set([
+  '/api/v1/auth/webauthn/login/generate-options',
+  '/api/v1/auth/webauthn/login/verify',
+  '/api/v1/auth/profile',
+  '/api/v1/users/me',
+  '/api/v1/users/me/sessions',
+]);
 const immutable = /^sha256:[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const capability = /^[A-Za-z0-9_-]{43}$/;
@@ -69,6 +82,7 @@ const failureStages = Object.freeze({
   'controller-start': 'controller',
   'controller-network': 'controller',
   'controller-ready': 'controller',
+  'controller-running': 'controller',
   'gateway-network': 'controller',
   'gateway-connect': 'controller',
   'gateway-targets': 'controller',
@@ -80,6 +94,7 @@ const failureStages = Object.freeze({
   'api-create': 'api',
   'api-start': 'api',
   'api-network': 'api',
+  'api-running': 'api',
   'api-ready': 'api',
   'web-start': 'startweb',
   'web-ready': 'startweb',
@@ -580,7 +595,8 @@ export function gatewayForwardTarget(targets, method, path) {
   fixed(
     !url.search &&
       !url.hash &&
-      (url.pathname === '/readyz' || url.pathname.startsWith('/api/v1/auth/')) &&
+      (url.pathname === '/readyz' || url.pathname.startsWith('/api/v1/auth/') ||
+        (method === 'GET' && ['/api/v1/users/me', '/api/v1/users/me/sessions'].includes(url.pathname))) &&
       url.pathname === path,
     'Gateway route is not a fixed inbound API path'
   );
@@ -596,6 +612,84 @@ export function gatewayProvisioningTarget(targets, body) {
   return { address: `nats://${targets.natsHost}:4222`, runID: targets.runID };
 }
 
+// Playwright route.fetch() runs through Node's TLS client, not Chromium's SPKI
+// exception. Trust only this run's private CA, and restore the default trust
+// store and child-process environment after the acceptance run.
+export function trustRegistrationFixtureCA(caPEM, caPath) {
+  fixed(
+    typeof caPEM === 'string' && new X509Certificate(caPEM).ca &&
+      typeof caPath === 'string' && isAbsolute(caPath),
+    'Invalid run-owned browser TLS authority'
+  );
+  const originalCAs = getCACertificates('default');
+  const originalExtraCA = process.env.NODE_EXTRA_CA_CERTS;
+  setDefaultCACertificates([...originalCAs, caPEM]);
+  // Also cover a Playwright driver that launches its own Node.js child.
+  // NODE_EXTRA_CA_CERTS is read only when that child starts.
+  process.env.NODE_EXTRA_CA_CERTS = caPath;
+  return () => {
+    setDefaultCACertificates(originalCAs);
+    if (originalExtraCA === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+    else process.env.NODE_EXTRA_CA_CERTS = originalExtraCA;
+  };
+}
+
+// HTTP/1.1 hop-by-hop framing belongs to each individual socket, never to a
+// forwarded request. In particular, a browser's Connection nominations may
+// not be replayed toward the API; Node must calculate outbound body framing.
+export function registrationForwardHeaders(incoming, origin) {
+  const headers = { ...incoming };
+  const hop = new Set([
+    'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization',
+    'proxy-authenticate', 'upgrade', 'te', 'trailer', 'transfer-encoding',
+  ]);
+  if (typeof incoming.connection === 'string')
+    for (const name of incoming.connection.split(','))
+      if (/^[a-z0-9-]{1,128}$/i.test(name.trim())) hop.add(name.trim().toLowerCase());
+  for (const name of Object.keys(headers))
+    if (hop.has(name.toLowerCase())) delete headers[name];
+  return {
+    ...headers,
+    host: new URL(origin).host,
+    'x-forwarded-proto': 'https',
+    'x-forwarded-for': '127.0.0.1',
+    'x-forwarded-host': new URL(origin).host,
+  };
+}
+
+// Chromium can discard streamed fetch bodies before CDP retrieves them. Retain
+// only this request's real ingress bytes in memory, without replaying the request.
+export function captureRegistrationResponse(result) {
+  const promise = new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const fail = () => reject(new Error('Registration ingress response was incomplete'));
+    result.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 256 * 1024) {
+        chunks.splice(0);
+        reject(new Error('Registration ingress response exceeded its byte limit'));
+      } else chunks.push(chunk);
+    });
+    result.on('aborted', fail);
+    result.on('error', fail);
+    result.on('end', () => {
+      try {
+        const bytes = Buffer.concat(chunks);
+        const value = result.statusCode === 204 ? undefined
+          : JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        fixed(result.statusCode !== 204 || size === 0, 'Unexpected registration 204 body');
+        resolve({ status: result.statusCode, value });
+      } catch {
+        reject(new Error('Registration ingress response was not valid JSON'));
+      }
+    });
+  });
+  // The browser may cancel before its observer asks for this response.
+  void promise.catch(() => {});
+  return promise;
+}
+
 export async function startRegistrationGateway(config, track) {
   const targets = validateGatewayTargets(config.gateway);
   const gateway = httpServer((request, response) => {
@@ -607,24 +701,7 @@ export async function startRegistrationGateway(config, track) {
       response.end();
       return;
     }
-    const headers = {
-      ...request.headers,
-      host: new URL(config.origin).host,
-      'x-forwarded-proto': 'https',
-      'x-forwarded-for': '127.0.0.1',
-      'x-forwarded-host': new URL(config.origin).host,
-    };
-    for (const key of [
-      'connection',
-      'proxy-connection',
-      'proxy-authorization',
-      'proxy-authenticate',
-      'upgrade',
-      'te',
-      'trailer',
-      'transfer-encoding',
-    ])
-      delete headers[key];
+    const headers = registrationForwardHeaders(request.headers, config.origin);
     const upstream = httpRequest({ ...target, headers, timeout: 15000 }, (result) => {
       response.writeHead(result.statusCode, result.headers);
       result.pipe(response);
@@ -648,6 +725,80 @@ export async function startRegistrationGateway(config, track) {
     if (gateway.listening) await closeServer(gateway);
     throw new RegistrationFailure('controller-start', false);
   }
+}
+
+// This is the production-required anti-enumeration decoy key, not a mock
+// authentication/provider switch. Keep it independent from every other secret.
+export function registrationPasskeyEnvironment(origin) {
+  assertLocalOrigin(origin);
+  return {
+    WEBAUTHN_RP_ID: 'localhost',
+    WEBAUTHN_RP_ORIGINS: origin,
+    WEBAUTHN_RP_DISPLAY_NAME: 'Registration acceptance',
+    WEBAUTHN_RESIDENT_KEY: 'required',
+    WEBAUTHN_USER_VERIFICATION: 'required',
+    WEBAUTHN_MOCK_CHALLENGE_KEY: randomBytes(32).toString('base64'),
+  };
+}
+
+export function registrationSecretEnvironmentValues(environment) {
+  return Object.entries(environment)
+    // Resident-key policy is public configuration, not key material.
+    .filter(([name]) => name !== 'WEBAUTHN_RESIDENT_KEY' &&
+      /(?:KEY|KEK|PEPPER|PASSWORD|USERNAME|_PEM|DATABASE_URL)$/.test(name))
+    .map(([, value]) => value);
+}
+
+// Inspect records may use a network name or ID as their map key. Identity is
+// the immutable NetworkID, plus the exact count and reserved address.
+export function assertRegistrationAPINetwork(state, image, networkID, address) {
+  if (!state.State?.Running) throw new RegistrationFailure('api-running', false);
+  const peers = Object.values(state.NetworkSettings?.Networks ?? {});
+  fixed(state.Image === image && peers.length === 1 && peers[0].NetworkID === networkID &&
+    peers[0].IPAddress === address, 'API escaped the owned internal network');
+}
+
+// Emit only fixed public setting names/categories, never exception text/values.
+export function registrationStartupSummary(output) {
+  const settings = ['APP_ENV', 'OIDC_CLIENTS_JSON', 'OIDC_ISSUER', 'SESSION_COOKIE_NAME', 'WEBAUTHN_MOCK_CHALLENGE_KEY',
+    'ENVELOPE_MASTER_KEK', 'ENVELOPE_BLIND_INDEX_PEPPER', 'STEPUP_REPLAY_HMAC_KEY',
+    'RECOVERY_CODES_HASH_PEPPER', 'SMS_IR_KEY_MODE', 'SMS_GATEWAY_API_KEY',
+    'REGISTRATION_CLEANUP_DATABASE_URL', 'REGISTRATION_SMTP_HOST'];
+  const text = String(output).slice(-65536);
+  return { settings: settings.filter((name) => text.includes(name)),
+    categories: ['configuration', 'database', 'redis', 'registration', 'permission', 'smtp', 'nats'].filter((name) =>
+      ({ configuration: /config:/i, database: /database|postgres|sqlstate/i, redis: /redis/i,
+        registration: /registration/i, permission: /permission denied|42501|EACCES/i,
+        smtp: /smtp/i, nats: /nats|jetstream/i })[name].test(text)) };
+}
+
+// Public diagnostics must never copy exception messages, request bodies or URLs.
+export function registrationBrowserDiagnostic(error, observed = {}) {
+  const message = String(error?.message ?? '');
+  const frames = String(error?.stack ?? '').split('\n').filter((frame) => !/^\s+at fixed[ (]/.test(frame)).join('\n');
+  const line = Number(/registration-browser\.mjs:(\d+):\d+/.exec(frames)?.[1]);
+  const paths = new Set([...safeLoginResponsePaths, root, ...['start', 'email/resend', 'email/verify', 'result',
+    'phone/send', 'phone/verify', 'passkey/options'].map((suffix) => `${root}/${suffix}`)]);
+  return {
+    kind: /strict mode violation/.test(message) ? 'ambiguous-locator'
+      : /No resource with given identifier|No data found|Response body.*unavailable|Network\.getResponseBody/.test(message) ? 'response-body-unavailable'
+      : error?.name === 'TimeoutError' || /\bTimeout [0-9]+ms exceeded\b/.test(message) ? 'timeout'
+      : error?.code === 'ERR_ASSERTION' ? 'assertion' : 'other',
+    line: Number.isSafeInteger(line) && line > 0 && line < 10000 ? line : null,
+    replies: (Array.isArray(observed.replies) ? observed.replies : []).flatMap((reply) =>
+      paths.has(reply?.path) && Number.isInteger(reply.status) && reply.status >= 100 && reply.status <= 599
+        ? [{ path: reply.path, status: reply.status }] : []).slice(-12),
+    failures: ['browser-runtime', 'browser-csp-hydration', 'browser-private-console',
+      'unexpected-download', 'browser-request-privacy', 'browser-response-privacy', 'response-body-unavailable']
+      .filter((name) => observed.failures instanceof Set && observed.failures.has(name)),
+  };
+}
+
+// Owner-only bind-mounted TLS material must be read by its creating host UID.
+// Root with dropped DAC capabilities cannot read another user's 0700/0600 files.
+export function registrationControllerUser(uid = process.getuid?.() ?? 0, gid = process.getgid?.() ?? 0) {
+  fixed([uid, gid].every((value) => Number.isInteger(value) && value >= 0 && value < 4294967295), 'Invalid controller credential owner');
+  return `${uid}:${gid}`;
 }
 
 // This controller is mounted only into a separately owned Node container. It is
@@ -1181,7 +1332,8 @@ async function startProductionWeb(portNumber, lifecycle) {
 export async function startRegistrationHarness(inputs, lifecycle, identity) {
   const cleanup = [],
     secrets = new Set(),
-    containers = [];
+    containers = [],
+    registrationResponses = new Map();
   const remember = (value) => {
     if (typeof value === 'string' && value.length >= 6) {
       secrets.add(value);
@@ -1197,7 +1349,8 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     cleanupKnown = true;
   const close = async () => {
     lifecycle.beginTeardown();
-    return boundedTeardown(dispose, lifecycle);
+    try { return await boundedTeardown(dispose, lifecycle); }
+    finally { registrationResponses.clear(); }
   };
   try {
     const manifest = await readReport(inputs.manifest);
@@ -1318,15 +1471,13 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
             method: request.method,
             path: request.url,
             timeout: 15000,
-            headers: {
-              ...request.headers,
-              host: new URL(origin).host,
-              'x-forwarded-for': '127.0.0.1',
-              'x-forwarded-proto': 'https',
-              'x-forwarded-host': new URL(origin).host,
-            },
+            headers: registrationForwardHeaders(request.headers, origin),
           },
           (result) => {
+            if ((path === root || path.startsWith(root + '/')) && request.headers.dpop) {
+              const proof = createHash('sha256').update(request.headers.dpop).digest('hex');
+              registrationResponses.set(proof, { path, body: captureRegistrationResponse(result) });
+            }
             response.writeHead(result.statusCode, result.headers);
             result.pipe(response);
           }
@@ -1393,7 +1544,7 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
       imageID = inputs.image,
       env = {},
       command = [],
-      containerNetwork = network.Id
+      containerNetwork = services.network
     ) => {
       const owned = createOwnedDockerResource(
         'container',
@@ -1424,6 +1575,8 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
         '127.0.0.1::8080',
         '--publish',
         '127.0.0.1::8081',
+        '--user',
+        registrationControllerUser(),
         '--cap-drop',
         'ALL',
         '--cap-add',
@@ -1514,6 +1667,8 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     };
     failureCheck = 'controller-ready';
     await waitUntil(async () => {
+      const [state] = JSON.parse(docker(['inspect', ownedController.id], lifecycle));
+      if (!state.State.Running) throw new RegistrationFailure('controller-running', false);
       try {
         return (await control('/summary')).violations === 0;
       } catch {
@@ -1629,11 +1784,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
           allowed_scopes: ['openid', 'profile'],
         },
       ]),
-      WEBAUTHN_RP_ID: 'localhost',
-      WEBAUTHN_RP_ORIGINS: origin,
-      WEBAUTHN_RP_DISPLAY_NAME: 'Registration acceptance',
-      WEBAUTHN_RESIDENT_KEY: 'required',
-      WEBAUTHN_USER_VERIFICATION: 'required',
+      ...registrationPasskeyEnvironment(origin),
       ENVELOPE_MASTER_KEK: randomBytes(32).toString('base64'),
       ENVELOPE_MASTER_KEK_VERSION: '1',
       ENVELOPE_BLIND_INDEX_PEPPER: randomBytes(32).toString('base64'),
@@ -1678,8 +1829,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
       ALL_PROXY: '',
       NO_PROXY: '*',
     };
-    for (const [name, value] of Object.entries(env))
-      if (/(?:KEY|KEK|PEPPER|PASSWORD|USERNAME|_PEM|DATABASE_URL)$/.test(name)) remember(value);
+    for (const value of registrationSecretEnvironmentValues(env)) remember(value);
     failureCheck = 'api-create';
     const api = createContainer(
       'api',
@@ -1701,13 +1851,11 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
     docker(['start', api.id], lifecycle);
     const [apiState] = JSON.parse(docker(['inspect', api.id], lifecycle));
     failureCheck = 'api-network';
-    fixed(
-      apiState.Image === inputs.image &&
-        Object.keys(apiState.NetworkSettings.Networks).length === 1 &&
-        apiState.NetworkSettings.Networks[services.network]?.NetworkID === network.Id &&
-        apiState.NetworkSettings.Networks[services.network]?.IPAddress === gatewayTargets.apiHost,
-      'API escaped the owned internal network'
-    );
+    if (!apiState.State.Running) {
+      const output = docker(['logs', '--tail', '20', api.id], lifecycle, { includeStderr: true });
+      console.log(JSON.stringify({ check: 'registration-api-startup', ...registrationStartupSummary(output) }));
+    }
+    assertRegistrationAPINetwork(apiState, inputs.image, network.Id, gatewayTargets.apiHost);
     failureCheck = 'web-start';
     web = await startProductionWeb(nextPort, lifecycle);
     cleanup.push(web.close);
@@ -1755,6 +1903,8 @@ phone_verified_at=phone_verified_at-interval '20 minutes',passkey_created_at=pas
       identity,
       origin,
       tlsSPKI: tls.spki,
+      tlsCA: tls.ca,
+      tlsCAPath: resolve(temporary, 'ca.pem'),
       control,
       inspect,
       expire,
@@ -1783,6 +1933,15 @@ phone_verified_at=phone_verified_at-interval '20 minutes',passkey_created_at=pas
           .split(/\r?\n/)
           .filter(Boolean).length,
       remember,
+      async registrationResponse(response) {
+        const proof = response.request().headers().dpop;
+        fixed(typeof proof === 'string', 'Missing observed registration proof');
+        const captured = registrationResponses.get(createHash('sha256').update(proof).digest('hex'));
+        fixed(captured?.path === new URL(response.url()).pathname, 'Unbound registration ingress response');
+        const result = await captured.body;
+        fixed(result.status === response.status(), 'Registration ingress/browser status mismatch');
+        return result.value;
+      },
       assertPrivateLogs() {
         const outputs = [
           web.privateOutput(),
@@ -1790,9 +1949,13 @@ phone_verified_at=phone_verified_at-interval '20 minutes',passkey_created_at=pas
             docker(['logs', item.id], lifecycle, { includeStderr: true })
           ),
         ];
-        for (const output of outputs)
-          for (const secret of secrets)
-            fixed(!output.includes(secret), 'Private proof/provider data entered supervised logs');
+        for (const [index, output] of outputs.entries()) {
+          const matched = [...secrets].filter((secret) => output.includes(secret));
+          if (matched.length)
+            console.error(JSON.stringify({ check: 'registration-private-log-failure', index,
+              ...privateLogSummary(output, matched) }));
+          fixed(matched.length === 0, 'Private proof/provider data entered supervised logs');
+        }
       },
     };
   } catch (error) {
@@ -1870,7 +2033,13 @@ function observe(context, harness) {
       }
     });
     page.on('response', (response) => {
-      if (!new URL(response.url()).pathname.startsWith('/api/')) return;
+      const pathname = new URL(response.url()).pathname;
+      if (!pathname.startsWith('/api/')) return;
+      // Only fixed, public login route names and numeric statuses are recorded.
+      // These checkpoints distinguish auth failure from SPA navigation failure.
+      const reply = { path: pathname, status: response.status() };
+      if (safeLoginResponsePaths.has(pathname) || pathname === root || pathname.startsWith(root + '/'))
+        state.replies.push(reply);
       const check = (async () => {
         const path = new URL(response.url()).pathname,
           headers = await response.allHeaders();
@@ -1883,8 +2052,8 @@ function observe(context, harness) {
           fixed(!headers['set-cookie'], 'Signup minted a session');
           let value;
           if (response.status() !== 204 && /json/.test(headers['content-type'] || ''))
-            value = await response.json();
-          state.replies.push({ path, status: response.status(), value, headers });
+            value = await harness.registrationResponse(response);
+          Object.assign(reply, { value, headers });
           if (path === root + '/start' && response.status() === 201) {
             fixed(
               uuid.test(value.attempt_id) && capability.test(value.capability),
@@ -1900,7 +2069,13 @@ function observe(context, harness) {
           harness.remember(headers['set-cookie']);
           harness.remember(headers['set-cookie'].split(';')[0].split('=').slice(1).join('='));
         }
-      })().catch(() => state.failures.add('browser-response-privacy'));
+      })().catch((error) => {
+        state.failures.add('browser-response-privacy');
+        if (!page.isClosed())
+          console.error(JSON.stringify({ check: 'registration-response-failure', ...registrationBrowserDiagnostic(error, { replies: [reply] }) }));
+        if (registrationBrowserDiagnostic(error).kind === 'response-body-unavailable')
+          state.failures.add('response-body-unavailable');
+      });
       state.pending.push(check);
     });
   });
@@ -2079,6 +2254,7 @@ async function newBrowserContext(browser, harness, options = {}) {
   return { context, page, observed };
 }
 const button = (page, label) => page.getByRole('button', { name: label, exact: true });
+const registrationAlert = (page) => page.locator('[data-registration-feedback]').getByRole('alert');
 async function startAttempt(page, observed, harness, suffix) {
   const raw = `  آزمايش${suffix}@BÜCHER.example  `,
     email = `آزمايش${suffix}@xn--bcher-kva.example`;
@@ -2178,7 +2354,7 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
     const wrong = await foreign.newPage();
     await wrong.goto(proof.link);
     await button(wrong, 'Verify email ownership').click();
-    await wrong.getByRole('alert').waitFor();
+    await registrationAlert(wrong).waitFor();
     fixed(new URL(wrong.url()).hash === '', 'Wrong-browser proof fragment remained');
     const initializedKey = await wrong.evaluate(async () => {
       if (!(await indexedDB.databases()).some((entry) => entry.name === 'hatef-portal-dpop'))
@@ -2314,10 +2490,10 @@ async function exerciseSuccessfulSignup(
       await page.getByLabel('SMS verification code', { exact: true }).fill(wrong);
       await button(page, 'Verify phone').click();
       fixed(
-        (await (await wrongReply).json()).error === 'proof_required',
+        (await harness.registrationResponse(await wrongReply)).error === 'proof_required',
         'Wrong OTP was not a definitive proof_required rejection'
       );
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       await waitUntil(
         () => page.getByLabel('SMS verification code', { exact: true }).isEnabled(),
         harness.lifecycle
@@ -2344,7 +2520,7 @@ async function exerciseSuccessfulSignup(
     }
     if (rateResend) {
       await button(page, 'Send a new SMS code').click();
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       await waitUntil(async () => {
         await Promise.all(observed.pending);
         return observed.replies.some(
@@ -2444,7 +2620,7 @@ async function exerciseSuccessfulSignup(
           Promise.reject(new DOMException('User canceled authenticator', 'NotAllowedError'));
       });
       await button(page, 'Create passkey and complete registration').click();
-      await page.getByRole('alert').waitFor();
+      await registrationAlert(page).waitFor();
       fixed(
         optionsSeen && harness.inspect(authority.email).accounts === 0,
         'Canceled passkey created an account'
@@ -2622,6 +2798,9 @@ async function exerciseSuccessfulSignup(
     );
     await Promise.all(observed.pending);
     fixed(observed.failures.size === 0, 'Browser CSP, privacy or runtime assertion failed');
+  } catch (error) {
+    console.error(JSON.stringify({ check: 'registration-flow-failure', ...registrationBrowserDiagnostic(error, observed) }));
+    throw error;
   } finally {
     try {
       if (lost && !page.isClosed())
@@ -2655,9 +2834,10 @@ async function exerciseBoundaries(browser, harness, mark) {
           await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
           'Registration overflowed mobile/desktop width'
         );
+        const status = page.locator('[data-registration-feedback]').getByRole('status');
         fixed(
-          (await page.getByRole('status').count()) === 1 &&
-            (await page.getByRole('status').getAttribute('aria-live')) === 'polite',
+          (await status.count()) === 1 &&
+            (await status.getAttribute('aria-live')) === 'polite',
           'Registration status is not accessible'
         );
         await page.keyboard.press('Tab');
@@ -2711,7 +2891,7 @@ async function exerciseBoundaries(browser, harness, mark) {
       .fill(`unsupported${randomBytes(6).toString('hex')}@example.test`);
     await page.getByLabel('Iranian mobile number', { exact: true }).fill('09123456789');
     await button(page, 'Start registration and send email').click();
-    await page.getByRole('alert').waitFor();
+    await registrationAlert(page).waitFor();
     fixed(observed.starts.length === 0, 'Unsupported passkey allocated an attempt');
   } finally {
     await unsupported.close();
@@ -2750,6 +2930,7 @@ async function exerciseBoundaries(browser, harness, mark) {
     await button(page, 'Cancel registration').click();
     await button(page, 'Start a new registration').click();
     const rotated = await startAttempt(page, observed, harness, randomBytes(6).toString('hex'));
+    const postsBeforeRotation = observed.posts.length;
     const tab = await context.newPage();
     await document(tab, harness, '/login');
     await tab.evaluate(async () => {
@@ -2780,10 +2961,14 @@ async function exerciseBoundaries(browser, harness, mark) {
       });
     });
     await page.bringToFront();
+    // Headless bringToFront does not guarantee a native visibility transition.
+    // Exercise the real foreground listener with the actual cross-tab IDB key.
+    fixed(await page.evaluate(() => document.visibilityState === 'visible'), 'Registration key check requires a visible document');
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await button(page, 'Start a new registration').waitFor();
     fixed(
-      (await harness.inspect(rotated.email)).accounts === 0,
-      'Cross-tab key change created an account'
+      (await harness.inspect(rotated.email)).accounts === 0 && observed.posts.length === postsBeforeRotation,
+      'Cross-tab key change created an account or replayed API work'
     );
     await tab.close();
     mark('cross-tab-key-change-clears');
@@ -2803,7 +2988,8 @@ export async function runRegistrationBrowser() {
     cleanup = { completed: false },
     failed = true,
     failureCheck = 'inputs',
-    failure;
+    failure,
+    restoreFixtureCA = () => {};
   const mark = (check) => {
     lifecycle.check();
     fixed(registrationChecks.includes(check), 'Unknown executed registration check');
@@ -2828,6 +3014,7 @@ export async function runRegistrationBrowser() {
     lifecycle.check();
     failureCheck = 'manifest-read';
     harness = await startRegistrationHarness(inputs, lifecycle, identity);
+    restoreFixtureCA = trustRegistrationFixtureCA(harness.tlsCA, harness.tlsCAPath);
     mark('immutable-quality-image');
     mark('isolated-production-services');
     mark('packaged-migration-cleanup');
@@ -2902,6 +3089,7 @@ export async function runRegistrationBrowser() {
     failed = false;
     return report;
   } catch (error) {
+    if (harness) console.error(JSON.stringify({ check: 'registration-browser-failure', ...registrationBrowserDiagnostic(error) }));
     failure = registrationFailureDetails(error, failureCheck);
     if (!harness) cleanup = failure.cleanup;
   } finally {
@@ -2918,6 +3106,7 @@ export async function runRegistrationBrowser() {
       teardownFailed = true;
     }
     lifecycle.signal.removeEventListener('abort', interrupted);
+    restoreFixtureCA();
     lifecycle.release();
     if (failed && inputs && identity) {
       const detail = failure ?? registrationFailureDetails(undefined, failureCheck);

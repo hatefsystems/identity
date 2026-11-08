@@ -1,3 +1,8 @@
+'use client';
+
+import { useTranslations } from 'next-intl';
+import type { MessageDescriptor } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
 import { Button, Input, Label, cn } from '@hatef/ui';
 import { CircleAlert, Eye, EyeOff, Info, LoaderCircle } from 'lucide-react';
 import {
@@ -21,8 +26,10 @@ export function AuthField({
 }: Omit<ComponentProps<typeof Input>, 'id' | 'aria-describedby' | 'aria-invalid'> & {
   label: string;
   hint?: string;
-  error?: string;
+  error?: MessageDescriptor;
 }) {
+  const t = useTranslations();
+  const message = useMessage();
   const id = useId();
   const [visible, setVisible] = useState(false);
   const isPassword = type === 'password';
@@ -31,16 +38,17 @@ export function AuthField({
   return (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
-      <div className="relative">
+      <div className="relative" dir={isPassword ? 'ltr' : undefined}>
         <Input
           {...props}
           id={id}
+          dir={isPassword || type === 'email' || type === 'tel' || props.inputMode === 'numeric' ? 'ltr' : 'auto'}
           type={isPassword && visible ? 'text' : type}
           aria-describedby={describedBy || undefined}
           aria-invalid={Boolean(error)}
           className={cn(
             'h-11 min-w-0 border-slate-500 aria-[invalid=true]:border-red-700 dark:border-slate-400 dark:aria-[invalid=true]:border-red-400',
-            isPassword && 'pr-12',
+            isPassword && 'pe-12',
             className
           )}
         />
@@ -49,9 +57,11 @@ export function AuthField({
             type="button"
             variant="ghost"
             size="icon"
-            className="absolute right-0 top-0 h-11 w-11 hover:bg-transparent"
+            className="absolute end-0 top-0 h-11 w-11 hover:bg-transparent"
             disabled={props.disabled}
-            aria-label={`${visible ? 'Hide' : 'Show'} ${label.toLowerCase()}`}
+            aria-label={t(
+              `auth.fields.${visible ? 'hide' : 'show'}${props.name === 'confirmation' ? 'ConfirmPassword' : props.autoComplete === 'new-password' ? 'NewPassword' : 'Password'}`
+            )}
             aria-pressed={visible}
             aria-controls={id}
             onClick={() => setVisible(!visible)}
@@ -67,7 +77,7 @@ export function AuthField({
       )}
       {error && (
         <p id={`${id}-error`} className="text-sm text-red-700 dark:text-red-400">
-          {error}
+          {message(error)}
         </p>
       )}
     </div>
@@ -83,11 +93,12 @@ type FormMessages = {
 };
 
 function FormFeedback({ status, messages }: { status: FormStatus; messages: FormMessages }) {
+  const t = useTranslations();
   const feedback = useRef<HTMLDivElement>(null);
   const hasError = !['idle', 'pending', 'success'].includes(status);
   const error =
     status === 'rate-limited'
-      ? 'Too many attempts. Please try again later.'
+      ? t('auth.forms.rateLimited')
       : messages[status as keyof FormMessages] || messages.error;
 
   useEffect(() => {
@@ -149,6 +160,7 @@ export function AuthForm({
   messages: FormMessages;
   children?: ReactNode;
 }) {
+  const t = useTranslations();
   const noticeId = useId();
 
   return (
@@ -160,8 +172,8 @@ export function AuthForm({
         >
           <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <p>
-            <span className="block font-medium">UI preview</span>
-            This form is not connected yet. Do not enter real credentials.
+            <span className="block font-medium">{t('auth.preview.title')}</span>
+            {t('auth.preview.notice')}
           </p>
         </div>
       )}

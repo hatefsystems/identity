@@ -1,6 +1,9 @@
 'use client';
 
 import { Button, Input, Label } from '@hatef/ui';
+import { useTranslations } from 'next-intl';
+import type { Message, MessageDescriptor } from '../../i18n/messages';
+import { useMessage } from '../../i18n/use-message';
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import type { StepUpChallenge, StepUpGrant } from '../_lib/portal/contracts';
 import type { StepUpIntent } from '../_lib/portal/action-intent';
@@ -21,31 +24,33 @@ export function StepUpDialog({
   resumeMethod,
   mode = 'default',
   verifiedContent,
-  verifiedStatus = 'Applying the confirmed action...',
+  verifiedStatus = { key: 'security.stepUp.applying' },
 }: {
   title: string;
   description: ReactNode;
   onCancel: () => void;
   onAuthorized: (grant: StepUpGrant, signal: AbortSignal) => Promise<void>;
-  actionError?: (error: unknown) => string;
+  actionError?: (error: unknown) => MessageDescriptor;
   intent?: StepUpIntent;
   resumeMethod?: 'totp';
   mode?: 'default' | 'webauthn-only';
   // Keep onAuthorized pending for the entire confirmation stage. Its finally
   // block owns the grant; callers must never retain authority after it returns.
   verifiedContent?: ReactNode;
-  verifiedStatus?: string;
+  verifiedStatus?: MessageDescriptor;
 }) {
+  const t = useTranslations('security.stepUp');
+  const message = useMessage();
   const { client, rememberStepUp } = usePortal();
   const webauthnOnly = mode === 'webauthn-only';
   const [challenge, setChallenge] = useState<StepUpChallenge | null>(null);
   const [method, setMethod] = useState<'webauthn' | 'totp'>(
     webauthnOnly ? 'webauthn' : (resumeMethod ?? 'webauthn')
   );
-  const [pending, setPending] = useState('');
-  const [error, setError] = useState('');
+  const [pending, setPending] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
   const [code, setCode] = useState('');
-  const [codeError, setCodeError] = useState('');
+  const [codeError, setCodeError] = useState<Message>('');
   const [verified, setVerified] = useState(false);
   const busy = useRef(false);
   const close = useRef(onCancel);
@@ -113,7 +118,7 @@ export function StepUpDialog({
     busy.current = true;
     const { signal } = lifetime.current;
     setError('');
-    setPending('Preparing fresh verification...');
+    setPending({ key: 'security.stepUp.preparing' });
     try {
       const value = await client.stepUpChallenge(signal);
       throwIfAborted(signal);
@@ -140,7 +145,7 @@ export function StepUpDialog({
     if (busy.current || !challenge || !lifetime.current) return;
     if (webauthnOnly && method !== 'webauthn') return;
     if (method === 'totp' && !/^[0-9]{6}$/.test(code)) {
-      setCodeError('Enter the six-digit code from your authenticator app.');
+      setCodeError({ key: 'security.stepUp.codeError' });
       input.current?.focus();
       return;
     }
@@ -152,8 +157,8 @@ export function StepUpDialog({
     setCodeError('');
     setPending(
       method === 'webauthn'
-        ? 'Complete PIN or biometric verification on your authenticator.'
-        : 'Verifying your authenticator code...'
+        ? { key: 'security.stepUp.passkeyPending' }
+        : { key: 'security.stepUp.codePending' }
     );
     try {
       const proof =
@@ -212,8 +217,7 @@ export function StepUpDialog({
       <Feedback error={error} status={verified ? verifiedStatus : pending} />
       {!verified && !webauthnOnly && resumeMethod === 'totp' && (
         <p className="text-sm text-muted-foreground">
-          Your pending action was restored after checking the same session. Start fresh
-          verification; no previous code or grant was retained.
+          {t('restored')}
         </p>
       )}
       {verified && verifiedContent ? (
@@ -225,12 +229,12 @@ export function StepUpDialog({
           disabled={Boolean(pending) || verified}
           onClick={start}
         >
-          {error ? 'Start new verification' : 'Continue to verification'}
+          {t(error ? 'restart' : 'continue')}
         </Button>
       ) : (
         <div className="space-y-4">
           <p className="text-sm">
-            Confirm your identity for this action only. Verification is single-use.
+            {t('singleUse')}
           </p>
           {method === 'webauthn' ? (
             <Button
@@ -239,11 +243,11 @@ export function StepUpDialog({
               onClick={verify}
               disabled={Boolean(pending)}
             >
-              Verify with a passkey
+              {t('passkey')}
             </Button>
           ) : (
             <form
-              aria-label="Step-up authenticator verification"
+              aria-label={t('form')}
               noValidate
               onSubmit={(event) => {
                 event.preventDefault();
@@ -251,12 +255,13 @@ export function StepUpDialog({
               }}
               className="space-y-3"
             >
-              <Label htmlFor={id}>Authenticator code</Label>
+              <Label htmlFor={id}>{t('code')}</Label>
               <Input
                 ref={input}
                 id={id}
                 name="stepup-code"
                 type="text"
+                dir="ltr"
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 pattern="[0-9]{6}"
@@ -272,11 +277,11 @@ export function StepUpDialog({
                 className={`${inputClass} font-mono tracking-widest`}
               />
               <p id={`${id}-hint`} className="text-sm text-muted-foreground">
-                Use your enrolled authenticator app, not an email, text message, or recovery code.
+                {t('hint')}
               </p>
               {codeError && (
                 <p id={`${id}-error`} className="text-sm text-red-700 dark:text-red-400">
-                  {codeError}
+                  {message(codeError)}
                 </p>
               )}
               <Button
@@ -284,7 +289,7 @@ export function StepUpDialog({
                 className={`${controlClass} w-full`}
                 disabled={Boolean(pending)}
               >
-                Verify code
+                {t('verifyCode')}
               </Button>
             </form>
           )}
@@ -296,7 +301,7 @@ export function StepUpDialog({
               disabled={Boolean(pending)}
               onClick={() => setMethod('totp')}
             >
-              Use authenticator code
+              {t('useCode')}
             </Button>
           )}
           {challenge.methods.includes('webauthn') && method !== 'webauthn' && (
@@ -307,13 +312,13 @@ export function StepUpDialog({
               disabled={Boolean(pending)}
               onClick={() => setMethod('webauthn')}
             >
-              Use a passkey instead
+              {t('usePasskey')}
             </Button>
           )}
         </div>
       )}
       <Button type="button" variant="ghost" className={`${controlClass} w-full`} onClick={cancel}>
-        Cancel
+        {t('cancel')}
       </Button>
     </NativeDialog>
   );

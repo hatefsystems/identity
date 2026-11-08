@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/textproto"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smtptransport"
 )
@@ -87,7 +89,8 @@ func (n *Notifier) NotifyDeletionRequested(ctx context.Context, notice privacy.D
 
 func (n *Notifier) message(notice privacy.DeletionNotice) ([]byte, error) {
 	invalid := &deliveryError{stage: "notice_validation", permanent: true}
-	if notice.DeliveryID == uuid.Nil || notice.BackupEmail != nil ||
+	catalog, ok := notification.Catalog(notice.Locale, notice.TemplateVersion)
+	if !ok || notice.DeliveryID == uuid.Nil || notice.BackupEmail != nil ||
 		!emailaddress.ValidMailbox(notice.PrimaryEmail) ||
 		len(notice.ReclaimToken) != 43 || notice.ExpiresAt.IsZero() || !notice.ExpiresAt.After(time.Now()) || notice.ExpiresAt.UTC().Year() > 9999 {
 		return nil, invalid
@@ -99,23 +102,21 @@ func (n *Notifier) message(notice privacy.DeletionNotice) ([]byte, error) {
 	}
 	clear(raw)
 	link := n.cfg.PublicOrigin + "/recover-account#token=" + notice.ReclaimToken
-	expires := notice.ExpiresAt.UTC().Format(time.RFC3339Nano)
-	text := "Account deletion was requested. Access to your identity account has been deactivated.\r\n\r\n" +
-		"You can recover your account until " + expires + " (UTC). This is the original recovery deadline; email retries do not extend it.\r\n\r\n" +
-		"Open this link and verify with your configured passkey or authenticator app:\r\n" + link + "\r\n\r\n" +
-		"Recovery requires a strong factor and does not sign you in automatically. If you did not request deletion, recover your account before the deadline.\r\n" +
-		"After the deadline the account is eligible for erasure, subject to lawful retention. Do not forward this recovery link.\r\n"
-	htmlBody := "<!doctype html><html><body><h1>Account deletion requested</h1>" +
-		"<p>Access to your identity account has been deactivated.</p>" +
-		"<p>You can recover your account until <strong>" + html.EscapeString(expires) + " (UTC)</strong>. This is the original recovery deadline; email retries do not extend it.</p>" +
-		"<p><a href=\"" + html.EscapeString(link) + "\">Recover your account</a> and verify with your configured passkey or authenticator app.</p>" +
-		"<p>Recovery requires a strong factor and does not sign you in automatically. If you did not request deletion, recover your account before the deadline.</p>" +
-		"<p>After the deadline the account is eligible for erasure, subject to lawful retention. Do not forward this recovery link.</p></body></html>\r\n"
+	expires := notice.ExpiresAt.UTC().Format(time.RFC3339Nano) + " (UTC)"
+	template := catalog.Deletion
+	text := template.Intro + " " + template.Deactivated + "\r\n\r\n" +
+		fmt.Sprintf(template.Deadline, expires) + "\r\n\r\n" + template.Instructions + "\r\n" + link + "\r\n\r\n" +
+		template.Recovery + "\r\n" + template.Retention + "\r\n"
+	htmlBody := "<!doctype html><html lang=\"" + string(notice.Locale) + "\" dir=\"" + catalog.Direction + "\"><body><h1>" + html.EscapeString(template.Subject) + "</h1>" +
+		"<p>" + html.EscapeString(template.Deactivated) + "</p>" +
+		"<p>" + fmt.Sprintf(html.EscapeString(template.Deadline), "<bdi dir=\"ltr\">"+html.EscapeString(expires)+"</bdi>") + "</p>" +
+		"<p>" + html.EscapeString(template.Instructions) + " <bdi dir=\"ltr\"><a href=\"" + html.EscapeString(link) + "\" lang=\"" + string(notice.Locale) + "\" dir=\"" + catalog.Direction + "\">" + html.EscapeString(template.LinkCaption) + "</a></bdi></p>" +
+		"<p>" + html.EscapeString(template.Recovery) + "</p><p>" + html.EscapeString(template.Retention) + "</p></body></html>\r\n"
 	var message bytes.Buffer
 	boundary := "deletion-" + notice.DeliveryID.String()
 	_, domain, _ := strings.Cut(n.cfg.From, "@")
-	_, _ = fmt.Fprintf(&message, "From: <%s>\r\nTo: <%s>\r\nSubject: Account deletion requested\r\nDate: %s\r\nMessage-ID: <deletion.%s@%s>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%q\r\n\r\n",
-		n.cfg.From, notice.PrimaryEmail, time.Now().UTC().Format(time.RFC1123Z), notice.DeliveryID, domain, boundary)
+	_, _ = fmt.Fprintf(&message, "From: <%s>\r\nTo: <%s>\r\nSubject: %s\r\nDate: %s\r\nMessage-ID: <deletion.%s@%s>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%q\r\n\r\n",
+		n.cfg.From, notice.PrimaryEmail, mime.QEncoding.Encode("UTF-8", template.Subject), time.Now().UTC().Format(time.RFC1123Z), notice.DeliveryID, domain, boundary)
 	writer := multipart.NewWriter(&message)
 	if err := writer.SetBoundary(boundary); err != nil {
 		return nil, invalid

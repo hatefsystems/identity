@@ -1,14 +1,19 @@
+import { getTranslations } from 'next-intl/server';
 import { AuthCard, AuthLink } from '../_components/auth-card';
 import { ResetPasswordScreen } from '../_components/screens';
 
-export const metadata = { title: 'Set a new password | Hatef Identity' };
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('reset.metadata') };
+}
 
-export default function ResetPasswordPage() {
+export default async function ResetPasswordPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Set a new password"
-      description="Choose a new password for your account. Reset-link verification is not connected yet."
-      footer={<AuthLink href="/login">Return to sign in</AuthLink>}
+      title={t('pages.reset.title')}
+      description={t('pages.reset.description')}
+      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
     >
       <ResetPasswordScreen />
     </AuthCard>
