@@ -42,6 +42,12 @@ import { hashFile } from './release-images.mjs';
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const script = fileURLToPath(import.meta.url);
 const root = '/api/v1/auth/register';
+const safeLoginResponsePaths = new Set([
+  '/api/v1/auth/webauthn/login/generate-options',
+  '/api/v1/auth/webauthn/login/verify',
+  '/api/v1/auth/profile',
+  '/api/v1/users/me',
+]);
 const immutable = /^sha256:[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const capability = /^[A-Za-z0-9_-]{43}$/;
@@ -721,7 +727,7 @@ export function registrationBrowserDiagnostic(error, observed = {}) {
   const message = String(error?.message ?? '');
   const frames = String(error?.stack ?? '').split('\n').filter((frame) => !/^\s+at fixed[ (]/.test(frame)).join('\n');
   const line = Number(/registration-browser\.mjs:(\d+):\d+/.exec(frames)?.[1]);
-  const paths = new Set([root, ...['start', 'email/resend', 'email/verify', 'result',
+  const paths = new Set([...safeLoginResponsePaths, root, ...['start', 'email/resend', 'email/verify', 'result',
     'phone/send', 'phone/verify', 'passkey/options'].map((suffix) => `${root}/${suffix}`)]);
   return {
     kind: /strict mode violation/.test(message) ? 'ambiguous-locator'
@@ -1964,7 +1970,12 @@ function observe(context, harness) {
       }
     });
     page.on('response', (response) => {
-      if (!new URL(response.url()).pathname.startsWith('/api/')) return;
+      const pathname = new URL(response.url()).pathname;
+      if (!pathname.startsWith('/api/')) return;
+      // Only fixed, public login route names and numeric statuses are recorded.
+      // These checkpoints distinguish auth failure from SPA navigation failure.
+      if (safeLoginResponsePaths.has(pathname))
+        state.replies.push({ path: pathname, status: response.status() });
       const check = (async () => {
         const path = new URL(response.url()).pathname,
           headers = await response.allHeaders();
