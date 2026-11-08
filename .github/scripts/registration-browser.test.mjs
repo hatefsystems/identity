@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { connect as tcpConnect, createServer } from 'node:net';
 import { request } from 'node:https';
 import { resolve } from 'node:path';
-import { connect } from 'node:tls';
+import { connect, getCACertificates } from 'node:tls';
 import { PassThrough, Readable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +34,7 @@ import {
   runtimeInputs,
   startRegistrationController,
   startRegistrationGateway,
+  trustRegistrationFixtureCA,
   validateGatewayTargets,
   validateSMSIRRequest,
 } from './registration-browser.mjs';
@@ -800,6 +801,30 @@ test('ephemeral Node TLS certificates bind only declared fixture names and verif
   assert(Date.parse(leaf.validFrom) < Date.now() && Date.parse(leaf.validTo) > Date.now());
   assert.match(tls.spki, /^[A-Za-z0-9+/]{43}=$/);
   assert.throws(() => createFixtureTLS('foreign-resource'), /ownership/);
+});
+
+test('registration browser trusts only its run-owned CA and restores TLS defaults', () => {
+  const ca = createFixtureTLS(randomBytes(16).toString('hex')).ca;
+  const originalCAs = getCACertificates('default');
+  const originalEnv = process.env.NODE_EXTRA_CA_CERTS;
+  const path = '/tmp/registration-test-owned-ca.pem';
+  const restore = trustRegistrationFixtureCA(ca, path);
+  try {
+    const fingerprint = new X509Certificate(ca).fingerprint256;
+    assert(
+      getCACertificates('default').some(
+        (candidate) => new X509Certificate(candidate).fingerprint256 === fingerprint
+      )
+    );
+    assert.equal(process.env.NODE_EXTRA_CA_CERTS, path);
+    assert.notEqual(process.env.NODE_TLS_REJECT_UNAUTHORIZED, '0');
+  } finally {
+    restore();
+  }
+  assert.deepEqual(getCACertificates('default'), originalCAs);
+  assert.equal(process.env.NODE_EXTRA_CA_CERTS, originalEnv);
+  assert.throws(() => trustRegistrationFixtureCA('not-a-certificate', path));
+  assert.throws(() => trustRegistrationFixtureCA(ca, 'relative-ca.pem'));
 });
 
 function providerRequest(port, tls, body, override = {}) {
