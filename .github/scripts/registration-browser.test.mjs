@@ -22,6 +22,7 @@ import {
   gatewayForwardTarget,
   gatewayProvisioningTarget,
   registrationGatewayTargets,
+  registrationForwardHeaders,
   registrationControllerUser,
   assertRegistrationAPINetwork,
   registrationStartupSummary,
@@ -41,6 +42,40 @@ import {
 import { portalCleanup } from './portal-harness.mjs';
 
 const token = randomBytes(32).toString('base64url');
+
+test('registration ingress forwards browser security context but not connection framing', () => {
+  const incoming = {
+    host: 'untrusted.example',
+    connection: 'keep-alive, x-portal-session, x-hop-secret',
+    'x-portal-session': 'forbidden-hop-value',
+    'x-hop-secret': 'forbidden-hop-value',
+    'proxy-connection': 'keep-alive',
+    'transfer-encoding': 'chunked',
+    te: 'trailers',
+    trailer: 'x-hint',
+    upgrade: 'websocket',
+    dpop: 'public-test-proof',
+    cookie: '__Host-session=opaque-browser-token',
+    'content-type': 'application/json',
+    'x-forwarded-proto': 'http',
+    'x-forwarded-for': '8.8.8.8',
+  };
+  const forwarded = registrationForwardHeaders(incoming, 'https://localhost:43123');
+  assert.equal(forwarded.host, 'localhost:43123');
+  assert.equal(forwarded['x-forwarded-proto'], 'https');
+  assert.equal(forwarded['x-forwarded-for'], '127.0.0.1');
+  assert.equal(forwarded['x-forwarded-host'], 'localhost:43123');
+  assert.equal(forwarded.cookie, incoming.cookie);
+  assert.equal(forwarded.dpop, incoming.dpop);
+  assert.equal(forwarded['content-type'], 'application/json');
+  for (const name of [
+    'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
+    'te', 'trailer', 'upgrade', 'x-portal-session', 'x-hop-secret',
+  ]) assert(!Object.hasOwn(forwarded, name), 'Forwarded hop-by-hop header: ' + name);
+  assert.equal(incoming['x-portal-session'], 'forbidden-hop-value');
+});
+
+
 
 test('browser diagnostics expose only fixed routes, HTTP statuses and numeric source lines', () => {
   const privateValue = 'private-email-token-cookie';
