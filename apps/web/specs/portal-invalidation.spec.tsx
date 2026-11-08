@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
 import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-provider';
 import { PortalClient } from '../app/_lib/portal/client';
 import { PortalError } from '../app/_lib/portal/errors';

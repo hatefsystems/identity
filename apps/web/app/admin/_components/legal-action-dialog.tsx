@@ -1,7 +1,11 @@
 'use client';
 
 import { Button, Input, Label } from '@hatef/ui';
-import { useEffect, useId, useRef, useState, type ChangeEvent } from 'react';
+import { useTranslations } from 'next-intl';
+import { useEffect, useId, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
+import type { legalEn } from '../../../messages/legal';
 import { controlClass, inputClass } from '../../_components/controls';
 import { usePortal } from '../../_components/portal-provider';
 import { StepUpDialog } from '../../_components/step-up-dialog';
@@ -26,6 +30,7 @@ import type { LegalOperation } from '../../_lib/portal/action-intent';
 import type { StepUpGrant } from '../../_lib/portal/contracts';
 import { isAborted, PortalError, throwIfAborted } from '../../_lib/portal/errors';
 import { clearLegalControls, clearLegalRegion, legalFieldLabels } from './legal-view-state';
+import { QueryUtcTime } from './query-view-time';
 
 export type LegalAction =
   | { kind: 'hold' | 'preservation'; accountRef?: string }
@@ -60,18 +65,7 @@ const emptyDraft = () => ({
   size: '',
 });
 type Draft = ReturnType<typeof emptyDraft>;
-const titles: Record<LegalOperation, string> = {
-  hold: 'Apply Legal Hold',
-  preservation: 'Record preservation',
-  release: 'Release Legal Hold request',
-  lookup: 'Attribution inquiry',
-};
-const confirmations: Record<LegalOperation, string> = {
-  hold: 'Confirm Legal Hold',
-  preservation: 'Confirm preservation',
-  release: 'Confirm release',
-  lookup: 'Confirm lookup',
-};
+type FieldLabel = keyof typeof legalEn.fields;
 
 export function LegalActionDialog({
   action,
@@ -82,13 +76,15 @@ export function LegalActionDialog({
   resumeTotp?: boolean;
   onOutcome: (outcome: LegalOutcome) => void;
 }) {
+  const t = useTranslations('legal');
+  const message = useMessage();
   const { client, profile, capabilities, reportPermissionLoss, reportLegalInterruption } =
     usePortal();
   const [deadline, setDeadline] = useState<number | null>(null);
   const [draft, setDraft] = useState(emptyDraft);
   const [fields, setFields] = useState<LegalDisclosureField[]>([]);
   const [prepared, setPrepared] = useState<Prepared | null>(null);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<Message>('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const region = useRef<HTMLDivElement>(null);
@@ -256,8 +252,8 @@ export function LegalActionDialog({
     } catch {
       setError(
         action.kind === 'lookup'
-          ? 'Use a bare email of at most 320 UTF-8 bytes, authority and case reference of 1-255 bytes, purpose of 1-4096 bytes, explicit ordered RFC3339 UTC bounds within the configured window, and an allowed page size.'
-          : 'Use canonical nonzero UUIDs, a reason of 1-4096 UTF-8 bytes, authority and legal basis of 1-255 bytes where required, and an optional RFC3339 UTC date with at most six fractional digits. Blank narratives are invalid.'
+          ? { key: 'legal.action.invalidLookup' }
+          : { key: 'legal.action.invalidCreate' }
       );
       form.current?.querySelector<HTMLElement>('input:not(:disabled), textarea')?.focus();
     }
@@ -337,12 +333,23 @@ export function LegalActionDialog({
     }
   }
 
-  function field(name: keyof Draft, label: string, multiline = false, disabled = false) {
+  function field(name: keyof Draft, label: FieldLabel, multiline = false, disabled = false) {
     const props = {
       id: `${id}-${name}`,
       name,
       value: draft[name],
       disabled,
+      dir: [
+        'accountRef',
+        'requestId',
+        'identifier',
+        'date',
+        'startTime',
+        'endTime',
+        'size',
+      ].includes(name)
+        ? 'ltr'
+        : 'auto',
       autoComplete: 'off',
       spellCheck: false,
       'aria-invalid': Boolean(error),
@@ -354,7 +361,7 @@ export function LegalActionDialog({
     };
     return (
       <div key={name} className="min-w-0 space-y-2">
-        <Label htmlFor={props.id}>{label}</Label>
+        <Label htmlFor={props.id}>{t(`fields.${label}`)}</Label>
         {multiline ? (
           <textarea
             {...props}
@@ -370,80 +377,149 @@ export function LegalActionDialog({
 
   const create = action.kind === 'hold' || action.kind === 'preservation';
   const pinnedAccount = 'accountRef' in action ? action.accountRef : undefined;
-  const summary: [string, string][] = !prepared
+  const summary: [FieldLabel, ReactNode][] = !prepared
     ? []
     : prepared.kind === 'release'
       ? [
-          ['Hold request UUID', prepared.holdId],
-          ['Original account reference', prepared.accountRef],
+          [
+            'holdId',
+            <bdi dir="ltr" key="holdId">
+              {prepared.holdId}
+            </bdi>,
+          ],
+          [
+            'accountRef',
+            <bdi dir="ltr" key="accountRef">
+              {prepared.accountRef}
+            </bdi>,
+          ],
         ]
       : prepared.kind === 'lookup'
         ? [
-            ['Transient email input (not evidence)', prepared.query.identifier],
-            ['Requesting authority', prepared.query.requestingAuthority],
-            ['Case reference', prepared.query.caseReference],
-            ['Inquiry purpose', prepared.query.purpose],
-            ['Start time (UTC)', prepared.query.startTime],
-            ['End time (UTC)', prepared.query.endTime],
-            ['Page size', String(prepared.query.limit)],
             [
-              'Additional disclosure fields',
-              prepared.query.fields.map((key) => legalFieldLabels[key]).join(', ') ||
-                'None (core metadata only)',
+              'transientEmail',
+              <bdi dir="ltr" key="identifier">
+                {prepared.query.identifier}
+              </bdi>,
+            ],
+            [
+              'requestingAuthority',
+              <bdi dir="auto" key="authority">
+                {prepared.query.requestingAuthority}
+              </bdi>,
+            ],
+            [
+              'caseReference',
+              <bdi dir="auto" key="case">
+                {prepared.query.caseReference}
+              </bdi>,
+            ],
+            [
+              'purpose',
+              <bdi dir="auto" key="purpose">
+                {prepared.query.purpose}
+              </bdi>,
+            ],
+            ['startTime', <QueryUtcTime key="start" value={prepared.query.startTime} />],
+            ['endTime', <QueryUtcTime key="end" value={prepared.query.endTime} />],
+            [
+              'size',
+              <bdi dir="ltr" key="size">
+                {prepared.query.limit}
+              </bdi>,
+            ],
+            [
+              'disclosure',
+              prepared.query.fields.length ? (
+                <ul>
+                  {prepared.query.fields.map((key) => (
+                    <li key={key}>{t(legalFieldLabels[key])}</li>
+                  ))}
+                </ul>
+              ) : (
+                t('values.coreOnly')
+              ),
             ],
           ]
         : [
-            ['Request kind', prepared.kind === 'hold' ? 'Legal Hold' : 'Preservation request'],
-            ['Original account reference', prepared.request.accountRef],
-            ['Operation UUID', prepared.request.requestId],
-            ['Reason', prepared.request.reason],
-            ['Requesting authority', prepared.request.requestingAuthority],
             [
-              'Legal basis',
-              prepared.kind === 'hold'
-                ? prepared.request.legalBasis
-                : 'preservation_request (server fixed)',
+              'requestKind',
+              t(prepared.kind === 'hold' ? 'values.hold' : 'values.preservationRequest'),
             ],
             [
-              prepared.kind === 'hold' ? 'Review at (UTC)' : 'Expires at (UTC)',
-              (prepared.kind === 'hold' ? prepared.request.reviewAt : prepared.request.expiresAt) ||
-                'Not supplied',
+              'accountRef',
+              <bdi dir="ltr" key="accountRef">
+                {prepared.request.accountRef}
+              </bdi>,
+            ],
+            [
+              'requestId',
+              <bdi dir="ltr" key="requestId">
+                {prepared.request.requestId}
+              </bdi>,
+            ],
+            [
+              'reason',
+              <bdi dir="auto" key="reason">
+                {prepared.request.reason}
+              </bdi>,
+            ],
+            [
+              'requestingAuthority',
+              <bdi dir="auto" key="authority">
+                {prepared.request.requestingAuthority}
+              </bdi>,
+            ],
+            [
+              'legalBasis',
+              prepared.kind === 'hold' ? (
+                <bdi dir="auto">{prepared.request.legalBasis}</bdi>
+              ) : (
+                t.rich('values.serverFixed', { kind: 'preservation_request', value: (chunks) => <bdi dir="ltr">{chunks}</bdi> })
+              ),
+            ],
+            [
+              prepared.kind === 'hold' ? 'reviewAt' : 'expiresAt',
+              (
+                prepared.kind === 'hold' ? prepared.request.reviewAt : prepared.request.expiresAt
+              ) ? (
+                <QueryUtcTime
+                  value={
+                    prepared.kind === 'hold'
+                      ? (prepared.request.reviewAt ?? null)
+                      : (prepared.request.expiresAt ?? null)
+                  }
+                />
+              ) : (
+                t('values.notSupplied')
+              ),
             ],
           ];
 
   return (
     <div ref={region}>
       <StepUpDialog
-        title={titles[action.kind]}
-        description={
-          <p>
-            Verify first, then review the exact legal operation and confirm explicitly. Verification
-            is one-use and expires. Cancellation or leaving this workflow clears its sensitive data.
-          </p>
-        }
+        title={t(`action.titles.${action.kind}`)}
+        description={<p>{t('action.description')}</p>}
         onCancel={cancel}
         onAuthorized={authorized}
         intent={{ kind: 'legal', operation: action.kind }}
         resumeMethod={resumeTotp ? 'totp' : undefined}
         verifiedStatus={
-          submitting
-            ? 'Sending one legal request. Do not submit again.'
-            : 'Verification complete. Review and confirm before verification expires.'
+          submitting ? { key: 'legal.action.sending' } : { key: 'legal.action.verified' }
         }
         verifiedContent={
           deadline && (
             <div className="min-w-0 space-y-4" data-legal-private>
               <p className="text-sm text-muted-foreground">
-                Single-use verification expires at{' '}
-                <time dateTime={new Date(deadline).toISOString()}>
-                  {new Date(deadline).toLocaleTimeString()}
-                </time>
-                . Expiry clears the form and requires fresh verification.
+                {t.rich('action.expiry', {
+                  time: () => <QueryUtcTime value={new Date(deadline).toISOString()} />,
+                })}
               </p>
               {!prepared ? (
                 <form
                   ref={form}
-                  aria-label="Prepare legal request"
+                  aria-label={t('action.prepare')}
                   method="post"
                   noValidate
                   autoComplete="off"
@@ -455,48 +531,36 @@ export function LegalActionDialog({
                 >
                   {create ? (
                     <>
-                      {field(
-                        'accountRef',
-                        'Original account reference',
-                        false,
-                        Boolean(pinnedAccount)
-                      )}
-                      {field('requestId', 'Operation UUID')}
-                      {field('reason', 'Reason', true)}
-                      {field('requestingAuthority', 'Requesting authority')}
-                      {action.kind === 'hold' && field('legalBasis', 'Legal basis')}
-                      {field(
-                        'date',
-                        action.kind === 'hold' ? 'Review at (UTC)' : 'Expires at (UTC)'
-                      )}
+                      {field('accountRef', 'accountRef', false, Boolean(pinnedAccount))}
+                      {field('requestId', 'requestId')}
+                      {field('reason', 'reason', true)}
+                      {field('requestingAuthority', 'requestingAuthority')}
+                      {action.kind === 'hold' && field('legalBasis', 'legalBasis')}
+                      {field('date', action.kind === 'hold' ? 'reviewAt' : 'expiresAt')}
                       <p id={`${id}-input-help`} className="text-sm text-muted-foreground">
-                        Use the original account_ref from controlled intake, not an email or a
-                        profile lookup. Record your operation UUID and exact normalized inputs in
-                        that external record. The browser does not generate a UUID or keep a
-                        recovery draft. Reason: 1-4096 UTF-8 bytes; authority and legal basis:
-                        1-255. Optional date: RFC3339 UTC ending in Z, at most six fractional
-                        digits; past dates are allowed. Dates never release a hold automatically.
+                        {t.rich('action.createHelp', {
+                          id: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+                        })}
                       </p>
                     </>
                   ) : (
                     <>
-                      {field('identifier', 'Email for attribution')}
-                      {field('requestingAuthority', 'Requesting authority')}
-                      {field('caseReference', 'Case reference')}
-                      {field('purpose', 'Inquiry purpose', true)}
-                      {field('startTime', 'Start time (UTC)')}
-                      {field('endTime', 'End time (UTC)')}
-                      {field('size', 'Page size')}
+                      {field('identifier', 'identifier')}
+                      {field('requestingAuthority', 'requestingAuthority')}
+                      {field('caseReference', 'caseReference')}
+                      {field('purpose', 'purpose', true)}
+                      {field('startTime', 'startTime')}
+                      {field('endTime', 'endTime')}
+                      {field('size', 'size')}
                       <p id={`${id}-input-help`} className="text-sm text-muted-foreground">
-                        Bare email up to 320 UTF-8 bytes; authority and case reference 1-255;
-                        purpose 1-4096. Enter explicit RFC3339 UTC bounds ending in Z. Maximum
-                        window: {capabilities?.limits.audit_max_window_seconds} seconds. Page size:
-                        1-{capabilities ? legalPageLimits(capabilities.limits).max : 1}. No
-                        provider-specific email normalization is performed here.
+                        {t('action.lookupHelp', {
+                          seconds: String(capabilities?.limits.audit_max_window_seconds ?? 0),
+                          max: String(capabilities ? legalPageLimits(capabilities.limits).max : 1),
+                        })}
                       </p>
                       <fieldset className="min-w-0 space-y-2 rounded-md border p-3">
                         <legend className="px-1 text-sm font-semibold">
-                          Additional disclosure for this inquiry purpose
+                          {t('action.disclosure')}
                         </legend>
                         {(Object.keys(legalFieldLabels) as LegalDisclosureField[]).map((key) => (
                           <label
@@ -515,29 +579,28 @@ export function LegalActionDialog({
                               }
                               className="size-5 shrink-0 accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             />
-                            {legalFieldLabels[key]}
+                            {t(legalFieldLabels[key])}
                           </label>
                         ))}
                         <p className="text-sm text-muted-foreground">
-                          All optional fields start unchecked. Only explicitly selected supported
-                          metadata is requested.
+                          {t('action.disclosureHelp')}
                         </p>
                       </fieldset>
                     </>
                   )}
                   {error && (
                     <p id={`${id}-error`} role="alert" className="text-sm text-destructive">
-                      {error}
+                      {message(error)}
                     </p>
                   )}
                   <Button type="submit" className={`${controlClass} w-full`}>
-                    Review request
+                    {t('action.review')}
                   </Button>
                 </form>
               ) : (
                 <form
                   ref={form}
-                  aria-label="Confirm legal request"
+                  aria-label={t('action.confirm')}
                   method="post"
                   noValidate
                   className="min-w-0 space-y-4"
@@ -549,26 +612,23 @@ export function LegalActionDialog({
                   <dl className="min-w-0 space-y-3 text-sm">
                     {summary.map(([label, value]) => (
                       <div key={label} className="min-w-0">
-                        <dt className="text-muted-foreground">{label}</dt>
+                        <dt className="text-muted-foreground">{t(`fields.${label}`)}</dt>
                         <dd className="mt-1 whitespace-pre-wrap break-all">{value}</dd>
                       </div>
                     ))}
                   </dl>
                   <p className="text-sm leading-relaxed">
-                    {action.kind === 'release'
-                      ? 'Release affects only this immutable hold request UUID. Other holds may remain. Original retention clocks resume, which may allow immediate eligibility at the next purge; release never resets retention. A 204 also covers an already released request and does not prove this caller changed it.'
-                      : action.kind === 'lookup'
-                        ? 'Class B records are pseudonymized personal data, not anonymous. An indexed match is not verified real-world identity or permission to disclose externally. Sequence position is not an inclusion proof. This request is for one page only.'
-                        : 'Each request is independent. Holds override retention until explicit release; review and expiry dates are advisory. A hold cannot restore erased data, extend account recovery, or create an immutable evidence snapshot.'}
+                    {t(
+                      action.kind === 'release'
+                        ? 'action.releaseWarning'
+                        : action.kind === 'lookup'
+                          ? 'action.lookupWarning'
+                          : 'action.createWarning'
+                    )}
                   </p>
                   {create && (
                     <p className="text-sm text-muted-foreground">
-                      Idempotency is scoped to the original reference, request kind, and UUID, not
-                      the actor or a global UUID. Changing target or kind creates another
-                      independent hold. Exact replay may return an already released request and
-                      never reactivates it; a cleaned narrative tombstone conflicts instead of
-                      recreating it. Preserve this exact normalized tuple in controlled external
-                      intake before confirming.
+                      {t('action.idempotencyWarning')}
                     </p>
                   )}
                   <label className="flex min-h-11 items-start gap-3 py-2 text-sm leading-relaxed">
@@ -579,23 +639,22 @@ export function LegalActionDialog({
                       onChange={(event) => setAcknowledged(event.target.checked)}
                       className="mt-1 size-5 shrink-0 accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     />
-                    {create
-                      ? 'I reviewed the target, operation UUID, request kind, and normalized inputs.'
-                      : action.kind === 'release'
-                        ? 'I reviewed this hold request UUID and the release consequences.'
-                        : 'I reviewed the inquiry purpose, fixed scope, and selected disclosure fields.'}
+                    {t(
+                      create
+                        ? 'action.acknowledgeCreate'
+                        : action.kind === 'release'
+                          ? 'action.acknowledgeRelease'
+                          : 'action.acknowledgeLookup'
+                    )}
                   </label>
                   <Button
                     type="submit"
                     className={`${controlClass} w-full`}
                     disabled={!acknowledged || submitting}
                   >
-                    {submitting ? 'Submitting legal request...' : confirmations[action.kind]}
+                    {t(submitting ? 'action.submitting' : `action.confirmations.${action.kind}`)}
                   </Button>
-                  <p className="text-sm text-muted-foreground">
-                    Inputs are now frozen. To change the target or scope, cancel and start fresh
-                    verification. Nothing retries automatically after transmission.
-                  </p>
+                  <p className="text-sm text-muted-foreground">{t('action.frozen')}</p>
                 </form>
               )}
             </div>

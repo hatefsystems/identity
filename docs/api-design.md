@@ -525,3 +525,11 @@ The worker accepts existing exact `{"user_id":"<uuid>"}` deletion payloads, vali
 Delivery is **at least once**. A PubAck followed by an uncertain database commit can replay the same ID, including outside the broker's finite deduplication window. Limits retention enables independent consumers; it is not the audit stream's work queue. A delayed or poisoned per-account head blocks its later revisions while other accounts can progress. Consumers must implement [idempotency, reconciliation and terminal tombstones](client-integration.md#4-user-lifecycle-consumption). Events synchronize projections, not instantaneous access revocation; continue using live authorization checks.
 
 Deploy dual-version publishing/readers and downstream consumers before enabling display-name writers. Downstream deployment is an explicit release prerequisite, not evidence supplied by repository tests. Rollback must retain v2-capable publishing/consumption while any v2 intent or replay remains; see [portal cutover](devops-operations.md#user-portal-cutover-task-73).
+
+## Notification presentation
+
+Only deletion initiation accepts `X-Hatef-Notification-Locale: en` or `fa-IR`.
+Missing, duplicate, oversized or unsupported values use English without changing
+authorization, routing, response codes or deadlines. The queued v2 intent freezes
+locale/template and v1 remains English. SMS.ir VERIFY uses the operator-configured
+provider template. See [localization](localization.md#notification-language-and-compatibility).

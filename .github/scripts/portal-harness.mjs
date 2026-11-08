@@ -261,7 +261,7 @@ export function failureCategories(output) {
 export function browserFailure(error, stage = 'unknown') {
   const kind = error?.name === 'AssertionError' ? 'assertion' : 'operation';
   const location = typeof error?.stack === 'string'
-    ? error.stack.match(/(?:web-(?:portal|admin)\.browser|portal-harness)\.mjs:\d+:\d+/)?.[0]
+    ? error.stack.match(/(?:web-(?:portal|admin|csp)\.browser|portal-harness|browser-localization)\.mjs:\d+:\d+/)?.[0]
     : undefined;
   const checkpoint = /^[a-z-]{1,64}$/.test(stage) ? stage : 'unknown';
   // Browser exception messages can embed full Cookie/DPoP/grant headers or DOM

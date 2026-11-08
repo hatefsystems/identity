@@ -6,7 +6,9 @@
     "targets": {
       "test-registration-browser": {
         "command": "node -e \"if (!/^sha256:[0-9a-f]{64}$/.test(process.env.REGISTRATION_BROWSER_API_IMAGE || '')) throw new Error('Immutable REGISTRATION_BROWSER_API_IMAGE is required'); const r = require('child_process').spawnSync(process.execPath, ['.github/scripts/registration-browser.mjs'], {stdio:'inherit'}); if(r.error) throw r.error; process.exit(r.status ?? 1)\"",
-        "dependsOn": ["build"],
+        "dependsOn": [
+          "build"
+        ],
         "cache": false,
         "parallelism": false
       },
@@ -21,9 +23,24 @@
         "command": "node .github/scripts/web-portal.browser.mjs",
         "dependsOn": [
           "build",
-          { "projects": ["identity-api"], "target": "build" },
-          { "projects": ["identity-api"], "target": "build-portal-fixture" },
-          { "projects": ["identity-api"], "target": "build-deletion-notifier" }
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-portal-fixture"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-deletion-notifier"
+          }
         ],
         "cache": false
       },
@@ -31,12 +48,42 @@
         "command": "node .github/scripts/web-admin.browser.mjs",
         "dependsOn": [
           "build",
-          { "projects": ["identity-api"], "target": "build" },
-          { "projects": ["identity-api"], "target": "build-portal-fixture" },
-          { "projects": ["identity-api"], "target": "build-deletion-notifier" },
-          { "projects": ["identity-api"], "target": "build-audit-signer" },
-          { "projects": ["identity-api"], "target": "build-admin-audit-publisher" },
-          { "projects": ["identity-api"], "target": "build-admin-legal" }
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-portal-fixture"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-deletion-notifier"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-audit-signer"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-admin-audit-publisher"
+          },
+          {
+            "projects": [
+              "identity-api"
+            ],
+            "target": "build-admin-legal"
+          }
         ],
         "cache": false
       }
@@ -45,7 +92,11 @@
   "dependencies": {
     "@hatef/ui": "*",
     "next": "~16.1.6",
+    "next-intl": "4.14.9",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@formatjs/icu-messageformat-parser": "3.5.22"
   }
 }

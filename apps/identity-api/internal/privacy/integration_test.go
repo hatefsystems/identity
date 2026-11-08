@@ -371,7 +371,7 @@ func TestIntegrationSoftDeleteThenPurge(t *testing.T) {
 	outboxBefore := countRows(ctx, t, pool,
 		"SELECT COUNT(*) FROM event_outbox WHERE subject = 'identity.user.deleted' AND payload::jsonb ->> 'user_id' = $1", user.ID.String())
 
-	result, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "203.0.113.10")
+	result, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "203.0.113.10", "en")
 	if err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
@@ -530,7 +530,7 @@ func TestIntegrationLegalHoldBlocksPurge(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "purge-hold@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	backdateDeletion(ctx, t, pool, user.ID, 2*testGracePeriod)
@@ -640,7 +640,7 @@ func TestIntegrationReclaimInsideWindow(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "reclaim-inside@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	notice := env.deliveredNotice(ctx, t)
@@ -688,7 +688,7 @@ func TestIntegrationReclaimPastWindowIsRefused(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "reclaim-expired@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	notice := env.deliveredNotice(ctx, t)
@@ -726,7 +726,7 @@ func TestIntegrationIdentifierIsReservedDuringGraceWindow(t *testing.T) {
 
 	const email = "squatted@privacy.test"
 	user := createTestUser(ctx, t, pool, email)
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	notice := env.deliveredNotice(ctx, t)
@@ -777,7 +777,7 @@ func TestIntegrationConcurrentReclaimVersusPurge(t *testing.T) {
 	env := newIntegrationEnv(t, pool)
 
 	user := createTestUser(ctx, t, pool, "race@privacy.test")
-	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, ""); err != nil {
+	if _, err := env.svc.RequestDeletion(ctx, user.ID, user.AuthVersion, "", "en"); err != nil {
 		t.Fatalf("RequestDeletion: %v", err)
 	}
 	notice := env.deliveredNotice(ctx, t)

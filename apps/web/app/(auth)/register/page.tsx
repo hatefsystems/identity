@@ -1,17 +1,22 @@
+import { getTranslations } from 'next-intl/server';
 import { AuthCard, AuthLink } from '../_components/auth-card';
 import { RegistrationScreen } from '../_components/screens';
 
-export const metadata = { title: 'Create an account | Hatef Identity' };
+export async function generateMetadata() {
+  const t = await getTranslations('auth.pages');
+  return { title: t('register.metadata') };
+}
 
-export default function RegistrationPage() {
+export default async function RegistrationPage() {
+  const t = await getTranslations('auth');
   return (
     <AuthCard
-      title="Create your account"
-      description="Verify your existing email and Iranian mobile number, then create a passkey."
+      title={t('pages.register.title')}
+      description={t('pages.register.description')}
       footer={
         <>
-          <span>Already have an account?</span>
-          <AuthLink href="/login">Sign in</AuthLink>
+          <span>{t('pages.register.existing')}</span>
+          <AuthLink href="/login">{t('home.signIn')}</AuthLink>
         </>
       }
     >

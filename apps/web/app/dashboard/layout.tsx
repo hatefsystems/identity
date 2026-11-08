@@ -1,10 +1,18 @@
+import { getTranslations } from 'next-intl/server';
 import type { ReactNode } from 'react';
 import { PortalProvider } from './_components/portal-provider';
 
-export const metadata = {
-  title: { default: 'Your account | Hatef Identity', template: '%s | Hatef Identity' },
-  robots: { index: false, follow: false },
-};
+export async function generateMetadata() {
+  const t = await getTranslations('portal.metadata');
+  const metadata = await getTranslations('auth');
+  return {
+    title: {
+      default: `${t('title')} | ${metadata('brand')}`,
+      template: `%s | ${metadata('brand')}`,
+    },
+    robots: { index: false, follow: false },
+  };
+}
 
 export default function DashboardLayout({ children }: { children: ReactNode }) {
   // The server renders only the shell. Cookie presence is not authorization;

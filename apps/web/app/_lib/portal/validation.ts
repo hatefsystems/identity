@@ -4,9 +4,9 @@ export function normalizeName(value: string): string {
   // Go's UTF-8 validator rejects lone surrogates after JSON decoding. Match its
   // control/line-separator policy before trimming, including at either edge.
   if (/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value))
-    throw new Error('Use a single line without control characters.');
+    throw new PortalError('name_single_line');
   const trimmed = value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
-  if (Array.from(trimmed).length > 80) throw new Error('Use at most 80 characters.');
+  if (Array.from(trimmed).length > 80) throw new PortalError('name_too_long');
   return trimmed;
 }
 

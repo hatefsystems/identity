@@ -1,11 +1,12 @@
 import { TextEncoder } from 'node:util';
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '../i18n/testing';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { I18nTestProvider } from '../i18n/testing';
 import { UsersView } from '../app/admin/_components/users-view';
 import { AuditView, auditCursorHistoryLimit } from '../app/admin/_components/audit-view';
 import { IntegrityView } from '../app/admin/_components/integrity-view';
 import { auditQueryDefaults, auditQueryFromDraft } from '../app/admin/_components/audit-query-form';
-import { queryClearedMessage, queryPageSize } from '../app/admin/_components/query-view-state';
+import { queryPageSize } from '../app/admin/_components/query-view-state';
 import { usePortal } from '../app/_components/portal-provider';
 import { AdminClient } from '../app/_lib/admin/client';
 import type {
@@ -295,9 +296,11 @@ describe('admin query presentation gates', () => {
         typeof import('../app/_components/portal-provider')
       >('../app/_components/portal-provider');
       const html = renderToStaticMarkup(
-        <PortalProvider surface="admin">
-          <View />
-        </PortalProvider>
+        <I18nTestProvider>
+          <PortalProvider surface="admin">
+            <View />
+          </PortalProvider>
+        </I18nTestProvider>
       );
       expect(html).toContain('Checking your secure browser session and administrative access');
       expect(html).not.toContain('<form');
@@ -553,7 +556,7 @@ describe('UTC audit query and bounded keyset navigation', () => {
     fireEvent.click(button('Newer records'));
     await screen.findByText(high);
     expect(api.auditLogs).toHaveBeenNthCalledWith(3, query, expect.any(AbortSignal));
-    expect(screen.getByText('1 records on this page. No total is calculated.')).toBeTruthy();
+    expect(screen.getByText('1 record on this page. No total is calculated.')).toBeTruthy();
     fireEvent.change(screen.getByLabelText('Event type (exact)'), {
       target: { value: 'user.logout' },
     });
@@ -976,7 +979,9 @@ describe('query privacy lifetime', () => {
       method.mockRejectedValueOnce(new PortalError('invalid_response', 403));
       render(<View />);
       fireEvent.click(button(action));
-      await screen.findByText(queryClearedMessage);
+      await screen.findByText(
+        'Private query data was cleared. Session and administrative access must be checked again before continuing.'
+      );
       expect(reportPermissionLoss).toHaveBeenCalledTimes(1);
       expect(signOut).not.toHaveBeenCalled();
       expect(screen.queryByRole('form')).toBeNull();
@@ -999,7 +1004,11 @@ describe('query privacy lifetime', () => {
       const signal = api.auditLogs.mock.calls[1][1] as AbortSignal;
       fireEvent(window, new Event(event));
       expect(signal.aborted).toBe(true);
-      expect(screen.getByText(queryClearedMessage)).toBeTruthy();
+      expect(
+        screen.getByText(
+          'Private query data was cleared. Session and administrative access must be checked again before continuing.'
+        )
+      ).toBeTruthy();
       expect(screen.queryByLabelText('Event type (exact)')).toBeNull();
       await act(async () => late.resolve(auditPage('3')));
       expect(screen.queryByRole('table')).toBeNull();
@@ -1022,7 +1031,11 @@ describe('query privacy lifetime', () => {
     await act(async () => late.resolve(completeProof()));
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
     fireEvent(document, new Event('visibilitychange'));
-    expect(screen.getByText(queryClearedMessage)).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Private query data was cleared. Session and administrative access must be checked again before continuing.'
+      )
+    ).toBeTruthy();
     expect(api.verify).toHaveBeenCalledTimes(2);
   });
 
@@ -1043,5 +1056,86 @@ describe('query privacy lifetime', () => {
       await act(async () => late.reject(new PortalError('network_error')));
       expect(reportPermissionLoss).not.toHaveBeenCalled();
     }
+  );
+});
+
+it('translates audit validation and pending results in place without replaying a query', async () => {
+  const content = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider locale={locale}>
+      <AuditView />
+    </I18nTestProvider>
+  );
+  const view = render(content('en'));
+  const start = screen.getByLabelText<HTMLInputElement>('Start time (UTC)');
+  fireEvent.change(start, { target: { value: '' } });
+  submitAudit();
+  expect(screen.getByRole('alert').textContent).toBe('Enter a valid start time in UTC.');
+  view.rerender(content('fa-IR'));
+  expect(screen.getByRole('alert').textContent).toBe('زمان آغاز معتبری بر اساس UTC وارد کنید.');
+  expect(screen.getByLabelText('زمان آغاز (UTC)')).toBe(start);
+  expect(api.auditLogs).not.toHaveBeenCalled();
+  fireEvent.change(start, { target: { value: '2026-10-28T09:00:00' } });
+  const pending = deferred<AdminAuditPage>();
+  api.auditLogs.mockReturnValueOnce(pending.promise);
+  fireEvent.submit(screen.getByRole('form', { name: 'جست‌وجوی سوابق ممیزی' }));
+  expect(screen.getByRole('status').textContent).toBe('در حال بارگیری یک صفحه از سوابق ممیزی...');
+  const signal = api.auditLogs.mock.calls[0][1];
+  view.rerender(content('en'));
+  expect(screen.getByRole('status').textContent).toBe('Loading one audit-log page...');
+  expect(signal.aborted).toBe(false);
+  expect(api.auditLogs).toHaveBeenCalledTimes(1);
+  await act(async () => pending.resolve(auditPage()));
+  const row = screen.getByTestId('admin-audit-row');
+  view.rerender(content('fa-IR'));
+  expect(screen.getByRole('columnheader', { name: 'شمارهٔ توالی' })).toBeTruthy();
+  expect(screen.getByTestId('admin-audit-row')).toBe(row);
+  expect(within(row).getByText(high).closest('bdi')?.dir).toBe('ltr');
+  fireEvent.click(screen.getByRole('button', { name: `مشاهدهٔ جزئیات توالی ${high}` }));
+  expect(screen.getByRole('dialog').textContent).toContain('اثبات بررسی تمامیت زنجیره نیستند');
+  const payload = screen.getByRole('dialog').querySelector('pre');
+  expect(payload?.textContent).toBe(log().payload);
+  expect(payload?.dir).toBe('ltr');
+  view.rerender(content('en'));
+  expect(screen.getByRole('dialog').querySelector('pre')).toBe(payload);
+  expect(api.auditLogs).toHaveBeenCalledTimes(1);
+});
+
+it('preserves a pending verification and exact bound across language and display preference changes', async () => {
+  const pending = deferred<AdminVerification>();
+  api.verify.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(completeProof());
+  const content = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider
+      locale={locale}
+      preferences={{ calendar: 'persian', timeZone: 'Asia/Tehran' }}
+    >
+      <IntegrityView />
+    </I18nTestProvider>
+  );
+  const view = render(content('en'));
+  fireEvent.click(button('Start new run'));
+  const signal = api.verify.mock.calls[0][2] as AbortSignal;
+  view.rerender(content('fa-IR'));
+  expect(screen.getByRole('status').textContent).toBe('در حال بررسی یک صفحهٔ محدود...');
+  expect(signal.aborted).toBe(false);
+  expect(api.verify).toHaveBeenCalledTimes(1);
+  await act(async () => pending.resolve(proof()));
+  const bound = screen.getByTestId('verification-bound');
+  expect(bound.textContent).toBe(maximum);
+  expect(bound.dir).toBe('ltr');
+  expect(screen.getByText('شواهد فنی اصلی')).toBeTruthy();
+  const raw = screen.getByText(auditScope);
+  expect(raw.closest('details')).toBeTruthy();
+  expect(raw.dir).toBe('ltr');
+  expect(screen.getByText(/ورود کامل داده، تشخیص قطع‌شدن انتهای زنجیره/)).toBeTruthy();
+  view.rerender(content('en'));
+  expect(screen.getByTestId('verification-bound')).toBe(bound);
+  expect(bound.textContent).toBe(maximum);
+  expect(api.verify).toHaveBeenCalledTimes(1);
+  fireEvent.click(button('Continue verification'));
+  await screen.findByText('Verification complete for the captured database-relative range.');
+  expect(api.verify).toHaveBeenLastCalledWith(
+    'audit',
+    { after_seq: high, through_seq: maximum, predecessor_hash: hash, limit: 2 },
+    expect.any(AbortSignal)
   );
 });

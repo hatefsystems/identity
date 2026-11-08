@@ -1,5 +1,9 @@
 'use client';
 
+import type { Message } from '../../../i18n/messages';
+
+import { useTranslations } from 'next-intl';
+
 import { Button } from '@hatef/ui';
 import { useEffect, useRef, useState } from 'react';
 import type { BrowserSession } from '../../_lib/portal/contracts';
@@ -10,12 +14,13 @@ import { NativeDialog } from './native-dialog';
 import { usePortal } from './portal-provider';
 
 export function SessionsView() {
+  const t = useTranslations();
   const { client, signOut } = usePortal();
   const [sessions, setSessions] = useState<BrowserSession[] | null>(null);
   const [target, setTarget] = useState<BrowserSession | null>(null);
   const [pending, setPending] = useState(false);
-  const [status, setStatus] = useState('');
-  const [error, setError] = useState('');
+  const [status, setStatus] = useState<Message>('');
+  const [error, setError] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   const operation = useRef<AbortController | null>(null);
   const read = useRef<AbortController | null>(null);
@@ -31,7 +36,7 @@ export function SessionsView() {
     const controller = new AbortController();
     const generation = ++readGeneration.current;
     read.current = controller;
-    setStatus('Loading sessions...');
+    setStatus({ key: 'portal.sessions.loading' });
     setError('');
     client
       .sessions(controller.signal)
@@ -71,9 +76,7 @@ export function SessionsView() {
     if (operation.current) {
       operation.current.abort();
       operation.current = null;
-      setStatus(
-        'Revocation was cancelled locally. It may already have completed. Refresh the list before trying again.'
-      );
+      setStatus({ key: 'portal.sessions.cancelled' });
     }
     setTarget(null);
     setPending(false);
@@ -97,14 +100,14 @@ export function SessionsView() {
       invalidateRead();
       setSessions((items) => items?.filter((item) => item.id !== target.id) ?? null);
       setTarget(null);
-      setStatus('Session revoked. Its linked access and refresh authority is no longer available.');
+      setStatus({ key: 'portal.sessions.revoked' });
     } catch (failure) {
       if (!controller.signal.aborted && !isAborted(failure)) {
         setTarget(null);
         if (failure instanceof PortalError && failure.status === 404) {
           invalidateRead();
           setSessions((items) => items?.filter((item) => item.id !== target.id) ?? null);
-          setStatus('This session is no longer in the list. Refresh to review current sessions.');
+          setStatus({ key: 'portal.sessions.missing' });
         } else setError(errorMessage(failure));
       }
     } finally {
@@ -115,14 +118,13 @@ export function SessionsView() {
 
   return (
     <>
-      <PageHeading title="Sessions">
-        A session is server-side browser authority, not a verified physical device or a separate
-        OAuth grant. Revoke individual sessions you no longer need.
+      <PageHeading title={t('portal.sessions.title')}>
+        {t('portal.sessions.description')}
       </PageHeading>
-      <Panel title="Active browser sessions" id="sessions-heading">
+      <Panel title={t('portal.sessions.panel')} id="sessions-heading">
         <Feedback error={error} status={status} />
         {sessions && (
-          <ul className="divide-y rounded-lg border" aria-label="Active sessions">
+          <ul className="divide-y rounded-lg border" aria-label={t('portal.sessions.list')}>
             {sessions.map((session) => (
               <li
                 key={session.id}
@@ -133,9 +135,12 @@ export function SessionsView() {
                 <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
                   <div className="min-w-0 space-y-1">
                     <h3 className="font-medium">
-                      {session.current ? 'This browser session' : 'Other browser session'}
+                      {session.current ? t('portal.sessions.current') : t('portal.sessions.other')}
                     </h3>
-                    <p className="break-all font-mono text-xs text-muted-foreground">
+                    <p
+                      dir="ltr"
+                      className="break-all font-mono text-xs text-muted-foreground isolate"
+                    >
                       {session.id}
                     </p>
                   </div>
@@ -148,26 +153,30 @@ export function SessionsView() {
                       setError('');
                     }}
                   >
-                    {session.current ? 'Sign out this session' : 'Revoke session'}
+                    {session.current ? t('portal.sessions.signOut') : t('portal.sessions.revoke')}
                   </Button>
                 </div>
                 <dl className="grid gap-3 text-sm sm:grid-cols-2">
                   <div className="min-w-0">
-                    <dt className="text-muted-foreground">Reported browser details</dt>
-                    <dd className="mt-1 break-words">{session.user_agent || 'Not provided'}</dd>
+                    <dt className="text-muted-foreground">{t('portal.sessions.browser')}</dt>
+                    <dd dir="auto" className="mt-1 break-words isolate">
+                      {session.user_agent || t('portal.sessions.notProvided')}
+                    </dd>
                   </div>
                   <div>
-                    <dt className="text-muted-foreground">IP at session creation</dt>
-                    <dd className="mt-1 break-all">{session.ip || 'Not provided'}</dd>
+                    <dt className="text-muted-foreground">{t('portal.sessions.ip')}</dt>
+                    <dd dir="ltr" className="mt-1 break-all isolate">
+                      {session.ip || t('portal.sessions.notProvided')}
+                    </dd>
                   </div>
                   <div>
-                    <dt className="text-muted-foreground">Created</dt>
+                    <dt className="text-muted-foreground">{t('portal.sessions.created')}</dt>
                     <dd className="mt-1">
                       <DateLabel value={session.created_at} />
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-muted-foreground">Last activity</dt>
+                    <dt className="text-muted-foreground">{t('portal.sessions.lastActivity')}</dt>
                     <dd className="mt-1">
                       <DateLabel value={session.last_seen_at} />
                     </dd>
@@ -177,11 +186,7 @@ export function SessionsView() {
             ))}
           </ul>
         )}
-        {sessions?.length === 0 && (
-          <p className="text-sm">
-            No active sessions are listed. Refresh to verify the current state.
-          </p>
-        )}
+        {sessions?.length === 0 && <p className="text-sm">{t('portal.sessions.empty')}</p>}
         <Button
           type="button"
           variant="outline"
@@ -192,35 +197,39 @@ export function SessionsView() {
             setAttempt((value) => value + 1);
           }}
         >
-          Refresh sessions
+          {t('portal.sessions.refresh')}
         </Button>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          Revocation blocks subsequent authorization. A request already admitted may finish, and
-          another browser clears its rendered data when it detects session loss. Browser details and
-          IP addresses do not establish location or device ownership.
+          {t('portal.sessions.policy')}
         </p>
       </Panel>
       {target && (
         <NativeDialog
-          title={target.current ? 'Sign out this session?' : 'Revoke this session?'}
+          title={
+            target.current ? t('portal.sessions.signOutTitle') : t('portal.sessions.revokeTitle')
+          }
           description={
             <>
               {target.current
-                ? 'This will end the current browser session and clear private portal data.'
-                : 'This will revoke the selected browser session and its linked access and refresh authority.'}
-              <span className="mt-2 block break-all font-mono text-xs">{target.id}</span>
+                ? t('portal.sessions.signOutDescription')
+                : t('portal.sessions.revokeDescription')}
+              <span dir="ltr" className="mt-2 block break-all font-mono text-xs isolate">
+                {target.id}
+              </span>
             </>
           }
           onCancel={close}
           testId="session-dialog"
         >
-          <Feedback status={pending ? 'Revoking the selected session...' : ''} />
+          <Feedback status={pending ? t('portal.sessions.revoking') : ''} />
           <div className="flex flex-wrap gap-3">
             <Button type="button" className={controlClass} onClick={revoke} disabled={pending}>
-              {target.current ? 'Confirm sign out' : 'Confirm revocation'}
+              {target.current
+                ? t('portal.sessions.confirmSignOut')
+                : t('portal.sessions.confirmRevoke')}
             </Button>
             <Button type="button" variant="outline" className={controlClass} onClick={close}>
-              Cancel
+              {t('portal.sessions.cancel')}
             </Button>
           </div>
         </NativeDialog>

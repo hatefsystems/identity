@@ -259,3 +259,10 @@ The suite covers login/profile/security/sessions plus UV-only deletion, durable 
 Repository test execution is not deployment approval. Manual assistive-technology/platform-authenticator review, real deployed HTTPS ingress/log-redaction verification and compatible downstream lifecycle consumers remain release gates unless separately evidenced. Follow [portal cutover](devops-operations.md#user-portal-cutover-task-73); do not mark task acceptance or operator gates complete solely because tests exist.
 
 Task 7.6 extends the existing `web:test-admin-browser` gate, not an independent authentication/browser harness or new CI job. Required evidence includes the **real** signer plus `admin-legal --operation=lookup-probe` before/after synthetic-account deletion, two API replicas, fixture omission/mismatch, DPO success and other seeded-role denial, strict contracts/string precision, independent/replayed/released holds, fresh verification per page, opt-in fields, actual audit-failure rollback and committed-but-lost write responses without retransmission. Exercise privacy clearing and late replies, direct routes/revoked capability, no-JavaScript shells, desktop/320px, both palettes, focus/keyboard/dialog escape and strict CSP. Mask legal narrative/result regions explicitly in artifacts; retain only sanitized scenarios/status/counts and masked screenshots, not raw traces or storage snapshots. These are required gates, **not recorded passing results**. Manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks remain unfinished until separately observed; no Task 5.3/5.4/5.5 status or production approval is implied.
+
+## Browser language and display preferences
+
+Owned public, auth, portal and admin interfaces support English and Iranian
+Persian on the same routes. Registration retains its existing email/phone proof
+and passkey-only contract; preference changes do not replay delivery, change
+identity bytes or extend wall/monotonic deadlines. See [localization](localization.md).

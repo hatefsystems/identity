@@ -3,7 +3,9 @@
 import { Button } from '@hatef/ui';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
 import { useEffect, useRef, useState } from 'react';
+import type { Message } from '../../../i18n/messages';
 import { controlClass, Feedback, linkClass, PageHeading } from '../../_components/controls';
 import { usePortal } from '../../_components/portal-provider';
 import { AdminClient } from '../../_lib/admin/client';
@@ -17,12 +19,13 @@ import {
 import {
   canModerate,
   ModerationDialog,
-  moderationLabel,
   type ModerationOutcome,
   type ModerationStatus,
 } from './moderation-dialog';
+import { QueryUtcTime } from './query-view-time';
 
 export function UserDetailView() {
+  const t = useTranslations('admin');
   const params = useParams<{ id: string }>();
   const id =
     typeof params.id === 'string' &&
@@ -39,8 +42,8 @@ export function UserDetailView() {
   } = usePortal();
   const access = capabilities?.capabilities;
   const [user, setUser] = useState<AdminUser | null>(null);
-  const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
+  const [error, setError] = useState<Message>('');
+  const [status, setStatus] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
   const [action, setAction] = useState<{
@@ -92,39 +95,31 @@ export function UserDetailView() {
     setUser(null);
     setError('');
     setBusy(true);
-    setStatus(
-      confirmed.current
-        ? 'Status change confirmed. Loading current account state...'
-        : 'Loading account...'
-    );
+    setStatus({
+      key: confirmed.current ? 'admin.detail.confirmedLoading' : 'admin.detail.loading',
+    });
     new AdminClient(client)
       .user(id, controller.signal)
       .then((value) => {
         throwIfAborted(controller.signal);
         if (current !== generation.current) return;
         setUser(value);
-        setStatus(
-          confirmed.current
-            ? 'Status change confirmed. Current account state loaded.'
-            : 'Current account state loaded.'
-        );
+        setStatus({
+          key: confirmed.current ? 'admin.detail.confirmedLoaded' : 'admin.detail.loaded',
+        });
         const desired = resume.current;
         resume.current = null;
         if (desired && access.users_status_write) {
           if (canModerate(value, profile.id) && value.status !== desired)
             setAction({ target: value, desired, resume: true });
-          else setError('The pending action is no longer available. Review current account state.');
+          else setError({ key: 'admin.detail.pendingUnavailable' });
         }
       })
       .catch((failure) => {
         if (controller.signal.aborted || current !== generation.current || isAborted(failure))
           return;
         setUser(null);
-        setStatus(
-          confirmed.current
-            ? 'Status change confirmed, but refreshing the current account failed.'
-            : ''
-        );
+        setStatus(confirmed.current ? { key: 'admin.detail.confirmedRefreshFailed' } : '');
         setError(errorMessage(failure));
         if (failure instanceof PortalError && failure.status === 403) reportPermissionLoss();
       })
@@ -162,7 +157,7 @@ export function UserDetailView() {
     request.current = controller;
     setBusy(true);
     setError('');
-    setStatus('Checking current account state before verification...');
+    setStatus({ key: 'admin.detail.checking' });
     try {
       const value = await new AdminClient(client).user(user.id, controller.signal);
       throwIfAborted(controller.signal);
@@ -174,7 +169,7 @@ export function UserDetailView() {
         value.status !== user.status ||
         !canModerate(value, profile.id)
       ) {
-        setError('The account changed. Review the updated state before choosing a new action.');
+        setError({ key: 'admin.detail.changed' });
         return;
       }
       confirmed.current = false;
@@ -204,18 +199,13 @@ export function UserDetailView() {
       generation.current++;
       request.current?.abort();
       setUser(null);
-      if (result.kind === 'conflict')
-        setError(
-          'The account changed. Read current state, review it, and start a new action with fresh verification. No status change was confirmed.'
-        );
+      if (result.kind === 'conflict') setError({ key: 'admin.detail.conflict' });
     } else if (result.kind === 'expired') {
-      setError(
-        'Verification expired. The reason was cleared. Start a new action with fresh verification.'
-      );
+      setError({ key: 'admin.detail.expired' });
     } else if (result.kind === 'failed') {
       setError(
         result.error instanceof PortalError && result.error.status === 403
-          ? 'The status change was not permitted. No change was confirmed.'
+          ? { key: 'admin.detail.denied' }
           : errorMessage(result.error)
       );
     }
@@ -223,22 +213,19 @@ export function UserDetailView() {
 
   return (
     <>
-      <PageHeading title="Account details">
-        Only metadata permitted for this session is shown. Every account read and status action is
-        audited.
-      </PageHeading>
+      <PageHeading title={t('detail.title')}>{t('detail.description')}</PageHeading>
       <Link
         href="/admin/users"
         prefetch={false}
         onClick={clearSensitiveViews}
         className={linkClass}
       >
-        Back to accounts
+        {t('detail.back')}
       </Link>
       {!access?.users_read ? (
-        <p role="status">Account access is not available for this session.</p>
+        <p role="status">{t('detail.unavailable')}</p>
       ) : !id ? (
-        <p role="alert">Invalid account reference.</p>
+        <p role="alert">{t('detail.invalidReference')}</p>
       ) : (
         <>
           <Feedback error={error} status={status} />
@@ -248,49 +235,45 @@ export function UserDetailView() {
               className="min-w-0 space-y-5 rounded-xl border bg-card p-5"
             >
               <h2 id="account-reference" className="break-all font-mono text-sm font-semibold">
-                {user.id}
+                <bdi dir="ltr">{user.id}</bdi>
               </h2>
               <dl className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 text-sm sm:grid-cols-[10rem_minmax(0,1fr)]">
-                <dt className="text-muted-foreground">Status</dt>
-                <dd className="font-medium capitalize">{user.status.replaceAll('_', ' ')}</dd>
-                <dt className="text-muted-foreground">Lifecycle revision</dt>
-                <dd className="break-all font-mono">{user.lifecycle_revision}</dd>
+                <dt className="text-muted-foreground">{t('detail.status')}</dt>
+                <dd className="font-medium">{t(`statuses.${user.status}`)}</dd>
+                <dt className="text-muted-foreground">{t('detail.revision')}</dt>
+                <dd className="break-all font-mono">
+                  <bdi dir="ltr">{user.lifecycle_revision}</bdi>
+                </dd>
                 {access.users_pii && user.email !== undefined && (
                   <>
-                    <dt className="text-muted-foreground">Email</dt>
-                    <dd className="break-all">{user.email}</dd>
+                    <dt className="text-muted-foreground">{t('detail.email')}</dt>
+                    <dd className="break-all">
+                      <bdi dir="ltr">{user.email}</bdi>
+                    </dd>
                   </>
                 )}
-                <dt className="text-muted-foreground">MFA enabled</dt>
-                <dd>{user.is_mfa_enabled ? 'Yes' : 'No'}</dd>
+                <dt className="text-muted-foreground">{t('detail.mfa')}</dt>
+                <dd>{t(user.is_mfa_enabled ? 'detail.yes' : 'detail.no')}</dd>
                 {(
                   [
-                    ['Created', user.created_at],
-                    ['Updated', user.updated_at],
-                    ['Deletion recorded', user.deleted_at],
+                    ['created', user.created_at],
+                    ['updated', user.updated_at],
+                    ['deleted', user.deleted_at],
                   ] as const
                 ).map(([label, value]) => (
                   <div key={label} className="contents">
-                    <dt className="text-muted-foreground">{label}</dt>
+                    <dt className="text-muted-foreground">{t(`detail.${label}`)}</dt>
                     <dd className="break-words">
-                      {value ? (
-                        <time dateTime={value}>
-                          {new Date(value).toISOString().replace('T', ' ').replace('Z', ' UTC')}
-                        </time>
-                      ) : (
-                        'Not recorded'
-                      )}
+                      <QueryUtcTime value={value} />
                     </dd>
                   </div>
                 ))}
               </dl>
               {access.users_status_write && (
                 <div className="space-y-3 border-t pt-4">
-                  <h3 className="font-semibold">Status actions</h3>
+                  <h3 className="font-semibold">{t('detail.actions')}</h3>
                   {!canModerate(user, profile.id) && (
-                    <p className="text-sm text-muted-foreground">
-                      This account is not eligible for a status change.
-                    </p>
+                    <p className="text-sm text-muted-foreground">{t('detail.ineligible')}</p>
                   )}
                   <div className="flex flex-wrap gap-2">
                     {(['suspended', 'banned', 'active'] as const)
@@ -304,14 +287,11 @@ export function UserDetailView() {
                           disabled={busy || Boolean(action) || !canModerate(user, profile.id)}
                           onClick={(event) => void select(desired, event.currentTarget)}
                         >
-                          {moderationLabel[desired]}
+                          {t(`moderation.actions.${desired}`)}
                         </Button>
                       ))}
                   </div>
-                  <p className="text-sm text-muted-foreground">
-                    Every action requires fresh verification, a reason, and final confirmation.
-                    Restrictions do not expire automatically.
-                  </p>
+                  <p className="text-sm text-muted-foreground">{t('detail.requirements')}</p>
                 </div>
               )}
             </section>
@@ -326,7 +306,7 @@ export function UserDetailView() {
               setAttempt((value) => value + 1);
             }}
           >
-            Read current state
+            {t('detail.read')}
           </Button>
           {action && (
             <ModerationDialog

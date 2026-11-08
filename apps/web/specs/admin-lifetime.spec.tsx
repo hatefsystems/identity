@@ -1,6 +1,7 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { TextEncoder } from 'node:util';
+import { I18nTestProvider, render } from '../i18n/testing';
 import { PortalProvider, usePortal } from '../app/_components/portal-provider';
 import { UserDetailView } from '../app/admin/_components/user-detail-view';
 import { UsersView } from '../app/admin/_components/users-view';
@@ -10,6 +11,7 @@ import type {
   AdminCapabilities,
   AdminModerationStatus,
   AdminUser,
+  AdminUsersPage,
   AdminUsersQuery,
 } from '../app/_lib/admin/contracts';
 import { PortalClient } from '../app/_lib/portal/client';
@@ -97,7 +99,7 @@ function makeClient() {
     stepUpVerify: jest.fn(),
     admin: {
       capabilities: jest.fn(nextCapabilities),
-      user: jest.fn(async () => ({ ...serverUser })),
+      user: jest.fn(async (_id: string, _signal: AbortSignal) => ({ ...serverUser })),
       users: jest.fn(async (_query: AdminUsersQuery, _signal: AbortSignal) => ({
         items: [{ ...serverUser }],
         total: 1,
@@ -243,9 +245,11 @@ function submit(reason = '  Verified abuse report  ') {
 
 it('server-renders a non-sensitive admin shell without private values, forms or clients', () => {
   const html = renderToStaticMarkup(
-    <PortalProvider surface="admin">
-      <UserDetailView />
-    </PortalProvider>
+    <I18nTestProvider>
+      <PortalProvider surface="admin">
+        <UserDetailView />
+      </PortalProvider>
+    </I18nTestProvider>
   );
   expect(html).toContain('Checking your secure browser session and administrative access');
   expect(html).not.toContain(serverUser.id);
@@ -849,7 +853,9 @@ it.each(['cancel', 'expiry', 'background', 'session loss'] as const)(
     expect(api.admin.updateStatus).toHaveBeenCalledTimes(1);
     expect(api.logout).not.toHaveBeenCalled();
     if (kind === 'session loss') {
-      expect(screen.getByRole('alert').textContent).toContain('Your session is no longer available');
+      expect(screen.getByRole('alert').textContent).toContain(
+        'Your session is no longer available'
+      );
       return;
     }
     const session = deferred<Profile>();
@@ -934,3 +940,276 @@ it.each(['PII', 'lookup', 'status write'] as const)(
     expect(clients.every((client) => client.logout.mock.calls.length === 0)).toBe(true);
   }
 );
+
+it.each([
+  ['en', 'Available workspaces', 'Accounts', 'Audit logs', 'Integrity', 'DPO and Legal'],
+  [
+    'fa-IR',
+    'بخش‌های در دسترس',
+    'حساب‌ها',
+    'سوابق ممیزی',
+    'تمامیت داده‌ها',
+    'حفاظت از داده‌ها و امور حقوقی',
+  ],
+] as const)(
+  'localizes the overview in %s while retaining only the capability-approved workspace links',
+  async (locale, workspaces, accounts, audit, integrity, legal) => {
+    mockPathname = '/admin';
+    nextCapabilities = async () => ({
+      ...permissions(),
+      capabilities: {
+        ...permissions().capabilities,
+        audit_logs_read: true,
+        ledger_verify: true,
+        legal_holds_read: true,
+      },
+    });
+    render(
+      <I18nTestProvider locale={locale}>
+        <PortalProvider surface="admin">
+          <AdminOverview />
+        </PortalProvider>
+      </I18nTestProvider>
+    );
+    const region = within(await screen.findByRole('region', { name: workspaces }));
+    for (const [name, href] of [
+      [accounts, '/admin/users'],
+      [audit, '/admin/audit-logs'],
+      [integrity, '/admin/integrity'],
+      [legal, '/admin/legal'],
+    ]) {
+      expect(region.getByRole('link', { name }).getAttribute('href')).toBe(href);
+    }
+    expect(clients[0].admin.user).not.toHaveBeenCalled();
+    expect(clients[0].admin.users).not.toHaveBeenCalled();
+  }
+);
+
+it.each([
+  ['en', 'Account directory', 'Apply filters', 'Account status', 'Exact email', 'Active'],
+  ['fa-IR', 'فهرست حساب‌ها', 'اعمال فیلترها', 'وضعیت حساب', 'ایمیل دقیق', 'فعال'],
+] as const)(
+  'localizes the account directory in %s without changing references, email or exact UTC time',
+  async (locale, heading, apply, status, email, active) => {
+    mockPathname = '/admin/users';
+    serverUser.created_at = '2026-01-01T00:00:00.123456789Z';
+    render(
+      <I18nTestProvider locale={locale}>
+        <PortalProvider surface="admin">
+          <UsersView />
+        </PortalProvider>
+      </I18nTestProvider>
+    );
+    await screen.findByRole('heading', { name: heading });
+    expect(screen.getByLabelText(status)).toBeTruthy();
+    expect(screen.getByLabelText(email).getAttribute('dir')).toBe('ltr');
+    expect(clients[0].admin.users).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: apply }));
+    const row = within(await screen.findByTestId('admin-account-row'));
+    expect(row.getByText(active)).toBeTruthy();
+    expect(row.getByText(mockTargetID).getAttribute('dir')).toBe('ltr');
+    expect(row.getByText(serverUser.email as string).getAttribute('dir')).toBe('ltr');
+    const timestamp = row.getByText('2026-01-01 00:00:00.123456789 UTC');
+    expect(timestamp.closest('time')?.getAttribute('dateTime')).toBe(serverUser.created_at);
+    expect(clients[0].admin.users).toHaveBeenCalledTimes(1);
+    expect(clients[0].admin.users).toHaveBeenCalledWith(
+      { limit: 20, offset: 0 },
+      expect.any(AbortSignal)
+    );
+  }
+);
+
+it('translates account validation and a pending query without refetching or resetting inputs', async () => {
+  mockPathname = '/admin/users';
+  const content = (locale: 'en' | 'fa-IR') => (
+    <I18nTestProvider locale={locale}>
+      <PortalProvider surface="admin">
+        <UsersView />
+      </PortalProvider>
+    </I18nTestProvider>
+  );
+  const view = render(content('en'));
+  const size = await screen.findByLabelText<HTMLInputElement>('Page size');
+  fireEvent.change(size, { target: { value: '101' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+  expect(screen.getByRole('alert').textContent).toBe('Enter a whole page size from 1 to 100.');
+  view.rerender(content('fa-IR'));
+  expect(screen.getByRole('alert').textContent).toContain('تعداد حساب‌های هر صفحه');
+  expect(screen.getByLabelText('تعداد در هر صفحه')).toBe(size);
+  expect(size.value).toBe('101');
+  expect(clients[0].admin.users).not.toHaveBeenCalled();
+  fireEvent.change(size, { target: { value: '20' } });
+  const pending = deferred<AdminUsersPage>();
+  const api = clients[0];
+  api.admin.users.mockReturnValueOnce(pending.promise);
+  fireEvent.click(screen.getByRole('button', { name: 'اعمال فیلترها' }));
+  expect(within(screen.getByRole('main')).getByRole('status').textContent).toBe(
+    'در حال بارگیری حساب‌ها...'
+  );
+  const signal = api.admin.users.mock.calls[0][1];
+  view.rerender(content('en'));
+  expect(within(screen.getByRole('main')).getByRole('status').textContent).toBe(
+    'Loading accounts...'
+  );
+  expect(signal.aborted).toBe(false);
+  expect(clients).toHaveLength(1);
+  expect(api.bootstrap).toHaveBeenCalledTimes(1);
+  expect(api.dispose).not.toHaveBeenCalled();
+  expect(api.admin.capabilities).toHaveBeenCalledTimes(1);
+  expect(api.admin.users).toHaveBeenCalledTimes(1);
+  await act(async () =>
+    pending.resolve({ items: [{ ...serverUser }], total: 1, limit: 20, offset: 0 })
+  );
+  expect(within(screen.getByRole('main')).getByRole('status').textContent).toBe(
+    '1 account on this page loaded.'
+  );
+  view.rerender(content('fa-IR'));
+  expect(within(screen.getByRole('main')).getByRole('status').textContent).toBe(
+    '۱ حساب در این صفحه بارگیری شد.'
+  );
+  expect(api.admin.users).toHaveBeenCalledTimes(1);
+});
+
+function localizedDetail(locale: 'en' | 'fa-IR') {
+  return (
+    <I18nTestProvider locale={locale}>
+      <PortalProvider surface="admin">
+        <UserDetailView />
+      </PortalProvider>
+    </I18nTestProvider>
+  );
+}
+
+it('preserves a pending moderation read, one-use grant, final draft and in-flight write across languages', async () => {
+  const view = render(localizedDetail('en'));
+  await startAction();
+  const checking = deferred<AdminUser>();
+  const sending = deferred<void>();
+  const api = clients[0];
+  api.admin.user.mockReturnValueOnce(checking.promise);
+  fireEvent.click(screen.getByRole('button', { name: 'Verify with a passkey' }));
+  await waitFor(() => expect(api.admin.user).toHaveBeenCalledTimes(3));
+  const grant = grants[0];
+  const deadline = grant.deadline;
+  const clear = jest.spyOn(grant, 'clear');
+  const signal = api.admin.user.mock.calls[2][1];
+  view.rerender(localizedDetail('fa-IR'));
+  let dialog = within(screen.getByRole('dialog', { name: 'تعلیق حساب' }));
+  expect(dialog.getByRole('status').textContent).toBe(
+    'تأیید هویت انجام شد. در حال بررسی حساب تثبیت‌شده پیش از تأیید نهایی.'
+  );
+  expect(signal.aborted).toBe(false);
+  expect(api.admin.user).toHaveBeenCalledTimes(3);
+  await act(async () => checking.resolve({ ...serverUser }));
+  const input = await screen.findByLabelText<HTMLTextAreaElement>('دلیل اقدام مدیریتی');
+  expect(input.getAttribute('dir')).toBe('auto');
+  fireEvent.click(
+    screen.getByRole('checkbox', {
+      name: 'حساب، وضعیت فعلی، وضعیت جدید و پیامدهای این اقدام را بررسی کرده‌ام.',
+    })
+  );
+  fireEvent.submit(screen.getByRole('form', { name: 'تأیید تغییر وضعیت حساب' }));
+  expect(screen.getByRole('alert').textContent).toBe('دلیلی با حداکثر ۲٬۰۰۰ بایت UTF-8 وارد کنید.');
+  view.rerender(localizedDetail('en'));
+  expect(screen.getByRole('alert').textContent).toBe(
+    'Enter a reason using no more than 2,000 UTF-8 bytes.'
+  );
+  const reason = '  گزارش بررسی‌شده ABC-123  ';
+  fireEvent.change(input, { target: { value: reason } });
+  view.rerender(localizedDetail('fa-IR'));
+  expect(screen.getByLabelText('دلیل اقدام مدیریتی')).toBe(input);
+  expect(input.value).toBe(reason);
+  expect(screen.getByRole<HTMLInputElement>('checkbox').checked).toBe(true);
+  expect(grant.deadline).toBe(deadline);
+  expect(clear).not.toHaveBeenCalled();
+  expect(grants).toHaveLength(1);
+  api.admin.updateStatus.mockImplementationOnce((_id, body, authority, _signal, sent) => {
+    authority.take('session-id');
+    sent();
+    serverUser = { ...serverUser, status: body.status, lifecycle_revision: '9007199254740994' };
+    return sending.promise;
+  });
+  fireEvent.submit(screen.getByRole('form', { name: 'تأیید تغییر وضعیت حساب' }));
+  view.rerender(localizedDetail('en'));
+  dialog = within(screen.getByRole('dialog', { name: 'Suspend account' }));
+  expect(dialog.getByRole('status').textContent).toBe(
+    'Sending status change. Do not submit again.'
+  );
+  expect(
+    dialog.getByRole<HTMLButtonElement>('button', { name: 'Submitting status change...' }).disabled
+  ).toBe(true);
+  fireEvent.submit(screen.getByRole('form', { name: 'Confirm account status change' }));
+  view.rerender(localizedDetail('fa-IR'));
+  dialog = within(screen.getByRole('dialog', { name: 'تعلیق حساب' }));
+  expect(dialog.getByRole('status').textContent).toBe(
+    'در حال ارسال تغییر وضعیت. دوباره ارسال نکنید.'
+  );
+  expect(api.admin.updateStatus).toHaveBeenCalledTimes(1);
+  expect(api.admin.updateStatus).toHaveBeenCalledWith(
+    mockTargetID,
+    { status: 'suspended', reason: reason.trim(), expected_revision: '9007199254740993' },
+    grant,
+    expect.any(AbortSignal),
+    expect.any(Function)
+  );
+  expect(api.admin.updateStatus.mock.calls[0][3].aborted).toBe(false);
+  expect(clients).toHaveLength(1);
+  expect(api.bootstrap).toHaveBeenCalledTimes(1);
+  expect(api.dispose).not.toHaveBeenCalled();
+  expect(api.admin.capabilities).toHaveBeenCalledTimes(1);
+  expect(api.stepUpChallenge).toHaveBeenCalledTimes(1);
+  expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+  expect(api.admin.user).toHaveBeenCalledTimes(3);
+  await act(async () => sending.resolve());
+  await screen.findByText('تغییر وضعیت تأیید شد. وضعیت فعلی حساب بارگیری شد.');
+  expect(input.value).toBe('');
+  expect(() => grant.take('session-id')).toThrow('grant_expired');
+  expect(api.admin.updateStatus).toHaveBeenCalledTimes(1);
+});
+
+it('does not extend the confirmation deadline or retain a reason after expiry on a language change', async () => {
+  jest.useFakeTimers();
+  grantSeconds = 1;
+  const view = render(localizedDetail('en'));
+  const input = await finalForm();
+  fireEvent.change(input, { target: { value: 'پیش‌نویس خصوصی' } });
+  const deadline = grants[0].deadline;
+  act(() => jest.advanceTimersByTime(400));
+  view.rerender(localizedDetail('fa-IR'));
+  expect(screen.getByLabelText('دلیل اقدام مدیریتی')).toBe(input);
+  expect(input.value).toBe('پیش‌نویس خصوصی');
+  expect(grants).toHaveLength(1);
+  expect(grants[0].deadline).toBe(deadline);
+  act(() => jest.advanceTimersByTime(601));
+  expect(screen.getByRole('alert').textContent).toBe(
+    'اعتبار تأیید هویت منقضی شد. دلیل واردشده پاک شد. با تأیید هویت مجدد اقدام تازه‌ای را آغاز کنید.'
+  );
+  expect(input.value).toBe('');
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(() => grants[0].take('session-id')).toThrow('grant_expired');
+  expect(clients[0].stepUpVerify).toHaveBeenCalledTimes(1);
+  expect(clients[0].admin.updateStatus).not.toHaveBeenCalled();
+});
+
+it('does not restart a waiting TOTP ceremony or normalize its code when presentation changes', async () => {
+  const view = render(localizedDetail('en'));
+  await startAction();
+  fireEvent.click(screen.getByRole('button', { name: 'Use authenticator code' }));
+  const code = screen.getByLabelText<HTMLInputElement>('Authenticator code');
+  fireEvent.change(code, { target: { value: '001234' } });
+  view.rerender(localizedDetail('fa-IR'));
+  expect(screen.getByRole('dialog', { name: 'تعلیق حساب' })).toBeTruthy();
+  expect(code.isConnected).toBe(true);
+  expect(code.value).toBe('001234');
+  view.rerender(localizedDetail('en'));
+  expect(screen.getByLabelText('Authenticator code')).toBe(code);
+  expect(code.value).toBe('001234');
+  expect(clients).toHaveLength(1);
+  expect(clients[0].bootstrap).toHaveBeenCalledTimes(1);
+  expect(clients[0].stepUpChallenge).toHaveBeenCalledTimes(1);
+  expect(clients[0].stepUpVerify).not.toHaveBeenCalled();
+  expect(grants).toHaveLength(0);
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  expect(code.value).toBe('');
+  expect(screen.queryByRole('dialog')).toBeNull();
+});

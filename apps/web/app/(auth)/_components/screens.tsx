@@ -1,12 +1,15 @@
 'use client';
 
+import { useTranslations } from 'next-intl';
+
 import { ForgotPasswordForm, LoginForm, ResetPasswordForm, TotpForm } from './forms';
 import { PasskeyLogin } from '../../_components/passkey-login';
 import { Registration } from '../../_components/registration';
 
 // Password and reset forms remain unavailable; signup is passkey-only.
 export function LoginScreen() {
-  return <LoginForm passkeyAction={<PasskeyLogin label="Continue with a passkey" />} />;
+  const t = useTranslations();
+  return <LoginForm passkeyAction={<PasskeyLogin label={t('auth.passkey.continue')} />} />;
 }
 
 export function RegistrationScreen() {

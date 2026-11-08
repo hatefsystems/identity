@@ -56,4 +56,18 @@
   body {
     @apply bg-background text-foreground;
   }
+
+  html[lang='fa-IR'] body {
+    line-height: 1.8;
+  }
+
+  html[lang='fa-IR'] :is(h1, h2, h3, button, summary) {
+    letter-spacing: normal;
+  }
+
+  bdi,
+  [dir='ltr'],
+  [dir='auto'] {
+    unicode-bidi: isolate;
+  }
 }

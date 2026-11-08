@@ -1,5 +1,10 @@
 'use client';
 
+import type { Message } from '../../i18n/messages';
+import { useMessage } from '../../i18n/use-message';
+
+import { useTranslations } from 'next-intl';
+
 import { Button } from '@hatef/ui';
 import { Fingerprint } from 'lucide-react';
 import { useRouter } from 'next/navigation';
@@ -12,16 +17,18 @@ import { safeReturnPath } from '../_lib/portal/validation';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
 
 export function PasskeyLogin({
-  label = 'Use a passkey',
+  label,
   introduction = false,
 }: {
   label?: string;
   introduction?: boolean;
 }) {
+  const t = useTranslations();
+  const message = useMessage();
   const router = useRouter();
   const [hydrated, setHydrated] = useState(false);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<Message>('');
   const active = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLParagraphElement>(null);
   const button = useRef<HTMLButtonElement>(null);
@@ -76,7 +83,7 @@ export function PasskeyLogin({
     active.current?.abort();
     active.current = null;
     setPending(false);
-    setError('The passkey request was cancelled. Start again to sign in.');
+    setError({ key: 'auth.passkey.cancelled' });
     button.current?.focus();
   }
 
@@ -84,8 +91,7 @@ export function PasskeyLogin({
     <div className="space-y-4">
       {introduction && (
         <p className="rounded-md bg-muted/50 p-4 text-sm leading-relaxed">
-          Use a fingerprint, face recognition, device PIN, or a security key for an existing
-          account. Your device chooses the account; no email address is needed.
+          {t('auth.passkey.intro')}
         </p>
       )}
       <p
@@ -94,9 +100,7 @@ export function PasskeyLogin({
         aria-atomic="true"
         className={pending ? 'text-sm text-muted-foreground' : 'sr-only'}
       >
-        {pending
-          ? 'Complete the passkey prompt. Your session will be checked before opening the portal.'
-          : ''}
+        {pending ? t('auth.passkey.pending') : ''}
       </p>
       {error && (
         <p
@@ -105,7 +109,7 @@ export function PasskeyLogin({
           role="alert"
           className="rounded-md border border-red-700 bg-red-50 p-3 text-sm leading-relaxed text-red-800 focus:outline-none dark:border-red-400 dark:bg-red-950 dark:text-red-200"
         >
-          {error}
+          {message(error)}
         </p>
       )}
       <Button
@@ -117,18 +121,15 @@ export function PasskeyLogin({
         className="h-auto min-h-11 w-full whitespace-normal"
       >
         <Fingerprint aria-hidden="true" />
-        {pending ? 'Verifying passkey...' : label}
+        {pending ? t('auth.passkey.verifying') : (label ?? t('auth.passkey.use'))}
       </Button>
       {pending && (
         <Button type="button" variant="outline" onClick={cancel} className="min-h-11 w-full">
-          Cancel sign in
+          {t('auth.passkey.cancel')}
         </Button>
       )}
       <noscript>
-        <p className="text-sm">
-          JavaScript is required for secure passkey sign-in. No credentials are submitted without
-          it.
-        </p>
+        <p className="text-sm">{t('auth.passkey.noScript')}</p>
       </noscript>
     </div>
   );

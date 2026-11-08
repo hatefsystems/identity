@@ -1,5 +1,14 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { renderToStaticMarkup } from 'react-dom/server';
+jest.mock('next-intl/server', () => ({
+  getTranslations: (...args: unknown[]) =>
+    jest.requireActual('../i18n/testing').getTestTranslations(...args),
+}));
+
+import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
+import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
+import type { ReactElement } from 'react';
+import { I18nTestProvider } from '../i18n/testing';
+const renderToStaticMarkup = (element: ReactElement) =>
+  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-provider';
 import { PortalClient } from '../app/_lib/portal/client';
 import type { Profile } from '../app/_lib/portal/contracts';
@@ -192,5 +201,43 @@ describe('protected portal bootstrap', () => {
     );
     expect(replace).not.toHaveBeenCalled();
     expect(api.logout).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('display preferences preserve session authority', () => {
+  it('keeps the same bootstrap, private draft, client and expiry timer across language changes', async () => {
+    jest.useFakeTimers();
+    const value = api.profile;
+    const expiry = Date.parse(value.session.expires_at);
+    function view(locale: 'en' | 'fa-IR') {
+      return (
+        <I18nTestProvider locale={locale}>
+          <PortalProvider>
+            <PrivateContent />
+            <input aria-label="Private draft" defaultValue="" />
+          </PortalProvider>
+        </I18nTestProvider>
+      );
+    }
+    const result = render(view('en'));
+    await act(async () => undefined);
+    const draft = screen.getByRole<HTMLInputElement>('textbox', { name: 'Private draft' });
+    fireEvent.change(draft, { target: { value: 'نام خصوصی ۱۲۳' } });
+    const calls = jest.mocked(PortalClient).mock.calls.length;
+    act(() => jest.advanceTimersByTime(59000));
+    result.rerender(view('fa-IR'));
+    expect(screen.getByRole('navigation', { name: 'ناوبری حساب' })).toBeTruthy();
+    expect(screen.getByRole('textbox', { name: 'Private draft' })).toBe(draft);
+    expect(draft.value).toBe('نام خصوصی ۱۲۳');
+    expect(jest.mocked(PortalClient)).toHaveBeenCalledTimes(calls);
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(api.dispose).not.toHaveBeenCalled();
+    expect(invalidateOtherTabs).not.toHaveBeenCalled();
+    expect(Date.parse(api.profile.session.expires_at)).toBe(expiry);
+    act(() => jest.advanceTimersByTime(1001));
+    expect(screen.queryByText('private@example.test')).toBeNull();
+    expect(screen.getByRole('alert').textContent).toBe(
+      'نشست شما دیگر در دسترس نیست. برای ادامه دوباره وارد شوید.'
+    );
   });
 });

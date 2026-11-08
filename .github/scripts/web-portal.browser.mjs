@@ -1,3 +1,4 @@
+import { assertOnlyPreferenceCookies, browserLocale, browserLocales, configureBrowserPreferences, exercisePreferenceSwitch, localizedText, screenshotName, setBrowserLocale, waitForFonts } from './browser-localization.mjs';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
@@ -8,6 +9,30 @@ import { anonymousReclaim, browserFailure, guardBrowserFailures, legalCoordinate
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
+
+function progress(stage) {
+  assert(/^[a-z-]{1,64}$/.test(stage), 'Invalid public portal checkpoint');
+  checkpoint = stage;
+  console.log(JSON.stringify({ portalStage: stage, locale: browserLocale() }));
+}
+
+// Browser protocol operations such as response.finished/clock.fastForward do
+// not inherit locator timeouts. Keep their diagnostic stage bounded on the
+// Node clock, independently of any page clock used to test secret expiry.
+async function boundedStage(stage, operation, milliseconds = 30_000) {
+  progress(stage);
+  let timer;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Bounded portal stage did not complete')), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const routes = ['/dashboard', '/dashboard/profile', '/dashboard/security', '/dashboard/sessions', '/dashboard/privacy', '/recover-account'];
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -124,6 +149,7 @@ function observe(context, harness) {
 
 async function newContext(browser, harness) {
   const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block' });
+  await configureBrowserPreferences(context, harness.origin);
   context.setDefaultTimeout(15_000);
   context.setDefaultNavigationTimeout(30_000);
   await context.addInitScript(() => {
@@ -406,7 +432,7 @@ async function navigate(page, origin, label, path) {
   await page.evaluate((marker) => {
     document.__portalNavigationMarker = marker;
   }, marker);
-  const link = page.getByRole('link', { name: label, exact: true });
+  const link = page.getByRole('link', { name: localizedText(label), exact: true });
   assert.equal(await link.getAttribute('href'), path);
   await Promise.all([page.waitForURL(origin + path), link.click()]);
   await page.getByTestId('portal-ready').waitFor({ state: 'visible' });
@@ -422,8 +448,8 @@ async function stepUp(page, trigger) {
   const dialog = page.getByTestId('stepup-dialog');
   await dialog.waitFor({ state: 'visible' });
   assert(await dialog.evaluate((element) => element instanceof HTMLDialogElement && element.open));
-  await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-  await dialog.getByRole('button', { name: 'Verify with a passkey', exact: true }).click();
+  await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+  await dialog.getByRole('button', { name: localizedText('Verify with a passkey'), exact: true }).click();
 }
 
 async function hidePortal(page, context, evidence, readyID = 'portal-ready') {
@@ -468,8 +494,8 @@ async function hidePortal(page, context, evidence, readyID = 'portal-ready') {
 async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
   await trigger();
   const dialog = page.getByTestId('stepup-dialog');
-  await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-  await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).click();
+  await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+  await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
   // Send a deliberately invalid factor to the real verifier, without mocking
   // its response or relying on a random six-digit value being incorrect.
   const pattern = '**/api/v1/auth/stepup/verify';
@@ -484,30 +510,30 @@ async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
       response.status() === 401 &&
       !response.headers()['dpop-nonce']
   );
-  await dialog.getByLabel('Authenticator code', { exact: true }).fill('000000');
-  await dialog.getByRole('button', { name: 'Verify code', exact: true }).click();
+  await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill('000000');
+  await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
   await rejected;
   await page.unroute(pattern, rejectFactor);
   await dialog.getByRole('alert').waitFor({ state: 'visible' });
   assert(await page.getByTestId('portal-ready').isVisible(), 'Rejected TOTP erased valid session state');
-  await dialog.getByLabel('Authenticator code', { exact: true }).fill('123');
+  await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill('123');
 
   const resume = await hidePortal(page, context, evidence);
   const rechecked = operationResponse(page, '/api/v1/users/me', 'GET');
   await resume();
   assert.equal((await rechecked).status(), 200);
   await page.getByTestId('portal-ready').waitFor({ state: 'visible' });
-  await dialog.getByText(/Your pending action was restored after checking the same session/).waitFor();
-  assert.equal(await dialog.getByLabel('Authenticator code', { exact: true }).count(), 0);
-  await dialog.getByRole('button', { name: 'Continue to verification', exact: true }).click();
-  const input = dialog.getByLabel('Authenticator code', { exact: true });
+  await dialog.getByText(localizedText(/Your pending action was restored after checking the same session/)).waitFor();
+  assert.equal(await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).count(), 0);
+  await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+  const input = dialog.getByLabel(localizedText('Authenticator code'), { exact: true });
   await input.waitFor({ state: 'visible' });
   assert.equal(await input.inputValue(), '', 'A factor code survived background suspension');
   let current = harness.fixture('totp-code', { user_id: fixture.user_id });
   assert.match(current.code, /^\d{6}$/);
   await input.fill(current.code);
   const verified = operationResponse(page, '/api/v1/auth/stepup/verify', 'POST');
-  await dialog.getByRole('button', { name: 'Verify code', exact: true }).click();
+  await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
   current = undefined;
   assert.equal((await verified).status(), 200, 'Production TOTP verification failed');
   evidence.checks.push(
@@ -561,6 +587,85 @@ async function concurrentTabs(browser, harness, evidence, contexts) {
   return { fixture, context, observed, pages, authenticators };
 }
 
+async function preferenceSwitchDuringProfileResponse(page, cdp, origin, method, trigger) {
+  assert(method === 'GET' || method === 'PATCH');
+  const endpoint = origin + '/api/v1/users/me';
+  let arrive, release;
+  const arrived = new Promise((resolve) => { arrive = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const pending = [];
+  let successes = 0;
+  let nonceRetries = 0;
+  let attempts = 0;
+  let interceptionFailed = false;
+  const observeRequest = (request) => {
+    if (request.url() === endpoint && request.method() === method) attempts++;
+  };
+  const pause = (event) => {
+    const operation = (async () => {
+      try {
+        if (event.request.url !== endpoint || event.request.method !== method) {
+          await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+          return;
+        }
+        if (event.responseStatusCode === 401) {
+          const headers = new Headers((event.responseHeaders || []).map(({ name, value }) => [name, value]));
+          assert(headers.has('DPoP-Nonce') && /^DPoP[ \t]+error="use_dpop_nonce"$/i.test(headers.get('WWW-Authenticate') || ''));
+          assert.equal(++nonceRetries, 1, 'More than one profile nonce retry');
+        } else {
+          assert.equal(event.responseStatusCode, 200, 'Pending profile operation did not reach its real success');
+          assert.equal(++successes, 1, 'Locale switching replayed a successful profile operation');
+          arrive();
+          await held;
+        }
+        // No response body/header/proof capture or replacement: release the
+        // original Chromium connection and preserve its real committed result.
+        await cdp.send('Fetch.continueRequest', { requestId: event.requestId });
+      } catch {
+        interceptionFailed = true;
+        arrive();
+        await cdp.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => {});
+      }
+    })();
+    pending.push(operation);
+  };
+  cdp.on('Fetch.requestPaused', pause);
+  page.on('request', observeRequest);
+  await cdp.send('Fetch.enable', { patterns: [{ urlPattern: endpoint, requestStage: 'Response' }] });
+  const result = operationResponse(page, '/api/v1/users/me', method);
+  // Keep a rejection observed even if a preceding assertion fails before release.
+  result.catch(() => {});
+  try {
+    await trigger();
+    await Promise.race([arrived, page.waitForTimeout(5000).then(() => { throw new Error('Real profile response did not reach its exact pause'); })]);
+    assert(!interceptionFailed && successes === 1, 'Exact profile response interception failed');
+    const requestsBeforeSwitch = attempts;
+    await exercisePreferenceSwitch(page, { privateSelector: 'main form input', onOtherLocale: async (locale) => {
+      const form = page.getByRole('form', { name: locale === 'en' ? 'Edit profile' : 'ویرایش نمایه', exact: true });
+      assert(await form.locator('input, button').evaluateAll((controls) => controls.every((control) => control.disabled)),
+        'Language switching discarded pending profile operation ownership');
+      const status = locale === 'en'
+        ? method === 'PATCH' ? 'Saving your profile...' : 'Refreshing the saved profile...'
+        : method === 'PATCH' ? 'در حال ذخیرهٔ نمایهٔ شما...' : 'در حال تازه‌سازی نمایهٔ ذخیره‌شده...';
+      assert.equal((await form.getByRole('status').textContent()).trim(), status,
+        'Pending profile feedback did not switch language');
+    } });
+    assert.equal(attempts, requestsBeforeSwitch, 'Preference save reissued a pending profile operation');
+    release();
+    assert.equal((await result).status(), 200);
+    await page.waitForFunction(() => !document.querySelector('main form input[name="display_name"]')?.disabled);
+    await Promise.all(pending);
+    assert(!interceptionFailed && successes === 1 && attempts === nonceRetries + 1,
+      'Pending profile operation was replayed or lost after language switching');
+  } finally {
+    release();
+    await Promise.all(pending);
+    await cdp.send('Fetch.disable').catch(() => {});
+    cdp.off('Fetch.requestPaused', pause);
+    page.off('request', observeRequest);
+  }
+}
+
 async function profileAndSessions(browser, harness, evidence, contexts, initial) {
   // Reuse the concurrent-login fixture to stay below the real shared anonymous
   // admission limit; never raise a production limit or fake a client subnet.
@@ -583,20 +688,29 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   );
 
   await navigate(page, harness.origin, 'Profile', '/dashboard/profile');
-  const input = page.getByLabel('Display name', { exact: true });
+  const input = page.getByLabel(localizedText('Display name'), { exact: true });
   for (const displayName of ['First portal name', 'Second portal name']) {
     harness.secrets.push(displayName);
     await input.fill(displayName);
-    const response = operationResponse(page, '/api/v1/users/me', 'PATCH');
-    await page.getByRole('button', { name: 'Save profile', exact: true }).click();
-    assert.equal((await response).status(), 200, 'Repeated profile save failed');
-    await page.getByRole('status').filter({ hasText: /saved/i }).waitFor({ state: 'visible' });
+    const save = () => page.getByRole('button', { name: localizedText('Save profile'), exact: true }).click();
+    if (displayName === 'First portal name') {
+      await preferenceSwitchDuringProfileResponse(page, authenticators[0].cdp, harness.origin, 'PATCH', save);
+    } else {
+      const response = operationResponse(page, '/api/v1/users/me', 'PATCH');
+      await save();
+      assert.equal((await response).status(), 200, 'Repeated profile save failed');
+    }
+    await page.getByRole('form', { name: localizedText('Edit profile'), exact: true })
+      .getByRole('status').filter({ hasText: localizedText('Profile saved.') }).waitFor({ state: 'visible' });
   }
   const saved = (await api(page, '/api/v1/users/me')).body;
   assert.equal(saved.lifecycle_revision, '9007199254740995');
   const draft = 'Unsaved portal draft';
   harness.secrets.push(draft);
   await input.fill(draft);
+  await exercisePreferenceSwitch(page, { privateSelector: 'input', settings: true });
+  assert.equal(await keyStorage(page).then((value) => value.publicKey), key.publicKey);
+  assert.equal(await tab.locator('html').getAttribute('lang'), browserLocale(), 'Another tab presentation changed automatically');
   const competing = await api(tab, '/api/v1/users/me', {
     method: 'PATCH',
     sessionID: original.body.session.id,
@@ -604,11 +718,14 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   });
   assert.equal(competing.status, 200);
   const conflict = operationResponse(page, '/api/v1/users/me', 'PATCH');
-  await page.getByRole('button', { name: 'Save profile', exact: true }).click();
+  await page.getByRole('button', { name: localizedText('Save profile'), exact: true }).click();
   assert.equal((await conflict).status(), 409);
   assert((await input.inputValue()) === draft, 'Profile conflict erased the unsaved draft');
-  await page.getByRole('button', { name: 'Refresh saved profile', exact: true }).click();
+  await preferenceSwitchDuringProfileResponse(page, authenticators[0].cdp, harness.origin, 'GET', () =>
+    page.getByRole('button', { name: localizedText('Refresh saved profile'), exact: true }).click());
   assert((await input.inputValue()) === draft, 'Conflict refresh erased the unsaved draft');
+  assert.equal(await keyStorage(page).then((value) => value.publicKey), key.publicKey);
+  evidence.checks.push('language switching during pending real profile PATCH and GET preserves draft, pending feedback, operation ownership and browser key; original responses released without replay or additional API work');
 
   const cookieOnly = await page.evaluate(async () => {
     const response = await fetch('/api/v1/users/me', { cache: 'no-store' });
@@ -636,7 +753,7 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   await navigate(page, harness.origin, 'Sessions', '/dashboard/sessions');
   const remoteRow = page.locator(`[data-session-id="${remoteProfile.session.id}"]`);
   await remoteRow.waitFor({ state: 'visible' });
-  await remoteRow.getByRole('button', { name: /revoke/i }).click();
+  await remoteRow.getByRole('button', { name: localizedText(/revoke/i) }).click();
   const revoke = operationResponse(
     page,
     `/api/v1/users/me/sessions/${remoteProfile.session.id}`,
@@ -644,7 +761,7 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   );
   await page
     .getByTestId('session-dialog')
-    .getByRole('button', { name: 'Confirm revocation', exact: true })
+    .getByRole('button', { name: localizedText('Confirm revocation'), exact: true })
     .click();
   assert.equal((await revoke).status(), 204);
   assert.equal(
@@ -655,7 +772,7 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   await remotePage.bringToFront();
   await remotePage.reload();
   await remotePage
-    .getByRole('link', { name: 'Sign in with a passkey', exact: true })
+    .getByRole('link', { name: localizedText('Sign in with a passkey'), exact: true })
     .waitFor({ state: 'visible' });
   await remotePage.getByTestId('portal-ready').waitFor({ state: 'hidden' });
   assert(
@@ -693,7 +810,7 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   await navigate(loginTab, harness.origin, 'Sessions', '/dashboard/sessions');
   await loginTab
     .locator(`[data-session-id="${changed.session.id}"]`)
-    .getByRole('button', { name: 'Sign out this session', exact: true })
+    .getByRole('button', { name: localizedText('Sign out this session'), exact: true })
     .click();
   const logout = operationResponse(
     loginTab,
@@ -702,7 +819,7 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   );
   await loginTab
     .getByTestId('session-dialog')
-    .getByRole('button', { name: 'Confirm sign out', exact: true })
+    .getByRole('button', { name: localizedText('Confirm sign out'), exact: true })
     .click();
   assert.equal((await logout).status(), 204);
   await page.getByTestId('portal-ready').waitFor({ state: 'hidden' });
@@ -761,14 +878,17 @@ async function appearance(page, evidence, scope = 'portal') {
     for (const viewport of [
       { width: 320, height: 568 },
       { width: 390, height: 844 },
+      { width: 768, height: 1024 },
       { width: 1280, height: 800 },
+      { width: 320, height: 256 },
     ]) {
       await page.setViewportSize(viewport);
+      await waitForFonts(page);
       const violations = await page.evaluate(() => {
         const failures = [];
         if (document.documentElement.scrollWidth > innerWidth + 1)
           failures.push('horizontal overflow');
-        for (const control of document.querySelectorAll('main button, main input, nav a')) {
+        for (const control of document.querySelectorAll('header button, header select, header summary, main button, main input, main select, main textarea, nav a')) {
           if (!control.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
           // A checkbox's associated, clickable label is its larger touch target.
           const target = control.matches('input[type="checkbox"]') && control.labels?.length
@@ -785,17 +905,16 @@ async function appearance(page, evidence, scope = 'portal') {
         [],
         `Portal ${dark ? 'dark' : 'light'} ${viewport.width}px reflow`
       );
-      evidence.viewports.push(`${scope}-${dark ? 'dark' : 'light'}-${viewport.width}x${viewport.height}`);
+      evidence.viewports.push(`${scope}-${browserLocale()}-${dark ? 'dark' : 'light'}-${viewport.width}x${viewport.height}`);
       if (process.env.PORTAL_BROWSER_ARTIFACT_DIR) {
         const directory = resolve(process.env.PORTAL_BROWSER_ARTIFACT_DIR);
         await mkdir(directory, { recursive: true });
         await page.screenshot({
-          path: resolve(directory, `${scope}-${dark ? 'dark' : 'light'}-${viewport.width}.png`),
+          path: resolve(directory, screenshotName(scope, viewport, dark)),
           fullPage: true,
           // Artifacts demonstrate layout, not a persistent account-data export.
           mask: [
-            page.locator('input, [data-testid="saved-display-name"]'),
-            page.getByText(/portal-[a-f0-9-]+@[a-f0-9]+\.example\.test/, { exact: true }),
+            page.locator('input, textarea, main dd, main .font-mono, [data-testid="saved-display-name"], [data-testid="recovery-viewer"], [data-testid="passkey-row"], [data-testid="session-row"], [data-legal-private]'),
           ],
         });
       }
@@ -818,8 +937,8 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   );
   const passkeyName = 'Portable browser test key';
   harness.secrets.push(passkeyName);
-  await page.getByLabel('New passkey name', { exact: true }).fill(passkeyName);
-  const add = page.getByRole('button', { name: 'Add passkey', exact: true });
+  await page.getByLabel(localizedText('New passkey name'), { exact: true }).fill(passkeyName);
+  const add = page.getByRole('button', { name: localizedText('Add passkey'), exact: true });
   await add.click();
   const dialog = page.getByTestId('stepup-dialog');
   await dialog.waitFor({ state: 'visible' });
@@ -860,25 +979,25 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   assert(key.name === passkeyName, 'Registration did not preserve the pending name');
   const row = page.locator(`[data-key-id="${key.id}"]`);
   await row.waitFor({ state: 'visible' });
-  await row.getByRole('button', { name: /^Rename / }).click();
-  await row.getByLabel('Passkey name', { exact: true }).fill('Renamed browser key');
+  await row.getByRole('button', { name: localizedText(/^Rename /) }).click();
+  await row.getByLabel(localizedText('Passkey name'), { exact: true }).fill('Renamed browser key');
   const renamed = operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'PATCH');
   await totpStepUp(page, context, harness, fixture, evidence, () =>
-    row.getByRole('button', { name: 'Save passkey name', exact: true }).click()
+    row.getByRole('button', { name: localizedText('Save passkey name'), exact: true }).click()
   );
   assert.equal((await renamed).status(), 200);
   const removed = operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'DELETE');
-  await stepUp(page, () => row.getByRole('button', { name: /remove/i }).click());
+  await stepUp(page, () => row.getByRole('button', { name: localizedText(/remove/i) }).click());
   assert.equal((await removed).status(), 204);
   await row.waitFor({ state: 'detached' });
 
   const original = page.locator(`[data-key-id="${originalID}"]`);
   assert(
-    await original.getByRole('button', { name: /^Remove / }).isDisabled(),
+    await original.getByRole('button', { name: localizedText(/^Remove /) }).isDisabled(),
     'UI offered to remove the final passkey'
   );
   await page
-    .getByText('Add another passkey before removing your last one.', { exact: true })
+    .getByText(localizedText('Add another passkey before removing your last one.'), { exact: true })
     .waitFor({ state: 'visible' });
   await clean(page, observed);
   evidence.checks.push(
@@ -886,14 +1005,32 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   );
 }
 
-async function generateCodes(page, harness) {
+async function generateCodes(page, harness, { switchLocale = false } = {}) {
+  // Finish the existing initial status load before observing the intentional
+  // post-generation read. Locale switching must start from a settled baseline.
+  progress('recovery-generation-initial-status');
+  await page.getByTestId('recovery-status').waitFor({ state: 'visible' });
+  const refreshedStatus = operationResponse(page, '/api/v1/auth/recovery-codes/status', 'GET');
+  refreshedStatus.catch(() => {});
   const generated = harness.captureJSON('/api/v1/auth/recovery-codes/generate', 'POST', 200);
-  await stepUp(page, () => page.getByRole('button', { name: /generate.*recovery codes/i }).click());
+  progress('recovery-generation-verification');
+  await stepUp(page, () => page.getByRole('button', { name: localizedText(/generate.*recovery codes/i) }).click());
   const batch = await generated;
   assert(Array.isArray(batch.codes) && batch.codes.length === batch.count && batch.count === 10);
   harness.secrets.push(...batch.codes);
   const viewer = page.getByTestId('recovery-viewer');
   await viewer.waitFor({ state: 'visible' });
+  progress('recovery-generation-refreshed-status');
+  const refreshed = await refreshedStatus;
+  assert.equal(refreshed.status(), 200, 'Post-generation recovery status did not finish');
+  // This status is published only after the client's bounded decoder accepts
+  // the post-generation body. It also works with the virtual expiry clock;
+  // Response.finished() can remain unresolved in that browser instrumentation.
+  const displayedCount = new Intl.NumberFormat(browserLocale()).format(batch.count);
+  await boundedStage('recovery-generation-refresh-body', () => page.waitForFunction((count) =>
+    document.querySelector('[data-testid="recovery-status"] strong')?.textContent === count,
+  displayedCount));
+  if (switchLocale) await boundedStage('recovery-generation-preferences', () => exercisePreferenceSwitch(page, { privateSelector: '[data-testid="recovery-code"]' }));
   const visible = await viewer.getByTestId('recovery-code').allTextContents();
   assert(
     visible.length === batch.codes.length &&
@@ -914,20 +1051,21 @@ async function recoveryLifecycle(browser, harness, evidence, contexts) {
   await navigate(page, harness.origin, 'Security', '/dashboard/security');
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: harness.origin });
   await page.evaluate(() => navigator.clipboard.writeText('portal-clipboard-sentinel'));
-  const first = await generateCodes(page, harness);
+  const first = await generateCodes(page, harness, { switchLocale: true });
   assert(
     (await page.evaluate(() => navigator.clipboard.readText())) === 'portal-clipboard-sentinel',
     'Codes were automatically copied'
   );
   assert.equal(observed.downloads, 0, 'Codes were automatically downloaded');
   const viewer = page.getByTestId('recovery-viewer');
-  await viewer.getByRole('button', { name: /copy/i }).click();
+  progress('recovery-lifecycle-copy');
+  await viewer.getByRole('button', { name: localizedText(/copy/i) }).click();
   await page.waitForFunction(async (codes) => {
     const value = await navigator.clipboard.readText();
     return codes.every((code) => value.includes(code));
   }, first);
   const downloadPromise = page.waitForEvent('download');
-  await viewer.getByRole('button', { name: /download/i }).click();
+  await viewer.getByRole('button', { name: localizedText(/download/i) }).click();
   const download = await downloadPromise;
   assert.match(
     download.suggestedFilename(),
@@ -940,6 +1078,7 @@ async function recoveryLifecycle(browser, harness, evidence, contexts) {
       download.suggestedFilename().includes(fixture.email)
     )
   );
+  progress('recovery-lifecycle-download');
   const stream = await download.createReadStream();
   assert(stream);
   let text = '';
@@ -953,7 +1092,7 @@ async function recoveryLifecycle(browser, harness, evidence, contexts) {
   );
   await page.waitForFunction(() => globalThis.__portalObjectURLs.size === 0);
   text = '';
-  await viewer.getByRole('button', { name: 'Done', exact: true }).click();
+  await viewer.getByRole('button', { name: localizedText('Done'), exact: true }).click();
   await viewer.waitFor({ state: 'hidden' });
   assert(
     (await page.evaluate(() => navigator.clipboard.readText())).includes(first[0]),
@@ -999,7 +1138,7 @@ async function recoveryLifecycle(browser, harness, evidence, contexts) {
   );
 
   await generateCodes(page, harness);
-  await page.clock.fastForward(300_001);
+  await boundedStage('recovery-lifecycle-expiry-clock', () => page.clock.fastForward(300_001));
   await page.getByTestId('recovery-viewer').waitFor({ state: 'hidden' });
   await page.clock.setSystemTime(new Date());
 
@@ -1065,11 +1204,11 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
     patterns: [{ urlPattern: `${harness.origin}/api/v1/auth/recovery-codes/generate`, requestStage: 'Response' }],
   });
   try {
-    await stepUp(page, () => page.getByRole('button', { name: /generate.*recovery codes/i }).click());
+    await stepUp(page, () => page.getByRole('button', { name: localizedText(/generate.*recovery codes/i) }).click());
     await page
       .getByTestId('stepup-dialog')
       .getByRole('alert')
-      .filter({ hasText: /may.*invalid|may.*replaced|cannot confirm|uncertain/i })
+      .filter({ hasText: localizedText(/may.*invalid|may.*replaced|cannot confirm|uncertain/i) })
       .waitFor({ state: 'visible' });
     await Promise.all(interceptions);
     assert.equal(interceptionFailed, false, 'Recovery response interception failed');
@@ -1084,7 +1223,7 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
   assert.equal((await api(page, '/api/v1/auth/recovery-codes/status')).body.remaining, 10);
   await page
     .getByTestId('stepup-dialog')
-    .getByRole('button', { name: 'Cancel', exact: true })
+    .getByRole('button', { name: localizedText('Cancel'), exact: true })
     .click();
   await page.getByTestId('stepup-dialog').waitFor({ state: 'hidden' });
   await generateCodes(page, harness);
@@ -1095,7 +1234,7 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
   lostCodes = undefined;
   await clean(page, observed);
   const logout = operationResponse(page, '/api/v1/auth/logout', 'POST');
-  await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+  await page.getByRole('button', { name: localizedText('Sign out'), exact: true }).click();
   assert.equal((await logout).status(), 204);
   await page.getByTestId('recovery-viewer').waitFor({ state: 'hidden' });
   assert(
@@ -1150,13 +1289,13 @@ async function deletionPolicy(page, harness, fixture, authenticator, evidence) {
 
   await navigate(page, harness.origin, 'Privacy', '/dashboard/privacy');
   await appearance(page, evidence, 'privacy');
-  const acknowledgement = page.getByRole('checkbox', { name: /I understand the account-deletion consequences/ });
-  const remove = page.getByRole('button', { name: 'Delete my account', exact: true });
+  const acknowledgement = page.getByRole('checkbox', { name: localizedText(/I understand the account-deletion consequences/) });
+  const remove = page.getByRole('button', { name: localizedText('Delete my account'), exact: true });
   assert(await remove.isDisabled(), 'Deletion did not require acknowledgement');
   await acknowledgement.focus();
   await page.keyboard.press('Space');
   await remove.click();
-  const dialog = page.getByRole('dialog', { name: 'Confirm account deletion', exact: true });
+  const dialog = page.getByRole('dialog', { name: localizedText('Confirm account deletion'), exact: true });
   await dialog.waitFor({ state: 'visible' });
   for (let index = 0; index < 8; index++) {
     assert(await dialog.evaluate((element) => element.contains(document.activeElement)),
@@ -1179,8 +1318,8 @@ async function deletionPolicy(page, harness, fixture, authenticator, evidence) {
     assert.equal(response.status(), 403, 'Presence-only authenticator was not rejected');
     assert.equal((await refusedBody).error, 'user_verification_required');
     await dialog.getByRole('alert').waitFor({ state: 'visible' });
-    assert.equal(await dialog.getByRole('button', { name: 'Use authenticator code', exact: true }).count(), 0);
-    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal(await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).count(), 0);
+    await dialog.getByRole('button', { name: localizedText('Cancel'), exact: true }).click();
   } finally {
     await authenticator.cdp.send('WebAuthn.setResponseOverrideBits', {
       authenticatorId: authenticator.authenticatorId,
@@ -1254,8 +1393,8 @@ async function deleteWithOutcome(page, harness, authenticator, mode) {
   }
   try {
     const confirmed = mode === 'confirmed' ? operationResponse(page, '/api/v1/users/me', 'DELETE') : null;
-    await page.getByRole('checkbox', { name: /I understand the account-deletion consequences/ }).check();
-    await stepUp(page, () => page.getByRole('button', { name: 'Delete my account', exact: true })
+    await page.getByRole('checkbox', { name: localizedText(/I understand the account-deletion consequences/) }).check();
+    await stepUp(page, () => page.getByRole('button', { name: localizedText('Delete my account'), exact: true })
       .evaluate((button) => { button.click(); button.click(); }));
     if (confirmed) {
       assert.equal((await confirmed).status(), 204);
@@ -1324,29 +1463,31 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
   for (const fragment of ['', '#token=invalid', `#token=${notice.token}&token=${notice.token}`]) {
     await openReclaimLink(page, harness, `/recover-account${fragment}`);
     await page.waitForURL(harness.origin + '/recover-account');
-    const start = page.getByRole('button', { name: 'Start account recovery', exact: true });
-    await page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
+    const start = page.getByRole('button', { name: localizedText('Start account recovery'), exact: true });
+    await page.getByRole('alert').filter({ hasText: localizedText(/no longer holds a usable recovery link/) }).waitFor();
     assert(await start.isDisabled(), 'Missing or duplicate token enabled recovery');
   }
   await openReclaimLink(page, harness, notice.link.slice(harness.origin.length));
   await page.waitForURL(harness.origin + '/recover-account');
-  await page.getByRole('button', { name: 'Start account recovery', exact: true }).waitFor();
+  await page.getByRole('button', { name: localizedText('Start account recovery'), exact: true }).waitFor();
   await page.reload({ waitUntil: 'load' });
-  await page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
-  assert(await page.getByRole('button', { name: 'Start account recovery', exact: true }).isDisabled(),
+  await page.getByRole('alert').filter({ hasText: localizedText(/no longer holds a usable recovery link/) }).waitFor();
+  assert(await page.getByRole('button', { name: localizedText('Start account recovery'), exact: true }).isDisabled(),
     'Reload restored an emailed bearer token');
   await openReclaimLink(page, harness, notice.link.slice(harness.origin.length));
   await page.waitForURL(harness.origin + '/recover-account');
   assert.equal(optionsCalls, 0, 'Opening an email link automatically requested options');
   assert.equal(completions, 0, 'Opening an email link automatically redeemed it');
+  await exercisePreferenceSwitch(page);
   await clean(page, observed, true);
-  assert.equal((await context.cookies(harness.origin)).length, 0);
+  assertOnlyPreferenceCookies(await context.cookies(harness.origin));
   const start = async () => {
-    await page.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) =>
-      button.textContent.trim() === 'Start account recovery' && !button.disabled));
+    const startButton = page.getByRole('button', { name: localizedText('Start account recovery'), exact: true });
+    await startButton.waitFor({ state: 'visible' });
+    await page.waitForFunction((button) => !button.disabled, await startButton.elementHandle());
     const prepared = operationResponse(page, '/api/v1/auth/deletion/reclaim/options', 'POST');
     const preparedBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/options', 'POST', 200);
-    await page.getByRole('button', { name: 'Start account recovery', exact: true })
+    await page.getByRole('button', { name: localizedText('Start account recovery'), exact: true })
       .evaluate((button) => { button.click(); button.click(); });
     const result = await prepared;
     assert.equal(result.status(), 200);
@@ -1357,8 +1498,8 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
   await start();
   assert.equal(optionsCalls, 1, 'Duplicate start clicks allocated two ceremonies');
   if (totpOnly) {
-    assert.equal(await page.getByRole('button', { name: 'Recover with a passkey', exact: true }).count(), 0);
-    const input = page.getByLabel('Authenticator code', { exact: true });
+    assert.equal(await page.getByRole('button', { name: localizedText('Recover with a passkey'), exact: true }).count(), 0);
+    const input = page.getByLabel(localizedText('Authenticator code'), { exact: true });
     await input.waitFor();
     assert.equal(await input.getAttribute('type'), 'text');
     assert.equal(await input.getAttribute('inputmode'), 'numeric');
@@ -1366,13 +1507,13 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
     assert.equal(await input.inputValue(), '004219', 'Whole-code entry lost a leading zero');
     const resume = await hidePortal(page, context, evidence);
     await resume();
-    await page.getByRole('button', { name: 'Start account recovery', exact: true }).waitFor();
+    await page.getByRole('button', { name: localizedText('Start account recovery'), exact: true }).waitFor();
     assert.equal(optionsCalls, 1, 'Background resume automatically retried recovery');
     assert.equal(await input.count(), 0, 'Backgrounding kept the TOTP form');
     await start();
     assert.equal(await input.inputValue(), '', 'Entered TOTP survived backgrounding');
     await input.fill('123');
-    await page.getByRole('button', { name: 'Recover account', exact: true }).click();
+    await page.getByRole('button', { name: localizedText('Recover account'), exact: true }).click();
     assert.equal(await input.getAttribute('aria-invalid'), 'true');
     assert.equal(completions, 0, 'Invalid TOTP length was submitted');
     const pattern = '**/api/v1/auth/deletion/reclaim/';
@@ -1384,12 +1525,12 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
       new URL(response.url()).pathname === '/api/v1/auth/deletion/reclaim/' && response.status() === 401);
     const rejectedBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/', 'POST', 401);
     await input.fill('000000');
-    await page.getByRole('button', { name: 'Recover account', exact: true }).click();
+    await page.getByRole('button', { name: localizedText('Recover account'), exact: true }).click();
     assert.equal((await rejected).status(), 401);
     assert.equal((await rejectedBody).error, 'invalid_token');
     await page.unroute(pattern, invalid);
     await page.getByRole('alert').filter({
-      hasText: /The recovery link or verification could not be accepted/,
+      hasText: localizedText(/The recovery link or verification could not be accepted/),
     }).waitFor({ state: 'visible' });
     await start();
     await appearance(page, evidence, 'reclaim');
@@ -1397,7 +1538,7 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
     await input.fill(factor.code);
     factor = undefined;
   } else {
-    assert.equal(await page.getByLabel('Authenticator code', { exact: true }).count(), 0,
+    assert.equal(await page.getByLabel(localizedText('Authenticator code'), { exact: true }).count(), 0,
       'Recovery ignored the server-selected factor');
   }
   let lost = 0;
@@ -1426,7 +1567,7 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
   const outcome = page.getByTestId('reclaim-outcome');
   try {
     const completed = loseSuccess ? null : operationResponse(page, '/api/v1/auth/deletion/reclaim/', 'POST');
-    await page.getByRole('button', { name: totpOnly ? 'Recover account' : 'Recover with a passkey', exact: true }).click();
+    await page.getByRole('button', { name: localizedText(totpOnly ? 'Recover account' : 'Recover with a passkey'), exact: true }).click();
     if (completed) assert.equal((await completed).status(), 204);
     await outcome.waitFor({ state: 'visible' });
     await Promise.all(interceptions);
@@ -1442,12 +1583,12 @@ async function reclaimFromMail(browser, harness, fixture, notice, credential, ev
   assert.equal(await outcome.getAttribute('data-outcome'), loseSuccess ? 'unconfirmed' : 'confirmed');
   await page.waitForFunction(() => document.activeElement === document.querySelector('[data-testid="reclaim-outcome"] h2'));
   assert(await outcome.getByRole('status').isVisible(), 'Recovery result was not announced');
-  const login = outcome.getByRole('link', { name: 'Sign in to your account', exact: true });
+  const login = outcome.getByRole('link', { name: localizedText('Sign in to your account'), exact: true });
   if (loseSuccess) assert.equal(await login.count(), 0, 'Unconfirmed recovery promised a successful sign-in');
   else assert.equal(await login.getAttribute('href'), '/login');
   assert.equal(page.url(), harness.origin + '/recover-account', 'Recovery signed in automatically');
-  assert.equal((await context.cookies(harness.origin)).length, 0, 'Recovery issued session state');
-  assert.equal(await page.getByLabel('Authenticator code', { exact: true }).count(), 0);
+  assertOnlyPreferenceCookies(await context.cookies(harness.origin));
+  assert.equal(await page.getByLabel(localizedText('Authenticator code'), { exact: true }).count(), 0);
   await clean(page, observed, true);
   assert.equal(completions, totpOnly ? 2 : 1, 'Recovery silently replayed a factor');
   assert(observed.anonymous >= (loseSuccess ? 1 : 2), 'Anonymous transport was not observed');
@@ -1507,6 +1648,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
         'Sibling tab echoed a deletion invalidation');
     }
     const notice = await harness.mail.waitFor(fixture.email, index + 1);
+    assert.equal(notice.locale, browserLocale(), 'Notification did not freeze its initiating tab language');
     assert.equal(Date.parse(notice.expires_at), Date.parse(pending.expires_at), 'Mail changed the persisted recovery deadline');
     const stable = await harness.waitForNoticeCleanup(fixture.user_id, index + 1);
     assert.equal(stable.attempts, index + 2, 'Worker did not persist each actual relay attempt');
@@ -1514,7 +1656,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
     assert.equal(stable.expires_at, pending.expires_at, 'Delivery retry reset recovery expiry');
     const attempts = harness.mail.messages.filter((message) => message.recipient === fixture.email && message.message_id === notice.message_id);
     assert.equal(attempts.length, index === 0 ? 2 : 1);
-    assert(attempts.every((attempt) => attempt.token === notice.token && attempt.expires_at === notice.expires_at));
+    assert(attempts.every((attempt) => attempt.token === notice.token && attempt.expires_at === notice.expires_at && attempt.locale === notice.locale));
 
     await context.addCookies(oldCookies);
     assert.equal((await api(page, '/api/v1/users/me')).status, 401, 'Old bound session survived deletion');
@@ -1552,19 +1694,19 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   const invalid = current.page.waitForResponse((response) =>
     new URL(response.url()).pathname === '/api/v1/auth/deletion/reclaim/options' && response.status() === 401);
   const invalidBody = harness.captureJSON('/api/v1/auth/deletion/reclaim/options', 'POST', 401);
-  await current.page.getByRole('button', { name: 'Start account recovery', exact: true }).click();
+  await current.page.getByRole('button', { name: localizedText('Start account recovery'), exact: true }).click();
   assert.equal((await invalid).status(), 401);
   assert.equal((await invalidBody).error, 'invalid_token');
   await current.page.getByRole('alert').filter({
-    hasText: /The recovery link or verification could not be accepted/,
+    hasText: localizedText(/The recovery link or verification could not be accepted/),
   }).waitFor({ state: 'visible' });
   assert.equal(await current.page.getByTestId('reclaim-outcome').count(), 0);
   await current.page.clock.install({ time: new Date() });
   await openReclaimLink(current.page, harness, last.link.slice(harness.origin.length));
   await current.page.waitForURL(harness.origin + '/recover-account');
   await current.page.clock.fastForward(300_001);
-  await current.page.getByRole('alert').filter({ hasText: /no longer holds a usable recovery link/ }).waitFor();
-  assert(await current.page.getByRole('button', { name: 'Start account recovery', exact: true }).isDisabled(),
+  await current.page.getByRole('alert').filter({ hasText: localizedText(/no longer holds a usable recovery link/) }).waitFor();
+  assert(await current.page.getByRole('button', { name: localizedText('Start account recovery'), exact: true }).isDisabled(),
     'Recovery token survived its five-minute memory bound');
   await clean(current.page, current.observed, true);
   evidence.checks.push(
@@ -1582,6 +1724,7 @@ export async function validatePortal(harness) {
   });
   const contexts = [];
   const evidence = {
+    locale: browserLocale(),
     checks: [],
     viewports: [],
     noJavaScript: 0,
@@ -1589,17 +1732,17 @@ export async function validatePortal(harness) {
     nativeHiddenTabObserved: false,
   };
   try {
-    checkpoint = 'concurrent-tabs';
+    progress('concurrent-tabs');
     const initial = await concurrentTabs(browser, harness, evidence, contexts);
-    checkpoint = 'profile-sessions';
+    progress('profile-sessions');
     await profileAndSessions(browser, harness, evidence, contexts, initial);
-    checkpoint = 'passkeys-totp';
+    progress('passkeys-totp');
     await passkeyManagement(browser, harness, evidence, contexts);
-    checkpoint = 'recovery-lifecycle';
-    await recoveryLifecycle(browser, harness, evidence, contexts);
-    checkpoint = 'uncertain-recovery';
+    progress('recovery-lifecycle');
+    await boundedStage('recovery-lifecycle', () => recoveryLifecycle(browser, harness, evidence, contexts), 120_000);
+    progress('uncertain-recovery');
     await uncertainRecovery(browser, harness, evidence, contexts);
-    checkpoint = 'deletion-reclaim';
+    progress('deletion-reclaim');
     // The legacy scenarios legitimately consume the production per-subnet login
     // budget. Isolate this account lifecycle instead of disabling rate limits.
     const privacyHarness = await startPortalHarness();
@@ -1628,7 +1771,7 @@ export async function validatePortal(harness) {
         ...privacyContexts.map((context) => () => context.close()),
       ])();
     }
-    checkpoint = 'final-evidence';
+    progress('final-evidence');
     for (const [start, finish] of [
       ['/api/v1/auth/webauthn/login/generate-options', '/api/v1/auth/webauthn/login/verify'],
       ['/api/v1/auth/webauthn/register/generate-options', '/api/v1/auth/webauthn/register/verify'],
@@ -1717,7 +1860,12 @@ export async function runPortalBrowser({
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    console.log(JSON.stringify(await runPortalBrowser(), null, 2));
+    for (const locale of browserLocales) {
+      setBrowserLocale(locale);
+      const root = process.env.PORTAL_BROWSER_ARTIFACT_DIR;
+      const evidence = await runPortalBrowser({ directory: root ? resolve(root, locale) : undefined });
+      console.log(JSON.stringify(evidence, null, 2));
+    }
     console.log('Focused real-API production portal browser checks and teardown passed');
   } catch (error) {
     console.error(browserFailure(error, checkpoint));

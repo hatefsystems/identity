@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/notification"
 )
 
 // DeletionNotice is the message content for a "your account is scheduled for
@@ -48,6 +50,9 @@ type DeletionNotice struct {
 	// ExpiresAt is when the token stops working, which is exactly when the purge
 	// worker becomes eligible to erase the account.
 	ExpiresAt time.Time
+	// Locale and TemplateVersion are frozen in the encrypted delivery intent.
+	Locale          notification.Locale
+	TemplateVersion notification.TemplateVersion
 }
 
 // Notifier delivers a DeletionNotice. It is the seam that isolates the deletion

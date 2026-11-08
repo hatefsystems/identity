@@ -18,7 +18,9 @@ afterAll(() => {
 
 describe('local auth validation', () => {
   it('requires an email without claiming whether an account exists', () => {
-    expect(validateEmail({ email: '' })).toEqual({ email: 'Enter your email address.' });
+    expect(validateEmail({ email: '' })).toEqual({
+      email: { key: 'auth.validation.emailRequired' },
+    });
   });
 
   it.each([
@@ -32,7 +34,7 @@ describe('local auth validation', () => {
     ' person@example.test',
     'person@example.test ',
   ])('rejects malformed email %j without silently normalizing it', (email) => {
-    expect(validateEmail({ email })).toEqual({ email: 'Enter a valid email address.' });
+    expect(validateEmail({ email })).toEqual({ email: { key: 'auth.validation.emailInvalid' } });
   });
 
   it.each(['person@example.test', 'first.last+tag@sub.example.test'])(
@@ -44,16 +46,26 @@ describe('local auth validation', () => {
 
   it('reports all missing login and registration fields', () => {
     expect(validateLogin({ email: '', password: '' })).toEqual({
-      email: 'Enter your email address.',
-      password: 'Enter your password.',
+      email: { key: 'auth.validation.emailRequired' },
+      password: { key: 'auth.validation.passwordRequired' },
     });
     expect(validateRegistration({ email: 'not-an-email', phone: '' })).toEqual({
-      email: 'Enter a valid email address without invisible characters (at most 1024 UTF-8 bytes).',
-      phone: 'Enter an Iranian mobile number, such as +989123456789.',
+      email: { key: 'registration.emailInvalid' },
+      phone: { key: 'registration.phoneInvalid' },
     });
   });
 
-  it.each(['x', ' ', '\t', '  keep my spaces  ', 'p\u00e4ss\u00a0word'])(
+  it.each([
+    'x',
+    ' ',
+    '\t',
+    '  keep my spaces  ',
+    'p\u00e4ss\u00a0word',
+    'گذرواژهٔ من ۱۲۳',
+    'رقم ١٢٣',
+    '\uff11\uff12',
+    '\u202epassword\u202c',
+  ])(
     'accepts the exact nonempty password %j without inventing a new-password policy',
     (password) => {
       const values = Object.freeze({
@@ -71,15 +83,15 @@ describe('local auth validation', () => {
 
   it('requires both new-password fields', () => {
     expect(validatePassword({ password: '', confirmation: '' })).toEqual({
-      password: 'Enter a new password.',
-      confirmation: 'Confirm your password.',
+      password: { key: 'auth.validation.newPasswordRequired' },
+      confirmation: { key: 'auth.validation.confirmationRequired' },
     });
     expect(validatePassword({ password: 'x', confirmation: '' })).toEqual({
-      confirmation: 'Confirm your password.',
+      confirmation: { key: 'auth.validation.confirmationRequired' },
     });
     expect(validatePassword({ password: '', confirmation: 'x' })).toEqual({
-      password: 'Enter a new password.',
-      confirmation: 'Passwords do not match.',
+      password: { key: 'auth.validation.newPasswordRequired' },
+      confirmation: { key: 'auth.validation.passwordMismatch' },
     });
   });
 
@@ -90,7 +102,7 @@ describe('local auth validation', () => {
     ['caf\u00e9', 'cafe\u0301'],
   ])('compares confirmation exactly: %j versus %j', (password, confirmation) => {
     expect(validatePassword({ password, confirmation })).toEqual({
-      confirmation: 'Passwords do not match.',
+      confirmation: { key: 'auth.validation.passwordMismatch' },
     });
   });
 
@@ -109,7 +121,11 @@ describe('local auth validation', () => {
     '123456\n',
     '\u0660\u0661\u0662\u0663\u0664\u0665',
     '\uff10\uff11\uff12\uff13\uff14\uff15',
+    '۰۱۲۳۴۵',
+    '01۲345',
+    '\u202e012345',
+    '012345\u2069',
   ])('rejects noncanonical authenticator code %j', (code) => {
-    expect(validateTotp({ code })).toEqual({ code: 'Enter exactly six digits (0-9).' });
+    expect(validateTotp({ code })).toEqual({ code: { key: 'auth.validation.code' } });
   });
 });

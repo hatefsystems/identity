@@ -41,9 +41,15 @@ import {
   startPortalServices,
 } from './portal-harness.mjs';
 import { identityGoModule, integrationPackages, racePackages, raceToolchainProfile } from './acceptance-report.mjs';
-import { deletionMail, startMailSink } from './portal-mail-sink.mjs';
+import { decodeQuotedPrintableUTF8, deletionMail, startMailSink } from './portal-mail-sink.mjs';
 import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, runAdminBrowser } from './web-admin.browser.mjs';
 import { clean, keyStorage, newContext, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
+
+function testDirectory(prefix) {
+  const parent = join(tmpdir(), 'kilo');
+  mkdirSync(parent, { recursive: true });
+  return mkdtempSync(join(parent, prefix));
+}
 
 test('portal harness refuses HTTP, remote, and noncanonical origins', () => {
   assert.equal(assertLocalOrigin('https://localhost:43210').port, '43210');
@@ -207,6 +213,10 @@ test('browser failures never print request headers, bodies or locator values', (
   assert.match(browserFailure(failure, 'SECRET USER VALUE'), /during unknown/);
   failure.stack += '\n    at validateAdmin (web-admin.browser.mjs:40:9)';
   assert.match(browserFailure(failure, 'admin-uncertain'), /admin-uncertain/);
+  const helperFailure = { name: 'AssertionError', stack: 'PRIVATE cookie=secret\n at chooseLanguage (browser-localization.mjs:187:9)\n at profileAndSessions (web-portal.browser.mjs:602:3)' };
+  const helperMessage = browserFailure(helperFailure, 'profile-sessions');
+  assert.match(helperMessage, /at browser-localization\.mjs:187:9/);
+  assert.doesNotMatch(helperMessage, /PRIVATE|cookie=|secret/);
 });
 
 test('portal cleanup shares one promise and waits for every resource in reverse order', async () => {
@@ -354,7 +364,7 @@ test('portal browser cleanup attempts browser close even after a context rejects
 });
 
 test('portal evidence invalidates stale success and waits for affirmative teardown before publishing', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'kilo', 'portal-evidence-test-'));
+  const directory = testDirectory('portal-evidence-test-');
   const path = join(directory, 'portal-evidence.json');
   let resume, entered;
   const waiting = new Promise((resolve) => { resume = resolve; });
@@ -392,7 +402,7 @@ test('portal evidence invalidates stale success and waits for affirmative teardo
 test('portal evidence never certifies startup, assertion, cleanup, callback or private-data failure', async (t) => {
   for (const kind of ['startup', 'assertion', 'cleanup', 'unconfirmed-cleanup', 'callback', 'private-evidence']) {
     await t.test(kind, async () => {
-      const directory = mkdtempSync(join(tmpdir(), 'kilo', 'portal-evidence-test-'));
+      const directory = testDirectory('portal-evidence-test-');
       const path = join(directory, 'portal-evidence.json');
       let interrupt, closes = 0, released = false;
       try {
@@ -995,7 +1005,7 @@ test('portal cleanup preserves fresh service ownership and successful idempotent
     const services = await startPortalServices();
     assert.match(services.runID, /^[a-f0-9]{32}$/);
     ids.add(services.runID);
-    assert(state.created.slice(run * 3).every(({ id }) => id.startsWith(`portal-browser-${services.runID}-`)));
+    assert(state.created.slice(run * 3).every(({ id, operation }) => operation === 'create' && id.startsWith(`portal-browser-${services.runID}-`)));
     const pending = services.close();
     assert.equal(services.close(), pending);
     assert.deepEqual(await pending, { completed: true });
@@ -1034,6 +1044,22 @@ test('portal cleanup removes its created broker after a port-binding start failu
   assert.deepEqual(state.removed, ['nats', 'redis', 'postgres', 'network']);
   assert.equal(state.releasedPorts, state.reservedPorts);
   assert.equal(state.ownershipViolation, false);
+});
+
+test('ordinary service start failures remove the Created container and only earlier run-owned resources', async (t) => {
+  const order = ['postgres', 'redis', 'nats'];
+  for (const [index, kind] of order.entries()) {
+    await t.test(kind, async (t) => {
+      const state = mockPortalDocker(t, { failStart: kind });
+      await assert.rejects(startPortalServices(), /Disposable Docker start failed/);
+      assert.deepEqual(state.created.map(({ kind }) => kind), order.slice(0, index + 1));
+      assert(state.created.every(({ operation }) => operation === 'create'));
+      assert.deepEqual(state.started.map((id) => id.split('-').at(-1)), order.slice(0, index));
+      assert.deepEqual(state.removed, [...order.slice(0, index + 1).reverse(), 'network']);
+      assert.equal(state.ownershipViolation, false, 'Start-failure cleanup adopted an unowned resource');
+      assert.equal(state.reservedPorts, 0, 'Ordinary service changes altered special broker port reservation');
+    });
+  }
 });
 
 test('portal cleanup rejects nonzero mocked Docker removal after trying every owned resource', async (t) => {
@@ -1436,7 +1462,7 @@ test('admin worktree identity exposes only its root, revision and opaque source 
 });
 
 test('admin evidence invalidates stale success, isolates captures, and publishes only after confirmed teardown', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'kilo', 'admin-evidence-test-'));
+  const directory = testDirectory('admin-evidence-test-');
   const path = join(directory, 'admin-evidence.json');
   const read = () => JSON.parse(readFileSync(path, 'utf8'));
   try {
@@ -1477,7 +1503,7 @@ test('admin evidence invalidates stale success, isolates captures, and publishes
 test('admin evidence never certifies startup, assertion, cleanup, identity or callback failure', async (t) => {
   for (const kind of ['startup', 'assertion', 'cleanup', 'unconfirmed-cleanup', 'worktree-change', 'callback', 'private-evidence']) {
     await t.test(kind, async () => {
-      const directory = mkdtempSync(join(tmpdir(), 'kilo', 'admin-evidence-test-'));
+      const directory = testDirectory('admin-evidence-test-');
       const path = join(directory, 'admin-evidence.json');
       let closeCalls = 0;
       let interrupt;
@@ -1609,16 +1635,16 @@ const mailToken = Buffer.alloc(32, 19).toString('base64url');
 function sampleMail(link = `${mailPolicy.origin}/recover-account#token=${mailToken}`) {
   const body = (media, content) => `--deletion-fixture\r\nContent-Transfer-Encoding: quoted-printable\r\nContent-Type: ${media}; charset=UTF-8\r\n\r\n${content}\r\n`;
   const encoded = link.replaceAll('=', '=3D');
-  return `From: <${mailPolicy.from}>\r\nTo: <${mailPolicy.recipient}>\r\nMessage-ID: <deletion.00000000-0000-4000-8000-000000000001@fixture.example.test>\r\nContent-Type: multipart/alternative; boundary="deletion-fixture"\r\n\r\n` +
+  return `From: <${mailPolicy.from}>\r\nTo: <${mailPolicy.recipient}>\r\nSubject: Account deletion requested\r\nMessage-ID: <deletion.00000000-0000-4000-8000-000000000001@fixture.example.test>\r\nContent-Type: multipart/alternative; boundary="deletion-fixture"\r\n\r\n` +
     body('text/plain', `Recover until 2026-11-25T12:00:00Z (UTC)\r\n${encoded}`) +
-    body('text/html', `<a href=3D"${encoded}">Recover account</a>`) + '--deletion-fixture--\r\n';
+    body('text/html', `<html lang=3D"en" dir=3D"ltr"><body><a href=3D"${encoded}">Recover account</a></body></html>`) + '--deletion-fixture--\r\n';
 }
 
 test('mail parser accepts bounded canonical fragment links and rejects leaks', () => {
   const mail = deletionMail(sampleMail(), mailPolicy);
   assert.equal(mail.token, mailToken);
   assert.equal(mail.expires_at, '2026-11-25T12:00:00Z');
-  assert.deepEqual(Object.keys(mail).sort(), ['expires_at', 'link', 'message_id', 'recipient', 'token']);
+  assert.deepEqual(Object.keys(mail).sort(), ['expires_at', 'link', 'locale', 'message_id', 'recipient', 'token']);
   for (const link of [
     `https://remote.example.test/recover-account#token=${mailToken}`,
     `${mailPolicy.origin}/recover-account?token=${mailToken}`,
@@ -1630,10 +1656,26 @@ test('mail parser accepts bounded canonical fragment links and rejects leaks', (
   assert.throws(() => deletionMail(sampleMail() + 'x'.repeat(32 * 1024), mailPolicy));
 });
 
+test('quoted-printable alternatives decode UTF-8 Persian without changing canonical security values', () => {
+  const encode = (value) => Array.from(Buffer.from(value, 'utf8'), (byte) => '=' + byte.toString(16).padStart(2, '0').toUpperCase()).join('');
+  const prose = 'تا این مهلت می‌توانید حساب خود را بازیابی کنید: ';
+  const persian = sampleMail().replace('Recover until ', encode(prose))
+    .replace('lang=3D"en" dir=3D"ltr"', 'lang=3D"fa-IR" dir=3D"rtl"')
+    .replace('Subject: Account deletion requested', `Subject: =?UTF-8?q?${encode('درخواست حذف حساب')}?=`);
+  assert.equal(decodeQuotedPrintableUTF8(encode(prose)), prose);
+  assert.equal(decodeQuotedPrintableUTF8('=D8=B3=\r\n=D9=84=D8=A7=D9=85'), 'سلام');
+  const notice = deletionMail(persian, mailPolicy);
+  assert.equal(notice.token, mailToken);
+  assert.equal(notice.locale, 'fa-IR');
+  assert.equal(notice.expires_at, '2026-11-25T12:00:00Z');
+  for (const invalid of ['=FF', '=C3=28', '=D8', '=ZZ', '=0', '=', 'سلام'])
+    assert.throws(() => decodeQuotedPrintableUTF8(invalid));
+  assert.throws(() => deletionMail(persian.replace('2026-11-25T12:00:00Z (UTC)', '۱۴۰۵/۰۹/۰۴'), mailPolicy));
+  assert.throws(() => deletionMail(persian.replace('2026-11-25T12:00:00Z (UTC)', '2026-11-25T12:00:00Z (UTC) 2026-11-26T12:00:00Z (UTC)'), mailPolicy));
+});
+
 test('owned mail sink requires verified TLS/auth, rejects foreign recipients, and captures retry identity in memory', { timeout: 15000 }, async () => {
-  const parent = join(tmpdir(), 'kilo');
-  mkdirSync(parent, { recursive: true });
-  const directory = mkdtempSync(join(parent, 'portal-mail-test-'));
+  const directory = testDirectory('portal-mail-test-');
   let sink;
   const clients = [];
   try {

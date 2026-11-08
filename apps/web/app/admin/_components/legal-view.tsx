@@ -1,7 +1,10 @@
 'use client';
 
 import { Button, Input, Label } from '@hatef/ui';
+import { useTranslations } from 'next-intl';
 import { useEffect, useId, useRef, useState } from 'react';
+import type { Message } from '../../../i18n/messages';
+import { useMessage } from '../../../i18n/use-message';
 import { controlClass, Feedback, inputClass, PageHeading, Panel } from '../../_components/controls';
 import { NativeDialog } from '../../_components/native-dialog';
 import { usePortal } from '../../_components/portal-provider';
@@ -25,6 +28,7 @@ import { LegalActionDialog, type LegalAction, type LegalOutcome } from './legal-
 import {
   clearLegalRegion,
   legalClearedMessage,
+  legalEvidenceNotes,
   legalFailureMessage,
   legalFieldLabels,
 } from './legal-view-state';
@@ -39,13 +43,9 @@ import {
 import { QueryUtcTime } from './query-view-time';
 
 type Section = 'holds' | 'preservation' | 'attribution';
-const sectionLabels: Record<Section, string> = {
-  holds: 'Legal Holds',
-  preservation: 'Preservation',
-  attribution: 'Attribution',
-};
 
 export function LegalView() {
+  const t = useTranslations('legal');
   const { profile, capabilities, resumedAction } = usePortal();
   const access = capabilities?.capabilities;
   const resume = resumedAction?.kind === 'legal' ? resumedAction.operation : undefined;
@@ -62,10 +62,7 @@ export function LegalView() {
     : '';
   return (
     <>
-      <PageHeading title="DPO and Legal">
-        Purpose-limited legal operations. Class B records are pseudonymized personal data, not
-        anonymous. Investigative access is not permission to disclose externally.
-      </PageHeading>
+      <PageHeading title={t('title')}>{t('introduction')}</PageHeading>
       {capabilities && access && flags.includes('1') ? (
         <LegalWorkspace
           key={`${profile.session.id}:${flags}`}
@@ -73,7 +70,7 @@ export function LegalView() {
           resume={resume}
         />
       ) : (
-        <Feedback error="No legal operation is available to this session. A false capability does not distinguish missing permission from deployment prerequisites. No legal records were requested." />
+        <Feedback error={{ key: 'legal.denied' }} />
       )}
     </>
   );
@@ -86,6 +83,7 @@ function LegalWorkspace({
   capabilities: AdminCapabilities;
   resume?: LegalOperation;
 }) {
+  const t = useTranslations('legal');
   const access = capabilities.capabilities;
   const sections: Section[] = [
     ...(access.legal_holds_read || access.legal_holds_apply || access.legal_holds_release
@@ -103,7 +101,7 @@ function LegalWorkspace({
   const region = useRef<HTMLDivElement>(null);
   return (
     <>
-      <nav aria-label="Legal workspace sections" className="flex flex-wrap gap-2">
+      <nav aria-label={t('sectionsLabel')} className="flex flex-wrap gap-2">
         {sections.map((section) => (
           <Button
             key={section}
@@ -118,18 +116,14 @@ function LegalWorkspace({
               setSelected(section);
             }}
           >
-            {sectionLabels[section]}
+            {t(`sections.${section}`)}
           </Button>
         ))}
       </nav>
       <div key={selected} ref={region} className="min-w-0 space-y-6">
         <LegalSection section={selected} capabilities={capabilities} resume={resumeOperation} />
       </div>
-      <p className="text-sm leading-relaxed text-muted-foreground">
-        Only the selected authorized section is mounted. No legal operation runs on load or while
-        typing. Leaving a section, hiding this page, or losing authority clears its private state.
-        There are no browser-saved drafts, exports, uploads, or external transfers.
-      </p>
+      <p className="text-sm leading-relaxed text-muted-foreground">{t('workspaceNotice')}</p>
     </>
   );
 }
@@ -143,6 +137,7 @@ function LegalSection({
   capabilities: AdminCapabilities;
   resume?: LegalOperation;
 }) {
+  const t = useTranslations('legal');
   const { reportLegalInterruption } = usePortal();
   const access = capabilities.capabilities;
   const initial: LegalAction | null =
@@ -163,11 +158,9 @@ function LegalSection({
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
   const [detail, setDetail] = useState<LegalHold | null>(null);
   const [readGeneration, setReadGeneration] = useState(0);
-  const [error, setError] = useState('');
-  const [status, setStatus] = useState(
-    resume === 'release'
-      ? 'The prior target was cleared. Read Legal Holds and select an authorized request row again before fresh release verification.'
-      : ''
+  const [error, setError] = useState<Message>('');
+  const [status, setStatus] = useState<Message>(
+    resume === 'release' ? { key: 'legal.state.releaseResume' } : ''
   );
   const region = useRef<HTMLDivElement>(null);
   const id = useId();
@@ -211,15 +204,11 @@ function LegalSection({
       setQuery(value.query);
       setSelectedRef(null);
       setOutcome(null);
-      setStatus(
-        `${value.page.items.length} indexed records accepted on this page. Each further page requires fresh verification.`
-      );
+      setStatus({ key: 'legal.state.lookupAccepted', values: { count: value.page.items.length } });
     } else if (value.kind === 'created' || value.kind === 'released') {
       setOutcome(value);
       if (section === 'holds') setReadGeneration((current) => current + 1);
-      setStatus(
-        'The legal response is confirmed. No list refresh was made automatically. Read Legal Holds explicitly for a current snapshot.'
-      );
+      setStatus({ key: 'legal.state.confirmed' });
     } else {
       setPage(null);
       setQuery(null);
@@ -228,20 +217,14 @@ function LegalSection({
       setOutcome(value);
       setReadGeneration((current) => current + 1);
       if (value.kind === 'failed') setError(legalFailureMessage(value.error));
-      else if (value.kind === 'expired')
-        setError(
-          'Verification expired. Private form data was cleared. Start fresh verification and reenter the original request.'
-        );
-      else if (value.kind === 'cancelled')
-        setStatus(
-          'The legal workflow was cancelled before transmission. Its private state was cleared.'
-        );
+      else if (value.kind === 'expired') setError({ key: 'legal.state.expired' });
+      else if (value.kind === 'cancelled') setStatus({ key: 'legal.state.cancelled' });
       else {
         reportLegalInterruption(value.operation);
         setStatus(
           value.operation === 'lookup'
-            ? 'No attribution result was accepted. This is not a no-match result. Start a new inquiry explicitly with fresh verification.'
-            : 'Legal write outcome unconfirmed. Nothing was retried and rollback is not implied. Reconcile the original external intake operation before a fresh, explicit attempt.'
+            ? { key: 'legal.state.lookupUnconfirmed' }
+            : { key: 'legal.state.writeUnconfirmed' }
         );
       }
     }
@@ -253,18 +236,12 @@ function LegalSection({
     outcome?.kind === 'created' && (observation ? observation.replayed : outcome.hold.replayed);
   return (
     <div ref={region} className="min-w-0 space-y-6">
-      <Panel title={sectionLabels[section]} id={`${id}-heading`}>
-        <p className="text-sm leading-relaxed">
-          {section === 'attribution'
-            ? 'Search one explicit email and UTC window against currently eligible indexed ledger records. An email may match distinct historical account references; do not merge them or infer verified real-world identity. An empty or final page is not proof of no historical activity.'
-            : section === 'preservation'
-              ? 'Record a freeze-before-order preservation request independently of a case workflow or full disclosure order. Its advisory expiry never releases the hold automatically. Preservation history is available in Legal Holds by request kind.'
-              : 'Each Legal Hold or preservation request is independent and overrides retention until explicit release. Release resumes original clocks and may allow immediate purge eligibility. A hold cannot restore erased data, extend recovery, or establish an immutable evidence snapshot.'}
-        </p>
+      <Panel title={t(`sections.${section}`)} id={`${id}-heading`}>
+        <p className="text-sm leading-relaxed">{t(`sectionNotice.${section}`)}</p>
         <div className="flex flex-wrap gap-3">
           {section === 'holds' && access.legal_holds_apply && (
             <Button type="button" className={controlClass} onClick={() => open({ kind: 'hold' })}>
-              Apply Legal Hold
+              {t('buttons.hold')}
             </Button>
           )}
           {section === 'preservation' && (
@@ -273,7 +250,7 @@ function LegalSection({
               className={controlClass}
               onClick={() => open({ kind: 'preservation' })}
             >
-              Record preservation
+              {t('buttons.preservation')}
             </Button>
           )}
           {section === 'attribution' && (
@@ -283,7 +260,7 @@ function LegalSection({
                 className={controlClass}
                 onClick={() => open({ kind: 'lookup' })}
               >
-                Start attribution inquiry
+                {t('buttons.lookup')}
               </Button>
               {(page || query) && (
                 <Button
@@ -295,12 +272,10 @@ function LegalSection({
                     setQuery(null);
                     setSelectedRef(null);
                     setOutcome(null);
-                    setStatus(
-                      'Inquiry and current page cleared. Reenter all inputs for a new run.'
-                    );
+                    setStatus({ key: 'legal.state.inquiryCleared' });
                   }}
                 >
-                  Clear inquiry
+                  {t('buttons.clearInquiry')}
                 </Button>
               )}
             </>
@@ -309,7 +284,7 @@ function LegalSection({
         <Feedback error={error} status={status} />
         {outcome?.kind === 'unconfirmed' && (
           <p data-testid="legal-outcome" data-outcome="unconfirmed" className="text-sm">
-            No automatic retransmission was made. No durable recovery draft is kept in this browser.
+            {t('outcome.noRetry')}
           </p>
         )}
         {(outcome?.kind === 'created' || outcome?.kind === 'released') && (
@@ -321,17 +296,16 @@ function LegalSection({
           >
             {outcome.kind === 'released' ? (
               <p className="break-all text-sm">
-                Request {outcome.holdId} is released, including if already released. This does not
-                prove this caller changed it. Other independent holds may remain.
+                {t.rich('outcome.released', {
+                  id: outcome.holdId,
+                  value: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+                })}
               </p>
             ) : (
               <>
                 <p className="text-sm font-semibold">
-                  {replayed
-                    ? 'Existing request replayed; current state returned.'
-                    : 'New legal request created.'}
-                  {!outcome.hold.is_active &&
-                    ' This request is already released; replay did not reactivate it.'}
+                  {t(replayed ? 'outcome.replayed' : 'outcome.created')}
+                  {!outcome.hold.is_active && <> {t('outcome.alreadyReleased')}</>}
                 </p>
                 <HoldCore hold={outcome.hold} />
                 <Button
@@ -340,29 +314,26 @@ function LegalSection({
                   className={controlClass}
                   onClick={() => setDetail(outcome.hold)}
                 >
-                  View restricted details
+                  {t('buttons.details')}
                 </Button>
                 {observation && (
                   <div className="min-w-0 space-y-2 text-sm">
                     <p>
-                      Observed at: <QueryUtcTime value={observation.observed_at} />
+                      {t.rich('outcome.observedAt', {
+                        time: () => <QueryUtcTime value={observation.observed_at} />,
+                      })}
                     </p>
                     <p>
-                      Account record present: {observation.account_present ? 'Yes' : 'No'}. Ledger
-                      payload present: {observation.ledger_evidence_present ? 'Yes' : 'No'}.
+                      {t('outcome.presence', {
+                        account: t(observation.account_present ? 'values.yes' : 'values.no'),
+                        ledger: t(observation.ledger_evidence_present ? 'values.yes' : 'values.no'),
+                      })}
                     </p>
-                    <p className="whitespace-pre-wrap break-words">{observation.note}</p>
-                    <p className="text-muted-foreground">
-                      Account presence includes soft-deleted records. Payload presence can include
-                      unindexed or expired records and says nothing about completeness. The hold is
-                      valid even if both observations are false.
-                    </p>
+                    <LegalEvidenceNote kind="preservation" note={observation.note} />
+                    <p className="text-muted-foreground">{t('outcome.presenceNotice')}</p>
                   </div>
                 )}
-                <p className="text-sm text-muted-foreground">
-                  Lookup and hold creation are separate transactions. This response does not promise
-                  that all previously displayed evidence survived until this hold committed.
-                </p>
+                <p className="text-sm text-muted-foreground">{t('outcome.transactionNotice')}</p>
               </>
             )}
           </div>
@@ -378,62 +349,73 @@ function LegalSection({
             onDetails={setDetail}
           />
         ) : (
-          <Feedback status="Listing is not available to this session. Release requires an authorized list row; no account-profile resolver or inferred target is used." />
+          <Feedback status={{ key: 'legal.outcome.listingUnavailable' }} />
         ))}
       {section === 'attribution' && page && query && (
-        <Panel title="Current attribution page" id={`${id}-results`}>
+        <Panel title={t('attribution.title')} id={`${id}-results`}>
           <div
             data-testid="legal-coverage"
             data-legal-private
             className="min-w-0 space-y-3 text-sm"
           >
             <p className="break-all">
-              Fixed UTC scope: {query.startTime} to {query.endTime}. Page size: {query.limit}.
+              {t.rich('attribution.scope', {
+                start: () => <QueryUtcTime value={query.startTime} />,
+                end: () => <QueryUtcTime value={query.endTime} />,
+                size: String(query.limit),
+              })}
             </p>
             <p className="break-all">
-              High-water sequence: <span className="font-mono">{page.coverage.through_seq}</span>.
+              {t.rich('attribution.highWater', {
+                sequence: page.coverage.through_seq,
+                value: (chunks) => (
+                  <bdi dir="ltr" className="font-mono">
+                    {chunks}
+                  </bdi>
+                ),
+              })}
             </p>
             <p>
-              Original observation: <QueryUtcTime value={page.coverage.observed_at} />.
+              {t.rich('attribution.observedAt', {
+                time: () => <QueryUtcTime value={page.coverage.observed_at} />,
+              })}
             </p>
             <p>
-              Eligibility checked: <QueryUtcTime value={page.coverage.eligibility_checked_at} />.
+              {t.rich('attribution.checkedAt', {
+                time: () => <QueryUtcTime value={page.coverage.eligibility_checked_at} />,
+              })}
             </p>
-            <p className="whitespace-pre-wrap break-words">{page.coverage.note}</p>
+            <LegalEvidenceNote kind="coverage" note={page.coverage.note} />
           </div>
           {page.items.length === 0 ? (
-            <p className="text-sm">
-              No matching indexed, currently eligible records were returned on this page in this
-              scope. This is not proof of no activity, no account, or a complete history.
-            </p>
+            <p className="text-sm">{t('attribution.empty')}</p>
           ) : (
             <div
               role="region"
-              aria-label="Attribution results, horizontally scrollable"
+              aria-label={t('attribution.region')}
               tabIndex={0}
               className={queryTableFrameClass}
               onFocus={revealQueryFocus}
               data-legal-private
             >
               <table className="w-full min-w-[48rem] border-collapse">
-                <caption className="sr-only">
-                  Pseudonymized personal data ordered by ascending sequence, not verified inclusion
-                  evidence
-                </caption>
+                <caption className="sr-only">{t('attribution.caption')}</caption>
                 <thead className="border-b bg-muted/40">
                   <tr>
-                    {[
-                      'Event reference',
-                      'Original account reference',
-                      'Event type',
-                      'Event time (UTC)',
-                      'Retain until (UTC)',
-                      'Sequence',
-                      ...query.fields.map((key) => legalFieldLabels[key]),
-                      'Reference selection',
-                    ].map((label) => (
+                    {(
+                      [
+                        'fields.eventRef',
+                        'fields.accountRef',
+                        'fields.eventType',
+                        'fields.eventTime',
+                        'fields.retainUntil',
+                        'fields.sequence',
+                        ...query.fields.map((key) => legalFieldLabels[key]),
+                        'fields.selection',
+                      ] as const
+                    ).map((label) => (
                       <th key={label} scope="col" className={queryHeadClass}>
-                        {label}
+                        {t(label)}
                       </th>
                     ))}
                   </tr>
@@ -442,28 +424,36 @@ function LegalSection({
                   {page.items.map((row) => (
                     <tr key={row.id} data-testid="legal-result-row">
                       <td className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}>
-                        {row.id}
+                        <bdi dir="ltr">{row.id}</bdi>
                       </td>
                       <th
                         scope="row"
                         className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}
                       >
-                        {row.account_ref}
+                        <bdi dir="ltr">{row.account_ref}</bdi>
                       </th>
-                      <td className={`${queryCellClass} max-w-48 break-all`}>{row.event_type}</td>
+                      <td className={`${queryCellClass} max-w-48 break-all`}>
+                        <bdi dir="ltr">{row.event_type}</bdi>
+                      </td>
                       <td className={queryCellClass}>
                         <QueryUtcTime value={row.timestamp} />
                       </td>
                       <td className={queryCellClass}>
                         <QueryUtcTime value={row.retain_until} />
                       </td>
-                      <td className={`${queryCellClass} break-all font-mono text-xs`}>{row.seq}</td>
+                      <td className={`${queryCellClass} break-all font-mono text-xs`}>
+                        <bdi dir="ltr">{row.seq}</bdi>
+                      </td>
                       {query.fields.map((key) => (
                         <td
                           key={key}
                           className={`${queryCellClass} max-w-56 whitespace-pre-wrap break-all`}
                         >
-                          {row[key] ?? 'Not present in this returned projection'}
+                          {row[key] === undefined ? (
+                            t('attribution.missingField')
+                          ) : (
+                            <bdi dir="ltr">{row[key]}</bdi>
+                          )}
                         </td>
                       ))}
                       <td className={queryCellClass}>
@@ -478,7 +468,7 @@ function LegalSection({
                               setOutcome(null);
                             }}
                           >
-                            Select reference
+                            {t('buttons.select')}
                           </Button>
                         )}
                       </td>
@@ -495,12 +485,16 @@ function LegalSection({
               data-testid="legal-selected-reference"
             >
               <p className="break-all text-sm">
-                Selected original reference: <span className="font-mono">{selectedRef}</span>.
+                {t.rich('attribution.selected', {
+                  id: selectedRef,
+                  value: (chunks) => (
+                    <bdi dir="ltr" className="font-mono">
+                      {chunks}
+                    </bdi>
+                  ),
+                })}
               </p>
-              <p className="text-sm text-muted-foreground">
-                This selection conveys only a reference, not proof that the account still exists or
-                who owned it. Confirm each independent operation with fresh verification.
-              </p>
+              <p className="text-sm text-muted-foreground">{t('attribution.selectionNotice')}</p>
               <div className="flex flex-wrap gap-3">
                 {access.legal_holds_apply && (
                   <Button
@@ -508,7 +502,7 @@ function LegalSection({
                     className={controlClass}
                     onClick={() => open({ kind: 'hold', accountRef: selectedRef })}
                   >
-                    Apply Legal Hold
+                    {t('buttons.hold')}
                   </Button>
                 )}
                 {access.preservation_requests_create && (
@@ -518,7 +512,7 @@ function LegalSection({
                     className={controlClass}
                     onClick={() => open({ kind: 'preservation', accountRef: selectedRef })}
                   >
-                    Record preservation
+                    {t('buttons.preservation')}
                   </Button>
                 )}
                 <Button
@@ -527,7 +521,7 @@ function LegalSection({
                   className={controlClass}
                   onClick={() => setSelectedRef(null)}
                 >
-                  Clear selection
+                  {t('buttons.clearSelection')}
                 </Button>
               </div>
             </div>
@@ -551,47 +545,45 @@ function LegalSection({
                 }
               }}
             >
-              Next attribution page
+              {t('buttons.nextLookup')}
             </Button>
           ) : (
-            <p className="text-sm">
-              No continuation was returned. This is not a complete-history finding.
-            </p>
+            <p className="text-sm">{t('attribution.final')}</p>
           )}
           <p className="text-sm leading-relaxed text-muted-foreground">
-            Only this page is retained; no previous-page cache or fetch-all exists. Current
-            retention and holds are rechecked on every page; release may remove expired matches.
-            Later ingestion above the bound is outside this run. The cursor has no advertised age
-            expiry, and no countdown is inferred. Coverage does not promise every historical pepper
-            generation is searchable. Missing selected metadata does not prove it never existed.
+            {t('attribution.coverageNotice')}
           </p>
         </Panel>
       )}
       {action && <LegalActionDialog action={action} resumeTotp={resumeTotp} onOutcome={receive} />}
       {detail && (
         <NativeDialog
-          title="Restricted legal request details"
+          title={t('details.title')}
           testId="legal-hold-details"
-          description="Restricted narrative data, rendered as inert text. Missing purged details are not empty original values."
+          description={t('details.description')}
           onCancel={() => setDetail(null)}
         >
           <div data-legal-private className="min-w-0 space-y-4">
             <HoldCore hold={detail} />
             {detail.details_purged ? (
-              <p className="text-sm">
-                Restricted details were purged. The original values are not available.
-              </p>
+              <p className="text-sm">{t('details.purged')}</p>
             ) : (
               <dl className="min-w-0 space-y-3 text-sm">
-                {[
-                  ['Reason', detail.reason],
-                  ['Requesting authority', detail.requesting_authority],
-                  ['Legal basis', detail.legal_basis],
-                ].map(([label, value]) => (
+                {(
+                  [
+                    ['reason', detail.reason],
+                    ['requestingAuthority', detail.requesting_authority],
+                    ['legalBasis', detail.legal_basis],
+                  ] as const
+                ).map(([label, value]) => (
                   <div key={label} className="min-w-0">
-                    <dt className="text-muted-foreground">{label}</dt>
+                    <dt className="text-muted-foreground">{t(`fields.${label}`)}</dt>
                     <dd className="mt-1 whitespace-pre-wrap break-all">
-                      {value ?? 'Not returned'}
+                      {value === undefined ? (
+                        t('values.notReturned')
+                      ) : (
+                        <bdi dir="auto">{value}</bdi>
+                      )}
                     </dd>
                   </div>
                 ))}
@@ -604,7 +596,7 @@ function LegalSection({
             className={controlClass}
             onClick={() => setDetail(null)}
           >
-            Close details
+            {t('buttons.closeDetails')}
           </Button>
         </NativeDialog>
       )}
@@ -613,40 +605,79 @@ function LegalSection({
 }
 
 function HoldCore({ hold }: { hold: LegalHold }) {
+  const t = useTranslations('legal');
   return (
     <dl className="min-w-0 space-y-2 text-sm">
-      {[
-        ['Request kind', hold.request_kind === 'preservation' ? 'Preservation' : 'Legal Hold'],
-        ['Hold request UUID', hold.id],
-        ['Original account reference', hold.account_ref],
-        ['Status', hold.is_active ? 'Active' : 'Released'],
-        ['Applied by (opaque reference)', hold.applied_by],
-        ['Released by (opaque reference)', hold.released_by ?? 'Not recorded'],
-      ].map(([label, value]) => (
+      {(
+        [
+          [
+            'requestKind',
+            t(hold.request_kind === 'preservation' ? 'values.preservation' : 'values.hold'),
+            false,
+          ],
+          ['holdId', hold.id, true],
+          ['accountRef', hold.account_ref, true],
+          ['status', t(hold.is_active ? 'values.active' : 'values.released'), false],
+          ['appliedBy', hold.applied_by, true],
+          ['releasedBy', hold.released_by ?? t('values.notRecorded'), hold.released_by !== null],
+        ] as const
+      ).map(([label, value, technical]) => (
         <div key={label} className="min-w-0">
-          <dt className="text-muted-foreground">{label}</dt>
-          <dd className="break-all">{value}</dd>
+          <dt className="text-muted-foreground">{t(`fields.${label}`)}</dt>
+          <dd className="break-all">{technical ? <bdi dir="ltr">{value}</bdi> : value}</dd>
         </div>
       ))}
       <div>
-        <dt className="text-muted-foreground">Applied at (UTC)</dt>
+        <dt className="text-muted-foreground">{t('fields.appliedAt')}</dt>
         <dd>
           <QueryUtcTime value={hold.applied_at} />
         </dd>
       </div>
       <div>
-        <dt className="text-muted-foreground">Advisory review at (UTC)</dt>
+        <dt className="text-muted-foreground">{t('fields.advisoryReviewAt')}</dt>
         <dd>
           <QueryUtcTime value={hold.review_at} />
         </dd>
       </div>
       <div>
-        <dt className="text-muted-foreground">Released at (UTC)</dt>
+        <dt className="text-muted-foreground">{t('fields.releasedAt')}</dt>
         <dd>
           <QueryUtcTime value={hold.released_at} />
         </dd>
       </div>
     </dl>
+  );
+}
+
+function LegalEvidenceNote({
+  kind,
+  note,
+}: {
+  kind: keyof typeof legalEvidenceNotes;
+  note: string;
+}) {
+  const t = useTranslations('legal');
+  const recognized = note === legalEvidenceNotes[kind];
+  return (
+    <div className="min-w-0 space-y-2">
+      <p>
+        {t.rich(recognized ? `evidence.${kind}` : 'evidence.unknown', {
+          field: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+        })}
+      </p>
+      {recognized ? (
+        <details className="min-w-0">
+          <summary className="min-h-11 cursor-pointer py-2">{t('evidence.original')}</summary>
+          <p className="whitespace-pre-wrap break-words">
+            <bdi dir="auto">{note}</bdi>
+          </p>
+        </details>
+      ) : (
+        <p className="whitespace-pre-wrap break-words">
+          <bdi dir="auto">{note}</bdi>
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -661,6 +692,8 @@ function LegalHoldsRead({
   onRelease: (hold: LegalHold) => void;
   onDetails: (hold: LegalHold) => void;
 }) {
+  const t = useTranslations('legal');
+  const message = useMessage();
   const { client, reportPermissionLoss } = usePortal();
   const sizes = legalPageLimits(limits);
   const [draft, setDraft] = useState({
@@ -672,11 +705,9 @@ function LegalHoldsRead({
   const [submitted, setSubmitted] = useState<LegalHoldsQuery | null>(null);
   const [page, setPage] = useState<LegalHoldsPage | null>(null);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState('');
-  const [inputError, setInputError] = useState('');
-  const [status, setStatus] = useState(
-    'Choose a reference or explicitly select all original references, then read. No request has run.'
-  );
+  const [error, setError] = useState<Message>('');
+  const [inputError, setInputError] = useState<Message>('');
+  const [status, setStatus] = useState<Message>({ key: 'legal.read.initial' });
   const busy = useRef(false);
   const region = useRef<HTMLDivElement>(null);
   const form = useRef<HTMLFormElement>(null);
@@ -705,7 +736,7 @@ function LegalHoldsRead({
     setPending(false);
     setInputError('');
     setError('');
-    setStatus('Filters changed. Read explicitly for a new snapshot.');
+    setStatus({ key: 'legal.read.changed' });
   }
   async function load(query: LegalHoldsQuery) {
     if (busy.current) return;
@@ -716,15 +747,16 @@ function LegalHoldsRead({
     setSubmitted(null);
     setPending(true);
     setError('');
-    setStatus('Loading one bounded Legal Holds page...');
+    setStatus({ key: 'legal.read.loading' });
     try {
       const result = await new LegalClient(client).holds(query, controller.signal);
       if (!work.current(controller)) return;
       setPage(result);
       setSubmitted(query);
-      setStatus(
-        `${result.items.length} requests on this page. Total ${result.total} in this response snapshot, not a stable multi-page inventory.`
-      );
+      setStatus({
+        key: 'legal.read.accepted',
+        values: { count: result.items.length, total: result.total },
+      });
     } catch (failure) {
       if (!work.current(controller) || isAborted(failure)) return;
       setStatus('');
@@ -753,19 +785,17 @@ function LegalHoldsRead({
       setInputError('');
       void load(query);
     } catch {
-      setInputError(
-        `Enter a canonical nonzero account reference or explicitly select all original references, and a page size from 1 to ${sizes.max}. Invalid input never becomes an all-subject query.`
-      );
+      setInputError({ key: 'legal.read.invalid', values: { max: sizes.max } });
       form.current?.querySelector<HTMLElement>('input:not(:disabled)')?.focus();
     }
   }
   if (cleared) return <Feedback status={legalClearedMessage} />;
   return (
     <div ref={region}>
-      <Panel title="Read independent requests" id={`${id}-heading`}>
+      <Panel title={t('read.title')} id={`${id}-heading`}>
         <form
           ref={form}
-          aria-label="Read Legal Holds"
+          aria-label={t('buttons.read')}
           method="post"
           noValidate
           autoComplete="off"
@@ -776,10 +806,11 @@ function LegalHoldsRead({
           }}
         >
           <div className="min-w-0 space-y-2">
-            <Label htmlFor={`${id}-ref`}>Original account reference</Label>
+            <Label htmlFor={`${id}-ref`}>{t('fields.accountRef')}</Label>
             <Input
               id={`${id}-ref`}
               name="accountRef"
+              dir="ltr"
               type="text"
               value={draft.accountRef}
               disabled={draft.all}
@@ -799,11 +830,11 @@ function LegalHoldsRead({
               onChange={(event) => edit({ ...draft, all: event.target.checked, accountRef: '' })}
               className="size-5 shrink-0 accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             />
-            All original references
+            {t('read.allReferences')}
           </label>
           <div className="grid min-w-0 gap-4 sm:grid-cols-2">
             <div className="min-w-0 space-y-2">
-              <Label htmlFor={`${id}-status`}>Hold status</Label>
+              <Label htmlFor={`${id}-status`}>{t('fields.holdStatus')}</Label>
               <select
                 id={`${id}-status`}
                 name="status"
@@ -811,16 +842,17 @@ function LegalHoldsRead({
                 className={querySelectClass}
                 onChange={(event) => edit({ ...draft, status: event.target.value })}
               >
-                <option value="active">Active</option>
-                <option value="released">Released</option>
-                <option value="all">All</option>
+                <option value="active">{t('values.active')}</option>
+                <option value="released">{t('values.released')}</option>
+                <option value="all">{t('values.all')}</option>
               </select>
             </div>
             <div className="min-w-0 space-y-2">
-              <Label htmlFor={`${id}-size`}>Page size</Label>
+              <Label htmlFor={`${id}-size`}>{t('fields.size')}</Label>
               <Input
                 id={`${id}-size`}
                 name="size"
+                dir="ltr"
                 type="number"
                 min={1}
                 max={sizes.max}
@@ -834,18 +866,19 @@ function LegalHoldsRead({
             </div>
           </div>
           <p id={`${id}-filter-help`} className="text-sm text-muted-foreground">
-            The reference is the original users.id, retained independently after deletion. An
-            all-subject read is explicit and bounded to at most {sizes.max}
-            requests per page. No account-profile browsing is granted.
+            {t.rich('read.filterHelp', {
+              max: String(sizes.max),
+              id: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+            })}
           </p>
           {inputError && (
             <p id={`${id}-error`} role="alert" className="text-sm text-destructive">
-              {inputError}
+              {message(inputError)}
             </p>
           )}
           <div className="flex flex-wrap gap-3">
             <Button type="submit" className={controlClass} disabled={pending}>
-              Read Legal Holds
+              {t('buttons.read')}
             </Button>
             <Button
               type="button"
@@ -855,7 +888,7 @@ function LegalHoldsRead({
                 edit({ accountRef: '', all: false, status: 'active', size: String(sizes.default) })
               }
             >
-              Clear hold query
+              {t('buttons.clearRead')}
             </Button>
             {pending && (
               <Button
@@ -871,46 +904,41 @@ function LegalHoldsRead({
                   })
                 }
               >
-                Cancel hold read
+                {t('buttons.cancelRead')}
               </Button>
             )}
           </div>
         </form>
         <Feedback error={error} status={status} />
-        {page?.items.length === 0 && (
-          <p className="text-sm">
-            No requests were returned on this page of the submitted filters. This is not a
-            missing-request API response or proof of no historical hold.
-          </p>
-        )}
+        {page?.items.length === 0 && <p className="text-sm">{t('read.empty')}</p>}
         {page && page.items.length > 0 && (
           <div
             role="region"
-            aria-label="Legal Holds, horizontally scrollable"
+            aria-label={t('read.region')}
             tabIndex={0}
             className={queryTableFrameClass}
             onFocus={revealQueryFocus}
             data-legal-private
           >
             <table className="w-full min-w-[54rem] border-collapse">
-              <caption className="sr-only">
-                Independent Legal Hold and preservation requests
-              </caption>
+              <caption className="sr-only">{t('read.caption')}</caption>
               <thead className="border-b bg-muted/40">
                 <tr>
-                  {[
-                    'Request kind',
-                    'Hold request UUID',
-                    'Original account reference',
-                    'Status',
-                    'Applied (UTC)',
-                    'Advisory review (UTC)',
-                    'Released (UTC)',
-                    'Actor references',
-                    'Actions',
-                  ].map((label) => (
+                  {(
+                    [
+                      'requestKind',
+                      'holdId',
+                      'accountRef',
+                      'status',
+                      'applied',
+                      'review',
+                      'released',
+                      'actors',
+                      'actions',
+                    ] as const
+                  ).map((label) => (
                     <th key={label} scope="col" className={queryHeadClass}>
-                      {label}
+                      {t(`fields.${label}`)}
                     </th>
                   ))}
                 </tr>
@@ -919,18 +947,22 @@ function LegalHoldsRead({
                 {page.items.map((row) => (
                   <tr key={row.id} data-testid="legal-hold-row">
                     <td className={queryCellClass}>
-                      {row.request_kind === 'preservation' ? 'Preservation' : 'Legal Hold'}
+                      {t(
+                        row.request_kind === 'preservation' ? 'values.preservation' : 'values.hold'
+                      )}
                     </td>
                     <th
                       scope="row"
                       className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}
                     >
-                      {row.id}
+                      <bdi dir="ltr">{row.id}</bdi>
                     </th>
                     <td className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}>
-                      {row.account_ref}
+                      <bdi dir="ltr">{row.account_ref}</bdi>
                     </td>
-                    <td className={queryCellClass}>{row.is_active ? 'Active' : 'Released'}</td>
+                    <td className={queryCellClass}>
+                      {t(row.is_active ? 'values.active' : 'values.released')}
+                    </td>
                     <td className={queryCellClass}>
                       <QueryUtcTime value={row.applied_at} />
                     </td>
@@ -941,9 +973,17 @@ function LegalHoldsRead({
                       <QueryUtcTime value={row.released_at} />
                     </td>
                     <td className={`${queryCellClass} max-w-52 break-all text-xs`}>
-                      Applied by: {row.applied_by}
+                      {t.rich('read.appliedBy', {
+                        id: row.applied_by,
+                        value: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+                      })}
                       <br />
-                      Released by: {row.released_by ?? 'Not recorded'}
+                      {t.rich('read.releasedBy', {
+                        id: row.released_by ?? t('values.notRecorded'),
+                        value: (chunks) => (
+                          <bdi dir={row.released_by ? 'ltr' : 'auto'}>{chunks}</bdi>
+                        ),
+                      })}
                     </td>
                     <td className={`${queryCellClass} space-y-2`}>
                       <Button
@@ -952,7 +992,7 @@ function LegalHoldsRead({
                         className={controlClass}
                         onClick={() => onDetails(row)}
                       >
-                        View restricted details
+                        {t('buttons.details')}
                       </Button>
                       {canRelease && row.is_active && (
                         <Button
@@ -961,7 +1001,7 @@ function LegalHoldsRead({
                           className={controlClass}
                           onClick={() => onRelease(row)}
                         >
-                          Release request
+                          {t('buttons.release')}
                         </Button>
                       )}
                     </td>
@@ -972,10 +1012,7 @@ function LegalHoldsRead({
           </div>
         )}
         {page && submitted && (
-          <nav
-            aria-label="Legal Holds offset pagination"
-            className="flex flex-wrap items-center gap-3"
-          >
+          <nav aria-label={t('read.pagination')} className="flex flex-wrap items-center gap-3">
             <Button
               type="button"
               variant="outline"
@@ -985,10 +1022,14 @@ function LegalHoldsRead({
                 void load({ ...submitted, offset: Math.max(0, submitted.offset - submitted.limit) })
               }
             >
-              Previous hold page
+              {t('buttons.previous')}
             </Button>
             <span className="text-sm text-muted-foreground">
-              Offset {page.offset}; {page.items.length} of {page.total} in this response snapshot.
+              {t('read.snapshot', {
+                offset: String(page.offset),
+                count: String(page.items.length),
+                total: String(page.total),
+              })}
             </span>
             <Button
               type="button"
@@ -1003,7 +1044,7 @@ function LegalHoldsRead({
                 void load({ ...submitted, offset: submitted.offset + submitted.limit })
               }
             >
-              Next hold page
+              {t('buttons.next')}
             </Button>
           </nav>
         )}
