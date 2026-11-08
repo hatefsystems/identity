@@ -821,7 +821,17 @@ test('registration browser trusts only its run-owned CA and restores TLS default
   } finally {
     restore();
   }
-  assert.deepEqual(getCACertificates('default'), originalCAs);
+  // Node normalizes its default CA lists after setDefaultCACertificates().
+  // Compare trust semantics, rather than order/PEM encoding of system roots.
+  const originalFingerprints = new Set(
+    originalCAs.map((pem) => new X509Certificate(pem).fingerprint256)
+  );
+  const restoredFingerprints = new Set(
+    getCACertificates('default').map((pem) => new X509Certificate(pem).fingerprint256)
+  );
+  assert(!restoredFingerprints.has(new X509Certificate(ca).fingerprint256));
+  for (const fingerprint of originalFingerprints)
+    assert(restoredFingerprints.has(fingerprint), 'Existing default CA was lost on restore');
   assert.equal(process.env.NODE_EXTRA_CA_CERTS, originalEnv);
   assert.throws(() => trustRegistrationFixtureCA('not-a-certificate', path));
   assert.throws(() => trustRegistrationFixtureCA(ca, 'relative-ca.pem'));
