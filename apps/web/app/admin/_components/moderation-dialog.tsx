@@ -226,6 +226,7 @@ export function ModerationDialog({
 
   return (
     <StepUpDialog
+      layout="review"
       title={t(`moderation.titles.${desiredStatus}`)}
       description={
         <div className="space-y-3">
@@ -262,9 +263,22 @@ export function ModerationDialog({
             ? { key: 'admin.moderation.verified' }
             : { key: 'admin.moderation.checking' }
       }
+      verifiedActions={
+        deadline && (
+          <Button
+            type="submit"
+            form={`${id}-form`}
+            className={`${controlClass} w-full`}
+            disabled={!acknowledged || submitting}
+          >
+            {submitting ? t('moderation.submitting') : t(`moderation.confirm.${desiredStatus}`)}
+          </Button>
+        )
+      }
       verifiedContent={
         deadline && (
           <form
+            id={`${id}-form`}
             aria-label={t('moderation.form')}
             className="space-y-4"
             noValidate
@@ -332,13 +346,6 @@ export function ModerationDialog({
               />
               {t('moderation.acknowledged')}
             </label>
-            <Button
-              type="submit"
-              className={`${controlClass} w-full`}
-              disabled={!acknowledged || submitting}
-            >
-              {submitting ? t('moderation.submitting') : t(`moderation.confirm.${desiredStatus}`)}
-            </Button>
           </form>
         )
       }

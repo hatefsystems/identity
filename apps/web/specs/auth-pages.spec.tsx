@@ -3,198 +3,175 @@ jest.mock('next-intl/server', () => ({
     jest.requireActual('../i18n/testing').getTestTranslations(namespace, mockPageLocale),
 }));
 
-import { fireEvent, render, screen } from '../i18n/testing';
+import { render, screen } from '../i18n/testing';
 import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
 import type { ReactElement } from 'react';
 import { I18nTestProvider } from '../i18n/testing';
-const renderToStaticMarkup = (element: ReactElement) =>
-  renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import AuthLayout from '../app/(auth)/layout';
-import ForgotPasswordPage, {
-  generateMetadata as forgotMetadata,
-} from '../app/(auth)/forgot-password/page';
+import ForgotPasswordPage, { generateMetadata as forgotMetadata } from '../app/(auth)/forgot-password/page';
 import LoginPage, { generateMetadata as loginMetadata } from '../app/(auth)/login/page';
-import PasskeyPage, {
-  generateMetadata as passkeyMetadata,
-} from '../app/(auth)/login/webauthn/page';
-import RegistrationPage, {
-  generateMetadata as registrationMetadata,
-} from '../app/(auth)/register/page';
-import ResetPasswordPage, {
-  generateMetadata as resetMetadata,
-} from '../app/(auth)/reset-password/page';
+import PasskeyPage, { generateMetadata as passkeyMetadata } from '../app/(auth)/login/webauthn/page';
+import RegistrationPage, { generateMetadata as registrationMetadata } from '../app/(auth)/register/page';
+import VerifyEmailPage, { generateMetadata as verifyEmailMetadata } from '../app/(auth)/register/verify-email/page';
+import ResetPasswordPage, { generateMetadata as resetMetadata } from '../app/(auth)/reset-password/page';
 import TotpPage, { generateMetadata as totpMetadata } from '../app/(auth)/verify-totp/page';
 
 jest.mock('next/navigation', () => ({ useRouter: () => ({ replace: jest.fn() }) }));
 
-let mockPageLocale: 'en' | 'fa-IR' = 'en';
+type Locale = 'en' | 'fa-IR';
+let mockPageLocale: Locale = 'en';
 afterEach(() => {
   mockPageLocale = 'en';
 });
 
-const notice = 'This form is not connected yet. Do not enter real credentials.';
+const presentation = {
+  en: {
+    home: 'Hatef Identity home',
+    language: 'Language',
+    register: 'Create an account',
+    signIn: 'Sign in',
+    continue: 'Continue with a passkey',
+    use: 'Use a passkey',
+    return: 'Return to sign in',
+    start: 'Start registration and send email',
+    notice: 'Use a passkey to sign in to an existing account, or create an account with email, phone and passkey verification.',
+  },
+  'fa-IR': {
+    home: 'صفحهٔ اصلی هویت هاتف',
+    language: 'زبان',
+    register: 'ایجاد حساب',
+    signIn: 'ورود',
+    continue: 'ادامه با کلید عبور',
+    use: 'استفاده از کلید عبور',
+    return: 'بازگشت به ورود',
+    start: 'شروع ثبت‌نام و ارسال ایمیل',
+    notice: 'برای ورود به حساب موجود از کلید عبور استفاده کنید، یا با تأیید ایمیل، تلفن و کلید عبور حساب بسازید.',
+  },
+};
 const routes = [
   {
-    path: '/login',
-    Page: LoginPage,
-    metadata: loginMetadata,
-    title: 'Sign in | Hatef Identity',
-    heading: 'Sign in to Hatef',
-    action: 'Sign in with password',
-    fields: [
-      ['Email address', 'email', 'username'],
-      ['Password', 'password', 'current-password'],
-    ],
-    links: [
-      ['Forgot password?', '/forgot-password'],
-      ['Create an account', '/register'],
-    ],
+    path: '/login', Page: LoginPage, metadata: loginMetadata,
+    headings: ['Sign in to Hatef', 'ورود به هاتف'],
+    titles: ['Sign in | Hatef Identity', 'ورود | هویت هاتف'],
   },
   {
-    path: '/register',
-    Page: RegistrationPage,
-    metadata: registrationMetadata,
-    title: 'Create an account | Hatef Identity',
-    heading: 'Create your account',
-    action: 'Start registration and send email',
-    fields: [
-      ['Email address', 'text', 'email'],
-      ['Iranian mobile number', 'tel', 'tel'],
-    ],
-    links: [['Sign in', '/login']],
+    path: '/register', Page: RegistrationPage, metadata: registrationMetadata,
+    headings: ['Create your account', 'حساب خود را ایجاد کنید'],
+    titles: ['Create an account | Hatef Identity', 'ایجاد حساب | هویت هاتف'],
   },
   {
-    path: '/login/webauthn',
-    Page: PasskeyPage,
-    metadata: passkeyMetadata,
-    title: 'Sign in with a passkey | Hatef Identity',
-    heading: 'Sign in with a passkey',
-    action: 'Use a passkey',
-    fields: [],
-    links: [['Return to sign in', '/login']],
+    path: '/login/webauthn', Page: PasskeyPage, metadata: passkeyMetadata,
+    headings: ['Sign in with a passkey', 'ورود با کلید عبور'],
+    titles: ['Sign in with a passkey | Hatef Identity', 'ورود با کلید عبور | هویت هاتف'],
   },
   {
-    path: '/verify-totp',
-    Page: TotpPage,
-    metadata: totpMetadata,
-    title: 'Verify authenticator code | Hatef Identity',
-    heading: 'Verify your authenticator code',
-    action: 'Verify code',
-    fields: [['Authenticator code', 'text', 'one-time-code']],
-    links: [['Return to sign in', '/login']],
+    path: '/verify-totp', Page: TotpPage, metadata: totpMetadata,
+    headings: ['Authenticator sign-in unavailable', 'ورود با رمزساز در دسترس نیست'],
+    titles: ['Authenticator sign-in unavailable | Hatef Identity', 'ورود با رمزساز در دسترس نیست | هویت هاتف'],
   },
   {
-    path: '/forgot-password',
-    Page: ForgotPasswordPage,
-    metadata: forgotMetadata,
-    title: 'Reset your password | Hatef Identity',
-    heading: 'Reset your password',
-    action: 'Send reset link',
-    fields: [['Email address', 'email', 'email']],
-    links: [['Return to sign in', '/login']],
+    path: '/forgot-password', Page: ForgotPasswordPage, metadata: forgotMetadata,
+    headings: ['Password reset unavailable', 'بازنشانی گذرواژه در دسترس نیست'],
+    titles: ['Password reset unavailable | Hatef Identity', 'بازنشانی گذرواژه در دسترس نیست | هویت هاتف'],
   },
   {
-    path: '/reset-password',
-    Page: ResetPasswordPage,
-    metadata: resetMetadata,
-    title: 'Set a new password | Hatef Identity',
-    heading: 'Set a new password',
-    action: 'Reset password',
-    fields: [
-      ['New password', 'password', 'new-password'],
-      ['Confirm password', 'password', 'new-password'],
-    ],
-    links: [['Return to sign in', '/login']],
+    path: '/reset-password', Page: ResetPasswordPage, metadata: resetMetadata,
+    headings: ['Password reset unavailable', 'بازنشانی گذرواژه در دسترس نیست'],
+    titles: ['Password reset unavailable | Hatef Identity', 'بازنشانی گذرواژه در دسترس نیست | هویت هاتف'],
   },
 ];
+const unavailable = routes.filter(({ Page }) => [TotpPage, ForgotPasswordPage, ResetPasswordPage].includes(Page));
+const staticMarkup = (element: ReactElement, locale: Locale) =>
+  renderStatic(<I18nTestProvider locale={locale}>{element}</I18nTestProvider>);
 
-describe('public auth routes', () => {
-  it.each(routes)(
-    '$path has meaningful headings, associated labels, native controls, and real navigation',
-    async ({ Page, metadata, title, heading, action, fields, links }) => {
-      const { container } = render(await AuthLayout({ children: await Page() }));
-      expect((await metadata()).title).toBe(title);
-      expect(screen.getAllByRole('main')).toHaveLength(1);
-      expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-      expect(screen.getByRole('heading', { level: 1, name: heading })).toBeTruthy();
-      expect(screen.getByRole('link', { name: 'Hatef Identity home' }).getAttribute('href')).toBe(
-        '/'
-      );
-      expect(document.activeElement).toBe(document.body);
-      expect(container.querySelectorAll('input')).toHaveLength(fields.length);
+describe.each(['en', 'fa-IR'] as const)('public auth routes in %s', (locale) => {
+  it.each(routes)('$path exposes one task heading, supported navigation and safe controls', async ({ Page, metadata, headings, titles }) => {
+    mockPageLocale = locale;
+    const copy = presentation[locale];
+    const index = locale === 'en' ? 0 : 1;
+    const { container } = render(await AuthLayout({ children: await Page() }), { locale });
+    expect((await metadata()).title).toBe(titles[index]);
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(screen.getByRole('heading', { name: headings[index], level: 1 })).toBeTruthy();
+    expect(screen.getByRole('link', { name: copy.home }).getAttribute('href')).toBe('/');
+    expect(screen.getByRole('combobox', { name: copy.language })).toBeTruthy();
+    expect(document.activeElement).toBe(document.body);
 
-      for (const [label, type, autocomplete] of fields) {
+    if (Page === RegistrationPage) {
+      const fields = locale === 'en'
+        ? ['Email address', 'Iranian mobile number']
+        : ['نشانی ایمیل', 'شمارهٔ همراه ایران'];
+      expect(container.querySelectorAll('input')).toHaveLength(2);
+      fields.forEach((label, fieldIndex) => {
         const input = screen.getByLabelText<HTMLInputElement>(label);
         expect(input.id).not.toBe('');
-        expect(
-          [...container.querySelectorAll('label')].some(
-            (element) => element.htmlFor === input.id && element.textContent === label
-          )
-        ).toBe(true);
-        expect(input.name).not.toBe('');
-        expect(input.type).toBe(type);
-        expect(input.autocomplete).toBe(autocomplete);
+        expect(container.querySelector(`label[for="${input.id}"]`)?.textContent).toBe(label);
+        expect(input.type).toBe(fieldIndex ? 'tel' : 'text');
+        expect(input.autocomplete).toBe(fieldIndex ? 'tel' : 'email');
         expect(input.required).toBe(true);
         expect(input.disabled).toBe(false);
+        expect(input.dir).toBe('ltr');
         expect(input.getAttribute('aria-invalid')).toBe('false');
         expect(input.hasAttribute('autofocus')).toBe(false);
-        if (type === 'email') {
-          expect(input.getAttribute('autocapitalize')).toBe('none');
-          expect(input.getAttribute('spellcheck')).toBe('false');
-        }
-      }
-      for (const [name, href] of links) {
-        expect(screen.getByRole('link', { name }).getAttribute('href')).toBe(href);
-      }
-      expect(screen.getAllByRole('link')).toHaveLength(links.length + 1);
-      const submit = screen.getByRole<HTMLButtonElement>('button', { name: action });
-      expect(submit.type).toBe(Page === PasskeyPage ? 'button' : 'submit');
-      expect(submit.disabled).toBe(Page !== PasskeyPage && Page !== RegistrationPage);
-      if (Page !== PasskeyPage && Page !== RegistrationPage)
-        expect(
-          document.getElementById(submit.getAttribute('aria-describedby') ?? '')?.textContent
-        ).toContain(notice);
-      for (const button of [...container.querySelectorAll<HTMLButtonElement>('form button')]) {
-        expect(button.getAttribute('type')).toBe(
-          button === submit && Page !== PasskeyPage ? 'submit' : 'button'
-        );
-        if (button !== submit) expect(button.disabled).toBe(false);
-      }
-      for (const icon of container.querySelectorAll('svg'))
-        expect(icon.getAttribute('aria-hidden')).toBe('true');
-      expect(container.querySelector('style, script, [style], [onclick]')).toBeNull();
+      });
+      const submit = screen.getByRole<HTMLButtonElement>('button', { name: copy.start });
+      expect(submit.type).toBe('submit');
+      expect(submit.disabled).toBe(false);
+      expect(screen.getByRole('link', { name: copy.signIn }).getAttribute('href')).toBe('/login');
+    } else if (Page === LoginPage || Page === PasskeyPage) {
+      const action = screen.getByRole<HTMLButtonElement>('button', { name: Page === LoginPage ? copy.continue : copy.use });
+      expect(action.type).toBe('button');
+      expect(action.disabled).toBe(false);
+      expect(container.querySelector('input, form')).toBeNull();
+      expect(screen.getByRole('link', { name: Page === LoginPage ? copy.register : copy.return }).getAttribute('href')).toBe(Page === LoginPage ? '/register' : '/login');
+      expect(container.querySelector('a[href="/forgot-password"]')).toBeNull();
+      expect(container.textContent).not.toContain(locale === 'en' ? 'or use your password' : 'یا از گذرواژهٔ خود استفاده کنید');
+    } else {
+      expect(screen.getByText(copy.notice)).toBeTruthy();
+      expect(screen.getByRole('link', { name: copy.continue }).getAttribute('href')).toBe('/login');
+      expect(screen.getByRole('link', { name: copy.register }).getAttribute('href')).toBe('/register');
+      expect(screen.getAllByRole('link')).toHaveLength(3);
+      expect(container.querySelector('input, form, button[type="submit"]')).toBeNull();
+      expect(container.textContent).not.toContain(locale === 'en' ? 'UI preview' : 'پیش‌نمایش رابط کاربری');
     }
-  );
+    for (const icon of container.querySelectorAll('svg')) expect(icon.getAttribute('aria-hidden')).toBe('true');
+    expect(container.querySelector('style, script, [style], [onclick]')).toBeNull();
+  });
 
-  it.each(routes.filter(({ Page }) => Page !== PasskeyPage && Page !== RegistrationPage))(
-    '$path is disconnected in the initial server HTML, before hydration or JavaScript',
-    async ({ Page }) => {
-      const html = renderToStaticMarkup(await AuthLayout({ children: await Page() }));
-      const document = new DOMParser().parseFromString(html, 'text/html');
-      expect(document.forms).toHaveLength(1);
-      const form = document.forms[0];
-      expect(form.getAttribute('method')).toBe('post');
-      expect(form.getAttribute('action')).toBeNull();
-      expect(form.textContent).toContain(notice);
-      const buttons = [...form.querySelectorAll<HTMLButtonElement>('button[type="submit"]')];
-      expect(buttons).toHaveLength(1);
-      expect(buttons[0].disabled).toBe(true);
-      expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
-    }
-  );
+  it.each(unavailable)('$path retains useful no-JS notices and links without credential forms', async ({ Page }) => {
+    mockPageLocale = locale;
+    const doc = new DOMParser().parseFromString(staticMarkup(await AuthLayout({ children: await Page() }), locale), 'text/html');
+    expect(doc.body.textContent).toContain(presentation[locale].notice);
+    expect(doc.forms).toHaveLength(0);
+    expect(doc.querySelector('input, button[type="submit"], [formaction], style, script, [style], [onclick]')).toBeNull();
+    expect(doc.querySelector('a[href="/login"]')?.textContent).toBe(presentation[locale].continue);
+    expect(doc.querySelector('a[href="/register"]')?.textContent).toBe(presentation[locale].register);
+  });
 
-  it('server-renders a disabled non-submitting passkey button without initiating a ceremony', async () => {
-    const html = renderToStaticMarkup(await AuthLayout({ children: await PasskeyPage() }));
-    const document = new DOMParser().parseFromString(html, 'text/html');
-    expect(document.forms).toHaveLength(0);
-    const button = document.querySelector<HTMLButtonElement>('[data-testid="passkey-login"]');
+  it.each([LoginPage, PasskeyPage])('server-renders an inert passkey action with no ceremony or submitting form', async (Page) => {
+    mockPageLocale = locale;
+    const doc = new DOMParser().parseFromString(staticMarkup(await AuthLayout({ children: await Page() }), locale), 'text/html');
+    const button = doc.querySelector<HTMLButtonElement>('[data-testid="passkey-login"]');
     expect(button?.disabled).toBe(true);
     expect(button?.type).toBe('button');
-    expect(document.querySelector('style, script, [style], [onclick], [formaction]')).toBeNull();
+    expect(doc.querySelector('input, form, script, [formaction]')).toBeNull();
+    expect(doc.querySelector('noscript')?.textContent).toContain(locale === 'en' ? 'JavaScript is required' : 'جاوااسکریپت لازم است');
+  });
+
+  it('keeps registration-email metadata stable, private-value-free and separate from unavailable auth routes', async () => {
+    mockPageLocale = locale;
+    const metadata = await verifyEmailMetadata();
+    expect(metadata).toEqual({ title: locale === 'en' ? 'Verify registration email | Hatef Identity' : 'تأیید ایمیل ثبت‌نام | هویت هاتف', referrer: 'no-referrer' });
+    const html = staticMarkup(await AuthLayout({ children: await VerifyEmailPage() }), locale);
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    expect(doc.querySelectorAll('h1')).toHaveLength(1);
+    expect(doc.querySelector('h1')?.textContent).toBe(locale === 'en' ? 'Verify your email ownership' : 'مالکیت ایمیل خود را تأیید کنید');
+    expect(doc.querySelector<HTMLButtonElement>('button[data-testid="passkey-login"]')).toBeNull();
   });
 });
 
-describe('disconnected route interaction', () => {
+describe('availability-page safety', () => {
   const fetch = jest.fn();
   const credentials = { get: jest.fn(), create: jest.fn() };
   const sendBeacon = jest.fn();
@@ -203,13 +180,9 @@ describe('disconnected route interaction', () => {
     { object: navigator, key: 'credentials', value: credentials },
     { object: navigator, key: 'sendBeacon', value: sendBeacon },
   ];
-  const originals = capabilities.map(({ object, key }) =>
-    Object.getOwnPropertyDescriptor(object, key)
-  );
-
+  const originals = capabilities.map(({ object, key }) => Object.getOwnPropertyDescriptor(object, key));
   beforeAll(() => {
-    for (const { object, key, value } of capabilities)
-      Object.defineProperty(object, key, { configurable: true, value });
+    for (const { object, key, value } of capabilities) Object.defineProperty(object, key, { configurable: true, value });
   });
   afterAll(() => {
     capabilities.forEach(({ object, key }, index) => {
@@ -222,125 +195,21 @@ describe('disconnected route interaction', () => {
     jest.restoreAllMocks();
     jest.clearAllMocks();
   });
-
-  it.each(routes.filter(({ Page }) => Page !== PasskeyPage && Page !== RegistrationPage))(
-    '$path keeps the notice and prevents submission without network, WebAuthn, storage, or navigation',
-    async ({ Page, action, fields }) => {
-      const requests = [
-        fetch,
-        credentials.get,
-        credentials.create,
-        sendBeacon,
-        jest.spyOn(XMLHttpRequest.prototype, 'open').mockImplementation(() => undefined),
-        jest.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(() => undefined),
-        jest.spyOn(window, 'localStorage', 'get'),
-        jest.spyOn(window, 'sessionStorage', 'get'),
-        jest.spyOn(document, 'cookie', 'set').mockImplementation(() => undefined),
-      ];
-      const initialUrl = window.location.href;
-      const { container } = render(await AuthLayout({ children: await Page() }));
-      const form = screen.getByRole<HTMLFormElement>('form');
-      expect(form.method).toBe('post');
-      expect(form.getAttribute('action')).toBeNull();
-
-      for (const [label, type] of fields) {
-        const input = screen.getByLabelText<HTMLInputElement>(label);
-        fireEvent.blur(input);
-        expect(input.getAttribute('aria-invalid')).toBe('true');
-        fireEvent.change(input, {
-          target: {
-            value:
-              type === 'email'
-                ? 'preview@example.test'
-                : type === 'password'
-                  ? 'not a real credential'
-                  : '012345',
-          },
-        });
-        fireEvent.blur(input);
-        expect(input.getAttribute('aria-invalid')).toBe('false');
-        fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
-      }
-      for (const toggle of screen.queryAllByRole('button', { name: /^Show / })) {
-        fireEvent.click(toggle);
-        expect(toggle.getAttribute('aria-pressed')).toBe('true');
-        fireEvent.click(toggle);
-      }
-      const submit = screen.getByRole<HTMLButtonElement>('button', { name: action });
-      fireEvent.click(submit);
-      expect(fireEvent.submit(form)).toBe(false);
-      expect(submit.disabled).toBe(true);
-      expect(form.textContent).toContain(notice);
-      expect(form.querySelector('[role="status"]')?.textContent).toBe('');
-      expect(screen.queryByRole('alert')).toBeNull();
-      expect(window.location.href).toBe(initialUrl);
-      for (const request of requests) expect(request).not.toHaveBeenCalled();
-      expect(container.querySelector('style, script, [style], [onclick]')).toBeNull();
-    }
-  );
-});
-
-describe('Persian public auth pages', () => {
-  it.each([
-    [LoginPage, loginMetadata, 'ورود به هاتف', 'ورود | هویت هاتف', 'ورود با گذرواژه'],
-    [
-      RegistrationPage,
-      registrationMetadata,
-      'حساب خود را ایجاد کنید',
-      'ایجاد حساب | هویت هاتف',
-      'شروع ثبت‌نام و ارسال ایمیل',
-    ],
-    [
-      PasskeyPage,
-      passkeyMetadata,
-      'ورود با کلید عبور',
-      'ورود با کلید عبور | هویت هاتف',
-      'استفاده از کلید عبور',
-    ],
-    [
-      TotpPage,
-      totpMetadata,
-      'کد رمزساز خود را تأیید کنید',
-      'تأیید کد رمزساز | هویت هاتف',
-      'تأیید کد',
-    ],
-    [
-      ForgotPasswordPage,
-      forgotMetadata,
-      'گذرواژهٔ خود را بازنشانی کنید',
-      'بازنشانی گذرواژه | هویت هاتف',
-      'ارسال پیوند بازنشانی',
-    ],
-    [
-      ResetPasswordPage,
-      resetMetadata,
-      'تعیین گذرواژهٔ جدید',
-      'تعیین گذرواژهٔ جدید | هویت هاتف',
-      'بازنشانی گذرواژه',
-    ],
-  ] as const)(
-    'server-resolves the Persian heading, metadata and accessible action for %s',
-    async (Page, metadata, heading, title, action) => {
-      mockPageLocale = 'fa-IR';
-      const content = await AuthLayout({ children: await Page() });
-      const { container } = render(content, { locale: 'fa-IR' });
-      expect((await metadata()).title).toBe(title);
-      expect(screen.getByRole('heading', { name: heading, level: 1 })).toBeTruthy();
-      expect(screen.getByRole('button', { name: action })).toBeTruthy();
-      expect(screen.getByRole('combobox', { name: 'زبان' })).toBeTruthy();
-      expect(screen.getByRole('link', { name: 'صفحهٔ اصلی هویت هاتف' }).getAttribute('href')).toBe(
-        '/'
-      );
-      for (const input of container.querySelectorAll<HTMLInputElement>('input')) {
-        expect(input.dir).toBe(input.name === 'email' && input.type === 'text' ? 'auto' : 'ltr');
-        expect(input.getAttribute('aria-invalid')).toBe('false');
-      }
-      if (Page !== PasskeyPage && Page !== RegistrationPage) {
-        expect(screen.getByRole<HTMLButtonElement>('button', { name: action }).disabled).toBe(true);
-        expect(
-          screen.getByText('این فرم هنوز متصل نیست. اطلاعات ورود واقعی را وارد نکنید.')
-        ).toBeTruthy();
-      }
-    }
-  );
+  it.each(unavailable)('$path does not request, access storage, write cookies or navigate on mount', async ({ Page }) => {
+    const requests = [
+      fetch, credentials.get, credentials.create, sendBeacon,
+      jest.spyOn(XMLHttpRequest.prototype, 'open').mockImplementation(() => undefined),
+      jest.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(() => undefined),
+      jest.spyOn(window, 'localStorage', 'get'),
+      jest.spyOn(window, 'sessionStorage', 'get'),
+      jest.spyOn(document, 'cookie', 'set').mockImplementation(() => undefined),
+    ];
+    const initialUrl = window.location.href;
+    const { container } = render(await AuthLayout({ children: await Page() }));
+    expect(container.querySelector('input, form, [formaction]')).toBeNull();
+    expect(screen.getByText(presentation.en.notice)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(window.location.href).toBe(initialUrl);
+    for (const request of requests) expect(request).not.toHaveBeenCalled();
+  });
 });

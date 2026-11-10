@@ -25,15 +25,12 @@ import type {
 import type { PortalClient } from '../../_lib/portal/client';
 import { isAborted, PortalError } from '../../_lib/portal/errors';
 import { clearSensitiveViews } from '../../_lib/portal/invalidation';
+import { AdminResults } from './admin-results';
 import {
-  queryCellClass,
   queryClearedMessage,
   queryFailureMessage,
-  queryHeadClass,
   queryPageSize,
   querySelectClass,
-  queryTableFrameClass,
-  revealQueryFocus,
   useQueryViewWork,
 } from './query-view-state';
 import { QueryUtcTime } from './query-view-time';
@@ -322,7 +319,7 @@ function AccountQuery({
       <Feedback error={error} status={status} />
       {page?.canonical_email && mode === 'lookup' && (
         <p className="break-all text-sm text-muted-foreground">
-          {t.rich('accounts.canonicalEmail', { email: page.canonical_email, value: (chunks) => <bdi dir="auto">{chunks}</bdi> })}
+          {t.rich('accounts.canonicalEmail', { email: page.canonical_email, value: (chunks) => <bdi dir="ltr">{chunks}</bdi> })}
         </p>
       )}
       {pending && (
@@ -339,71 +336,39 @@ function AccountQuery({
         </Button>
       )}
       {page && page.items.length > 0 && (
-        <div
-          role="region"
-          aria-label={t('accounts.resultsRegion')}
-          tabIndex={0}
-          className={queryTableFrameClass}
-          onFocus={revealQueryFocus}
-        >
-          <table className="w-full min-w-[26rem] border-collapse">
-            <caption className="sr-only">
-              {t(mode === 'lookup' ? 'accounts.lookupResult' : 'accounts.results')}
-            </caption>
-            <thead className="border-b bg-muted/40">
-              <tr>
-                <th scope="col" className={queryHeadClass}>
-                  {t('accounts.reference')}
-                </th>
-                <th scope="col" className={queryHeadClass}>
-                  {t('accounts.status')}
-                </th>
-                {canPII && (
-                  <th scope="col" className={queryHeadClass}>
-                    {t('accounts.emailColumn')}
-                  </th>
-                )}
-                <th scope="col" className={`${queryHeadClass} hidden sm:table-cell`}>
-                  {t('accounts.created')}
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {page.items.map((account) => (
-                <tr key={account.id} data-testid="admin-account-row">
-                  <th scope="row" className={`${queryCellClass} max-w-64 font-normal`}>
-                    <Link
-                      href={`/admin/users/${account.id}`}
-                      prefetch={false}
-                      onClick={clearSensitiveViews}
-                      aria-label={t('accounts.view', { id: account.id })}
-                      className={`${linkClass} max-w-40 break-all font-mono text-xs sm:max-w-none`}
-                    >
-                      <bdi dir="ltr">{account.id}</bdi>
-                    </Link>
-                  </th>
-                  <td className={queryCellClass}>
-                    <span className="inline-block rounded border px-2 py-1 text-xs font-medium">
-                      {t(`statuses.${account.status}`)}
-                    </span>
-                  </td>
-                  {canPII && (
-                    <td className={`${queryCellClass} max-w-64 break-all`}>
-                      {account.email === undefined ? (
-                        t('accounts.notProvided')
-                      ) : (
-                        <bdi dir="ltr">{account.email}</bdi>
-                      )}
-                    </td>
-                  )}
-                  <td className={`${queryCellClass} hidden sm:table-cell`}>
-                    <QueryUtcTime value={account.created_at} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <AdminResults
+          label={t('accounts.resultsRegion')}
+          caption={t(mode === 'lookup' ? 'accounts.lookupResult' : 'accounts.results')}
+          viewLabel={t('accounts.resultView')}
+          compactLabel={t('accounts.compactRows')}
+          tableLabel={t('accounts.tableView')}
+          width={26}
+          columns={[
+            { id: 'reference', label: t('accounts.reference'), rowHeader: true, wide: true },
+            { id: 'status', label: t('accounts.status') },
+            ...(canPII ? [{ id: 'email', label: t('accounts.emailColumn'), secondary: true }] : []),
+            { id: 'created', label: t('accounts.created'), secondary: true },
+            { id: 'actions', label: t('accounts.actions'), wide: true },
+          ]}
+          rows={page.items.map((account) => ({
+            id: account.id,
+            testId: 'admin-account-row',
+            cells: [
+              <bdi key="reference" dir="ltr" className="break-all font-mono text-xs">{account.id}</bdi>,
+              <span key="status" className="inline-block rounded border px-2 py-1 text-xs font-medium">
+                {t(`statuses.${account.status}`)}
+              </span>,
+              ...(canPII ? [account.email === undefined ? t('accounts.notProvided') :
+                <bdi key="email" dir="ltr" className="break-all">{account.email}</bdi>] : []),
+              <QueryUtcTime key="created" value={account.created_at} />,
+              <Link key="actions" href={`/admin/users/${account.id}`} prefetch={false}
+                onClick={clearSensitiveViews} aria-label={t('accounts.view', { id: account.id })}
+                className={linkClass}>
+                {t('accounts.viewAccount')}
+              </Link>,
+            ],
+          }))}
+        />
       )}
       {page?.items.length === 0 && (
         <p className="text-sm">{t(mode === 'lookup' ? 'accounts.noMatch' : 'accounts.empty')}</p>

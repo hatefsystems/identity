@@ -3,7 +3,7 @@ const { join } = require('path');
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   darkMode: ['class'],
-  // Keep the existing palette available before a theme switcher is introduced.
+  // The nonce-authorized System initializer applies this class before paint.
   safelist: ['dark'],
   content: [
     join(__dirname, '{app,pages,components,specs,i18n}/**/*.{ts,tsx,html}'),

@@ -33,17 +33,20 @@ export function AuthField({
   const id = useId();
   const [visible, setVisible] = useState(false);
   const isPassword = type === 'password';
+  const isTechnical = isPassword || type === 'email' || type === 'tel' ||
+    props.inputMode === 'numeric' || props.inputMode === 'email';
   const describedBy = [hint && `${id}-hint`, error && `${id}-error`].filter(Boolean).join(' ');
 
   return (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
-      <div className="relative" dir={isPassword ? 'ltr' : undefined}>
+      <div className="relative" dir={isTechnical ? 'ltr' : undefined}>
         <Input
           {...props}
           id={id}
-          dir={isPassword || type === 'email' || type === 'tel' || props.inputMode === 'numeric' ? 'ltr' : 'auto'}
-          type={isPassword && visible ? 'text' : type}
+          dir={isTechnical ? 'ltr' : 'auto'}
+          type={(isPassword && visible) || type === 'email' ? 'text' : type}
+          inputMode={type === 'email' ? 'email' : props.inputMode}
           aria-describedby={describedBy || undefined}
           aria-invalid={Boolean(error)}
           className={cn(

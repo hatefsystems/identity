@@ -8,7 +8,7 @@ import { formatDisplayDate } from '../../i18n/formats';
 
 import { Button } from '@hatef/ui';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { AuthLink } from '../(auth)/_components/auth-card';
+import { AuthCard, AuthLink } from '../(auth)/_components/auth-card';
 import { AuthField } from '../(auth)/_components/form-controls';
 import {
   validateRegistration,
@@ -26,11 +26,14 @@ import {
   type RegistrationOutcome,
 } from '../_lib/portal/registration-client';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
+import { normalizeNumericInput } from '../_lib/numeric-input';
 
 const cleared: MessageDescriptor =
   { key: 'registration.cleared' };
 const invalidLink: MessageDescriptor =
   { key: 'registration.invalidLink' };
+const emailConfirmed: MessageDescriptor = { key: 'registration.emailConfirmed' };
+const verifyingEmail: MessageDescriptor = { key: 'registration.verifyingEmail' };
 function registrationError(failure: unknown): MessageDescriptor {
   if (failure instanceof PortalError) {
     if (failure.uncertain || failure.code === 'result_required')
@@ -145,6 +148,7 @@ export function Registration() {
   const [values, setValues] = useState<RegistrationValues>({ email: '', phone: '' });
   const [errors, setErrors] = useState<FieldErrors<RegistrationValues>>({});
   const [codeError, setCodeError] = useState<Message>('');
+  const [smsCode, setSMSCode] = useState('');
   const [hasSMS, setHasSMS] = useState(false);
   const [pending, setPending] = useState<Message>('');
   const [error, setError] = useState<Message>('');
@@ -172,6 +176,7 @@ export function Registration() {
       setValues({ email: '', phone: '' });
       setErrors({});
       setCodeError('');
+      setSMSCode('');
       setHasSMS(false);
       setPending('');
       setMessage('');
@@ -203,6 +208,7 @@ export function Registration() {
     },
     () => {
       if (code.current) code.current.value = '';
+      setSMSCode('');
       if (active.current) clear();
     }
   );
@@ -237,6 +243,7 @@ export function Registration() {
     if (!alive.current || active.current?.signal !== signal) return;
     setHasSMS(false);
     if (code.current) code.current.value = '';
+    setSMSCode('');
     if (result.state === 'completed') {
       api.current?.dispose();
       api.current = null;
@@ -315,7 +322,7 @@ export function Registration() {
     const data = new FormData(event.currentTarget);
     const contacts = {
       email: String(data.get('email') ?? ''),
-      phone: String(data.get('phone') ?? ''),
+      phone: normalizeNumericInput(String(data.get('phone') ?? '')),
     };
     const invalid = validateRegistration(contacts);
     setValues(contacts);
@@ -348,7 +355,9 @@ export function Registration() {
   }
   function verifyPhone(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const value = code.current?.value ?? '';
+    const value = normalizeNumericInput(code.current?.value ?? '');
+    if (code.current) code.current.value = value;
+    setSMSCode(value);
     const invalid = validateTotp({ code: value }).code;
     setCodeError(invalid ?? '');
     if (invalid) {
@@ -357,6 +366,7 @@ export function Registration() {
     }
     void run({ key: 'registration.verifyingPhone' }, async (client, signal) => {
       if (code.current) code.current.value = '';
+      setSMSCode('');
       try {
         await client.verifyPhone(value, signal);
       } catch (failure) {
@@ -374,6 +384,18 @@ export function Registration() {
   const disabled = !hydrated || Boolean(pending);
   const actionClass = 'h-auto min-h-11 w-full whitespace-normal';
   return (
+    <AuthCard
+      title={t(`registration.headings.${phase}`)}
+      description={phase === 'contacts' ? t('auth.pages.register.description') : undefined}
+      footer={phase === 'completed' ? (
+        <AuthLink href="/login">{t('registration.signIn')}</AuthLink>
+      ) : (
+        <>
+          <span>{t('auth.pages.register.existing')}</span>
+          <AuthLink href="/login">{t('auth.home.signIn')}</AuthLink>
+        </>
+      )}
+    >
     <div ref={view} className="space-y-5">
       <Feedback message={message} error={error} pending={pending} />
       {phase === 'contacts' && (
@@ -393,6 +415,7 @@ export function Registration() {
             label={t('registration.emailLabel')}
             type="text"
             inputMode="email"
+            dir="ltr"
             autoComplete="email"
             autoCapitalize="none"
             spellCheck={false}
@@ -410,6 +433,7 @@ export function Registration() {
             name="phone"
             label={t('registration.phoneLabel')}
             type="tel"
+            dir="ltr"
             inputMode="tel"
             autoComplete="tel"
             required
@@ -418,26 +442,13 @@ export function Registration() {
             error={errors.phone}
             hint={t('registration.phoneHint')}
             onChange={(event) => {
-              setValues({ ...values, phone: event.target.value });
+              setValues({ ...values, phone: normalizeNumericInput(event.target.value) });
               setErrors({});
             }}
           />
           <Button type="submit" disabled={disabled} className={actionClass}>
             {t('registration.start')}</Button>
         </form>
-      )}
-      {attempt && (
-        <p className="break-words rounded-md bg-muted/50 p-3 text-sm leading-relaxed">
-          {t.rich('registration.canonicalMailbox', {
-            email: attempt.canonical_email,
-            mailbox: (chunks) => <bdi dir="auto">{chunks}</bdi>,
-          })}
-          <br />
-          {t.rich('registration.deadline', {
-            deadline: formatDisplayDate(attempt.expires_at, preferences),
-            time: (chunks) => <time dateTime={attempt.expires_at}>{chunks}</time>,
-          })}
-        </p>
       )}
       {phase === 'email' && (
         <div className="space-y-3">
@@ -472,25 +483,6 @@ export function Registration() {
       )}
       {phase === 'phone' && (
         <div className="space-y-4">
-          <Button
-            type="button"
-            disabled={disabled}
-            className={actionClass}
-            onClick={() =>
-              void run({ key: 'registration.requestingSMS' }, async (client, signal) => {
-                setHasSMS(false);
-                if (code.current) code.current.value = '';
-                await client.sendPhone(signal);
-                throwIfAborted(signal);
-                setHasSMS(true);
-                setMessage(
-                  { key: 'registration.smsAccepted' }
-                );
-              })
-            }
-          >
-            {hasSMS ? t('registration.resendSMS') : t('registration.sendSMS')}
-          </Button>
           {hasSMS && (
             <form
               method="post"
@@ -504,6 +496,7 @@ export function Registration() {
                 name="code"
                 label={t('registration.smsCode')}
                 type="text"
+                dir="ltr"
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 pattern="[0-9]{6}"
@@ -512,6 +505,11 @@ export function Registration() {
                 disabled={disabled}
                 error={codeError || undefined}
                 hint={t('registration.codeHint')}
+                value={smsCode}
+                onChange={(event) => {
+                  setSMSCode(normalizeNumericInput(event.target.value));
+                  setCodeError('');
+                }}
               />
               <Button type="submit" disabled={disabled} className={actionClass}>
                 {t('registration.verifyPhone')}</Button>
@@ -519,16 +517,23 @@ export function Registration() {
           )}
           <Button
             type="button"
-            variant="outline"
+            variant={hasSMS ? 'outline' : 'default'}
             disabled={disabled}
             className={actionClass}
             onClick={() =>
-              void run({ key: 'registration.checkingProofs' }, async (client, signal) =>
-                applyOutcome(await client.result(signal), signal)
-              )
+              void run({ key: 'registration.requestingSMS' }, async (client, signal) => {
+                setHasSMS(false);
+                if (code.current) code.current.value = '';
+                setSMSCode('');
+                await client.sendPhone(signal);
+                throwIfAborted(signal);
+                setHasSMS(true);
+                setMessage({ key: 'registration.smsAccepted' });
+              })
             }
           >
-            {t('registration.checkProofs')}</Button>
+            {hasSMS ? t('registration.resendSMS') : t('registration.sendSMS')}
+          </Button>
         </div>
       )}
       {phase === 'passkey' && (
@@ -571,7 +576,6 @@ export function Registration() {
         >
           {t('registration.checkResult')}</Button>
       )}
-      {phase === 'completed' && <AuthLink href="/login">{t('registration.signIn')}</AuthLink>}
       {phase === 'closed' && (
         <Button
           type="button"
@@ -596,20 +600,48 @@ export function Registration() {
           {t('registration.cancel')}</Button>
       )}
       {phase === 'uncertain' && <AuthLink href="/login">{t('registration.normalSignIn')}</AuthLink>}
+      {attempt && (
+        <div className="space-y-3">
+          <p className="break-words rounded-md bg-muted/50 p-3 text-sm leading-relaxed">
+            {t.rich('registration.canonicalMailbox', {
+              email: attempt.canonical_email,
+              mailbox: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+            })}
+            <br />
+            {t.rich('registration.deadline', {
+              deadline: formatDisplayDate(attempt.expires_at, preferences),
+              time: (chunks) => <time dateTime={attempt.expires_at}>{chunks}</time>,
+            })}
+          </p>
+          {phase === 'phone' && (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={disabled}
+              className={actionClass}
+              onClick={() =>
+                void run({ key: 'registration.checkingProofs' }, async (client, signal) =>
+                  applyOutcome(await client.result(signal), signal)
+                )
+              }
+            >
+              {t('registration.checkProofs')}
+            </Button>
+          )}
+        </div>
+      )}
       <noscript>
         <p className="text-sm">
           {t('registration.noScript')}</p>
       </noscript>
     </div>
+    </AuthCard>
   );
 }
 
 export function RegistrationEmailVerification() {
   const t = useTranslations();
-  const [ready, setReady] = useState(false);
-  const [pending, setPending] = useState<Message>('');
-  const [message, setMessage] = useState<Message>('');
-  const [error, setError] = useState<Message>('');
+  const [phase, setPhase] = useState<'loading' | 'ready' | 'verifying' | 'confirmed' | 'closed'>('loading');
   const captured = useRef(false);
   const proof = useRef<EmailProof | undefined>(undefined);
   const deadline = useRef<{ wall: number; monotonic: number } | undefined>(undefined);
@@ -629,9 +661,7 @@ export function RegistrationEmailVerification() {
       /* Verification stays disabled. */
     }
     if (alive.current) {
-      setReady(false);
-      setPending('');
-      setError(invalidLink);
+      setPhase((current) => current === 'confirmed' ? current : 'closed');
     }
   }, []);
   useRegistrationLifetime(
@@ -667,8 +697,7 @@ export function RegistrationEmailVerification() {
         catch { clear(); }
       });
     }
-    setReady(Boolean(proof.current));
-    if (!proof.current) setError(invalidLink);
+    setPhase(proof.current ? 'ready' : 'closed');
     const timer = setTimeout(
       clear,
       Math.max(
@@ -694,7 +723,7 @@ export function RegistrationEmailVerification() {
   async function verify() {
     const limit = deadline.current;
     if (
-      !ready ||
+      phase !== 'ready' ||
       !proof.current ||
       active.current ||
       !limit ||
@@ -711,41 +740,49 @@ export function RegistrationEmailVerification() {
     api.current = current;
     const capturedProof = proof.current;
     proof.current = undefined;
-    setReady(false);
-    setError('');
-    setPending({ key: 'registration.verifyingEmail' });
+    setPhase('verifying');
     try {
       // No key initialization here. Another browser cannot redeem this link.
       await current.verifyEmail(capturedProof, controller.signal);
       throwIfAborted(controller.signal);
-      setMessage(
-        { key: 'registration.emailConfirmed' }
-      );
+      setPhase('confirmed');
     } catch (failure) {
       if (alive.current && active.current === controller && !isAborted(failure))
-        setError(invalidLink);
+        setPhase('closed');
     } finally {
       current.dispose();
       if (active.current === controller) {
         active.current = null;
         api.current = null;
-        if (alive.current) setPending('');
       }
     }
   }
   return (
+    <AuthCard
+      title={t(`registration.verifyHeadings.${phase}`)}
+      description={['loading', 'ready'].includes(phase) ? t('registration.verifyDescription') : undefined}
+      footer={phase === 'confirmed' ? (
+        <p>{t('registration.returnOriginalTab')}</p>
+      ) : (
+        <AuthLink href="/register">{t('registration.restartLink')}</AuthLink>
+      )}
+    >
     <div className="space-y-5">
-      <p className="text-sm leading-relaxed">
-        {t('registration.originalBrowser')}</p>
-      <Feedback message={message} error={error} pending={pending} />
-      <Button
+      {phase !== 'confirmed' && <p className="text-sm leading-relaxed">
+        {t('registration.originalBrowser')}</p>}
+      <Feedback
+        message={phase === 'confirmed' ? emailConfirmed : ''}
+        error={phase === 'closed' ? invalidLink : ''}
+        pending={phase === 'verifying' ? verifyingEmail : ''}
+      />
+      {phase !== 'confirmed' && <Button
         type="button"
-        disabled={!ready || Boolean(pending)}
+        disabled={phase !== 'ready'}
         className="h-auto min-h-11 w-full whitespace-normal"
         onClick={() => void verify()}
       >
-        {t('registration.verifyEmail')}</Button>
-      {pending && (
+        {t('registration.verifyEmail')}</Button>}
+      {phase === 'verifying' && (
         <Button type="button" variant="outline" className="min-h-11 w-full" onClick={clear}>
           {t('registration.cancelEmail')}</Button>
       )}
@@ -754,5 +791,6 @@ export function RegistrationEmailVerification() {
           {t('registration.emailNoScript')}</p>
       </noscript>
     </div>
+    </AuthCard>
   );
 }

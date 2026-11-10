@@ -172,7 +172,7 @@ async function prepareTotp(kind: 'rename' | 'recovery' = 'rename') {
       target: { value: 'Intended label' },
     });
     fireEvent.submit(screen.getByRole('form', { name: 'Rename passkey' }));
-  } else fireEvent.click(screen.getByRole('button', { name: 'Generate new recovery codes' }));
+  } else fireEvent.click(await screen.findByRole('button', { name: 'Replace recovery codes' }));
   fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Use authenticator code' }));
   const code = screen.getByLabelText<HTMLInputElement>('Authenticator code');

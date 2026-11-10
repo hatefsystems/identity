@@ -24,18 +24,17 @@ export function PrivacyView() {
   return (
     <>
       <PageHeading title={t('privacy.title')}>{t('privacy.description')}</PageHeading>
-      <Panel title={t('privacy.before')} id={`${id}-consequences`}>
+      <Panel title={t('privacy.deleteTitle')} id={`${id}-delete`}>
+        <h3 id={`${id}-consequences`} className="font-semibold">
+          {t('privacy.before')}
+        </h3>
         <ul className="list-disc space-y-3 ps-5 text-sm leading-relaxed">
           <li>{t('privacy.deactivate')}</li>
           <li>{t('privacy.window')}</li>
           <li>{t('privacy.mail')}</li>
           <li>{t('privacy.reserved')}</li>
         </ul>
-      </Panel>
-      <Panel title={t('privacy.remains')} id={`${id}-retention`}>
-        <p className="text-sm leading-relaxed text-muted-foreground">{t('privacy.retention')}</p>
-      </Panel>
-      <Panel title={t('privacy.deleteTitle')} id={`${id}-delete`}>
+        <p className="text-sm leading-relaxed">{t('privacy.erasureWarning')}</p>
         <p className="text-sm leading-relaxed text-muted-foreground">{t('privacy.verification')}</p>
         {!profile.deletion_enabled && (
           <p role="status" className="rounded-md border bg-muted/40 p-4 text-sm leading-relaxed">
@@ -76,6 +75,16 @@ export function PrivacyView() {
         >
           {t('privacy.delete')}
         </Button>
+      </Panel>
+      <Panel title={t('privacy.remains')} id={`${id}-retention`}>
+        <details className="rounded-md border px-3">
+          <summary className="min-h-11 cursor-pointer py-3 text-sm">
+            {t('privacy.policy')}
+          </summary>
+          <p className="pb-3 text-sm leading-relaxed text-muted-foreground">
+            {t('privacy.retention')}
+          </p>
+        </details>
       </Panel>
       {confirm && (
         <StepUpDialog

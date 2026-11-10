@@ -2,11 +2,14 @@ import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle } fro
 import Link from 'next/link';
 import { getTranslations } from 'next-intl/server';
 import { PreferenceControls } from '../i18n/preferences';
+import { BrandLink } from './_components/brand-link';
 
 export default async function Index() {
   const t = await getTranslations('auth.home');
+  const brand = await getTranslations('auth');
   return (
     <main className="container flex min-h-screen flex-col items-center justify-center gap-8 py-16">
+      <header><BrandLink homeLabel={brand('homeLabel')}>{brand('brand')}</BrandLink></header>
       <div className="flex flex-col items-center gap-2 text-center">
         <h1 className="text-4xl font-bold tracking-tight">{t('title')}</h1>
         <p className="max-w-xl text-muted-foreground">{t('description')}</p>

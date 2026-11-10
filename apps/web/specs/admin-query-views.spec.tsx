@@ -1,5 +1,5 @@
 import { TextEncoder } from 'node:util';
-import { act, fireEvent, render, screen, within } from '../i18n/testing';
+import { act, fireEvent, render, screen, waitFor, within } from '../i18n/testing';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { I18nTestProvider } from '../i18n/testing';
 import { UsersView } from '../app/admin/_components/users-view';
@@ -199,9 +199,32 @@ function submitAccounts() {
   fireEvent.submit(screen.getByRole('form', { name: 'Filter accounts' }));
 }
 const encoderDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'TextEncoder');
+const matchMediaDescriptor = Object.getOwnPropertyDescriptor(window, 'matchMedia');
 let visibility: PropertyDescriptor | undefined;
 
+function resultViewport(initial = false) {
+  let wide = initial;
+  const events = new EventTarget();
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: jest.fn((query: string) => ({
+      media: query,
+      get matches() { return query === '(min-width: 1024px)' && wide; },
+      addEventListener: query === '(min-width: 1024px)' ? events.addEventListener.bind(events) : jest.fn(),
+      removeEventListener: query === '(min-width: 1024px)' ? events.removeEventListener.bind(events) : jest.fn(),
+    })),
+  });
+  return (desktop: boolean) => {
+    wide = desktop;
+    act(() => events.dispatchEvent(new Event('change')));
+  };
+}
+
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(0, 0, 100, 44)],
+  });
   Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
     configurable: true,
     value: jest.fn(),
@@ -237,6 +260,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   jest.restoreAllMocks();
+  if (matchMediaDescriptor) Object.defineProperty(window, 'matchMedia', matchMediaDescriptor);
+  else Reflect.deleteProperty(window, 'matchMedia');
   if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
   else Reflect.deleteProperty(document, 'visibilityState');
 });
@@ -346,7 +371,7 @@ describe('bounded accounts and exact lookup', () => {
     expect(button('Next page').disabled).toBe(true);
     expect(screen.getByText('3-3 of 3 matching accounts')).toBeTruthy();
     expect(
-      screen.getByRole('region', { name: 'Account results, horizontally scrollable' }).className
+      screen.getByRole('region', { name: 'Account results' }).className
     ).toContain('overflow-x-auto');
     expect(api.lookup).not.toHaveBeenCalled();
   });
@@ -412,21 +437,31 @@ describe('bounded accounts and exact lookup', () => {
     expect(api.lookup).not.toHaveBeenCalled();
   });
 
-  it('displays the backend canonical Unicode email in bidi isolation and clears it with the result', async () => {
-    const canonical = '\u00fcser@xn--bcher-kva.test';
-    const raw = ' U\u0308SER@B\u00dcCHER.test ';
+  it.each([
+    ['en', '\u00fcser@xn--bcher-kva.test', ' U\u0308SER@B\u00dcCHER.test '],
+    ['en', 'کاربر+proof@xn--mgbh0fb.xn--kgbechtv', ' کاربر+proof@XN--MGBH0FB.XN--KGBECHTV '],
+    ['fa-IR', 'کاربر+proof@xn--mgbh0fb.xn--kgbechtv', ' کاربر+proof@XN--MGBH0FB.XN--KGBECHTV '],
+  ] as const)('displays the exact backend canonical mailbox LTR in %s and clears it with the result', async (locale, canonical, raw) => {
     api.lookup.mockResolvedValueOnce({
       ...accounts([account(3, { email: canonical })], 1, 0, 1),
       canonical_email: canonical,
     });
-    render(<UsersView />);
-    fireEvent.change(screen.getByLabelText('Exact email'), { target: { value: raw } });
+    render(<UsersView />, { locale });
+    const input = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Exact email' : 'ایمیل دقیق');
+    expect(input.dir).toBe('ltr');
+    fireEvent.change(input, { target: { value: raw } });
     expect(api.lookup).not.toHaveBeenCalled();
-    fireEvent.submit(screen.getByRole('form', { name: 'Exact email lookup' }));
+    fireEvent.submit(screen.getByRole('form', { name: locale === 'en' ? 'Exact email lookup' : 'جست‌وجوی ایمیل دقیق' }));
     await screen.findByRole('table');
     expect(api.lookup).toHaveBeenCalledWith(raw, expect.any(AbortSignal));
-    for (const address of screen.getAllByText(canonical)) expect(address.tagName).toBe('BDI');
-    fireEvent.click(button('Clear lookup'));
+    expect(api.lookup).toHaveBeenCalledTimes(1);
+    expect(api.users).not.toHaveBeenCalled();
+    for (const address of screen.getAllByText(canonical)) {
+      expect(address.tagName).toBe('BDI');
+      expect(address.getAttribute('dir')).toBe('ltr');
+      expect(address.textContent).toBe(canonical);
+    }
+    fireEvent.click(button(locale === 'en' ? 'Clear lookup' : 'پاک کردن جست‌وجو'));
     expect(screen.queryByText(canonical)).toBeNull();
   });
 
@@ -485,7 +520,146 @@ describe('bounded accounts and exact lookup', () => {
   });
 });
 
+describe.each(['en', 'fa-IR'] as const)('stable compact admin results in %s', (locale) => {
+  const names = locale === 'en'
+    ? { rows: 'Compact rows', table: 'Table view', accounts: 'Account results', view: 'Account result view', apply: 'Apply filters' }
+    : { rows: 'ردیف‌های فشرده', table: 'نمای جدول', accounts: 'نتایج حساب‌ها', view: 'نمای نتایج حساب‌ها', apply: 'اعمال فیلترها' };
+
+  it.each([false, true])('uses the same full references/actions and only granted email with PII=%p', async (pii) => {
+    const viewport = resultViewport();
+    context({ ...allFlags, users_pii: pii, users_lookup: pii });
+    render(<UsersView />, { locale });
+    expect(api.users).not.toHaveBeenCalled();
+    fireEvent.click(button(names.apply));
+    const rows = await screen.findAllByTestId('admin-account-row');
+    const table = screen.getByRole('table');
+    const frame = screen.getByRole('region', { name: names.accounts });
+    const controls = screen.getByRole('group', { name: names.view });
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('compact');
+    expect(within(controls).getByRole('button', { name: names.rows }).getAttribute('aria-pressed')).toBe('true');
+    const target = within(rows[1]).getByText(account(2).id);
+    expect(target.tagName).toBe('BDI');
+    expect(target.getAttribute('dir')).toBe('ltr');
+    const link = within(rows[1]).getByRole('link', {
+      name: locale === 'en' ? `View account ${account(2).id}` : `مشاهدهٔ حساب ${account(2).id}`,
+    });
+    expect(link.textContent).toBe(locale === 'en' ? 'View account' : 'مشاهدهٔ حساب');
+    expect(link.getAttribute('href')).toBe(`/admin/users/${account(2).id}`);
+    expect(screen.getAllByRole('link', { name: locale === 'en' ? /^View account / : /^مشاهدهٔ حساب / })).toHaveLength(2);
+    expect(Boolean(screen.queryByText('account2@example.test'))).toBe(pii);
+    const tableChoice = within(controls).getByRole('button', { name: names.table });
+    tableChoice.focus();
+    fireEvent.click(tableChoice);
+    expect(document.activeElement).toBe(tableChoice);
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('table');
+    expect(screen.getByRole('table')).toBe(table);
+    expect(screen.getAllByTestId('admin-account-row')[1]).toBe(rows[1]);
+    expect(within(rows[1]).getByText(account(2).id)).toBe(target);
+    viewport(true);
+    expect(document.activeElement).toBe(frame);
+    expect(screen.queryByRole('group', { name: names.view })).toBeNull();
+    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
+    link.focus();
+    viewport(false);
+    expect(document.activeElement).toBe(link);
+    fireEvent.click(button(names.rows));
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('compact');
+    expect(within(rows[1]).getByRole('link', { name: locale === 'en' ? `View account ${account(2).id}` : `مشاهدهٔ حساب ${account(2).id}` })).toBe(link);
+    expect(api.users).toHaveBeenCalledTimes(1);
+    expect(api.lookup).not.toHaveBeenCalled();
+    expect(api.user).not.toHaveBeenCalled();
+    expect(reportPermissionLoss).not.toHaveBeenCalled();
+  });
+
+  it('keeps exact sequence/time evidence, one Details action and its opener through switches and reflow', async () => {
+    const viewport = resultViewport(true);
+    const rowData = log(maximum, { timestamp: '2026-11-08T21:00:00.123456789Z' });
+    api.auditLogs.mockResolvedValueOnce(auditPage(maximum, false, rowData));
+    render(<AuditView />, { locale });
+    fireEvent.click(button(locale === 'en' ? 'Search audit logs' : 'جست‌وجوی سوابق ممیزی'));
+    const row = await screen.findByTestId('admin-audit-row');
+    const table = screen.getByRole('table');
+    const frame = screen.getByRole('region', { name: locale === 'en' ? 'Audit results' : 'نتایج ممیزی' });
+    await waitFor(() => expect(frame.parentElement?.getAttribute('data-result-view')).toBe('table'));
+    expect(screen.queryByRole('button', { name: names.table })).toBeNull();
+    expect(within(row).getByText(maximum).getAttribute('dir')).toBe('ltr');
+    expect(within(row).getByText('2026-11-08 21:00:00.123456789 UTC').getAttribute('datetime')).toBe(rowData.timestamp);
+    expect(screen.queryByText(rowData.payload)).toBeNull();
+    expect(screen.queryByText(rowData.actor_id)).toBeNull();
+    const detailsName = locale === 'en' ? `View details for sequence ${maximum}` : `مشاهدهٔ جزئیات توالی ${maximum}`;
+    const open = within(row).getByRole('button', { name: detailsName });
+    open.focus();
+    viewport(false);
+    expect(document.activeElement).toBe(open);
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('compact');
+    fireEvent.click(button(names.table));
+    expect(screen.getByRole('table')).toBe(table);
+    expect(screen.getByTestId('admin-audit-row')).toBe(row);
+    expect(screen.getAllByRole('button', { name: detailsName })).toHaveLength(1);
+    open.focus();
+    fireEvent.click(open);
+    const dialog = screen.getByRole('dialog');
+    const payload = dialog.querySelector('pre');
+    viewport(true);
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    expect(dialog.querySelector('pre')).toBe(payload);
+    fireEvent.click(within(dialog).getByRole('button', { name: locale === 'en' ? 'Close details' : 'بستن جزئیات' }));
+    expect(document.activeElement).toBe(open);
+    expect(api.auditLogs).toHaveBeenCalledTimes(1);
+    expect(api.user).not.toHaveBeenCalled();
+  });
+});
+
 describe('UTC audit query and bounded keyset navigation', () => {
+  it.each(['en', 'fa-IR'] as const)('previews exact valid Gregorian UTC drafts in %s without preference-driven conversion or queries', async (locale) => {
+    const content = (language: 'en' | 'fa-IR', calendar: 'gregory' | 'persian', timeZone: string) => (
+      <I18nTestProvider locale={language} preferences={{ calendar, timeZone }}><AuditView /></I18nTestProvider>
+    );
+    const view = render(content(locale, 'persian', 'Asia/Tehran'));
+    const start = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Start time (Gregorian UTC)' : 'زمان آغاز (میلادی، UTC)');
+    const end = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'End time (Gregorian UTC)' : 'زمان پایان (میلادی، UTC)');
+    expect(start.type).toBe('datetime-local');
+    expect(start.dir).toBe('ltr');
+    expect(start.step).toBe('0.001');
+    fireEvent.change(start, { target: { value: '2026-11-08T21:00:00.120' } });
+    fireEvent.change(end, { target: { value: '2026-11-08T21:00:00.120' } });
+    const event = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Event type (exact)' : 'نوع دقیق رویداد');
+    fireEvent.change(event, { target: { value: ' user.login ' } });
+    const preview = screen.getByTestId('audit-draft-preview');
+    expect([...preview.querySelectorAll('time')].map((time) => time.dateTime)).toEqual([
+      '2026-11-08T21:00:00.120Z', '2026-11-08T21:00:00.120Z',
+    ]);
+    expect(preview.textContent).toContain('2026-11-08 21:00:00.120 UTC');
+    expect(preview.textContent).toContain('user.login');
+    expect(api.auditLogs).not.toHaveBeenCalled();
+    const otherLocale = locale === 'en' ? 'fa-IR' : 'en';
+    view.rerender(content(otherLocale, 'gregory', 'UTC'));
+    expect(screen.getByLabelText(otherLocale === 'en' ? 'Start time (Gregorian UTC)' : 'زمان آغاز (میلادی، UTC)')).toBe(start);
+    expect(screen.getByTestId('audit-draft-preview')).toBe(preview);
+    expect(event.value).toBe(' user.login ');
+    fireEvent.click(button(otherLocale === 'en' ? 'Search audit logs' : 'جست‌وجوی سوابق ممیزی'));
+    await screen.findByTestId('audit-submitted-filters');
+    expect(api.auditLogs).toHaveBeenCalledWith({
+      start_time: '2026-11-08T21:00:00.120Z', end_time: '2026-11-08T21:00:00.120Z',
+      event_type: 'user.login', limit: 2,
+    }, expect.any(AbortSignal));
+    expect(screen.getByTestId('audit-submitted-filters').textContent).toContain('2026-11-08T21:00:00.120Z');
+    view.rerender(content(locale, 'persian', 'Asia/Tehran'));
+    expect(api.auditLogs).toHaveBeenCalledTimes(1);
+    expect(preview.textContent).toContain('2026-11-08 21:00:00.120 UTC');
+    fireEvent.change(event, { target: { value: 'User.login' } });
+    expect(screen.queryByTestId('audit-draft-preview')).toBeNull();
+    expect(screen.queryByTestId('audit-submitted-filters')).toBeNull();
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(api.auditLogs).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['2026-11-08T21:00:00.1234', '2026-11-08T21:00:00Z', '2026-11-08T21:00:00+03:30', '۲۰۲۶-۱۱-۰۸T۲۱:۰۰', '2026-11-08T21:00 '])(
+    'keeps the strict UTC parser rejecting %p without normalization', (start) => {
+      expect(auditQueryFromDraft({ ...auditQueryDefaults(limits, now), start }, limits).error?.field).toBe('start');
+    }
+  );
+
   it.each([31 * 86400, 3600, 0.5, 0.0000001])(
     'bounds its last-24-hours default by %p configured seconds',
     (maximumWindow) => {
@@ -514,13 +688,13 @@ describe('UTC audit query and bounded keyset navigation', () => {
     ] as const)
       expect(auditQueryFromDraft({ ...draft, ...patch }, limits).error?.field).toBe(field);
     render(<AuditView />);
-    fireEvent.change(screen.getByLabelText('End time (UTC)'), {
+    fireEvent.change(screen.getByLabelText('End time (Gregorian UTC)'), {
       target: { value: '2026-10-26T00:00' },
     });
     expect(api.auditLogs).not.toHaveBeenCalled();
     submitAudit();
     expect(screen.getByRole('alert').textContent).toContain('at or after');
-    expect(document.activeElement).toBe(screen.getByLabelText('End time (UTC)'));
+    expect(document.activeElement).toBe(screen.getByLabelText('End time (Gregorian UTC)'));
     expect(api.auditLogs).not.toHaveBeenCalled();
   });
 
@@ -615,7 +789,7 @@ describe('UTC audit query and bounded keyset navigation', () => {
     expect(screen.queryByText(row.payload)).toBeNull();
     expect(screen.queryByText(row.client_ip)).toBeNull();
     expect(screen.queryByText(row.actor_id)).toBeNull();
-    const frame = screen.getByRole('region', { name: 'Audit results, horizontally scrollable' });
+    const frame = screen.getByRole('region', { name: 'Audit results' });
     jest.mocked(frame.scrollIntoView).mockClear();
     frame.focus();
     expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
@@ -628,7 +802,7 @@ describe('UTC audit query and bounded keyset navigation', () => {
     expect(within(dialog).getByText(row.sha256_chain_hash)).toBeTruthy();
     expect(within(dialog).getByText(/Stored hashes are record fields, not proof/)).toBeTruthy();
     expect(
-      screen.getByRole('region', { name: 'Audit results, horizontally scrollable' }).className
+      screen.getByRole('region', { name: 'Audit results' }).className
     ).toContain('overflow-x-auto');
     expect(button('Close details').className).toContain('min-h-11');
     fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
@@ -658,11 +832,51 @@ describe('UTC audit query and bounded keyset navigation', () => {
 });
 
 describe('honest independent canonical-v2 verification', () => {
+  it.each([
+    ['en', 'Start new run', 'Continue verification', 'Stop verification', 'Original technical evidence', '1 verified page', '3 chain nodes checked'],
+    ['fa-IR', 'آغاز بررسی تازه', 'ادامهٔ بررسی', 'توقف بررسی', 'شواهد فنی اصلی', '۱ صفحهٔ تأییدشده', '۳ گرهٔ زنجیره بررسی‌شده'],
+  ] as const)('leads with interpretation and meaningful actions in %s while failure visits never become verified pages', async (locale, start, continuation, stop, detailsLabel, verifiedCaption, checkedCaption) => {
+    api.verify.mockResolvedValueOnce(proof()).mockResolvedValueOnce(completeProof({
+      verified: false, complete: false, failure_reason: 'chain_mismatch',
+      broken_at_seq: maximum, expected_hash: hash, stored_hash: lastHash, next_after_seq: null,
+    }));
+    render(<IntegrityView />, { locale });
+    expect(screen.queryByRole('button', { name: continuation })).toBeNull();
+    expect(screen.queryByRole('button', { name: stop })).toBeNull();
+    expect(screen.queryByTestId('verification-summary')).toBeNull();
+    fireEvent.click(button(start));
+    await screen.findByTestId('verification-page');
+    expect(button(continuation).disabled).toBe(false);
+    expect(button(continuation).className).toContain('bg-primary');
+    expect(button(start).className).toContain('bg-background');
+    const bound = screen.getByTestId('verification-bound');
+    expect(bound.textContent).toBe(maximum);
+    expect(bound.closest('details')).toBeNull();
+    expect(screen.getByTestId('verification-summary').textContent).toContain(verifiedCaption);
+    const details = screen.getByText(detailsLabel).closest('details');
+    expect(details?.open).toBe(false);
+    expect(screen.getByText(auditScope).closest('details')).toBe(details);
+    expect(screen.getByTestId('verification-summary').compareDocumentPosition(details as Node) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    fireEvent.click(button(continuation));
+    await screen.findByText('chain_mismatch');
+    expect(screen.queryByRole('button', { name: continuation })).toBeNull();
+    expect(screen.queryByRole('button', { name: stop })).toBeNull();
+    expect(screen.getByText('chain_mismatch').closest('details')).toBeNull();
+    const summary = screen.getByTestId('verification-summary');
+    expect(summary.textContent).toContain(verifiedCaption);
+    expect(summary.textContent).toContain(checkedCaption);
+    expect(screen.getByRole('alert').closest('details')).toBeNull();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    expect(api.verify).toHaveBeenCalledTimes(2);
+    expect(api.auditLogs).not.toHaveBeenCalled();
+  });
+
   it('walks an explicit fixed-bound run across sequence gaps and ignores a completed response cursor', async () => {
     api.verify.mockResolvedValueOnce(proof()).mockResolvedValueOnce(completeProof());
     render(<IntegrityView />);
     expect(api.verify).not.toHaveBeenCalled();
-    expect(button('Continue verification').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Stop verification' })).toBeNull();
     fireEvent.click(button('Start new run'));
     await screen.findByText('Clean partial segment. Verification is not complete.');
     expect(api.verify).toHaveBeenNthCalledWith(
@@ -682,8 +896,8 @@ describe('honest independent canonical-v2 verification', () => {
       { after_seq: high, through_seq: maximum, predecessor_hash: hash, limit: 2 },
       expect.any(AbortSignal)
     );
-    expect(button('Continue verification').disabled).toBe(true);
-    expect(button('Stop verification').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Stop verification' })).toBeNull();
     expect(screen.getByText(auditScope)).toBeTruthy();
     expect(screen.queryByRole('progressbar')).toBeNull();
     expect(api.auditLogs).not.toHaveBeenCalled();
@@ -766,7 +980,7 @@ describe('honest independent canonical-v2 verification', () => {
       expect(screen.getByText(/No payload or record content was verified/)).toBeTruthy();
       expect(screen.queryByText(/Verification complete for/)).toBeNull();
       expect(screen.queryByText(/Retained audit payloads were recomputed/)).toBeNull();
-      expect(button('Continue verification').disabled).toBe(true);
+      expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
     }
   );
 
@@ -805,8 +1019,8 @@ describe('honest independent canonical-v2 verification', () => {
       expect(screen.queryByTestId('verification-page')).toBeNull();
       expect(screen.queryByText('No records checked.')).toBeNull();
       expect(screen.queryByText(/Verification complete for/)).toBeNull();
-      expect(button('Continue verification').disabled).toBe(true);
-      expect(button('Stop verification').disabled).toBe(true);
+      expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Stop verification' })).toBeNull();
       expect(api.verify).toHaveBeenCalledTimes(1);
       expect(api.verify).toHaveBeenCalledWith(
         chain,
@@ -833,7 +1047,7 @@ describe('honest independent canonical-v2 verification', () => {
     await screen.findByText('No verification evidence.');
     expect(screen.getByText(/not proof of no activity/)).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(button('Continue verification').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
   });
 
   it.each([
@@ -870,7 +1084,7 @@ describe('honest independent canonical-v2 verification', () => {
       await screen.findByText(reason);
       expect(screen.getByRole('alert').textContent).toContain('No continuation');
       expect(screen.getByText(/visited nodes, not successfully verified payloads/)).toBeTruthy();
-      expect(button('Continue verification').disabled).toBe(true);
+      expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
       expect(screen.queryByText(/Verification complete for/)).toBeNull();
       if (mismatch) expect(screen.getByText('Expected hash')).toBeTruthy();
     }
@@ -898,7 +1112,7 @@ describe('honest independent canonical-v2 verification', () => {
     fireEvent.click(button('Continue verification'));
     await screen.findByText('predecessor_mismatch');
     expect(screen.getByRole('alert').textContent).toContain('stored predecessor changed');
-    expect(button('Continue verification').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
   });
 
   it.each([
@@ -919,7 +1133,7 @@ describe('honest independent canonical-v2 verification', () => {
       expect((await screen.findByRole('alert')).textContent).toContain('inconsistent');
       expect(screen.getByText(/Run incomplete/)).toBeTruthy();
       expect(screen.getByTestId('verification-bound').textContent).toBe(maximum);
-      expect(button('Continue verification').disabled).toBe(true);
+      expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
       expect(
         screen.queryByText('Verification complete for the captured database-relative range.')
       ).toBeNull();
@@ -942,7 +1156,7 @@ describe('honest independent canonical-v2 verification', () => {
       fireEvent.click(button('Continue verification'));
       expect((await screen.findByRole('alert')).textContent).toContain(message);
       expect(screen.queryByText('Failure code')).toBeNull();
-      expect(button('Continue verification').disabled).toBe(true);
+      expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
       expect(api.verify).toHaveBeenCalledTimes(2);
     }
   );
@@ -957,7 +1171,7 @@ describe('honest independent canonical-v2 verification', () => {
     const signal = api.verify.mock.calls[0][2] as AbortSignal;
     fireEvent.click(button('Stop verification'));
     expect(signal.aborted).toBe(true);
-    expect(button('Continue verification').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Continue verification' })).toBeNull();
     fireEvent.click(button('Start new run'));
     await screen.findByText('Clean partial segment. Verification is not complete.');
     await act(async () => late.resolve(proof({ through_seq: high, complete: true })));
@@ -1066,13 +1280,13 @@ it('translates audit validation and pending results in place without replaying a
     </I18nTestProvider>
   );
   const view = render(content('en'));
-  const start = screen.getByLabelText<HTMLInputElement>('Start time (UTC)');
+  const start = screen.getByLabelText<HTMLInputElement>('Start time (Gregorian UTC)');
   fireEvent.change(start, { target: { value: '' } });
   submitAudit();
   expect(screen.getByRole('alert').textContent).toBe('Enter a valid start time in UTC.');
   view.rerender(content('fa-IR'));
   expect(screen.getByRole('alert').textContent).toBe('زمان آغاز معتبری بر اساس UTC وارد کنید.');
-  expect(screen.getByLabelText('زمان آغاز (UTC)')).toBe(start);
+  expect(screen.getByLabelText('زمان آغاز (میلادی، UTC)')).toBe(start);
   expect(api.auditLogs).not.toHaveBeenCalled();
   fireEvent.change(start, { target: { value: '2026-10-28T09:00:00' } });
   const pending = deferred<AdminAuditPage>();

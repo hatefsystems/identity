@@ -24,6 +24,7 @@ import {
 } from '../../_lib/admin/legal-validation';
 import type { LegalOperation } from '../../_lib/portal/action-intent';
 import { isAborted, PortalError } from '../../_lib/portal/errors';
+import { AdminResults } from './admin-results';
 import { LegalActionDialog, type LegalAction, type LegalOutcome } from './legal-action-dialog';
 import {
   clearLegalRegion,
@@ -33,11 +34,7 @@ import {
   legalFieldLabels,
 } from './legal-view-state';
 import {
-  queryCellClass,
-  queryHeadClass,
   querySelectClass,
-  queryTableFrameClass,
-  revealQueryFocus,
   useQueryViewWork,
 } from './query-view-state';
 import { QueryUtcTime } from './query-view-time';
@@ -390,93 +387,41 @@ function LegalSection({
           {page.items.length === 0 ? (
             <p className="text-sm">{t('attribution.empty')}</p>
           ) : (
-            <div
-              role="region"
-              aria-label={t('attribution.region')}
-              tabIndex={0}
-              className={queryTableFrameClass}
-              onFocus={revealQueryFocus}
-              data-legal-private
-            >
-              <table className="w-full min-w-[48rem] border-collapse">
-                <caption className="sr-only">{t('attribution.caption')}</caption>
-                <thead className="border-b bg-muted/40">
-                  <tr>
-                    {(
-                      [
-                        'fields.eventRef',
-                        'fields.accountRef',
-                        'fields.eventType',
-                        'fields.eventTime',
-                        'fields.retainUntil',
-                        'fields.sequence',
-                        ...query.fields.map((key) => legalFieldLabels[key]),
-                        'fields.selection',
-                      ] as const
-                    ).map((label) => (
-                      <th key={label} scope="col" className={queryHeadClass}>
-                        {t(label)}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {page.items.map((row) => (
-                    <tr key={row.id} data-testid="legal-result-row">
-                      <td className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}>
-                        <bdi dir="ltr">{row.id}</bdi>
-                      </td>
-                      <th
-                        scope="row"
-                        className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}
-                      >
-                        <bdi dir="ltr">{row.account_ref}</bdi>
-                      </th>
-                      <td className={`${queryCellClass} max-w-48 break-all`}>
-                        <bdi dir="ltr">{row.event_type}</bdi>
-                      </td>
-                      <td className={queryCellClass}>
-                        <QueryUtcTime value={row.timestamp} />
-                      </td>
-                      <td className={queryCellClass}>
-                        <QueryUtcTime value={row.retain_until} />
-                      </td>
-                      <td className={`${queryCellClass} break-all font-mono text-xs`}>
-                        <bdi dir="ltr">{row.seq}</bdi>
-                      </td>
-                      {query.fields.map((key) => (
-                        <td
-                          key={key}
-                          className={`${queryCellClass} max-w-56 whitespace-pre-wrap break-all`}
-                        >
-                          {row[key] === undefined ? (
-                            t('attribution.missingField')
-                          ) : (
-                            <bdi dir="ltr">{row[key]}</bdi>
-                          )}
-                        </td>
-                      ))}
-                      <td className={queryCellClass}>
-                        {(access.legal_holds_apply || access.preservation_requests_create) && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className={controlClass}
-                            aria-pressed={selectedRef === row.account_ref}
-                            onClick={() => {
-                              setSelectedRef(row.account_ref);
-                              setOutcome(null);
-                            }}
-                          >
-                            {t('buttons.select')}
-                          </Button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <AdminResults label={t('attribution.region')} caption={t('attribution.caption')}
+              viewLabel={t('resultView')} compactLabel={t('compactRows')} tableLabel={t('tableView')}
+              width={48} privateRegion
+              columns={[
+                { id: 'reference', label: t('fields.accountRef'), rowHeader: true, wide: true },
+                { id: 'event', label: t('fields.eventType') },
+                { id: 'time', label: t('fields.eventTime') },
+                { id: 'sequence', label: t('fields.sequence') },
+                { id: 'record', label: t('fields.eventRef'), secondary: true },
+                { id: 'retention', label: t('fields.retainUntil'), secondary: true },
+                ...query.fields.map((key) => ({ id: key, label: t(legalFieldLabels[key]), secondary: true })),
+                { id: 'selection', label: t('fields.selection'), wide: true },
+              ]}
+              rows={page.items.map((row) => ({
+                id: row.id, testId: 'legal-result-row',
+                cells: [
+                  <bdi key="reference" dir="ltr" className="break-all font-mono text-xs">{row.account_ref}</bdi>,
+                  <bdi key="event" dir="ltr" className="break-all">{row.event_type}</bdi>,
+                  <QueryUtcTime key="time" value={row.timestamp} />,
+                  <bdi key="sequence" dir="ltr" className="break-all font-mono text-xs">{row.seq}</bdi>,
+                  <bdi key="record" dir="ltr" className="break-all font-mono text-xs">{row.id}</bdi>,
+                  <QueryUtcTime key="retention" value={row.retain_until} />,
+                  ...query.fields.map((key) => row[key] === undefined ? t('attribution.missingField') :
+                    <bdi key={key} dir="ltr" className="whitespace-pre-wrap break-all">{row[key]}</bdi>),
+                  (access.legal_holds_apply || access.preservation_requests_create) && (
+                    <Button key="selection" type="button" variant="outline" className={controlClass}
+                      data-focus-return={`legal-select:${row.id}`}
+                      aria-pressed={selectedRef === row.account_ref}
+                      onClick={() => { setSelectedRef(row.account_ref); setOutcome(null); }}>
+                      {t('buttons.select')}
+                    </Button>
+                  ),
+                ],
+              }))}
+            />
           )}
           {selectedRef && (
             <div
@@ -912,104 +857,49 @@ function LegalHoldsRead({
         <Feedback error={error} status={status} />
         {page?.items.length === 0 && <p className="text-sm">{t('read.empty')}</p>}
         {page && page.items.length > 0 && (
-          <div
-            role="region"
-            aria-label={t('read.region')}
-            tabIndex={0}
-            className={queryTableFrameClass}
-            onFocus={revealQueryFocus}
-            data-legal-private
-          >
-            <table className="w-full min-w-[54rem] border-collapse">
-              <caption className="sr-only">{t('read.caption')}</caption>
-              <thead className="border-b bg-muted/40">
-                <tr>
-                  {(
-                    [
-                      'requestKind',
-                      'holdId',
-                      'accountRef',
-                      'status',
-                      'applied',
-                      'review',
-                      'released',
-                      'actors',
-                      'actions',
-                    ] as const
-                  ).map((label) => (
-                    <th key={label} scope="col" className={queryHeadClass}>
-                      {t(`fields.${label}`)}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {page.items.map((row) => (
-                  <tr key={row.id} data-testid="legal-hold-row">
-                    <td className={queryCellClass}>
-                      {t(
-                        row.request_kind === 'preservation' ? 'values.preservation' : 'values.hold'
-                      )}
-                    </td>
-                    <th
-                      scope="row"
-                      className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}
-                    >
-                      <bdi dir="ltr">{row.id}</bdi>
-                    </th>
-                    <td className={`${queryCellClass} max-w-52 break-all font-mono text-xs`}>
-                      <bdi dir="ltr">{row.account_ref}</bdi>
-                    </td>
-                    <td className={queryCellClass}>
-                      {t(row.is_active ? 'values.active' : 'values.released')}
-                    </td>
-                    <td className={queryCellClass}>
-                      <QueryUtcTime value={row.applied_at} />
-                    </td>
-                    <td className={queryCellClass}>
-                      <QueryUtcTime value={row.review_at} />
-                    </td>
-                    <td className={queryCellClass}>
-                      <QueryUtcTime value={row.released_at} />
-                    </td>
-                    <td className={`${queryCellClass} max-w-52 break-all text-xs`}>
-                      {t.rich('read.appliedBy', {
-                        id: row.applied_by,
-                        value: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
-                      })}
-                      <br />
-                      {t.rich('read.releasedBy', {
-                        id: row.released_by ?? t('values.notRecorded'),
-                        value: (chunks) => (
-                          <bdi dir={row.released_by ? 'ltr' : 'auto'}>{chunks}</bdi>
-                        ),
-                      })}
-                    </td>
-                    <td className={`${queryCellClass} space-y-2`}>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className={controlClass}
-                        onClick={() => onDetails(row)}
-                      >
-                        {t('buttons.details')}
-                      </Button>
-                      {canRelease && row.is_active && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          className={controlClass}
-                          onClick={() => onRelease(row)}
-                        >
-                          {t('buttons.release')}
-                        </Button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <AdminResults label={t('read.region')} caption={t('read.caption')} width={54} privateRegion
+            viewLabel={t('resultView')} compactLabel={t('compactRows')} tableLabel={t('tableView')}
+            columns={[
+              { id: 'kind', label: t('fields.requestKind') },
+              { id: 'id', label: t('fields.holdId'), rowHeader: true, wide: true },
+              { id: 'reference', label: t('fields.accountRef'), wide: true },
+              { id: 'status', label: t('fields.status') },
+              { id: 'applied', label: t('fields.applied'), secondary: true },
+              { id: 'review', label: t('fields.review'), secondary: true },
+              { id: 'released', label: t('fields.released'), secondary: true },
+              { id: 'actors', label: t('fields.actors'), secondary: true },
+              { id: 'actions', label: t('fields.actions'), wide: true },
+            ]}
+            rows={page.items.map((row) => ({
+              id: row.id, testId: 'legal-hold-row',
+              cells: [
+                t(row.request_kind === 'preservation' ? 'values.preservation' : 'values.hold'),
+                <bdi key="id" dir="ltr" className="break-all font-mono text-xs">{row.id}</bdi>,
+                <bdi key="reference" dir="ltr" className="break-all font-mono text-xs">{row.account_ref}</bdi>,
+                t(row.is_active ? 'values.active' : 'values.released'),
+                <QueryUtcTime key="applied" value={row.applied_at} />,
+                <QueryUtcTime key="review" value={row.review_at} />,
+                <QueryUtcTime key="released" value={row.released_at} />,
+                <div key="actors" className="space-y-1 break-all text-xs">
+                  <p>{t.rich('read.appliedBy', { id: row.applied_by, value: (chunks) => <bdi dir="ltr">{chunks}</bdi> })}</p>
+                  <p>{t.rich('read.releasedBy', { id: row.released_by ?? t('values.notRecorded'),
+                    value: (chunks) => <bdi dir={row.released_by ? 'ltr' : 'auto'}>{chunks}</bdi> })}</p>
+                </div>,
+                <div key="actions" className="flex flex-wrap gap-2">
+                  <Button type="button" variant="outline" className={controlClass}
+                    data-focus-return={`legal-details:${row.id}`} onClick={() => onDetails(row)}>
+                    {t('buttons.details')}
+                  </Button>
+                  {canRelease && row.is_active && (
+                    <Button type="button" variant="outline" className={controlClass}
+                      data-focus-return={`legal-release:${row.id}`} onClick={() => onRelease(row)}>
+                      {t('buttons.release')}
+                    </Button>
+                  )}
+                </div>,
+              ],
+            }))}
+          />
         )}
         {page && submitted && (
           <nav aria-label={t('read.pagination')} className="flex flex-wrap items-center gap-3">

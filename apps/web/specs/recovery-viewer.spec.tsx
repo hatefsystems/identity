@@ -106,7 +106,7 @@ afterEach(() => {
 });
 
 async function startGeneration() {
-  fireEvent.click(screen.getByRole('button', { name: 'Generate new recovery codes' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Replace recovery codes' }));
   fireEvent.click(screen.getByRole('button', { name: 'Continue to verification' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Verify with a passkey' }));
 }
@@ -118,6 +118,43 @@ async function generateView() {
 }
 
 describe('one-time recovery viewer', () => {
+  it.each([
+    ['en', 0, 'Generate new recovery codes'],
+    ['en', 2, 'Replace recovery codes'],
+    ['fa-IR', 0, 'تولید کدهای بازیابی جدید'],
+    ['fa-IR', 2, 'جایگزینی کدهای بازیابی'],
+  ] as const)('labels generation from the known remaining count in %s (%i)', async (locale, remaining, label) => {
+    api.recoveryStatus.mockResolvedValueOnce({ remaining, low: remaining < 3 });
+    render(<RecoveryPanel />, { locale });
+    const action = await screen.findByRole('button', { name: label });
+    expect(api.generateRecovery).not.toHaveBeenCalled();
+    fireEvent.click(action);
+    expect(screen.getByRole('dialog', { name: label })).toBeTruthy();
+    expect(api.stepUpChallenge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['en', 'Generate or replace recovery codes', 'Replace recovery codes', 'Refresh recovery status'],
+    ['fa-IR', 'تولید یا جایگزینی کدهای بازیابی', 'جایگزینی کدهای بازیابی', 'تازه‌سازی وضعیت بازیابی'],
+  ] as const)('keeps unknown/loading/failed status generation neutral in %s even after an earlier successful read', async (locale, neutral, replace, refresh) => {
+    let reject: (error: PortalError) => void = () => undefined;
+    api.recoveryStatus.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail; }));
+    render(<RecoveryPanel />, { locale });
+    expect(screen.getByRole('button', { name: neutral })).toBeTruthy();
+    await act(async () => reject(new PortalError('network_error')));
+    expect(screen.getByRole('alert')).toBeTruthy();
+    expect(screen.getByRole('button', { name: neutral })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: refresh }));
+    await screen.findByRole('button', { name: replace });
+    api.recoveryStatus.mockRejectedValueOnce(new PortalError('network_error'));
+    fireEvent.click(screen.getByRole('button', { name: refresh }));
+    expect(screen.getByRole('button', { name: neutral })).toBeTruthy();
+    await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: neutral })).toBeTruthy();
+    expect(api.generateRecovery).not.toHaveBeenCalled();
+    expect(api.stepUpChallenge).not.toHaveBeenCalled();
+  });
+
   it('reads only status before explicit warning and fresh verification; never auto-copies or downloads', async () => {
     const storage = jest.spyOn(Storage.prototype, 'setItem');
     render(<RecoveryPanel />);
@@ -126,7 +163,7 @@ describe('one-time recovery viewer', () => {
     );
     expect(screen.queryByTestId('recovery-viewer')).toBeNull();
     expect(api.generateRecovery).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Generate new recovery codes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace recovery codes' }));
     const dialog = screen.getByRole('dialog', { name: 'Replace recovery codes' });
     expect(dialog.textContent).toContain('invalidates every previous recovery code');
     expect(api.stepUpChallenge).not.toHaveBeenCalled();
@@ -148,6 +185,13 @@ describe('one-time recovery viewer', () => {
     expect(storage).not.toHaveBeenCalled();
     storage.mockRestore();
     expect(viewer.textContent).toContain('does not erase your clipboard');
+    expect(within(viewer).getAllByRole('button').map((button) => button.textContent)).toEqual([
+      'Copy codes', 'Download codes', 'Done',
+    ]);
+    const details = within(viewer).getByText('Storage and clearing details').closest('details');
+    expect(details?.open).toBe(false);
+    expect(within(viewer).getAllByTestId('recovery-code').every((code) => !code.closest('details'))).toBe(true);
+    expect(viewer.compareDocumentPosition(screen.getByText(/Recovery codes provide account recovery/)) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   });
 
   it('copies only on request, reports actual clipboard failure and never claims a failed copy succeeded', async () => {
@@ -318,6 +362,8 @@ it('keeps one-time bytes and the original five-minute deadline when language, ca
   const result = render(view('en'));
   await generateView();
   const originalNodes = screen.getAllByTestId('recovery-code');
+  const details = screen.getByText('Storage and clearing details').closest('details');
+  if (details) details.open = true;
   const originalStatusReads = api.recoveryStatus.mock.calls.length;
   act(() => jest.advanceTimersByTime(299000));
   result.rerender(view('fa-IR'));
@@ -326,6 +372,8 @@ it('keeps one-time bytes and the original five-minute deadline when language, ca
   ).toBeTruthy();
   const currentNodes = screen.getAllByTestId('recovery-code');
   expect(currentNodes[0]).toBe(originalNodes[0]);
+  expect(screen.getByText('جزئیات نگهداری و پاک‌کردن کدها').closest('details')).toBe(details);
+  expect(details?.open).toBe(true);
   expect(currentNodes.map((item) => item.textContent)).toEqual(codes);
   fireEvent.click(screen.getByRole('button', { name: 'کپی کدها' }));
   await act(async () => undefined);

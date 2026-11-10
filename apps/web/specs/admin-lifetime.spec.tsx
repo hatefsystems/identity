@@ -152,6 +152,10 @@ function makeClient() {
 }
 
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(0, 0, 100, 44)],
+  });
   Object.defineProperty(globalThis, 'TextEncoder', { configurable: true, value: TextEncoder });
   Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
     configurable: true,
@@ -243,20 +247,27 @@ function submit(reason = '  Verified abuse report  ') {
   fireEvent.submit(screen.getByRole('form', { name: 'Confirm account status change' }));
 }
 
-it('server-renders a non-sensitive admin shell without private values, forms or clients', () => {
-  const html = renderToStaticMarkup(
-    <I18nTestProvider>
-      <PortalProvider surface="admin">
-        <UserDetailView />
-      </PortalProvider>
-    </I18nTestProvider>
-  );
-  expect(html).toContain('Checking your secure browser session and administrative access');
-  expect(html).not.toContain(serverUser.id);
-  expect(html).not.toContain(serverUser.email);
-  expect(html).not.toContain('Moderation reason');
-  expect(PortalClient).not.toHaveBeenCalled();
-});
+it.each([
+  ['en', 'Administration', 'Elevated access'],
+  ['fa-IR', 'مدیریت', 'دسترسی ویژه'],
+] as const)(
+  'server-renders a neutral non-sensitive admin shell in %s without claiming elevated access',
+  (locale, title, elevated) => {
+    const html = renderToStaticMarkup(
+      <I18nTestProvider locale={locale}>
+        <PortalProvider surface="admin">
+          <UserDetailView />
+        </PortalProvider>
+      </I18nTestProvider>
+    );
+    expect(html).toContain(title);
+    expect(html).not.toContain(elevated);
+    expect(html).not.toContain(serverUser.id);
+    expect(html).not.toContain(serverUser.email);
+    expect(html).not.toContain('Moderation reason');
+    expect(PortalClient).not.toHaveBeenCalled();
+  }
+);
 
 it('waits for capabilities after normal-session bootstrap before disclosing children', async () => {
   const pending = deferred<AdminCapabilities>();
@@ -268,6 +279,70 @@ it('waits for capabilities after normal-session bootstrap before disclosing chil
   await act(async () => pending.resolve(permissions()));
   await screen.findByText(serverUser.email as string);
 });
+
+it.each([
+  ['en', 'Administration', 'Elevated access'],
+  ['fa-IR', 'مدیریت', 'دسترسی ویژه'],
+] as const)('does not claim elevation for a resolved empty capability projection in %s', async (locale, title, elevated) => {
+  const empty = permissions();
+  for (const key of Object.keys(empty.capabilities) as (keyof typeof empty.capabilities)[]) empty.capabilities[key] = false;
+  nextCapabilities = async () => empty;
+  render(<PortalProvider surface="admin"><UserDetailView /></PortalProvider>, { locale });
+  await screen.findByTestId('admin-ready');
+  const header = screen.getByRole('link', { name: locale === 'en' ? 'Hatef Identity home' : 'صفحهٔ اصلی هویت هاتف' }).closest('header');
+  if (!header) throw new Error('Missing product header');
+  const banner = within(header);
+  expect(banner.getByText(title)).toBeTruthy();
+  expect(banner.queryByText(elevated)).toBeNull();
+  expect(clients[0].admin.user).not.toHaveBeenCalled();
+  expect(clients[0].logout).not.toHaveBeenCalled();
+  expect(clients).toHaveLength(1);
+});
+
+it.each([
+  ['en', 'Administration', 'Elevated access', 'Return to account', 'Check access again'],
+  ['fa-IR', 'مدیریت', 'دسترسی ویژه', 'بازگشت به حساب', 'بررسی دوبارهٔ دسترسی'],
+] as const)(
+  'claims elevated access in %s only after authenticated capabilities and removes it on denial',
+  async (locale, title, elevated, returnAccount, checkAccess) => {
+    const session = deferred<Profile>();
+    const capabilities = deferred<AdminCapabilities>();
+    nextBootstrap = () => session.promise;
+    nextCapabilities = () => capabilities.promise;
+    render(
+      <PortalProvider surface="admin">
+        <UserDetailView />
+      </PortalProvider>,
+      { locale }
+    );
+    const banner = within(screen.getByRole('banner'));
+    expect(banner.getByText(title)).toBeTruthy();
+    expect(banner.queryByText(elevated)).toBeNull();
+    expect(screen.getByRole('heading', { name: title })).toBeTruthy();
+    expect(clients[0].admin.capabilities).not.toHaveBeenCalled();
+    await act(async () => session.resolve(profile()));
+    expect(clients[0].admin.capabilities).toHaveBeenCalledTimes(1);
+    expect(banner.getByText(title)).toBeTruthy();
+    expect(banner.queryByText(elevated)).toBeNull();
+    expect(screen.queryByTestId('admin-ready')).toBeNull();
+    await act(async () => capabilities.resolve(permissions()));
+    await screen.findByTestId('admin-ready');
+    expect(banner.getByText(elevated)).toBeTruthy();
+    expect(banner.queryByText(title)).toBeNull();
+    act(() => clients[0].onSessionLoss?.(new PortalError('forbidden', 403)));
+    expect(banner.getByText(title)).toBeTruthy();
+    expect(banner.queryByText(elevated)).toBeNull();
+    const main = within(screen.getByRole('main'));
+    const remedy = main.getByRole('link', { name: returnAccount });
+    expect(remedy.getAttribute('href')).toBe('/dashboard');
+    expect(remedy.parentElement?.firstElementChild).toBe(remedy);
+    expect(remedy.className).toContain('bg-primary');
+    expect(main.getByRole('button', { name: checkAccess }).className).toContain('bg-background');
+    expect(screen.queryByTestId('admin-ready')).toBeNull();
+    expect(clients[0].logout).not.toHaveBeenCalled();
+    expect(clients).toHaveLength(1);
+  }
+);
 
 it('offers a neutral account-shell Admin entry without any capabilities request', async () => {
   function Content() {
@@ -285,6 +360,35 @@ it('offers a neutral account-shell Admin entry without any capabilities request'
 });
 
 it.each([
+  ['en', 'Current section: Accounts', 'Return to account'],
+  ['fa-IR', 'بخش فعلی: حساب‌ها', 'بازگشت به حساب'],
+] as const)(
+  'keeps the nested administrative current section and account return discoverable in %s without replaying capabilities',
+  async (locale, currentSection, returnAccount) => {
+    render(
+      <PortalProvider surface="admin"><UserDetailView /></PortalProvider>,
+      { locale }
+    );
+    await screen.findByTestId('admin-ready');
+    const toggle = screen.getByRole('button', { name: currentSection });
+    const links = document.getElementById(toggle.getAttribute('aria-controls') as string) as HTMLElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const destinations = within(links).getAllByRole('link');
+    expect(destinations.map((link) => link.getAttribute('href'))).toEqual(['/admin', '/admin/users']);
+    expect(destinations[1].getAttribute('aria-current')).toBe('page');
+    expect(links.contains(screen.getByRole('link', { name: returnAccount }))).toBe(false);
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(clients[0].bootstrap).toHaveBeenCalledTimes(1);
+    expect(clients[0].admin.capabilities).toHaveBeenCalledTimes(1);
+    expect(clients[0].admin.user).toHaveBeenCalledTimes(1);
+    expect(clients[0].logout).not.toHaveBeenCalled();
+  }
+);
+
+it.each([
+  [401, 'session_required', /session is no longer available/],
   [403, 'forbidden', /no access/],
   [404, 'not_found', /not available on this deployment/],
   [503, 'audit_unavailable', /unavailable/],
@@ -299,6 +403,13 @@ it.each([
     expect(clients[0].admin.user).not.toHaveBeenCalled();
     expect(clients[0].logout).not.toHaveBeenCalled();
     expect(screen.queryByTestId('admin-ready')).toBeNull();
+    expect(screen.queryByText('Elevated access')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Administration' })).toBeTruthy();
+    const remedy = within(screen.getByRole('main')).getByRole('link', {
+      name: 'Return to account',
+    });
+    expect(remedy.getAttribute('href')).toBe('/dashboard');
+    expect(remedy.parentElement?.firstElementChild).toBe(remedy);
     const href = screen.getByRole('link', { name: 'Sign in with a passkey' }).getAttribute('href');
     expect(href).toBe('/login?returnTo=%2Fadmin%2Fusers');
     expect(href).not.toContain(mockTargetID);
@@ -411,6 +522,38 @@ it('restores the action opener after the pre-verification read and cancellation'
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   expect(document.activeElement).toBe(opener);
   expect(clients[0].admin.updateStatus).not.toHaveBeenCalled();
+});
+
+it('keeps moderation target, consequences and acknowledgement in one review body with form-linked footer actions', async () => {
+  renderDetail();
+  await startAction();
+  const element = screen.getByRole('dialog');
+  const dialog = within(element);
+  const title = dialog.getByRole('heading', { name: 'Suspend account' });
+  const cancel = dialog.getByRole('button', { name: 'Cancel' });
+  expect(element.getAttribute('data-layout')).toBe('review');
+  expect(element.querySelectorAll('[data-dialog-scroll]')).toHaveLength(1);
+  expect(cancel.closest('footer')).not.toBeNull();
+  fireEvent.click(dialog.getByRole('button', { name: 'Verify with a passkey' }));
+  await dialog.findByLabelText('Moderation reason');
+  const form = dialog.getByRole<HTMLFormElement>('form', { name: 'Confirm account status change' });
+  const confirm = dialog.getByRole<HTMLButtonElement>('button', { name: 'Confirm suspend' });
+  expect(confirm.form).toBe(form);
+  expect(form.contains(confirm)).toBe(false);
+  expect(confirm.closest('footer')).not.toBeNull();
+  expect(confirm.disabled).toBe(true);
+  const body = element.querySelector('[data-dialog-scroll]') as HTMLElement;
+  expect(within(body).getByText(mockTargetID)).toBeTruthy();
+  expect(within(body).getByText(/Suspension and ban remain/)).toBeTruthy();
+  expect(within(body).getByRole('checkbox', { name: /I reviewed the account/ })).toBeTruthy();
+  expect(dialog.getByRole('heading', { name: 'Suspend account' })).toBe(title);
+  expect(dialog.getByRole('button', { name: 'Cancel' })).toBe(cancel);
+  fireEvent.change(dialog.getByLabelText('Moderation reason'), { target: { value: 'Reviewed reason' } });
+  fireEvent.click(dialog.getByRole('checkbox', { name: /I reviewed the account/ }));
+  expect(confirm.disabled).toBe(false);
+  fireEvent.click(confirm);
+  await screen.findByText('Status change confirmed. Current account state loaded.');
+  expect(clients[0].admin.updateStatus).toHaveBeenCalledTimes(1);
 });
 
 it.each(['', 'é'.repeat(1001)])(
@@ -803,6 +946,10 @@ it.each([
   expect(api.admin.capabilities).toHaveBeenCalledTimes(2);
   expect(api.admin.updateStatus).toHaveBeenCalledTimes(1);
   expect(api.dispose).toHaveBeenCalled();
+  expect(screen.queryByText('Elevated access')).toBeNull();
+  expect(screen.getByRole('heading', { name: 'Administration' })).toBeTruthy();
+  const remedy = within(screen.getByRole('main')).getByRole('link', { name: 'Return to account' });
+  expect(remedy.parentElement?.firstElementChild).toBe(remedy);
   fireEvent.click(screen.getByRole('button', { name: 'Check access again' }));
   await screen.findByText(serverUser.email as string);
   expect(clients).toHaveLength(2);

@@ -9,14 +9,16 @@ import { useDisplayPreferences } from '../../i18n/provider';
 import type { Locale } from '../../i18n/config';
 
 import { Button, cn } from '@hatef/ui';
-import { ShieldCheck } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 import Link from 'next/link';
+import { BrandLink } from './brand-link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
   createContext,
   useCallback,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
   type ReactNode,
@@ -83,6 +85,11 @@ export function PortalProvider({
   const [deletionOutcome, setDeletionOutcome] = useState<DeletionOutcome | null>(null);
   const [moderationInterrupted, setModerationInterrupted] = useState(false);
   const [legalInterrupted, setLegalInterrupted] = useState<LegalOperation | null>(null);
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const navigationButton = useRef<HTMLButtonElement>(null);
+  const navigationLinks = useRef<HTMLDivElement>(null);
+  const navigationFocus = useRef<HTMLElement | null>(null);
+  const navigationID = useId();
   const terminal = useRef<DeletionOutcome | null>(null);
   const deleting = useRef<{ sent: boolean; interrupt: () => void } | null>(null);
   const alive = useRef(false);
@@ -132,6 +139,8 @@ export function PortalProvider({
     // A waiting TOTP marker is only meaningful on the route where it started.
     // No target identifier or account snapshot is retained in the marker.
     suspended.current = null;
+    navigationFocus.current = null;
+    setNavigationOpen(false);
     if (admin) {
       active.current?.dispose();
       active.current = null;
@@ -140,6 +149,36 @@ export function PortalProvider({
     }
     clearSensitiveViews();
   }, [pathname, admin]);
+
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const desktop = window.matchMedia('(min-width: 1024px)');
+    function focused(event: FocusEvent) {
+      const target = event.target;
+      // CSS can drop focus to body before the media-query event is delivered.
+      if (target === document.body && navigationFocus.current && !navigationFocus.current.getClientRects().length) return;
+      navigationFocus.current = target instanceof HTMLElement &&
+        (target === navigationButton.current || navigationLinks.current?.contains(target)) ? target : null;
+    }
+    function changed() {
+      setNavigationOpen(false);
+      const focused = document.activeElement;
+      const lastFocused = focused === document.body ? navigationFocus.current : focused;
+      if (desktop.matches && lastFocused === navigationButton.current) {
+        const links = navigationLinks.current;
+        (links?.querySelector<HTMLElement>('[aria-current="page"]') ??
+          links?.querySelector<HTMLElement>('a[href]'))?.focus();
+      } else if (!desktop.matches && navigationLinks.current?.contains(lastFocused)) {
+        navigationButton.current?.focus();
+      }
+    }
+    document.addEventListener('focusin', focused);
+    desktop.addEventListener('change', changed);
+    return () => {
+      document.removeEventListener('focusin', focused);
+      desktop.removeEventListener('change', changed);
+    };
+  }, []);
 
   useEffect(() => {
     if (document.visibilityState === 'hidden' || requireReconciliation.current) return;
@@ -476,6 +515,10 @@ export function PortalProvider({
         ['/dashboard/sessions', t('portal.sessions.title')],
         ['/dashboard/privacy', t('privacy.title')],
       ];
+  const currentDestination = navigation.find(
+    ([href]) =>
+      pathname === href || (href === '/admin/users' && pathname.startsWith(`${href}/`))
+  );
   return (
     <div className="min-h-svh bg-muted/20">
       <a
@@ -486,22 +529,13 @@ export function PortalProvider({
       </a>
       <header className={cn('border-b bg-background', admin && 'border-t-4 border-t-primary')}>
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-6">
-          <Link
-            href="/"
-            prefetch={false}
-            onClick={clearSensitiveViews}
-            className="flex min-h-11 items-center gap-3 rounded-md px-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label={t('portal.shell.home')}
-          >
-            <span className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <ShieldCheck aria-hidden="true" className="size-5" />
-            </span>
-            <span className="font-semibold tracking-tight">{t('auth.brand')}</span>
-          </Link>
+          <BrandLink homeLabel={t('portal.shell.home')} onClick={clearSensitiveViews}>{t('auth.brand')}</BrandLink>
           <PreferenceControls />
           {admin && (
             <span className="rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-wider">
-              {t('portal.shell.elevated')}
+              {permissions && Object.values(permissions).some(Boolean)
+                ? t('portal.shell.elevated')
+                : t('portal.shell.adminTitle')}
             </span>
           )}
           {ready && !deletionOutcome && (
@@ -529,41 +563,67 @@ export function PortalProvider({
           className="min-w-0"
           hidden={Boolean(deletionOutcome)}
         >
-          <p className="mb-3 px-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+          <p className="mb-3 hidden px-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground lg:block">
             {admin ? t('portal.shell.adminTitle') : t('portal.shell.accountTitle')}
           </p>
-          <ul className="grid grid-cols-2 gap-1 sm:grid-cols-5 lg:grid-cols-1">
-            {navigation.map(([href, label]) => (
-              <li key={href}>
-                <Link
-                  href={href}
-                  prefetch={false}
-                  onClick={() => {
-                    if (pathname !== href) clearSensitiveViews();
-                  }}
-                  aria-current={
-                    pathname === href ||
-                    (href === '/admin/users' && pathname.startsWith(`${href}/`))
-                      ? 'page'
-                      : undefined
-                  }
-                  className={cn(
-                    'flex min-h-11 items-center rounded-md px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
-                    pathname === href ||
-                      (href === '/admin/users' && pathname.startsWith(`${href}/`))
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                  )}
-                >
-                  {label}
-                </Link>
-              </li>
-            ))}
-          </ul>
+          <Button
+            ref={navigationButton}
+            type="button"
+            variant="outline"
+            className={`${controlClass} w-full justify-between gap-3 text-start lg:hidden`}
+            data-portal-navigation-toggle
+            aria-expanded={navigationOpen}
+            aria-controls={navigationID}
+            onClick={() => setNavigationOpen((value) => !value)}
+          >
+            {t('portal.shell.currentSection', {
+              section:
+                currentDestination?.[1] ??
+                t(admin ? 'portal.shell.adminTitle' : 'portal.shell.accountTitle'),
+            })}
+            <ChevronDown
+              aria-hidden="true"
+              className={cn('shrink-0', navigationOpen && 'rotate-180')}
+            />
+          </Button>
+          <div
+            ref={navigationLinks}
+            id={navigationID}
+            data-portal-navigation-links
+            className={cn('mt-2 lg:mt-0 lg:block', !navigationOpen && 'hidden')}
+          >
+            <ul className="grid gap-1">
+              {navigation.map(([href, label]) => (
+                <li key={href}>
+                  <Link
+                    href={href}
+                    prefetch={false}
+                    onClick={() => {
+                      setNavigationOpen(false);
+                      navigationButton.current?.focus();
+                      if (pathname !== href) clearSensitiveViews();
+                    }}
+                    aria-current={href === currentDestination?.[0] ? 'page' : undefined}
+                    className={cn(
+                      'flex min-h-11 items-center rounded-md px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+                      href === currentDestination?.[0]
+                        ? 'bg-primary text-primary-foreground'
+                        : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                    )}
+                  >
+                    {label}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
           <Link
             href={admin ? '/dashboard' : '/admin'}
             prefetch={false}
-            onClick={clearSensitiveViews}
+            onClick={() => {
+              setNavigationOpen(false);
+              clearSensitiveViews();
+            }}
             className={`${linkClass} mt-4`}
           >
             {admin ? t('portal.shell.returnAccount') : t('portal.shell.admin')}
@@ -671,7 +731,19 @@ export function PortalProvider({
               />
               {(phase === 'failed' || phase === 'no-access' || phase === 'disabled') && (
                 <div className="flex flex-wrap gap-3">
-                  <Button type="button" className={controlClass} onClick={checkSession}>
+                  {admin && (
+                    <Button asChild className={controlClass}>
+                      <Link href="/dashboard" prefetch={false} onClick={clearSensitiveViews}>
+                        {t('portal.shell.returnAccount')}
+                      </Link>
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant={admin ? 'outline' : 'default'}
+                    className={controlClass}
+                    onClick={checkSession}
+                  >
                     {admin ? t('portal.shell.checkAccess') : t('portal.shell.checkSession')}
                   </Button>
                   <Link

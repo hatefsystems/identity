@@ -7,6 +7,7 @@ export const legalEn = {
   denied:
     'No legal operation is available to this session. A false capability does not distinguish missing permission from deployment prerequisites. No legal records were requested.',
   sectionsLabel: 'Legal workspace sections',
+  resultView: 'Legal result view', compactRows: 'Compact rows', tableView: 'Table view',
   sections: { holds: 'Legal Holds', preservation: 'Preservation', attribution: 'Attribution' },
   workspaceNotice:
     'Only the selected authorized section is mounted. No legal operation runs on load or while typing. Leaving a section, hiding this page, or losing authority clears its private state. There are no browser-saved drafts, exports, uploads, or external transfers.',
@@ -79,7 +80,7 @@ export const legalEn = {
     checkedAt: 'Eligibility checked: <time></time>.',
     empty:
       'No matching indexed, currently eligible records were returned on this page in this scope. This is not proof of no activity, no account, or a complete history.',
-    region: 'Attribution results, horizontally scrollable',
+    region: 'Attribution results',
     caption:
       'Pseudonymized personal data ordered by ascending sequence, not verified inclusion evidence',
     missingField: 'Not present in this returned projection',
@@ -180,7 +181,7 @@ export const legalEn = {
       'The reference is the original <id>users.id</id>, retained independently after deletion. An all-subject read is explicit and bounded to at most {max} requests per page. No account-profile browsing is granted.',
     empty:
       'No requests were returned on this page of the submitted filters. This is not a missing-request API response or proof of no historical hold.',
-    region: 'Legal Holds, horizontally scrollable',
+    region: 'Legal Hold results',
     caption: 'Independent Legal Hold and preservation requests',
     appliedBy: 'Applied by: <value>{id}</value>',
     releasedBy: 'Released by: <value>{id}</value>',
@@ -271,6 +272,7 @@ export const legalFa = {
   denied:
     'هیچ عملیات حقوقی برای این نشست در دسترس نیست. غیرفعال بودن یک قابلیت مشخص نمی‌کند که مجوز وجود ندارد یا پیش‌نیازهای استقرار فراهم نیست. هیچ سابقه حقوقی درخواست نشده است.',
   sectionsLabel: 'بخش‌های فضای کاری حقوقی',
+  resultView: 'نمای نتایج حقوقی', compactRows: 'ردیف‌های فشرده', tableView: 'نمای جدول',
   sections: {
     holds: 'دستورهای نگهداشت حقوقی',
     preservation: 'حفظ پیشگیرانه',
@@ -347,7 +349,7 @@ export const legalFa = {
     checkedAt: 'زمان بررسی شرایط: <time></time>.',
     empty:
       'در این صفحه و این محدوده، هیچ سابقه نمایه‌شده مطابقی که هم‌اکنون واجد شرایط باشد بازگردانده نشد. این نتیجه، نبود فعالیت، نبود حساب یا کامل بودن تاریخچه را اثبات نمی‌کند.',
-    region: 'نتایج انتساب، با امکان پیمایش افقی',
+    region: 'نتایج انتساب',
     caption:
       'داده‌های شخصی مستعارسازی‌شده به ترتیب صعودی شماره توالی؛ نه شواهد تأییدشده درج در دفتر ثبت',
     missingField: 'در فیلدهای بازگردانده‌شده این پاسخ موجود نیست',
@@ -448,7 +450,7 @@ export const legalFa = {
       'این شناسه همان <id>users.id</id> اصلی است که پس از حذف نیز مستقل نگهداری می‌شود. خواندن اطلاعات همه اشخاص باید صریح باشد و به حداکثر {max} درخواست در هر صفحه محدود است. هیچ مجوزی برای مرور نمایه حساب‌ها اعطا نمی‌شود.',
     empty:
       'در این صفحه با فیلترهای ارسال‌شده، هیچ درخواستی بازگردانده نشد. این نه پاسخ «درخواست یافت نشد» از API است و نه اثبات نبود نگهداشت در گذشته.',
-    region: 'دستورهای نگهداشت حقوقی، با امکان پیمایش افقی',
+    region: 'نتایج دستورهای نگهداشت حقوقی',
     caption: 'دستورهای مستقل نگهداشت حقوقی و درخواست‌های حفظ پیشگیرانه',
     appliedBy: 'اعمال‌کننده: <value>{id}</value>',
     releasedBy: 'لغوکننده: <value>{id}</value>',

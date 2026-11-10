@@ -11,7 +11,7 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { PortalClient } from '../_lib/portal/client';
 import { browserKey } from '../_lib/portal/dpop';
-import { errorMessage, isAborted, throwIfAborted } from '../_lib/portal/errors';
+import { errorMessage, isAborted, PortalError, throwIfAborted } from '../_lib/portal/errors';
 import { invalidateOtherTabs } from '../_lib/portal/invalidation';
 import { safeReturnPath } from '../_lib/portal/validation';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
@@ -28,37 +28,45 @@ export function PasskeyLogin({
   const router = useRouter();
   const [hydrated, setHydrated] = useState(false);
   const [pending, setPending] = useState(false);
+  const [status, setStatus] = useState<Message>('');
   const [error, setError] = useState<Message>('');
-  const active = useRef<AbortController | null>(null);
+  const active = useRef<{ controller: AbortController; verificationStarted: boolean } | null>(null);
   const feedback = useRef<HTMLParagraphElement>(null);
   const button = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     setHydrated(true);
     return () => {
-      active.current?.abort();
+      active.current?.controller.abort();
       active.current = null;
     };
   }, []);
   useEffect(() => {
     if (error) feedback.current?.focus();
-  }, [error]);
+    else if (status) button.current?.focus();
+  }, [error, status]);
 
   async function login() {
     if (active.current) return;
     const controller = new AbortController();
-    active.current = controller;
+    const operation = { controller, verificationStarted: false };
+    active.current = operation;
     setPending(true);
+    setStatus('');
     setError('');
     let client: PortalClient | undefined;
     try {
       requireWebAuthn();
       await browserKey(true, controller.signal);
+      throwIfAborted(controller.signal);
       client = new PortalClient();
       const options = await client.loginOptions(controller.signal);
+      throwIfAborted(controller.signal);
       const assertion = await usePasskey(options, controller.signal);
       throwIfAborted(controller.signal);
       try {
+        // No send callback is exposed here: verification may be sent from this point.
+        operation.verificationStarted = true;
         await client.loginVerify(assertion, controller.signal);
       } finally {
         // A lost verify response may still have changed the shared cookie.
@@ -69,10 +77,23 @@ export function PasskeyLogin({
       throwIfAborted(controller.signal);
       router.replace(safeReturnPath(new URLSearchParams(window.location.search).get('returnTo')));
     } catch (failure) {
-      if (!controller.signal.aborted && !isAborted(failure)) setError(errorMessage(failure));
+      if (active.current !== operation || controller.signal.aborted) return;
+      if (
+        operation.verificationStarted &&
+        (!(failure instanceof PortalError) ||
+          failure.uncertain ||
+          ['cancelled', 'network_error', 'invalid_response'].includes(failure.code))
+      ) {
+        setStatus({ key: 'auth.passkey.unconfirmed' });
+      } else if (
+        isAborted(failure) ||
+        (failure instanceof PortalError && failure.code === 'cancelled')
+      ) {
+        setStatus({ key: 'auth.passkey.notCompleted' });
+      } else setError(errorMessage(failure));
     } finally {
       client?.dispose();
-      if (active.current === controller) {
+      if (active.current === operation) {
         active.current = null;
         setPending(false);
       }
@@ -80,11 +101,15 @@ export function PasskeyLogin({
   }
 
   function cancel() {
-    active.current?.abort();
+    const operation = active.current;
+    if (!operation) return;
+    operation.controller.abort();
     active.current = null;
     setPending(false);
-    setError({ key: 'auth.passkey.cancelled' });
-    button.current?.focus();
+    setError('');
+    setStatus({
+      key: operation.verificationStarted ? 'auth.passkey.unconfirmed' : 'auth.passkey.cancelled',
+    });
   }
 
   return (
@@ -98,9 +123,9 @@ export function PasskeyLogin({
         role="status"
         aria-live="polite"
         aria-atomic="true"
-        className={pending ? 'text-sm text-muted-foreground' : 'sr-only'}
+        className={pending || status ? 'text-sm leading-relaxed text-muted-foreground' : 'sr-only'}
       >
-        {pending ? t('auth.passkey.pending') : ''}
+        {pending ? t('auth.passkey.pending') : message(status)}
       </p>
       {error && (
         <p

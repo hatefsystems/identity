@@ -1,10 +1,12 @@
 export const locales = ['en', 'fa-IR'] as const;
 export type Locale = (typeof locales)[number];
 export type CalendarPreference = 'auto' | 'gregory' | 'persian';
+export type ThemePreference = 'system' | 'light' | 'dark';
 export type DisplayPreferences = {
   locale: Locale;
   calendar: CalendarPreference;
   timeZone: string;
+  theme: ThemePreference;
 };
 
 export const preferenceCookie = '__Host-hatef-ui';
@@ -14,6 +16,7 @@ export const defaultPreferences: DisplayPreferences = {
   locale: 'en',
   calendar: 'auto',
   timeZone: 'UTC',
+  theme: 'system',
 };
 
 export const timeZones = ['UTC', ...Intl.supportedValuesOf('timeZone')];
@@ -25,6 +28,10 @@ export function isLocale(value: unknown): value is Locale {
 
 export function isCalendar(value: unknown): value is CalendarPreference {
   return value === 'auto' || value === 'gregory' || value === 'persian';
+}
+
+export function isTheme(value: unknown): value is ThemePreference {
+  return value === 'system' || value === 'light' || value === 'dark';
 }
 
 export function canonicalTimeZone(value: unknown): string | undefined {
@@ -54,12 +61,14 @@ export function resolvedCalendar(preferences: DisplayPreferences): 'gregory' | '
 export function parsePreferences(value: string | undefined): DisplayPreferences {
   if (!value || value.length > preferenceMaxLength) return { ...defaultPreferences };
   const parts = value.split('~');
-  if (parts.length !== 4 || parts[0] !== '1') return { ...defaultPreferences };
-  const [, locale, calendar, timeZone] = parts;
+  if (!((parts[0] === '1' && parts.length === 4) || (parts[0] === '2' && parts.length === 5)))
+    return { ...defaultPreferences };
+  const [, locale, calendar, timeZone, theme] = parts;
   return {
     locale: isLocale(locale) ? locale : defaultPreferences.locale,
     calendar: isCalendar(calendar) ? calendar : defaultPreferences.calendar,
     timeZone: canonicalTimeZone(timeZone) ?? defaultPreferences.timeZone,
+    theme: isTheme(theme) ? theme : defaultPreferences.theme,
   };
 }
 
@@ -67,17 +76,18 @@ export function validatePreferences(value: unknown): DisplayPreferences | undefi
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   if (
-    Object.keys(record).sort().join(',') !== 'calendar,locale,timeZone' ||
+    Object.keys(record).sort().join(',') !== 'calendar,locale,theme,timeZone' ||
     !isLocale(record.locale) ||
-    !isCalendar(record.calendar)
+    !isCalendar(record.calendar) ||
+    !isTheme(record.theme)
   )
     return undefined;
   const timeZone = canonicalTimeZone(record.timeZone);
-  return timeZone ? { locale: record.locale, calendar: record.calendar, timeZone } : undefined;
+  return timeZone ? { locale: record.locale, calendar: record.calendar, timeZone, theme: record.theme } : undefined;
 }
 
 export function serializePreferences(preferences: DisplayPreferences): string {
-  return `1~${preferences.locale}~${preferences.calendar}~${preferences.timeZone}`;
+  return `2~${preferences.locale}~${preferences.calendar}~${preferences.timeZone}~${preferences.theme}`;
 }
 
 export function hasDuplicatePreferenceCookie(header: string | null): boolean {

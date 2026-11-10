@@ -28,7 +28,22 @@ import {
   assertIdentity,
   assertRegistrationReport,
   readReport,
+  registrationChecks,
+  registrationJourneys,
+  registrationLocaleChecks,
+  registrationLocales,
 } from './acceptance-report.mjs';
+// The bare Node controller mounts only these scripts, not npm dependencies.
+const {
+  assertOnlyPreferenceCookies,
+  browserLocale,
+  configureBrowserPreferences,
+  exercisePreferenceSwitch,
+  preferenceActionInput,
+  setBrowserLocale,
+  setBrowserTheme,
+  waitForFonts,
+} = process.argv[2] === '--controller' ? {} : await import('./browser-localization.mjs');
 import {
   acceptanceLifecycle,
   assertLocalOrigin,
@@ -149,38 +164,51 @@ export function registrationFailureMessage(error, fallback = 'unclassified') {
   const detail = registrationFailureDetails(error, fallback);
   return `Registration browser acceptance failed [${detail.failure_stage}/${detail.failure_check}]; private diagnostics suppressed.`;
 }
-export const registrationChecks = Object.freeze([
-  'immutable-quality-image',
-  'isolated-production-services',
-  'packaged-migration-cleanup',
-  'unicode-canonical-mailbox',
-  'explicit-smtputf8-email-proof',
-  'email-resend-proof-invalidation',
-  'explicit-smsir-verify-contract',
-  'leading-zero-otp-preserved',
-  'corrected-otp-same-reference',
-  'missing-capability-denied',
-  'foreign-jkt-denied',
-  'wrong-browser-link-denied',
-  'ownership-before-account-birth',
-  'resident-uv-passkey',
-  'atomic-unprivileged-account-birth',
-  'fresh-discoverable-login',
-  'proof-replay-denied',
-  'expired-authority-denied',
-  'cancel-clears-authority',
-  'passkey-cancellation-no-birth',
-  'unsupported-passkey-inert',
-  'rate-limit-retry-after',
-  'lost-completion-durable-receipt',
-  'completion-pending-deadline-handoff',
-  'cross-tab-key-change-clears',
-  'desktop-mobile-light-dark',
-  'keyboard-focus-status',
-  'noscript-inert',
-  'proof-storage-console-network-private',
-  'verified-owned-teardown',
-]);
+export { registrationChecks };
+
+const registrationPersianNames = Object.freeze({
+  'Email address': 'نشانی ایمیل',
+  'Iranian mobile number': 'شمارهٔ همراه ایران',
+  'SMS verification code': 'کد تأیید پیامکی',
+  'Start registration and send email': 'شروع ثبت‌نام و ارسال ایمیل',
+  'Check email verification': 'بررسی تأیید ایمیل',
+  'Send another verification email': 'ارسال ایمیل تأیید دیگر',
+  'Verify email ownership': 'تأیید مالکیت ایمیل',
+  'Send SMS code': 'ارسال کد پیامکی',
+  'Verify phone': 'تأیید تلفن',
+  'Send a new SMS code': 'ارسال کد پیامکی تازه',
+  'Create passkey and complete registration': 'ساخت کلید عبور و تکمیل ثبت‌نام',
+  'Check registration result': 'بررسی نتیجهٔ ثبت‌نام',
+  'Start a new registration': 'شروع ثبت‌نام تازه',
+  'Cancel registration': 'لغو ثبت‌نام',
+  'Sign in with your passkey': 'ورود با کلید عبور',
+  'Continue with a passkey': 'ادامه با کلید عبور',
+  'Restart registration': 'شروع دوبارهٔ ثبت‌نام',
+  'Create your account': 'حساب خود را ایجاد کنید',
+  'Verify your email': 'ایمیل خود را تأیید کنید',
+  'Verify your mobile number': 'شمارهٔ همراه خود را تأیید کنید',
+  'Create your passkey': 'کلید عبور خود را بسازید',
+  'Check registration outcome': 'نتیجهٔ ثبت‌نام را بررسی کنید',
+  'Account created': 'حساب ساخته شد',
+  'Registration needs a fresh start': 'ثبت‌نام باید دوباره آغاز شود',
+  'Verify your email ownership': 'مالکیت ایمیل خود را تأیید کنید',
+  'Email verified': 'ایمیل تأیید شد',
+  'Email verification unavailable': 'تأیید ایمیل در دسترس نیست',
+  'A new email was accepted for delivery. Previous email and phone proofs are invalidated. Confirm the new email link before continuing.': 'ایمیل تازه برای ارسال پذیرفته شد. مدارک پیشین ایمیل و تلفن نامعتبر شدند. پیش از ادامه، پیوند ایمیل تازه را تأیید کنید.',
+  'Email ownership is verified. This did not create an account or sign you in. This page cannot recover signup authority.': 'مالکیت ایمیل تأیید شد. این کار حسابی نساخت و شما را وارد حساب نکرد. این صفحه نمی‌تواند اختیار ثبت‌نام را بازیابی کند.',
+  'Return to the original registration tab and choose Check email verification there.': 'به زبانهٔ اولیهٔ ثبت‌نام برگردید و «بررسی تأیید ایمیل» را در آنجا انتخاب کنید.',
+  Calendar: 'تقویم',
+  'Time zone': 'منطقهٔ زمانی',
+});
+export function registrationAccessibleName(english, locale = browserLocale()) {
+  fixed(registrationLocales.includes(locale) && Object.hasOwn(registrationPersianNames, english), 'Unknown registration accessible name or locale');
+  return locale === 'en' ? english : registrationPersianNames[english];
+}
+export function nativeRegistrationDigits(value) {
+  fixed(typeof value === 'string' && /^[+0-9]+$/.test(value), 'Native numeric fixture requires ASCII source digits');
+  return value.replace(/[0-9]/g, (digit, index) => index % 3 === 2 ? digit :
+    String.fromCharCode((index % 3 === 0 ? 0x06f0 : 0x0660) + Number(digit)));
+}
 
 export function runtimeInputs(env = process.env) {
   fixed(
@@ -1347,8 +1375,9 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     nextPort,
     failureCheck = 'manifest-read',
     cleanupKnown = true;
-  const close = async () => {
-    lifecycle.beginTeardown();
+  const close = async ({ final = true } = {}) => {
+    fixed(typeof final === 'boolean', 'Invalid registration cleanup phase');
+    if (final) lifecycle.beginTeardown();
     try { return await boundedTeardown(dispose, lifecycle); }
     finally { registrationResponses.clear(); }
   };
@@ -1815,6 +1844,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
       SMS_OTP_HASH_PEPPER: randomBytes(32).toString('base64'),
       SMS_OTP_GLOBAL_PER_DAY: '100',
       SMS_OTP_MAX_PENDING_SIGNUP: '100',
+      SMS_OTP_PER_SUBNET_PER_HOUR: '100',
       REGISTRATION_SMTP_HOST: 'smtp.registration.test',
       REGISTRATION_SMTP_PORT: '465',
       REGISTRATION_SMTP_TLS_MODE: 'implicit',
@@ -2239,6 +2269,7 @@ async function document(page, harness, path = '/register') {
   await page.bringToFront();
   const response = await page.goto(harness.origin + path);
   fixed(response?.status() === 200, 'Production registration page failed');
+  if (path === '/register') await registrationHeading(page, 'Create your account', true);
 }
 async function newBrowserContext(browser, harness, options = {}) {
   const context = await browser.newContext({
@@ -2248,16 +2279,81 @@ async function newBrowserContext(browser, harness, options = {}) {
   });
   context.setDefaultTimeout(15000);
   context.setDefaultNavigationTimeout(30000);
+  await configureBrowserPreferences(context, harness.origin, browserLocale());
   const observed = observe(context, harness),
     page = await context.newPage();
   await document(page, harness);
   return { context, page, observed };
 }
-const button = (page, label) => page.getByRole('button', { name: label, exact: true });
+const button = (page, label) => page.getByRole('button', { name: registrationAccessibleName(label), exact: true });
+const field = (page, label) => page.getByLabel(registrationAccessibleName(label), { exact: true });
 const registrationAlert = (page) => page.locator('[data-registration-feedback]').getByRole('alert');
+async function registrationHeading(page, english, initial = false, locale = browserLocale()) {
+  await page.getByRole('heading', { name: registrationAccessibleName(english, locale), level: 1, exact: true }).waitFor();
+  fixed(await page.locator('h1').count() === 1, 'Registration duplicated its task heading');
+  fixed(await page.evaluate((initial) => {
+    const heading = document.querySelector('h1');
+    if (initial) document.__registrationTaskHeading = heading;
+    return heading === document.__registrationTaskHeading && heading.isConnected;
+  }, initial), 'Registration phase or preferences remounted its task heading');
+}
+
+async function registrationDisplayPreferences(page, observed, mark) {
+  const before = observed.posts.length;
+  await exercisePreferenceSwitch(page, {
+    privateSelector: 'bdi[dir="ltr"]',
+    onOtherLocale: (locale) => registrationHeading(page, 'Verify your email', false, locale),
+  });
+  const locale = browserLocale();
+  const details = page.locator('[data-ui-preferences] details');
+  const summary = page.locator('[data-ui-preferences] summary');
+  const wasOpen = await details.evaluate((node) => node.open);
+  const url = page.url();
+  const actions = [], apiCalls = [];
+  const observe = (request) => {
+    if (new URL(request.url()).pathname.startsWith('/api/')) apiCalls.push(request.method());
+    if (request.method() === 'POST' && request.headers()['next-action']) actions.push(request);
+  };
+  page.on('request', observe);
+  await page.evaluate(() => { document.__registrationDisplayTime = document.querySelector('time'); });
+  const expiry = await page.locator('time').getAttribute('datetime');
+  try {
+    if (!wasOpen) await summary.click();
+    const calendar = page.getByRole('combobox', { name: registrationAccessibleName('Calendar'), exact: true });
+    const zone = page.getByRole('combobox', { name: registrationAccessibleName('Time zone'), exact: true });
+    async function choose(control, value) {
+      const before = actions.length;
+      const changed = await control.inputValue() !== value;
+      if (changed) await control.selectOption(value);
+      await page.waitForFunction(() => !document.querySelector('[data-ui-preferences] select')?.disabled);
+      fixed(await control.inputValue() === value && actions.length === before + Number(changed), 'Registration display preference was omitted or replayed');
+      if (changed) preferenceActionInput({ url: actions.at(-1).url(), method: 'POST', type: actions.at(-1).resourceType(), headers: actions.at(-1).headers(), body: actions.at(-1).postData() }, url);
+    }
+    for (const displayCalendar of ['gregory', 'persian']) {
+      await choose(calendar, displayCalendar);
+      for (const timeZone of ['UTC', 'Asia/Tehran']) {
+        await choose(zone, timeZone);
+        await waitForFonts(page);
+        fixed(await page.locator('time').evaluate((node, { locale, displayCalendar, timeZone, expiry }) =>
+          node === document.__registrationDisplayTime && node.dateTime === expiry &&
+          node.textContent === new Intl.DateTimeFormat(locale, { calendar: displayCalendar, timeZone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(expiry)),
+        { locale, displayCalendar, timeZone, expiry }), 'Registration display date changed canonical evidence or did not apply explicit preferences');
+      }
+    }
+    await choose(calendar, 'auto');
+    await choose(zone, 'UTC');
+    await registrationHeading(page, 'Verify your email');
+    fixed(page.url() === url && observed.posts.length === before && apiCalls.length === 0, 'Registration display preferences replayed API work or navigated');
+    mark('registration-display-preferences');
+  } finally {
+    page.off('request', observe);
+    if (await details.evaluate((node) => node.open) !== wasOpen) await summary.click();
+    await page.evaluate(() => { delete document.__registrationDisplayTime; });
+  }
+}
 async function startAttempt(page, observed, harness, suffix) {
-  const raw = `  آزمايش${suffix}@BÜCHER.example  `,
-    email = `آزمايش${suffix}@xn--bcher-kva.example`;
+  const raw = `  آزمايش${suffix}+tag.name@BÜCHER.example  `,
+    email = `آزمايش${suffix}+tag.name@xn--bcher-kva.example`;
   const phone =
     '091' + String(parseInt(randomBytes(4).toString('hex'), 16) % 100000000).padStart(8, '0');
   harness.remember(raw);
@@ -2265,12 +2361,26 @@ async function startAttempt(page, observed, harness, suffix) {
   harness.remember(phone);
   const deliveryBefore = await harness.control('/summary');
   const count = observed.starts.length;
-  await page.getByLabel('Email address', { exact: true }).fill(raw);
-  await page.getByLabel('Iranian mobile number', { exact: true }).fill(phone);
+  const mailbox = field(page, 'Email address');
+  await mailbox.fill(raw);
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: harness.origin });
+  try {
+    await mailbox.evaluate((input) => { input.focus(); input.setSelectionRange(2, input.value.indexOf('@'), 'backward'); });
+    await mailbox.press('ControlOrMeta+C');
+    fixed(await page.evaluate(() => navigator.clipboard.readText()) === raw.slice(2, raw.indexOf('@')), 'Technical email copy altered selected bytes');
+    fixed(await mailbox.evaluate((input) => input.selectionStart === 2 && input.selectionEnd === input.value.indexOf('@') && input.selectionDirection === 'backward'), 'Technical email selection moved');
+    await page.evaluate((raw) => navigator.clipboard.writeText(raw), raw);
+    await mailbox.press('ControlOrMeta+A');
+    await mailbox.press('ControlOrMeta+V');
+    fixed(await mailbox.inputValue() === raw, 'Technical email paste altered exact bytes');
+  } finally {
+    await page.evaluate(() => navigator.clipboard.writeText(''));
+  }
+  await field(page, 'Iranian mobile number').fill(nativeRegistrationDigits(phone));
   fixed(
-    (await page.getByLabel('Email address', { exact: true }).getAttribute('type')) === 'text' &&
-      (await page.getByLabel('Email address', { exact: true }).getAttribute('inputmode')) ===
-        'email',
+    (await mailbox.getAttribute('type')) === 'text' &&
+      (await mailbox.getAttribute('inputmode')) === 'email' &&
+      (await mailbox.getAttribute('dir')) === 'ltr',
     'Native ASCII email validation returned'
   );
   await button(page, 'Start registration and send email').click();
@@ -2293,10 +2403,11 @@ async function startAttempt(page, observed, harness, suffix) {
     'Frontend rewrote raw registration identifiers'
   );
   fixed(
-    (await page.locator('bdi[dir="auto"]').innerText()) === email,
+    (await page.locator('bdi[dir="ltr"]').innerText()) === email,
     'Canonical mailbox lacks bidi isolation'
   );
   await waitUntil(() => button(page, 'Check email verification').isEnabled(), harness.lifecycle);
+  await registrationHeading(page, 'Verify your email');
   const delivered = await harness.control('/summary');
   fixed(
     delivered.mail === deliveryBefore.mail + 1 && delivered.sms === deliveryBefore.sms,
@@ -2323,7 +2434,7 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
     await button(page, 'Send another verification email').click();
     await page
       .getByRole('status')
-      .filter({ hasText: 'A new email was accepted for delivery.' })
+      .filter({ hasText: registrationAccessibleName('A new email was accepted for delivery. Previous email and phone proofs are invalidated. Confirm the new email link before continuing.') })
       .waitFor();
     proof = await takeProof(harness, '/take-mail', { recipient: authority.email });
     fixed(
@@ -2350,11 +2461,14 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
   const before = await harness.control('/summary');
   const foreign = await browser.newContext({ serviceWorkers: 'block' });
   try {
+    await configureBrowserPreferences(foreign, harness.origin, browserLocale());
     const wrongObserved = observe(foreign, harness);
     const wrong = await foreign.newPage();
     await wrong.goto(proof.link);
+    await registrationHeading(wrong, 'Verify your email ownership', true);
     await button(wrong, 'Verify email ownership').click();
     await registrationAlert(wrong).waitFor();
+    await registrationHeading(wrong, 'Email verification unavailable');
     fixed(new URL(wrong.url()).hash === '', 'Wrong-browser proof fragment remained');
     const initializedKey = await wrong.evaluate(async () => {
       if (!(await indexedDB.databases()).some((entry) => entry.name === 'hatef-portal-dpop'))
@@ -2387,6 +2501,7 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
   mark('wrong-browser-link-denied');
   const same = await context.newPage();
   await same.goto(proof.link);
+  await registrationHeading(same, 'Verify your email ownership', true);
   await waitUntil(() => new URL(same.url()).hash === '', harness.lifecycle);
   const unverified = await browserPost(page, root + '/result', {
     attempt_id: authority.attempt_id,
@@ -2398,12 +2513,21 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
   );
   await same.bringToFront();
   await button(same, 'Verify email ownership').click();
-  await same.getByRole('status').filter({ hasText: 'Email ownership is verified.' }).waitFor();
+  await same.getByRole('status').filter({ hasText: registrationAccessibleName('Email ownership is verified. This did not create an account or sign you in. This page cannot recover signup authority.') }).waitFor();
+  await registrationHeading(same, 'Email verified');
+  await same.getByText(registrationAccessibleName('Return to the original registration tab and choose Check email verification there.'), { exact: true }).waitFor();
+  fixed(await button(same, 'Verify email ownership').count() === 0 &&
+    await same.getByRole('link', { name: registrationAccessibleName('Restart registration'), exact: true }).count() === 0,
+  'Confirmed email retained obsolete verification or restart controls');
+  await exercisePreferenceSwitch(same, {
+    onOtherLocale: (locale) => registrationHeading(same, 'Email verified', false, locale),
+  });
   fixed(new URL(same.url()).hash === '', 'Email proof fragment was not scrubbed');
   await same.close();
   await page.bringToFront();
   await button(page, 'Check email verification').click();
   await button(page, 'Send SMS code').waitFor();
+  await registrationHeading(page, 'Verify your mobile number');
   const replay = await browserPost(page, root + '/email/verify', {
     attempt_id: proof.attempt_id,
     token: proof.token,
@@ -2413,6 +2537,7 @@ async function verifyEmail(page, context, authority, harness, browser, mark, res
   fixed(after.sms === before.sms, 'Email verification automatically sent an SMS');
   mark('explicit-smtputf8-email-proof');
   mark('proof-replay-denied');
+  mark('email-tab-handoff');
 }
 
 async function exerciseSuccessfulSignup(
@@ -2426,6 +2551,7 @@ async function exerciseSuccessfulSignup(
     colorScheme: dark ? 'dark' : 'light',
   });
   try {
+    await setBrowserTheme(page, dark ? 'dark' : 'light');
     if (lost) {
       await page.evaluate(installCompletionDeadlineController);
       await page.route('**/api/v1/auth/register/start', async (route) => {
@@ -2444,6 +2570,8 @@ async function exerciseSuccessfulSignup(
     const sessionsBefore = harness.sessionCount();
     const authority = await startAttempt(page, observed, harness, randomBytes(6).toString('hex'));
     mark('unicode-canonical-mailbox');
+    mark('technical-email-ltr-roundtrip');
+    if (adversarial) await registrationDisplayPreferences(page, observed, mark);
     if (adversarial) {
       const missing = await browserPost(page, root + '/result', {
         attempt_id: authority.attempt_id,
@@ -2462,7 +2590,17 @@ async function exerciseSuccessfulSignup(
     await verifyEmail(page, context, authority, harness, browser, mark, adversarial);
     const beforeSMS = await harness.control('/summary');
     await button(page, 'Send SMS code').click();
-    await page.getByLabel('SMS verification code', { exact: true }).waitFor();
+    await field(page, 'SMS verification code').waitFor();
+    fixed(await field(page, 'SMS verification code').getAttribute('dir') === 'ltr', 'SMS code lacks explicit technical direction');
+    fixed(await page.evaluate(() => {
+      const code = document.querySelector('input[name="code"]');
+      const verify = code.closest('form').querySelector('button[type="submit"]');
+      const resend = code.closest('form').nextElementSibling;
+      const deadline = document.querySelector('time');
+      return code.closest('form').parentElement.firstElementChild === code.closest('form') &&
+        resend.tagName === 'BUTTON' && (verify.compareDocumentPosition(resend) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+        (resend.compareDocumentPosition(deadline) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }), 'SMS verification is not before secondary actions');
     let sms = await takeProof(harness, '/take-sms', { mobile: authority.mobile });
     fixed(
       (await harness.control('/summary')).sms === beforeSMS.sms + 1,
@@ -2487,7 +2625,7 @@ async function exerciseSuccessfulSignup(
         (response) =>
           new URL(response.url()).pathname === root + '/phone/verify' && response.status() === 409
       );
-      await page.getByLabel('SMS verification code', { exact: true }).fill(wrong);
+      await field(page, 'SMS verification code').fill(wrong);
       await button(page, 'Verify phone').click();
       fixed(
         (await harness.registrationResponse(await wrongReply)).error === 'proof_required',
@@ -2495,7 +2633,7 @@ async function exerciseSuccessfulSignup(
       );
       await registrationAlert(page).waitFor();
       await waitUntil(
-        () => page.getByLabel('SMS verification code', { exact: true }).isEnabled(),
+        () => field(page, 'SMS verification code').isEnabled(),
         harness.lifecycle
       );
       fixed(
@@ -2509,7 +2647,7 @@ async function exerciseSuccessfulSignup(
       );
       fixed(
         (await button(page, 'Send a new SMS code').isEnabled()) &&
-          (await page.getByLabel('SMS verification code', { exact: true }).count()) === 1,
+          (await field(page, 'SMS verification code').count()) === 1,
         'Definitive wrong OTP discarded its input/challenge'
       );
       fixed(
@@ -2537,7 +2675,7 @@ async function exerciseSuccessfulSignup(
         'SMS rate limit lacked Retry-After'
       );
       fixed(
-        (await page.getByLabel('SMS verification code', { exact: true }).count()) === 0,
+        (await field(page, 'SMS verification code').count()) === 0,
         'Rate-limited resend retained an old verification input'
       );
       fixed(
@@ -2547,7 +2685,7 @@ async function exerciseSuccessfulSignup(
       mark('rate-limit-retry-after');
       await delay(61000, undefined, { signal: harness.lifecycle.signal });
       await button(page, 'Send SMS code').click();
-      await page.getByLabel('SMS verification code', { exact: true }).waitFor();
+      await field(page, 'SMS verification code').waitFor();
       sms = await takeProof(harness, '/take-sms', { mobile: authority.mobile });
       await Promise.all(observed.pending);
       const fresh = observed.replies
@@ -2560,9 +2698,14 @@ async function exerciseSuccessfulSignup(
       harness.remember(fresh);
     }
     const sentBeforeCorrection = (await harness.control('/summary')).sms;
-    await page.getByLabel('SMS verification code', { exact: true }).fill(sms.code);
+    await field(page, 'SMS verification code').fill(nativeRegistrationDigits(sms.code));
+    fixed(await field(page, 'SMS verification code').inputValue() === sms.code, 'Native SMS input did not normalize without changing its leading zero');
     await button(page, 'Verify phone').click();
     await button(page, 'Create passkey and complete registration').waitFor();
+    await registrationHeading(page, 'Create your passkey');
+    await Promise.all(observed.pending);
+    fixed(observed.posts.some((item) => item.path === root + '/phone/verify' && item.body.code === sms.code), 'Native SMS digits reached the ASCII-only wire');
+    mark('native-numeric-ascii-wire');
     if (adversarial) {
       await Promise.all(observed.pending);
       fixed(
@@ -2632,9 +2775,11 @@ async function exerciseSuccessfulSignup(
       mark('passkey-cancellation-no-birth');
     }
     let lostAccepted = false,
+      completionRouteFailure = false,
       finalBody,
       completionReceipt;
     await page.route('**/api/v1/auth/register', async (route) => {
+      try {
       finalBody = route.request().postDataJSON();
       if (lost) await page.evaluate(() => window.__registrationAcceptanceDeadline.hold(true));
       const response = await route.fetch();
@@ -2676,6 +2821,11 @@ async function exerciseSuccessfulSignup(
         await route.abort('failed');
       } else await route.fulfill({ response });
       if (lost) await page.evaluate(() => window.__registrationAcceptanceDeadline.hold(false));
+      } catch (error) {
+        completionRouteFailure = true;
+        console.error(JSON.stringify({ check: 'registration-completion-route-failure', ...registrationBrowserDiagnostic(error) }));
+        await route.abort('failed').catch(() => {});
+      }
     });
     if (lost) {
       const near = await page.evaluate(() => window.__registrationAcceptanceDeadline.arm());
@@ -2694,6 +2844,11 @@ async function exerciseSuccessfulSignup(
     await button(page, 'Create passkey and complete registration').click();
     if (lost) {
       await button(page, 'Check registration result').waitFor();
+      await waitUntil(async () => {
+        fixed(!completionRouteFailure, 'Registration completion route failed');
+        return !(await button(page, 'Check registration result').isDisabled());
+      }, harness.lifecycle, 15000);
+      await registrationHeading(page, 'Check registration outcome');
       fixed(lostAccepted, 'Lost response was not a successful committed completion');
       const committed = await harness.inspect(authority.email);
       fixed(
@@ -2703,7 +2858,9 @@ async function exerciseSuccessfulSignup(
       await button(page, 'Check registration result').click();
       mark('lost-completion-durable-receipt');
     }
-    await page.getByRole('link', { name: 'Sign in with your passkey', exact: true }).waitFor();
+    await page.getByRole('link', { name: registrationAccessibleName('Sign in with your passkey'), exact: true }).waitFor();
+    await registrationHeading(page, 'Account created');
+    mark('registration-phase-headings');
     await page.unroute('**/api/v1/auth/register');
     await page.unroute('**/api/v1/auth/register/passkey/options');
     const created = await harness.inspect(authority.email);
@@ -2717,10 +2874,8 @@ async function exerciseSuccessfulSignup(
         created.created === 1,
       'Signup birth was not one unprivileged atomic result'
     );
-    fixed(
-      (await context.cookies()).length === 0 && harness.sessionCount() === sessionsBefore,
-      'Signup automatically created a session'
-    );
+    assertOnlyPreferenceCookies(await context.cookies());
+    fixed(harness.sessionCount() === sessionsBefore, 'Signup automatically created a session');
     mark('atomic-unprivileged-account-birth');
     const credentials = await authenticator.cdp.send('WebAuthn.getCredentials', {
       authenticatorId: authenticator.authenticatorId,
@@ -2776,8 +2931,8 @@ async function exerciseSuccessfulSignup(
       'Completion replay created another account/event'
     );
     await assertNoStoredAuthority(page, harness);
-    await page.getByRole('link', { name: 'Sign in with your passkey', exact: true }).click();
-    await page.getByTestId('passkey-login').click();
+    await page.getByRole('link', { name: registrationAccessibleName('Sign in with your passkey'), exact: true }).click();
+    await button(page, 'Continue with a passkey').click();
     await page.waitForURL(harness.origin + '/dashboard');
     await page.getByTestId('portal-ready').waitFor();
     fixed(
@@ -2815,18 +2970,22 @@ async function exerciseBoundaries(browser, harness, mark) {
   for (const viewport of [
     { width: 1280, height: 900 },
     { width: 390, height: 844 },
+    { width: 320, height: 844 },
+    { width: 768, height: 900 },
+    { width: 320, height: 256 },
   ])
-    for (const colorScheme of ['light', 'dark']) {
+    for (const colorScheme of ['light', 'dark'])
+      for (const theme of ['system', 'light', 'dark']) {
       const { context, page, observed } = await newBrowserContext(browser, harness, {
         viewport,
         colorScheme,
       });
       try {
-        await page.getByLabel('Email address', { exact: true }).fill('raw invalid <mailbox>');
+        await setBrowserTheme(page, theme);
+        await field(page, 'Email address').fill('raw invalid <mailbox>');
         await button(page, 'Start registration and send email').click();
         fixed(
-          await page
-            .getByLabel('Email address', { exact: true })
+          await field(page, 'Email address')
             .evaluate((element) => document.activeElement === element),
           'Invalid input did not receive keyboard focus'
         );
@@ -2850,11 +3009,14 @@ async function exerciseBoundaries(browser, harness, mark) {
           'Keyboard focus was lost'
         );
         fixed(observed.starts.length === 0, 'Invalid raw input allocated signup state');
+        await Promise.all(observed.pending);
+        fixed(observed.failures.size === 0, 'Registration boundary violated CSP, privacy or runtime guards');
       } finally {
         await context.close();
       }
     }
   mark('desktop-mobile-light-dark');
+  mark('real-theme-preferences');
   mark('keyboard-focus-status');
   const noJS = await browser.newContext({
     javaScriptEnabled: false,
@@ -2862,6 +3024,7 @@ async function exerciseBoundaries(browser, harness, mark) {
     serviceWorkers: 'block',
   });
   try {
+    await configureBrowserPreferences(noJS, harness.origin, browserLocale());
     const page = await noJS.newPage();
     let requests = 0;
     page.on('request', (request) => {
@@ -2880,16 +3043,16 @@ async function exerciseBoundaries(browser, harness, mark) {
   mark('noscript-inert');
   const unsupported = await browser.newContext({ serviceWorkers: 'block' });
   try {
+    await configureBrowserPreferences(unsupported, harness.origin, browserLocale());
     await unsupported.addInitScript(() =>
       Object.defineProperty(window, 'PublicKeyCredential', { value: undefined, configurable: true })
     );
     const page = await unsupported.newPage(),
       observed = observe(unsupported, harness);
     await document(page, harness);
-    await page
-      .getByLabel('Email address', { exact: true })
+    await field(page, 'Email address')
       .fill(`unsupported${randomBytes(6).toString('hex')}@example.test`);
-    await page.getByLabel('Iranian mobile number', { exact: true }).fill('09123456789');
+    await field(page, 'Iranian mobile number').fill('09123456789');
     await button(page, 'Start registration and send email').click();
     await registrationAlert(page).waitFor();
     fixed(observed.starts.length === 0, 'Unsupported passkey allocated an attempt');
@@ -2903,8 +3066,9 @@ async function exerciseBoundaries(browser, harness, mark) {
     const authority = await startAttempt(page, observed, harness, randomBytes(6).toString('hex'));
     await button(page, 'Cancel registration').click();
     await button(page, 'Start a new registration').waitFor();
+    await registrationHeading(page, 'Registration needs a fresh start');
     fixed(
-      (await page.locator('bdi').count()) === 0 &&
+      (await page.locator('bdi[dir="ltr"]').count()) === 0 &&
         (await harness.inspect(authority.email)).accounts === 0,
       'Cancel retained visible authority or created an account'
     );
@@ -2981,6 +3145,10 @@ async function exerciseBoundaries(browser, harness, mark) {
 export async function runRegistrationBrowser() {
   const lifecycle = acceptanceLifecycle(),
     checks = new Set();
+  const localeEvidence = [];
+  const providers = { mail: 0, sms: 0, auth: 0, violations: 0 };
+  let lastProviderSnapshot;
+  const initialLocale = browserLocale();
   let harness,
     browser,
     inputs,
@@ -3025,27 +3193,62 @@ export async function runRegistrationBrowser() {
       timeout: Math.min(60000, lifecycle.remaining()),
       args: [`--ignore-certificate-errors-spki-list=${harness.tlsSPKI}`],
     });
-    failureCheck = 'flow-desktop-light';
-    await exerciseSuccessfulSignup(browser, harness, mark, { adversarial: true });
-    failureCheck = 'flow-desktop-dark';
-    await exerciseSuccessfulSignup(browser, harness, mark, { dark: true, rateResend: true });
-    failureCheck = 'flow-mobile-light';
-    await exerciseSuccessfulSignup(browser, harness, mark, { mobile: true });
-    failureCheck = 'flow-mobile-dark';
-    await exerciseSuccessfulSignup(browser, harness, mark, {
-      mobile: true,
-      dark: true,
-      lost: true,
-    });
-    failureCheck = 'boundaries';
-    await exerciseBoundaries(browser, harness, mark);
+    for (const locale of registrationLocales) {
+      if (localeEvidence.length) {
+        failureCheck = 'teardown';
+        harness.assertPrivateLogs();
+        await boundedTeardown(() => browser.close(), lifecycle);
+        browser = undefined;
+        const retired = await harness.close({ final: false });
+        fixed(retired.completed === true, 'Prior locale fixture cleanup was not verified');
+        harness = undefined;
+        restoreFixtureCA();
+        restoreFixtureCA = () => {};
+        failureCheck = 'services-start';
+        harness = await startRegistrationHarness(inputs, lifecycle, identity);
+        restoreFixtureCA = trustRegistrationFixtureCA(harness.tlsCA, harness.tlsCAPath);
+        failureCheck = 'browser';
+        browser = await chromium.launch({ headless: true, timeout: Math.min(60000, lifecycle.remaining()),
+          args: [`--ignore-certificate-errors-spki-list=${harness.tlsSPKI}`] });
+      }
+      setBrowserLocale(locale);
+      const baseline = await harness.control('/summary');
+      const sessionsBefore = harness.sessionCount();
+      const localeChecks = new Set(), journeys = [];
+      const localeMark = (check) => {
+        fixed(registrationLocaleChecks.includes(check), 'Unexpected registration locale check');
+        localeChecks.add(check);
+        mark(check);
+      };
+      for (const [journey, options] of [
+        ['desktop-light', { adversarial: true }],
+        ['desktop-dark', { dark: true, rateResend: true }],
+        ['mobile-light', { mobile: true }],
+        ['mobile-dark', { mobile: true, dark: true, lost: true }],
+      ]) {
+        failureCheck = `flow-${journey}`;
+        await exerciseSuccessfulSignup(browser, harness, localeMark, options);
+        journeys.push(journey);
+      }
+      failureCheck = 'boundaries';
+      await exerciseBoundaries(browser, harness, localeMark);
+      failureCheck = 'provider-counts';
+      const completed = await harness.control('/summary');
+      lastProviderSnapshot = completed;
+      const measured = Object.fromEntries(Object.keys(providers).map((key) => [key, completed[key] - baseline[key]]));
+      fixed(measured.mail === 8 && measured.sms === 5 && measured.auth >= 0 && measured.violations === 0,
+        'Registration locale provider/relay contract evidence failed');
+      fixed(harness.sessionCount() - sessionsBefore === registrationJourneys.length, 'Registration locale session evidence failed');
+      fixed(localeChecks.size === registrationLocaleChecks.length, 'Incomplete registration locale execution');
+      localeEvidence.push({ locale, journeys, checks: [...localeChecks].sort(), providers: measured, sessions: harness.sessionCount() - sessionsBefore });
+      for (const key of Object.keys(providers)) providers[key] += measured[key];
+    }
     failureCheck = 'provider-counts';
     const controller = await harness.control('/summary');
     fixed(
       controller.violations === 0 &&
         controller.auth > 0 &&
-        controller.sms === 5 &&
-        controller.mail === 8,
+        Object.keys(providers).every((key) => controller[key] === lastProviderSnapshot[key]),
       'Provider/relay contract evidence failed'
     );
     failureCheck = 'private-logs';
@@ -3065,7 +3268,7 @@ export async function runRegistrationBrowser() {
     assertIdentity(await boundedTeardown(() => acceptanceIdentity(), lifecycle), identity);
     lifecycle.check(true);
     const report = {
-      schema: 1,
+      schema: 2,
       kind: 'registration-browser',
       scope: 'full',
       status: 'passed',
@@ -3077,6 +3280,8 @@ export async function runRegistrationBrowser() {
       skipped: 0,
       tests: checks.size,
       checks: [...checks].sort(),
+      localeEvidence,
+      providers,
     };
     failureCheck = 'evidence';
     assertRegistrationReport(report, harness.manifest);
@@ -3107,11 +3312,12 @@ export async function runRegistrationBrowser() {
     }
     lifecycle.signal.removeEventListener('abort', interrupted);
     restoreFixtureCA();
+    setBrowserLocale(initialLocale);
     lifecycle.release();
     if (failed && inputs && identity) {
       const detail = failure ?? registrationFailureDetails(undefined, failureCheck);
       const report = {
-        schema: 1,
+        schema: 2,
         kind: 'registration-browser',
         scope: 'full',
         status: 'failed',
@@ -3125,6 +3331,8 @@ export async function runRegistrationBrowser() {
         skipped: 0,
         tests: checks.size,
         checks: [...checks].sort(),
+        localeEvidence,
+        providers,
       };
       try {
         await mkdir(inputs.directory, { recursive: true });

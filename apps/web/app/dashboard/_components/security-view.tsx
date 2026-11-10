@@ -11,8 +11,8 @@ export function SecurityView() {
   return (
     <>
       <PageHeading title={t('security.title')}>{t('security.description')}</PageHeading>
-      <PasskeysPanel />
       <RecoveryPanel />
+      <PasskeysPanel />
     </>
   );
 }

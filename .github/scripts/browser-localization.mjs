@@ -15,6 +15,13 @@ import { parse } from '@formatjs/icu-messageformat-parser';
 import { createTranslator } from 'use-intl/core';
 
 export const browserLocales = ['en', 'fa-IR'];
+export const browserThemes = ['system', 'light', 'dark'];
+export const browserViewports = [
+  { width: 320, height: 568 }, { width: 390, height: 844 }, { width: 768, height: 1024 },
+  { width: 1280, height: 800 }, { width: 320, height: 256 },
+];
+export const focusedBrowserViewports = [320, 375, 390, 430, 768, 1024, 1280, 1440, 1920]
+  .map((width) => ({ width, height: 800 }));
 export const uiPreferenceCookie = '__Host-hatef-ui';
 const catalogRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../apps/web/messages');
 const cache = new Map();
@@ -106,6 +113,7 @@ export function expectedPageTitle(pathname, locale) {
   assert(browserLocales.includes(locale), 'Unsupported metadata validation locale');
   const messages = catalog(locale === 'fa-IR' ? 'fa-IR' : 'en').default;
   if (pathname === '/') return messages.metadata.title;
+  if (pathname === '/register/verify-email') return messages.registration.verifyMetadata;
   const auth = {
     '/login': 'login', '/register': 'register', '/forgot-password': 'forgot',
     '/reset-password': 'reset', '/verify-totp': 'totp',
@@ -159,11 +167,12 @@ export function localizedText(value, { exact = true } = {}) {
   return new RegExp((exact ? '^' : '') + '(?:' + unique.join('|') + ')' + (exact ? '$' : ''), 'u');
 }
 
-export async function configureBrowserPreferences(context, origin, locale = activeLocale) {
-  if (locale === 'en') return;
+export async function configureBrowserPreferences(context, origin, locale = activeLocale, theme = 'system') {
   assert(browserLocales.includes(locale));
+  assert(browserThemes.includes(theme), 'Unsupported browser theme');
+  if (locale === 'en' && theme === 'system') return;
   await context.addCookies([{
-    name: uiPreferenceCookie, value: `1~${locale}~auto~UTC`, url: origin,
+    name: uiPreferenceCookie, value: `2~${locale}~auto~UTC~${theme}`, url: origin,
     secure: true, httpOnly: true, sameSite: 'Lax', expires: Math.floor(Date.now() / 1000) + 31536000,
   }]);
 }
@@ -176,7 +185,7 @@ export function decodePreferenceCookieValue(value) {
   // literal separators. Permit these exact representations, decoding once only.
   assert(decoded.length <= 128 && (value === decoded || value === encodeURIComponent(decoded)),
     'Noncanonical preference-cookie encoding');
-  assert.match(decoded, /^1~(?:en|fa-IR)~(?:auto|gregory|persian)~[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+){0,2}$/);
+  assert.match(decoded, /^(?:1~(?:en|fa-IR)~(?:auto|gregory|persian)~[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+){0,2}|2~(?:en|fa-IR)~(?:auto|gregory|persian)~[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+){0,2}~(?:system|light|dark))$/);
   const zone = decoded.split('~')[3];
   assert.equal(Intl.DateTimeFormat('en', { timeZone: zone }).resolvedOptions().timeZone, zone,
     'Noncanonical preference-cookie zone');
@@ -196,11 +205,229 @@ export function assertOnlyPreferenceCookies(cookies) {
   }
 }
 
-export async function waitForFonts(page) {
-  await page.evaluate(async () => {
-    await document.fonts.ready;
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  });
+export async function waitForFonts(page, { animationFrames = true, timeout = 15000 } = {}) {
+  assert(typeof animationFrames === 'boolean' && Number.isInteger(timeout) && timeout > 0 && timeout <= 30000);
+  let timer;
+  try {
+    await Promise.race([
+      animationFrames
+        ? page.evaluate(async () => {
+          await document.fonts.ready;
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        })
+        : page.waitForFunction(() => document.fonts.status === 'loaded', undefined, { polling: 100, timeout }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Browser font and render readiness timed out')), timeout); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+export function browserThemeMatchesDocument(theme) {
+  const root = document.documentElement;
+  const dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+  const scheme = dark ? 'dark' : 'light';
+  const computedScheme = getComputedStyle(root).colorScheme;
+  // Forced-color adjustment may override color-scheme to the UA's light/dark pair.
+  const schemeMatches = computedScheme === scheme ||
+    (matchMedia('(forced-colors: active)').matches && computedScheme === 'light dark');
+  return root.getAttribute('data-theme') === theme && root.classList.contains('dark') === dark && schemeMatches &&
+    [...document.querySelectorAll('input, select, textarea, button')]
+      .filter((node) => node.checkVisibility({ checkVisibilityCSS: true }))
+      .every((node) => getComputedStyle(node).colorScheme === computedScheme) &&
+    document.getAnimations().filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
+      .every((animation) => animation.playState === 'finished' || animation.playState === 'idle');
+}
+
+export async function assertBrowserTheme(page, theme) {
+  assert(browserThemes.includes(theme), 'Unsupported browser theme');
+  await page.waitForFunction(browserThemeMatchesDocument, theme);
+}
+
+// Shared by the real registration/account/admin suites. Never fake a theme by
+// changing classes: one explicit save owns persistence and the stable controller.
+export async function setBrowserTheme(page, theme) {
+  assert(browserThemes.includes(theme), 'Unsupported browser theme');
+  const locale = await page.locator('html').getAttribute('lang');
+  assert(browserLocales.includes(locale));
+  const details = page.locator('[data-ui-preferences] details');
+  const summary = page.locator('[data-ui-preferences] summary');
+  const wasOpen = await details.evaluate((node) => node.open);
+  const initialURL = page.url();
+  const actions = [], apiCalls = [];
+  const observe = (request) => {
+    if (new URL(request.url()).pathname.startsWith('/api/')) apiCalls.push(request.method());
+    if (request.method() === 'POST' && request.headers()['next-action']) actions.push(request);
+  };
+  page.on('request', observe);
+  try {
+    if (!wasOpen) await summary.click();
+    const control = page.getByRole('combobox', { name: locale === 'en' ? 'Appearance' : 'ظاهر', exact: true });
+    await control.waitFor({ state: 'visible' });
+    await page.waitForFunction(() => !document.querySelector('[data-ui-preferences] select')?.disabled);
+    const changed = await control.inputValue() !== theme;
+    await page.evaluate(() => {
+      document.__themeSnapshot = [...document.querySelectorAll('input, textarea, [data-testid="recovery-code"]')]
+        .map((node) => ({ node, value: 'value' in node ? node.value : node.textContent }));
+      document.__themeDocument = crypto.randomUUID();
+    });
+    const marker = await page.evaluate(() => document.__themeDocument);
+    if (changed) await control.selectOption(theme);
+    await page.waitForFunction(({ theme }) => {
+      const control = document.querySelector('[data-ui-preferences] select[id$="-theme"]');
+      return control?.value === theme && !control.disabled;
+    }, { theme });
+    await assertBrowserTheme(page, theme);
+    await waitForFonts(page);
+    assert.equal(page.url(), initialURL, 'Appearance save navigated or changed a private URL');
+    assert.equal(await page.evaluate(() => document.__themeDocument), marker, 'Appearance save replaced the document');
+    assert(await page.evaluate(() => document.__themeSnapshot.every(({ node, value }) =>
+      node.isConnected && ('value' in node ? node.value : node.textContent) === value)),
+    'Appearance save remounted or cleared a draft/one-time viewer');
+    assert.equal(actions.length, changed ? 1 : 0, 'Appearance save replayed or omitted its explicit action');
+    if (changed) {
+      const request = actions[0];
+      const input = preferenceActionInput({ url: request.url(), method: request.method(),
+        type: request.resourceType(), headers: request.headers(), body: request.postData() }, initialURL);
+      assert.equal(input.theme, theme);
+      const cookies = (await page.context().cookies(new URL(initialURL).origin)).filter((cookie) => cookie.name === uiPreferenceCookie);
+      assertOnlyPreferenceCookies(cookies);
+      assert.equal(cookies.length, 1);
+      assert.equal(decodePreferenceCookieValue(cookies[0].value),
+        `2~${input.locale}~${input.calendar}~${input.timeZone}~${theme}`);
+    }
+    assert.deepEqual(apiCalls, [], 'Appearance save reauthenticated, rebootstrapped or replayed API work');
+  } finally {
+    page.off('request', observe);
+    if (await details.evaluate((node) => node.open) !== wasOpen) await summary.click();
+    await page.evaluate(() => { delete document.__themeSnapshot; delete document.__themeDocument; });
+  }
+}
+
+export async function withTextResize(page, check) {
+  const before = await page.evaluate(() => getComputedStyle(document.documentElement).fontSize);
+  try {
+    await page.evaluate(() => {
+      const nonce = document.querySelector('script[nonce]')?.nonce;
+      if (!nonce || document.getElementById('browser-text-resize')) throw new Error('Missing request nonce or duplicate text-resize probe');
+      const style = document.createElement('style');
+      style.id = 'browser-text-resize';
+      style.nonce = nonce;
+      style.textContent = ':root{font-size:200% !important}';
+      document.head.append(style);
+    });
+    await waitForFonts(page);
+    assert.equal(Number.parseFloat(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize)),
+      Number.parseFloat(before) * 2, 'Text resize did not double the root font');
+    await check();
+  } finally {
+    await page.evaluate(() => document.getElementById('browser-text-resize')?.remove());
+    await waitForFonts(page);
+    assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).fontSize), before);
+  }
+}
+
+export async function exerciseThemeChoices(page, check = async () => {}) {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
+  const originalOS = await page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  const calls = [], saves = [], combinations = [];
+  const observe = (request) => {
+    if (new URL(request.url()).pathname.startsWith('/api/')) calls.push(request.method());
+    if (request.method() === 'POST' && request.headers()['next-action']) saves.push(true);
+  };
+  page.on('request', observe);
+  try {
+    for (const theme of browserThemes) {
+      await setBrowserTheme(page, theme);
+      for (const os of ['light', 'dark']) {
+        const before = saves.length;
+        await page.emulateMedia({ colorScheme: os });
+        await assertBrowserTheme(page, theme);
+        await waitForFonts(page);
+        await check({ theme, os });
+        assert.equal(saves.length, before, 'OS appearance changes must not persist a preference');
+        combinations.push({ theme, os });
+      }
+    }
+    assert.deepEqual(calls, [], 'Theme choices or OS changes replayed API work');
+    return combinations;
+  } finally {
+    try {
+      await setBrowserTheme(page, originalTheme);
+      const before = saves.length;
+      await page.emulateMedia({ colorScheme: originalOS });
+      await assertBrowserTheme(page, originalTheme);
+      assert.equal(saves.length, before, 'Restoring the OS appearance saved a preference');
+      assert.deepEqual(calls, [], 'Restoring appearance replayed API work');
+    } finally { page.off('request', observe); }
+  }
+}
+
+export async function exercisePortalNavigation(page, audit, capture = async () => {}) {
+  const toggle = page.locator('[data-portal-navigation-toggle]');
+  if (!(await toggle.count())) return; // Public reclaim has no account/admin navigation.
+  const admin = new URL(page.url()).pathname.startsWith('/admin');
+  const locale = await page.locator('html').getAttribute('lang');
+  const messages = catalog(locale === 'en' ? 'en' : 'fa-IR').default.portal.shell;
+  const nav = page.getByRole('navigation', { name: messages[admin ? 'adminNavigation' : 'accountNavigation'], exact: true });
+  const links = nav.locator('[data-portal-navigation-links]');
+  const calls = [];
+  const observe = (request) => { if (new URL(request.url()).pathname.startsWith('/api/')) calls.push(request.method()); };
+  await page.evaluate(() => { document.__navigationReady = document.querySelector('[data-testid="portal-ready"], [data-testid="admin-ready"]'); });
+  page.on('request', observe);
+  try {
+    const active = links.locator('[aria-current="page"]');
+    const section = await active.count() ? (await active.textContent()).trim() : messages[admin ? 'adminTitle' : 'accountTitle'];
+    assert.equal((await toggle.textContent()).trim(), messages.currentSection.replace('{section}', section),
+      'Compact navigation does not name the current section');
+    assert.equal(await toggle.getAttribute('aria-controls'), await links.getAttribute('id'));
+    for (const viewport of focusedBrowserViewports) {
+      await page.setViewportSize(viewport);
+      await waitForFonts(page);
+      if (viewport.width < 1024) {
+        assert(await toggle.isVisible(), 'Compact navigation disclosure is missing');
+        if (await toggle.getAttribute('aria-expanded') === 'true') await toggle.click();
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+        assert(!(await links.isVisible()), 'Collapsed navigation retains visible destinations');
+        await capture('navigation-closed', viewport);
+        await toggle.focus();
+        await page.keyboard.press('Space');
+        await links.waitFor({ state: 'visible' });
+        assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
+        const destinations = links.getByRole('link');
+        assert(await destinations.count() > 0);
+        for (let index = 0; index < await destinations.count(); index++) {
+          await page.keyboard.press('Tab');
+          assert(await destinations.nth(index).evaluate((node) => node === document.activeElement),
+            'Compact navigation keyboard order skipped a visible destination');
+          if (audit) await audit();
+        }
+        await capture('navigation-open', viewport);
+        await toggle.focus();
+        await page.keyboard.press('Space');
+        await page.keyboard.press('Tab');
+        assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('href')), admin ? '/dashboard' : '/admin',
+          'Collapsed navigation trapped focus in a hidden destination');
+      } else {
+        assert(!(await toggle.isVisible()), 'Desktop retained the compact disclosure');
+        assert(await links.isVisible(), 'Desktop navigation rail is hidden');
+        await capture('navigation-rail', viewport);
+      }
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await (await active.count() ? active : links.getByRole('link').first()).focus();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForFunction(() => document.activeElement === document.querySelector('[data-portal-navigation-toggle]'));
+    assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+    await page.setViewportSize({ width: 1024, height: 800 });
+    await page.waitForFunction(() => document.querySelector('[data-portal-navigation-links]')?.contains(document.activeElement));
+    assert(await page.evaluate(() => document.__navigationReady?.isConnected && document.__navigationReady ===
+      document.querySelector('[data-testid="portal-ready"], [data-testid="admin-ready"]')),
+    'Navigation presentation remounted the security view');
+    assert.deepEqual(calls, [], 'Navigation disclosure or breakpoint changes replayed API work');
+  } finally {
+    page.off('request', observe);
+    await page.evaluate(() => { delete document.__navigationReady; });
+    await page.setViewportSize({ width: 1280, height: 800 });
+  }
 }
 
 export function screenshotName(state, viewport, dark) {
@@ -266,7 +493,7 @@ export async function exercisePreferenceSwitch(page, { privateSelector = '', set
       const cookie = (await page.context().cookies(origin)).filter((cookie) => cookie.name === uiPreferenceCookie);
       assertOnlyPreferenceCookies(cookie);
       assert.equal(cookie.length, 1);
-      assert(cookie[0].value.startsWith(`1~${locale}~`));
+      assert(decodePreferenceCookieValue(cookie[0].value).startsWith(`2~${locale}~`));
       assert(!(await page.evaluate(() => document.cookie)).includes(uiPreferenceCookie));
     } finally { page.off('request', observeAction); }
   }
@@ -382,19 +609,29 @@ export function preferenceActionInput(request, documentURL) {
   assert(Array.isArray(args) && args.length === 1, 'Unexpected preference action arguments');
   const preference = args[0];
   assert(preference && typeof preference === 'object' && !Array.isArray(preference));
-  assert.deepEqual(Object.keys(preference).sort(), ['calendar', 'locale', 'timeZone']);
+  assert.deepEqual(Object.keys(preference).sort(), ['calendar', 'locale', 'theme', 'timeZone']);
   assert(browserLocales.includes(preference.locale));
   assert(['auto', 'gregory', 'persian'].includes(preference.calendar));
+  assert(browserThemes.includes(preference.theme));
   assert(typeof preference.timeZone === 'string' && preference.timeZone.length <= 64);
   assert(Intl.DateTimeFormat('en', { timeZone: preference.timeZone }).resolvedOptions().timeZone === preference.timeZone);
   return preference;
 }
 
-export async function exercisePreferenceFailure(page, expectResourceFailure = () => {}) {
+export async function exercisePreferenceFailure(page, expectResourceFailure = () => {}, { theme } = {}) {
+  if (theme !== undefined) assert(browserThemes.includes(theme), 'Unsupported failed-save theme');
   const initialURL = page.url();
   const initialLocale = await page.locator('html').getAttribute('lang');
   const otherLocale = initialLocale === 'en' ? 'fa-IR' : 'en';
-  const initialTitle = await page.title();
+  const initialTheme = await page.locator('html').getAttribute('data-theme');
+  const initialAppearance = await page.evaluate(() => ({ dark: document.documentElement.classList.contains('dark'),
+    scheme: getComputedStyle(document.documentElement).colorScheme }));
+  const details = page.locator('[data-ui-preferences] details');
+  const summary = page.locator('[data-ui-preferences] summary');
+  const wasOpen = await details.evaluate((node) => node.open);
+  if (theme !== undefined && !wasOpen) await summary.click();
+  const initialTitle = expectedPageTitle(new URL(initialURL).pathname, initialLocale);
+  await page.waitForFunction((title) => document.title === title, initialTitle);
   const initialCookies = (await page.context().cookies(new URL(initialURL).origin))
     .filter((cookie) => cookie.name === uiPreferenceCookie);
   const marker = await page.evaluate(() => {
@@ -407,6 +644,9 @@ export async function exercisePreferenceFailure(page, expectResourceFailure = ()
   let attempts = 0;
   let interceptionFailed = false;
   const pending = [];
+  const apiCalls = [];
+  const observe = (request) => { if (new URL(request.url()).pathname.startsWith('/api/')) apiCalls.push(request.method()); };
+  page.on('request', observe);
   const matcher = (url) => url.href === initialURL.split('#')[0];
   const handler = (route) => {
     const request = route.request();
@@ -415,7 +655,8 @@ export async function exercisePreferenceFailure(page, expectResourceFailure = ()
       try {
         const input = preferenceActionInput({ url: request.url(), method: request.method(),
           type: request.resourceType(), headers: request.headers(), body: request.postData() }, initialURL);
-        assert.equal(input.locale, otherLocale);
+        assert.equal(input.locale, theme === undefined ? otherLocale : initialLocale);
+        assert.equal(input.theme, theme === undefined ? initialTheme : theme);
         attempts++;
         arrived();
         await waiting;
@@ -431,24 +672,28 @@ export async function exercisePreferenceFailure(page, expectResourceFailure = ()
     return operation;
   };
   await page.route(matcher, handler);
-  const control = page.getByRole('combobox', { name: initialLocale === 'en' ? 'Language' : 'زبان', exact: true });
+  const control = page.getByRole('combobox', { name: theme === undefined
+    ? initialLocale === 'en' ? 'Language' : 'زبان'
+    : initialLocale === 'en' ? 'Appearance' : 'ظاهر', exact: true });
+  const nextValue = theme ?? otherLocale;
+  const previousValue = theme === undefined ? initialLocale : initialTheme;
   try {
-    await control.selectOption(otherLocale);
+    await control.selectOption(nextValue);
     await Promise.race([started, page.waitForTimeout(5000).then(() => { throw new Error('Preference action fault did not reach its exact request'); })]);
     assert(!interceptionFailed, 'Preference failure injection escaped its exact action envelope');
     assert(await page.locator('[data-ui-preferences] select, [data-ui-preferences] button')
-      .evaluateAll((controls) => controls.length >= 4 && controls.every((control) => control.disabled)),
+      .evaluateAll((controls) => controls.length >= 5 && controls.every((control) => control.disabled)),
     'Overlapping preference saves were not disabled');
     // Deliberately dispatch repeated changes against the real hydrated handler
     // while the network operation is held. The native disabled state above is
     // checked separately; the synchronous ownership lock must also hold.
-    await control.evaluate((select, locale) => {
+    await control.evaluate((select, { nextValue, previousValue }) => {
       const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-      for (const value of [locale, locale === 'en' ? 'fa-IR' : 'en', locale]) {
+      for (const value of [nextValue, previousValue, nextValue]) {
         setter.call(select, value);
         select.dispatchEvent(new Event('change', { bubbles: true }));
       }
-    }, otherLocale);
+    }, { nextValue, previousValue });
     await page.waitForTimeout(100);
     assert.equal(attempts, 1, 'Rapid preference changes transmitted overlapping saves');
     release();
@@ -457,9 +702,14 @@ export async function exercisePreferenceFailure(page, expectResourceFailure = ()
       : 'ذخیرهٔ تنظیمات ممکن نشد. تنظیمات قبلی شما تغییر نکرده است.';
     await page.locator('[data-ui-preferences] [role="status"]').filter({ hasText: failed }).waitFor({ state: 'visible' });
     await page.waitForFunction(() => !document.querySelector('[data-ui-preferences] select')?.disabled);
-    assert.equal(await control.inputValue(), initialLocale, 'Failed preference save changed the selected language');
+    assert.equal(await control.inputValue(), previousValue, 'Failed preference save changed the selected setting');
     assert.equal(await page.locator('html').getAttribute('lang'), initialLocale);
     assert.equal(await page.locator('html').getAttribute('dir'), initialLocale === 'en' ? 'ltr' : 'rtl');
+    assert.equal(await page.locator('html').getAttribute('data-theme'), initialTheme);
+    assert.deepEqual(await page.evaluate(() => ({ dark: document.documentElement.classList.contains('dark'),
+      scheme: getComputedStyle(document.documentElement).colorScheme })), initialAppearance,
+    'Failed preference save changed the applied appearance');
+    await page.waitForFunction((title) => document.title === title, initialTitle);
     assert.equal(await page.title(), initialTitle);
     assert.equal(page.url(), initialURL);
     assert.equal(await page.evaluate(() => document.__failedPreferenceMarker), marker);
@@ -467,11 +717,14 @@ export async function exercisePreferenceFailure(page, expectResourceFailure = ()
       .filter((cookie) => cookie.name === uiPreferenceCookie), initialCookies,
     'Failed preference action changed browser persistence');
     assert.equal(attempts, 1, 'Failed preference save automatically replayed');
+    assert.deepEqual(apiCalls, [], 'Failed preferences replayed API work');
     assert(!interceptionFailed);
   } finally {
     release();
+    page.off('request', observe);
     await Promise.all(pending);
     await page.unroute(matcher, handler);
+    if (await details.evaluate((node) => node.open) !== wasOpen) await summary.click();
     await page.evaluate(() => { delete document.__failedPreferenceMarker; });
   }
 }

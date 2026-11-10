@@ -128,6 +128,25 @@ let nextBootstrap: () => Promise<Profile>;
 let nextCapabilities: () => Promise<AdminCapabilities>;
 let visibility: PropertyDescriptor | undefined;
 let peerInvalidation: () => void;
+const resultMatchMediaDescriptor = Object.getOwnPropertyDescriptor(window, 'matchMedia');
+
+function resultViewport(initial = false) {
+  let wide = initial;
+  const events = new EventTarget();
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: jest.fn((query: string) => ({
+      media: query,
+      get matches() { return query === '(min-width: 1024px)' && wide; },
+      addEventListener: query === '(min-width: 1024px)' ? events.addEventListener.bind(events) : jest.fn(),
+      removeEventListener: query === '(min-width: 1024px)' ? events.removeEventListener.bind(events) : jest.fn(),
+    })),
+  });
+  return (desktop: boolean) => {
+    wide = desktop;
+    act(() => events.dispatchEvent(new Event('change')));
+  };
+}
 
 function makeClient() {
   const bootstrap = nextBootstrap;
@@ -251,6 +270,14 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(0, 0, 100, 44)],
+  });
+  Object.defineProperty(HTMLElement.prototype, 'getClientRects', {
+    configurable: true,
+    value: () => [new DOMRect(0, 0, 100, 44)],
+  });
   Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
     configurable: true,
     value: jest.fn(),
@@ -307,6 +334,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   jest.useRealTimers();
+  if (resultMatchMediaDescriptor) Object.defineProperty(window, 'matchMedia', resultMatchMediaDescriptor);
+  else Reflect.deleteProperty(window, 'matchMedia');
   if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
   else Reflect.deleteProperty(document, 'visibilityState');
 });
@@ -429,6 +458,34 @@ it('keeps a sole dialog control in view when Tab wraps after responsive reflow',
   expect(close.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
 });
 
+it('keeps legal prepare and confirmation actions in one stable review footer with exact form association', async () => {
+  renderLegal();
+  const dialog = await openAction();
+  const element = screen.getByRole('dialog');
+  const title = dialog.getByRole('heading', { name: 'Apply Legal Hold' });
+  const cancel = dialog.getByRole('button', { name: 'Cancel' });
+  expect(element.getAttribute('data-layout')).toBe('review');
+  expect(element.querySelectorAll('[data-dialog-scroll]')).toHaveLength(1);
+  const review = dialog.getByRole<HTMLButtonElement>('button', { name: 'Review request' });
+  expect(review.form).toBe(dialog.getByRole('form', { name: 'Prepare legal request' }));
+  expect(review.closest('footer')).not.toBeNull();
+  fillCreate();
+  const form = dialog.getByRole<HTMLFormElement>('form', { name: 'Confirm legal request' });
+  const confirm = dialog.getByRole<HTMLButtonElement>('button', { name: 'Confirm Legal Hold' });
+  expect(confirm.form).toBe(form);
+  expect(form.contains(confirm)).toBe(false);
+  expect(confirm.closest('footer')).not.toBeNull();
+  expect(confirm.disabled).toBe(true);
+  expect(dialog.getByRole('heading', { name: 'Apply Legal Hold' })).toBe(title);
+  expect(dialog.getByRole('button', { name: 'Cancel' })).toBe(cancel);
+  expect(element.querySelector('[data-dialog-scroll]')?.contains(form)).toBe(true);
+  fireEvent.click(dialog.getByRole('checkbox', { name: /I reviewed/ }));
+  expect(confirm.disabled).toBe(false);
+  fireEvent.click(confirm);
+  await waitFor(() => expect(clients[0].legal.applyHold).toHaveBeenCalledTimes(1));
+  expect(clients[0].legal.applyHold.mock.calls[0][0].accountRef).toBe(reference);
+});
+
 it.each([
   'legal_holds_read',
   'legal_holds_apply',
@@ -525,6 +582,118 @@ it('requires explicit all-reference selection and bounds pages without silently 
   expect((await screen.findByTestId('legal-hold-details')).textContent).toContain(
     'Controlled legal reason'
   );
+});
+
+describe.each(['en', 'fa-IR'] as const)('stable compact legal results in %s', (locale) => {
+  const names = locale === 'en'
+    ? { rows: 'Compact rows', table: 'Table view', holds: 'Legal Hold results', attribution: 'Attribution results', details: 'View restricted details', release: 'Release request', select: 'Select reference' }
+    : { rows: 'ردیف‌های فشرده', table: 'نمای جدول', holds: 'نتایج دستورهای نگهداشت حقوقی', attribution: 'نتایج انتساب', details: 'مشاهده جزئیات محدودشده', release: 'لغو نگهداشت درخواست', select: 'انتخاب شناسه اصلی' };
+
+  it('keeps independent hold UUIDs for the same original reference and only eligible actions through reflow', async () => {
+    const viewport = resultViewport();
+    const view = renderLegal();
+    await screen.findByTestId('admin-ready');
+    const api = clients[0];
+    const secondID = '00000000-0000-4000-8000-000000000022';
+    api.legal.holds.mockResolvedValueOnce({
+      items: [hold({ review_at: '2020-01-01T00:00:00.123456Z' }), hold({
+        id: secondID, request_kind: 'preservation', is_active: false,
+        released_at: '2026-11-01T12:00:00Z', released_by: profile().id,
+      })], total: 2, offset: 0, limit: 2,
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'All original references' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Read Legal Holds' }));
+    const rows = await screen.findAllByTestId('legal-hold-row');
+    view.rerender(legalTree(locale));
+    const table = screen.getByRole('table');
+    const frame = screen.getByRole('region', { name: names.holds });
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('compact');
+    expect(frame.hasAttribute('data-legal-private')).toBe(true);
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByText(holdID).getAttribute('dir')).toBe('ltr');
+    expect(within(rows[1]).getByText(secondID).getAttribute('dir')).toBe('ltr');
+    for (const row of rows) expect(within(row).getByText(reference).getAttribute('dir')).toBe('ltr');
+    expect(within(rows[0]).getByRole('button', { name: names.release })).toBeTruthy();
+    expect(within(rows[1]).queryByRole('button', { name: names.release })).toBeNull();
+    expect(within(rows[0]).getByText('2020-01-01 00:00:00.123456 UTC')).toBeTruthy();
+    expect(screen.queryByText('Controlled legal reason')).toBeNull();
+    const open = within(rows[1]).getByRole('button', { name: names.details });
+    const tableChoice = screen.getByRole('button', { name: names.table });
+    tableChoice.focus();
+    fireEvent.click(tableChoice);
+    expect(document.activeElement).toBe(tableChoice);
+    viewport(true);
+    expect(document.activeElement).toBe(frame);
+    expect(screen.getByRole('table')).toBe(table);
+    expect(screen.getAllByTestId('legal-hold-row')[1]).toBe(rows[1]);
+    open.focus();
+    viewport(false);
+    fireEvent.click(screen.getByRole('button', { name: names.rows }));
+    expect(within(rows[1]).getByRole('button', { name: names.details })).toBe(open);
+    expect(screen.getAllByRole('button', { name: names.details })).toHaveLength(2);
+    open.focus();
+    fireEvent.click(open);
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(secondID)).toBeTruthy();
+    expect(within(dialog).getByText(reference)).toBeTruthy();
+    viewport(true);
+    fireEvent.click(within(dialog).getByRole('button', { name: locale === 'en' ? 'Close details' : 'بستن جزئیات' }));
+    expect(document.activeElement).toBe(open);
+    expect(api.legal.holds).toHaveBeenCalledTimes(1);
+    expect(api.stepUpChallenge).not.toHaveBeenCalled();
+    expect(api.legal.releaseHold).not.toHaveBeenCalled();
+    expect(api.legal.applyHold).not.toHaveBeenCalled();
+    expect(clients).toHaveLength(1);
+  });
+
+  it('retains exact attribution references/sequences, selected disclosure and selection without another read or verification', async () => {
+    const viewport = resultViewport(true);
+    const view = renderLegal();
+    await screen.findByTestId('admin-ready');
+    const api = clients[0];
+    const optional = '<script>inert reported metadata</script>';
+    api.legal.lookup.mockResolvedValueOnce(lookupPage({ items: [
+      { ...lookupPage().items[0], timestamp: '2026-11-08T21:00:00.123456789Z', user_agent: optional },
+      { ...lookupPage().items[0], id: holdID, account_ref: otherReference, seq: maximum, user_agent: optional },
+    ] }));
+    await inquiry(['User agent'], '2');
+    const rows = screen.getAllByTestId('legal-result-row');
+    const table = screen.getByRole('table');
+    view.rerender(legalTree(locale));
+    const frame = screen.getByRole('region', { name: names.attribution });
+    expect(frame.parentElement?.getAttribute('data-result-view')).toBe('table');
+    expect(within(rows[0]).getByText(reference).getAttribute('dir')).toBe('ltr');
+    expect(within(rows[1]).getByText(otherReference).getAttribute('dir')).toBe('ltr');
+    expect(within(rows[1]).getByText(maximum).getAttribute('dir')).toBe('ltr');
+    expect(within(rows[0]).getByText('2026-11-08 21:00:00.123456789 UTC')).toBeTruthy();
+    expect(within(rows[1]).getByText(optional).textContent).toBe(optional);
+    expect(rows[1].querySelector('script, a')).toBeNull();
+    const select = within(rows[1]).getByRole('button', { name: names.select });
+    select.focus();
+    viewport(false);
+    expect(document.activeElement).toBe(select);
+    fireEvent.click(select);
+    const selected = screen.getByTestId('legal-selected-reference');
+    expect(selected.textContent).toContain(otherReference);
+    expect(select.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: names.table }));
+    expect(screen.getByRole('table')).toBe(table);
+    expect(screen.getAllByTestId('legal-result-row')[1]).toBe(rows[1]);
+    expect(screen.getByTestId('legal-selected-reference')).toBe(selected);
+    expect(within(rows[1]).getByRole('button', { name: names.select })).toBe(select);
+    expect(screen.getAllByRole('button', { name: names.select })).toHaveLength(2);
+    viewport(true);
+    viewport(false);
+    fireEvent.click(screen.getByRole('button', { name: names.rows }));
+    expect(select.getAttribute('aria-pressed')).toBe('true');
+    expect(api.legal.lookup).toHaveBeenCalledTimes(1);
+    expect(api.legal.lookup.mock.calls[0][0].fields).toEqual(['user_agent']);
+    expect(api.stepUpVerify).toHaveBeenCalledTimes(1);
+    expect(api.admin.capabilities).toHaveBeenCalledTimes(1);
+    expect(api.legal.applyHold).not.toHaveBeenCalled();
+    expect(api.legal.preserve).not.toHaveBeenCalled();
+    expect(clients).toHaveLength(1);
+  });
 });
 
 it('normalizes, freezes and confirms one recorded UUID create without generating or auto-refetching', async () => {
@@ -1099,10 +1268,19 @@ it('keeps the held grant, frozen tuple and final confirmation across locale chan
   });
   expect(input.value).toBe('');
   const form = screen.getByRole('form', { name: 'Confirm legal request' });
+  const reviewDialog = screen.getByRole('dialog');
+  const reviewHeading = within(reviewDialog).getByRole('heading', { name: 'Apply Legal Hold' });
+  const cancelReview = within(reviewDialog).getByRole('button', { name: 'Cancel' });
+  const confirmReview = within(reviewDialog).getByRole<HTMLButtonElement>('button', { name: 'Confirm Legal Hold' });
+  expect(confirmReview.form).toBe(form);
   const acknowledgement = within(form).getByRole<HTMLInputElement>('checkbox');
   fireEvent.click(acknowledgement);
   view.rerender(legalTree('fa-IR'));
   expect(screen.getByRole('form', { name: 'تأیید درخواست حقوقی' })).toBe(form);
+  expect(screen.getByRole('dialog')).toBe(reviewDialog);
+  expect(within(reviewDialog).getByRole('heading', { name: 'اعمال دستور نگهداشت حقوقی' })).toBe(reviewHeading);
+  expect(within(reviewDialog).getByRole('button', { name: 'لغو' })).toBe(cancelReview);
+  expect(within(reviewDialog).getByRole('button', { name: 'تأیید نگهداشت حقوقی' })).toBe(confirmReview);
   expect(acknowledgement.checked).toBe(true);
   expect(within(form).getByText(narrative).closest('bdi')?.dir).toBe('auto');
   expect(form.querySelector('script, a')).toBeNull();

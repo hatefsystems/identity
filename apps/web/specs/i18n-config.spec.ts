@@ -1,5 +1,8 @@
 /** @jest-environment node */
 
+import { runInNewContext } from 'node:vm';
+import { themeInitializer } from '../i18n/theme';
+
 import {
   canonicalTimeZone,
   defaultPreferences,
@@ -21,6 +24,8 @@ describe('bounded browser display preferences', () => {
     '0~fa-IR~auto~UTC',
     '2~fa-IR~auto~UTC',
     '1~fa-IR~auto~UTC~extra',
+    '3~fa-IR~auto~UTC~dark',
+    '2~fa-IR~auto~UTC~dark~extra',
     'x'.repeat(preferenceMaxLength + 1),
   ])('uses English/automatic/UTC for malformed versioned values: %s', (value) => {
     expect(parsePreferences(value)).toEqual(defaultPreferences);
@@ -31,16 +36,19 @@ describe('bounded browser display preferences', () => {
       locale: 'en',
       calendar: 'persian',
       timeZone: 'Asia/Tehran',
+      theme: 'system',
     });
     expect(parsePreferences('1~fa-IR~hijri~No/SuchZone')).toEqual({
       locale: 'fa-IR',
       calendar: 'auto',
       timeZone: 'UTC',
+      theme: 'system',
     });
     expect(parsePreferences('1~fa-IR~gregory~UTC')).toEqual({
       locale: 'fa-IR',
       calendar: 'gregory',
       timeZone: 'UTC',
+      theme: 'system',
     });
   });
 
@@ -49,9 +57,10 @@ describe('bounded browser display preferences', () => {
       locale: 'fa-IR',
       calendar: 'gregory',
       timeZone: 'America/New_York',
+      theme: 'dark',
     } as const;
     const cookie = serializePreferences(preferences);
-    expect(cookie).toBe('1~fa-IR~gregory~America/New_York');
+    expect(cookie).toBe('2~fa-IR~gregory~America/New_York~dark');
     expect(cookie.length).toBeLessThanOrEqual(preferenceMaxLength);
     expect(parsePreferences(cookie)).toEqual(preferences);
   });
@@ -75,6 +84,9 @@ describe('bounded browser display preferences', () => {
     { ...defaultPreferences, token: 'private' },
     { ...defaultPreferences, locale: 'fa' },
     { ...defaultPreferences, calendar: 'islamic' },
+    { locale: 'en', calendar: 'auto', timeZone: 'UTC' },
+    { ...defaultPreferences, theme: 'auto' },
+    { ...defaultPreferences, theme: 'dark<script>' },
     { ...defaultPreferences, timeZone: 'No/SuchZone' },
   ])('rejects invalid action input without persisting it', (value) => {
     expect(validatePreferences(value)).toBeUndefined();
@@ -112,15 +124,43 @@ describe('bounded browser display preferences', () => {
         locale,
         calendar: 'gregory',
         timeZone: 'Asia/Tehran',
+        theme: 'system',
       });
-      expect(preferences).toEqual({ locale, calendar: 'gregory', timeZone: 'Asia/Tehran' });
+      expect(preferences).toEqual({ locale, calendar: 'gregory', timeZone: 'Asia/Tehran', theme: 'system' });
       if (!preferences) throw new Error('Expected supported explicit display preferences');
       expect(resolvedCalendar(preferences)).toBe('gregory');
     }
   });
+
+  it.each(['system', 'light', 'dark'] as const)('roundtrips %s and defaults only invalid theme fields', (theme) => {
+    expect(parsePreferences(`2~fa-IR~persian~Asia/Tehran~${theme}`)).toEqual({
+      locale: 'fa-IR', calendar: 'persian', timeZone: 'Asia/Tehran', theme,
+    });
+    expect(parsePreferences('2~fa-IR~persian~Asia/Tehran~')).toEqual({
+      locale: 'fa-IR', calendar: 'persian', timeZone: 'Asia/Tehran', theme: 'system',
+    });
+    expect(parsePreferences('2~fa-IR~persian~Asia/Tehran~unsupported')).toEqual({
+      locale: 'fa-IR', calendar: 'persian', timeZone: 'Asia/Tehran', theme: 'system',
+    });
+  });
 });
 
 describe('explicit display-only date formatting', () => {
+  it.each(['en', 'fa-IR'] as const)('disambiguates the audited UTC/Tehran day boundary in both calendars for %s', (locale) => {
+    const timestamp = '2026-11-08T21:00:00Z';
+    for (const calendar of ['gregory', 'persian'] as const) {
+      const utc = { ...defaultPreferences, locale, calendar };
+      const tehran = { ...utc, timeZone: 'Asia/Tehran' };
+      expect(formatDisplayDate(timestamp, utc)).toBe(new Intl.DateTimeFormat(locale, {
+        calendar, timeZone: 'UTC', dateStyle: 'medium', timeStyle: 'short',
+      }).format(new Date(timestamp)));
+      expect(formatDisplayDate(timestamp, tehran)).toBe(new Intl.DateTimeFormat(locale, {
+        calendar, timeZone: 'Asia/Tehran', dateStyle: 'medium', timeStyle: 'short',
+      }).format(new Date(timestamp)));
+      expect(formatDisplayDate(timestamp, tehran)).not.toBe(formatDisplayDate(timestamp, utc));
+    }
+    expect(timestamp).toBe('2026-11-08T21:00:00Z');
+  });
   it('uses Jalali year boundaries only when the selected calendar requests them', () => {
     const preferences = { ...defaultPreferences, calendar: 'persian' } as const;
     expect(formatDisplayDate('2024-03-19T12:00:00Z', preferences)).toContain('1402');
@@ -142,5 +182,37 @@ describe('explicit display-only date formatting', () => {
     expect(formatDisplayDate('2024-03-10T06:59:00Z', preferences)).toBe('Mar 10, 2024, 1:59 AM');
     expect(formatDisplayDate('2024-03-10T07:00:00Z', preferences)).toBe('Mar 10, 2024, 3:00 AM');
     expect(Date.parse('2024-03-10T07:00:00Z') - Date.parse('2024-03-10T06:59:00Z')).toBe(60_000);
+  });
+});
+
+describe('constant before-paint appearance initializer', () => {
+  it.each(['system', 'light', 'dark'] as const)('resolves %s without storage, interpolation or styles', (theme) => {
+    for (const osDark of [false, true]) {
+      const toggle = jest.fn();
+      const query = jest.fn((value: string) => {
+        expect(value).toBe('(prefers-color-scheme: dark)');
+        return { matches: osDark };
+      });
+      const attribute = jest.fn(() => theme);
+      runInNewContext(themeInitializer, {
+        document: { documentElement: { getAttribute: attribute, classList: { toggle } } },
+        window: { matchMedia: query },
+      });
+      expect(attribute).toHaveBeenCalledWith('data-theme');
+      expect(query).toHaveBeenCalledTimes(theme === 'system' ? 1 : 0);
+      expect(toggle).toHaveBeenCalledWith('dark', theme === 'dark' || (theme === 'system' && osDark));
+    }
+  });
+
+  it('fails to light when system detection is unavailable and cannot execute a mode attribute', () => {
+    for (const mode of ['system', "dark');throw new Error('unsafe')", '', undefined]) {
+      const toggle = jest.fn();
+      runInNewContext(themeInitializer, {
+        document: { documentElement: { getAttribute: () => mode, classList: { toggle } } },
+        window: {},
+      });
+      expect(toggle).toHaveBeenCalledWith('dark', false);
+    }
+    expect(themeInitializer).not.toMatch(/localStorage|sessionStorage|\.style|document\.cookie|fetch\(/);
   });
 });

@@ -3,6 +3,7 @@ import { Button } from '@hatef/ui';
 import { Fingerprint } from 'lucide-react';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
+import { normalizeNumericInput } from '../../_lib/numeric-input';
 import { useAuthForm, type FormOutcome, type FormSubmit } from '../_lib/use-auth-form';
 import {
   validateEmail,
@@ -105,10 +106,16 @@ export function PasskeyForm({ submit }: { submit?: () => Promise<FormOutcome> })
 export function TotpForm({ submit }: { submit?: FormSubmit<TotpValues> }) {
   const t = useTranslations();
   const form = useAuthForm({ code: '' }, validateTotp, submit);
+  const code = form.field('code');
 
   return (
     <AuthForm
       {...form}
+      onSubmit={(event) => {
+        const input = event.currentTarget.elements.namedItem('code');
+        if (input instanceof HTMLInputElement) input.value = normalizeNumericInput(input.value);
+        void form.onSubmit(event);
+      }}
       label={t('auth.forms.totp.label')}
       submitLabel={t('auth.forms.totp.submit')}
       messages={{
@@ -118,7 +125,11 @@ export function TotpForm({ submit }: { submit?: FormSubmit<TotpValues> }) {
       }}
     >
       <AuthField
-        {...form.field('code')}
+        {...code}
+        onChange={(event) => {
+          event.target.value = normalizeNumericInput(event.target.value);
+          code.onChange(event);
+        }}
         label={t('security.stepUp.code')}
         hint={t('auth.fields.codeHint')}
         type="text"

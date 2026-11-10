@@ -4,7 +4,7 @@ import { useId, useRef, useState, useSyncExternalStore, useTransition } from 're
 import { useTranslations } from 'next-intl';
 import { Button } from '@hatef/ui';
 import { saveDisplayPreferences } from './actions';
-import { canonicalTimeZone, type DisplayPreferences } from './config';
+import { canonicalTimeZone, isTheme, type DisplayPreferences } from './config';
 import { useDisplayPreferences, useDisplayTimeZones } from './provider';
 
 const subscribe = () => () => undefined;
@@ -82,6 +82,22 @@ export function PreferenceControls() {
         </summary>
         <div className="space-y-3 pb-4">
           <p className="text-sm leading-relaxed text-muted-foreground">{t('displayOnly')}</p>
+          <div className="grid min-w-0 gap-1">
+            <label htmlFor={`${id}-theme`} className="text-sm font-medium">{t('appearance')}</label>
+            <select
+              id={`${id}-theme`}
+              className={selectClass}
+              value={preferences.theme}
+              disabled={!ready || pending}
+              onChange={(event) => {
+                if (isTheme(event.target.value)) save({ theme: event.target.value });
+              }}
+            >
+              <option value="system">{t('system')}</option>
+              <option value="light">{t('light')}</option>
+              <option value="dark">{t('dark')}</option>
+            </select>
+          </div>
           <div className="grid min-w-0 gap-1">
             <label htmlFor={`${id}-calendar`} className="text-sm font-medium">
               {t('calendar')}

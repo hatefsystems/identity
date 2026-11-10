@@ -135,6 +135,7 @@ function IntegrityQuery({
   const page = run?.result;
   const failure = page?.failure_reason;
   const integrityFailure = failure && failure !== 'no_stored_records';
+  const canContinue = !stopped && Boolean(page?.verified && run?.next);
   return (
     <>
       <Panel title={t('verify')} id={`${id}-heading`}>
@@ -166,29 +167,32 @@ function IntegrityQuery({
           {t('instructions', { limit: Math.min(1000, capabilities.limits.chain_verify_max_limit) })}
         </p>
         <div className="flex flex-wrap gap-3">
-          <Button type="button" className={controlClass} disabled={pending} onClick={start}>
+          {canContinue && (
+            <Button
+              type="button"
+              className={controlClass}
+              disabled={pending}
+              onClick={() => {
+                if (run) void verifyPage(run);
+              }}
+            >
+              {t('continue')}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant={canContinue ? 'outline' : 'default'}
+            className={controlClass}
+            disabled={pending}
+            onClick={start}
+          >
             {t('start')}
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            className={controlClass}
-            disabled={pending || stopped || !run?.result || !run.next}
-            onClick={() => {
-              if (run) void verifyPage(run);
-            }}
-          >
-            {t('continue')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            className={controlClass}
-            disabled={!pending && (!run?.next || !run.result)}
-            onClick={stop}
-          >
-            {t('stop')}
-          </Button>
+          {(pending || canContinue) && (
+            <Button type="button" variant="outline" className={controlClass} onClick={stop}>
+              {t('stop')}
+            </Button>
+          )}
         </div>
         <Feedback
           status={notice}
@@ -197,6 +201,14 @@ function IntegrityQuery({
             (integrityFailure ? t('failureEnd', { description: t(`failures.${failure}`) }) : '')
           }
         />
+        {run && (
+          <p className="text-sm font-medium" data-testid="verification-summary">
+            {t('summary', {
+              pages: run.pages - (page && !page.verified ? 1 : 0),
+              checked: run.checked,
+            })}
+          </p>
+        )}
         {run && (
           <dl
             aria-label={t('progress')}
@@ -207,8 +219,6 @@ function IntegrityQuery({
               ['bound', run.through_seq ?? t('notCaptured')],
               ['pages', String(run.pages)],
               ['checked', String(run.checked)],
-              ['pageChecked', String(page?.checked ?? 0)],
-              ['limit', String(run.limit)],
             ].map(([field, value]) => (
               <div key={field} className="min-w-0">
                 <dt className="text-muted-foreground">
@@ -239,35 +249,20 @@ function IntegrityQuery({
             {!page.verified && failure !== 'no_stored_records' && (
               <p className="text-sm">{t('failureCounts')}</p>
             )}
-            <dl className="grid min-w-0 gap-4 text-sm sm:grid-cols-2">
-              {[
-                ['after', page.after_seq],
-                ['first', page.first_seq ?? t('none')],
-                ['last', page.last_seq ?? t('none')],
-                ['seedSource', t(`seed.${page.seed_source}`)],
-                ['seedHash', page.seed_hash],
-                ['lastHash', page.last_hash],
-                ...(failure
-                  ? [
-                      ['failure', failure],
-                      ['broken', page.broken_at_seq ?? t('notProvided')],
-                    ]
-                  : []),
-                ...(page.expected_hash !== null ? [['expected', page.expected_hash]] : []),
-                ...(page.stored_hash !== null ? [['stored', page.stored_hash]] : []),
-              ].map(([field, value]) => (
-                <div key={field} className="min-w-0">
-                  <dt className="text-muted-foreground">
-                    {t(
-                      `fields.${field as keyof typeof import('../../../messages/integrity').integrityEn.fields}`
-                    )}
-                  </dt>
-                  <dd dir="ltr" className="mt-1 break-all font-mono text-xs">
-                    {value}
+            {failure && (
+              <dl className="grid min-w-0 gap-4 text-sm sm:grid-cols-2">
+                <div className="min-w-0">
+                  <dt className="text-muted-foreground">{t('fields.failure')}</dt>
+                  <dd dir="ltr" className="mt-1 break-all font-mono">{failure}</dd>
+                </div>
+                <div className="min-w-0">
+                  <dt className="text-muted-foreground">{t('fields.broken')}</dt>
+                  <dd dir="ltr" className="mt-1 break-all font-mono">
+                    {page.broken_at_seq ?? t('notProvided')}
                   </dd>
                 </div>
-              ))}
-            </dl>
+              </dl>
+            )}
             {page.chain === 'ledger' && run && (
               <div className="space-y-2 text-sm">
                 <p>
@@ -294,13 +289,40 @@ function IntegrityQuery({
             <div className="space-y-2">
               <h3 className="text-sm font-semibold">{t('scope')}</h3>
               <p className="text-sm leading-relaxed">{t(`scopes.${page.chain}`)}</p>
-              <details className="min-w-0 rounded-md border px-3">
-                <summary className="min-h-11 cursor-pointer py-3 text-sm">{t('original')}</summary>
+            </div>
+            <details className="min-w-0 rounded-md border px-3">
+              <summary className="min-h-11 cursor-pointer py-3 text-sm">{t('original')}</summary>
+              <div className="space-y-4 pb-3">
+                <dl className="grid min-w-0 gap-4 text-sm sm:grid-cols-2">
+                  {[
+                    ['after', page.after_seq],
+                    ['first', page.first_seq ?? t('none')],
+                    ['last', page.last_seq ?? t('none')],
+                    ['seedSource', t(`seed.${page.seed_source}`)],
+                    ['seedHash', page.seed_hash],
+                    ['lastHash', page.last_hash],
+                    ['pageChecked', String(page.checked)],
+                    ['limit', String(run?.limit ?? 0)],
+                    ...(page.expected_hash !== null ? [['expected', page.expected_hash]] : []),
+                    ...(page.stored_hash !== null ? [['stored', page.stored_hash]] : []),
+                  ].map(([field, value]) => (
+                    <div key={field} className="min-w-0">
+                      <dt className="text-muted-foreground">
+                        {t(
+                          `fields.${field as keyof typeof import('../../../messages/integrity').integrityEn.fields}`
+                        )}
+                      </dt>
+                      <dd dir="ltr" className="mt-1 break-all font-mono text-xs">
+                        {value}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
                 <p dir="ltr" className="break-words pb-3 font-mono text-xs leading-relaxed">
                   {page.scope}
                 </p>
-              </details>
-            </div>
+              </div>
+            </details>
           </div>
         )}
       </Panel>

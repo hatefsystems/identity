@@ -13,7 +13,7 @@ export default async function ForgotPasswordPage() {
     <AuthCard
       title={t('pages.forgot.title')}
       description={t('pages.forgot.description')}
-      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
+      footer={<AuthLink href="/register">{t('home.register')}</AuthLink>}
     >
       <ForgotPasswordScreen />
     </AuthCard>

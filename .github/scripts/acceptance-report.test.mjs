@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { aggregateReports, assertExecutedEvidence, assertGoModule, assertIdentity, assertRaceToolchain, assertRegistrationReport, exportAcceptanceImage, fingerprintFiles, identityGoModule, integrationPackages, integrationTargets, loadAcceptanceImage, racePackages, raceToolchainProfile, readReport } from './acceptance-report.mjs';
+import { registrationChecks, registrationJourneys, registrationLocaleChecks, registrationLocales } from './acceptance-report.mjs';
 
 const identity = { revision: 'a'.repeat(40), source: 'b'.repeat(64), generated: Object.fromEntries(['apps/identity-api/internal/db', 'libs/schemas/gen/go', 'libs/schemas/gen/ts'].map((path) => [path, { files: 1, sha256: 'c'.repeat(64) }])), runId: '123', runAttempt: '1' };
 const toolchain = { schema: 1, profile: raceToolchainProfile,
@@ -146,9 +147,52 @@ test('passing process and one skip or absent package evidence cannot certify a r
 test('registration report binds the exact publication image and source generation', () => {
   const imageId = `sha256:${'d'.repeat(64)}`;
   const manifest = { imageId, identity };
-  const report = { schema: 1, kind: 'registration-browser', scope: 'full', status: 'passed', identity, apiImageId: imageId, cleanup: { completed: true }, exit: 0, failed: 0, skipped: 0, tests: 1, checks: ['production-registration'] };
+  const report = registrationReport(imageId);
   assertRegistrationReport(report, manifest);
   for (const change of [{ apiImageId: `sha256:${'e'.repeat(64)}` }, { scope: 'partial' }, { status: 'failed' }, { cleanup: { completed: false } }, { skipped: 1 }, { failed: 1 }, { tests: 0 }, { checks: [] }, { identity: { ...identity, source: 'f'.repeat(64) } }]) assert.throws(() => assertRegistrationReport({ ...report, ...change }, manifest));
+});
+
+function registrationReport(imageId = `sha256:${'d'.repeat(64)}`) {
+  return { schema: 2, kind: 'registration-browser', scope: 'full', status: 'passed', identity, apiImageId: imageId,
+    cleanup: { completed: true }, exit: 0, failed: 0, skipped: 0, tests: registrationChecks.length, checks: [...registrationChecks],
+    localeEvidence: registrationLocales.map((locale) => ({ locale, journeys: [...registrationJourneys], checks: [...registrationLocaleChecks],
+      providers: { mail: 8, sms: 5, auth: locale === 'en' ? 1 : 0, violations: 0 }, sessions: 4 })),
+    providers: { mail: 16, sms: 10, auth: 1, violations: 0 } };
+}
+
+test('bilingual registration evidence requires every isolated locale journey and measured provider deltas', () => {
+  const report = registrationReport();
+  const manifest = { imageId: report.apiImageId, identity };
+  // A reused authenticated SMTP connection need not authenticate again in a new
+  // locale. Report observed AUTH counts, not an invented authentication per send.
+  assertRegistrationReport(report, manifest);
+  for (const mutate of [
+    (value) => { value.schema = 1; },
+    (value) => { delete value.localeEvidence; },
+    (value) => { value.localeEvidence.pop(); },
+    (value) => { value.localeEvidence[1].locale = 'en'; },
+    (value) => { value.localeEvidence[1].locale = 'ar'; },
+    (value) => { value.localeEvidence[1].journeys.pop(); },
+    (value) => { value.localeEvidence[1].journeys[0] = 'mobile-dark'; },
+    (value) => { value.localeEvidence[1].checks.pop(); },
+    (value) => { value.localeEvidence[1].checks[0] = 'unit-tests-passed'; },
+    (value) => { value.localeEvidence[1].sessions = 3; },
+    (value) => { value.localeEvidence[1].providers.mail = 7; },
+    (value) => { value.localeEvidence[1].providers.sms = 6; },
+    (value) => { value.localeEvidence[1].providers.auth = -1; },
+    (value) => { value.localeEvidence[1].providers.violations = 1; },
+    (value) => { value.localeEvidence[1].providers.email = 'private@example.test'; },
+    (value) => { value.localeEvidence[1].private = 'opaque-proof'; },
+    (value) => { value.private = 'opaque-proof'; },
+    (value) => { value.providers.sms = 9; },
+    (value) => { value.localeEvidence[0].providers.auth = 0; value.providers.auth = 0; },
+    (value) => { value.tests++; },
+    (value) => { value.checks.pop(); },
+  ]) {
+    const invalid = structuredClone(report);
+    mutate(invalid);
+    assert.throws(() => assertRegistrationReport(invalid, manifest));
+  }
 });
 
 test('acceptance API export/load binds exact checksum, source and generation on nonrelease runs too', async () => {

@@ -3,7 +3,7 @@ jest.mock('next-intl/server', () => ({
     jest.requireActual('../i18n/testing').getTestTranslations(...args),
 }));
 
-import { act, fireEvent, render, screen, waitFor } from '../i18n/testing';
+import { act, fireEvent, render, screen, waitFor, within } from '../i18n/testing';
 import { renderToStaticMarkup as renderStatic } from 'react-dom/server';
 import type { ReactElement } from 'react';
 import { I18nTestProvider } from '../i18n/testing';
@@ -13,11 +13,12 @@ import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-p
 import { PortalClient } from '../app/_lib/portal/client';
 import type { Profile } from '../app/_lib/portal/contracts';
 import { PortalError } from '../app/_lib/portal/errors';
-import { invalidateOtherTabs, onOtherTabInvalidation } from '../app/_lib/portal/invalidation';
+import { clearSensitiveViews, invalidateOtherTabs, onOtherTabInvalidation } from '../app/_lib/portal/invalidation';
 
 const replace = jest.fn();
+let mockPathname = '/dashboard';
 jest.mock('next/navigation', () => ({
-  usePathname: () => '/dashboard',
+  usePathname: () => mockPathname,
   useRouter: () => ({ replace }),
 }));
 jest.mock('../app/_lib/portal/client', () => ({ PortalClient: jest.fn() }));
@@ -55,8 +56,11 @@ function PrivateContent() {
 let api: ReturnType<typeof makeClient>;
 let invalidate: () => void;
 let visibility: PropertyDescriptor | undefined;
+let mediaDescriptor: PropertyDescriptor | undefined;
 beforeEach(() => {
   jest.clearAllMocks();
+  mockPathname = '/dashboard';
+  mediaDescriptor = Object.getOwnPropertyDescriptor(window, 'matchMedia');
   visibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
   api = makeClient();
@@ -67,9 +71,99 @@ beforeEach(() => {
   });
 });
 afterEach(() => {
+  if (mediaDescriptor) Object.defineProperty(window, 'matchMedia', mediaDescriptor);
+  else Reflect.deleteProperty(window, 'matchMedia');
   if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
   else Reflect.deleteProperty(document, 'visibilityState');
   jest.useRealTimers();
+});
+
+describe('compact account navigation', () => {
+  it.each([
+    ['en', 'Account navigation', 'Current section: Sessions', 'Sessions', 'Admin', 'Sign out'],
+    ['fa-IR', 'ناوبری حساب', 'بخش فعلی: نشست‌ها', 'نشست‌ها', 'مدیریت', 'خروج'],
+  ] as const)(
+    'labels the current section and preserves one ordered destination set in %s',
+    async (locale, navLabel, currentSection, sessions, admin, signOut) => {
+      mockPathname = '/dashboard/sessions';
+      render(
+        <PortalProvider><PrivateContent /></PortalProvider>,
+        { locale }
+      );
+      await screen.findByTestId('portal-ready');
+      const nav = within(screen.getByRole('navigation', { name: navLabel }));
+      const toggle = nav.getByRole('button', { name: currentSection });
+      const links = document.getElementById(toggle.getAttribute('aria-controls') as string) as HTMLElement;
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(toggle.className).toContain('lg:hidden');
+      expect(links.classList.contains('hidden')).toBe(true);
+      expect(links.className).toContain('lg:block');
+      expect(within(links).getAllByRole('link').map((link) => link.getAttribute('href'))).toEqual([
+        '/dashboard', '/dashboard/profile', '/dashboard/security', '/dashboard/sessions', '/dashboard/privacy',
+      ]);
+      expect(nav.getByRole('link', { name: sessions }).getAttribute('aria-current')).toBe('page');
+      expect(links.contains(nav.getByRole('link', { name: admin }))).toBe(false);
+      expect(screen.getByRole('button', { name: signOut })).toBeTruthy();
+      const clears = jest.mocked(clearSensitiveViews).mock.calls.length;
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(links.classList.contains('hidden')).toBe(false);
+      const current = nav.getByRole('link', { name: sessions });
+      current.addEventListener('click', (event) => event.preventDefault());
+      fireEvent.click(current);
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(links.classList.contains('hidden')).toBe(true);
+      expect(clearSensitiveViews).toHaveBeenCalledTimes(clears);
+      expect(api.bootstrap).toHaveBeenCalledTimes(1);
+      expect(api.logout).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([false, true])('restores navigation after breakpoint changes with CSS body fallback %s without rebootstrap or draft loss', async (bodyFallback) => {
+    let desktop = false;
+    const listeners = new Set<() => void>();
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: (query: string) => ({
+        media: query,
+        get matches() { return query === '(min-width: 1024px)' && desktop; },
+        addEventListener: (_type: string, listener: () => void) => {
+          if (query === '(min-width: 1024px)') listeners.add(listener);
+        },
+        removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+      }),
+    });
+    mockPathname = '/dashboard/profile';
+    render(
+      <PortalProvider>
+        <PrivateContent />
+        <input aria-label="Private draft" defaultValue="" />
+      </PortalProvider>
+    );
+    await screen.findByTestId('portal-ready');
+    const draft = screen.getByLabelText<HTMLInputElement>('Private draft');
+    fireEvent.change(draft, { target: { value: 'Draft kept in memory' } });
+    const toggle = screen.getByRole('button', { name: 'Current section: Profile' });
+    fireEvent.click(toggle);
+    toggle.focus();
+    const current = screen.getByRole('link', { name: 'Profile' });
+    if (bodyFallback) toggle.blur();
+    act(() => { desktop = true; listeners.forEach((listener) => listener()); });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(current);
+    if (bodyFallback) current.blur();
+    act(() => { desktop = false; listeners.forEach((listener) => listener()); });
+    expect(document.activeElement).toBe(toggle);
+    draft.focus();
+    act(() => { desktop = true; listeners.forEach((listener) => listener()); });
+    act(() => { desktop = false; listeners.forEach((listener) => listener()); });
+    expect(document.activeElement).toBe(draft);
+    expect(screen.getByLabelText('Private draft')).toBe(draft);
+    expect(draft.value).toBe('Draft kept in memory');
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(PortalClient).toHaveBeenCalledTimes(1);
+    expect(api.dispose).not.toHaveBeenCalled();
+  });
 });
 
 describe('protected portal bootstrap', () => {
@@ -221,12 +315,17 @@ describe('display preferences preserve session authority', () => {
     }
     const result = render(view('en'));
     await act(async () => undefined);
+    const navigation = screen.getByRole('button', { name: 'Current section: Overview' });
+    fireEvent.click(navigation);
+    expect(navigation.getAttribute('aria-expanded')).toBe('true');
     const draft = screen.getByRole<HTMLInputElement>('textbox', { name: 'Private draft' });
     fireEvent.change(draft, { target: { value: 'نام خصوصی ۱۲۳' } });
     const calls = jest.mocked(PortalClient).mock.calls.length;
     act(() => jest.advanceTimersByTime(59000));
     result.rerender(view('fa-IR'));
     expect(screen.getByRole('navigation', { name: 'ناوبری حساب' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'بخش فعلی: نمای کلی' })).toBe(navigation);
+    expect(navigation.getAttribute('aria-expanded')).toBe('true');
     expect(screen.getByRole('textbox', { name: 'Private draft' })).toBe(draft);
     expect(draft.value).toBe('نام خصوصی ۱۲۳');
     expect(jest.mocked(PortalClient)).toHaveBeenCalledTimes(calls);

@@ -18,6 +18,7 @@ import type {
 import type { PortalClient } from '../../_lib/portal/client';
 import { isAborted, PortalError } from '../../_lib/portal/errors';
 import { clearSensitiveViews } from '../../_lib/portal/invalidation';
+import { AdminResults } from './admin-results';
 import {
   auditQueryDefaults,
   auditQueryFromDraft,
@@ -25,12 +26,8 @@ import {
   type AuditQueryField,
 } from './audit-query-form';
 import {
-  queryCellClass,
   queryClearedMessage,
   queryFailureMessage,
-  queryHeadClass,
-  queryTableFrameClass,
-  revealQueryFocus,
   useQueryViewWork,
 } from './query-view-state';
 import { QueryUtcTime } from './query-view-time';
@@ -172,6 +169,7 @@ function AuditQuery({
     void readPage(submitted, { cursors, position: cursors.length - 1, dropped });
   }
 
+  const preview = auditQueryFromDraft(draft, limits).query;
   if (cleared) return <Feedback status={queryClearedMessage} />;
   return (
     <>
@@ -294,9 +292,22 @@ function AuditQuery({
           </div>
         </form>
         <Feedback status={status} error={error} />
-        {submitted && (
+        <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+          {preview && (
+            <p className="min-w-0 break-words rounded-md border p-3 text-sm text-muted-foreground"
+              data-testid="audit-draft-preview">
+              {t.rich('draftPreview', {
+                start: () => <QueryUtcTime value={preview.start_time} />,
+                end: () => <QueryUtcTime value={preview.end_time} />,
+                event: preview.event_type ?? t('all'),
+                eventValue: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+                size: String(preview.limit),
+              })}
+            </p>
+          )}
+          {submitted && (
           <p
-            className="break-words text-sm text-muted-foreground"
+            className="min-w-0 break-words rounded-md border p-3 text-sm text-muted-foreground"
             data-testid="audit-submitted-filters"
           >
             {t.rich('submitted', {
@@ -308,67 +319,33 @@ function AuditQuery({
               eventValue: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
             })}
           </p>
-        )}
+          )}
+        </div>
         {page && page.items.length > 0 && (
-          <div
-            role="region"
-            aria-label={t('region')}
-            tabIndex={0}
-            className={queryTableFrameClass}
-            onFocus={revealQueryFocus}
-          >
-            <table className="w-full min-w-[36rem] border-collapse">
-              <caption className="sr-only">{t('caption')}</caption>
-              <thead className="border-b bg-muted/40">
-                <tr>
-                  <th scope="col" className={queryHeadClass}>
-                    {t('eventTime')}
-                  </th>
-                  <th scope="col" className={queryHeadClass}>
-                    {t('eventType')}
-                  </th>
-                  <th scope="col" className={queryHeadClass}>
-                    {t('actionStatus')}
-                  </th>
-                  <th scope="col" className={queryHeadClass}>
-                    {t('sequence')}
-                  </th>
-                  <th scope="col" className={queryHeadClass}>
-                    {t('details')}
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {page.items.map((row) => (
-                  <tr key={row.id} data-testid="admin-audit-row">
-                    <td className={queryCellClass}>
-                      <QueryUtcTime value={row.timestamp} />
-                    </td>
-                    <th scope="row" className={`${queryCellClass} max-w-60 break-all font-medium`}>
-                      <bdi dir="ltr">{row.event_type}</bdi>
-                    </th>
-                    <td className={`${queryCellClass} max-w-32 break-words`}>
-                      <bdi dir="ltr">{row.action_status}</bdi>
-                    </td>
-                    <td className={`${queryCellClass} break-all font-mono text-xs`}>
-                      <bdi dir="ltr">{row.seq}</bdi>
-                    </td>
-                    <td className={queryCellClass}>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className={controlClass}
-                        aria-label={t('viewDetails', { sequence: row.seq })}
-                        onClick={() => setDetail(row)}
-                      >
-                        {t('details')}
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <AdminResults label={t('region')} caption={t('caption')} width={36}
+            viewLabel={t('resultView')} compactLabel={t('compactRows')} tableLabel={t('tableView')}
+            columns={[
+              { id: 'event', label: t('eventType'), rowHeader: true, wide: true },
+              { id: 'time', label: t('eventTime') },
+              { id: 'status', label: t('actionStatus') },
+              { id: 'sequence', label: t('sequence') },
+              { id: 'details', label: t('details'), wide: true },
+            ]}
+            rows={page.items.map((row) => ({
+              id: row.id, testId: 'admin-audit-row',
+              cells: [
+                <bdi key="event" dir="ltr" className="break-all">{row.event_type}</bdi>,
+                <QueryUtcTime key="time" value={row.timestamp} />,
+                <bdi key="status" dir="ltr" className="break-all">{row.action_status}</bdi>,
+                <bdi key="sequence" dir="ltr" className="break-all font-mono text-xs">{row.seq}</bdi>,
+                <Button key="details" type="button" variant="outline" className={controlClass}
+                  data-focus-return={`audit-details:${row.id}`}
+                  aria-label={t('viewDetails', { sequence: row.seq })} onClick={() => setDetail(row)}>
+                  {t('details')}
+                </Button>,
+              ],
+            }))}
+          />
         )}
         {page?.items.length === 0 && <p className="text-sm">{t('empty')}</p>}
         {page && submitted && (

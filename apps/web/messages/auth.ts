@@ -27,21 +27,21 @@ export const authEn = {
       existing: 'Already have an account?',
     },
     forgot: {
-      metadata: 'Reset your password | Hatef Identity',
-      title: 'Reset your password',
-      description: 'Enter your primary email address to request a password reset link.',
+      metadata: 'Password reset unavailable | Hatef Identity',
+      title: 'Password reset unavailable',
+      description: 'Password reset is not available. No reset email can be requested here.',
     },
     reset: {
-      metadata: 'Set a new password | Hatef Identity',
-      title: 'Set a new password',
+      metadata: 'Password reset unavailable | Hatef Identity',
+      title: 'Password reset unavailable',
       description:
-        'Choose a new password for your account. Reset-link verification is not connected yet.',
+        'Password reset is not available. This page cannot verify a reset link or change a password.',
     },
     totp: {
-      metadata: 'Verify authenticator code | Hatef Identity',
-      title: 'Verify your authenticator code',
+      metadata: 'Authenticator sign-in unavailable | Hatef Identity',
+      title: 'Authenticator sign-in unavailable',
       description:
-        'Use the current code from your authenticator app. No verification session is connected to this preview.',
+        'Authenticator-code sign-in is not available on this page. Do not enter a code here.',
     },
     passkey: {
       metadata: 'Sign in with a passkey | Hatef Identity',
@@ -78,6 +78,10 @@ export const authEn = {
   preview: {
     title: 'UI preview',
     notice: 'This form is not connected yet. Do not enter real credentials.',
+  },
+  availability: {
+    notice:
+      'Use a passkey to sign in to an existing account, or create an account with email, phone and passkey verification.',
   },
   validation: {
     emailRequired: 'Enter your email address.',
@@ -116,7 +120,7 @@ export const authEn = {
       error: 'We could not verify the passkey. Please try again.',
       cancelled: 'The passkey request was cancelled. You can try again.',
       unsupported:
-        'Passkeys are not supported in this browser. Try another browser or use the password form.',
+        'Passkeys are not supported in this browser. Try a browser that supports passkeys.',
     },
     totp: {
       label: 'Authenticator verification',
@@ -153,7 +157,9 @@ export const authEn = {
     pending: 'Complete the passkey prompt. Your session will be checked before opening the portal.',
     verifying: 'Verifying passkey...',
     cancel: 'Cancel sign in',
-    cancelled: 'The passkey request was cancelled. Start again to sign in.',
+    cancelled: 'Sign-in cancelled here before passkey verification was sent. Start again when you are ready.',
+    notCompleted: 'Sign-in was not completed. The passkey prompt may have closed, timed out, or been unavailable. Start again when you are ready.',
+    unconfirmed: 'Sign-in outcome not confirmed. Verification may already have completed, but this page could not confirm your session. The request has not been retried. Start a new sign-in only when you are ready.',
     noScript:
       'JavaScript is required for secure passkey sign-in. No credentials are submitted without it.',
   },
@@ -161,7 +167,7 @@ export const authEn = {
     closed:
       'This page no longer holds a usable recovery link. Reopen the link in your recovery email to continue.',
     hidden:
-      'Verification was cleared when this page was hidden. Start account recovery again for fresh verification.',
+      'The code and verification were cleared when this page was hidden. Return here and start again for fresh verification. If the page no longer holds the link, reopen it from your recovery email. The original five-minute page limit and the deadline in your email are unchanged.',
     opaque:
       'The recovery link or verification could not be accepted. Use the link in your recovery email and fresh verification. This page cannot identify the reason.',
     rateLimited:
@@ -181,13 +187,15 @@ export const authEn = {
     signIn: 'Sign in to your account',
     intro:
       'Opening this page does not recover your account. Start explicitly when you are ready. The link is held privately in this page for at most five minutes, without extending the deadline in your email. Leaving or reloading clears it.',
+    samePhone:
+      'If verification asks for a code from an authenticator on this phone, open the authenticator first, then return here and start fresh verification. Enter the current code or use one-time-code autofill if available. Switching apps after starting clears the code and verification; start again on return. The service chooses the verification method.',
     passkeyHint:
       'Use your account passkey with a device PIN or biometric verification. The service selected this verification method; a touch-only key cannot complete recovery.',
     passkey: 'Recover with a passkey',
     form: 'Account recovery verification',
     code: 'Authenticator code',
     codeHint:
-      'Use the six-digit code from your enrolled authenticator app. Switching apps clears this form but keeps the link for the remaining five-minute limit. Start again on return for fresh options. Email, text-message and recovery codes are not accepted here.',
+      'Use the six-digit code from your enrolled authenticator app. English, Persian and Arabic-Indic digits are accepted. If you need to switch apps, return here and start fresh verification before entering the code. The link is kept only for the remainder of its original five-minute page limit. Email, text-message and recovery codes are not accepted here.',
     recover: 'Recover account',
     start: 'Start account recovery',
     cancelled: 'Verification cancelled. Start again when you are ready.',
@@ -224,21 +232,21 @@ export const authFa = {
       existing: 'از قبل حساب دارید؟',
     },
     forgot: {
-      metadata: 'بازنشانی گذرواژه | هویت هاتف',
-      title: 'گذرواژهٔ خود را بازنشانی کنید',
-      description: 'برای درخواست پیوند بازنشانی گذرواژه، ایمیل اصلی خود را وارد کنید.',
+      metadata: 'بازنشانی گذرواژه در دسترس نیست | هویت هاتف',
+      title: 'بازنشانی گذرواژه در دسترس نیست',
+      description: 'بازنشانی گذرواژه در دسترس نیست. در اینجا نمی‌توان ایمیل بازنشانی درخواست کرد.',
     },
     reset: {
-      metadata: 'تعیین گذرواژهٔ جدید | هویت هاتف',
-      title: 'تعیین گذرواژهٔ جدید',
+      metadata: 'بازنشانی گذرواژه در دسترس نیست | هویت هاتف',
+      title: 'بازنشانی گذرواژه در دسترس نیست',
       description:
-        'گذرواژهٔ جدیدی برای حساب خود انتخاب کنید. بررسی پیوند بازنشانی هنوز متصل نشده است.',
+        'بازنشانی گذرواژه در دسترس نیست. این صفحه نمی‌تواند پیوند بازنشانی را تأیید کند یا گذرواژه را تغییر دهد.',
     },
     totp: {
-      metadata: 'تأیید کد رمزساز | هویت هاتف',
-      title: 'کد رمزساز خود را تأیید کنید',
+      metadata: 'ورود با رمزساز در دسترس نیست | هویت هاتف',
+      title: 'ورود با رمزساز در دسترس نیست',
       description:
-        'از کد فعلی برنامهٔ رمزساز خود استفاده کنید. هیچ نشست تأیید هویتی به این پیش‌نمایش متصل نیست.',
+        'ورود با کد رمزساز در این صفحه در دسترس نیست. در اینجا کدی وارد نکنید.',
     },
     passkey: {
       metadata: 'ورود با کلید عبور | هویت هاتف',
@@ -275,6 +283,10 @@ export const authFa = {
   preview: {
     title: 'پیش‌نمایش رابط کاربری',
     notice: 'این فرم هنوز متصل نیست. اطلاعات ورود واقعی را وارد نکنید.',
+  },
+  availability: {
+    notice:
+      'برای ورود به حساب موجود از کلید عبور استفاده کنید، یا با تأیید ایمیل، تلفن و کلید عبور حساب بسازید.',
   },
   validation: {
     emailRequired: 'نشانی ایمیل خود را وارد کنید.',
@@ -313,7 +325,7 @@ export const authFa = {
       error: 'کلید عبور تأیید نشد. دوباره تلاش کنید.',
       cancelled: 'درخواست کلید عبور لغو شد. می‌توانید دوباره تلاش کنید.',
       unsupported:
-        'این مرورگر از کلید عبور پشتیبانی نمی‌کند. مرورگر دیگری یا فرم گذرواژه را امتحان کنید.',
+        'این مرورگر از کلید عبور پشتیبانی نمی‌کند. مرورگری را امتحان کنید که از کلید عبور پشتیبانی کند.',
     },
     totp: {
       label: 'تأیید با رمزساز',
@@ -349,7 +361,9 @@ export const authFa = {
     pending: 'درخواست کلید عبور را تکمیل کنید. پیش از بازشدن درگاه، نشست شما بررسی می‌شود.',
     verifying: 'در حال تأیید کلید عبور...',
     cancel: 'لغو ورود',
-    cancelled: 'درخواست کلید عبور لغو شد. برای ورود دوباره آغاز کنید.',
+    cancelled: 'ورود در این صفحه پیش از ارسال تأیید کلید عبور لغو شد. هنگامی که آماده هستید دوباره آغاز کنید.',
+    notCompleted: 'ورود کامل نشد. ممکن است درخواست کلید عبور بسته شده، مهلتش پایان یافته یا در دسترس نبوده باشد. هنگامی که آماده هستید دوباره آغاز کنید.',
+    unconfirmed: 'نتیجهٔ ورود تأیید نشده است. ممکن است تأیید هویت انجام شده باشد، اما این صفحه نتوانست نشست شما را تأیید کند. درخواست تکرار نشده است. ورود جدید را فقط هنگامی که آماده هستید آغاز کنید.',
     noScript:
       'برای ورود امن با کلید عبور، جاوااسکریپت لازم است. بدون آن هیچ اطلاعات ورودی ارسال نمی‌شود.',
   },
@@ -357,7 +371,7 @@ export const authFa = {
     closed:
       'این صفحه دیگر پیوند بازیابی قابل استفاده‌ای ندارد. برای ادامه، پیوند را از ایمیل بازیابی دوباره باز کنید.',
     hidden:
-      'با پنهان‌شدن صفحه، تأیید هویت پاک شد. برای تأیید هویت تازه، بازیابی حساب را دوباره آغاز کنید.',
+      'با پنهان‌شدن صفحه، کد و تأیید هویت پاک شدند. به اینجا بازگردید و برای تأیید هویت تازه دوباره آغاز کنید. اگر صفحه دیگر پیوند را نگه نمی‌دارد، آن را از ایمیل بازیابی دوباره باز کنید. مهلت اولیهٔ پنج‌دقیقه‌ای صفحه و مهلت درج‌شده در ایمیل تغییر نکرده‌اند.',
     opaque:
       'پیوند بازیابی یا تأیید هویت پذیرفته نشد. از پیوند ایمیل بازیابی و تأیید هویت تازه استفاده کنید. این صفحه نمی‌تواند علت را مشخص کند.',
     rateLimited:
@@ -377,13 +391,15 @@ export const authFa = {
     signIn: 'ورود به حساب شما',
     intro:
       'بازکردن این صفحه حساب شما را بازیابی نمی‌کند. هنگامی که آماده هستید، صریحاً آغاز کنید. پیوند حداکثر پنج دقیقه به‌صورت خصوصی در این صفحه نگه داشته می‌شود و مهلت ایمیل شما را تمدید نمی‌کند. ترک یا بارگذاری دوبارهٔ صفحه آن را پاک می‌کند.',
+    samePhone:
+      'اگر تأیید هویت به کد برنامهٔ رمزساز روی همین تلفن نیاز دارد، ابتدا رمزساز را باز کنید، سپس به اینجا بازگردید و تأیید هویت تازه را آغاز کنید. کد فعلی را وارد کنید یا در صورت دسترسی از تکمیل خودکار کد یک‌بارمصرف استفاده کنید. جابه‌جایی بین برنامه‌ها پس از آغاز، کد و تأیید هویت را پاک می‌کند؛ پس از بازگشت دوباره آغاز کنید. سرویس روش تأیید هویت را انتخاب می‌کند.',
     passkeyHint:
       'از کلید عبور حساب خود همراه با پین دستگاه یا تأیید زیست‌سنجی استفاده کنید. سرویس این روش تأیید هویت را انتخاب کرده است؛ کلید صرفاً لمسی نمی‌تواند بازیابی را تکمیل کند.',
     passkey: 'بازیابی با کلید عبور',
     form: 'تأیید هویت بازیابی حساب',
     code: 'کد رمزساز',
     codeHint:
-      'از کد شش‌رقمی برنامهٔ رمزساز ثبت‌شدهٔ خود استفاده کنید. جابه‌جایی بین برنامه‌ها این فرم را پاک می‌کند اما پیوند را تا پایان مهلت پنج‌دقیقه‌ای نگه می‌دارد. پس از بازگشت، برای گزینه‌های تازه دوباره آغاز کنید. کد ایمیل، پیامک و بازیابی در اینجا پذیرفته نمی‌شود.',
+      'از کد شش‌رقمی برنامهٔ رمزساز ثبت‌شدهٔ خود استفاده کنید. رقم‌های انگلیسی، فارسی و عربی پذیرفته می‌شوند. اگر باید بین برنامه‌ها جابه‌جا شوید، پس از بازگشت و پیش از واردکردن کد، تأیید هویت تازه را آغاز کنید. پیوند فقط تا پایان مهلت اولیهٔ پنج‌دقیقه‌ای صفحه نگه داشته می‌شود. کد ایمیل، پیامک و بازیابی در اینجا پذیرفته نمی‌شود.',
     recover: 'بازیابی حساب',
     start: 'آغاز بازیابی حساب',
     cancelled: 'تأیید هویت لغو شد. هنگامی که آماده هستید دوباره آغاز کنید.',

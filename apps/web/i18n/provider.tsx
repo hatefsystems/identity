@@ -1,14 +1,36 @@
 'use client';
 
-import { createContext, useContext, type ReactNode } from 'react';
+import { createContext, useContext, useLayoutEffect, type ReactNode } from 'react';
 import { NextIntlClientProvider } from 'next-intl';
-import { timeZones as defaultTimeZones, type DisplayPreferences } from './config';
+import { timeZones as defaultTimeZones, type DisplayPreferences, type ThemePreference } from './config';
 import type { Messages } from './messages';
 import { formats } from './formats';
 import { commonEn, commonFa } from '../messages/common';
 
 const DisplayContext = createContext<DisplayPreferences | undefined>(undefined);
 const TimeZonesContext = createContext<readonly string[]>(defaultTimeZones);
+
+function AppearanceController({ theme }: { theme: ThemePreference }) {
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.setAttribute('data-theme', theme);
+    if (theme !== 'system') {
+      root.classList.toggle('dark', theme === 'dark');
+      return undefined;
+    }
+    try {
+      const query = window.matchMedia('(prefers-color-scheme: dark)');
+      const apply = () => root.classList.toggle('dark', query.matches === true);
+      apply();
+      query.addEventListener('change', apply);
+      return () => query.removeEventListener('change', apply);
+    } catch {
+      root.classList.remove('dark');
+    }
+    return undefined;
+  }, [theme]);
+  return null;
+}
 
 export function DisplayProvider({
   children,
@@ -23,6 +45,7 @@ export function DisplayProvider({
 }) {
   return (
     <DisplayContext.Provider value={preferences}>
+      <AppearanceController theme={preferences.theme} />
       <TimeZonesContext.Provider value={timeZones}>
         <NextIntlClientProvider
           locale={preferences.locale}

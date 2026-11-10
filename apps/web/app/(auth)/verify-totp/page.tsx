@@ -13,7 +13,7 @@ export default async function TotpPage() {
     <AuthCard
       title={t('pages.totp.title')}
       description={t('pages.totp.description')}
-      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
+      footer={<AuthLink href="/register">{t('home.register')}</AuthLink>}
     >
       <TotpScreen />
     </AuthCard>

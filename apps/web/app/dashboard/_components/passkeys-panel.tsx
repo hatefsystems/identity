@@ -40,6 +40,8 @@ export function PasskeysPanel() {
   const pinned = useRef<PasskeyAction | null>(null);
   const nameInput = useRef<HTMLInputElement>(null);
   const editInput = useRef<HTMLInputElement>(null);
+  const list = useRef<HTMLUListElement>(null);
+  const renamed = useRef<string | null>(null);
   const id = useId();
 
   useEffect(() => {
@@ -99,6 +101,15 @@ export function PasskeysPanel() {
       });
     return () => controller.abort();
   }, [client, attempt]);
+
+  useEffect(() => {
+    if (action || !renamed.current) return;
+    const row = [...(list.current?.querySelectorAll<HTMLElement>('[data-key-id]') ?? [])].find(
+      (element) => element.dataset.keyId === renamed.current
+    );
+    row?.querySelector<HTMLElement>('h3')?.focus();
+    renamed.current = null;
+  }, [keys, action]);
 
   function open(value: PasskeyAction) {
     if (pinned.current || blocked.current) return;
@@ -169,6 +180,7 @@ export function PasskeysPanel() {
         throwIfAborted(signal);
         invalidateRead();
         setKeys((items) => items?.map((item) => (item.id === key.id ? key : item)) ?? null);
+        renamed.current = key.id;
         setEditing(null);
         setStatus({ key: 'security.passkeys.renamed' });
       } else {
@@ -203,8 +215,20 @@ export function PasskeysPanel() {
         }
         status={status}
       />
+      <Button
+        type="button"
+        variant={needsRefresh ? 'default' : 'outline'}
+        className={controlClass}
+        disabled={Boolean(action)}
+        onClick={() => {
+          invalidateRead();
+          setAttempt((value) => value + 1);
+        }}
+      >
+        {t('security.passkeys.refresh')}
+      </Button>
       {keys && (
-        <ul className="divide-y rounded-lg border" aria-label={t('security.passkeys.list')}>
+        <ul ref={list} className="divide-y rounded-lg border" aria-label={t('security.passkeys.list')}>
           {keys.map((key) => (
             <li
               key={key.id}
@@ -214,7 +238,11 @@ export function PasskeysPanel() {
             >
               <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
                 <div className="min-w-0 space-y-1">
-                  <h3 dir="auto" className="break-words font-medium isolate">
+                  <h3
+                    dir="auto"
+                    tabIndex={-1}
+                    className="break-words font-medium isolate focus:outline-none"
+                  >
                     {key.name || t('security.passkeys.unnamed')}
                   </h3>
                   <p className="text-xs leading-relaxed text-muted-foreground">
@@ -272,7 +300,7 @@ export function PasskeysPanel() {
                     event.preventDefault();
                     rename();
                   }}
-                  className="space-y-3"
+                  className="max-w-xl space-y-3"
                 >
                   <Label htmlFor={`${id}-rename`}>{t('security.passkeys.name')}</Label>
                   <Input
@@ -295,7 +323,12 @@ export function PasskeysPanel() {
                     </p>
                   )}
                   <div className="flex flex-wrap gap-2">
-                    <Button type="submit" className={controlClass} disabled={needsRefresh}>
+                    <Button
+                      type="submit"
+                      variant="outline"
+                      className={controlClass}
+                      disabled={needsRefresh}
+                    >
                       {t('security.passkeys.saveName')}
                     </Button>
                     <Button
@@ -317,18 +350,6 @@ export function PasskeysPanel() {
       {keys?.length === 1 && (
         <p className="text-sm text-muted-foreground">{t('security.passkeys.last')}</p>
       )}
-      <Button
-        type="button"
-        variant="outline"
-        className={controlClass}
-        disabled={Boolean(action)}
-        onClick={() => {
-          invalidateRead();
-          setAttempt((value) => value + 1);
-        }}
-      >
-        {t('security.passkeys.refresh')}
-      </Button>
       <form
         aria-label={t('security.passkeys.add')}
         noValidate
@@ -336,7 +357,7 @@ export function PasskeysPanel() {
           event.preventDefault();
           add();
         }}
-        className="space-y-3 border-t pt-5"
+        className="max-w-xl space-y-3 border-t pt-5"
       >
         <Label htmlFor={`${id}-name`}>{t('security.passkeys.newName')}</Label>
         <Input
@@ -361,7 +382,12 @@ export function PasskeysPanel() {
             {message(nameError)}
           </p>
         )}
-        <Button type="submit" className={controlClass} disabled={!keys || needsRefresh}>
+        <Button
+          type="submit"
+          variant={keys?.length ? 'outline' : 'default'}
+          className={controlClass}
+          disabled={!keys || needsRefresh}
+        >
           {t('security.passkeys.add')}
         </Button>
       </form>

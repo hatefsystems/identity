@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { connect as tcpConnect, createServer } from 'node:net';
 import { request } from 'node:https';
 import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { connect, getCACertificates } from 'node:tls';
 import { PassThrough, Readable } from 'node:stream';
 import test from 'node:test';
@@ -31,6 +33,8 @@ import {
   registrationPasskeyEnvironment,
   registrationSecretEnvironmentValues,
   registrationChecks,
+  registrationAccessibleName,
+  nativeRegistrationDigits,
   registrationFailureDetails,
   registrationFailureMessage,
   registrationStartupFailure,
@@ -42,6 +46,8 @@ import {
   validateSMSIRRequest,
 } from './registration-browser.mjs';
 import { portalCleanup } from './portal-harness.mjs';
+import { registrationJourneys, registrationLocaleChecks, registrationLocales } from './acceptance-report.mjs';
+import { localizedText, setBrowserLocale } from './browser-localization.mjs';
 
 const token = randomBytes(32).toString('base64url');
 
@@ -632,13 +638,74 @@ test('OTP and pending-completion checks extend, never replace, the original inve
     'proof-storage-console-network-private',
     'verified-owned-teardown',
   ];
-  assert.equal(registrationChecks.length, retained.length + 2);
+  assert.equal(registrationChecks.length, retained.length + 8);
   for (const item of [
     ...retained,
     'corrected-otp-same-reference',
     'completion-pending-deadline-handoff',
+    'technical-email-ltr-roundtrip', 'native-numeric-ascii-wire', 'registration-phase-headings',
+    'email-tab-handoff', 'real-theme-preferences', 'registration-display-preferences',
   ])
     assert(registrationChecks.includes(item));
+});
+
+test('registration locale inventory requires both isolated full journeys and no unit-only substitutions', () => {
+  assert.deepEqual(registrationLocales, ['en', 'fa-IR']);
+  assert.deepEqual(registrationJourneys, ['desktop-light', 'desktop-dark', 'mobile-light', 'mobile-dark']);
+  assert.equal(new Set(registrationLocaleChecks).size, registrationLocaleChecks.length);
+  for (const check of registrationLocaleChecks) assert(registrationChecks.includes(check));
+  assert(!registrationLocaleChecks.includes('verified-owned-teardown'));
+  assert(!registrationLocaleChecks.includes('immutable-quality-image'));
+});
+
+test('registration has explicit independently checked English and Persian accessible names', () => {
+  const names = [
+    ['Email address', 'نشانی ایمیل'], ['Iranian mobile number', 'شمارهٔ همراه ایران'], ['SMS verification code', 'کد تأیید پیامکی'],
+    ['Start registration and send email', 'شروع ثبت‌نام و ارسال ایمیل'], ['Verify phone', 'تأیید تلفن'],
+    ['Verify email ownership', 'تأیید مالکیت ایمیل'], ['Check email verification', 'بررسی تأیید ایمیل'],
+    ['Send SMS code', 'ارسال کد پیامکی'], ['Send a new SMS code', 'ارسال کد پیامکی تازه'],
+    ['Create passkey and complete registration', 'ساخت کلید عبور و تکمیل ثبت‌نام'],
+    ['Check registration result', 'بررسی نتیجهٔ ثبت‌نام'], ['Sign in with your passkey', 'ورود با کلید عبور'],
+    ['Create your account', 'حساب خود را ایجاد کنید'], ['Verify your email', 'ایمیل خود را تأیید کنید'],
+    ['Verify your mobile number', 'شمارهٔ همراه خود را تأیید کنید'], ['Create your passkey', 'کلید عبور خود را بسازید'],
+    ['Check registration outcome', 'نتیجهٔ ثبت‌نام را بررسی کنید'], ['Account created', 'حساب ساخته شد'],
+    ['Email verified', 'ایمیل تأیید شد'], ['Email verification unavailable', 'تأیید ایمیل در دسترس نیست'],
+    ['Return to the original registration tab and choose Check email verification there.', 'به زبانهٔ اولیهٔ ثبت‌نام برگردید و «بررسی تأیید ایمیل» را در آنجا انتخاب کنید.'],
+  ];
+  try {
+    setBrowserLocale('fa-IR');
+    for (const [en, fa] of names) {
+      assert.equal(registrationAccessibleName(en, 'en'), en);
+      assert.equal(registrationAccessibleName(en, 'fa-IR'), fa);
+      assert.match(fa, localizedText(en));
+    }
+  } finally { setBrowserLocale('en'); }
+  assert.throws(() => registrationAccessibleName('private@example.test', 'fa-IR'));
+  assert.throws(() => registrationAccessibleName('Email address', 'ar'));
+});
+
+test('native registration input fixtures retain six digits and leading zeroes without changing expected provider bytes', () => {
+  assert.equal(nativeRegistrationDigits('000123'), '۰٠0۱٢3');
+  assert.equal(nativeRegistrationDigits('09123456789'), '۰٩1۲٣4۵٦7۸٩');
+  assert.match(nativeRegistrationDigits('+989123456789'), /^\+[0-9۰-۹٠-٩]{12}$/);
+  for (const value of ['۰۱۲۳۴۵', '012 345', '12a456', 123456]) assert.throws(() => nativeRegistrationDigits(value));
+});
+
+test('bare Node controller admission has no browser catalog/npm dependency or fixture side effects', async () => {
+  const parent = resolve(tmpdir(), 'kilo');
+  await mkdir(parent, { recursive: true });
+  const directory = await mkdtemp(resolve(parent, 'registration-controller-import-'));
+  try {
+    for (const name of ['registration-browser.mjs', 'acceptance-report.mjs', 'portal-harness.mjs', 'portal-mail-sink.mjs', 'release-images.mjs']) {
+      await writeFile(resolve(directory, name), await readFile(new URL(name, import.meta.url)), { mode: 0o600 });
+    }
+    const result = spawnSync(process.execPath, [resolve(directory, 'registration-browser.mjs'), '--controller'], {
+      env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }, encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout.trim(), 'Registration failure stage=controller check=controller-mode cleanup=incomplete.');
+    assert.equal(result.stderr.trim(), 'Registration browser acceptance failed [controller/controller-mode]; private diagnostics suppressed.');
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('corrected OTP requires the original reference and no additional delivery', () => {

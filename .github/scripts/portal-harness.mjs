@@ -380,13 +380,23 @@ async function waitFor(check, description, timeout = 60_000, lifecycle) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
-async function freePort() {
-  const server = tcpServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
-  return port;
+export async function freePorts(count) {
+  assert(Number.isInteger(count) && count > 0 && count <= 8, 'Invalid fixture port group');
+  const servers = [], ports = [];
+  try {
+    // Hold every listener until the whole group exists, so the kernel cannot
+    // immediately return a released port to another replica in the same run.
+    for (let index = 0; index < count; index++) {
+      const server = tcpServer();
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      servers.push(server);
+      ports.push(server.address().port);
+    }
+    return ports;
+  } finally {
+    await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+  }
 }
 
 function cleanEnvironment() {
@@ -478,7 +488,7 @@ export async function startPortalServices({ integration = false, lifecycle, inte
       const id = restartBroker ? 'admin-test-nats' : `${name}-${suffix}`;
       // Docker reassigns automatic host bindings on restart. Explicit bindings
       // must be owned via create before a potentially failing port-binding start.
-      const hostPorts = restartBroker ? await Promise.all(ports.map(() => freePort())) : ports.map(() => '');
+      const hostPorts = restartBroker ? await freePorts(ports.length) : ports.map(() => '');
       if (restartBroker) assert.equal(new Set(hostPorts).size, ports.length, 'Disposable broker ports overlapped');
       const owned = createOwnedDockerResource('container', ['--name', id, '--network', name,
         '--label', restartBroker ? 'ldp.task=6.3' : 'ldp.task=7.5',
@@ -507,7 +517,7 @@ export async function startPortalServices({ integration = false, lifecycle, inte
     await waitFor(() => operation(['exec', postgres.id, 'pg_isready', '-h', '127.0.0.1', '-U', 'portal', '-d', database], true).status === 0, 'disposable PostgreSQL', 60_000, lifecycle);
     await waitFor(() => operation(['exec', redis.id, 'redis-cli', 'ping'], true).stdout.trim() === 'PONG', 'disposable Redis', 60_000, lifecycle);
     await waitFor(async () => {
-      if (internal) return operation(['exec', nats.id, '/bin/busybox', 'wget', '-q', '-O', '-',
+      if (internal) return operation(['exec', nats.id, '/bin/busybox', 'wget', '-Y', 'off', '-q', '-O', '-',
         'http://127.0.0.1:8222/healthz?js-enabled-only=true'], true).status === 0;
       try {
         const response = await fetch(`http://127.0.0.1:${nats.ports[8222]}/healthz?js-enabled-only=true`, { signal: AbortSignal.timeout(1000), redirect: 'error' });
@@ -938,8 +948,8 @@ export async function startPortalHarness({ admin = false } = {}) {
     const tlsSPKI = createHash('sha256')
       .update(new X509Certificate(tls.cert).publicKey.export({ type: 'spki', format: 'der' }))
       .digest('base64');
-    const apiPorts = [await freePort(), await freePort()];
-    const nextPort = await freePort();
+    const [apiA, apiB, nextPort] = await freePorts(3);
+    const apiPorts = [apiA, apiB];
     let sequence = 0;
     const routeEvidence = new Map();
     const originEvidence = { unsafe: 0, anonymous: 0, mismatched: 0, referrers: 0, admin: 0, legal: 0 };

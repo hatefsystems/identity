@@ -236,10 +236,12 @@ describe('explicit factor verification', () => {
     expect(document.activeElement).toBe(input);
     expect(api.complete).not.toHaveBeenCalled();
     for (const value of [
-      '۰۱۲۳۴۵',
-      '٠١٢٣٤٥',
       '０１２３４５',
-      '01۲345',
+      '01234',
+      '0123456',
+      '01-234',
+      '01 234',
+      '01234x',
       '\u202e012345',
       '012345\u2069',
     ]) {
@@ -275,6 +277,21 @@ describe('explicit factor verification', () => {
     expect(screen.queryByRole('link', { name: /dashboard/i })).toBeNull();
     expect(api.options).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['۰۱۲۳۴۵', '٠١٢٣٤٥', '0۱٢34۵'])(
+    'normalizes supported typed or pasted digits to exact ASCII proof bytes', async (value) => {
+      render(page());
+      const input = await totp();
+      fireEvent.change(input, { target: { value } });
+      expect(input.value).toBe('012345');
+      expect(input.dir).toBe('ltr');
+      expect(api.complete).not.toHaveBeenCalled();
+      fireEvent.submit(screen.getByRole('form', { name: 'Account recovery verification' }));
+      await waitFor(() => expect(api.complete).toHaveBeenCalledTimes(1));
+      expect(api.complete.mock.calls[0][0]).toEqual({ token, factor: 'totp', code: '012345' });
+      expect(input.value).toBe('');
+    }
+  );
 
   it('uses only server-selected WebAuthn with required UV and no TOTP fallback', async () => {
     const options = {
@@ -360,6 +377,8 @@ describe('bounded private-memory lifetime', () => {
     expect(oldInput.value).toBe('');
     expect(screen.queryByLabelText('Authenticator code')).toBeNull();
     show();
+    expect(screen.getByRole('alert').textContent).toContain('start again for fresh verification');
+    expect(screen.getByRole('alert').textContent).toContain('original five-minute page limit');
     expect(api.options).toHaveBeenCalledTimes(1);
     const newInput = await totp();
     expect(newInput).not.toBe(oldInput);
@@ -548,6 +567,23 @@ describe('uncertain completion', () => {
 });
 
 describe('recovery presentation changes', () => {
+  it.each([
+    ['en', 'Start account recovery', 'Authenticator code', 'Account recovery verification'],
+    ['fa-IR', 'آغاز بازیابی حساب', 'کد رمزساز', 'تأیید هویت بازیابی حساب'],
+  ] as const)('keeps canonical code bytes and fresh-start guidance in %s', async (locale, startLabel, codeLabel, formLabel) => {
+    const AccountRecovery = (await import('../app/(auth)/_components/account-recovery')).AccountRecovery;
+    render(<AccountRecovery />, { locale });
+    fireEvent.click(screen.getByRole('button', { name: startLabel }));
+    const input = await screen.findByLabelText<HTMLInputElement>(codeLabel, { exact: true });
+    fireEvent.change(input, { target: { value: '0۱٢34۵' } });
+    expect(input.value).toBe('012345');
+    expect(input.dir).toBe('ltr');
+    fireEvent.submit(screen.getByRole('form', { name: formLabel }));
+    await waitFor(() => expect(api.complete).toHaveBeenCalledTimes(1));
+    expect(api.complete.mock.calls[0][0]).toEqual({ token, factor: 'totp', code: '012345' });
+    expect(input.value).toBe('');
+  });
+
   it('retains an active token, pending read and ASCII code without resetting its original memory deadline', async () => {
     jest.useFakeTimers();
     const options = deferred<ReclaimOptions>();

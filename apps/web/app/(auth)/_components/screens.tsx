@@ -1,15 +1,15 @@
 'use client';
 
 import { useTranslations } from 'next-intl';
+import { Button } from '@hatef/ui';
+import Link from 'next/link';
 
-import { ForgotPasswordForm, LoginForm, ResetPasswordForm, TotpForm } from './forms';
 import { PasskeyLogin } from '../../_components/passkey-login';
 import { Registration } from '../../_components/registration';
 
-// Password and reset forms remain unavailable; signup is passkey-only.
 export function LoginScreen() {
   const t = useTranslations();
-  return <LoginForm passkeyAction={<PasskeyLogin label={t('auth.passkey.continue')} />} />;
+  return <PasskeyLogin label={t('auth.passkey.continue')} />;
 }
 
 export function RegistrationScreen() {
@@ -21,13 +21,27 @@ export function PasskeyScreen() {
 }
 
 export function TotpScreen() {
-  return <TotpForm />;
+  return <UnavailableAuthScreen />;
 }
 
 export function ForgotPasswordScreen() {
-  return <ForgotPasswordForm />;
+  return <UnavailableAuthScreen />;
 }
 
 export function ResetPasswordScreen() {
-  return <ResetPasswordForm />;
+  return <UnavailableAuthScreen />;
+}
+
+function UnavailableAuthScreen() {
+  const t = useTranslations();
+  return (
+    <div className="space-y-5">
+      <p className="rounded-md bg-muted/50 p-3 text-sm leading-relaxed">
+        {t('auth.availability.notice')}
+      </p>
+      <Button asChild className="h-auto min-h-11 w-full whitespace-normal">
+        <Link href="/login">{t('auth.passkey.continue')}</Link>
+      </Button>
+    </div>
+  );
 }

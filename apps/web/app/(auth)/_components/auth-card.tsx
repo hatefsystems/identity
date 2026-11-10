@@ -20,7 +20,7 @@ export function AuthCard({
   footer,
 }: {
   title: string;
-  description: string;
+  description?: string;
   children: ReactNode;
   footer: ReactNode;
 }) {
@@ -28,7 +28,9 @@ export function AuthCard({
     <Card className="w-full min-w-0">
       <CardHeader className="space-y-3 p-6 sm:p-8">
         <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-        <CardDescription className="leading-relaxed">{description}</CardDescription>
+        {description && (
+          <CardDescription className="leading-relaxed">{description}</CardDescription>
+        )}
       </CardHeader>
       <CardContent className="space-y-5 px-6 pb-6 sm:px-8 sm:pb-8">{children}</CardContent>
       <CardFooter className="flex-wrap justify-center gap-x-1 border-t bg-muted/30 px-4 py-3 text-center text-sm text-muted-foreground">

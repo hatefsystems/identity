@@ -13,7 +13,7 @@ export default async function ResetPasswordPage() {
     <AuthCard
       title={t('pages.reset.title')}
       description={t('pages.reset.description')}
-      footer={<AuthLink href="/login">{t('pages.returnSignIn')}</AuthLink>}
+      footer={<AuthLink href="/register">{t('home.register')}</AuthLink>}
     >
       <ResetPasswordScreen />
     </AuthCard>

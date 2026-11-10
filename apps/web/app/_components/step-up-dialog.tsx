@@ -5,6 +5,7 @@ import { useTranslations } from 'next-intl';
 import type { Message, MessageDescriptor } from '../../i18n/messages';
 import { useMessage } from '../../i18n/use-message';
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { normalizeNumericInput } from '../_lib/numeric-input';
 import type { StepUpChallenge, StepUpGrant } from '../_lib/portal/contracts';
 import type { StepUpIntent } from '../_lib/portal/action-intent';
 import { errorMessage, isAborted, PortalError, throwIfAborted } from '../_lib/portal/errors';
@@ -23,7 +24,9 @@ export function StepUpDialog({
   intent,
   resumeMethod,
   mode = 'default',
+  layout = 'default',
   verifiedContent,
+  verifiedActions,
   verifiedStatus = { key: 'security.stepUp.applying' },
 }: {
   title: string;
@@ -34,15 +37,18 @@ export function StepUpDialog({
   intent?: StepUpIntent;
   resumeMethod?: 'totp';
   mode?: 'default' | 'webauthn-only';
+  layout?: 'default' | 'review';
   // Keep onAuthorized pending for the entire confirmation stage. Its finally
   // block owns the grant; callers must never retain authority after it returns.
   verifiedContent?: ReactNode;
+  verifiedActions?: ReactNode;
   verifiedStatus?: MessageDescriptor;
 }) {
   const t = useTranslations('security.stepUp');
   const message = useMessage();
   const { client, rememberStepUp } = usePortal();
   const webauthnOnly = mode === 'webauthn-only';
+  const review = layout === 'review';
   const [challenge, setChallenge] = useState<StepUpChallenge | null>(null);
   const [method, setMethod] = useState<'webauthn' | 'totp'>(
     webauthnOnly ? 'webauthn' : (resumeMethod ?? 'webauthn')
@@ -144,7 +150,8 @@ export function StepUpDialog({
   async function verify() {
     if (busy.current || !challenge || !lifetime.current) return;
     if (webauthnOnly && method !== 'webauthn') return;
-    if (method === 'totp' && !/^[0-9]{6}$/.test(code)) {
+    const normalizedCode = normalizeNumericInput(input.current?.value ?? code);
+    if (method === 'totp' && !/^[0-9]{6}$/.test(normalizedCode)) {
       setCodeError({ key: 'security.stepUp.codeError' });
       input.current?.focus();
       return;
@@ -167,7 +174,7 @@ export function StepUpDialog({
               method: 'webauthn' as const,
               assertion: await usePasskey(challenge.webauthn, signal, false, true),
             }
-          : { method: 'totp' as const, code };
+          : { method: 'totp' as const, code: normalizedCode };
       throwIfAborted(signal);
       grant = await client.stepUpVerify(proof, signal);
       authority.current = grant;
@@ -212,8 +219,64 @@ export function StepUpDialog({
     }
   }
 
+  const continueControl = (
+    <Button
+      type="button"
+      className={`${controlClass} w-full`}
+      disabled={Boolean(pending) || verified}
+      onClick={start}
+    >
+      {t(error ? 'restart' : 'continue')}
+    </Button>
+  );
+  const passkeyControl = (
+    <Button
+      type="button"
+      className={`${controlClass} w-full`}
+      onClick={verify}
+      disabled={Boolean(pending)}
+    >
+      {t('passkey')}
+    </Button>
+  );
+  const codeControl = (
+    <Button
+      type="submit"
+      form={review ? `${id}-form` : undefined}
+      className={`${controlClass} w-full`}
+      disabled={Boolean(pending)}
+    >
+      {t('verifyCode')}
+    </Button>
+  );
+  const cancelControl = (
+    <Button type="button" variant="ghost" className={`${controlClass} w-full`} onClick={cancel}>
+      {t('cancel')}
+    </Button>
+  );
+
   return (
-    <NativeDialog title={title} description={description} onCancel={cancel} testId="stepup-dialog">
+    <NativeDialog
+      title={title}
+      description={description}
+      onCancel={cancel}
+      testId="stepup-dialog"
+      layout={layout}
+      footer={
+        review && (
+          <>
+            {verified
+              ? verifiedActions
+              : !challenge
+                ? continueControl
+                : method === 'webauthn'
+                  ? passkeyControl
+                  : codeControl}
+            {cancelControl}
+          </>
+        )
+      }
+    >
       <Feedback error={error} status={verified ? verifiedStatus : pending} />
       {!verified && !webauthnOnly && resumeMethod === 'totp' && (
         <p className="text-sm text-muted-foreground">
@@ -223,30 +286,17 @@ export function StepUpDialog({
       {verified && verifiedContent ? (
         verifiedContent
       ) : !challenge ? (
-        <Button
-          type="button"
-          className={`${controlClass} w-full`}
-          disabled={Boolean(pending) || verified}
-          onClick={start}
-        >
-          {t(error ? 'restart' : 'continue')}
-        </Button>
+        !review && continueControl
       ) : (
         <div className="space-y-4">
           <p className="text-sm">
             {t('singleUse')}
           </p>
           {method === 'webauthn' ? (
-            <Button
-              type="button"
-              className={`${controlClass} w-full`}
-              onClick={verify}
-              disabled={Boolean(pending)}
-            >
-              {t('passkey')}
-            </Button>
+            !review && passkeyControl
           ) : (
             <form
+              id={`${id}-form`}
               aria-label={t('form')}
               noValidate
               onSubmit={(event) => {
@@ -268,7 +318,7 @@ export function StepUpDialog({
                 maxLength={6}
                 value={code}
                 onChange={(event) => {
-                  setCode(event.target.value);
+                  setCode(normalizeNumericInput(event.target.value));
                   setCodeError('');
                 }}
                 disabled={Boolean(pending)}
@@ -284,13 +334,7 @@ export function StepUpDialog({
                   {message(codeError)}
                 </p>
               )}
-              <Button
-                type="submit"
-                className={`${controlClass} w-full`}
-                disabled={Boolean(pending)}
-              >
-                {t('verifyCode')}
-              </Button>
+              {!review && codeControl}
             </form>
           )}
           {!webauthnOnly && challenge.methods.includes('totp') && method !== 'totp' && (
@@ -317,9 +361,7 @@ export function StepUpDialog({
           )}
         </div>
       )}
-      <Button type="button" variant="ghost" className={`${controlClass} w-full`} onClick={cancel}>
-        {t('cancel')}
-      </Button>
+      {!review && cancelControl}
     </NativeDialog>
   );
 }

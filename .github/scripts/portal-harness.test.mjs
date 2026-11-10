@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { setBrowserLocale } from './browser-localization.mjs';
 import childProcess, { spawnSync } from 'node:child_process';
 import { webcrypto } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
@@ -20,6 +21,7 @@ import {
   capturePortalJSON,
   fixtureSecretValues,
   fixtureRouteReferences,
+  freePorts,
   integrationTargets,
   integrationInvocation,
   acceptanceLifecycle,
@@ -42,14 +44,34 @@ import {
 } from './portal-harness.mjs';
 import { identityGoModule, integrationPackages, racePackages, raceToolchainProfile } from './acceptance-report.mjs';
 import { decodeQuotedPrintableUTF8, deletionMail, startMailSink } from './portal-mail-sink.mjs';
-import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, runAdminBrowser } from './web-admin.browser.mjs';
-import { clean, keyStorage, newContext, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
+import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, reviewAppearance, runAdminBrowser, visibleKeyboardStops } from './web-admin.browser.mjs';
+import { clean, destructiveAppearance, keyStorage, newContext, recoveryAction, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
 
 function testDirectory(prefix) {
   const parent = join(tmpdir(), 'kilo');
   mkdirSync(parent, { recursive: true });
   return mkdtempSync(join(parent, prefix));
 }
+
+test('fixture port groups are distinct, released after allocation, and bounded', async () => {
+  for (const count of [1, 3, 5]) {
+    const ports = await freePorts(count);
+    assert.equal(ports.length, count);
+    assert.equal(new Set(ports).size, count);
+    const listeners = [];
+    try {
+      for (const port of ports) {
+        const listener = net.createServer();
+        listeners.push(listener);
+        listener.listen(port, '127.0.0.1');
+        await once(listener, 'listening');
+      }
+    } finally {
+      await Promise.all(listeners.map((listener) => listener.listening ? new Promise((resolve) => listener.close(resolve)) : undefined));
+    }
+  }
+  for (const count of [0, -1, 9, 1.5]) await assert.rejects(freePorts(count), /Invalid fixture port group/);
+});
 
 test('portal harness refuses HTTP, remote, and noncanonical origins', () => {
   assert.equal(assertLocalOrigin('https://localhost:43210').port, '43210');
@@ -308,10 +330,11 @@ test('portal key storage and clean reject an extra private object store beside a
 
 test('admin appearance rejects undersized pointer targets, weak contrast and invisible or clipped keyboard focus', () => {
   const inspect = ({ checkbox = false, width = 44, labelWidth = 44, labelled = true, focused = true,
-    color = 'rgb(0, 0, 0)', shadow = 'rgb(0, 0, 0) 0px 0px 0px 2px', left = 0, focusedOnly = false } = {}) => {
+    color = 'rgb(0, 0, 0)', shadow = 'rgb(0, 0, 0) 0px 0px 0px 2px', left = 0, focusedOnly = false,
+    forcedColors = false, outlineStyle = 'none', outlineWidth = '0px', forcedColorAdjust = 'auto' } = {}) => {
     const style = {
       color, backgroundColor: 'rgb(255, 255, 255)', fontSize: '16px', fontWeight: '400',
-      boxShadow: shadow, outlineStyle: 'none', outlineWidth: '0px', outlineColor: 'rgb(0, 0, 0)',
+      boxShadow: shadow, outlineStyle, outlineWidth, outlineColor: 'rgb(0, 0, 0)', forcedColorAdjust,
     };
     const element = (size) => ({
       parentElement: null,
@@ -323,8 +346,8 @@ test('admin appearance rejects undersized pointer targets, weak contrast and inv
     const control = element(checkbox ? 20 : width);
     control.labels = labelled ? [element(labelWidth)] : [];
     let text = { parentElement: control, textContent: 'PRIVATE-FIXTURE-TEXT' };
-    return structuredClone(runInNewContext(`(${adminAppearance})({ focusedOnly })`, {
-      focusedOnly, innerWidth: 320, innerHeight: 256, NodeFilter: { SHOW_TEXT: 4 },
+    return structuredClone(runInNewContext(`(${adminAppearance})({ focusedOnly, forcedColors })`, {
+      focusedOnly, forcedColors, innerWidth: 320, innerHeight: 256, NodeFilter: { SHOW_TEXT: 4 },
       getComputedStyle: () => style,
       document: {
         getAnimations: () => [],
@@ -341,11 +364,116 @@ test('admin appearance rejects undersized pointer targets, weak contrast and inv
   assert(inspect({ checkbox: true, labelled: false }).includes('Admin checkbox lacks a visible associated label'));
   assert(inspect({ color: 'rgb(200, 200, 200)' }).includes('Admin text contrast is below its readable-size threshold'));
   assert.deepEqual(inspect({ focusedOnly: true }), []);
+  assert(inspect({ focusedOnly: true, forcedColors: true }).includes('Admin keyboard target lacks a 2px, 3:1 focus indicator'));
+  assert.deepEqual(inspect({ focusedOnly: true, forcedColors: true, shadow: 'none', outlineStyle: 'solid', outlineWidth: '2px' }), []);
+  assert(inspect({ forcedColors: true, forcedColorAdjust: 'none' }).includes('Admin control suppresses forced colors'));
   for (const options of [{ focused: false }, { shadow: 'none' }, { shadow: 'rgb(200, 200, 200) 0px 0px 0px 2px' }, { left: -2 }]) {
     const failures = inspect({ ...options, focusedOnly: true });
     assert(failures.length > 0);
     assert.doesNotMatch(JSON.stringify(failures), /PRIVATE-/);
   }
+});
+
+test('review keyboard inventory excludes hidden, disabled, inert, collapsed-details and negative-tabindex targets only', () => {
+  const visible = (change = {}) => ({ tabIndex: 0, matches: () => false, closest: () => null,
+    checkVisibility: () => true, getClientRects: () => [{}], parentElement: null, ...change });
+  const summary = visible();
+  const details = { localName: 'details', open: false, parentElement: null, querySelector: () => ({ contains: (node) => node === summary }) };
+  summary.parentElement = details;
+  const nodes = [visible(), visible({ tabIndex: -1 }), visible({ matches: () => true }), visible({ closest: () => ({}) }),
+    visible({ checkVisibility: () => false }), visible({ getClientRects: () => [] }), summary, visible({ parentElement: details })];
+  assert.deepEqual(visibleKeyboardStops(nodes), [0, 6]);
+  details.open = true;
+  assert.deepEqual(visibleKeyboardStops(nodes), [0, 6, 7]);
+});
+
+test('long review requires a persistent localized title/cancel footer and independently scrollable body', () => {
+  const inspect = ({ locale = 'en', bodyHeight = 128, overflow = 'auto', movingHeader = false, cancelCount = 1, layout = 'review' } = {}) => {
+    const body = { scrollTop: 0, scrollHeight: 400, clientHeight: bodyHeight,
+      getBoundingClientRect: () => ({ top: 64, bottom: 64 + bodyHeight, height: bodyHeight }) };
+    const header = { querySelector: () => ({}), getBoundingClientRect: () => ({ top: movingHeader ? body.scrollTop : 0, bottom: 64 }) };
+    const footer = { getBoundingClientRect: () => ({ top: 192, bottom: 256 }),
+      querySelectorAll: () => Array.from({ length: cancelCount }, () => ({ textContent: locale === 'en' ? 'Cancel' : 'لغو' })) };
+    const dialog = { getAttribute: () => layout, querySelectorAll: () => [body], querySelector: (selector) => selector === 'header' ? header : footer };
+    return structuredClone(runInNewContext(`(${reviewAppearance})(dialog)`, {
+      dialog, innerHeight: 256, getComputedStyle: () => ({ overflowY: overflow }), document: { documentElement: { lang: locale } },
+    }));
+  };
+  for (const locale of ['en', 'fa-IR']) assert.deepEqual(inspect({ locale }), []);
+  for (const options of [{ bodyHeight: 0 }, { bodyHeight: 200 }, { overflow: 'visible' }, { movingHeader: true },
+    { cancelCount: 0 }, { cancelCount: 2 }, { layout: 'default' }]) assert(inspect(options).length > 0);
+});
+
+test('portal recovery acceptance uses exact known-zero, known-positive and unknown actions in both locales', async () => {
+  try {
+    for (const locale of ['en', 'fa-IR']) for (const remaining of [0, 10, null]) {
+      setBrowserLocale(locale);
+      const english = remaining === null ? 'Generate or replace recovery codes' : remaining === 0 ? 'Generate new recovery codes' : 'Replace recovery codes';
+      const persian = remaining === null ? 'تولید یا جایگزینی کدهای بازیابی' : remaining === 0 ? 'تولید کدهای بازیابی جدید' : 'جایگزینی کدهای بازیابی';
+      const action = { count: async () => 1 };
+      const page = {
+        getByTestId: () => ({ locator: () => ({ count: async () => remaining === null ? 0 : 1,
+          textContent: async () => new Intl.NumberFormat(locale).format(remaining) }) }),
+        getByRole: (role, options) => {
+          assert.equal(role, 'button'); assert.equal(options.exact, true);
+          if (locale === 'en') assert.equal(options.name, english); else assert.match(persian, options.name);
+          return action;
+        },
+      };
+      assert.equal(await recoveryAction(page), action);
+    }
+  } finally { setBrowserLocale('en'); }
+});
+
+test('enabled destructive contrast composites alpha and opacity, requires essential focus and separates forced colors', () => {
+  const inspect = ({ backgroundColor = 'rgb(185, 28, 28)', color = 'rgb(255, 255, 255)', opacity = '1',
+    parentColor = 'rgba(255, 255, 255, 0)', parentOpacity = '1', rootColor = 'rgb(255, 255, 255)', focused = true, disabled = false,
+    visible = true, shadow = 'rgb(255, 255, 255) 0px 0px 0px 2px, rgb(0, 0, 0) 0px 0px 0px 4px',
+    left = 0, focusVisible = false, forcedColors = false, actualForcedColors = forcedColors,
+    outlineWidth = '0px', outlineStyle = 'none', outlineColor = 'rgb(0, 0, 0)', forcedColorAdjust = 'auto',
+    backgroundImage = 'none' } = {}) => {
+    const base = { backgroundImage: 'none', backgroundColor: rootColor, opacity: '1' };
+    const root = { parentElement: null, style: base };
+    const parent = { parentElement: root, style: { ...base, backgroundColor: parentColor, opacity: parentOpacity } };
+    const element = {
+      parentElement: parent, disabled,
+      style: { ...base, backgroundColor, color, opacity, boxShadow: shadow,
+        outlineWidth, outlineStyle, outlineColor, outlineOffset: '2px', forcedColorAdjust, backgroundImage },
+      textContent: 'PRIVATE-FIXTURE-CONTROL',
+      checkVisibility: () => visible, matches: () => focused,
+      getBoundingClientRect: () => ({ left, right: left + 150, top: 0, bottom: 44 }),
+    };
+    return structuredClone(runInNewContext(`(${destructiveAppearance})(element, options)`, {
+      element, options: { focusVisible, forcedColors }, getComputedStyle: (node) => node.style,
+      document: { activeElement: focused ? element : parent }, innerWidth: 320, innerHeight: 256,
+      matchMedia: () => ({ matches: actualForcedColors }),
+    }));
+  };
+  assert.deepEqual(inspect(), []);
+  assert.deepEqual(inspect({ focusVisible: true }), []);
+  assert.deepEqual(inspect({ backgroundColor: 'rgba(185, 28, 28, 0.9)' }), [], 'Hover alpha must be composited with its actual backdrop');
+  assert.deepEqual(inspect({ rootColor: 'rgb(2, 6, 23)', backgroundColor: 'rgb(127, 29, 29)' }), [], 'Dark button fill is not an essential boundary when its text identifies the action');
+  for (const options of [
+    { backgroundColor: 'rgb(239, 68, 68)' }, { backgroundColor: 'rgba(185, 28, 28, 0.4)' },
+    { opacity: '0.5' }, { parentOpacity: '0.5' }, { color: 'rgba(255, 255, 255, 0.3)' },
+  ]) assert(inspect(options).includes('Destructive-state text contrast is below 4.5:1'));
+  for (const options of [
+    { focused: false }, { shadow: 'none' },
+    { shadow: 'rgb(220, 220, 220) 0px 0px 0px 2px' },
+    { shadow: 'rgb(255, 255, 255) 0px 0px 0px 3px, rgb(0, 0, 0) 0px 0px 0px 4px' },
+    { left: -2 },
+  ]) assert(inspect({ ...options, focusVisible: true }).length > 0);
+  assert(inspect({ disabled: true }).includes('Destructive-state control is not visible and enabled'));
+  assert(inspect({ visible: false }).includes('Destructive-state control is not visible and enabled'));
+  assert(inspect({ forcedColors: true, actualForcedColors: false }).includes('Destructive-state palette does not match the requested color mode'));
+  assert(inspect({ forcedColors: true, forcedColorAdjust: 'none' }).includes('Destructive-state control suppresses forced colors'));
+  assert(inspect({ forcedColors: true, focusVisible: true }).includes('Destructive-state focus indicator is below 3:1 or 2px'), 'Forced-color box shadows must never prove native focus');
+  assert.deepEqual(inspect({ forcedColors: true, focusVisible: true, shadow: 'none',
+    outlineStyle: 'solid', outlineWidth: '2px' }), []);
+  assert.throws(() => inspect({ backgroundImage: 'linear-gradient(red, white)' }), /Unmeasured destructive-state background image/);
+  for (const color of ['rgb(NaN, 255, 255)', 'rgba(255, 255, 255, 2)', 'PRIVATE-COLOR'])
+    assert.throws(() => inspect({ color }), /(?:Invalid|Unsupported) computed destructive-state color/);
+  assert.doesNotMatch(JSON.stringify(inspect({ color: 'rgb(200, 200, 200)', focused: false, focusVisible: true })), /PRIVATE-/);
 });
 
 test('portal browser cleanup attempts browser close even after a context rejects', async (t) => {

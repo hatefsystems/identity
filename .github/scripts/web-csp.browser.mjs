@@ -2,6 +2,10 @@ import {
   assertOnlyPreferenceCookies,
   browserLocale,
   browserLocales,
+  browserThemes,
+  browserViewports,
+  focusedBrowserViewports,
+  assertBrowserTheme,
   configureBrowserPreferences,
   exercisePreferenceFailure,
   exercisePreferenceSwitch,
@@ -10,6 +14,8 @@ import {
   preferenceActionInput,
   screenshotName,
   setBrowserLocale,
+  setBrowserTheme,
+  withTextResize,
   waitForFonts,
 } from './browser-localization.mjs';
 import assert from 'node:assert/strict';
@@ -22,16 +28,15 @@ import { chromium } from 'playwright';
 import { browserFailure } from './portal-harness.mjs';
 import { smokeImage, webDocumentNonce } from './smoke-image.mjs';
 
-const previewNotice = 'This form is not connected yet. Do not enter real credentials.';
+const availabilityNotice = 'Use a passkey to sign in to an existing account, or create an account with email, phone and passkey verification.';
 const email = { name: 'email', label: 'Email address' };
-const password = { name: 'password', label: 'New password' };
-const confirmation = { name: 'confirmation', label: 'Confirm password' };
-const authRoutes = [
+export const authRoutes = [
   {
     path: '/login',
     heading: 'Sign in to Hatef',
-    submit: 'Sign in with password',
-    fields: [email, { ...password, label: 'Password' }],
+    submit: 'Continue with a passkey',
+    passkey: true,
+    fields: [],
     back: 'Create an account',
     backPath: '/register',
   },
@@ -53,34 +58,143 @@ const authRoutes = [
   },
   {
     path: '/verify-totp',
-    heading: 'Verify your authenticator code',
-    submit: 'Verify code',
-    fields: [{ name: 'code', label: 'Authenticator code' }],
-    back: 'Return to sign in',
+    heading: 'Authenticator sign-in unavailable',
+    availability: true,
+    fields: [],
+    back: 'Continue with a passkey',
   },
   {
     path: '/forgot-password',
-    heading: 'Reset your password',
-    submit: 'Send reset link',
-    fields: [email],
-    back: 'Return to sign in',
+    heading: 'Password reset unavailable',
+    availability: true,
+    fields: [],
+    back: 'Continue with a passkey',
   },
   {
     path: '/reset-password',
-    heading: 'Set a new password',
-    submit: 'Reset password',
-    fields: [password, confirmation],
-    back: 'Return to sign in',
+    heading: 'Password reset unavailable',
+    availability: true,
+    fields: [],
+    back: 'Continue with a passkey',
   },
 ];
-const viewports = [
-  { width: 320, height: 568 },
-  { width: 390, height: 844 },
-  { width: 768, height: 1024 },
-  { width: 1280, height: 800 },
-  // Also exercises the CSS viewport available at 400% zoom on a 1280x1024 display.
-  { width: 320, height: 256 },
-];
+const viewports = [...browserViewports, ...focusedBrowserViewports
+  .filter((viewport) => !browserViewports.some((base) => base.width === viewport.width && base.height === viewport.height))];
+
+export function assertThemeDocument(html, { theme, nonce, initializer }) {
+  assert(browserThemes.includes(theme));
+  const root = html.match(/<html\b([^>]*)>/i)?.[1];
+  assert(root, 'Appearance document has no root element');
+  assert.equal(root.match(/\bdata-theme="([^"]*)"/)?.[1], theme, 'SSR selected theme differs from the saved choice');
+  const dark = (root.match(/\bclass="([^"]*)"/)?.[1] ?? '').split(/\s+/).includes('dark');
+  assert.equal(dark, theme === 'dark', 'Explicit SSR appearance is not deterministic');
+  const head = html.match(/<head\b[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? '';
+  const initializers = [...head.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
+    .filter((match) => match[2].includes("getAttribute('data-theme')"));
+  assert.equal(initializers.length, theme === 'system' ? 1 : 0, 'System requires exactly one head initializer only');
+  if (theme === 'system') {
+    assert.equal(initializers[0][2], initializer, 'Appearance initializer is not the constant reviewed source');
+    assert.equal(initializers[0][1].match(/\bnonce="([^"]*)"/)?.[1], nonce, 'Appearance initializer lacks the request nonce');
+  }
+}
+
+async function checkPublicAppearance(browser, baseURL, documentPaths) {
+  const source = await readFile(new URL('../../apps/web/i18n/theme.ts', import.meta.url), 'utf8');
+  const literal = source.match(/export const themeInitializer\s*=\s*("(?:[^"\\]|\\.)*");/);
+  assert(literal, 'Appearance initializer must remain a constant string');
+  const initializer = JSON.parse(literal[1]);
+  const results = [];
+  const seenNonces = new Set();
+  for (const theme of browserThemes) for (const os of ['light', 'dark']) {
+    const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block', colorScheme: os });
+    try {
+      await configureBrowserPreferences(context, new URL(baseURL).origin, browserLocale(), theme);
+      await context.addInitScript(() => {
+        globalThis.__appearanceFrames = [];
+        globalThis.__appearanceCsp = [];
+        globalThis.__appearanceCredentials = [];
+        globalThis.__appearanceShifts = [];
+        globalThis.__appearanceShiftBoundary = 0;
+        new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) if (entry.startTime >= globalThis.__appearanceShiftBoundary)
+            globalThis.__appearanceShifts.push(entry.value);
+        }).observe({ type: 'layout-shift', buffered: true });
+        document.addEventListener('securitypolicyviolation', (event) => globalThis.__appearanceCsp.push(event.effectiveDirective));
+        for (const method of ['get', 'create', 'store', 'preventSilentAccess']) {
+          const prototype = globalThis.CredentialsContainer?.prototype;
+          const original = prototype?.[method];
+          if (original) prototype[method] = function (...args) {
+            globalThis.__appearanceCredentials.push(method);
+            return Reflect.apply(original, this, args);
+          };
+        }
+        const sample = () => {
+          const root = document.documentElement;
+          if (document.body && root && getComputedStyle(root).getPropertyValue('--background').trim())
+            globalThis.__appearanceFrames.push({ selected: root.getAttribute('data-theme'),
+              dark: root.classList.contains('dark'), scheme: getComputedStyle(root).colorScheme });
+          if (!globalThis.__appearanceSettled && globalThis.__appearanceFrames.length < 120) requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+      });
+      const page = await context.newPage();
+      page.setDefaultTimeout(15000);
+      const observed = observePage(page);
+      const cold = async () => {
+        const response = await page.goto(new URL('/', baseURL).href, { waitUntil: 'load' });
+        assert.equal(response.status(), 200);
+        const html = await response.text();
+        const nonce = webDocumentNonce(new Headers(await response.allHeaders()), html, seenNonces);
+        assertThemeDocument(html, { theme, nonce, initializer });
+        await assertBrowserTheme(page, theme);
+        await waitForExternalCss(page);
+        await waitForFonts(page);
+        const frames = await page.evaluate(() => { globalThis.__appearanceSettled = true; return globalThis.__appearanceFrames; });
+        assert(frames.length > 0, 'Safe public probe did not observe any styled rendering frame');
+        const dark = theme === 'dark' || (theme === 'system' && os === 'dark');
+        assert(frames.every((frame) => frame.selected === theme && frame.dark === dark && frame.scheme === (dark ? 'dark' : 'light')),
+          'Safe public probe observed a wrong first-paint appearance frame');
+        assert.deepEqual(await page.evaluate(() => globalThis.__appearanceCsp), [], 'Appearance initializer violated strict CSP');
+        return frames.length;
+      };
+      const frames = await cold();
+      if (process.env.WEB_BROWSER_ARTIFACT_DIR) {
+        await mkdir(resolve(process.env.WEB_BROWSER_ARTIFACT_DIR), { recursive: true });
+        await page.screenshot({
+          path: resolve(process.env.WEB_BROWSER_ARTIFACT_DIR, screenshotName(`appearance-${theme}-os-${os}`, { width: 1280, height: 720 }, theme === 'dark' || (theme === 'system' && os === 'dark'))),
+          fullPage: true, caret: 'initial', animations: 'disabled', mask: [page.locator('input, textarea, [data-legal-private]')],
+        });
+      }
+      const alternate = theme === 'dark' ? 'light' : 'dark';
+      await setBrowserTheme(page, alternate);
+      await setBrowserTheme(page, theme);
+      await exercisePreferenceFailure(page, observed.expectResourceFailure, { theme: alternate });
+      await cold();
+      const marker = randomUUID();
+      await page.evaluate((marker) => { document.__appearanceNavigation = marker; }, marker);
+      await Promise.all([page.waitForURL(new URL('/login', baseURL).href),
+        page.getByRole('link', { name: localizedText('Sign in'), exact: true }).click()]);
+      await assertBrowserTheme(page, theme);
+      assert.equal(await page.evaluate(() => document.__appearanceNavigation), marker,
+        'Theme navigation replaced the document');
+      await waitForFonts(page);
+      await page.evaluate(() => { globalThis.__appearanceShiftBoundary = performance.now(); globalThis.__appearanceShifts = []; });
+      const before = observed.requests.length;
+      await page.emulateMedia({ colorScheme: os === 'dark' ? 'light' : 'dark' });
+      await assertBrowserTheme(page, theme);
+      await waitForFonts(page);
+      assert.equal(await page.evaluate(() => globalThis.__appearanceShifts.reduce((sum, value) => sum + value, 0)), 0,
+        'An OS theme change shifted the settled safe public layout');
+      assert.equal(observed.requests.slice(before).filter((request) => request.method === 'POST' || new URL(request.url).pathname.startsWith('/api/')).length, 0,
+        'An OS appearance change saved preferences or replayed API work');
+      assert.deepEqual(await page.evaluate(() => globalThis.__appearanceCredentials), [], 'Appearance changes started a credentials ceremony');
+      assertSafeRequests(observed, baseURL, documentPaths, []);
+      assert.deepEqual(observed.errors, [], 'Public appearance runtime/CSP regression');
+      results.push({ theme, os, styledColdFrames: frames });
+    } finally { await context.close(); }
+  }
+  console.log(JSON.stringify({ check: 'safe-public-appearance', locale: browserLocale(), combinations: results }));
+}
 
 // Browser SPKI trust does not configure Playwright's Node-side route.fetch.
 // Retrieve only this public probe through the same ingress using its exact CA.
@@ -136,7 +250,8 @@ export function fetchPinnedCspDocument(url, certificate, cookies = []) {
   });
 }
 
-async function waitForExternalCss(page, dark = false) {
+async function waitForExternalCss(page, dark) {
+  dark ??= await page.locator('html').evaluate((root) => root.classList.contains('dark'));
   await page.waitForFunction((dark) => {
     const externalStylesheet = [...document.querySelectorAll('link[rel="stylesheet"]')].some(
       (link) =>
@@ -300,7 +415,7 @@ async function assertInitialFontResources(page, observed) {
   }
 }
 
-function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
+export function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
   for (const request of observed.requests) {
     const url = new URL(request.url);
     assert.equal(url.origin, new URL(baseURL).origin, 'No third-party auth or telemetry requests');
@@ -313,7 +428,7 @@ function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
       ['GET', 'HEAD'].includes(request.method),
       `Unexpected ${request.method} ${url.pathname}`
     );
-    assert.equal(request.body, null, 'Preview requests must not carry a body');
+    assert.equal(request.body, null, 'Public auth navigation must not carry a body');
     assert(
       documentPaths.has(url.pathname) ||
         url.pathname.startsWith('/_next/static/') ||
@@ -322,7 +437,7 @@ function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
     );
     if (['fetch', 'xhr'].includes(request.type)) {
       assert(documentPaths.has(url.pathname), 'Only Next document navigation/prefetch may fetch');
-      assert.equal(request.headers.rsc, '1', 'No authentication fetch/XHR in UI previews');
+      assert.equal(request.headers.rsc, '1', 'No authentication fetch/XHR without an explicit action');
       assert(
         [...url.searchParams.keys()].every((key) => key === '_rsc'),
         'RSC requests must not forward form values in query parameters'
@@ -348,10 +463,11 @@ function assertSafeRequests(observed, baseURL, documentPaths, secrets) {
   }
 }
 
-async function assertUnavailable(page, route, noScript = false) {
+export async function assertUnavailable(page, route, noScript = false) {
   if (route.passkey) {
     const action = page.getByTestId('passkey-login');
     await action.waitFor({ state: 'visible' });
+    assert.equal(await page.getByRole('button', { name: localizedText(route.submit), exact: true }).count(), 1);
     assert.equal(await action.getAttribute('type'), 'button');
     if (noScript) {
       assert(await action.isDisabled(), 'Passkey action stays disabled without JavaScript');
@@ -365,6 +481,14 @@ async function assertUnavailable(page, route, noScript = false) {
       0,
       'Passkey action has no native submission'
     );
+    assert.equal(await page.getByRole('main').locator('form, input, textarea').count(), 0,
+      'Public sign-in must not expose disconnected credential fields');
+    assert.equal(await page.getByRole('main').locator('a[href="/forgot-password"]').count(), 0,
+      'Public sign-in must not offer unsupported password recovery');
+    assert.equal(await page.getByRole('main').getByRole('alert').count(), 0,
+      'Passive passkey entry must not claim an authentication outcome');
+    assert.equal((await page.getByRole('main').getByRole('status').textContent()).trim(), '',
+      'Passive passkey entry must not claim progress or success');
     return;
   }
   if (route.registration) {
@@ -407,45 +531,37 @@ async function assertUnavailable(page, route, noScript = false) {
     assert.equal(await page.getByRole('main').getByRole('alert').count(), 0);
     return;
   }
-  const form = page.getByRole('form');
-  await form.getByText(localizedText('UI preview'), { exact: true }).waitFor({ state: 'visible' });
-  await form.getByText(localizedText(previewNotice, { exact: false })).waitFor({ state: 'visible' });
-  assert.equal(await form.getAttribute('method'), 'post', `${route.path} keeps POST semantics`);
-  assert.equal(await form.getAttribute('action'), null, `${route.path} has no action endpoint`);
-  const submit = form.getByRole('button', { name: localizedText(route.submit), exact: true });
-  assert(await submit.isDisabled(), `${route.path} submit must remain natively disabled`);
-  assert.equal(await submit.getAttribute('type'), 'submit');
-  assert.equal(
-    (await form.getByRole('status').textContent()).trim(),
-    '',
-    'No fake progress/success'
-  );
-  assert.equal(await form.getByRole('alert').count(), 0, 'No simulated authentication outcome');
-}
-
-async function assertFieldError(page, field, value = '') {
-  const input = page.getByLabel(localizedText(field.label), { exact: true });
-  await input.fill(value);
-  await input.press('Tab');
-  await input.and(page.locator('[aria-invalid="true"]')).waitFor({ state: 'visible' });
-  assert(
-    await input.evaluate((element) => {
-      const ids = (element.getAttribute('aria-describedby') || '').split(/\s+/);
-      const error = document.getElementById(`${element.id}-error`);
-      return (
-        ids.includes(error?.id) &&
-        error.checkVisibility() &&
-        error.textContent.trim() &&
-        ids.every((id) => document.getElementById(id)?.checkVisibility()) &&
-        element !== document.activeElement
-      );
-    }),
-    `${field.label}: blur error must be visibly associated without stealing focus`
-  );
+  assert(route.availability, 'Every public auth route requires an explicit supported state');
+  const main = page.getByRole('main');
+  await main.getByText(localizedText(availabilityNotice), { exact: true }).waitFor({ state: 'visible' });
+  assert.equal(await main.locator('form, input, textarea, button').count(), 0,
+    `${route.path}: availability notice must not expose a disconnected form`);
+  assert.equal(await main.getByRole('status').count(), 0, 'No simulated authentication progress/success');
+  assert.equal(await main.getByRole('alert').count(), 0, 'No simulated authentication failure');
+  for (const [name, path] of [['Continue with a passkey', '/login'], ['Create an account', '/register']]) {
+    const link = main.getByRole('link', { name: localizedText(name), exact: true });
+    await link.waitFor({ state: 'visible' });
+    assert.equal(await link.getAttribute('href'), path, 'Availability notice requires a supported next action');
+  }
 }
 
 // Runs in Chromium: measured colors include translucent card/notice/footer backgrounds.
 // These checks complement, rather than claim to replace, visual and assistive-technology review.
+export function authAppearanceCounts(failures) {
+  const counts = { total: failures.length, horizontal: 0, inlineStyle: 0, geometry: 0, targets: 0, contrast: 0, focus: 0, other: 0 };
+  for (const failure of failures) {
+    const category = failure === 'Horizontal document scrolling' ? 'horizontal'
+      : failure === 'Application inline style attribute' ? 'inlineStyle'
+      : typeof failure !== 'string' ? 'other'
+      : /focus-visible|keyboard focus indicator/.test(failure) ? 'focus'
+      : /outside the document|clipped by/.test(failure) ? 'geometry'
+      : /touch area/.test(failure) ? 'targets'
+      : /:1, need/.test(failure) ? 'contrast' : 'other';
+    counts[category] += 1;
+  }
+  return counts;
+}
+
 function auditAuthAppearance({ focusedOnly = false } = {}) {
   const failures = [];
   const describe = (element) =>
@@ -516,10 +632,13 @@ function auditAuthAppearance({ focusedOnly = false } = {}) {
     if (!element.matches(':focus-visible'))
       failures.push(`${describe(element)}: not focus-visible`);
     geometry(element, element.getBoundingClientRect(), true);
-    const ring = [...style.boxShadow.matchAll(/(rgba?\([^)]+\)) 0px 0px 0px ([\d.]+)px/g)].some(
+    const forcedColors = matchMedia('(forced-colors: active)').matches;
+    const ring = !forcedColors && [...style.boxShadow.matchAll(/(rgba?\([^)]+\)) 0px 0px 0px ([\d.]+)px/g)].some(
       (match) => Number(match[2]) >= 2 && ratio(color(match[1]), backdrop) >= 3
     );
-    if (!ring) failures.push(`${describe(element)}: missing a 3:1, 2px keyboard focus indicator`);
+    const outline = !['none', 'hidden'].includes(style.outlineStyle) && Number.parseFloat(style.outlineWidth) >= 2 &&
+      ratio(color(style.outlineColor), backdrop) >= 3;
+    if (!ring && !outline) failures.push(`${describe(element)}: missing a 3:1, 2px keyboard focus indicator`);
     return failures;
   }
 
@@ -589,6 +708,7 @@ function auditAuthAppearance({ focusedOnly = false } = {}) {
 }
 
 async function assertKeyboardTraversal(page, label) {
+  await page.bringToFront();
   const candidates = page.locator(
     'a[href], button, input, select, textarea, summary, [tabindex], [contenteditable="true"]'
   );
@@ -656,10 +776,17 @@ async function assertKeyboardTraversal(page, label) {
     ['Shift+Tab', candidates.nth(stops.at(-1))],
   ]) {
     await page.keyboard.press(key);
-    if (await page.evaluate(() => document.activeElement === document.body))
+    const atExpectedEdge = await edge.evaluate((element) => element === document.activeElement);
+    if (!atExpectedEdge && await page.evaluate(() => document.activeElement === document.body || !document.hasFocus()))
       await page.keyboard.press(key);
+    if (await edge.evaluate((element) => element === document.activeElement && !document.hasFocus())) await page.bringToFront();
+    const reachedEdge = await edge.evaluate((element) => element === document.activeElement && document.hasFocus());
+    if (!reachedEdge) {
+      const state = await edge.evaluate((element) => ({ expectedTag: element.tagName, activeTag: document.activeElement?.tagName, activeTabIndex: document.activeElement?.tabIndex, documentFocused: document.hasFocus(), expectedActive: element === document.activeElement }));
+      console.error(JSON.stringify({ check: 'keyboard-edge', context: label, key, state }));
+    }
     assert(
-      await edge.evaluate((element) => element === document.activeElement),
+      reachedEdge,
       `${label}: cannot leave keyboard traversal edge`
     );
   }
@@ -673,8 +800,9 @@ async function assertKeyboardTraversal(page, label) {
 }
 
 async function checkAuthViewports(page, route) {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
   for (const dark of [false, true]) {
-    await page.evaluate((dark) => document.documentElement.classList.toggle('dark', dark), dark);
+    await setBrowserTheme(page, dark ? 'dark' : 'light');
     await waitForExternalCss(page, dark);
     for (const viewport of viewports) {
       await page.setViewportSize(viewport);
@@ -697,108 +825,51 @@ async function checkAuthViewports(page, route) {
           mask: [page.locator('input, textarea, [data-legal-private]')],
         });
       }
-      const submit = page.getByRole('button', { name: localizedText(route.submit), exact: true });
-      await submit.scrollIntoViewIfNeeded();
+      const action = route.availability
+        ? page.getByRole('link', { name: localizedText(route.back), exact: true })
+        : page.getByRole('button', { name: localizedText(route.submit), exact: true });
+      await action.scrollIntoViewIfNeeded();
+      await action.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+      const bounds = await action.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height, viewportWidth: innerWidth, viewportHeight: innerHeight };
+      });
+      const reachable = bounds.top >= 0 && bounds.bottom <= bounds.viewportHeight && bounds.left >= 0 && bounds.right <= bounds.viewportWidth;
+      if (!reachable) console.log(JSON.stringify({ check: 'auth-action-geometry-failure', locale: browserLocale(), route: route.path, viewport, bounds }));
       assert(
-        await submit.evaluate((element) => {
-          const rect = element.getBoundingClientRect();
-          return (
-            rect.top >= 0 &&
-            rect.bottom <= innerHeight &&
-            rect.left >= 0 &&
-            rect.right <= innerWidth
-          );
-        }),
-        `${label}: disabled action must remain scroll-reachable`
+        reachable,
+        `${label}: supported action must remain scroll-reachable`
       );
     }
   }
-  await page.evaluate(() => document.documentElement.classList.remove('dark'));
+  await withTextResize(page, async () => {
+    for (const viewport of [{ width: 320, height: 568 }, { width: 1280, height: 800 }]) {
+      await page.setViewportSize(viewport);
+      const failures = await page.evaluate(auditAuthAppearance);
+      if (failures.length) console.log(JSON.stringify({ check: 'auth-text-resize-failure', locale: browserLocale(), route: route.path, viewport, counts: authAppearanceCounts(failures) }));
+      assert.deepEqual(failures, [], `${route.path}: 200% root-font text resize`);
+      await assertKeyboardTraversal(page, `${route.path}: 200% text resize`);
+    }
+  });
+  await page.emulateMedia({ forcedColors: 'active' });
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await waitForFonts(page);
+    assert.deepEqual(await page.evaluate(auditAuthAppearance), [], `${route.path}: forced colors`);
+    await assertKeyboardTraversal(page, `${route.path}: forced colors`);
+  } finally { await page.emulateMedia({ forcedColors: 'none' }); }
+  await setBrowserTheme(page, originalTheme);
   await page.setViewportSize({ width: 1280, height: 800 });
 }
 
-const alternateFieldLabels = {
-  'Email address': 'نشانی ایمیل',
-  Password: 'گذرواژه',
-  'New password': 'گذرواژهٔ جدید',
-  'Confirm password': 'تکرار گذرواژه',
-  'Authenticator code': 'کد رمزساز',
-};
-const missingFieldMessages = {
-  en: {
-    email: 'Enter your email address.',
-    password: 'Enter your password.',
-    newPassword: 'Enter a new password.',
-    confirmation: 'Confirm your password.',
-    code: 'Enter exactly six digits (0-9).',
-  },
-  'fa-IR': {
-    email: 'نشانی ایمیل خود را وارد کنید.',
-    password: 'گذرواژهٔ خود را وارد کنید.',
-    newPassword: 'یک گذرواژهٔ جدید وارد کنید.',
-    confirmation: 'گذرواژهٔ خود را تکرار کنید.',
-    code: 'دقیقاً شش رقم انگلیسی (0-9) وارد کنید.',
-  },
-};
-
-async function checkValidationLanguageSwitch(page, route) {
-  await page.evaluate(() => {
-    document.__validationInputNodes = [...document.querySelectorAll('form input')];
-  });
-  try {
-    await exercisePreferenceSwitch(page, {
-      privateSelector: 'form input',
-      onOtherLocale: async (locale) => {
-        assert(
-          await page.evaluate(() =>
-            document.__validationInputNodes.every(
-              (node) => node.isConnected && document.getElementById(node.id) === node
-            )
-          ),
-          'Language switching remounted an auth field'
-        );
-        for (const field of route.fields) {
-          const input = page.getByLabel(
-            locale === 'en' ? field.label : alternateFieldLabels[field.label],
-            { exact: true }
-          );
-          assert.equal(
-            await input.getAttribute('aria-invalid'),
-            'true',
-            'Language switching cleared visible validation'
-          );
-          assert.equal(await input.inputValue(), '');
-          const key = field.label === 'New password' ? 'newPassword' : field.name;
-          assert.equal(
-            await input.evaluate(
-              (node) => document.getElementById(node.id + '-error')?.textContent
-            ),
-            missingFieldMessages[locale][key],
-            'Visible validation did not update to the selected language'
-          );
-        }
-        assert.equal(await page.evaluate(() => globalThis.__authObservations.submissions), 0);
-        assert.deepEqual(
-          await page.evaluate(() => globalThis.__authObservations.credentialCalls),
-          []
-        );
-      },
-    });
-    await assertUnavailable(page, route);
-  } finally {
-    await page.evaluate(() => {
-      delete document.__validationInputNodes;
-    });
-  }
-}
-
 async function checkExpandedDisplaySettings(page, route) {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
   const summary = page.locator('[data-ui-preferences] summary');
   const details = page.locator('[data-ui-preferences] details');
   if (!(await details.evaluate((node) => node.open))) await summary.click();
   try {
     for (const dark of [false, true]) {
-      await page.evaluate((dark) => document.documentElement.classList.toggle('dark', dark), dark);
+      await setBrowserTheme(page, dark ? 'dark' : 'light');
       await waitForExternalCss(page, dark);
       for (const viewport of [
         { width: 320, height: 568 },
@@ -877,10 +948,10 @@ async function checkExpandedDisplaySettings(page, route) {
         }
         assert.deepEqual(failures, [], label);
         await assertKeyboardTraversal(page, label);
-        for (const name of ['Calendar', 'Time zone']) {
+        for (const name of ['Appearance', 'Calendar', 'Time zone']) {
           const control = page.getByRole('combobox', { name: localizedText(name), exact: true });
           assert(await control.isVisible(), 'Expanded display control is hidden');
-          assert.equal(await control.inputValue(), name === 'Calendar' ? 'auto' : 'UTC');
+          assert.equal(await control.inputValue(), name === 'Appearance' ? dark ? 'dark' : 'light' : name === 'Calendar' ? 'auto' : 'UTC');
         }
         assert.equal(
           await page
@@ -903,7 +974,7 @@ async function checkExpandedDisplaySettings(page, route) {
     }
   } finally {
     if (await details.evaluate((node) => node.open)) await summary.click();
-    await page.evaluate(() => document.documentElement.classList.remove('dark'));
+    await setBrowserTheme(page, originalTheme);
     await page.setViewportSize({ width: 1280, height: 800 });
   }
 }
@@ -922,26 +993,42 @@ export async function storageSnapshot(page, timeout = 15000) {
   } finally { clearTimeout(timer); }
 }
 
+export function assertPublicStorageUnchanged(before, after) {
+  const normalize = (snapshot) => {
+    assertOnlyPreferenceCookies(snapshot.persistent.cookies);
+    return { ...snapshot, persistent: { ...snapshot.persistent,
+      cookies: snapshot.persistent.cookies.map((cookie) => ({ ...cookie, expires: 0 })) } };
+  };
+  // Explicit appearance saves renew only the public preference-cookie lifetime.
+  // Every cookie attribute/value, database record and session-storage value stays exact.
+  assert.deepEqual(normalize(after), normalize(before), 'Appearance changed public auth storage beyond its preference-cookie lifetime');
+}
 async function assertInertInteraction(page, route, observed, beforeStorage, noScript = false) {
+  await waitForFonts(page, { animationFrames: !noScript });
+  const actionRequests = () => observed.requests.filter((request) =>
+    !['GET', 'HEAD'].includes(request.method) || new URL(request.url).pathname.startsWith('/api/')).length;
   const marker = randomUUID();
   const before = {
     url: page.url(),
     navigations: observed.navigations.length,
     marker,
     storage: beforeStorage,
+    actionRequests: actionRequests(),
   };
   await page.evaluate((marker) => {
     document.__authDocumentMarker = marker;
   }, marker);
   for (const field of route.fields)
     await page.getByLabel(localizedText(field.label), { exact: true }).press('Enter');
-  const submit = page.getByRole('button', { name: localizedText(route.submit), exact: true });
-  assert(await submit.isDisabled());
-  await submit.scrollIntoViewIfNeeded();
-  const bounds = await submit.boundingBox();
-  assert(bounds);
-  // A physical click tests the disabled control without Playwright's enabled-state retry/force.
-  await page.mouse.click(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  if (!route.availability) {
+    const submit = page.getByRole('button', { name: localizedText(route.submit), exact: true });
+    assert(await submit.isDisabled());
+    await submit.scrollIntoViewIfNeeded();
+    const bounds = await submit.boundingBox();
+    assert(bounds);
+    // A physical click tests the disabled control without enabled-state retry/force.
+    await page.mouse.click(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  }
   await page.evaluate(
     () => document.activeElement instanceof HTMLElement && document.activeElement.blur()
   );
@@ -954,9 +1041,10 @@ async function assertInertInteraction(page, route, observed, beforeStorage, noSc
       navigations: observed.navigations.length,
       marker: await page.evaluate(() => document.__authDocumentMarker),
       storage: await storageSnapshot(page),
+      actionRequests: actionRequests(),
     },
     before,
-    `${route.path}: disabled Enter/click must not navigate, replace the document or persist credentials`
+    `${route.path}: passive Enter/disabled click must not request, navigate, replace the document or persist credentials`
   );
   await assertUnavailable(page, route, noScript);
 }
@@ -977,6 +1065,7 @@ export async function validateWebCsp({
       bypassCSP: false,
       serviceWorkers: 'block',
       locale: 'fa-IR',
+      colorScheme: 'light',
     });
     await configureBrowserPreferences(context, new URL(baseURL).origin);
     context.setDefaultTimeout(15_000);
@@ -1023,12 +1112,10 @@ export async function validateWebCsp({
       ...notFoundPaths,
       ...authRoutes.map((route) => route.path),
     ]);
+    await checkPublicAppearance(browser, baseURL, documentPaths);
     const canary = `browser-only-${randomUUID()}`;
     const values = {
       email: `${canary}@example.test`,
-      password: ` ${canary} password `,
-      confirmation: ` ${canary} password `,
-      code: '012345',
       phone: '+989123456789',
     };
     const secrets = Object.values(values);
@@ -1124,13 +1211,10 @@ export async function validateWebCsp({
       await navigate('Return home', '/');
     }
 
-    // Preserve both homepage CTAs and inactive password/reset navigation. Passkey
-    // authentication is now an explicit button action, tested with the real API
-    // in web-portal.browser.mjs, not against this standalone image-only fixture.
+    // Public login is passkey-only. Unavailable URLs remain notices with supported
+    // actions; real authentication belongs to the separately gated API suite.
     await navigate('Sign in', '/login');
     await visit('/login/webauthn', 200, 'Sign in with a passkey');
-    await navigate('Return to sign in', '/login');
-    await navigate('Forgot password?', '/forgot-password');
     await navigate('Return to sign in', '/login');
     await navigate('Hatef Identity home', '/');
     await navigate('Create an account', '/register');
@@ -1140,7 +1224,7 @@ export async function validateWebCsp({
       console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'visit' }));
       await visit(route.path, 200, route.heading);
       await assertUnavailable(page, route);
-      await waitForReactHandler(
+      if (!route.availability) await waitForReactHandler(
         route.passkey ? page.getByTestId('passkey-login') : page.getByRole('form'),
         route.passkey ? 'onClick' : 'onSubmit'
       );
@@ -1155,11 +1239,9 @@ export async function validateWebCsp({
       }
 
       // Measure untouched boundaries as well as the invalid fields used in the reflow matrix.
+      const originalTheme = await page.locator('html').getAttribute('data-theme');
       for (const dark of [false, true]) {
-        await page.evaluate(
-          (dark) => document.documentElement.classList.toggle('dark', dark),
-          dark
-        );
+        await setBrowserTheme(page, dark ? 'dark' : 'light');
         await waitForExternalCss(page, dark);
         const appearance = await page.evaluate(auditAuthAppearance);
         if (appearance.length) {
@@ -1178,9 +1260,10 @@ export async function validateWebCsp({
           `${route.path}: untouched ${dark ? 'dark' : 'light'} palette`
         );
       }
+      await setBrowserTheme(page, originalTheme);
       if (route.registration) {
         // Registration has its own baseline before invalid submissions; the
-        // disconnected-form baseline below is outside this branch's lifetime.
+        // passive-entry baseline below is outside this branch's lifetime.
         console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-baseline' }));
         const beforeStorage = await storageSnapshot(page);
         // Valid signup sends mail and belongs to the separately gated real-API
@@ -1206,136 +1289,45 @@ export async function validateWebCsp({
           await form.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
         assert(await submit.isEnabled(), 'Hydrated signup requires explicit contact submission');
         console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-storage' }));
-        assert.deepEqual(
-          await storageSnapshot(page),
-          beforeStorage,
-          'Invalid signup must not allocate persistent proof authority'
-        );
+        assertPublicStorageUnchanged(beforeStorage, await storageSnapshot(page));
         await assertCleanBaseline();
         console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-navigation' }));
         await navigate(route.back, route.backPath || '/login');
         await navigate('Hatef Identity home', '/');
-        assert.deepEqual(
-          await storageSnapshot(page),
-          beforeStorage,
-          'Leaving signup must not persist contacts'
-        );
+        assertPublicStorageUnchanged(beforeStorage, await storageSnapshot(page));
         console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'registration-complete' }));
         continue;
       }
-      for (const field of route.fields) await assertFieldError(page, field);
-      if (route.fields.length) await checkValidationLanguageSwitch(page, route);
-      // Preference actions precede the inert-form storage baseline.
-      const beforeStorage = await storageSnapshot(page);
+      await exercisePreferenceSwitch(page);
+      await assertUnavailable(page, route);
+      await assertCleanBaseline();
+      // Preference actions precede the passive-entry storage baseline.
       await checkAuthViewports(page, route);
-
-      for (const field of route.fields) {
-        const input = page.getByLabel(localizedText(field.label), { exact: true });
-        if (field.name === 'email') await assertFieldError(page, field, 'not-an-email');
-        await input.fill(values[field.name]);
-        if (['password', 'confirmation'].includes(field.name)) {
-          const id = await input.getAttribute('id');
-          const show = `Show ${field.label.toLowerCase()}`;
-          const hide = `Hide ${field.label.toLowerCase()}`;
-          await input.focus();
-          await page.keyboard.press('Tab');
-          const toggle = page.getByRole('button', { name: localizedText(show), exact: true });
-          assert(await toggle.evaluate((element) => element === document.activeElement));
-          assert.equal(await toggle.getAttribute('type'), 'button');
-          assert.equal(await toggle.getAttribute('aria-controls'), id);
-          assert.equal(await toggle.getAttribute('aria-pressed'), 'false');
-          await page.keyboard.press('Space');
-          const revealed = page.getByRole('button', { name: localizedText(hide), exact: true });
-          await revealed.waitFor({ state: 'visible' });
-          assert.equal(await input.getAttribute('type'), 'text');
-          assert.equal(await revealed.getAttribute('aria-pressed'), 'true');
-          assert(
-            await revealed.evaluate((element) => element === document.activeElement),
-            'Reveal must retain toggle focus'
-          );
-          assert.equal(
-            await input.inputValue(),
-            values[field.name],
-            'Password reveal must preserve spaces/value'
-          );
-          await page.keyboard.press('Space');
-          await toggle.waitFor({ state: 'visible' });
-          assert.equal(await toggle.getAttribute('aria-pressed'), 'false');
-          assert(
-            await toggle.evaluate((element) => element === document.activeElement),
-            'Hiding the password must retain toggle focus'
-          );
-          assert.equal(await input.getAttribute('type'), 'password');
-          assert.equal(await input.getAttribute('id'), id);
-          assert.equal(await input.inputValue(), values[field.name]);
-        }
-        if (field.name === 'confirmation') {
-          await assertFieldError(page, field, `${canary}-mismatch`);
-          await input.fill(values.confirmation);
-        }
-        if (field.name === 'code') {
-          assert.equal(await input.getAttribute('type'), 'text');
-          assert.equal(await input.getAttribute('inputmode'), 'numeric');
-          assert.equal(await input.getAttribute('autocomplete'), 'one-time-code');
-          await assertFieldError(page, field, '12345');
-          await input.fill('');
-          await context.grantPermissions(['clipboard-read', 'clipboard-write'], {
-            origin: new URL(baseURL).origin,
-          });
-          try {
-            await page.evaluate((code) => navigator.clipboard.writeText(code), values.code);
-            await input.focus();
-            await page.keyboard.press('Control+V');
-            await page.waitForFunction(
-              (code) =>
-                document.querySelector('input[autocomplete="one-time-code"]')?.value === code,
-              values.code
-            );
-            assert.equal(
-              await input.inputValue(),
-              '012345',
-              'Native whole-code paste must preserve the leading zero'
-            );
-            assert(
-              await input.evaluate((element) => element === document.activeElement),
-              'Sixth digit must not submit or move focus'
-            );
-            assert.equal(
-              await page.evaluate(() => globalThis.__authObservations.submissions),
-              0,
-              'No sixth-digit autosubmit'
-            );
-          } finally {
-            await page.evaluate(() => navigator.clipboard.writeText(''));
-            await context.clearPermissions();
-          }
-        }
-        await input.press('Tab');
-        await input.and(page.locator('[aria-invalid="false"]')).waitFor({ state: 'visible' });
-        assert(
-          await input.evaluate((element) => !document.getElementById(`${element.id}-error`)),
-          'Resolved errors must be removed'
-        );
-      }
+      const beforeStorage = await storageSnapshot(page);
       assert.equal(
         page.url(),
         new URL(route.path, baseURL).href,
-        'Typing, validation and paste must not navigate'
+        'Passive auth entry and appearance checks must not navigate'
       );
       if (!route.passkey) await assertInertInteraction(page, route, observed, beforeStorage);
       await assertCleanBaseline();
       await navigate(route.back, route.backPath || '/login');
+      if (route.availability) {
+        await visit(route.path, 200, route.heading);
+        await navigate('Create an account', '/register');
+      }
       await navigate('Hatef Identity home', '/');
       assert.deepEqual(
         await storageSnapshot(page),
         beforeStorage,
-        'Navigating away must not persist form values'
+        'Passive auth navigation must not persist credentials or contacts'
       );
     }
     await assertCleanBaseline();
     await page.close();
 
     // Unmodified, JS-disabled documents prove the action is disabled in SSR, without React prevention.
+    console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), stage: 'no-js' }));
     const noScriptContext = await browser.newContext({
       javaScriptEnabled: false,
       bypassCSP: false,
@@ -1348,6 +1340,7 @@ export async function validateWebCsp({
       const noScript = await noScriptContext.newPage();
       const noScriptObserved = observePage(noScript);
       for (const route of authRoutes) {
+        console.log(JSON.stringify({ check: 'auth-csp-progress', locale: browserLocale(), route: route.path, stage: 'no-js-visit' }));
         const response = await noScript.goto(new URL(route.path, baseURL).href, {
           waitUntil: 'load',
         });
@@ -1361,10 +1354,6 @@ export async function validateWebCsp({
           .waitFor({ state: 'visible' });
         await assertUnavailable(noScript, route, true);
         const beforeStorage = await storageSnapshot(noScript);
-        if (!route.registration) {
-          for (const field of route.fields)
-            await noScript.getByLabel(localizedText(field.label), { exact: true }).fill(values[field.name]);
-        }
         await assertInertInteraction(
           noScript,
           route.registration ? { ...route, fields: [] } : route,
@@ -1515,7 +1504,7 @@ export async function validateWebCsp({
     }
   }
   console.log(
-    'Production browser CSP, inactive auth forms, passive passkey entry, keyboard/contrast/reflow, no-JS safety and client navigation checks passed'
+    'Production browser CSP, localized auth availability notices, passive passkey entry, keyboard/contrast/reflow, no-JS safety and supported client navigation checks passed'
   );
 }
 

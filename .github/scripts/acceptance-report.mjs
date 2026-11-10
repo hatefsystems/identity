@@ -30,6 +30,24 @@ export const raceToolchainProfile = 'linux-amd64-cgo-go1.26.5-gcc';
 const digest = /^[0-9a-f]{64}$/;
 const imageDigest = /^sha256:[0-9a-f]{64}$/;
 const generatedRoots = ['apps/identity-api/internal/db', 'libs/schemas/gen/go', 'libs/schemas/gen/ts'];
+export const registrationLocales = Object.freeze(['en', 'fa-IR']);
+export const registrationJourneys = Object.freeze(['desktop-light', 'desktop-dark', 'mobile-light', 'mobile-dark']);
+export const registrationLocaleChecks = Object.freeze([
+  'unicode-canonical-mailbox', 'explicit-smtputf8-email-proof', 'email-resend-proof-invalidation',
+  'explicit-smsir-verify-contract', 'leading-zero-otp-preserved', 'corrected-otp-same-reference',
+  'missing-capability-denied', 'foreign-jkt-denied', 'wrong-browser-link-denied',
+  'ownership-before-account-birth', 'resident-uv-passkey', 'atomic-unprivileged-account-birth',
+  'fresh-discoverable-login', 'proof-replay-denied', 'expired-authority-denied', 'cancel-clears-authority',
+  'passkey-cancellation-no-birth', 'unsupported-passkey-inert', 'rate-limit-retry-after',
+  'lost-completion-durable-receipt', 'completion-pending-deadline-handoff', 'cross-tab-key-change-clears',
+  'desktop-mobile-light-dark', 'keyboard-focus-status', 'noscript-inert',
+  'technical-email-ltr-roundtrip', 'native-numeric-ascii-wire', 'registration-phase-headings',
+  'email-tab-handoff', 'real-theme-preferences', 'registration-display-preferences',
+]);
+export const registrationChecks = Object.freeze([
+  'immutable-quality-image', 'isolated-production-services', 'packaged-migration-cleanup',
+  ...registrationLocaleChecks, 'proof-storage-console-network-private', 'verified-owned-teardown',
+]);
 
 async function treeFiles(root, base = root) {
   const entries = await readdir(root, { withFileTypes: true });
@@ -145,12 +163,34 @@ export function aggregateReports(reports, kind, identity) {
 }
 
 export function assertRegistrationReport(report, manifest) {
-  assert(report?.schema === 1 && report.kind === 'registration-browser' && report.status === 'passed' && report.scope === 'full' && report.cleanup?.completed === true, 'Registration acceptance did not pass with verified cleanup');
+  assert(report?.schema === 2 && report.kind === 'registration-browser' && report.status === 'passed' && report.scope === 'full' && report.cleanup?.completed === true, 'Registration acceptance did not pass with verified cleanup');
+  assert.deepEqual(Object.keys(report).sort(), ['apiImageId', 'checks', 'cleanup', 'exit', 'failed', 'identity', 'kind', 'localeEvidence', 'providers', 'schema', 'scope', 'skipped', 'status', 'tests'], 'Unexpected private registration report fields');
   assertIdentity(report.identity, manifest.identity);
   assert(imageDigest.test(manifest.imageId) && report.apiImageId === manifest.imageId, 'Registration API image mismatch');
   assert(report.exit === 0 && report.failed === 0 && report.skipped === 0 && Number.isSafeInteger(report.tests) && report.tests > 0 && Array.isArray(report.checks) && report.checks.length > 0, 'Registration acceptance lacks executed evidence');
   assert.equal(new Set(report.checks).size, report.checks.length, 'Duplicate registration evidence');
   for (const check of report.checks) assert(/^[a-z][a-z0-9-]{0,127}$/.test(check), 'Registration evidence must use fixed private-data-free check identifiers');
+  assert.deepEqual([...report.checks].sort(), [...registrationChecks].sort(), 'Incomplete registration check inventory');
+  assert.equal(report.tests, report.checks.length, 'Registration check count mismatch');
+  assert(Array.isArray(report.localeEvidence) && report.localeEvidence.length === registrationLocales.length, 'Missing isolated registration locale evidence');
+  assert.deepEqual(report.localeEvidence.map((entry) => entry.locale).sort(), [...registrationLocales].sort(), 'Missing or duplicate registration locale');
+  const providers = { mail: 0, sms: 0, auth: 0, violations: 0 };
+  for (const entry of report.localeEvidence) {
+    assert.deepEqual(Object.keys(entry).sort(), ['checks', 'journeys', 'locale', 'providers', 'sessions'], 'Unexpected private registration locale evidence');
+    assert(Array.isArray(entry.checks) && Array.isArray(entry.journeys), 'Missing executed registration locale inventory');
+    assert.deepEqual([...entry.checks].sort(), [...registrationLocaleChecks].sort(), 'Incomplete registration locale checks');
+    assert.deepEqual([...entry.journeys].sort(), [...registrationJourneys].sort(), 'Missing or duplicate registration locale journey');
+    assert.equal(entry.sessions, registrationJourneys.length, 'Registration locale did not establish one fresh session per journey');
+    assert(entry.providers && typeof entry.providers === 'object' && !Array.isArray(entry.providers), 'Missing measured registration provider counts');
+    assert.deepEqual(Object.keys(entry.providers).sort(), ['auth', 'mail', 'sms', 'violations'], 'Unexpected private provider evidence');
+    for (const key of Object.keys(providers)) {
+      assert(Number.isSafeInteger(entry.providers[key]) && entry.providers[key] >= 0 && entry.providers[key] <= 1000, 'Invalid measured registration provider count');
+      providers[key] += entry.providers[key];
+    }
+    assert(entry.providers.mail === 8 && entry.providers.sms === 5 && entry.providers.violations === 0, 'Registration locale provider contract did not pass');
+  }
+  assert.deepEqual(report.providers, providers, 'Aggregate registration provider counts do not match measured locale deltas');
+  assert(providers.auth > 0, 'Registration SMTP authentication evidence missing');
 }
 
 export async function exportAcceptanceImage(reference, directory, { identify = acceptanceIdentity, run = runCommand } = {}) {

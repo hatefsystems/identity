@@ -1,4 +1,4 @@
-import { assertOnlyPreferenceCookies, browserLocale, browserLocales, configureBrowserPreferences, exercisePreferenceSwitch, localizedText, screenshotName, setBrowserLocale, waitForFonts } from './browser-localization.mjs';
+import { assertOnlyPreferenceCookies, browserLocale, browserLocales, browserViewports, configureBrowserPreferences, exercisePortalNavigation, exercisePreferenceSwitch, exerciseThemeChoices, localizedText, screenshotName, setBrowserLocale, setBrowserTheme, waitForFonts, withTextResize } from './browser-localization.mjs';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
@@ -148,7 +148,7 @@ function observe(context, harness) {
 }
 
 async function newContext(browser, harness) {
-  const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block' });
+  const context = await browser.newContext({ bypassCSP: false, serviceWorkers: 'block', colorScheme: 'light' });
   await configureBrowserPreferences(context, harness.origin);
   context.setDefaultTimeout(15_000);
   context.setDefaultNavigationTimeout(30_000);
@@ -708,6 +708,9 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
   const draft = 'Unsaved portal draft';
   harness.secrets.push(draft);
   await input.fill(draft);
+  evidence.themeChoices = await exerciseThemeChoices(page, async () => {
+    assert.equal(await input.inputValue(), draft, 'Appearance changed an unsent profile draft');
+  });
   await exercisePreferenceSwitch(page, { privateSelector: 'input', settings: true });
   assert.equal(await keyStorage(page).then((value) => value.publicKey), key.publicKey);
   assert.equal(await tab.locator('html').getAttribute('lang'), browserLocale(), 'Another tab presentation changed automatically');
@@ -873,15 +876,10 @@ async function noJavaScript(browser, authenticated, harness, evidence) {
 }
 
 async function appearance(page, evidence, scope = 'portal') {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
   for (const dark of [false, true]) {
-    await page.evaluate((dark) => document.documentElement.classList.toggle('dark', dark), dark);
-    for (const viewport of [
-      { width: 320, height: 568 },
-      { width: 390, height: 844 },
-      { width: 768, height: 1024 },
-      { width: 1280, height: 800 },
-      { width: 320, height: 256 },
-    ]) {
+    await setBrowserTheme(page, dark ? 'dark' : 'light');
+    for (const viewport of browserViewports) {
       await page.setViewportSize(viewport);
       await waitForFonts(page);
       const violations = await page.evaluate(() => {
@@ -912,6 +910,8 @@ async function appearance(page, evidence, scope = 'portal') {
         await page.screenshot({
           path: resolve(directory, screenshotName(scope, viewport, dark)),
           fullPage: true,
+          caret: 'initial',
+          animations: 'disabled',
           // Artifacts demonstrate layout, not a persistent account-data export.
           mask: [
             page.locator('input, textarea, main dd, main .font-mono, [data-testid="saved-display-name"], [data-testid="recovery-viewer"], [data-testid="passkey-row"], [data-testid="session-row"], [data-legal-private]'),
@@ -919,9 +919,168 @@ async function appearance(page, evidence, scope = 'portal') {
         });
       }
     }
+    await exercisePortalNavigation(page, async () => {
+      assert.deepEqual(await page.locator(':focus').evaluate(destructiveAppearance, { focusVisible: true }), [], 'Account navigation focus/contrast regressed');
+    }, async (state, viewport) => {
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Account navigation overflows the document');
+      if (process.env.PORTAL_BROWSER_ARTIFACT_DIR) await page.screenshot({
+        path: resolve(process.env.PORTAL_BROWSER_ARTIFACT_DIR, screenshotName(`${scope}-${state}`, viewport, dark)),
+        fullPage: true, caret: 'initial', animations: 'disabled',
+        mask: [page.locator('input, textarea, main dd, main .font-mono, [data-testid="saved-display-name"], [data-testid="recovery-viewer"], [data-testid="passkey-row"], [data-testid="session-row"], [data-legal-private]')],
+      });
+    });
+    await withTextResize(page, async () => {
+      await page.setViewportSize({ width: 320, height: 568 });
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Account 200% root-font text resize overflows');
+    });
   }
-  await page.evaluate(() => document.documentElement.classList.remove('dark'));
+  await setBrowserTheme(page, originalTheme);
   await page.setViewportSize({ width: 1280, height: 800 });
+}
+
+// Runs in Chromium. Alpha colors and ancestor opacity are composited before
+// measuring; diagnostics contain only public categories, never control text.
+export function destructiveAppearance(element, { focusVisible = false, forcedColors = false } = {}) {
+  const failures = [];
+  const color = (value) => {
+    const match = value.match(/^rgba?\(([^)]+)\)$/);
+    if (!match) throw new Error('Unsupported computed destructive-state color');
+    const channels = match[1].split(/[,\s/]+/).map(Number);
+    if (![3, 4].includes(channels.length) || channels.some((value) => !Number.isFinite(value)) ||
+      channels.slice(0, 3).some((value) => value < 0 || value > 255) ||
+      (channels[3] !== undefined && (channels[3] < 0 || channels[3] > 1)))
+      throw new Error('Invalid computed destructive-state color');
+    return [...channels.slice(0, 3), channels[3] ?? 1];
+  };
+  const over = (front, back) => {
+    const alpha = front[3] + back[3] * (1 - front[3]);
+    return [...front.slice(0, 3).map((value, index) => alpha
+      ? (value * front[3] + back[index] * back[3] * (1 - front[3])) / alpha : 0), alpha];
+  };
+  const pixel = (node, foreground = [0, 0, 0, 0]) => {
+    let painted = foreground;
+    for (let current = node; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (style.backgroundImage !== 'none')
+        throw new Error('Unmeasured destructive-state background image');
+      painted = over(painted, color(style.backgroundColor));
+      painted[3] *= Number(style.opacity);
+    }
+    return over(painted, [255, 255, 255, 1]);
+  };
+  const luminance = (rgb) => rgb.slice(0, 3).reduce((sum, value, index) => {
+    const channel = value / 255;
+    return sum + (channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4) *
+      [0.2126, 0.7152, 0.0722][index];
+  }, 0);
+  const contrast = (front, back) => {
+    const a = luminance(front), b = luminance(back);
+    return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+  };
+  const style = getComputedStyle(element);
+  if (element.disabled || !element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }))
+    failures.push('Destructive-state control is not visible and enabled');
+  if (matchMedia('(forced-colors: active)').matches !== forcedColors)
+    failures.push('Destructive-state palette does not match the requested color mode');
+  if (forcedColors && style.forcedColorAdjust === 'none')
+    failures.push('Destructive-state control suppresses forced colors');
+  if (contrast(pixel(element, color(style.color)), pixel(element)) < 4.5)
+    failures.push('Destructive-state text contrast is below 4.5:1');
+  if (focusVisible) {
+    if (element !== document.activeElement || !element.matches(':focus-visible'))
+      failures.push('Destructive-state keyboard focus is not visible');
+    const rect = element.getBoundingClientRect();
+    if (rect.left < 0 || rect.right > innerWidth || rect.top < 0 || rect.bottom > innerHeight)
+      failures.push('Destructive-state keyboard focus is clipped by the viewport');
+    const backdrop = pixel(element.parentElement);
+    const indicatorPixel = (value) => pixel(element.parentElement,
+      [...value.slice(0, 3), value[3] * Number(style.opacity)]);
+    const outline = style.outlineStyle === 'solid' &&
+      Number.parseFloat(style.outlineWidth) >= 2 && Number.parseFloat(style.outlineOffset) >= 0 &&
+      contrast(indicatorPixel(color(style.outlineColor)), backdrop) >= 3;
+    // Forced colors discard box shadows. Normal mode also checks the actual
+    // ring width outside any offset, not a contrasting but fully covered shadow.
+    const shadows = [...style.boxShadow.matchAll(/(rgba?\([^)]+\)) 0px 0px 0px ([\d.]+)px/g)]
+      .map((match) => ({ color: color(match[1]), spread: Number(match[2]) }));
+    const ring = !forcedColors && shadows.some((shadow, index) => {
+      const covered = Math.max(0, ...shadows.slice(0, index).map((prior) => prior.spread));
+      return shadow.spread - covered >= 2 &&
+        contrast(indicatorPixel(shadow.color), backdrop) >= 3;
+    });
+    if (!outline && !ring)
+      failures.push('Destructive-state focus indicator is below 3:1 or 2px');
+  }
+  return failures;
+}
+
+async function checkedDeletionAppearance(page, acknowledgement, remove, evidence) {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
+  const apiCalls = [];
+  const observeRequest = (request) => {
+    if (new URL(request.url()).pathname.startsWith('/api/')) apiCalls.push(request.method());
+  };
+  page.on('request', observeRequest);
+  const assertState = async (state, dark, forcedColors = false, focusVisible = false) => {
+    await waitForFonts(page);
+    await page.waitForFunction(() => document.getAnimations()
+      .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
+      .every((animation) => animation.playState === 'finished' || animation.playState === 'idle'));
+    assert(await acknowledgement.isChecked(), 'Deletion state lost acknowledgement');
+    assert(await remove.isEnabled(), 'Checked deletion action is not enabled');
+    assert.equal(await page.getByTestId('stepup-dialog').count(), 0,
+      'A pre-dialog appearance probe opened verification');
+    assert.deepEqual(await remove.evaluate(destructiveAppearance, { forcedColors, focusVisible }), [],
+      `Enabled deletion ${state} ${forcedColors ? 'forced-colors' : dark ? 'dark' : 'light'}`);
+    if (process.env.PORTAL_BROWSER_ARTIFACT_DIR) {
+      const directory = resolve(process.env.PORTAL_BROWSER_ARTIFACT_DIR);
+      await mkdir(directory, { recursive: true });
+      await page.screenshot({
+        path: resolve(directory, screenshotName(`privacy-deletion-enabled-${forcedColors ? 'forced-colors-' : ''}${state}`, { width: 1280, height: 800 }, dark)),
+        fullPage: true,
+        caret: 'initial',
+        animations: 'disabled',
+        mask: [page.locator('input, textarea, main dd, main .font-mono, [data-testid="saved-display-name"], [data-testid="recovery-viewer"], [data-testid="passkey-row"], [data-testid="session-row"], [data-legal-private]')],
+      });
+    }
+    assert.deepEqual(apiCalls, [], 'Appearance interactions requested or replayed API work');
+  };
+  try {
+    for (const forcedColors of [false, true]) {
+      await page.emulateMedia({ forcedColors: forcedColors ? 'active' : 'none' });
+      for (const dark of [false, true]) {
+        await setBrowserTheme(page, dark ? 'dark' : 'light');
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await page.mouse.move(0, 0);
+        await remove.evaluate((button) => button.blur());
+        await remove.scrollIntoViewIfNeeded();
+        await assertState('default', dark, forcedColors);
+        await remove.hover();
+        assert(await remove.evaluate((button) => button.matches(':hover')));
+        await assertState('hover', dark, forcedColors);
+        await page.mouse.down();
+        try {
+          assert(await remove.evaluate((button) => button.matches(':active')));
+          await assertState('pressed', dark, forcedColors);
+        } finally {
+          // Release outside the button so a held press never activates deletion.
+          await page.mouse.move(0, 0);
+          await page.mouse.up();
+        }
+        await acknowledgement.focus();
+        await page.keyboard.press('Tab');
+        assert(await remove.evaluate((button) => button === document.activeElement),
+          'Enabled deletion is not the next keyboard action after acknowledgement');
+        await assertState('focus', dark, forcedColors, true);
+      }
+    }
+    evidence.checks.push('checked/enabled deletion before dialog: default, hover, held pointer press and keyboard focus in both palettes; composited text >=4.5:1 and essential focus >=3:1/2px; forced colors checked separately; zero API work');
+  } finally {
+    page.off('request', observeRequest);
+    await page.mouse.up();
+    await page.emulateMedia({ forcedColors: 'none' });
+    await setBrowserTheme(page, originalTheme);
+    await page.setViewportSize({ width: 1280, height: 800 });
+  }
 }
 
 async function passkeyManagement(browser, harness, evidence, contexts) {
@@ -1005,6 +1164,16 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   );
 }
 
+export async function recoveryAction(page) {
+  const count = page.getByTestId('recovery-status').locator('strong');
+  const name = await count.count() === 0 ? 'Generate or replace recovery codes'
+    : (await count.textContent()).trim() === new Intl.NumberFormat(browserLocale()).format(0)
+      ? 'Generate new recovery codes' : 'Replace recovery codes';
+  const action = page.getByRole('button', { name: localizedText(name), exact: true });
+  assert.equal(await action.count(), 1, 'Recovery requires exactly one current-state explicit action');
+  return action;
+}
+
 async function generateCodes(page, harness, { switchLocale = false } = {}) {
   // Finish the existing initial status load before observing the intentional
   // post-generation read. Locale switching must start from a settled baseline.
@@ -1014,7 +1183,7 @@ async function generateCodes(page, harness, { switchLocale = false } = {}) {
   refreshedStatus.catch(() => {});
   const generated = harness.captureJSON('/api/v1/auth/recovery-codes/generate', 'POST', 200);
   progress('recovery-generation-verification');
-  await stepUp(page, () => page.getByRole('button', { name: localizedText(/generate.*recovery codes/i) }).click());
+  await stepUp(page, async () => (await recoveryAction(page)).click());
   const batch = await generated;
   assert(Array.isArray(batch.codes) && batch.codes.length === batch.count && batch.count === 10);
   harness.secrets.push(...batch.codes);
@@ -1170,6 +1339,7 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
   const authenticator = await addAuthenticator(page, fixture.credentials[0]);
   await signIn(page, harness.origin);
   await navigate(page, harness.origin, 'Security', '/dashboard/security');
+  await page.getByTestId('recovery-status').waitFor({ state: 'visible' });
   let committed = 0;
   let lostCodes;
   let interceptionFailed = false;
@@ -1204,7 +1374,7 @@ async function uncertainRecovery(browser, harness, evidence, contexts) {
     patterns: [{ urlPattern: `${harness.origin}/api/v1/auth/recovery-codes/generate`, requestStage: 'Response' }],
   });
   try {
-    await stepUp(page, () => page.getByRole('button', { name: localizedText(/generate.*recovery codes/i) }).click());
+    await stepUp(page, async () => (await recoveryAction(page)).click());
     await page
       .getByTestId('stepup-dialog')
       .getByRole('alert')
@@ -1292,8 +1462,17 @@ async function deletionPolicy(page, harness, fixture, authenticator, evidence) {
   const acknowledgement = page.getByRole('checkbox', { name: localizedText(/I understand the account-deletion consequences/) });
   const remove = page.getByRole('button', { name: localizedText('Delete my account'), exact: true });
   assert(await remove.isDisabled(), 'Deletion did not require acknowledgement');
+  const disabledAppearance = await remove.evaluate((button) => {
+    const style = getComputedStyle(button);
+    return { opacity: style.opacity, color: style.color, background: style.backgroundColor };
+  });
   await acknowledgement.focus();
   await page.keyboard.press('Space');
+  assert.notDeepEqual(await remove.evaluate((button) => {
+    const style = getComputedStyle(button);
+    return { opacity: style.opacity, color: style.color, background: style.backgroundColor };
+  }), disabledAppearance, 'Enabled and disabled deletion actions are visually indistinguishable');
+  await checkedDeletionAppearance(page, acknowledgement, remove, evidence);
   await remove.click();
   const dialog = page.getByRole('dialog', { name: localizedText('Confirm account deletion'), exact: true });
   await dialog.waitFor({ state: 'visible' });

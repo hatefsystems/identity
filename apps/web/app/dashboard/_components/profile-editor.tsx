@@ -95,6 +95,23 @@ export function ProfileEditor() {
     }
   }
 
+  const refreshControl = (
+    <Button
+      key="refresh"
+      type="button"
+      variant={conflict ? 'default' : 'outline'}
+      className={controlClass}
+      onClick={refresh}
+      disabled={pending}
+    >
+      {t('portal.profile.refresh')}
+    </Button>
+  );
+  const saveControl = (
+    <Button key="save" type="submit" className={controlClass} disabled={pending || conflict}>
+      {t('portal.profile.save')}
+    </Button>
+  );
   return (
     <>
       <PageHeading title={t('portal.profile.title')}>{t('portal.profile.description')}</PageHeading>
@@ -119,7 +136,7 @@ export function ProfileEditor() {
           noValidate
           aria-label={t('portal.profile.form')}
           onSubmit={save}
-          className="space-y-4"
+          className="max-w-xl space-y-4"
         >
           <div className="space-y-2">
             <Label htmlFor={id}>{t('portal.profile.name')}</Label>
@@ -165,18 +182,7 @@ export function ProfileEditor() {
             })}
           </p>
           <div className="flex flex-wrap gap-3">
-            <Button type="submit" className={controlClass} disabled={pending || conflict}>
-              {t('portal.profile.save')}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              className={controlClass}
-              onClick={refresh}
-              disabled={pending}
-            >
-              {t('portal.profile.refresh')}
-            </Button>
+            {conflict ? [refreshControl, saveControl] : [saveControl, refreshControl]}
           </div>
         </form>
       </Panel>

@@ -7,7 +7,7 @@ language automatically. Preferences belong to a browser, not an account profile.
 
 ## Request and preference boundary
 
-`apps/web/i18n/config.ts` defines the supported locales, calendar options and zone
+`apps/web/i18n/config.ts` defines the supported locales, calendar, appearance and zone
 validation. `server.ts` resolves each request's cookie; `request.ts` configures
 `next-intl` using an explicit catalog allowlist. The root retains `connection()`
 for fresh per-request CSP nonces, renders the initial `lang`/`dir` and passes only
@@ -19,18 +19,21 @@ signal, component key, security-effect dependency, or authorization cache.
 The `__Host-hatef-ui` cookie has this bounded versioned representation:
 
 ```text
-1~en~auto~UTC
-1~fa-IR~persian~Asia/Tehran
+2~en~auto~UTC~system
+2~fa-IR~persian~Asia/Tehran~dark
 ```
 
-It contains only `locale`, `calendar` and `timeZone`, is at most 128 characters,
+It contains only `locale`, `calendar`, `timeZone` and `theme`, is at most 128 characters,
 and uses `Secure; HttpOnly; Path=/; SameSite=Lax; Max-Age=31536000` without a Domain.
 The authentication cookie remains `SameSite=Strict`. Missing, oversized, duplicate,
 malformed or unsupported-version preference cookies resolve to English, automatic
-calendar and UTC. An unsupported individual field receives its own default.
+calendar, UTC and System appearance. An unsupported individual field receives its
+own default. V1 cookies (`1~locale~calendar~timeZone`) remain readable and migrate
+to System without losing the other saved choices. V2 readers must be deployed
+before V2 writes in a rolling release, and retained during rollback.
 Untrusted cookie text never becomes an import path, HTML, log payload or authority.
-The Server Action accepts exactly those three properties and rejects unknown keys,
-unsupported locale/calendar and invalid zones; it writes only the preference
+The Server Action accepts exactly those four properties and rejects unknown keys,
+unsupported locale/calendar/theme and invalid zones; it writes only the preference
 cookie. A failed save keeps the previous presentation and reports localized
 feedback. Saves are serialized so a stale response cannot replace a newer choice.
 
@@ -43,6 +46,17 @@ original deadlines. Native security dialogs continue to make background controls
 inert. Existing tabs retain their presentation until an explicit change or later
 server navigation; preferences do not use the authentication invalidation channel.
 Use the existing local HTTPS harness to exercise the secure cookie.
+
+Appearance accepts exactly `system`, `light` and `dark`. Explicit Light/Dark render
+in SSR. System uses one constant, request-nonced head initializer before paint,
+reading only the validated selected-mode attribute and OS color-scheme query.
+The stable client controller synchronizes successful saves before paint and
+follows OS changes only while System is active; unavailable detection uses light.
+The `.dark` class and CSS `color-scheme` agree, including native widgets. There is
+no localStorage, inline style, authentication-channel broadcast or CSP exception.
+Other tabs keep their selected presentation until explicit change/server navigation;
+active System tabs still independently follow OS changes. Failed saves preserve
+the old appearance as well as language/calendar/zone and do not replay API work.
 
 Normal page errors and not-found text use the request language. If the root itself
 fails, `global-error.tsx` intentionally provides independent English and Persian
@@ -105,8 +119,21 @@ and input padding must deliberately account for the LTR input inside an RTL shel
 Names and user narratives use `dir="auto"`/isolation. Emails, URLs, codes, UUIDs,
 IP addresses, hashes, revisions, sequence values and technical timestamps use
 isolated LTR presentation. Bidi marks must never enter wire, clipboard or download
-bytes. Passwords remain exact; TOTP still accepts exactly six ASCII digits, including
-leading zeroes, without converting Persian, Arabic-Indic or fullwidth digits.
+bytes. Passwords remain exact. Numeric browser controls for registration phone/SMS
+and authenticator verification convert Persian (`U+06F0..U+06F9`) and Arabic-Indic
+(`U+0660..U+0669`) digits, including mixtures with ASCII, before strict validation
+and submission. Leading zeroes are preserved. Fullwidth digits, bidi marks, spaces
+and other OTP junk are not converted or stripped; phone formatting follows its
+existing rules. TOTP/SMS still require exactly six canonical ASCII digits. Raw
+validators, API/provider contracts and Go validators remain ASCII-only. Email,
+passwords, recovery credentials/tokens and WebAuthn data are never normalized.
+
+Technical email inputs and displayed mailbox values use explicit LTR isolation,
+including RTL-first international local parts and domains. Email controls use
+unrestricted text with `inputMode="email"`, retaining native caret/selection APIs
+without restrictive HTML email validation. Existing mailbox validation remains
+authoritative. No bidi marks or display normalization enter submitted/copy bytes;
+passwords and display names keep their existing policies.
 
 Persian uses the unmodified variable Vazirmatn v33.003 WOFF2 under SIL Open Font
 License 1.1. The tagged release, source archive member, local SHA-256 values,
@@ -205,8 +232,12 @@ responses are artifact inputs. Only the preference cookie may be added to an
 anonymous page's browser jar; anonymous reclaim API requests still send zero
 cookies/DPoP/session/grants.
 
-The matrix includes light/dark, 320/390/768/1280 widths and short 320×256 reflow.
-The latter is a CSS-viewport approximation, not observed native zoom. The seven
+The matrix includes both locales and all System/Light/Dark choices against light
+and dark OS preferences. It uses representative 320/390/768/1280 widths and short
+320×256 reflow, plus focused 320/375/390/430/768/1024/1280/1440/1920 boundary probes.
+The short viewport and 200% text-size probes are automated approximations, not
+observed native browser zoom. Forced colors and composited checked/enabled
+destructive-control contrast are separate checks from disabled states. The seven
 serial disposable integration targets are security-db, admin, retention, legal
 workflow, gRPC, lifecycle and portal; the helper must not silently run only five.
 Execution results belong in the delivery evidence/PR, not inferred from test
@@ -217,7 +248,43 @@ wording review; screen reader, keyboard/platform-authenticator and native zoom
 review; native hidden-tab/bfcache behavior where not observed; deployed HTTPS
 nonce/Server Action/font/cookie behavior and ingress/log-redaction checks; mailbox,
 SMTP provider and compatible queue rollout/rollback review. Mark each unperformed
-or unavailable check explicitly. Password/signup/reset/TOTP previews remain
-unconnected. Primary-email verification, backup-code login UI, invitations,
-password-reset delivery and OAuth consent/error pages are separate product work;
-browser/OS-owned WebAuthn prompts cannot be translated by this application.
+or unavailable check explicitly. Public authentication offers implemented passkey
+sign-in and registration, including its separate email-verification tab. Password
+reset and general authenticator-login URLs remain localized availability notices
+with supported next actions; disconnected forms are covered only by test fixtures.
+Backup-code login UI, invitations, password-reset delivery and OAuth consent/error
+pages are separate product work. Browser/OS-owned WebAuthn prompts cannot be
+translated by this application.
+
+## UX audit release gates
+
+The isolated registration fixture gives its shared subnet a bounded hourly SMS
+budget of 100 for the expanded bilingual journeys and adversarial attempts. It
+does not change production defaults or the per-phone minute/hour limits. The
+browser rate-limit checks remain real per-phone checks; they do not certify the
+production default subnet budget of ten per hour.
+Each locale uses fresh private services and a fresh browser after verified prior
+locale teardown. The hard-coded signup-start subnet limit is unchanged; no Redis
+rate bucket is cleared or shared evidence reused between the locale journeys.
+
+Implementation, Jest geometry, headless browser checks and synthetic gallery
+frames do not certify human/platform/deployed-ingress acceptance. Release remains
+blocked until actual owners are assigned and the following observations are
+recorded; no reviewer or device owner is implicitly assigned by a test run.
+
+| Gate | Required Owner | Current Observation |
+| --- | --- | --- |
+| Persian deletion cancellation, passkey interruption, sessions and irreversible actions | Independent professional Persian security reviewer, not assigned | Unrun |
+| Persian UTC queries, legal references, holds and integrity interpretation | Independent professional Persian legal reviewer, not assigned | Unrun |
+| Same-phone authenticator return/restart, native typing/paste/autofill/IME and cross-tab registration handoff | Platform/device owner, not assigned | Unrun on physical devices |
+| Native passkey prompts, orientation, short landscape and mobile safe areas | Platform/device owner, not assigned | Unrun on physical devices |
+| Screen reader announcements, native keyboard and implicit Enter in long reviews | Accessibility reviewer, not assigned | Unrun with native assistive technology |
+| Native browser zoom at 200% and 400%, plus supported system text scaling | Accessibility/device owner, not assigned | Unrun; CSS viewport/text probes are not substitutes |
+| Deployed HTTPS nonces, Server Actions, strict cookies, fonts and ingress/log redaction | Deployment/security operator, not assigned | Unrun against deployed ingress |
+| Real mailbox/provider behavior and compatible notifier rollout/rollback | Mail/platform operator, not assigned | Unrun against production providers |
+
+The original 464-frame gallery remains a preserved baseline. A new run must derive
+its counts from the declared inventory, use a distinct run-owned destination and
+pass its sanitizer/offline/manifest checks after formal browser acceptance.
+Synthetic post-sanitization presentation clones are illustration only; they cannot
+stand in for live cancellation, authorization, focus, delivery or mutation evidence.

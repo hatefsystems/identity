@@ -1,7 +1,6 @@
 import { getTranslations } from 'next-intl/server';
 import { PreferenceControls } from '../../i18n/preferences';
-import { ShieldCheck } from 'lucide-react';
-import Link from 'next/link';
+import { BrandLink } from '../_components/brand-link';
 import type { ReactNode } from 'react';
 
 export default async function AuthLayout({ children }: { children: ReactNode }) {
@@ -9,16 +8,7 @@ export default async function AuthLayout({ children }: { children: ReactNode }) 
   return (
     <div className="flex min-h-svh flex-col items-center justify-center gap-6 bg-muted/30 px-4 py-8 sm:px-6 sm:py-12">
       <header>
-        <Link
-          href="/"
-          className="flex min-h-11 items-center gap-3 rounded-md px-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          aria-label={t('homeLabel')}
-        >
-          <span className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <ShieldCheck aria-hidden="true" className="size-5" />
-          </span>
-          <span className="text-base font-semibold tracking-tight">{t('brand')}</span>
-        </Link>
+        <BrandLink homeLabel={t('homeLabel')}>{t('brand')}</BrandLink>
       </header>
       <div className="w-full max-w-md">
         <PreferenceControls />

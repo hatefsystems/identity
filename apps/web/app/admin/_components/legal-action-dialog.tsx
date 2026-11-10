@@ -499,6 +499,7 @@ export function LegalActionDialog({
   return (
     <div ref={region}>
       <StepUpDialog
+        layout="review"
         title={t(`action.titles.${action.kind}`)}
         description={<p>{t('action.description')}</p>}
         onCancel={cancel}
@@ -507,6 +508,20 @@ export function LegalActionDialog({
         resumeMethod={resumeTotp ? 'totp' : undefined}
         verifiedStatus={
           submitting ? { key: 'legal.action.sending' } : { key: 'legal.action.verified' }
+        }
+        verifiedActions={
+          deadline && (
+            <Button
+              type="submit"
+              form={`${id}-${prepared ? 'confirm' : 'prepare'}`}
+              className={`${controlClass} w-full`}
+              disabled={Boolean(prepared) && (!acknowledged || submitting)}
+            >
+              {prepared
+                ? t(submitting ? 'action.submitting' : `action.confirmations.${action.kind}`)
+                : t('action.review')}
+            </Button>
+          )
         }
         verifiedContent={
           deadline && (
@@ -518,6 +533,7 @@ export function LegalActionDialog({
               </p>
               {!prepared ? (
                 <form
+                  id={`${id}-prepare`}
                   ref={form}
                   aria-label={t('action.prepare')}
                   method="post"
@@ -593,12 +609,10 @@ export function LegalActionDialog({
                       {message(error)}
                     </p>
                   )}
-                  <Button type="submit" className={`${controlClass} w-full`}>
-                    {t('action.review')}
-                  </Button>
                 </form>
               ) : (
                 <form
+                  id={`${id}-confirm`}
                   ref={form}
                   aria-label={t('action.confirm')}
                   method="post"
@@ -647,13 +661,6 @@ export function LegalActionDialog({
                           : 'action.acknowledgeLookup'
                     )}
                   </label>
-                  <Button
-                    type="submit"
-                    className={`${controlClass} w-full`}
-                    disabled={!acknowledged || submitting}
-                  >
-                    {t(submitting ? 'action.submitting' : `action.confirmations.${action.kind}`)}
-                  </Button>
                   <p className="text-sm text-muted-foreground">{t('action.frozen')}</p>
                 </form>
               )}

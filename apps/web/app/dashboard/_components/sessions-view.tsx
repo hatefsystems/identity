@@ -13,6 +13,43 @@ import { controlClass, DateLabel, Feedback, PageHeading, Panel } from './control
 import { NativeDialog } from './native-dialog';
 import { usePortal } from './portal-provider';
 
+function SessionIdentity({ session }: { session: BrowserSession }) {
+  const t = useTranslations();
+  // UA tokens are self-reported hints, not proof of a browser or physical device.
+  const browser = ([
+    [/\bEdg(?:e|A|iOS)?\/[\d.]+/, 'Edge'],
+    [/\bOPR\/[\d.]+/, 'Opera'],
+    [/\bSamsungBrowser\/[\d.]+/, 'Samsung Internet'],
+    [/\b(?:Firefox|FxiOS)\/[\d.]+/, 'Firefox'],
+    [/\b(?:Chrome|CriOS)\/[\d.]+/, 'Chrome'],
+    [/\bVersion\/[\d.]+.*\bSafari\/[\d.]+/, 'Safari'],
+  ] as const).find(([pattern]) => pattern.test(session.user_agent))?.[1];
+
+  return (
+    <div className="min-w-0 space-y-1">
+      <h3 dir="auto" className="break-words font-medium isolate">
+        {browser
+          ? t('portal.sessions.reportedBrowser', { browser })
+          : t('portal.sessions.unknownBrowser')}
+      </h3>
+      <p className="text-sm">
+        {session.current ? t('portal.sessions.current') : t('portal.sessions.other')}
+      </p>
+      <p className="text-sm">
+        {t.rich('portal.sessions.lastSeen', {
+          date: () => <DateLabel value={session.last_seen_at} />,
+        })}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        {t('portal.sessions.reference')}
+        <span dir="ltr" className="block break-all font-mono isolate">
+          {session.id}
+        </span>
+      </p>
+    </div>
+  );
+}
+
 export function SessionsView() {
   const t = useTranslations();
   const { client, signOut } = usePortal();
@@ -133,17 +170,7 @@ export function SessionsView() {
                 className="space-y-3 p-4"
               >
                 <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
-                  <div className="min-w-0 space-y-1">
-                    <h3 className="font-medium">
-                      {session.current ? t('portal.sessions.current') : t('portal.sessions.other')}
-                    </h3>
-                    <p
-                      dir="ltr"
-                      className="break-all font-mono text-xs text-muted-foreground isolate"
-                    >
-                      {session.id}
-                    </p>
-                  </div>
+                  <SessionIdentity session={session} />
                   <Button
                     type="button"
                     variant="outline"
@@ -175,12 +202,6 @@ export function SessionsView() {
                       <DateLabel value={session.created_at} />
                     </dd>
                   </div>
-                  <div>
-                    <dt className="text-muted-foreground">{t('portal.sessions.lastActivity')}</dt>
-                    <dd className="mt-1">
-                      <DateLabel value={session.last_seen_at} />
-                    </dd>
-                  </div>
                 </dl>
               </li>
             ))}
@@ -210,12 +231,12 @@ export function SessionsView() {
           }
           description={
             <>
-              {target.current
-                ? t('portal.sessions.signOutDescription')
-                : t('portal.sessions.revokeDescription')}
-              <span dir="ltr" className="mt-2 block break-all font-mono text-xs isolate">
-                {target.id}
-              </span>
+              <SessionIdentity session={target} />
+              <p className="mt-3">
+                {target.current
+                  ? t('portal.sessions.signOutDescription')
+                  : t('portal.sessions.revokeDescription')}
+              </p>
             </>
           }
           onCancel={close}

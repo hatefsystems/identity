@@ -270,48 +270,15 @@ export function RecoveryPanel() {
     }
   }
 
+  const generationLabel = t(
+    loading || loadError || !remaining
+      ? 'security.recovery.generateOrReplace'
+      : remaining.remaining === 0
+        ? 'security.recovery.generate'
+        : 'security.recovery.replace'
+  );
   return (
     <Panel title={t('security.recovery.title')} id="recovery-heading">
-      <p className="text-sm leading-relaxed text-muted-foreground">
-        {t('security.recovery.description')}
-      </p>
-      {remaining && (
-        <p className="text-sm" data-testid="recovery-status">
-          {t.rich('security.recovery.remaining', {
-            count: remaining.remaining,
-            amount: (chunks) => <strong className="text-lg tabular-nums">{chunks}</strong>,
-          })}
-          {remaining.low ? ` ${t('security.recovery.low')}` : ''}
-        </p>
-      )}
-      <Feedback error={loadError} status={loading ? t('security.recovery.loading') : ''} />
-      <Feedback error={error} status={status} />
-      <div className="flex flex-wrap gap-3">
-        <Button
-          type="button"
-          className={controlClass}
-          onClick={() => {
-            if (activeAction.current) return;
-            clearBatch();
-            setError('');
-            setStatus('');
-            activeAction.current = true;
-            setConfirm(true);
-            setResumeTotp(false);
-          }}
-        >
-          {t('security.recovery.generate')}
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          className={controlClass}
-          disabled={loading}
-          onClick={() => setAttempt((value) => value + 1)}
-        >
-          {t('security.recovery.refresh')}
-        </Button>
-      </div>
       {batch && (
         <div
           ref={viewer}
@@ -321,7 +288,6 @@ export function RecoveryPanel() {
           <h3 ref={heading} tabIndex={-1} className="font-semibold focus:outline-none">
             {t('security.recovery.save')}
           </h3>
-          <p className="text-sm leading-relaxed">{t('security.recovery.viewerWarning')}</p>
           <ol
             aria-label={t('security.recovery.list')}
             className="grid min-w-0 gap-2 sm:grid-cols-2"
@@ -338,9 +304,6 @@ export function RecoveryPanel() {
               </li>
             ))}
           </ol>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            {t('security.recovery.storageWarning')}
-          </p>
           <div className="flex flex-wrap gap-3">
             <Button
               type="button"
@@ -368,14 +331,62 @@ export function RecoveryPanel() {
               {t('security.recovery.done')}
             </Button>
           </div>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {t('security.recovery.clearWarning')}
-          </p>
+          <p className="text-sm leading-relaxed">{t('security.recovery.viewerWarning')}</p>
+          <details className="rounded-md border px-3">
+            <summary className="min-h-11 cursor-pointer py-3 text-sm">
+              {t('security.recovery.storageDetails')}
+            </summary>
+            <div className="space-y-3 pb-3 text-sm leading-relaxed text-muted-foreground">
+              <p>{t('security.recovery.storageWarning')}</p>
+              <p>{t('security.recovery.clearWarning')}</p>
+            </div>
+          </details>
         </div>
       )}
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        {t('security.recovery.description')}
+      </p>
+      {remaining && (
+        <p className="text-sm" data-testid="recovery-status">
+          {t.rich('security.recovery.remaining', {
+            count: remaining.remaining,
+            amount: (chunks) => <strong className="text-lg tabular-nums">{chunks}</strong>,
+          })}
+          {remaining.low ? ` ${t('security.recovery.low')}` : ''}
+        </p>
+      )}
+      <Feedback error={loadError} status={loading ? t('security.recovery.loading') : ''} />
+      <Feedback error={error} status={status} />
+      <div className="flex flex-wrap gap-3">
+        <Button
+          type="button"
+          variant={batch ? 'outline' : 'default'}
+          className={controlClass}
+          onClick={() => {
+            if (activeAction.current) return;
+            clearBatch();
+            setError('');
+            setStatus('');
+            activeAction.current = true;
+            setConfirm(true);
+            setResumeTotp(false);
+          }}
+        >
+          {generationLabel}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          className={controlClass}
+          disabled={loading}
+          onClick={() => setAttempt((value) => value + 1)}
+        >
+          {t('security.recovery.refresh')}
+        </Button>
+      </div>
       {confirm && (
         <StepUpDialog
-          title={t('security.recovery.replace')}
+          title={generationLabel}
           description={t('security.recovery.replaceDescription')}
           onCancel={closeConfirmation}
           onAuthorized={generate}

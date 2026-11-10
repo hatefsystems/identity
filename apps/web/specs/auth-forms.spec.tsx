@@ -7,6 +7,8 @@ import {
   TotpForm,
 } from '../app/(auth)/_components/forms';
 import type { FormOutcome } from '../app/(auth)/_lib/use-auth-form';
+import { AuthField } from '../app/(auth)/_components/form-controls';
+import { I18nTestProvider } from '../i18n/testing';
 
 function enter(label: string, value: string) {
   const input = screen.getByLabelText<HTMLInputElement>(label);
@@ -374,7 +376,7 @@ describe('operation-specific presentations', () => {
     ['cancelled', 'The passkey request was cancelled. You can try again.'],
     [
       'unsupported',
-      'Passkeys are not supported in this browser. Try another browser or use the password form.',
+      'Passkeys are not supported in this browser. Try a browser that supports passkeys.',
     ],
     ['error', 'We could not verify the passkey. Please try again.'],
   ] as const)(
@@ -510,18 +512,111 @@ it('translates visible validation and visibility controls while preserving exact
   expect(submit).not.toHaveBeenCalled();
 });
 
-it.each(['۰۱۲۳۴۵', '٠١٢٣٤٥', '０１２３４５', '01۲345', '\u202e012345', '012345\u2069'])(
-  'keeps non-ASCII/bidi TOTP input %j unchanged and rejects it in Persian',
+it.each(['０１２３４５', '01234', '0123456', '01۲ 345', '01۲a45', '\u202e012345', '012345\u2069'])(
+  'rejects invalid TOTP input %j without stripping characters or changing the length in Persian',
   (value) => {
     const submit = jest.fn();
     render(<TotpForm submit={submit} />, { locale: 'fa-IR' });
     const input = screen.getByLabelText<HTMLInputElement>('کد رمزساز');
     fireEvent.change(input, { target: { value } });
     fireEvent.submit(screen.getByRole('form', { name: 'تأیید با رمزساز' }));
-    expect(input.value).toBe(value);
+    expect(input.value).toBe(value.replace('۲', '2'));
     expect(input.dir).toBe('ltr');
     expect(input.getAttribute('aria-invalid')).toBe('true');
     expect(screen.getByText('دقیقاً شش رقم انگلیسی (0-9) وارد کنید.')).toBeTruthy();
     expect(submit).not.toHaveBeenCalled();
   }
 );
+
+it.each(['en', 'fa-IR'] as const)('normalizes typed, pasted and autofilled native TOTP digits to ASCII only on explicit submit in %s', async (locale) => {
+  const submit = jest.fn().mockResolvedValue('error');
+  render(<TotpForm submit={submit} />, { locale });
+  const input = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Authenticator code' : 'کد رمزساز');
+  const form = screen.getByRole('form', { name: locale === 'en' ? 'Authenticator verification' : 'تأیید با رمزساز' });
+  for (const value of ['۰۱۲۳۴۵', '٠١٢٣٤٥', '0۱٢۳4۵']) {
+    fireEvent.change(input, { target: { value } });
+    fireEvent.blur(input);
+    expect(input.value).toBe('012345');
+    expect(input.getAttribute('aria-invalid')).toBe('false');
+    expect(submit).not.toHaveBeenCalled();
+  }
+  expect(fireEvent.paste(input, { clipboardData: { getData: () => '۰۱٢۳٤۵' } })).toBe(true);
+  fireEvent.input(input, { target: { value: '۰۱٢۳٤۵' }, inputType: 'insertFromPaste' });
+  expect(input.value).toBe('012345');
+  expect(submit).not.toHaveBeenCalled();
+  // Autofill can change the DOM without emitting a React change event.
+  input.value = '۰۱٢۳٤۵';
+  fireEvent.submit(form);
+  await screen.findByRole('alert');
+  expect(submit).toHaveBeenCalledTimes(1);
+  expect(submit).toHaveBeenCalledWith({ code: '012345' });
+  expect(input.value).toBe('012345');
+  expect(input.dir).toBe('ltr');
+});
+
+it('isolates technical text email without imposing HTML email parsing or transforming narrative/password values', () => {
+  const email = 'هاتف۱۲+news.!tag@مثال.ایران';
+  const narrative = 'نام فارسی ۱۲۳';
+  const password = '  گذرواژه۱۲۳\u200c  ';
+  render(<>
+    <AuthField name="email" label="Technical mailbox" type="text" inputMode="email" defaultValue={email} />
+    <AuthField name="name" label="Display name" defaultValue={narrative} />
+    <AuthField name="password" label="Exact password" type="password" defaultValue={password} />
+  </>, { locale: 'fa-IR' });
+  const technical = screen.getByLabelText<HTMLInputElement>('Technical mailbox');
+  expect(technical.type).toBe('text');
+  expect(technical.inputMode).toBe('email');
+  expect(technical.dir).toBe('ltr');
+  expect(technical.parentElement?.dir).toBe('ltr');
+  expect(technical.value).toBe(email);
+  expect(technical.validity.typeMismatch).toBe(false);
+  technical.setSelectionRange(0, email.indexOf('@'), 'backward');
+  expect(technical.selectionDirection).toBe('backward');
+  expect(technical.value.slice(technical.selectionStart ?? 0, technical.selectionEnd ?? 0)).toBe('هاتف۱۲+news.!tag');
+  expect(fireEvent.copy(technical)).toBe(true);
+  expect(screen.getByLabelText<HTMLInputElement>('Display name').dir).toBe('auto');
+  expect(screen.getByLabelText<HTMLInputElement>('Display name').value).toBe(narrative);
+  expect(screen.getByLabelText<HTMLInputElement>('Exact password').value).toBe(password);
+});
+
+it.each(['en', 'fa-IR'] as const)('renders email-typed AuthField as unrestricted technical text and submits exact international mailbox/password bytes in %s', async (locale) => {
+  const submit = jest.fn().mockResolvedValue('error');
+  render(<LoginForm submit={submit} />, { locale });
+  const rawEmail = 'هاتف۱۲+tag.name@مثال.ایران';
+  const rawPassword = '  گذرواژه۱۲۳\u200c  ';
+  const email = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Email address' : 'نشانی ایمیل');
+  fireEvent.change(email, { target: { value: rawEmail } });
+  fireEvent.change(screen.getByLabelText(locale === 'en' ? 'Password' : 'گذرواژه'), { target: { value: rawPassword } });
+  expect(email.type).toBe('text');
+  expect(email.inputMode).toBe('email');
+  expect(email.dir).toBe('ltr');
+  email.setSelectionRange(0, rawEmail.indexOf('@'), 'backward');
+  expect(email.selectionStart).toBe(0);
+  expect(email.selectionEnd).toBe(rawEmail.indexOf('@'));
+  expect(email.value.slice(0, email.selectionEnd ?? 0)).toBe('هاتف۱۲+tag.name');
+  expect(email.validity.typeMismatch).toBe(false);
+  fireEvent.submit(screen.getByRole('form', { name: locale === 'en' ? 'Password sign in' : 'ورود با گذرواژه' }));
+  await screen.findByRole('alert');
+  expect(submit).toHaveBeenCalledWith({ email: rawEmail, password: rawPassword });
+});
+
+it('preserves international email caret and selection through a locale rerender without translating input bytes', () => {
+  const value = 'هاتف+tag.name@BÜCHER.example';
+  const view = (locale: 'en' | 'fa-IR') => <I18nTestProvider locale={locale}>
+    <AuthField name="email" label={locale === 'en' ? 'Email address' : 'نشانی ایمیل'} type="text" inputMode="email" defaultValue={value} />
+  </I18nTestProvider>;
+  const { rerender } = render(view('en'));
+  const email = screen.getByLabelText<HTMLInputElement>('Email address');
+  email.focus();
+  email.setSelectionRange(2, 11, 'backward');
+  rerender(view('fa-IR'));
+  expect(screen.getByLabelText('نشانی ایمیل')).toBe(email);
+  expect(email.dir).toBe('ltr');
+  expect(email.value).toBe(value);
+  expect(email.selectionStart).toBe(2);
+  expect(email.selectionEnd).toBe(11);
+  expect(email.selectionDirection).toBe('backward');
+  email.setSelectionRange(value.indexOf('@'), value.indexOf('@'));
+  expect(email.selectionStart).toBe(value.indexOf('@'));
+  expect(email.selectionEnd).toBe(value.indexOf('@'));
+});

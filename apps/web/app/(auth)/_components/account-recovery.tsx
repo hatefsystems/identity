@@ -15,6 +15,7 @@ import {
   type ReclaimProof,
 } from '../../_lib/portal/reclaim-client';
 import { usePasskey } from '../../_lib/portal/webauthn';
+import { normalizeNumericInput } from '../../_lib/numeric-input';
 import { controlClass, Feedback, inputClass } from '../../dashboard/_components/controls';
 import { AuthLink } from './auth-card';
 
@@ -256,7 +257,7 @@ export function AccountRecovery() {
     )
       return;
     const selected = challenge.current;
-    let code = input.current?.value ?? '';
+    let code = normalizeNumericInput(input.current?.value ?? '');
     if (selected.factor === 'totp' && (code.length !== 6 || !/^[0-9]{6}$/.test(code))) {
       setCodeError({ key: 'auth.reclaim.codeError' });
       input.current?.focus();
@@ -337,6 +338,7 @@ export function AccountRecovery() {
       ) : (
         <>
           <p className="text-sm leading-relaxed text-muted-foreground">{t('auth.reclaim.intro')}</p>
+          <p className="text-sm leading-relaxed text-muted-foreground">{t('auth.reclaim.samePhone')}</p>
           {factor ? (
             <div ref={factorView} className="space-y-4">
               {factor === 'webauthn' ? (
@@ -377,7 +379,10 @@ export function AccountRecovery() {
                     disabled={Boolean(pending)}
                     aria-invalid={Boolean(codeError)}
                     aria-describedby={`${id}-hint${codeError ? ` ${id}-error` : ''}`}
-                    onChange={() => setCodeError('')}
+                    onChange={(event) => {
+                      event.currentTarget.value = normalizeNumericInput(event.currentTarget.value);
+                      setCodeError('');
+                    }}
                     className={`${inputClass} font-mono tracking-widest`}
                   />
                   <p id={`${id}-hint`} className="text-sm leading-relaxed text-muted-foreground">

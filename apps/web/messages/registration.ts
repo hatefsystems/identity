@@ -1,6 +1,23 @@
 import type { CatalogShape } from '../i18n/types';
 
 export const registrationEn = {
+  headings: {
+    contacts: 'Create your account',
+    email: 'Verify your email',
+    phone: 'Verify your mobile number',
+    passkey: 'Create your passkey',
+    uncertain: 'Check registration outcome',
+    completed: 'Account created',
+    closed: 'Registration needs a fresh start',
+  },
+  verifyHeadings: {
+    loading: 'Verify your email ownership',
+    ready: 'Verify your email ownership',
+    verifying: 'Verifying email ownership',
+    confirmed: 'Email verified',
+    closed: 'Email verification unavailable',
+  },
+  returnOriginalTab: 'Return to the original registration tab and choose Check email verification there.',
   "cleared": "Registration was cleared. Start again, or sign in normally if account creation may have completed.",
   "invalidLink": "This link cannot be verified here. Use the original browser, or restart registration. The link cannot recover signup authority.",
   "completionLost": "The completion response was lost. Check the registration result before creating anything else. You can also try normal passkey sign-in.",
@@ -42,7 +59,7 @@ export const registrationEn = {
   "sendSMS": "Send SMS code",
   "verifyPhoneLabel": "Verify registration phone",
   "smsCode": "SMS verification code",
-  "codeHint": "Enter six ASCII digits, including any leading zero. The code is never submitted automatically.",
+  "codeHint": "Enter six English, Persian or Arabic-Indic digits, including any leading zero. The code is never submitted automatically.",
   "verifyPhone": "Verify phone",
   "checkingProofs": "Checking saved ownership proofs...",
   "checkProofs": "Check saved proofs",
@@ -56,7 +73,7 @@ export const registrationEn = {
   "normalSignIn": "Try normal passkey sign-in",
   "noScript": "JavaScript is required for secure registration. No credentials or verification request are submitted without it.",
   "verifyingEmail": "Verifying email ownership in the original browser...",
-  "emailConfirmed": "Email ownership is verified. Return to the original registration tab and check email verification there. This page cannot create an account or recover signup authority.",
+  "emailConfirmed": "Email ownership is verified. This did not create an account or sign you in. This page cannot recover signup authority.",
   "originalBrowser": "Confirm only in the browser where registration started. Keep the original registration tab open. A different browser must restart registration.",
   "verifyEmail": "Verify email ownership",
   "cancelEmail": "Cancel email verification",
@@ -72,6 +89,23 @@ export const registrationEn = {
 } as const;
 
 export const registrationFa = {
+  headings: {
+    contacts: 'حساب خود را ایجاد کنید',
+    email: 'ایمیل خود را تأیید کنید',
+    phone: 'شمارهٔ همراه خود را تأیید کنید',
+    passkey: 'کلید عبور خود را بسازید',
+    uncertain: 'نتیجهٔ ثبت‌نام را بررسی کنید',
+    completed: 'حساب ساخته شد',
+    closed: 'ثبت‌نام باید دوباره آغاز شود',
+  },
+  verifyHeadings: {
+    loading: 'مالکیت ایمیل خود را تأیید کنید',
+    ready: 'مالکیت ایمیل خود را تأیید کنید',
+    verifying: 'در حال تأیید مالکیت ایمیل',
+    confirmed: 'ایمیل تأیید شد',
+    closed: 'تأیید ایمیل در دسترس نیست',
+  },
+  returnOriginalTab: 'به زبانهٔ اولیهٔ ثبت‌نام برگردید و «بررسی تأیید ایمیل» را در آنجا انتخاب کنید.',
   "cleared": "ثبت‌نام پاک شد. دوباره شروع کنید؛ اگر احتمال دارد حساب ساخته شده باشد، به روش معمول وارد شوید.",
   "invalidLink": "این پیوند در اینجا قابل تأیید نیست. از مرورگر اولیه استفاده کنید یا ثبت‌نام را دوباره شروع کنید. این پیوند نمی‌تواند اختیار ثبت‌نام را بازیابی کند.",
   "completionLost": "پاسخ تکمیل دریافت نشد. پیش از ایجاد مورد جدید، نتیجهٔ ثبت‌نام را بررسی کنید. همچنین می‌توانید ورود معمول با کلید عبور را امتحان کنید.",
@@ -113,7 +147,7 @@ export const registrationFa = {
   "sendSMS": "ارسال کد پیامکی",
   "verifyPhoneLabel": "تأیید تلفن ثبت‌نام",
   "smsCode": "کد تأیید پیامکی",
-  "codeHint": "شش رقم انگلیسی (ASCII) را با حفظ صفر ابتدایی وارد کنید. کد هرگز خودکار ارسال نمی‌شود.",
+  "codeHint": "شش رقم انگلیسی، فارسی یا عربی را با حفظ صفر ابتدایی وارد کنید. کد هرگز خودکار ارسال نمی‌شود.",
   "verifyPhone": "تأیید تلفن",
   "checkingProofs": "در حال بررسی مدارک مالکیت ذخیره‌شده...",
   "checkProofs": "بررسی مدارک ذخیره‌شده",
@@ -127,7 +161,7 @@ export const registrationFa = {
   "normalSignIn": "امتحان ورود معمول با کلید عبور",
   "noScript": "برای ثبت‌نام امن به جاوااسکریپت نیاز است. بدون آن هیچ اطلاعات ورود یا درخواست تأییدی ارسال نمی‌شود.",
   "verifyingEmail": "در حال تأیید مالکیت ایمیل در مرورگر اولیه...",
-  "emailConfirmed": "مالکیت ایمیل تأیید شد. به زبانهٔ اولیهٔ ثبت‌نام برگردید و تأیید ایمیل را آنجا بررسی کنید. این صفحه نمی‌تواند حساب بسازد یا اختیار ثبت‌نام را بازیابی کند.",
+  "emailConfirmed": "مالکیت ایمیل تأیید شد. این کار حسابی نساخت و شما را وارد حساب نکرد. این صفحه نمی‌تواند اختیار ثبت‌نام را بازیابی کند.",
   "originalBrowser": "فقط در مرورگری تأیید کنید که ثبت‌نام در آن شروع شده است. زبانهٔ اولیهٔ ثبت‌نام را باز نگه دارید. در مرورگر دیگر باید ثبت‌نام را دوباره شروع کنید.",
   "verifyEmail": "تأیید مالکیت ایمیل",
   "cancelEmail": "لغو تأیید ایمیل",

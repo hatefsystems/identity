@@ -2,7 +2,7 @@ import type { CatalogShape } from '../i18n/types';
 
 export const securityEn = {
   title: 'Security',
-  description: 'Review your sign-in credentials. Sensitive changes require fresh passkey or enrolled authenticator verification.',
+  description: 'Manage recovery codes and registered passkeys. Sensitive changes require fresh passkey or enrolled authenticator verification.',
   stepUp: {
     applying: 'Applying the confirmed action...', preparing: 'Preparing fresh verification...',
     codeError: 'Enter the six-digit code from your authenticator app.',
@@ -50,6 +50,7 @@ export const securityEn = {
     remaining: '{count, plural, one {<amount>#</amount> unused code remaining.} other {<amount>#</amount> unused codes remaining.}}',
     low: 'Your supply is running low.', loading: 'Checking remaining recovery codes...',
     generate: 'Generate new recovery codes', refresh: 'Refresh recovery status', save: 'Save your new recovery codes',
+    generateOrReplace: 'Generate or replace recovery codes', storageDetails: 'Storage and clearing details',
     viewerWarning: 'Every previous code is now invalid. These codes are shown once and clear within five minutes, at session expiry, or when you leave or hide this page.',
     list: 'New recovery codes',
     storageWarning: 'Keep the codes in private storage, such as a password manager. Anyone who obtains a code may recover your account. Do not share or email them.',
@@ -62,7 +63,7 @@ export const securityEn = {
 } as const;
 
 export const securityFa = {
-  title: 'امنیت', description: 'اطلاعات ورود خود را بررسی کنید. تغییرات حساس به تأیید هویت تازه با کلید عبور یا برنامهٔ رمزساز ثبت‌شده نیاز دارند.',
+  title: 'امنیت', description: 'کدهای بازیابی و کلیدهای عبور ثبت‌شده را مدیریت کنید. تغییرات حساس به تأیید هویت تازه با کلید عبور یا برنامهٔ رمزساز ثبت‌شده نیاز دارند.',
   stepUp: {
     applying: 'در حال اعمال عملیات تأییدشده...', preparing: 'در حال آماده‌سازی تأیید هویت تازه...',
     codeError: 'کد شش‌رقمی برنامهٔ رمزساز خود را وارد کنید.',
@@ -108,6 +109,7 @@ export const securityFa = {
     remaining: '{count, plural, one {<amount>#</amount> کد استفاده‌نشده باقی مانده است.} other {<amount>#</amount> کد استفاده‌نشده باقی مانده است.}}',
     low: 'تعداد کدهای باقی‌مانده کم است.', loading: 'در حال بررسی کدهای بازیابی باقی‌مانده...',
     generate: 'تولید کدهای بازیابی جدید', refresh: 'تازه‌سازی وضعیت بازیابی', save: 'کدهای بازیابی جدید خود را ذخیره کنید',
+    generateOrReplace: 'تولید یا جایگزینی کدهای بازیابی', storageDetails: 'جزئیات نگهداری و پاک‌کردن کدها',
     viewerWarning: 'همهٔ کدهای قبلی اکنون نامعتبرند. این کدها فقط یک بار نمایش داده می‌شوند و ظرف پنج دقیقه، هنگام انقضای نشست، یا با ترک یا پنهان‌کردن این صفحه پاک می‌شوند.',
     list: 'کدهای بازیابی جدید',
     storageWarning: 'کدها را در فضای خصوصی مانند مدیر گذرواژه نگه دارید. هر کسی که کدی به دست آورد ممکن است حساب شما را بازیابی کند. آن‌ها را به اشتراک نگذارید و ایمیل نکنید.',

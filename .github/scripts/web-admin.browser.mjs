@@ -1,4 +1,4 @@
-import { assertOnlyPreferenceCookies, browserLocale, browserLocales, configureBrowserPreferences, exercisePreferenceSwitch, localizedText, screenshotName, setBrowserLocale, waitForFonts } from './browser-localization.mjs';
+import { assertOnlyPreferenceCookies, assertBrowserTheme, browserLocale, browserLocales, browserViewports, focusedBrowserViewports, configureBrowserPreferences, exercisePortalNavigation, exercisePreferenceSwitch, exerciseThemeChoices, localizedText, screenshotName, setBrowserLocale, setBrowserTheme, waitForFonts, withTextResize } from './browser-localization.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -20,6 +20,7 @@ const statusRoute = /^\/api\/v1\/admin\/users\/[^/]+\/status\/?$/;
 const legalCreate = ['/api/v1/admin/legal-holds', '/api/v1/admin/preservation-requests'];
 const legalLookup = '/api/v1/admin/legal-inquiry/lookup';
 const legalRelease = /^\/api\/v1\/admin\/legal-holds\/[0-9a-f-]{36}$/;
+const focusedReviews = new Set();
 
 export function observeLegalWrites(cdp, origin) {
   const attempts = [];
@@ -371,6 +372,7 @@ async function confirmForm(page, action = 'Suspend', method = 'passkey', harness
   const dialog = page.getByTestId('stepup-dialog');
   await dialog.waitFor({ state: 'visible' });
   assert(await dialog.evaluate((element) => element instanceof HTMLDialogElement && element.open));
+  await checkFocusedReview(page, 'moderation');
   assert.equal(await dialog.getByLabel(localizedText('Moderation reason'), { exact: true }).count(), 0);
   await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
   if (method === 'totp') {
@@ -392,7 +394,7 @@ async function finalSubmit(dialog, reason, action = 'suspend') {
   await dialog.getByRole('button', { name: localizedText(`Confirm ${action}`), exact: true }).click();
 }
 
-export function adminAppearance({ focusedOnly = false } = {}) {
+export function adminAppearance({ focusedOnly = false, forcedColors = false } = {}) {
   // Measure settled theme/focus colors rather than a transition's intermediate frame.
   for (const animation of document.getAnimations()) {
     if (animation instanceof CSSTransition) animation.finish();
@@ -431,8 +433,9 @@ export function adminAppearance({ focusedOnly = false } = {}) {
       return ['Admin keyboard target is not visibly focused'];
     }
     const style = getComputedStyle(element);
+    if (forcedColors && style.forcedColorAdjust === 'none') failures.add('Admin focused control suppresses forced colors');
     const backdrop = background(element.parentElement);
-    const ring = [...style.boxShadow.matchAll(/(rgba?\([^)]+\)) 0px 0px 0px ([\d.]+)px/g)]
+    const ring = !forcedColors && [...style.boxShadow.matchAll(/(rgba?\([^)]+\)) 0px 0px 0px ([\d.]+)px/g)]
       .some((match) => Number(match[2]) >= 2 && ratio(color(match[1]), backdrop) >= 3);
     const outline = !['none', 'hidden'].includes(style.outlineStyle) &&
       Number.parseFloat(style.outlineWidth) >= 2 && ratio(color(style.outlineColor), backdrop) >= 3;
@@ -462,6 +465,7 @@ export function adminAppearance({ focusedOnly = false } = {}) {
   }
   for (const element of (modal || document).querySelectorAll('a[href], button, input:not([type=hidden]), select, textarea')) {
     if (!shown(element) || element.matches(':disabled')) continue;
+    if (forcedColors && getComputedStyle(element).forcedColorAdjust === 'none') failures.add('Admin control suppresses forced colors');
     const target = element.matches('input[type=checkbox]')
       ? Array.from(element.labels || []).find(shown) : element;
     if (!target) { failures.add('Admin checkbox lacks a visible associated label'); continue; }
@@ -485,24 +489,170 @@ export function adminAppearance({ focusedOnly = false } = {}) {
   return [...failures];
 }
 
+export function visibleKeyboardStops(elements) {
+  return elements.flatMap((element, index) => {
+    if (element.tabIndex < 0 || element.matches(':disabled, [aria-disabled="true"]') ||
+      element.closest('[hidden], [inert]') || !element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) ||
+      !element.getClientRects().length) return [];
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (parent.localName === 'details' && !parent.open && !parent.querySelector(':scope > summary')?.contains(element)) return [];
+    }
+    return [index];
+  });
+}
+
+export function reviewAppearance(dialog) {
+  const failures = [];
+  if (dialog.getAttribute('data-layout') !== 'review') return ['Expected opt-in review layout'];
+  const bodies = dialog.querySelectorAll('[data-dialog-scroll]');
+  const header = dialog.querySelector('header');
+  const heading = header?.querySelector('h2');
+  const footer = dialog.querySelector('footer');
+  if (bodies.length !== 1 || !header || !heading || !footer) return ['Review needs one stable title, scroll body and footer'];
+  const body = bodies[0];
+  const h = header.getBoundingClientRect(), b = body.getBoundingClientRect(), f = footer.getBoundingClientRect();
+  if (h.top < -1 || f.bottom > innerHeight + 1 || b.height <= 0 || b.top < h.bottom - 1 || b.bottom > f.top + 1)
+    failures.push('Review title/body/footer overlap or leave the viewport');
+  if (getComputedStyle(body).overflowY !== 'auto') failures.push('Review body is not independently scrollable');
+  const initial = body.scrollTop;
+  body.scrollTop = body.scrollHeight;
+  if (body.scrollHeight > body.clientHeight && body.scrollTop <= 0) failures.push('Long review body cannot be scrolled');
+  if (header.getBoundingClientRect().top !== h.top || footer.getBoundingClientRect().bottom !== f.bottom)
+    failures.push('Review scrolling moved the persistent title or footer');
+  body.scrollTop = initial;
+  const cancel = document.documentElement.lang === 'en' ? 'Cancel' : 'لغو';
+  if ([...footer.querySelectorAll('button')].filter((button) => button.textContent.trim() === cancel).length !== 1)
+    failures.push('Review footer lacks one localized cancel action');
+  return failures;
+}
+
+async function reviewKeyboard(page, modal, forcedColors = false) {
+  const candidates = modal.locator('a[href], button, input, select, textarea, summary, [tabindex]');
+  const stops = await candidates.evaluateAll(visibleKeyboardStops);
+  assert(stops.length > 0, 'Admin modal has no visible enabled keyboard controls');
+  await candidates.nth(stops[0]).focus();
+  await page.keyboard.press('Shift+Tab');
+  for (const index of stops) {
+    await page.keyboard.press('Tab');
+    assert(await candidates.nth(index).evaluate((node) => node === document.activeElement), 'Native dialog skipped or trapped a visible keyboard control');
+    const failures = await page.evaluate(adminAppearance, { focusedOnly: true, forcedColors });
+    if (failures.length) {
+      const metrics = await candidates.nth(index).evaluate((node) => {
+        const r = node.getBoundingClientRect(), b = node.closest('[data-dialog-scroll]')?.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return { tag: node.tagName, height: r.height, top: r.top, bottom: r.bottom, viewportHeight: innerHeight,
+          scrollTop: b?.top, scrollBottom: b?.bottom, outlineWidth: Number.parseFloat(style.outlineWidth), hasShadow: style.boxShadow !== 'none' };
+      });
+      console.error(JSON.stringify({ check: 'review-focus-failure', codes: failures.map((failure) => [
+        'Admin focused control suppresses forced colors', 'Admin keyboard target lacks a 2px, 3:1 focus indicator',
+        'Admin keyboard target is outside the viewport', 'Admin keyboard target is clipped by a scrolling or clipping ancestor',
+        'Admin modal lost keyboard containment',
+      ].indexOf(failure)), metrics }));
+    }
+    assert.deepEqual(failures, [], 'Admin modal focus is obscured or lacks contrast');
+  }
+}
+
+async function checkFocusedReview(page, scope) {
+  if (focusedReviews.has(scope)) return;
+  const modal = page.locator('dialog[open][data-layout="review"]');
+  assert.equal(await modal.count(), 1);
+  assert.equal(await page.locator('html').getAttribute('data-theme'), 'system', 'Pre-verification OS review probe requires System');
+  const viewport = page.viewportSize();
+  const calls = [];
+  const observe = (request) => { if (new URL(request.url()).pathname.startsWith('/api/')) calls.push(request.method()); };
+  page.on('request', observe);
+  try {
+    for (const size of [...focusedBrowserViewports, { width: 320, height: 256 }]) {
+      await page.setViewportSize(size);
+      await waitForFonts(page);
+      const failures = await modal.evaluate(reviewAppearance);
+      if (failures.length) {
+        const regions = await modal.evaluate((dialog) => Object.fromEntries(['header', '[data-dialog-scroll]', 'footer'].map((selector) => {
+          const bounds = dialog.querySelector(selector)?.getBoundingClientRect();
+          return [selector, bounds ? { top: bounds.top, bottom: bounds.bottom, height: bounds.height } : null];
+        })));
+        const codes = failures.map((failure) => [
+          'Expected opt-in review layout', 'Review needs one stable title, scroll body and footer',
+          'Review title/body/footer overlap or leave the viewport', 'Review body is not independently scrollable',
+          'Long review body cannot be scrolled', 'Review scrolling moved the persistent title or footer',
+          'Review footer lacks one localized cancel action',
+        ].indexOf(failure));
+        console.error(JSON.stringify({ check: 'review-layout-failure', viewport: size, codes, regions }));
+      }
+      assert.deepEqual(failures, [], 'Review responsive title/cancel/scroll regions regressed');
+      await reviewKeyboard(page, modal);
+    }
+    assert.deepEqual(calls, [], 'Pre-verification review probes generated a challenge or replayed API work');
+    focusedReviews.add(scope);
+  } finally {
+    page.off('request', observe);
+    await page.setViewportSize(viewport);
+  }
+}
+
+async function resultChoices(page, capture) {
+  const results = page.locator('[data-result-view]');
+  for (let index = 0; index < await results.count(); index++) {
+    const result = results.nth(index);
+    const group = result.getByRole('group');
+    if (!(await group.isVisible())) continue;
+    await result.evaluate((node) => { node.__rows = [...node.querySelectorAll('[data-result-id]')]; });
+    const calls = [];
+    const observe = (request) => { if (new URL(request.url()).pathname.startsWith('/api/')) calls.push(request.method()); };
+    page.on('request', observe);
+    try {
+      for (const [name, view] of [['Table view', 'table'], ['Compact rows', 'compact']]) {
+        const button = group.getByRole('button', { name: localizedText(name), exact: true });
+        await button.click();
+        await page.waitForFunction(({ index, view }) => document.querySelectorAll('[data-result-view]')[index]?.getAttribute('data-result-view') === view, { index, view });
+        assert.equal(await button.getAttribute('aria-pressed'), 'true');
+        assert(await result.evaluate((node) => node.__rows.every((row) => row.isConnected && node.contains(row))), 'Result choice replaced rows or modal action targets');
+        assert.deepEqual(await page.evaluate(adminAppearance), [], 'Optional table/compact result reflow regressed');
+        const actions = result.locator('tbody a[href]:visible, tbody button:enabled:visible');
+        for (let action = 0; action < await actions.count(); action++) {
+          await actions.nth(action).focus();
+          await page.keyboard.press('Shift+Tab');
+          await page.keyboard.press('Tab');
+          assert(await actions.nth(action).evaluate((node) => node === document.activeElement));
+          assert.deepEqual(await page.evaluate(adminAppearance, { focusedOnly: true }), [], 'Visible compact/table action cannot receive unobscured keyboard focus');
+        }
+        await capture(view);
+      }
+      assert.deepEqual(calls, [], 'Result presentation choices reran the private query');
+    } finally {
+      page.off('request', observe);
+      await result.evaluate((node) => { delete node.__rows; });
+    }
+  }
+}
+
 async function layout(page, name, evidence, artifactDirectory) {
-  for (const viewport of [{ width: 1280, height: 900 }, { width: 768, height: 1024 }, { width: 390, height: 844 }, { width: 320, height: 900 }, { width: 320, height: 256 }]) {
+  const originalTheme = await page.locator('html').getAttribute('data-theme');
+  const initiallyModal = await page.locator('dialog[open]').count() > 0;
+  if (!initiallyModal && !evidence.themeChoices) evidence.themeChoices = await exerciseThemeChoices(page, async () => {
+    assert.deepEqual(await page.evaluate(adminAppearance), [], 'Admin selected-theme/OS combination regressed');
+  });
+  for (const viewport of browserViewports) {
     for (const dark of [false, true]) {
       await page.setViewportSize(viewport);
-      await page.evaluate((enabled) => document.documentElement.classList.toggle('dark', enabled), dark);
+      if (initiallyModal) {
+        assert.equal(originalTheme, 'system', 'Modal OS probes must not disturb a non-System committed preference');
+        await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light' });
+        await assertBrowserTheme(page, 'system');
+      } else await setBrowserTheme(page, dark ? 'dark' : 'light');
       await waitForFonts(page);
       assert.deepEqual(await page.evaluate(adminAppearance), [], 'Admin pointer targets, contrast or reflow regressed');
       const modal = page.locator('dialog[open]');
       if (await modal.count()) {
-        const stops = await modal.locator('a[href], button:enabled, input:enabled, select:enabled, textarea:enabled').count();
-        assert(stops > 0, 'Admin modal has no keyboard controls');
-        for (let index = 0; index < stops; index++) {
-          await page.keyboard.press('Tab');
-          const failures = await page.evaluate(adminAppearance, { focusedOnly: true });
-          if (failures.length) console.error(JSON.stringify({ check: 'admin-modal-focus', viewport, dark, failures }));
-          assert.deepEqual(failures, [], 'Admin modal keyboard focus regressed');
-        }
+        if (await modal.getAttribute('data-layout') === 'review') assert.deepEqual(await modal.evaluate(reviewAppearance), []);
+        await reviewKeyboard(page, modal);
       } else {
+        if (viewport.width < 1024) await resultChoices(page, async (view) => {
+          if (artifactDirectory) await page.screenshot({ path: resolve(artifactDirectory, screenshotName(`${name}-${view}`, viewport, dark)),
+            fullPage: true, caret: 'initial', animations: 'disabled',
+            mask: [page.locator('tbody, [data-result-id], main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="audit-draft-preview"], [data-testid="audit-submitted-filters"], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')] });
+        });
         const controls = page.locator('table tbody a[href]:visible, table tbody button:enabled:visible');
         if (await controls.count()) {
           assert(await page.locator('table').evaluateAll((tables) => tables.every((table) => {
@@ -527,16 +677,38 @@ async function layout(page, name, evidence, artifactDirectory) {
         await page.screenshot({
           path: resolve(artifactDirectory, screenshotName(name, viewport, dark)),
           fullPage: true,
+          caret: 'initial',
           animations: 'disabled',
-          mask: [page.locator('tbody, main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')],
+          mask: [page.locator('tbody, [data-result-id], main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="audit-draft-preview"], [data-testid="audit-submitted-filters"], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')],
         });
       }
       evidence.layouts++;
     }
   }
+  if (!initiallyModal) await exercisePortalNavigation(page, async () => {
+    assert.deepEqual(await page.evaluate(adminAppearance, { focusedOnly: true }), []);
+  }, async (state, viewport) => {
+    assert.deepEqual(await page.evaluate(adminAppearance), []);
+    if (artifactDirectory) await page.screenshot({ path: resolve(artifactDirectory, screenshotName(`${name}-${state}`, viewport)),
+      fullPage: true, caret: 'initial', animations: 'disabled',
+      mask: [page.locator('tbody, [data-result-id], main dd, main .font-mono, input, textarea, [data-legal-private], [data-testid="audit-draft-preview"], [data-testid="audit-submitted-filters"], [data-testid="legal-outcome"], [data-testid="legal-coverage"]')] });
+  });
+  await withTextResize(page, async () => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.deepEqual(await page.evaluate(adminAppearance), [], 'Admin 200% root-font text resize regressed');
+    if (initiallyModal) await reviewKeyboard(page, page.locator('dialog[open]'));
+  });
+  await page.emulateMedia({ forcedColors: 'active' });
+  try {
+    await waitForFonts(page);
+    assert.deepEqual(await page.evaluate(adminAppearance, { forcedColors: true }), [], 'Admin forced-colors text/geometry regressed');
+    if (initiallyModal) await reviewKeyboard(page, page.locator('dialog[open]'), true);
+  } finally { await page.emulateMedia({ forcedColors: 'none' }); }
   evidence.headlessZoomEquivalent = '320x256 CSS viewport; not native browser zoom';
+  evidence.textResize = 'Separate 200% root-font CSS text resize; not native browser zoom';
   await page.setViewportSize({ width: 1280, height: 900 });
-  await page.evaluate(() => document.documentElement.classList.remove('dark'));
+  if (initiallyModal) { await page.emulateMedia({ colorScheme: 'light' }); await assertBrowserTheme(page, 'system'); }
+  else await setBrowserTheme(page, originalTheme);
 }
 
 async function queryFault(page, path, action, response) {
@@ -631,6 +803,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     await button.click();
     const dialog = page.getByTestId('stepup-dialog');
     await dialog.waitFor({ state: 'visible' });
+    await checkFocusedReview(page, 'legal');
     assert.equal(await dialog.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
     assert.equal(await dialog.getByLabel(localizedText('Email for attribution'), { exact: true }).count(), 0);
     await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
@@ -1153,6 +1326,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
 }
 
 export async function validateAdmin(harness, { artifactDirectory } = {}) {
+  focusedReviews.clear();
   const evidence = { locale: browserLocale(), checks: [], layouts: 0, nativeHiddenTabObserved: false, nativeBfcacheRestoreObserved: false };
   const markerID = randomBytes(16).toString('hex');
   const markers = Object.fromEntries(['reason', 'cancelledDraft', 'backgroundDraft', 'expiredDraft']
@@ -1502,6 +1676,22 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
 
     checkpoint = 'admin-audit';
     await open(dpo, harness, '/admin/audit-logs');
+    const start = dpo.getByLabel(localizedText('Start time (Gregorian UTC)'), { exact: true });
+    const end = dpo.getByLabel(localizedText('End time (Gregorian UTC)'), { exact: true });
+    for (const input of [start, end]) {
+      assert.equal(await input.getAttribute('type'), 'datetime-local');
+      assert.equal(await input.getAttribute('step'), '0.001');
+      assert.equal(await input.getAttribute('dir'), 'ltr');
+    }
+    const canonicalDraft = async () => Promise.all([start, end].map(async (input) =>
+      new Date(`${await input.inputValue()}Z`).toISOString()));
+    const draft = await canonicalDraft();
+    const preview = dpo.getByTestId('audit-draft-preview');
+    await preview.waitFor({ state: 'visible' });
+    assert.deepEqual(await preview.locator('time').evaluateAll((times) => times.map((time) => time.dateTime)), draft);
+    assert(await preview.locator('time').evaluateAll((times) => times.every((time) => time.dir === 'ltr' && / UTC$/.test(time.textContent))));
+    await exercisePreferenceSwitch(dpo, { privateSelector: 'input[type="datetime-local"]', settings: true });
+    assert.deepEqual(await canonicalDraft(), draft, 'Locale changes reinterpreted Gregorian UTC input');
     await dpo.getByLabel(localizedText('Event type (exact)'), { exact: true }).fill(audit.event_type);
     await dpo.getByLabel(localizedText('Page size'), { exact: true }).fill('20');
     const logs = operationResponse(dpo, '/api/v1/admin/audit-logs', 'GET');
@@ -1514,6 +1704,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert(logBody.items.every((row) => typeof row.seq === 'string'));
     assert(logBody.items.some((row) => BigInt(row.seq) > BigInt(Number.MAX_SAFE_INTEGER)));
     const initialQuery = new URL(logsResponse.url()).searchParams;
+    assert.deepEqual([initialQuery.get('start_time'), initialQuery.get('end_time')], draft, 'UTC query changed the normalized native draft');
     assert(initialQuery.get('start_time').endsWith('Z') && initialQuery.get('end_time').endsWith('Z'));
     await dpo.getByRole('button', { name: localizedText(/^View details for sequence /) }).first().click();
     const details = dpo.getByRole('dialog', { name: localizedText('Audit record details'), exact: true });
@@ -1660,7 +1851,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     assert.equal(broken.verified, false);
     assert.equal(broken.failure_reason, 'payload_absent_without_erasure_record');
     await dpo.getByRole('main').getByRole('alert').waitFor();
-    assert(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).isDisabled());
+    assert.equal(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).count(), 0);
     harness.fixture('admin-chain-state', { scenario: 'erased' });
     let allErased = 0;
     for (let page = 0; page < 32; page++) {
@@ -1686,7 +1877,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     await dpo.getByRole('button', { name: localizedText('Start new run'), exact: true }).click();
     assert.equal((await missing).status(), 400);
     await dpo.getByRole('main').getByRole('alert').waitFor();
-    assert(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).isDisabled());
+    assert.equal(await dpo.getByRole('button', { name: localizedText('Continue verification'), exact: true }).count(), 0);
     evidence.checks.push('real tampered ledger stops; database-relative erasure annotations never claim content verification, receipt chaining or legal authorization; initialized empty and missing head stay distinct');
 
     checkpoint = 'admin-final';
