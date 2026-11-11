@@ -47,6 +47,7 @@ The project is structured as an Nx-driven monorepo to maximize code reuse, enfor
 │   ├── utils/                  # Shared utilities and helpers
 │   └── schemas/                # Protocol Buffers (.proto) for TS & Go generation
 ├── docs/                       # Comprehensive design & operational specifications
+├── tools/page-gallery/          # Opt-in internal bilingual gallery tooling
 └── README.md                   # This overview & entry point
 ```
 
@@ -176,3 +177,19 @@ zone without changing authentication or operation deadlines. Deletion notificati
 queue v2 freezes its locale; deploy compatible v1/v2 readers before v2 writers.
 The configured SMS.ir VERIFY template remains operator-owned. See the
 [localization contract](docs/localization.md) for maintenance and rollout gates.
+
+## Internal Page Gallery
+
+The versioned tooling in `tools/page-gallery/` produces sanitized offline
+illustrations, not security or transaction evidence. It reuses the existing
+browser acceptance helpers and requires separate formal browser acceptance.
+Nothing runs during installation, ordinary builds or unrelated tests.
+
+```bash
+npm exec -- nx run web:check-page-gallery
+# Only after fresh formal browser acceptance genuinely passes:
+PAGE_GALLERY_BROWSER_ACCEPTANCE=passed npm exec -- nx run web:page-gallery
+```
+
+See [the fresh-clone workflow](docs/page-gallery.md) for Linux/WSL2 prerequisites,
+acceptance requirements, resource costs, tests and ignored output locations.

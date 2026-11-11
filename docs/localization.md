@@ -283,7 +283,9 @@ recorded; no reviewer or device owner is implicitly assigned by a test run.
 | Deployed HTTPS nonces, Server Actions, strict cookies, fonts and ingress/log redaction | Deployment/security operator, not assigned | Unrun against deployed ingress |
 | Real mailbox/provider behavior and compatible notifier rollout/rollback | Mail/platform operator, not assigned | Unrun against production providers |
 
-The original 464-frame gallery remains a preserved baseline. A new run must derive
+The internal [page-gallery workflow](page-gallery.md) uses tracked tooling under
+`tools/page-gallery/`, not local Kilo scripts. The original 464-frame gallery
+remains a preserved baseline. A new run must derive
 its counts from the declared inventory, use a distinct run-owned destination and
 pass its sanitizer/offline/manifest checks after formal browser acceptance.
 Synthetic post-sanitization presentation clones are illustration only; they cannot

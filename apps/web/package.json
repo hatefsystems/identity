@@ -4,6 +4,24 @@
   "private": true,
   "nx": {
     "targets": {
+      "page-gallery": {
+        "command": "node tools/page-gallery/generate-page-gallery.mjs",
+        "dependsOn": [],
+        "cache": false,
+        "parallelism": false
+      },
+      "check-page-gallery": {
+        "command": "node tools/page-gallery/generate-page-gallery.mjs --check",
+        "dependsOn": [],
+        "cache": false,
+        "parallelism": false
+      },
+      "test-page-gallery": {
+        "command": "node --test tools/page-gallery/*.test.mjs .github/scripts/*.test.mjs",
+        "dependsOn": [],
+        "cache": false,
+        "parallelism": false
+      },
       "test-registration-browser": {
         "command": "node -e \"if (!/^sha256:[0-9a-f]{64}$/.test(process.env.REGISTRATION_BROWSER_API_IMAGE || '')) throw new Error('Immutable REGISTRATION_BROWSER_API_IMAGE is required'); const r = require('child_process').spawnSync(process.execPath, ['.github/scripts/registration-browser.mjs'], {stdio:'inherit'}); if(r.error) throw r.error; process.exit(r.status ?? 1)\"",
         "dependsOn": [
