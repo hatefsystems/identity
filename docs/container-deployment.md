@@ -57,6 +57,61 @@ Signup, SMS, SMTP, admin, legal workflow, gRPC and operational workers are not
 automatically enabled. They retain their existing activation requirements;
 this stack does not seed users or claim that a fresh installation can send mail/SMS.
 
+### Enable real local signup
+
+The default `REGISTRATION_ENABLED=false` deliberately leaves
+`POST /api/v1/auth/register/start` unmounted (404 after origin validation).
+To use the registration form with real SMS.ir and email delivery:
+
+1. Copy `.env.registration.example` to **`.env.registration`** and fill it privately.
+   It is gitignored. Single-quote credentials containing `$` to preserve their
+   exact bytes through Compose interpolation. Use a live SMS.ir verification key, approved template ID and
+   exact code parameter (without `#`). The SMTP relay must support authenticated,
+   verified TLS **and SMTPUTF8 after TLS**, including when your test address is ASCII.
+   Use `starttls`/587 or your provider's `implicit`/465 settings.
+2. Set explicit positive budgets: `SMS_OTP_GLOBAL_PER_DAY` and
+   `REGISTRATION_GLOBAL_DAILY_LIMIT` at most 100000,
+   `REGISTRATION_PENDING_CAPACITY` at most 10000 and
+   `REGISTRATION_EMAIL_HOURLY_LIMIT` at most 10. Choose these to match your intended
+   live spend; the pending SMS/signup capacities are kept identical automatically.
+3. Generate an independent base64 32-byte `SMS_OTP_HASH_PEPPER` and a separate
+   32..128 character URL-safe `REGISTRATION_CLEANUP_PASSWORD` (letters, digits,
+   `_` and `-`). For example, privately run `openssl rand -base64 32` and
+   `openssl rand -hex 32`. Keep these stable with the retained data. Do not reuse
+   the envelope key/pepper and do not paste credentials or generated secrets in chat.
+4. Enable the local overlay using **both** Compose files:
+
+   ```sh
+   docker compose --env-file .env.registration -f compose.yaml -f compose.registration.yaml up -d --wait
+   ```
+
+The overlay creates one dedicated local cleanup login with only the existing
+registration cleanup privileges, then supervises a bounded cleanup pass every
+60 seconds. Existing login passwords/privileges are not overwritten; the worker
+checks its real credentials/schema/privileges and API startup waits for it to be
+healthy. This local owner-based role bootstrap must not be applied to production.
+No users are seeded, tokens are bypassed, or production roles/gates are changed.
+If an interrupted first provisioning left an incomplete role, inspect and repair
+only `identity_registration_cleanup` explicitly; never reset the database/volumes.
+
+Continue using the same `--env-file` and **both** `-f` arguments for subsequent
+`up`, `ps` and `logs` commands. Running plain `docker compose up -d` selects the
+base stack again and disables signup. Inspect only bounded, secret-free startup
+diagnostics, for example:
+
+```sh
+docker compose --env-file .env.registration -f compose.yaml -f compose.registration.yaml ps -a
+docker compose --env-file .env.registration -f compose.yaml -f compose.registration.yaml logs --tail=30 registration-setup registration-cleanup api
+```
+
+API startup verifies SMTP TLS/authentication/SMTPUTF8 without sending a message.
+Submitting the form sends real email and, in the phone verification step, billable
+SMS. Your browser must trust the local CA and support WebAuthn/passkeys. The email
+link uses `https://localhost:8443`; open it in the same registering browser on this
+computer, not on a phone where localhost refers to a different device. Actual
+provider credentials, recipient delivery and relay policy must be verified with
+your own configured services; copying the example does not establish delivery.
+
 ## Production using tested GHCR images
 
 The canonical workflow publishes both `identity-api` and `identity-web` packages

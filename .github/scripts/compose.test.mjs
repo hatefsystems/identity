@@ -34,7 +34,15 @@ const productionEnv = {
 function config(file, env = {}) {
   const result = spawnSync(
     'docker',
-    ['compose', '--env-file', '.env.production.example', '-f', file, 'config', '--format', 'json'],
+    [
+      'compose',
+      '--env-file',
+      '.env.production.example',
+      ...[file].flat().flatMap((path) => ['-f', path]),
+      'config',
+      '--format',
+      'json',
+    ],
     {
       cwd: root,
       env: { ...process.env, ...env },
@@ -78,6 +86,73 @@ test('full local Compose renders with gated migration, persistent secrets and on
   assert.deepEqual(Object.keys(services.ingress.networks).sort(), ['edge', 'ingress']);
   assert.equal(services.api.networks.edge, undefined);
   assert.equal(services.ingress.networks.default, undefined);
+});
+
+const registrationEnv = {
+  SMS_GATEWAY_API_KEY: 'test-provider-key',
+  SMS_IR_TEMPLATE_ID: '123',
+  SMS_IR_CODE_PARAMETER: 'Code',
+  SMS_OTP_HASH_PEPPER: Buffer.alloc(32, 7).toString('base64'),
+  SMS_OTP_GLOBAL_PER_DAY: '10',
+  REGISTRATION_PENDING_CAPACITY: '10',
+  REGISTRATION_GLOBAL_DAILY_LIMIT: '10',
+  REGISTRATION_EMAIL_HOURLY_LIMIT: '2',
+  REGISTRATION_SMTP_HOST: 'smtp.example.invalid',
+  REGISTRATION_SMTP_PORT: '587',
+  REGISTRATION_SMTP_USERNAME: 'test-relay-user',
+  REGISTRATION_SMTP_PASSWORD: 'test-relay-password',
+  REGISTRATION_SMTP_FROM: 'identity@example.invalid',
+  REGISTRATION_CLEANUP_PASSWORD: 'test-cleanup-password-'.repeat(3),
+};
+
+test('real signup overlay gates API on a dedicated worker without passing provider secrets to it', () => {
+  const { services } = config(['compose.yaml', 'compose.registration.yaml'], registrationEnv);
+  const env = services.api.environment;
+  assert.equal(env.REGISTRATION_ENABLED, 'true');
+  assert.equal(env.SMS_ENABLED, 'true');
+  assert.equal(env.SMS_IR_KEY_MODE, 'live');
+  assert.equal(env.REGISTRATION_PENDING_CAPACITY, env.SMS_OTP_MAX_PENDING_SIGNUP);
+  assert.equal(env.REGISTRATION_SMTP_PUBLIC_ORIGIN, env.PORTAL_ORIGIN);
+  assert.equal(services.api.depends_on['registration-cleanup'].condition, 'service_healthy');
+  assert.equal(
+    services['registration-cleanup'].depends_on['registration-setup'].condition,
+    'service_completed_successfully'
+  );
+  assert.match(env.REGISTRATION_CLEANUP_DATABASE_URL, /\/\/identity_registration_cleanup:/);
+  assert.deepEqual(Object.keys(services['registration-cleanup'].environment).sort(), [
+    'APP_ENV',
+    'REGISTRATION_CLEANUP_BATCH_SIZE',
+    'REGISTRATION_CLEANUP_DATABASE_URL',
+  ]);
+  assert.equal(services['registration-setup'].environment.SMS_GATEWAY_API_KEY, undefined);
+  assert.equal(services['registration-cleanup'].ports, undefined);
+  assert.equal(services['registration-setup'].ports, undefined);
+  assert.equal(config('compose.yaml').services.api.environment.REGISTRATION_ENABLED, 'false');
+});
+
+test('registration secrets file is ignored without excluding its public template', () => {
+  const ignored = spawnSync(
+    'git',
+    [
+      '-c',
+      `safe.directory=${root.replaceAll('\\', '/').replace(/\/$/, '')}`,
+      'check-ignore',
+      '.env.registration',
+    ],
+    { cwd: root, encoding: 'utf8', windowsHide: true }
+  );
+  assert.equal(ignored.status, 0);
+  const template = spawnSync(
+    'git',
+    [
+      '-c',
+      `safe.directory=${root.replaceAll('\\', '/').replace(/\/$/, '')}`,
+      'check-ignore',
+      '.env.registration.example',
+    ],
+    { cwd: root, encoding: 'utf8', windowsHide: true }
+  );
+  assert.equal(template.status, 1);
 });
 
 test('production renders without builds, owner credentials in API or public application ports', () => {

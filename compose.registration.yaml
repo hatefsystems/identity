@@ -1,0 +1,73 @@
+# Opt in to REAL registration on the local stack. Load .env.registration via
+# --env-file; do not apply this development role bootstrap to production.
+services:
+  api:
+    environment:
+      REGISTRATION_ENABLED: 'true'
+      SMS_ENABLED: 'true'
+      SMS_PROVIDER: smsir
+      SMS_IR_KEY_MODE: live
+      SMS_GATEWAY_API_KEY: ${SMS_GATEWAY_API_KEY:?Set the private SMS.ir key in .env.registration}
+      SMS_IR_TEMPLATE_ID: ${SMS_IR_TEMPLATE_ID:?Set the approved verification template ID}
+      SMS_IR_CODE_PARAMETER: ${SMS_IR_CODE_PARAMETER:?Set the exact template code parameter}
+      SMS_OTP_HASH_PEPPER: ${SMS_OTP_HASH_PEPPER:?Set an independent private base64 pepper}
+      SMS_OTP_GLOBAL_PER_DAY: ${SMS_OTP_GLOBAL_PER_DAY:?Set the finite daily SMS budget}
+      SMS_OTP_MAX_PENDING_SIGNUP: ${REGISTRATION_PENDING_CAPACITY:?Set the finite pending signup capacity}
+      REGISTRATION_PENDING_CAPACITY: ${REGISTRATION_PENDING_CAPACITY:?Set the finite pending signup capacity}
+      REGISTRATION_GLOBAL_DAILY_LIMIT: ${REGISTRATION_GLOBAL_DAILY_LIMIT:?Set the finite daily signup limit}
+      REGISTRATION_EMAIL_HOURLY_LIMIT: ${REGISTRATION_EMAIL_HOURLY_LIMIT:?Set the finite per-email hourly limit}
+      REGISTRATION_SMTP_HOST: ${REGISTRATION_SMTP_HOST:?Set the SMTP host}
+      REGISTRATION_SMTP_PORT: ${REGISTRATION_SMTP_PORT:?Set the SMTP port}
+      REGISTRATION_SMTP_TLS_MODE: ${REGISTRATION_SMTP_TLS_MODE:-starttls}
+      REGISTRATION_SMTP_USERNAME: ${REGISTRATION_SMTP_USERNAME:?Set the private SMTP username}
+      REGISTRATION_SMTP_PASSWORD: ${REGISTRATION_SMTP_PASSWORD:?Set the private SMTP password}
+      REGISTRATION_SMTP_FROM: ${REGISTRATION_SMTP_FROM:?Set the sender mailbox}
+      REGISTRATION_SMTP_TIMEOUT: 5s
+      REGISTRATION_SMTP_PUBLIC_ORIGIN: https://localhost:8443
+      REGISTRATION_CLEANUP_DATABASE_URL: postgres://identity_registration_cleanup:${REGISTRATION_CLEANUP_PASSWORD:?Set the dedicated cleanup password}@postgres:5432/identity?sslmode=disable
+      REGISTRATION_CLEANUP_BATCH_SIZE: '100'
+    depends_on:
+      registration-cleanup:
+        condition: service_healthy
+
+  registration-setup:
+    image: postgres:16-alpine
+    restart: 'no'
+    entrypoint: [/bin/sh, /opt/registration/setup-cleanup.sh]
+    environment:
+      APP_ENV: development
+      PGHOST: postgres
+      PGDATABASE: identity
+      PGUSER: identity
+      PGPASSWORD: identity_local_only
+      PGOPTIONS: -c password_encryption=scram-sha-256
+      REGISTRATION_CLEANUP_PASSWORD: ${REGISTRATION_CLEANUP_PASSWORD:?Set the dedicated cleanup password}
+    volumes:
+      - ./tools/docker/registration/setup-cleanup.sh:/opt/registration/setup-cleanup.sh:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  registration-cleanup:
+    image: hatef-idp-api:local
+    platform: linux/amd64
+    restart: unless-stopped
+    stop_grace_period: 40s
+    entrypoint: [/bin/sh, /opt/registration/cleanup-loop.sh]
+    environment:
+      APP_ENV: development
+      REGISTRATION_CLEANUP_DATABASE_URL: postgres://identity_registration_cleanup:${REGISTRATION_CLEANUP_PASSWORD:?Set the dedicated cleanup password}@postgres:5432/identity?sslmode=disable
+      REGISTRATION_CLEANUP_BATCH_SIZE: '100'
+    volumes:
+      - ./tools/docker/registration/cleanup-loop.sh:/opt/registration/cleanup-loop.sh:ro
+    depends_on:
+      registration-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /bin/sh, /opt/registration/cleanup-loop.sh, healthcheck]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s

@@ -12,6 +12,7 @@ node_modules
 dist
 .env
 .env.production
+.env.registration
 local-ca.crt
 .nx
 .next

@@ -634,6 +634,8 @@ jobs:
         run: docker compose build
       - name: Exercise isolated HTTPS stack and persistent initialization
         run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/tools/docker/smoke-compose.mjs"
+      - name: Verify opt-in registration roles and worker without provider delivery
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/tools/docker/smoke-registration-config.mjs"
 
   publish:
     name: Publish release images
