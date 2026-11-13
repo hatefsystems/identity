@@ -170,7 +170,7 @@ async function fixture(t, { version = VERSION, env: overrides = {} } = {}) {
     assert.equal(options.headers.Authorization, 'Bearer test-token');
     assert.equal(options.redirect, 'manual');
     calls.push({ action: 'github' });
-    assert.equal(url, `https://api.github.com/repos/${REPOSITORY}/git/ref/tags/v${version}`);
+    assert.equal(url, `https://api.github.com/repos/${REPOSITORY}/git/ref/${env.GITHUB_REF === 'refs/heads/main' ? 'heads/main' : `tags/v${version}`}`);
     return response({
       ref: env.GITHUB_REF,
       object: { type: 'commit', sha: controls.tagRevision || REVISION },
@@ -190,7 +190,7 @@ async function fixture(t, { version = VERSION, env: overrides = {} } = {}) {
       }
       return remote.get(`${kind}:${reference}`) || null;
     },
-    async promote(kind, image) {
+    async promote(kind, image, alias = 'latest') {
       assert.equal(
         calls.filter((call) => call.action === 'smoke').length >= 2,
         true,
@@ -198,7 +198,7 @@ async function fixture(t, { version = VERSION, env: overrides = {} } = {}) {
       );
       calls.push({ action: 'promote', kind, digest: image.digest });
       if (controls.failPromote === kind) throw new Error('promotion failure');
-      remote.set(`${kind}:latest`, image);
+      remote.set(`${kind}:${alias}`, image);
       if (controls.failAfterPromote === kind) throw new Error('promotion response lost');
     },
   };
@@ -258,12 +258,13 @@ test('stable comparisons are numerical and retain arbitrary integer precision', 
   assert.throws(() => compareStableVersions('1.2.3-rc.1', '1.2.3'), /stable/);
 });
 
-test('metadata allows only explicit canonical version-tag pushes', () => {
+test('metadata allows only canonical main and version-tag pushes', () => {
   assert.deepEqual(computeMetadata(envFor(), REVISION), {
     revision: REVISION,
     version: VERSION,
     source: SOURCE,
     release: true,
+    publish: true,
   });
   assert.equal(
     computeMetadata(envFor({ GITHUB_REF: 'refs/tags/v2.0.0-beta.1' }), REVISION).version,
@@ -303,7 +304,7 @@ test('metadata allows only explicit canonical version-tag pushes', () => {
   );
 });
 
-test('metadata CLI writes the four integration outputs with no token', async (t) => {
+test('metadata CLI writes integration outputs with no token', async (t) => {
   const directory = await temporaryDirectory(t);
   const env = envFor({ GITHUB_OUTPUT: join(directory, 'outputs') });
   const logged = [];
@@ -311,7 +312,7 @@ test('metadata CLI writes the four integration outputs with no token', async (t)
   await main(['metadata'], env, { run: async () => `${REVISION}\n` });
   assert.equal(
     await readFile(env.GITHUB_OUTPUT, 'utf8'),
-    `revision=${REVISION}\nversion=${VERSION}\nsource=${SOURCE}\nrelease=true\n`
+    `revision=${REVISION}\nversion=${VERSION}\nsource=${SOURCE}\nrelease=true\npublish=true\n`
   );
   assert.deepEqual(JSON.parse(logged[0]), computeMetadata(env, REVISION));
   assert.equal(logged[0].includes(env.GITHUB_TOKEN), false);
@@ -442,11 +443,11 @@ test('export refuses nonrelease events and mismatched image labels/platform', as
   await assert.rejects(exportImage('api', '--help', directory), /local image reference/);
 });
 
-test('publisher gate rejects noncanonical/non-tag/non-push events before network or Docker', async (t) => {
+test('publisher gate rejects noncanonical/nonpublication/non-push events before network or Docker', async (t) => {
   for (const override of [
     { GITHUB_EVENT_NAME: 'workflow_dispatch' },
     { GITHUB_EVENT_NAME: 'pull_request' },
-    { GITHUB_REF: 'refs/heads/main' },
+    { GITHUB_REF: 'refs/heads/feature' },
     { GITHUB_REPOSITORY: 'fork/identity' },
     { GITHUB_RUN_ID: undefined },
     { GITHUB_REF: 'refs/tags/v1.2.3+metadata' },
@@ -936,4 +937,52 @@ test('importing the module does not execute its CLI', async () => {
     ]),
     'import-safe'
   );
+});
+
+test('main publishes both immutable SHAs and promotes main without touching latest', async (t) => {
+  const f = await fixture(t, { version: `sha-${REVISION}`, env: { GITHUB_REF: 'refs/heads/main' } });
+  const result = await f.execute();
+  assert.equal(result.release, false);
+  assert.equal(result.publish, true);
+  for (const kind of ['api', 'web']) {
+    assert.equal(f.remote.get(`${kind}:main`).digest, f.images[kind].digest);
+    assert.equal(f.remote.get(`${kind}:sha-${REVISION}`).digest, f.images[kind].digest);
+    assert.equal(f.remote.has(`${kind}:latest`), false);
+  }
+  assert.equal(f.calls.filter((call) => call.action === 'promote').length, 2);
+});
+
+test('older queued main run publishes SHA but never rolls main back', async (t) => {
+  const f = await fixture(t, { version: `sha-${REVISION}`, env: { GITHUB_REF: 'refs/heads/main' } });
+  f.controls.tagRevision = OTHER_REVISION;
+  const result = await f.execute();
+  assert.equal(f.calls.some((call) => call.action === 'promote'), false);
+  assert.equal(f.calls.filter((call) => call.action === 'push').length, 2);
+  assert.ok(result.images.every((image) => image.aliasResult.includes('newer main')));
+});
+
+test('main never promotes either alias after a tested image fails smoke', async (t) => {
+  const f = await fixture(t, { version: `sha-${REVISION}`, env: { GITHUB_REF: 'refs/heads/main' } });
+  f.controls.failSmoke = 'web';
+  await assert.rejects(f.execute(), /smoke failure/);
+  assert.equal(f.calls.some((call) => call.action === 'promote'), false);
+});
+
+test('main export accepts matching SHA provenance and refuses event/label mismatches', async (t) => {
+  const directory = await temporaryDirectory(t);
+  const env = envFor({ GITHUB_REF: 'refs/heads/main' });
+  const image = imageFor('api', `sha-${REVISION}`);
+  const run = async (command, args) => {
+    if (command === 'git') return REVISION;
+    if (args[1] === 'inspect') return JSON.stringify([inspectDocument(image)]);
+    await writeFile(args[3], 'main-archive');
+    return '';
+  };
+  const exported = await exportImage('api', 'api:ci', directory, { env, run });
+  assert.equal(exported.version, `sha-${REVISION}`);
+  for (const override of [{GITHUB_EVENT_NAME:'pull_request'}, {GITHUB_EVENT_NAME:'workflow_dispatch'}, {GITHUB_REPOSITORY:'fork/identity'}]) {
+    assert.equal(computeMetadata({...env,...override}, REVISION).publish, false);
+    await assert.rejects(exportImage('api', 'api:ci', directory, {env:{...env,...override},run}), /canonical repository/);
+  }
+  assert.throws(() => assertImage({...image, version:`sha-${OTHER_REVISION}`}), /match revision/);
 });

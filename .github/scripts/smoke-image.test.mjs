@@ -319,7 +319,7 @@ test('rejects unsupported kinds and unsafe references without starting Docker', 
 });
 
 test('actual runtime inventory is exact and excludes fixture, private key and environment files', () => {
-  const inventory = ['etc/ssl/certs/ca-certificates.crt', ...maintenanceEntrypoints.map((name) => `usr/local/bin/${name}`)];
+  const inventory = ['etc/ssl/certs/ca-certificates.crt', ...[...maintenanceEntrypoints, 'healthcheck'].map((name) => `usr/local/bin/${name}`)];
   assertRuntimeInventory(inventory);
   for (const file of ['usr/local/bin/portal-fixture', 'usr/local/bin/admin-roles', '.env', 'etc/.env.production', 'etc/signing.key', 'usr/local/bin/unknown']) assert.throws(() => assertRuntimeInventory([...inventory, file]));
   assert.throws(() => assertRuntimeInventory(inventory.filter((name) => !name.endsWith('/registration-cleanup'))));
@@ -355,7 +355,7 @@ test('image smoke publishes success only after every actual owned ID is retired'
     const present = new Map(), created = [], removed = [], messages = [];
     t.mock.method(console, 'log', (message) => messages.push(message));
     t.mock.method(childProcess, 'spawnSync', (command, args) => {
-      if (command === 'tar') return { status: 0, stdout: maintenanceEntrypoints.map((name) => `usr/local/bin/${name}`).join('\n') + (problem === 'inventory' ? '\n.env' : '') };
+      if (command === 'tar') return { status: 0, stdout: [...maintenanceEntrypoints, 'healthcheck'].map((name) => `usr/local/bin/${name}`).join('\n') + (problem === 'inventory' ? '\n.env' : '') };
       assert.equal(command, 'docker');
       if (args[0] === 'image') return { status: 0, stdout: JSON.stringify([{ Id: `sha256:${'f'.repeat(64)}`, Os: 'linux', Architecture: 'amd64', Config: { User: 'nonroot:nonroot' } }]) };
       if (args[0] === 'create') {

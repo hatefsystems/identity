@@ -1,0 +1,21 @@
+# Replace identity.example.com with PORTAL_ORIGIN's host and install in Nginx's
+# http{} context. Install proxy-headers.conf at /etc/nginx/proxy-headers.conf.
+# Host Nginx owns TLS/certificate renewal. No raw auth URLs in proxy logs.
+server {
+    listen 443 ssl;
+    server_name identity.example.com;
+    if ($host != identity.example.com) { return 421; }
+    ssl_certificate /etc/letsencrypt/live/identity.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/identity.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    access_log off;
+    error_log /dev/null crit;
+    include /etc/nginx/proxy-headers.conf;
+    # Next owns the single request-time CSP and document cache policy.
+    location = /oauth2/authorize { proxy_pass http://127.0.0.1:3000; }
+    location = /oauth2/error { proxy_pass http://127.0.0.1:3000; }
+    location ~ ^/(api|oauth2|\.well-known)(/|$) { proxy_pass http://127.0.0.1:8080; }
+    location = /healthz { proxy_pass http://127.0.0.1:8080; }
+    location = /readyz { proxy_pass http://127.0.0.1:8080; }
+    location / { proxy_pass http://127.0.0.1:3000; }
+}

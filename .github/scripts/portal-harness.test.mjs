@@ -1928,7 +1928,7 @@ test('CI preserves image/CSP coverage and gates release on the real portal suite
   assert.match(workflow, /--integration-target=\$\{\{ matrix\.target \}\}/);
   assert(workflow.includes('test-portal-integration'));
   assert.match(workflow, /nx run web:test-admin-browser --skipNxCache/);
-  assert.match(workflow, /needs: \[quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser\]/);
+  assert.match(workflow, /needs: \[quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser, compose-smoke\]/);
 });
 
 test('admin browser is uncached, builds its production dependencies and uses armed fixtures', () => {

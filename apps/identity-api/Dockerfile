@@ -73,12 +73,21 @@ RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
     && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
     && test -x /out/security-ledger-purge && test -x /out/admin-legal \
     && test -x /out/lifecycle-publisher && test -x /out/deletion-notifier \
-    && test -x /out/registration-cleanup
+    && test -x /out/registration-cleanup && test -x /out/healthcheck
+
+# Explicit opt-in local target. The final/default production stage stays distroless.
+FROM alpine:3.23 AS local
+RUN apk add --no-cache ca-certificates openssl
+COPY --from=builder /out/ /usr/local/bin/
+COPY apps/identity-api/docker/ /opt/local/
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/bin/sh", "/opt/local/local-entrypoint.sh"]
 
 # ---------------------------------------------------------------------------
 # Runtime stage
 # ---------------------------------------------------------------------------
-FROM ${RUNTIME_IMAGE}
+FROM ${RUNTIME_IMAGE} AS production
 
 # The distroless static base provides ca-certificates (needed for outbound TLS to
 # the SMS provider and NATS) and tzdata, and nothing else: no shell, no package
@@ -89,6 +98,7 @@ FROM ${RUNTIME_IMAGE}
 WORKDIR /
 
 COPY --from=builder /out/server /usr/local/bin/identity-api
+COPY --from=builder /out/healthcheck /usr/local/bin/healthcheck
 COPY --from=builder /out/purge-worker /usr/local/bin/purge-worker
 COPY --from=builder /out/migrate /usr/local/bin/migrate
 # The audit chain signer (Task 5.2). It shares this image rather than getting its own
@@ -111,8 +121,8 @@ EXPOSE 8080
 # image is unusable as root even if a Pod spec omits securityContext.
 USER nonroot:nonroot
 
-# No HEALTHCHECK: the base image has no shell and no HTTP client to run one with.
-# Liveness and readiness are the orchestrator's job, against GET /healthz and
-# GET /readyz (see docs/devops-operations.md).
+# Compose uses /usr/local/bin/healthcheck for API readiness without a shell.
+# No image-wide HEALTHCHECK: this image also runs one-off maintenance commands
+# and workers that do not expose HTTP (see docs/devops-operations.md).
 
 ENTRYPOINT ["/usr/local/bin/identity-api"]

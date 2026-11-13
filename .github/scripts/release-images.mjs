@@ -12,6 +12,7 @@ export const PLATFORM = 'linux/amd64';
 const KINDS = ['api', 'web'];
 const COMMIT = /^[a-f0-9]{40}(?![\s\S])/;
 const DIGEST = /^sha256:[a-f0-9]{64}(?![\s\S])/;
+const SHA_VERSION = /^sha-[a-f0-9]{40}(?![\s\S])/;
 const MANIFEST_TYPES = [
   'application/vnd.oci.image.manifest.v1+json',
   'application/vnd.docker.distribution.manifest.v2+json',
@@ -53,11 +54,13 @@ export function computeMetadata(env, revision) {
     ? parseVersion(env.GITHUB_REF.slice('refs/tags/v'.length)).version
     : null;
   const release = Boolean(tagPush && env.GITHUB_REPOSITORY === REPOSITORY);
+  const mainPush = env.GITHUB_EVENT_NAME === 'push' && env.GITHUB_REF === 'refs/heads/main' && env.GITHUB_REPOSITORY === REPOSITORY;
   return {
     revision,
     version: release ? taggedVersion : `sha-${revision}`,
     source: `https://github.com/${repository}`,
     release,
+    publish: release || mainPush,
   };
 }
 
@@ -146,9 +149,9 @@ export async function getMetadata({ env = process.env, run = runCommand } = {}) 
   );
 }
 
-function requireRelease(metadata, env) {
-  if (!metadata.release || !computeMetadata(env, metadata.revision).release) {
-    throw new Error('Publication/export requires a canonical repository version-tag push');
+function requirePublication(metadata, env) {
+  if (!metadata.publish || !computeMetadata(env, metadata.revision).publish) {
+    throw new Error('Publication/export requires a canonical repository main or version-tag push');
   }
   if (!/^\d+(?![\s\S])/.test(env.GITHUB_RUN_ID || ''))
     throw new Error('GITHUB_RUN_ID is required to bind artifacts to this run');
@@ -184,7 +187,8 @@ export function assertImage(image, expected = {}) {
   }
   if (image.digest !== undefined && !DIGEST.test(image.digest))
     throw new Error('Invalid registry manifest digest');
-  parseVersion(image.version);
+  if (!SHA_VERSION.test(image.version)) parseVersion(image.version);
+  else if (image.version !== `sha-${image.revision}`) throw new Error('SHA version must match revision');
   for (const key of ['imageId', 'platform', 'source', 'revision', 'version']) {
     if (expected[key] !== undefined && image[key] !== expected[key])
       throw new Error(`Image ${key} mismatch`);
@@ -220,7 +224,7 @@ export async function exportImage(
   if (!/^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,254}(?![\s\S])/.test(reference || ''))
     throw new Error('Invalid local image reference');
   const metadata = await getMetadata({ env, run });
-  requireRelease(metadata, env);
+  requirePublication(metadata, env);
   const image = await inspectImage(reference, run, env);
   assertImage(image, metadata);
   await mkdir(directory, { recursive: true });
@@ -350,6 +354,30 @@ export async function verifyReleaseTag(metadata, env, fetchImpl = globalThis.fet
     throw new Error('Event commit does not match the tested checkout');
 }
 
+// A stale main run may publish its immutable SHA, but cannot move the main alias.
+export async function isCurrentMain(metadata, env, fetchImpl = globalThis.fetch) {
+  if (!env.GITHUB_TOKEN || env.GITHUB_SHA !== metadata.revision)
+    throw new Error('Main event must match the tested checkout and supply GITHUB_TOKEN');
+  const response = await request(`https://api.github.com/repos/${REPOSITORY}/git/ref/heads/main`, {
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'identity-release',
+    },
+  }, fetchImpl);
+  if (response.status !== 200) throw new Error(`GitHub main verification failed (HTTP ${response.status})`);
+  const ref = json(response);
+  if (ref.ref !== 'refs/heads/main' || ref.object?.type !== 'commit' || !COMMIT.test(ref.object.sha))
+    throw new Error('Invalid main branch response');
+  return ref.object.sha === metadata.revision;
+}
+
+async function verifyPublication(metadata, env, fetchImpl) {
+  if (metadata.release) await verifyReleaseTag(metadata, env, fetchImpl);
+  else await isCurrentMain(metadata, env, fetchImpl);
+}
+
 export class RegistryError extends Error {
   constructor(stage, response) {
     let codes = [];
@@ -400,7 +428,7 @@ export function createRegistry(env, fetchImpl = globalThis.fetch) {
   };
   return {
     async read(kind, reference, { anonymous = false } = {}) {
-      if (reference !== 'latest' && !DIGEST.test(reference)) parseVersion(reference);
+      if (!['latest', 'main'].includes(reference) && !DIGEST.test(reference) && !SHA_VERSION.test(reference)) parseVersion(reference);
       const { name, headers } = await token(kind, anonymous);
       const response = await request(
         `https://ghcr.io/v2/${name}/manifests/${reference}`,
@@ -460,11 +488,12 @@ export function createRegistry(env, fetchImpl = globalThis.fetch) {
         mediaType,
       };
     },
-    async promote(kind, image) {
+    async promote(kind, image, alias = 'latest') {
+      if (!['latest', 'main'].includes(alias)) throw new Error('Unsupported image alias');
       checkDigest(image.manifest, image.digest);
       const { name, headers } = await token(kind, false);
       const response = await request(
-        `https://ghcr.io/v2/${name}/manifests/latest`,
+        `https://ghcr.io/v2/${name}/manifests/${alias}`,
         {
           method: 'PUT',
           headers: { ...headers, 'Content-Type': image.mediaType },
@@ -491,7 +520,7 @@ export function formatSummary(summary) {
     `Version: \`${summary.version}\``,
     `Platform: \`${PLATFORM}\``,
     '',
-    '| Image | Version Result | Version Digest | Previous Latest | Observed Latest | Alias Result | Anonymous Access |',
+    `| Image | Version Result | Version Digest | Previous ${summary.release === false ? 'Main' : 'Latest'} | Observed Alias | Alias Result | Anonymous Access |`,
     '| --- | --- | --- | --- | --- | --- | --- |',
   ];
   for (const image of summary.images) {
@@ -509,6 +538,12 @@ export function formatSummary(summary) {
     '',
     'Public access is verified separately from publication. Newly created GHCR packages start private; an administrator must review image contents, set BOTH packages Public, and confirm repository Actions access. This helper never changes visibility or deletes images.'
   );
+  if (summary.images.every((image) => DIGEST.test(image.digest))) {
+    lines.push('', '### Deploy this tested pair', '', '```sh',
+      `API_IMAGE=${imageRepository('api')}@${summary.images.find((image) => image.kind === 'api').digest}`,
+      `WEB_IMAGE=${imageRepository('web')}@${summary.images.find((image) => image.kind === 'web').digest}`,
+      '# Store these references in .env.production, then follow docs/container-deployment.md.', '```');
+  }
   if (summary.error)
     lines.push(
       '',
@@ -538,7 +573,7 @@ export async function publishImages(
   } = {}
 ) {
   const metadata = await getMetadata({ env, run });
-  requireRelease(metadata, env);
+  requirePublication(metadata, env);
   const summary = {
     ...metadata,
     images: KINDS.map((kind) => ({
@@ -552,7 +587,7 @@ export async function publishImages(
     })),
   };
   try {
-    await verifyReleaseTag(metadata, env, fetchImpl);
+    await verifyPublication(metadata, env, fetchImpl);
     const artifacts = await Promise.all(
       KINDS.map((kind) => readArtifact(directory, kind, metadata, env))
     );
@@ -571,7 +606,7 @@ export async function publishImages(
       summary.images[index].digest = image.digest;
       summary.images[index].versionResult = 'existing; content verified';
     });
-    await verifyReleaseTag(metadata, env, fetchImpl);
+    await verifyPublication(metadata, env, fetchImpl);
     const published = [];
     for (let i = 0; i < KINDS.length; i++) {
       const state = summary.images[i];
@@ -639,6 +674,29 @@ export async function publishImages(
         state.visibility = 'not public: administrator bootstrap/access review required';
       }
     }
+    if (!metadata.release) {
+      // Publication jobs share one non-cancelling lock. Check immediately before
+      // EACH alias write, so older queued jobs cannot undo a newer main run.
+      for (let i = 0; i < KINDS.length; i++) {
+        const state = summary.images[i];
+        const previous = await registry.read(state.kind, 'main');
+        state.oldLatest = previous?.digest || 'absent';
+        state.newLatest = state.oldLatest;
+        if (!await isCurrentMain(metadata, env, fetchImpl)) {
+          state.aliasResult = 'unchanged: newer main commit exists';
+          continue;
+        }
+        state.aliasResult = 'promotion attempted; outcome unknown';
+        state.newLatest = 'unknown';
+        await registry.promote(state.kind, published[i], 'main');
+        const image = await registry.read(state.kind, 'main');
+        assertImage(image, artifacts[i]);
+        if (image.digest !== published[i].digest) throw new Error('Main alias digest mismatch');
+        state.newLatest = image.digest;
+        state.aliasResult = 'advanced';
+      }
+      return summary;
+    }
     if (!parseVersion(metadata.version).stable) {
       for (const state of summary.images) state.aliasResult = 'unchanged: prerelease';
       return summary;
@@ -698,7 +756,7 @@ export async function publishImages(
       }
       if (state.aliasResult === 'promotion attempted; outcome unknown') {
         try {
-          state.newLatest = (await registry.read(state.kind, 'latest'))?.digest || 'absent';
+          state.newLatest = (await registry.read(state.kind, metadata.release ? 'latest' : 'main'))?.digest || 'absent';
         } catch {
           /* Preserve unknown state; the next authorized rerun must preflight again. */
         }

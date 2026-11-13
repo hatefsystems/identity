@@ -1,5 +1,18 @@
 # Hatef Identity Platform (LDP)
 
+Run the complete local stack (PostgreSQL, Redis, NATS, migrations, Go API,
+Next.js and local HTTPS) from this directory:
+
+```sh
+docker compose up -d
+```
+
+Open **https://localhost:8443** after the first build. See
+[container startup, local certificate trust and GHCR deployment](docs/container-deployment.md)
+for the one-time CA import, persistent keys, production environment template and
+host Nginx setup. GitHub Actions publishes tested API/web images on `main` and
+version tags; it does not deploy a server.
+
 The **Hatef Identity Platform (LDP)** is a centralized, privacy-first Identity Provider (IdP) and Single Sign-On (SSO) system designed to serve as the unified authentication and authorization backbone for the entire Hatef ecosystem (including the Search Engine, Email Service, and future applications). 
 
 Built with Go (Golang) and Next.js, and managed inside an Nx monorepo, the platform enforces strict zero-trust security principles, enterprise-grade cryptography, and standards-compliant authentication protocols.

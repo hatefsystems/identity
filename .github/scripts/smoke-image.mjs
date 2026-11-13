@@ -37,7 +37,7 @@ export const maintenanceEntrypoints = [
 
 export function assertRuntimeInventory(files) {
   const normalized = files.map((path) => path.replace(/^\.\//, '').replace(/^\//, ''));
-  assert.deepEqual(normalized.filter((path) => path.startsWith('usr/local/bin/') && !path.endsWith('/')).map((path) => path.slice('usr/local/bin/'.length)).sort(), [...maintenanceEntrypoints].sort(), 'Unexpected packaged command inventory');
+  assert.deepEqual(normalized.filter((path) => path.startsWith('usr/local/bin/') && !path.endsWith('/')).map((path) => path.slice('usr/local/bin/'.length)).sort(), [...maintenanceEntrypoints, 'healthcheck'].sort(), 'Unexpected packaged command inventory');
   assert(!normalized.some((path) => /(?:^|\/)(?:portal-fixture|admin-roles|\.env(?:\.[^/]*)?|[^/]*\.(?:key|p12|pfx)|[^/]*(?:private|signing|secret|key)[^/]*\.pem)$/.test(path)), 'Runtime image contains a fixture, operator binary, environment file or private key');
 }
 
@@ -287,6 +287,8 @@ export async function smokeImage(kind, reference, validateWeb) {
     const list = spawnSync('tar', ['--list', '--file', archive], { encoding: 'utf8', timeout: Math.min(60_000, lifecycle.remaining()), maxBuffer: 4 * 1024 * 1024, windowsHide: true });
     assert(!list.error && list.status === 0, 'Actual runtime image inventory failed');
     assertRuntimeInventory(list.stdout.trim().split(/\r?\n/));
+    const probe = create(['--network', 'none', '--entrypoint', '/usr/local/bin/healthcheck', imageID]);
+    assert.equal(operation(['start', '--attach', probe], true).status, 1, 'Probe must fail when no API is listening');
     for (const binary of maintenanceEntrypoints) {
       lifecycle.check();
       const id = create(['--name', `ci-api-${randomUUID()}`, '--pull', 'never', '--network', 'none', '--env', 'APP_ENV=production', '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);

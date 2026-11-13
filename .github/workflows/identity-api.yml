@@ -17,7 +17,8 @@ env:
 
 concurrency:
   group: identity-api-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # Do not cancel an in-flight alias write when another main commit arrives.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   quality:
@@ -145,11 +146,11 @@ jobs:
           overwrite: true
 
       - name: Export tested backend release image
-        if: steps.image.outputs.release == 'true'
+        if: steps.image.outputs.publish == 'true'
         run: node .github/scripts/release-images.mjs export api identity-api:ci "$RUNNER_TEMP/release-api"
 
       - name: Upload tested backend release image
-        if: steps.image.outputs.release == 'true'
+        if: steps.image.outputs.publish == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-api
@@ -419,11 +420,11 @@ jobs:
           overwrite: true
 
       - name: Export tested web release image
-        if: steps.image.outputs.release == 'true'
+        if: steps.image.outputs.publish == 'true'
         run: node .github/scripts/release-images.mjs export web identity-web:ci "$RUNNER_TEMP/release-web"
 
       - name: Upload tested web release image
-        if: steps.image.outputs.release == 'true'
+        if: steps.image.outputs.publish == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-web
@@ -612,12 +613,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  compose-smoke:
+    name: Fresh full-stack Compose acceptance
+    needs: [quality, frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install workspace tooling
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+      - name: Build full local stack from clean source
+        run: docker compose build
+      - name: Exercise isolated HTTPS stack and persistent initialization
+        run: npm exec -- nx exec -p schemas -- node "$GITHUB_WORKSPACE/tools/docker/smoke-compose.mjs"
+
   publish:
     name: Publish release images
-    needs: [quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser]
+    needs: [quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser, compose-smoke]
     if: >-
       github.repository == 'hatefsystems/identity' &&
-      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
