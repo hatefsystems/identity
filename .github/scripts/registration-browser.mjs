@@ -1945,7 +1945,13 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
       await waitUntil(async () => {
         web.healthy();
         const [state] = JSON.parse(docker(['inspect', api.id], lifecycle));
-        fixed(state.State.Running, 'Production API exited');
+        if (!state.State.Running) {
+          // A process may exit after the first inspect, while the readiness
+          // loop is running. Emit only allowlisted categories, never raw logs.
+          const output = docker(['logs', '--tail', '30', api.id], lifecycle, { includeStderr: true });
+          console.log(JSON.stringify({ check: 'registration-api-startup', ...registrationStartupSummary(output) }));
+          throw new RegistrationFailure('api-running', false);
+        }
         try {
           const response = await fetch(`http://127.0.0.1:${selected}${path}`, {
             signal: AbortSignal.timeout(1000),
