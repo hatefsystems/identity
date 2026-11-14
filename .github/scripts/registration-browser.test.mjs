@@ -62,7 +62,7 @@ test('username browser authority is a pinned isolated fixture with a dedicated v
   assert.deepEqual(policy.reserved_names, []);
   assert.equal(policy.folds.length, 4);
   const artifact = Buffer.from(JSON.stringify({ policy, regex: environment.USERNAME_REGEX,
-    implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0', unicode: '17.0.0', max_username_bytes: 1024 }));
+    implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0', unicode: '15.0.0', max_username_bytes: 1024 }));
   const fingerprint = createHash('sha256').update(artifact).digest('hex');
   const key = Buffer.from(environment.USERNAME_LOOKUP_KEY, 'base64');
   assert.equal(key.length, 32);

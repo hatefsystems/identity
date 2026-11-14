@@ -791,7 +791,10 @@ export function registrationUsernameFixture() {
   const regex = `${alphabet}+(?:\\.${alphabet}+)*`;
   const artifact = Buffer.from(JSON.stringify({
     policy, regex, implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0',
-    unicode: '17.0.0', max_username_bytes: 1024,
+    // golang.org/x/text@v0.40.0 selects Unicode 15.0.0 for Go <1.27.
+    // Go 1.27 selects Unicode 17.0.0, which changes the authority fingerprint;
+    // keep this fixture pinned to the production Go 1.26.x toolchain.
+    unicode: '15.0.0', max_username_bytes: 1024,
   }));
   const fingerprint = createHash('sha256').update(artifact).digest('hex');
   const lookupKey = randomBytes(32);
