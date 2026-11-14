@@ -65,6 +65,7 @@ const safeLoginResponsePaths = new Set([
   '/api/v1/auth/profile',
   '/api/v1/users/me',
   '/api/v1/users/me/sessions',
+  '/api/v1/users/me/username',
 ]);
 const immutable = /^sha256:[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
@@ -627,7 +628,7 @@ export function gatewayForwardTarget(targets, method, path) {
     !url.search &&
       !url.hash &&
       (url.pathname === '/readyz' || url.pathname.startsWith('/api/v1/auth/') ||
-        (method === 'GET' && ['/api/v1/users/me', '/api/v1/users/me/sessions'].includes(url.pathname))) &&
+        (method === 'GET' && ['/api/v1/users/me', '/api/v1/users/me/sessions', '/api/v1/users/me/username'].includes(url.pathname))) &&
       url.pathname === path,
     'Gateway route is not a fixed inbound API path'
   );
@@ -791,7 +792,10 @@ export function registrationUsernameFixture() {
   const regex = `${alphabet}+(?:\\.${alphabet}+)*`;
   const artifact = Buffer.from(JSON.stringify({
     policy, regex, implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0',
-    unicode: '17.0.0', max_username_bytes: 1024,
+    // golang.org/x/text@v0.40.0 selects Unicode 15.0.0 for Go <1.27.
+    // Go 1.27 selects Unicode 17.0.0, which changes the authority fingerprint;
+    // keep this fixture pinned to the production Go 1.26.x toolchain.
+    unicode: '15.0.0', max_username_bytes: 1024,
   }));
   const fingerprint = createHash('sha256').update(artifact).digest('hex');
   const lookupKey = randomBytes(32);
@@ -848,7 +852,7 @@ export function registrationBrowserDiagnostic(error, observed = {}) {
   const message = String(error?.message ?? '');
   const frames = String(error?.stack ?? '').split('\n').filter((frame) => !/^\s+at fixed[ (]/.test(frame)).join('\n');
   const line = Number(/registration-browser\.mjs:(\d+):\d+/.exec(frames)?.[1]);
-  const paths = new Set([...safeLoginResponsePaths, root, ...['start', 'email/resend', 'email/verify', 'result',
+  const paths = new Set([...safeLoginResponsePaths, root, ...['validate', 'start', 'email/resend', 'email/verify', 'result',
     'phone/send', 'phone/verify', 'passkey/options'].map((suffix) => `${root}/${suffix}`)]);
   return {
     kind: /strict mode violation/.test(message) ? 'ambiguous-locator'
@@ -1945,7 +1949,13 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
       await waitUntil(async () => {
         web.healthy();
         const [state] = JSON.parse(docker(['inspect', api.id], lifecycle));
-        fixed(state.State.Running, 'Production API exited');
+        if (!state.State.Running) {
+          // A process may exit after the first inspect, while the readiness
+          // loop is running. Emit only allowlisted categories, never raw logs.
+          const output = docker(['logs', '--tail', '30', api.id], lifecycle, { includeStderr: true });
+          console.log(JSON.stringify({ check: 'registration-api-startup', ...registrationStartupSummary(output) }));
+          throw new RegistrationFailure('api-running', false);
+        }
         try {
           const response = await fetch(`http://127.0.0.1:${selected}${path}`, {
             signal: AbortSignal.timeout(1000),
@@ -2997,6 +3007,11 @@ async function exerciseSuccessfulSignup(
     await button(page, 'Continue with a passkey').click();
     await page.waitForURL(harness.origin + '/dashboard');
     await page.getByTestId('portal-ready').waitFor();
+    await page.locator('[data-username-private]').getByText(authority.username_display, { exact: true }).waitFor();
+    fixed(
+      observed.replies.some((reply) => reply.path === '/api/v1/users/me/username' && reply.status === 200),
+      'Fresh passkey login did not read the registered username'
+    );
     fixed(
       (await context.cookies()).some(
         (item) =>

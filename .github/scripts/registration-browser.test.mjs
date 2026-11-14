@@ -62,7 +62,7 @@ test('username browser authority is a pinned isolated fixture with a dedicated v
   assert.deepEqual(policy.reserved_names, []);
   assert.equal(policy.folds.length, 4);
   const artifact = Buffer.from(JSON.stringify({ policy, regex: environment.USERNAME_REGEX,
-    implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0', unicode: '17.0.0', max_username_bytes: 1024 }));
+    implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0', unicode: '15.0.0', max_username_bytes: 1024 }));
   const fingerprint = createHash('sha256').update(artifact).digest('hex');
   const key = Buffer.from(environment.USERNAME_LOOKUP_KEY, 'base64');
   assert.equal(key.length, 32);
@@ -182,6 +182,9 @@ test('browser diagnostics expose only fixed routes, HTTP statuses and numeric so
   const result = registrationBrowserDiagnostic(error, {
     replies: [
       { path: '/api/v1/auth/register/start', status: 503, value: { token: privateValue } },
+      { path: '/api/v1/auth/register/validate', status: 200, value: { username_display: privateValue } },
+      { path: '/api/v1/users/me/username', status: 200, value: { username: { display: privateValue } } },
+      { path: `/api/v1/users/me/username?${privateValue}`, status: 401 },
       { path: `/api/v1/auth/register/start?${privateValue}`, status: 401 },
       { path: '/api/v1/auth/register', status: privateValue },
       { path: '/api/v1/auth/register', status: 999 },
@@ -189,7 +192,11 @@ test('browser diagnostics expose only fixed routes, HTTP statuses and numeric so
     ], failures: new Set(['browser-response-privacy', privateValue]),
   });
   assert.deepEqual(result, { kind: 'timeout', line: 123,
-    replies: [{ path: '/api/v1/auth/register/start', status: 503 }],
+    replies: [
+      { path: '/api/v1/auth/register/start', status: 503 },
+      { path: '/api/v1/auth/register/validate', status: 200 },
+      { path: '/api/v1/users/me/username', status: 200 },
+    ],
     failures: ['browser-response-privacy'] });
   assert(!JSON.stringify(result).includes(privateValue));
   for (const [message, kind] of [
@@ -301,6 +308,16 @@ test('gateway forwards only fixed API routes and never accepts selected hosts or
   );
   assert.throws(() => gatewayForwardTarget(privateTargets, 'PATCH', '/api/v1/users/me'));
   assert.equal(gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions').hostname, privateTargets.apiHost);
+  assert.deepEqual(gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/username'), {
+    hostname: privateTargets.apiHost,
+    port: 8080,
+    path: '/api/v1/users/me/username',
+    method: 'GET',
+  });
+  for (const method of ['POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'])
+    assert.throws(() => gatewayForwardTarget(privateTargets, method, '/api/v1/users/me/username'));
+  for (const path of ['/api/v1/users/me/username/foreign', '/api/v1/users/me/username?target=external'])
+    assert.throws(() => gatewayForwardTarget(privateTargets, 'GET', path));
   assert.throws(() => gatewayForwardTarget(privateTargets, 'DELETE', '/api/v1/users/me/sessions'));
   assert.throws(() => gatewayForwardTarget(privateTargets, 'GET', '/api/v1/users/me/sessions/foreign'));
   for (const path of [
@@ -360,7 +377,7 @@ test('real loopback gateway server selects only its fixed private API and strips
     upstream.on('finish', () => {
       const result = Readable.from(['{"unit":true}']);
       result.statusCode = 200;
-      result.headers = { 'cache-control': 'no-store' };
+      result.headers = { 'cache-control': 'private, no-store', 'referrer-policy': 'no-referrer' };
       reply(result);
     });
     return upstream;
@@ -402,10 +419,23 @@ test('real loopback gateway server selects only its fixed private API and strips
   assert.equal(forwarded[0].headers['proxy-authorization'], undefined);
   assert.equal(forwarded[0].headers.host, 'localhost:8443');
   assert.equal(forwarded[0].headers['x-forwarded-proto'], 'https');
+  const username = await fetch(`http://127.0.0.1:${gateway.port}/api/v1/users/me/username`, {
+    headers: { cookie: '__Host-session=unit-session', dpop: 'unit-username-proof' },
+  });
+  assert.equal(username.status, 200);
+  assert.equal(username.headers.get('cache-control'), 'private, no-store');
+  assert.equal(username.headers.get('referrer-policy'), 'no-referrer');
+  await username.arrayBuffer();
+  assert.equal(forwarded.length, 2);
+  assert.equal(forwarded[1].path, '/api/v1/users/me/username');
+  assert.equal(forwarded[1].method, 'GET');
+  assert.equal(forwarded[1].hostname, privateTargets.apiHost);
+  assert.equal(forwarded[1].headers.cookie, '__Host-session=unit-session');
+  assert.equal(forwarded[1].headers.dpop, 'unit-username-proof');
   const denied = await fetch(`http://127.0.0.1:${gateway.port}/arbitrary-target`);
   await denied.arrayBuffer();
   assert.equal(denied.status, 400);
-  assert.equal(forwarded.length, 1);
+  assert.equal(forwarded.length, 2);
 });
 
 test('gateway port collision leaves foreign listener untouched and returns classified private error', async (t) => {

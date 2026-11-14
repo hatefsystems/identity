@@ -19,7 +19,7 @@
       "cache": true
     }
   },
-  "analytics": true,
+  "analytics": false,
   "plugins": [
     {
       "plugin": "@nx/js/typescript",

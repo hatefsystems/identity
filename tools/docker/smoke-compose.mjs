@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { request } from 'node:https';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -63,6 +64,25 @@ function get(path) {
     req.end();
   });
 }
+
+// Do not treat Docker Compose's container-health snapshot as proof that nginx
+// has re-established its upstream connections after an ordered restart.
+async function requireRecoveredHTTPS(path, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'unreachable';
+  while (Date.now() < deadline) {
+    try {
+      const response = await get(path);
+      lastStatus = response.status;
+      if (response.status === 200) return;
+    } catch {
+      lastStatus = 'unreachable';
+    }
+    await delay(750);
+  }
+  assert.equal(lastStatus, 200, `${path} did not recover after restart`);
+}
+
 try {
   await compose(['up', '-d', '--no-build', '--wait', '--wait-timeout', '180']);
   await compose(['cp', 'init:/run/local-tls/ca.crt', join(temp, 'ca.crt')]);
@@ -107,7 +127,13 @@ try {
   await compose(['run', '--rm', '--no-deps', 'migrate', 'up']);
   await compose(['run', '--rm', '--no-deps', 'init']);
   assert.equal((await hashes()).stdout, before, 'initialization must reuse keys');
-  await compose(['restart', 'postgres', 'redis', 'nats', 'api', 'web', 'ingress']);
+  // Restart dependencies before their consumers, then re-resolve upstreams last.
+  // Each --wait checks container health; the HTTPS probes below verify ingress.
+  await compose(['restart', 'postgres', 'redis', 'nats']);
+  await compose(['up', '-d', '--no-build', '--wait', '--wait-timeout', '180']);
+  await compose(['restart', 'api', 'web']);
+  await compose(['up', '-d', '--no-build', '--wait', '--wait-timeout', '180']);
+  await compose(['restart', 'ingress']);
   await compose(['up', '-d', '--no-build', '--wait', '--wait-timeout', '180']);
   assert.equal((await hashes()).stdout, before, 'restart must preserve keys');
   assert.equal(
@@ -131,8 +157,8 @@ try {
     ).stdout.trim(),
     'compose-smoke'
   );
-  assert.equal((await get('/readyz')).status, 200);
-  assert.equal((await get('/login')).status, 200);
+  await requireRecoveredHTTPS('/readyz');
+  await requireRecoveredHTTPS('/login');
   // Deliberately damage only this run's keys, then prove init fails and restore.
   await compose([
     'run',
