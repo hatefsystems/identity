@@ -15,8 +15,8 @@ func TestBundledBaselineInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 || entries[0].Name() != "00001_initial_schema.sql" || entries[1].Name() != "00002_registration_attempts.sql" {
-		t.Fatalf("binary must embed the baseline and approved registration migration: %v", entries)
+	if len(entries) != 3 || entries[0].Name() != "00001_initial_schema.sql" || entries[1].Name() != "00002_registration_attempts.sql" || entries[2].Name() != "00003_username_reservations.sql" {
+		t.Fatalf("binary must embed the baseline, registration and username migrations: %v", entries)
 	}
 	// Provider construction and source listing must not connect to PostgreSQL.
 	database, err := sql.Open("pgx", "postgres://localhost/unused?sslmode=disable")
@@ -33,8 +33,9 @@ func TestBundledBaselineInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	sources := r.ListSources()
-	if len(sources) != 2 || sources[0].Version != 1 || sources[0].Path != "00001_initial_schema.sql" ||
-		sources[1].Version != 2 || sources[1].Path != "00002_registration_attempts.sql" {
+	if len(sources) != 3 || sources[0].Version != 1 || sources[0].Path != "00001_initial_schema.sql" ||
+		sources[1].Version != 2 || sources[1].Path != "00002_registration_attempts.sql" ||
+		sources[2].Version != 3 || sources[2].Path != "00003_username_reservations.sql" {
 		t.Fatalf("unexpected bundled runner sources: %+v", sources)
 	}
 }

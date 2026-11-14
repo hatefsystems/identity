@@ -16,6 +16,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // SubjectDeletedEvent is the NATS subject the outbox row carries
@@ -476,6 +477,11 @@ type pgSubjectTx struct {
 func (t *pgSubjectTx) Store() PurgeStore                { return t.store }
 func (t *pgSubjectTx) Commit(ctx context.Context) error { return t.tx.Commit(ctx) }
 func (t *pgSubjectTx) LockAccount(ctx context.Context, account uuid.UUID) error {
+	// Physical deletion releases a username. Join the policy coordination before
+	// the account lock, without requiring the purger to possess its lookup secret.
+	if err := username.AcquireOwnershipGuard(ctx, t.tx); err != nil {
+		return err
+	}
 	return pglock.LockAccount(ctx, t.tx, account)
 }
 

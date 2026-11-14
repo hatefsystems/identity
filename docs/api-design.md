@@ -112,6 +112,7 @@ If issuing the restricted session fails after a recovery code was consumed, the 
 ### 1.4 User Profile & Privacy (GDPR)
 - `GET /api/v1/users/me`: Bootstrap projection: `id`, `email`, `display_name`, `status`, decimal-string `lifecycle_revision`, `deletion_enabled`, and `session: {id, expires_at}`. `deletion_enabled` is a server-controlled capability, not a legal-hold disclosure; clients default a missing field to false during rollout. `expires_at` is the session's real absolute RFC 3339 deadline. No roles, backup contacts, factor secrets, ciphertext or legal data.
 - `PATCH /api/v1/users/me`: Strict required string fields `{"display_name":"Example","expected_revision":"42"}`; returns the same projection. No step-up is required for this cosmetic field. Revision strings are canonical nonnegative decimals, at most `9223372036854775807`; JSON numbers, signs, leading zeros, nulls, unknown/duplicate fields and trailing bodies are rejected.
+- `GET /api/v1/users/me/username`: When username support is enabled, normal authenticated admission returns `{username: {display}}` or `{username: null}`. No claim/rename/clear mutation is mounted; absence is not derived from email or `display_name`. See the [username contract](registration-contract.md#username-namespace).
 - `GET /api/v1/users/me/sessions`: Array of live owned browser authority with public `id`, `current`, creation/activity times and bounded IP/user-agent metadata. A session is not a physical-device identity or standalone OAuth grant.
 - `DELETE /api/v1/users/me/sessions/{session_id}`: Owner-scoped individual revocation (`204`/`404`); deleting the current session also clears its cookie. Linked access/refresh authority fails subsequent live validation immediately. Already admitted requests may finish; remote DOM clears on detection, not instantaneously. No bulk-revocation portal action.
 - `PUT /api/v1/users/me/password` and `POST /api/v1/users/me/export-data`: Planned interfaces, outside this portal implementation.
@@ -142,6 +143,11 @@ Reclaim is anonymous, not unprotected: exact Origin, bounded JSON, shared admiss
 
 ### 1.5 New-Account Registration
 
+The authoritative [registration contract](registration-contract.md) distinguishes
+the existing flow, this coordinated username increment and the deferred final
+contact-choice/password/six-stage target. The table below is the enabled
+current-flow contract with usernames, not proof of live policy installation.
+
 `REGISTRATION_ENABLED=false` is independently opt-in. When enabled with schema,
 shared Redis, private keys, approved finite admission/send budgets, SMS.ir and
 verified TLS SMTP prerequisites, all routes below require exact Origin, bounded
@@ -154,7 +160,8 @@ except email verification, which needs its distinct token and original JKT.
 
 | POST route | Exact request fields | Successful result / meaning |
 |---|---|---|
-| `/api/v1/auth/register/start` | `{email,phone}` | `{attempt_id,capability,canonical_email,expires_at,email_sent}`; durable attempt only, no account/availability claim. `email_sent` is submission acceptance, not inbox delivery. |
+| `/api/v1/auth/register/validate` | `{stage:"username",registration:{username}}` | `200 {username_display,available}`; read-only NFC display and advisory availability, no proof/reservation/owner disclosure. No other validation stage is mounted by this increment. |
+| `/api/v1/auth/register/start` | `{email,phone,username}` | `201 {attempt_id,capability,canonical_email,username_display,expires_at,email_sent}`; freezes username/policy but reserves nothing until final commit. `email_sent` is submission acceptance, not inbox delivery. |
 | `/api/v1/auth/register/email/resend` | `{attempt_id,capability}` | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send. |
 | `/api/v1/auth/register/email/verify` | `{attempt_id,token}` | Marks only email ownership from the original JKT; no capability/session/role issuance. |
 | `/api/v1/auth/register/phone/send` | `{attempt_id,capability}` | `{verification_id}` for the frozen Iranian phone after verified email; no automatic billed retry. |
@@ -173,11 +180,19 @@ handles, roles, status, auth versions or proof flags are not accepted.
 Pending state lasts 15 minutes, email proof 10 minutes, passkey challenge at most
 5 minutes (also bounded by pending expiry) and completion receipt 1 hour. Pending
 attempts are not users and cannot log in. Final SQL commit creates exactly one
-active user, canonical email, frozen handle, resident UV credential, encrypted
-verified phone, revision-1 created-event intent and receipt together. No password,
+active user, canonical email, immutable unique username, frozen handle, resident
+UV credential, encrypted verified phone, revision-1 created-event intent and receipt together. No password,
 mailbox, role or session is created; normal discoverable login follows separately.
 Email/phone/pending-deletion/credential uniqueness remains database-authoritative;
 conflict never attaches a credential to an existing account.
+
+Username display receives NFC only; the separate four-fold security key reserves
+every equivalent spelling across all surviving account statuses until physical
+deletion. Availability is advisory. `invalid_username` (400) and
+`username_unavailable` (409) include `field_errors: {username: <same code>}`;
+`username_policy_changed` (409) requires explicit restart without extending expiry.
+Owner-reviewed policy/reserved names and controlled activation remain
+[operational gates](devops-operations.md#username-policy-and-preflight-gates).
 
 For lost/ambiguous final responses, explicitly read `/register/result` using the
 same capability/JKT and a new DPoP proof. Same-authority identical completion can

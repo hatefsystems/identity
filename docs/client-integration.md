@@ -167,13 +167,28 @@ For full HTTP shapes and failure handling, see the [browser boundary](api-design
 
 ### 1.4 Conditional New-Account Registration
 
+See the authoritative [registration contract](registration-contract.md) for live
+flow versus username increment versus deferred final target. The enabled contract
+below adds usernames only; email links and separate discoverable login remain.
+
 Registration and SMS default disabled. Enabled signup uses the
-[eight fixed POST routes](api-design.md#15-new-account-registration), exact Origin,
+[fixed POST routes](api-design.md#15-new-account-registration), exact Origin,
 bounded strict JSON and public DPoP nonce/replay, without session cookies as
-authority, Authorization, `ath` or `X-Portal-Session`. Start accepts only existing
-owned email/phone and returns `{attempt_id,capability,canonical_email,expires_at,
-email_sent}`. Submission acceptance is not mailbox ownership; use explicit proof
-verification and bounded resend, never automatic mail/SMS sends.
+authority, Authorization, `ath` or `X-Portal-Session`. Start accepts exactly
+`{email,phone,username}` and returns `{attempt_id,capability,canonical_email,
+username_display,expires_at,email_sent}`. Submission acceptance is not mailbox
+ownership; use explicit proof verification and bounded resend, never automatic
+mail/SMS sends.
+
+Explicit `/validate` with `{stage:"username",registration:{username}}` returns
+`{username_display,available}`; availability does not reserve a name. Use the
+server's NFC display, never browser security folding or a Go-regex HTML `pattern`.
+Handle `invalid_username`/`username_unavailable` field errors without owner/status
+disclosure; `username_policy_changed` requires explicit restart. A locale change
+must not validate, send, enroll or extend deadlines. When username support is
+enabled, authenticated `GET /users/me/username` returns `{username:{display}|null}`
+through the ordinary portal client, not this public signup client; show absence
+honestly and expose no claim/rename control.
 
 Keep the original verified non-exportable browser key/JKT and transient attempt
 authority. Follow-ups require `{attempt_id,capability}`; email verification alone
@@ -406,13 +421,17 @@ The runtime bounds initial dependency/SVID acquisition to ten seconds, handshake
 
 Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
 
-The unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql` install uses
+The bundled `00001_initial_schema.sql`, `00002_registration_attempts.sql` and
+additive `00003_username_reservations.sql` install uses
 `public.identity_schema_version`, refusing all legacy `public.goose_db_version`,
 untracked nonempty application schemas and contradictory histories without
 upgrade/adoption. Stop all old writers before switching to explicitly scoped fresh
 PostgreSQL and matching fresh/isolated Redis/NATS state; do not reuse old sessions,
 events or consumer checkpoints. Reconcile each consumer baseline before activation.
 Wire formats, cryptographic contracts and production/manual gates are unchanged.
+The username migration preserves existing NULL usernames and seeds no active policy;
+its [installation gates](devops-operations.md#username-policy-and-preflight-gates)
+are separate from schema setup.
 Baseline Down/reset refuse; any existing-environment reset needs separately explicit
 scoped authorization. See [active setup](admin-operations.md#migration-and-contraction).
 

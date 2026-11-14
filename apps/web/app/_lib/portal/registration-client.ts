@@ -1,7 +1,7 @@
 import {
   validateRegistration,
   validateSignupEmail,
-  type RegistrationValues,
+  type RegistrationValues as ContactValues,
 } from '../../(auth)/_lib/validation';
 import { browserKey, signProof, type BrowserKey } from './dpop';
 import { isAborted, parseRetryAfter, PortalError, throwIfAborted } from './errors';
@@ -13,8 +13,11 @@ import { base64url, creationOptions, unbase64url } from './webauthn';
 const root = '/api/v1/auth/register';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export type EmailProof = { attempt_id: string; token: string };
+export type RegistrationValues = ContactValues & { username: string };
+export type UsernameValidation = { username_display: string; available: boolean };
 export type RegistrationAttempt = {
   canonical_email: string;
+  username_display: string;
   expires_at: string;
   email_sent: boolean;
 };
@@ -63,6 +66,11 @@ function canonicalEmail(value: unknown): string {
     new TextEncoder().encode(value.split('@')[0]).length > 64 ||
     !/^[a-z0-9.-]+$/.test(value.split('@')[1])
   )
+    throw new PortalError('invalid_response');
+  return value;
+}
+function usernameDisplay(value: unknown): string {
+  if (typeof value !== 'string' || !value || new TextEncoder().encode(value).length > 1024)
     throw new PortalError('invalid_response');
   return value;
 }
@@ -140,27 +148,49 @@ export class RegistrationClient {
       throw failure;
     }
   }
+  validateUsername(username: string, signal: AbortSignal): Promise<UsernameValidation> {
+    if (
+      this.#authority || typeof username !== 'string' || !username ||
+      new TextEncoder().encode(username).length > 1024
+    )
+      return Promise.reject(new PortalError('invalid_request'));
+    return this.request(
+      'validate',
+      { stage: 'username', registration: { username } },
+      (value) => {
+        const item = exact(value, ['username_display', 'available']);
+        if (typeof item.available !== 'boolean') throw new PortalError('invalid_response');
+        return { username_display: usernameDisplay(item.username_display), available: item.available };
+      },
+      signal,
+      true
+    );
+  }
   async start(values: RegistrationValues, signal: AbortSignal): Promise<RegistrationAttempt> {
     if (
       this.#authority ||
-      Object.keys(values).sort().join(',') !== 'email,phone' ||
+      Object.keys(values).sort().join(',') !== 'email,phone,username' ||
+      typeof values.username !== 'string' || !values.username ||
+      new TextEncoder().encode(values.username).length > 1024 ||
       Object.keys(validateRegistration(values)).length
     )
       throw new PortalError('invalid_request');
     const requestedAt = Date.now();
     return this.request(
       'start',
-      { email: values.email, phone: values.phone },
+      { email: values.email, phone: values.phone, username: values.username },
       (value) => {
         const item = exact(value, [
           'attempt_id',
           'capability',
           'canonical_email',
+          'username_display',
           'expires_at',
           'email_sent',
         ]);
         const expires_at = timestamp(item.expires_at);
         const email = canonicalEmail(item.canonical_email);
+        const username_display = usernameDisplay(item.username_display);
         if (
           typeof item.email_sent !== 'boolean' ||
           Date.parse(expires_at) <= Date.now() ||
@@ -174,7 +204,7 @@ export class RegistrationClient {
           email,
         };
         this.#pendingMonotonic = performance.now() + Date.parse(expires_at) - Date.now();
-        return { canonical_email: email, expires_at, email_sent: item.email_sent };
+        return { canonical_email: email, username_display, expires_at, email_sent: item.email_sent };
       },
       signal,
       true
@@ -470,6 +500,7 @@ export class RegistrationClient {
   private async request<T>(
     operation:
       | 'start'
+      | 'validate'
       | 'email/resend'
       | 'email/verify'
       | 'phone/send'
@@ -530,7 +561,13 @@ export class RegistrationClient {
           if (response.status !== status) throw new PortalError('invalid_response');
           return decode(value);
         }
-        const error = exact(value, ['error']).error;
+        const envelope = record(value);
+        const error = envelope.error;
+        if (['invalid_username', 'username_unavailable'].includes(String(error))) {
+          exact(envelope, ['error', 'field_errors']);
+          if (exact(envelope.field_errors, ['username']).username !== error)
+            throw new PortalError('invalid_response');
+        } else exact(envelope, ['error']);
         if (typeof error !== 'string' || !/^[a-z_]{1,80}$/.test(error))
           throw new PortalError('invalid_response');
         const challenge = response.headers.get('DPoP-Nonce');
@@ -572,6 +609,8 @@ export class RegistrationClient {
           'invalid_registration',
           'registration_expired',
           'registration_conflict',
+          'username_unavailable',
+          'username_policy_changed',
           'restart_registration',
           'invalid_dpop_proof',
         ].includes(error.code)

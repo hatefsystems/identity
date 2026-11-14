@@ -100,6 +100,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"legal_workflow_events", "legal_hold_reviews", "legal_workflow_replays", "legal_transparency_coverage",
 			"legal_transparency_years", "legal_transparency_months", "legal_transparency_reports", "legal_transparency_replays",
 			"deletion_notifications", "registration_attempts",
+			"username_policy_artifacts", "username_lookup_keys", "username_active_policy",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -117,7 +118,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var count int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 35 {
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 38 {
 			t.Fatalf("final application table count: %d, %v", count, err)
 		}
 	})
@@ -133,6 +134,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			// (retain_until, seq). Replaced idx_security_ledger_retention_seq.
 			"idx_security_ledger_retention",
 			"idx_registration_pending_expiry", "idx_registration_receipt_expiry", "idx_registration_result_user",
+			"users_username_key_unique",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -154,7 +156,8 @@ func TestInitialSchemaMigration(t *testing.T) {
 		for table, want := range map[string]int{"roles": 4, "permissions": 13, "role_permissions": 15,
 			"users": 0, "user_roles": 0, "audit_log_head": 0, "security_ledger_head": 0,
 			"audit_log_chain": 0, "security_ledger_chain": 0, "security_ledger_retention_settings": 0,
-			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0} {
+			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0,
+			"username_policy_artifacts": 0, "username_lookup_keys": 0, "username_active_policy": 1} {
 			var count int
 			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
 				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)
@@ -162,7 +165,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var functions, sequences int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
-			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 11 {
+			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 13 {
 			t.Fatalf("final function inventory: %d, %v", functions, err)
 		}
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace

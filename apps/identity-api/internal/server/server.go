@@ -85,6 +85,8 @@ type Deps struct {
 	// Parent composition only supplies it after enabled/readiness prerequisites.
 	Registration      *registration.Service
 	RegistrationReady func(context.Context) error
+	Usernames         UsernameReader
+	UsernameReady     func(context.Context) error
 	// WebAuthnLimiter bounds anonymous ceremony allocation by trusted subnet.
 	WebAuthnLimiter ratelimit.Limiter
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
@@ -251,6 +253,9 @@ func (s *Server) registerRoutes() {
 	}
 	if s.deps.Profile != nil {
 		s.registerProfileRoutes()
+	}
+	if s.deps.Usernames != nil {
+		s.registerUsernameRoutes()
 	}
 
 	// Passkey ceremony routes are only mounted when a WebAuthn service has

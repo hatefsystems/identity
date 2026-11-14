@@ -24,6 +24,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 type registrationRestoreFixture struct {
@@ -36,6 +37,7 @@ type registrationRestoreFixture struct {
 	fingerprint         []byte
 	user                db.User
 	phone               string
+	usernameDisplay     string
 }
 
 func (f *registrationRestoreFixture) clear() {
@@ -51,6 +53,9 @@ func (f *registrationRestoreFixture) clear() {
 	clear(f.completed.CompletionFingerprint)
 	clear(f.user.PhoneEncrypted)
 	clear(f.user.WebauthnUserHandle)
+	clear(f.user.UsernameKey)
+	clear(f.user.UsernameDetailsEncrypted)
+	clear(f.user.UsernamePolicyFingerprint)
 	*f = registrationRestoreFixture{}
 }
 
@@ -60,7 +65,9 @@ func seedRegistrationRestoreFixture(ctx context.Context, t *testing.T, pool *pgx
 	t.Helper()
 	f := &registrationRestoreFixture{phone: "+989123456782"}
 	t.Cleanup(f.clear)
-	store, err := registration.NewStore(pool, cipher, 10)
+	usernames := registrationRestoreUsernames(t, pool, cipher)
+	seedRegistrationRestoreUsernamePolicy(ctx, t, pool, usernames.Normalizer())
+	store, err := registration.NewStore(pool, cipher, 10, usernames)
 	if err != nil {
 		t.Fatal("construct registration restore store failed")
 	}
@@ -68,7 +75,11 @@ func seedRegistrationRestoreFixture(ctx context.Context, t *testing.T, pool *pgx
 	if err != nil {
 		t.Fatal("canonicalize Unicode restore contact failed")
 	}
-	f.pending, f.pendingCapability, err = store.Create(ctx, pendingEmail, "+989123456781", registrationRestoreJKT(t))
+	pendingUsername, err := usernames.Normalizer().Normalize("\u0628\u0627\u0632\u0633\u0627\u0632\u06cc.\u0643\u06cc\u0648\u0627\u0646")
+	if err != nil {
+		t.Fatal("normalize chosen pending restore username failed")
+	}
+	f.pending, f.pendingCapability, err = store.Create(ctx, pendingEmail, "+989123456781", registrationRestoreJKT(t), pendingUsername)
 	if err != nil {
 		t.Fatal("seed envelope-bound pending signup fixture failed")
 	}
@@ -123,6 +134,11 @@ func seedRegistrationRestoreFixture(ctx context.Context, t *testing.T, pool *pgx
 	}
 	defer clear(phoneCipher)
 	completedID, userID := uuid.New(), uuid.New()
+	completedUsername, err := usernames.Normalizer().Normalize("\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u06cc")
+	if err != nil {
+		t.Fatal("normalize synthetic completed restore username failed")
+	}
+	f.usernameDisplay = completedUsername.Display()
 	fingerprint := sha256.Sum256([]byte("registration-restore-completion:v1:" + completedID.String() + ":" + userID.String()))
 	f.fingerprint = bytes.Clone(fingerprint[:])
 	created := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Microsecond)
@@ -134,9 +150,15 @@ func seedRegistrationRestoreFixture(ctx context.Context, t *testing.T, pool *pgx
 	tx = registrationRestoreTransaction(ctx, t, pool)
 	func() {
 		defer registrationRestoreRollback(t, tx)
+		if err := usernames.Guard(ctx, tx); err != nil {
+			t.Fatal("guard synthetic completed username authority failed")
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO public.users(id,email,phone_encrypted,phone_blind_index,webauthn_user_handle,lifecycle_revision,created_at,updated_at)
 VALUES($1,$2,$3,$4,$5,1,$6,$6)`, userID, completedEmail, phoneCipher, indexer.Compute(f.phone), handle, created); err != nil {
 			t.Fatal("seed synthetic local signup user fixture failed")
+		}
+		if err := usernames.Assign(ctx, tx, userID, 0, completedUsername); err != nil {
+			t.Fatal("assign account-bound synthetic restore username failed")
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO public.registration_attempts(id,capability_hash,jkt,state,created_at,expires_at,
 terminal_at,receipt_expires_at,email_verified_at,phone_verified_at,challenge_revision,row_revision,completion_fingerprint,result_user_id)
@@ -158,6 +180,44 @@ VALUES($1,$2,$3,'completed',$4,$5,$6,$7,$8,$9,3,4,$10,$11)`, completedID, comple
 		t.Fatal("read bound local signup user fixture failed")
 	}
 	return f
+}
+
+func registrationRestoreUsernames(t *testing.T, pool *pgxpool.Pool, cipher Encryptor) *username.Store {
+	t.Helper()
+	policy := username.Policy{
+		ID: uuid.MustParse("1bc0aee3-4d3f-48f7-a6d5-4960b412c5ac"), Normalization: username.NormalizationV1,
+		Folds:         []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}},
+		ReservedNames: []string{},
+	}
+	const syntax = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
+	normalizer, err := username.New(policy, syntax, bytes.Repeat([]byte{0x64}, 32), "registration-restore-only")
+	if err != nil {
+		t.Fatal("construct approved restore username policy failed")
+	}
+	store, err := username.NewStore(pool, cipher, normalizer)
+	if err != nil {
+		t.Fatal("construct real restore username store failed")
+	}
+	return store
+}
+
+func seedRegistrationRestoreUsernamePolicy(ctx context.Context, t *testing.T, pool *pgxpool.Pool, normalizer *username.Normalizer) {
+	t.Helper()
+	// The caller has migrated its run-owned source child. Restore checks never
+	// reseed this authority: its exact registry and active row must survive copying.
+	a := normalizer.Authority()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO username_policy_artifacts(policy_id,fingerprint,artifact) VALUES($1,$2,$3)`, []any{a.PolicyID, a.Fingerprint[:], normalizer.CanonicalArtifact()}},
+		{`INSERT INTO username_lookup_keys(key_id,key_verifier) VALUES($1,$2)`, []any{a.KeyID, a.KeyVerifier[:]}},
+		{`UPDATE username_active_policy SET policy_id=$1,fingerprint=$2,epoch=1,key_id=$3,key_verifier=$4,admission_state='open' WHERE singleton`, []any{a.PolicyID, a.Fingerprint[:], a.KeyID, a.KeyVerifier[:]}},
+	} {
+		if tag, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil || tag.RowsAffected() != 1 {
+			t.Fatal("seed owned restore username authority failed")
+		}
+	}
 }
 
 // RFC 7638 public-key thumbprints are generated without retaining the signing
@@ -185,18 +245,25 @@ func registrationRestoreJKT(t *testing.T) string {
 
 func checkRegistrationRestoredState(ctx context.Context, t *testing.T, pool *pgxpool.Pool, cipher Encryptor, f *registrationRestoreFixture) {
 	t.Helper()
-	var tables, appliedRegistration, attemptCount int
+	var tables, appliedRegistration, appliedUsername, attemptCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 35 {
-		t.Fatal("restore lost the exact 35-table application inventory")
+WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 38 {
+		t.Fatal("restore lost the exact 38-table application inventory")
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM identity_schema_version WHERE version_id=2 AND is_applied`).Scan(&appliedRegistration); err != nil || appliedRegistration != 1 {
 		t.Fatal("restored registration migration metadata is missing")
 	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM identity_schema_version WHERE version_id=3 AND is_applied`).Scan(&appliedUsername); err != nil || appliedUsername != 1 {
+		t.Fatal("restored username migration metadata is missing")
+	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM registration_attempts`).Scan(&attemptCount); err != nil || attemptCount != 2 {
 		t.Fatal("restore lost pending or completed signup fixture")
 	}
-	store, err := registration.NewStore(pool, cipher, 10)
+	usernames := registrationRestoreUsernames(t, pool, cipher)
+	if err := usernames.CheckReady(ctx); err != nil {
+		t.Fatal("restored immutable username policy or active key authority differs")
+	}
+	store, err := registration.NewStore(pool, cipher, 10, usernames)
 	if err != nil {
 		t.Fatal("construct restored signup authority store failed")
 	}
@@ -206,6 +273,11 @@ WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_versi
 	}
 	compareRegistrationRestoreValue(t, f.pending.Record, pending.Record)
 	compareRegistrationRestoreValue(t, f.pending.Details, pending.Details)
+	chosen, err := usernames.Normalizer().Normalize(pending.Details.UsernameDisplay)
+	if err != nil || chosen.Display() != pending.Details.UsernameDisplay || chosen.SecurityName() != pending.Details.UsernameSecurity ||
+		chosen.Authority() != pending.Details.UsernameAuthority || pending.Details.UsernameEpoch != 1 {
+		t.Fatal("restored pending username spelling, security name or frozen authority differs")
+	}
 	capabilityHash, _ := registration.HashCapability(f.pendingCapability)
 	tokenHash, _ := registration.HashCapability(f.emailToken)
 	if !bytes.Equal(pending.Record.CapabilityHash, capabilityHash) || !bytes.Equal(pending.Record.EmailTokenHash, tokenHash) ||
@@ -227,7 +299,8 @@ WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_versi
 		completed.Record.PasskeyCreatedAt.Valid || completed.Record.PasskeyExpiresAt.Valid || len(completed.Record.CompletionFingerprint) != 32 ||
 		!completed.Record.ResultUserID.Valid || completed.Record.ResultUserID.UUID != f.user.ID || completed.Record.ChallengeRevision != 3 ||
 		completed.Record.RowRevision != 4 || !completed.Record.ReceiptExpiresAt.Time.Equal(completed.Record.TerminalAt.Time.Add(registration.ReceiptLifetime)) ||
-		completed.Details.Email != "" || completed.Details.Phone != "" || len(completed.Details.UserHandle) != 0 || len(completed.Details.Ceremony) != 0 {
+		completed.Details.Email != "" || completed.Details.Phone != "" || len(completed.Details.UserHandle) != 0 || len(completed.Details.Ceremony) != 0 ||
+		completed.Details.UsernameDisplay != "" || completed.Details.UsernameSecurity != "" || completed.Details.UsernameAuthority != (username.Authority{}) || completed.Details.UsernameEpoch != 0 {
 		t.Fatal("restored completion metadata, deadline or transient NULLs differ")
 	}
 	user, replay, err := registration.CheckReplay(completed, f.fingerprint)
@@ -245,6 +318,10 @@ WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_versi
 		t.Fatal("restored completion FK target failed")
 	}
 	compareRegistrationRestoreValue(t, f.user, boundUser)
+	name, err := usernames.Get(ctx, boundUser.ID, boundUser.AuthVersion)
+	if err != nil || name == nil || name.Display != f.usernameDisplay {
+		t.Fatal("restored account-bound username ciphertext or exact display differs")
+	}
 	phone, err := cipher.Decrypt(ctx, boundUser.PhoneEncrypted)
 	defer clear(phone)
 	if err != nil || string(phone) != f.phone || !emailaddress.ValidCanonicalMailbox(boundUser.Email) ||
@@ -284,7 +361,7 @@ AND contype='f' AND confrelid='public.users'::regclass AND confdeltype='c' AND c
 	if err != nil {
 		t.Fatal("construct wrong envelope restore probe failed")
 	}
-	wrongStore, err := registration.NewStore(pool, wrongCipher, 10)
+	wrongStore, err := registration.NewStore(pool, wrongCipher, 10, registrationRestoreUsernames(t, pool, wrongCipher))
 	if err != nil {
 		t.Fatal("construct wrong-key signup store failed")
 	}

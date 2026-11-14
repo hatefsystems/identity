@@ -4,6 +4,11 @@ services:
   api:
     environment:
       REGISTRATION_ENABLED: 'true'
+      USERNAME_ENABLED: 'true'
+      USERNAME_REGEX: ${USERNAME_REGEX:?Set the reviewed username admission regex}
+      USERNAME_POLICY_JSON: ${USERNAME_POLICY_JSON:?Set the explicit reviewed immutable username policy}
+      USERNAME_LOOKUP_KEY: ${USERNAME_LOOKUP_KEY:?Set the independent private username lookup key}
+      USERNAME_LOOKUP_KEY_ID: ${USERNAME_LOOKUP_KEY_ID:?Set the installed username lookup key ID}
       SMS_ENABLED: 'true'
       SMS_PROVIDER: smsir
       SMS_IR_KEY_MODE: live

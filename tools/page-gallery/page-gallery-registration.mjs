@@ -15,7 +15,7 @@ import { registrationFailureDetails, runtimeInputs, startRegistrationHarness, tr
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const preparedImages = new WeakMap();
 const root = '/api/v1/auth/register';
-const masks = ['bdi', 'time', '[data-registration-feedback] [dir="ltr"]'];
+const masks = ['bdi', 'time', '[name="username"]', '[data-registration-feedback] [dir="ltr"]'];
 const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
 const diagnostics = new WeakMap();
 const stages = new Set([
@@ -457,19 +457,24 @@ export async function registrationPhase(api) {
       const suffix = randomBytes(8).toString('hex');
       const email = `gallery-${suffix}@example.test`;
       const phone = '091' + String(randomBytes(4).readUInt32BE() % 100_000_000).padStart(8, '0');
-      remember(harness, { email, phone });
+      const letters = '\u0627\u0628\u067e\u062a\u062b\u062c\u0686\u062d\u062e\u062f\u0630\u0631\u0632\u0698\u0633\u0634';
+      const username = '\u0639\u0644\u06cc.\u0645\u0624\u0645\u0646\u06cc.' + [...suffix].map(digit => letters[parseInt(digit, 16)]).join('');
+      remember(harness, { email, phone, username });
       await page.getByLabel(localizedText('Email address'), { exact: true }).fill(email);
       const nativePhone = phone.replace(/[0-9]/g, (digit, index) => String.fromCharCode((index % 2 ? 0x0660 : 0x06f0) + Number(digit)));
       await page.getByLabel(localizedText('Iranian mobile number'), { exact: true }).fill(nativePhone);
       assert.equal(await page.getByLabel(localizedText('Iranian mobile number'), { exact: true }).inputValue(), phone);
-      contacts = { email, phone };
+      await page.getByLabel(localizedText('Username'), { exact: true }).fill(username);
+      const checked = await action(page, '/validate', 200, () => button(page, 'Check username').click());
+      assert(checked.available === true && checked.username_display === username);
+      contacts = { email, phone, username };
       await capture(page, 'register-native-input');
     });
     await api.group(['register-email-pending'], async () => {
       assert(contacts, 'Registration native-input state unavailable');
       const { phone } = contacts;
       const result = await action(page, '/start', 201, () => button(page, 'Start registration and send email').click());
-      assert(result.email_sent === true && typeof result.canonical_email === 'string' &&
+      assert(result.email_sent === true && result.username_display === contacts.username && typeof result.canonical_email === 'string' &&
         /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(result.attempt_id) &&
         /^[A-Za-z0-9_-]{43}$/.test(result.capability));
       await status(page, 'Verification email accepted for delivery. Open its link in this browser and explicitly confirm it. No account exists yet.').waitFor();

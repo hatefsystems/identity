@@ -22,6 +22,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/dbprivilege"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // Only this helper's unique child database is migrated. DATABASE_URL supplies
@@ -194,14 +195,15 @@ func TestRegistrationRealRolePrivilegesAndSchemaReadiness(t *testing.T) {
 	if err := CheckCleanupReady(ctx, cleaner); err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewStore(api, testCipher(t), 10)
+	namespace := testUsernames(t)
+	s, err := NewStore(api, testCipher(t), 10, namespace)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := s.CheckReady(ctx); err != nil {
 		t.Fatal("API schema/envelope readiness failed", err)
 	}
-	a, secret, err := s.Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	a, secret, err := s.Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", usernameValue(t, namespace.normalizer, fixtureUsername))
 	if err != nil {
 		t.Fatal("narrow API admission failed", err)
 	}
@@ -232,7 +234,7 @@ func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 	cleaner, _ := registrationRole(ctx, t, root, "cleanup")
 	stores := make([]*Store, 2)
 	for i := range stores {
-		s, err := NewStore(api, testCipher(t), 1)
+		s, err := NewStore(api, testCipher(t), 1, testUsernames(t))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -241,11 +243,12 @@ func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 	}
 	var wait sync.WaitGroup
 	results := make(chan error, 8)
+	chosen := usernameValue(t, stores[0].usernames.Normalizer(), fixtureUsername)
 	for i := range 8 {
 		wait.Add(1)
 		go func(i int) {
 			defer wait.Done()
-			_, secret, err := stores[i%2].Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+			_, secret, err := stores[i%2].Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", chosen)
 			clear(secret)
 			results <- err
 		}(i)
@@ -271,11 +274,11 @@ func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 	if err != nil || stats.Deleted != 1 {
 		t.Fatalf("expired pending cleanup failed: %+v %v", stats, err)
 	}
-	restarted, err := NewStore(api, testCipher(t), 1)
+	restarted, err := NewStore(api, testCipher(t), 1, testUsernames(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, secret, err := restarted.Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); err != nil {
+	if _, secret, err := restarted.Create(ctx, "person@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", chosen); err != nil {
 		t.Fatal("cleanup capacity not restored on reconstructed store", err)
 	} else {
 		clear(secret)
@@ -284,13 +287,13 @@ func TestRegistrationSharedCapacityExpiredPendingAndRestart(t *testing.T) {
 
 func completedRegistration(ctx context.Context, t *testing.T, pool *pgxpool.Pool, start time.Time) (Attempt, []byte) {
 	t.Helper()
-	s, err := NewStore(pool, testCipher(t), 100)
+	s, err := NewStore(pool, testCipher(t), 100, testUsernames(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.now = func() time.Time { return start }
 	email := "registration-" + uuid.NewString() + "@example.com"
-	a, secret, err := s.Create(ctx, email, "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	a, secret, err := s.Create(ctx, email, "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", usernameValue(t, s.usernames.Normalizer(), fixtureUsername))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +363,7 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 	}
 	rollback(blocker)
 	registrationExec(ctx, t, root, `UPDATE legal_holds SET is_active=false,released_at=now() WHERE account_ref=$1`, held.Record.ResultUserID.UUID)
-	restarted, err := NewStore(root, testCipher(t), 100)
+	restarted, err := NewStore(root, testCipher(t), 100, testUsernames(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +374,7 @@ func TestRegistrationReceiptCleanupHoldContentionFailureAndPurge(t *testing.T) {
 	if err != nil || stats.Deleted != 2 {
 		t.Fatalf("restart cleanup did not resume deferred rows: %+v %v", stats, err)
 	}
-	pending, capability, err := restarted.Create(ctx, "pending@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	pending, capability, err := restarted.Create(ctx, "pending@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", usernameValue(t, restarted.usernames.Normalizer(), fixtureUsername))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,17 +405,18 @@ func TestRegistrationSQLConstraintsAndCleanupFailureResume(t *testing.T) {
 	ctx, root := registrationDatabase(t)
 	cleaner, _ := registrationRole(ctx, t, root, "cleanup")
 	// Every mutation is in this unique fixture, never in the provisioning DB.
-	s, err := NewStore(root, testCipher(t), 100)
+	s, err := NewStore(root, testCipher(t), 100, testUsernames(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.now = func() time.Time { return time.Now().Add(-16 * time.Minute) }
-	a, key, err := s.Create(ctx, "first@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	chosen := usernameValue(t, s.usernames.Normalizer(), fixtureUsername)
+	a, key, err := s.Create(ctx, "first@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", chosen)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(key)
-	b, key2, err := s.Create(ctx, "second@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	b, key2, err := s.Create(ctx, "second@example.com", "+989123456789", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", chosen)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,5 +482,241 @@ func TestRegistrationReadinessRejectsMalformedSchema(t *testing.T) {
 	}
 	if err := CheckSchema(ctx, root); err != nil {
 		t.Fatal("schema refusal mutated valid fixture", err)
+	}
+}
+
+// Activation here is an explicit fixture seed in a newly created child database,
+// not an operator path or approval to adopt an environment's active authority.
+func registrationUsernameNamespace(ctx context.Context, t *testing.T, pool *pgxpool.Pool) *username.Store {
+	t.Helper()
+	n := usernameNormalizer(t)
+	a := n.Authority()
+	registrationExec(ctx, t, pool, `INSERT INTO username_policy_artifacts(policy_id,fingerprint,artifact) VALUES($1,$2,$3)`, a.PolicyID, a.Fingerprint[:], n.CanonicalArtifact())
+	registrationExec(ctx, t, pool, `INSERT INTO username_lookup_keys(key_id,key_verifier) VALUES($1,$2)`, a.KeyID, a.KeyVerifier[:])
+	registrationExec(ctx, t, pool, `UPDATE username_active_policy SET policy_id=$1,fingerprint=$2,epoch=1,key_id=$3,key_verifier=$4,admission_state='open' WHERE singleton`, a.PolicyID, a.Fingerprint[:], a.KeyID, a.KeyVerifier[:])
+	namespace, err := username.NewStore(pool, testCipher(t), n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return namespace
+}
+
+func registrationReadyBirth(ctx context.Context, t *testing.T, pool *pgxpool.Pool, namespace *username.Store, chosen, phone string) (*Service, Authority, *signupPasskey) {
+	t.Helper()
+	store, err := NewStore(pool, testCipher(t), 100, namespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	store.now = func() time.Time { return start }
+	email := "birth-" + uuid.NewString() + "@example.com"
+	a, capability, err := store.Create(ctx, email, phone, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", usernameValue(t, namespace.Normalizer(), chosen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clear(capability) })
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(tx)
+	if err := namespace.Guard(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	a, err = store.Lock(ctx, tx, a.Record.ID, capability, a.Record.Jkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Record.EmailTokenIssuedAt = timestamp(start)
+	a.Record.EmailTokenExpiresAt = timestamp(start.Add(EmailLifetime))
+	a.Record.EmailVerifiedAt = timestamp(start.Add(time.Second))
+	a.Record.SmsVerificationRef = uuid.NullUUID{UUID: uuid.New(), Valid: true}
+	a.Record.PhoneVerifiedAt = timestamp(start.Add(2 * time.Second))
+	a.Record.ChallengeRevision = 1
+	a.Record.PasskeyCreatedAt = timestamp(start.Add(3 * time.Second))
+	a.Record.PasskeyExpiresAt = timestamp(start.Add(3*time.Second + PasskeyLifetime))
+	a.Details.Ceremony = []byte(`{"purpose":"registration","fixture":true}`)
+	a.Details.CeremonyRevision = 1
+	store.now = func() time.Time { return start.Add(4 * time.Second) }
+	if _, err := store.Save(ctx, tx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mail, err := NewEmail(EmailConfig{From: "identity@example.com", PublicOrigin: "https://identity.example.com"}, &recordingMail{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialID := uuid.New()
+	passkey := &signupPasskey{credential: db.CreateWebauthnCredentialParams{ID: bytes.Clone(credentialID[:]), PublicKey: []byte{2}, AttestationType: "none", Aaguid: uuid.New(), UserVerified: true, UserPresent: true}}
+	service, err := NewService(Deps{Store: store, Database: pool, Usernames: namespace, Email: mail, Phone: &signupPhone{}, WebAuthn: passkey, Encryptor: store.cipher, Indexer: signupIndexer{}, Limiter: &signupLimiter{}, GlobalDailyLimit: 10, EmailHourlyLimit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, Authority{a.Record.ID, capability, a.Record.Jkt}, passkey
+}
+
+func TestRegistrationUsernameEquivalentBirthRaceOneAtomicOwner(t *testing.T) {
+	ctx, pool := registrationDatabase(t)
+	namespace := registrationUsernameNamespace(ctx, t, pool)
+	names := []string{fixtureUsername, "\u0639\u0644\u064a.\u0645\u0648\u0645\u0646\u064a"}
+	services, authorities, passkeys := make([]*Service, 2), make([]Authority, 2), make([]*signupPasskey, 2)
+	ready, start := make(chan struct{}, 2), make(chan struct{})
+	for i := range services {
+		services[i], authorities[i], passkeys[i] = registrationReadyBirth(ctx, t, pool, namespace, names[i], []string{"+989123456789", "+989123456780"}[i])
+		v := usernameValue(t, namespace.Normalizer(), names[i])
+		if available, err := namespace.Available(ctx, v); err != nil || !available {
+			t.Fatal("pending admission reserved an advisory name", err)
+		}
+		passkeys[i].onVerify = func() { ready <- struct{}{}; <-start }
+	}
+	results := make(chan error, 2)
+	for i := range services {
+		go func(i int) {
+			_, err := services[i].Complete(ctx, authorities[i], []byte(`{"id":"fixture-credential"}`))
+			results <- err
+		}(i)
+	}
+	for range 2 {
+		select {
+		case <-ready:
+		case <-time.After(10 * time.Second):
+			close(start)
+			t.Fatal("competing registrations did not reach independent verification")
+		}
+	}
+	close(start)
+	wins := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			wins++
+		} else if !errors.Is(err, ErrUsernameUnavailable) {
+			t.Fatalf("unexpected username race loser: %v", err)
+		}
+	}
+	var users, claimed, credentials, receipts, intents int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM users WHERE username_key IS NOT NULL),(SELECT count(*) FROM webauthn_credentials),(SELECT count(*) FROM registration_attempts WHERE state='completed'),(SELECT count(*) FROM event_outbox)`).Scan(&users, &claimed, &credentials, &receipts, &intents); err != nil || wins != 1 || users != 1 || claimed != 1 || credentials != 1 || receipts != 1 || intents != 1 {
+		t.Fatalf("race left partial account/ownership: wins=%d users=%d claimed=%d credentials=%d receipts=%d intents=%d err=%v", wins, users, claimed, credentials, receipts, intents, err)
+	}
+	var owner uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE username_key IS NOT NULL`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	for _, spelling := range names {
+		if id, err := namespace.Lookup(ctx, spelling); err != nil || id != owner {
+			t.Fatal("equivalent spelling escaped committed namespace", err)
+		}
+	}
+	for i := range services {
+		result, err := services[i].Result(ctx, authorities[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.State == "completed" {
+			credential, err := db.New(pool).GetWebauthnCredential(ctx, passkeys[i].credential.ID)
+			if err != nil || credential.UserID != owner {
+				t.Fatal("winning credential attached to another account", err)
+			}
+		} else if _, err := db.New(pool).GetWebauthnCredential(ctx, passkeys[i].credential.ID); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal("losing credential attached to winning account", err)
+		}
+	}
+}
+
+func TestRegistrationUsernameBirthVersusInitialAssignmentRace(t *testing.T) {
+	ctx, pool := registrationDatabase(t)
+	namespace := registrationUsernameNamespace(ctx, t, pool)
+	service, authority, passkey := registrationReadyBirth(ctx, t, pool, namespace, fixtureUsername, "+989123456789")
+	var legacy uuid.UUID
+	var epoch int64
+	if err := pool.QueryRow(ctx, `INSERT INTO users(email) VALUES('unclaimed@example.com') RETURNING id,auth_version`).Scan(&legacy, &epoch); err != nil {
+		t.Fatal(err)
+	}
+	value := usernameValue(t, namespace.Normalizer(), "\u0639\u0644\u06cc.\u0645\u0648\u0645\u0646\u06cc")
+	ready, start := make(chan struct{}, 2), make(chan struct{})
+	passkey.onVerify = func() { ready <- struct{}{}; <-start }
+	results := make(chan error, 2)
+	go func() { _, err := service.Complete(ctx, authority, []byte(`{"id":"fixture"}`)); results <- err }()
+	go func() {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			results <- err
+			return
+		}
+		defer rollback(tx)
+		ready <- struct{}{}
+		<-start
+		if err := namespace.Assign(ctx, tx, legacy, epoch, value); err != nil {
+			results <- err
+			return
+		}
+		results <- tx.Commit(ctx)
+	}()
+	for range 2 {
+		select {
+		case <-ready:
+		case <-time.After(10 * time.Second):
+			close(start)
+			t.Fatal("registration/initial-assignment race did not start")
+		}
+	}
+	close(start)
+	wins := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			wins++
+		} else if !errors.Is(err, ErrUsernameUnavailable) && !errors.Is(err, username.ErrConflict) {
+			t.Fatal(err)
+		}
+	}
+	var claimed, users, credentials, receipts, intents int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users WHERE username_key IS NOT NULL),(SELECT count(*) FROM users),(SELECT count(*) FROM webauthn_credentials),(SELECT count(*) FROM registration_attempts WHERE state='completed'),(SELECT count(*) FROM event_outbox)`).Scan(&claimed, &users, &credentials, &receipts, &intents); err != nil || wins != 1 || claimed != 1 {
+		t.Fatal("shared assignment primitive did not choose exactly one owner", err)
+	}
+	owner, err := namespace.Lookup(ctx, fixtureUsername)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner == legacy {
+		if users != 1 || credentials != 0 || receipts != 0 || intents != 0 {
+			t.Fatal("losing registration left partial durable birth")
+		}
+	} else if users != 2 || credentials != 1 || receipts != 1 || intents != 1 {
+		t.Fatal("registration winner did not commit complete birth")
+	}
+}
+
+func TestRegistrationUsernameSQLBirthFailuresRollbackOwnership(t *testing.T) {
+	for _, stage := range []string{"account", "username", "credential", "receipt", "outbox"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, pool := registrationDatabase(t)
+			namespace := registrationUsernameNamespace(ctx, t, pool)
+			service, authority, _ := registrationReadyBirth(ctx, t, pool, namespace, fixtureUsername, "+989123456789")
+			table, event, condition := "users", "INSERT", "TRUE"
+			switch stage {
+			case "username":
+				table, event, condition = "users", "UPDATE", "NEW.username_key IS NOT NULL"
+			case "credential":
+				table = "webauthn_credentials"
+			case "receipt":
+				table, event, condition = "registration_attempts", "UPDATE", "NEW.state='completed'"
+			case "outbox":
+				table = "event_outbox"
+			}
+			registrationExec(ctx, t, pool, `CREATE FUNCTION registration_username_fixture_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture private username SQL failure'; END $$`)
+			registrationExec(ctx, t, pool, "CREATE TRIGGER registration_username_fixture_failure BEFORE "+event+" ON "+pgx.Identifier{table}.Sanitize()+" FOR EACH ROW WHEN ("+condition+") EXECUTE FUNCTION registration_username_fixture_failure()")
+			result, err := service.Complete(ctx, authority, []byte(`{"id":"fixture"}`))
+			if err == nil || result.State != "" || strings.Contains(err.Error(), "private") {
+				t.Fatalf("failed birth leaked completion/diagnostics: %v", err)
+			}
+			var users, credentials, receipts, intents int
+			if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM webauthn_credentials),(SELECT count(*) FROM registration_attempts WHERE state='completed'),(SELECT count(*) FROM event_outbox)`).Scan(&users, &credentials, &receipts, &intents); err != nil || users != 0 || credentials != 0 || receipts != 0 || intents != 0 {
+				t.Fatal("birth failure retained partial username/account/credential/receipt/outbox", err)
+			}
+			if available, err := namespace.Available(ctx, usernameValue(t, namespace.Normalizer(), fixtureUsername)); err != nil || !available {
+				t.Fatal("rollback retained username reservation", err)
+			}
+		})
 	}
 }

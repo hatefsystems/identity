@@ -100,21 +100,27 @@ describe.each(['en', 'fa-IR'] as const)('public auth routes in %s', (locale) => 
 
     if (Page === RegistrationPage) {
       const fields = locale === 'en'
-        ? ['Email address', 'Iranian mobile number']
-        : ['نشانی ایمیل', 'شمارهٔ همراه ایران'];
-      expect(container.querySelectorAll('input')).toHaveLength(2);
+        ? ['Email address', 'Iranian mobile number', 'Username']
+        : ['نشانی ایمیل', 'شمارهٔ همراه ایران', 'نام کاربری'];
+      expect(container.querySelectorAll('input')).toHaveLength(3);
       fields.forEach((label, fieldIndex) => {
         const input = screen.getByLabelText<HTMLInputElement>(label);
         expect(input.id).not.toBe('');
         expect(container.querySelector(`label[for="${input.id}"]`)?.textContent).toBe(label);
-        expect(input.type).toBe(fieldIndex ? 'tel' : 'text');
-        expect(input.autocomplete).toBe(fieldIndex ? 'tel' : 'email');
+        expect(input.type).toBe(fieldIndex === 1 ? 'tel' : 'text');
+        expect(input.autocomplete).toBe(['email', 'tel', 'username'][fieldIndex]);
         expect(input.required).toBe(true);
         expect(input.disabled).toBe(false);
-        expect(input.dir).toBe('ltr');
+        expect(input.dir).toBe(fieldIndex === 2 ? 'auto' : 'ltr');
         expect(input.getAttribute('aria-invalid')).toBe('false');
         expect(input.hasAttribute('autofocus')).toBe(false);
       });
+      expect(container.querySelector('input[name="username"]')?.hasAttribute('pattern')).toBe(false);
+      const checkUsername = screen.getByRole<HTMLButtonElement>('button', {
+        name: locale === 'en' ? 'Check username' : 'بررسی نام کاربری',
+      });
+      expect(checkUsername.type).toBe('button');
+      expect(checkUsername.disabled).toBe(false);
       const submit = screen.getByRole<HTMLButtonElement>('button', { name: copy.start });
       expect(submit.type).toBe('submit');
       expect(submit.disabled).toBe(false);

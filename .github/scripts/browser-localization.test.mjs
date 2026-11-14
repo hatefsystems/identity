@@ -5,6 +5,7 @@ import { runInNewContext } from 'node:vm';
 import { createServer } from 'node:http';
 import { get } from 'node:https';
 import { createConnection } from 'node:net';
+import { readFile } from 'node:fs/promises';
 import { assertPublicStorageUnchanged, assertSafeRequests, assertThemeDocument, assertUnavailable, authRoutes, fetchPinnedCspDocument, storageSnapshot } from './web-csp.browser.mjs';
 import {
   assertOnlyPreferenceCookies,
@@ -77,6 +78,25 @@ test('browser locale expectations retain exact English/Persian accessible names 
   } finally {
     setBrowserLocale('en');
   }
+});
+
+test('username presentation has explicit bilingual browser names and remains structurally masked in artifacts', async () => {
+  assert.equal(localizedText('Username', { locale: 'en' }), 'Username');
+  try {
+    setBrowserLocale('fa-IR');
+    assert.match('نام کاربری', localizedText('Username'));
+    assert.match('بررسی نام کاربری', localizedText('Check username'));
+  } finally { setBrowserLocale('en'); }
+  const csp = await readFile(new URL('./web-csp.browser.mjs', import.meta.url), 'utf8');
+  const masks = csp.match(/mask: \[page\.locator\('[^']*'\)\]/g);
+  assert(masks?.length > 0);
+  for (const mask of masks) {
+    assert(mask.includes('input, textarea'));
+    assert(mask.includes('[data-username-private]'));
+  }
+  const portal = await readFile(new URL('./web-portal.browser.mjs', import.meta.url), 'utf8');
+  const accountMasks = portal.match(/page\.locator\('input, textarea, main dd[^']*'\)/g);
+  assert(accountMasks?.length >= 3, 'Account username must remain inside the existing structural dd masks');
 });
 
 test('preference setup uses only the secure browser cookie and anonymous document assertions reject session authority', async () => {
@@ -352,7 +372,7 @@ test('public CSP routes require passkey-only entry and availability notices, nev
   ]);
   for (const route of authRoutes) {
     assert.equal([route.passkey, route.registration, route.availability].filter(Boolean).length, 1);
-    if (route.registration) assert.deepEqual(route.fields.map((field) => field.name), ['email', 'phone']);
+    if (route.registration) assert.deepEqual(route.fields.map((field) => field.name), ['email', 'phone', 'username']);
     else assert.deepEqual(route.fields, []);
     if (route.availability) {
       assert.equal(route.submit, undefined);

@@ -15,6 +15,31 @@
   },
   "tags": ["lang:go", "scope:backend"],
   "targets": {
+    "username-preflight": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go run ./cmd/username preflight" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "username-install": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go run ./cmd/username install" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-username": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go test -count=1 ./internal/username ./cmd/username ./internal/migrate" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-username-integration": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go test -tags=integration -race -count=1 -timeout=10m ./internal/username ./internal/migrate" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false,
+      "parallelism": false
+    },
     "build": {
       "executor": "nx:run-commands",
       "options": {

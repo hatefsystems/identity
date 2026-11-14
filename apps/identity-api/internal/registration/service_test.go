@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 type signupLimiter struct {
@@ -113,12 +114,12 @@ func signupFixture(t *testing.T) (*Service, Authority, *testDatabase, *testTx, *
 	email, _ := NewEmail(EmailConfig{From: "identity@example.com", PublicOrigin: "https://identity.example.com"}, mail)
 	passkey := &signupPasskey{credential: db.CreateWebauthnCredentialParams{ID: []byte{1}, PublicKey: []byte{2}, UserVerified: true, UserPresent: true}}
 	phone := &signupPhone{id: id}
-	service, err := NewService(Deps{Store: store, Database: database, Email: email, Phone: phone, WebAuthn: passkey, Encryptor: store.cipher, Indexer: signupIndexer{}, Limiter: &signupLimiter{}, GlobalDailyLimit: 10, EmailHourlyLimit: 5})
+	service, err := NewService(Deps{Store: store, Database: database, Usernames: store.usernames, Email: email, Phone: phone, WebAuthn: passkey, Encryptor: store.cipher, Indexer: signupIndexer{}, Limiter: &signupLimiter{}, GlobalDailyLimit: 10, EmailHourlyLimit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
 	service.now = store.now
-	user := db.User{ID: uuid.New(), Email: attempt.Details.Email, Status: "active"}
+	user := db.User{ID: uuid.New(), Email: attempt.Details.Email, Status: "active", AuthVersion: 1}
 	tx.onQuery = func(name string, args []any) pgx.Row {
 		if err := tx.failures[name]; err != nil {
 			return valueRow{err: err}
@@ -153,7 +154,7 @@ func signupFixture(t *testing.T) (*Service, Authority, *testDatabase, *testTx, *
 }
 
 func TestSignupAtomicBirthWriteOrderAndFailureIsolation(t *testing.T) {
-	for _, failure := range []string{"", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt", "commit"} {
+	for _, failure := range []string{"", "username_guard", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt", "commit"} {
 		t.Run("failure_"+failure, func(t *testing.T) {
 			s, a, _, tx, _, _, _ := signupFixture(t)
 			if failure != "" {
@@ -164,7 +165,7 @@ func TestSignupAtomicBirthWriteOrderAndFailureIsolation(t *testing.T) {
 				if err != nil || result.State != "completed" || result.Next != "login" || tx.commits != 1 {
 					t.Fatalf("complete: %v", err)
 				}
-				want := []string{"CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt"}
+				want := []string{"username_guard", "LockRegistrationAttempt", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt"}
 				last := -1
 				for _, op := range want {
 					index := -1
@@ -178,6 +179,10 @@ func TestSignupAtomicBirthWriteOrderAndFailureIsolation(t *testing.T) {
 						t.Fatalf("wrong birth order %v", tx.ops)
 					}
 					last = index
+				}
+				n := s.deps.Usernames.(*signupUsernames)
+				if n.assignments != 1 || n.assignedID == uuid.Nil || n.assignedAuthVersion != 1 || n.assignedValue.Display() != fixtureUsername || n.assignedValue.Authority() != n.normalizer.Authority() {
+					t.Fatal("username assignment lost new account/auth-version/frozen display binding")
 				}
 			} else if err == nil || tx.commits != 0 || tx.rollbacks == 0 || strings.Contains(err.Error(), "secret") || result.State != "" {
 				t.Fatal("failed birth leaked state/diagnostic or committed")
@@ -216,8 +221,14 @@ func TestSignupCompletionLockedSnapshotAndReplay(t *testing.T) {
 		r.CompletionFingerprint = fingerprint
 		r.ResultUserID = uuid.NullUUID{UUID: uuid.New(), Valid: true}
 		d.read = r
+		n := s.deps.Usernames.(*signupUsernames)
+		n.guardErr = username.ErrPolicyMismatch
+		n.epoch++
 		if result, err := s.Complete(t.Context(), a, body); err != nil || result.Next != "login" || p.calls != 0 || d.begins != 0 {
 			t.Fatal("receipt repeated birth or crypto")
+		}
+		if result, err := s.Result(t.Context(), a); err != nil || result.State != "completed" || result.Next != "login" || n.guards != 0 || n.assignments != 0 {
+			t.Fatal("policy mismatch invalidated durable receipt or repeated assignment")
 		}
 		if _, err := s.Complete(t.Context(), a, []byte(`{"id":"changed"}`)); !errors.Is(err, ErrConflict) {
 			t.Fatal("changed completion accepted")
@@ -254,7 +265,7 @@ func TestSignupUnprovenContactsAndAdmissionNeverAllocateUser(t *testing.T) {
 		s, a, d, _, _, _, _ := signupFixture(t)
 		l := &signupLimiter{denyAt: budget}
 		s.deps.Limiter = l
-		if _, err := s.Start(t.Context(), "Person@EXAMPLE.COM", "+989123456789", a.JKT, "203.0.113.9"); !errors.Is(err, ErrRateLimited) || d.begins != 0 {
+		if _, err := s.Start(t.Context(), "Person@EXAMPLE.COM", "+989123456789", fixtureUsername, a.JKT, "203.0.113.9"); !errors.Is(err, ErrRateLimited) || d.begins != 0 {
 			t.Fatal("admission allocated before budgets")
 		}
 		for _, key := range l.keys {
@@ -345,13 +356,127 @@ func TestSignupConstructorAndUnsupportedMobileFailBeforeAllocation(t *testing.T)
 	if _, err := NewService(deps); err == nil {
 		t.Fatal("typed nil phone admitted")
 	}
+	deps = s.deps
+	var namespaces *signupUsernames
+	deps.Usernames = namespaces
+	if _, err := NewService(deps); err == nil {
+		t.Fatal("typed nil username namespace admitted")
+	}
 	var mail *recordingMail
 	if _, err := NewEmail(EmailConfig{From: "identity@example.com", PublicOrigin: "https://identity.example.com"}, mail); err == nil {
 		t.Fatal("typed nil sender admitted")
 	}
 	for _, phone := range []string{"+12025550123", "+982112345678", "bad"} {
-		if _, err := s.Start(t.Context(), "person@example.com", phone, a.JKT, "203.0.113.9"); !errors.Is(err, ErrInvalid) || d.begins != 0 {
+		if _, err := s.Start(t.Context(), "person@example.com", phone, fixtureUsername, a.JKT, "203.0.113.9"); !errors.Is(err, ErrInvalid) || d.begins != 0 {
 			t.Fatal("unsupported mobile allocated pending PII")
+		}
+	}
+}
+
+func TestSignupFrozenUsernameAndPolicyRejectBeforeNativeOrCommit(t *testing.T) {
+	for _, operation := range []string{"options", "complete"} {
+		for _, mismatch := range []string{"legacy missing", "security", "policy ID", "fingerprint", "key ID", "key verifier", "epoch", "active guard"} {
+			t.Run(operation+"/"+mismatch, func(t *testing.T) {
+				s, a, d, tx, p, _, _ := signupFixture(t)
+				n := s.deps.Usernames.(*signupUsernames)
+				details := Details{}
+				plain, err := s.deps.Store.cipher.Decrypt(t.Context(), d.read.DetailsEncrypted)
+				if err != nil || json.Unmarshal(plain, &details) != nil {
+					t.Fatal("fixture envelope unreadable")
+				}
+				want := ErrUsernamePolicyChanged
+				switch mismatch {
+				case "legacy missing":
+					details.UsernameDisplay, details.UsernameSecurity = "", ""
+					details.UsernameAuthority = username.Authority{}
+					details.UsernameEpoch = 0
+				case "security":
+					details.UsernameSecurity += "\u06cc"
+				case "policy ID":
+					details.UsernameAuthority.PolicyID = uuid.New()
+				case "fingerprint":
+					details.UsernameAuthority.Fingerprint[0] ^= 1
+				case "key ID":
+					details.UsernameAuthority.KeyID += "-stale"
+				case "key verifier":
+					details.UsernameAuthority.KeyVerifier[0] ^= 1
+				case "epoch":
+					n.epoch++
+				case "active guard":
+					n.guardErr = username.ErrPolicyMismatch
+					want = ErrUnavailable
+				}
+				d.read.DetailsEncrypted, err = s.deps.Store.seal(t.Context(), details)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tx.record = d.read
+				if result, err := s.Result(t.Context(), a); err != nil || result.State != "pending" {
+					t.Fatal("bounded pending receipt became unreadable", err)
+				}
+				if operation == "options" {
+					_, err = s.PasskeyOptions(t.Context(), a)
+				} else {
+					_, err = s.Complete(t.Context(), a, []byte(`{"id":"credential"}`))
+				}
+				if !errors.Is(err, want) || p.calls != 0 || tx.commits != 0 || n.assignments != 0 {
+					t.Fatalf("mismatched frozen username progressed: err=%v native=%d commits=%d", err, p.calls, tx.commits)
+				}
+				for _, op := range tx.ops {
+					if op == "CreateUser" || (mismatch == "active guard" && op == "LockRegistrationAttempt") {
+						t.Fatalf("guard did not fail before locked birth: %v", tx.ops)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSignupUsernameValidationIsAdvisoryBoundedAndDoesNotAllocate(t *testing.T) {
+	for _, available := range []bool{true, false} {
+		s, _, d, tx, p, phone, mail := signupFixture(t)
+		n := s.deps.Usernames.(*signupUsernames)
+		n.unavailable = !available
+		result, err := s.ValidateUsername(t.Context(), fixtureUsername, "203.0.113.9")
+		if err != nil || result.Display != fixtureUsername || result.Available != available || n.availability != 1 || n.assignments != 0 || d.begins != 0 || tx.commits != 0 || p.calls != 0 || phone.sends != 0 || len(mail.message) != 0 {
+			t.Fatalf("validation reserved identity or issued proofs: %v", err)
+		}
+	}
+	for _, failure := range []string{"invalid", "rate", "lookup"} {
+		s, _, d, _, _, _, _ := signupFixture(t)
+		n := s.deps.Usernames.(*signupUsernames)
+		input, want := fixtureUsername, ErrUnavailable
+		switch failure {
+		case "invalid":
+			input, want = "latin.invalid", ErrInvalidUsername
+		case "rate":
+			s.deps.Limiter = &signupLimiter{denyAt: 1}
+			want = ErrRateLimited
+		case "lookup":
+			n.availableErr = errors.New("private username SQL")
+		}
+		if _, err := s.ValidateUsername(t.Context(), input, "203.0.113.9"); !errors.Is(err, want) || d.begins != 0 || n.assignments != 0 || strings.Contains(err.Error(), "private") {
+			t.Fatalf("validation failure unsafe: %v", err)
+		}
+	}
+}
+
+func TestSignupUnavailableOrInvalidUsernameNeverStartsProofs(t *testing.T) {
+	for _, mode := range []string{"invalid", "unavailable", "policy"} {
+		s, a, d, _, p, phone, mail := signupFixture(t)
+		n := s.deps.Usernames.(*signupUsernames)
+		input, want := fixtureUsername, ErrUsernameUnavailable
+		switch mode {
+		case "invalid":
+			input, want = "latin", ErrInvalidUsername
+		case "unavailable":
+			n.unavailable = true
+		case "policy":
+			n.availableErr, want = username.ErrPolicyMismatch, ErrUnavailable
+		}
+		result, err := s.Start(t.Context(), "person@example.com", "+989123456789", input, a.JKT, "203.0.113.9")
+		if !errors.Is(err, want) || len(result.Capability) != 0 || d.begins != 0 || p.calls != 0 || phone.sends != 0 || len(mail.message) != 0 || n.assignments != 0 {
+			t.Fatalf("invalid username issued pending authority: %v", err)
 		}
 	}
 }

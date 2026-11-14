@@ -17,12 +17,12 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ## Fresh-Baseline Environment Cutover
 
-Current installation uses unchanged `00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql`, applying through version 2 in
+Current bundled installation uses unchanged `00001_initial_schema.sql` plus additive
+`00002_registration_attempts.sql` and `00003_username_reservations.sql`, through version 3 in
 `public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
 are refused regardless of their version or apparent equivalence; untracked nonempty
 application schemas and contradictory histories also fail closed. There is no
-in-place v1/v2 upgrade, data conversion or automatic history adoption. Generic
+upgrade/adoption of the retired migration lineage or automatic data conversion. Generic
 `up-to` is for the new bundled lineage, not the old chain. Baseline Down/reset and
 rollback to zero refuse. Historical acceptance and prior plans remain unchanged;
 they are not evidence that this baseline passed.
@@ -40,7 +40,7 @@ they are not evidence that this baseline passed.
    Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
 3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
    `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
-    fresh `up` records versions 1 and 2, repeated `up` verifies a no-op. Do not stamp, rename
+    fresh `up` records versions 1 through 3; repeated `up` verifies a no-op. Do not stamp, rename
    or clear metadata after refusal. Verify packaged embedded inventory and final
    schema before starting compatible binaries.
 4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
@@ -234,6 +234,127 @@ password/new-mailbox bootstrap or relaxation of general mutation retries is adde
 Preserve registration/migration state in consistent forward restores. Stop signup
 intake before incompatible rollback, retain accepted accounts/events/receipts and
 original clocks; no Down/reset/adoption or automatic laboratory transformation.
+
+### Username Policy and Preflight Gates
+
+The [registration contract](registration-contract.md) adds username support to
+the existing email-link + mobile-SMS + resident-UV flow, not the final one-contact
+or password flow. Schema/config/operator code is not a live installation. No
+production policy, reserved-name set, deployment privileges, cutover timing or
+zero-pause upgrade has been approved by this documentation.
+`00003_username_reservations.sql` preserves legacy NULLs, creates the unique
+reservation/immutability boundary and seeds an **uninstalled** authority record,
+not an active policy. It provisions no runtime/maintenance login or reindex bypass.
+
+| Username configuration | Required meaning when enabled |
+|---|---|
+| `USERNAME_ENABLED` | Explicit username enablement, including authenticated reads when signup is off. Enabled registration requires username support; no username-less fallback. |
+| `USERNAME_REGEX` | One bounded Go expression, compiled once with whole-string anchoring against NFC display. Initial syntax is the reviewed Persian repertoire/Arabic Yeh-Kaf aliases with single internal dots, not `7..40`, Latin mode, ZWNJ or another spelling validator. |
+| `USERNAME_POLICY_JSON` | Explicit keys `id` (nonzero UUID), `normalization` (`nfc-four-fold-v1`), `folds` (the exact four `{from,to}` scalar pairs) and owner-reviewed `reserved_names`. The complete artifact, exact regex and pinned Unicode/normalizer version are fingerprinted. No implicit reserved names or invented system accounts. |
+| `USERNAME_LOOKUP_KEY`, `USERNAME_LOOKUP_KEY_ID` | Dedicated base64 secret of at least 32 random bytes and explicit ID; never email/phone/ledger pepper. Actual key verifier must match database authority, not just its label. |
+
+Owner review is required for the production regex/artifact and actual system/support
+reserved set; sample empty sets are not approval. Missing enabled configuration,
+same-ID changed content, wrong secret under a key ID, malformed/duplicate/unknown
+artifact fields, unsafe mappings and invalid/empty/over-budget regexes fail closed.
+No hot reload, env-only override/rollback, concurrent active namespaces or transparent
+HMAC rotation is permitted. Input/normalized bytes, regex source and artifact have
+1024-byte/4096-byte/16-KiB technical ceilings, not a business length policy.
+
+Operator entry points are `cmd/username install` and `cmd/username preflight`.
+Before either, verify the explicitly authorized target database/schema through
+bundled migration 3, approved policy/reserved set, actual login grants and key
+inventory. Provision secrets through the existing secret manager, not command
+arguments or checked-in files. Run each mode with its own process environment;
+both read **`DATABASE_URL`**, not dedicated username-specific DSN variables.
+
+| Mode | Database identity and environment |
+|---|---|
+| Both | `APP_ENV` (`development`, `test` or `production`), `USERNAME_ENABLED=true`, and all four policy/lookup variables above. These configure the operator; they do not enable API traffic or activate a policy. |
+| `install` | Separate non-owner installer `DATABASE_URL`; SELECT/INSERT only on `username_policy_artifacts` and `username_lookup_keys`, with no active-row/account mutation, role assumption, grant options, DDL or trigger bypass. Loads the candidate from `USERNAME_*`; no envelope, review, SMS or Redis secret is required. |
+| `preflight` | Separate non-owner read-only scanner `DATABASE_URL`; SELECT on `users`, `username_policy_artifacts`, `username_lookup_keys` and `username_active_policy`, with no application writes/DDL/role assumption. If authority exists, `USERNAME_*` must match its current artifact and actual key verifier; on the uninstalled baseline it describes the installed candidate. |
+| Preflight secrets | Independent base64 `USERNAME_REVIEW_KEY` (32..1024 decoded bytes) for restricted opaque review references, never the lookup/envelope/pepper secret. `ENVELOPE_MASTER_KEK` is the actual 32-byte base64 decryption key and `ENVELOPE_MASTER_KEK_VERSION` its actual version (`0..255`, default `1`); unavailable/wrong-key records block clearance. No `ENVELOPE_BLIND_INDEX_PEPPER` is needed. |
+
+The commands probe effective restricted privileges; an API/schema-owner credential
+is not an acceptable substitute. These prerequisites do not provision any role or
+grant. With the appropriate mode-specific environment already supplied, the
+workspace-root targets are:
+
+```bash
+npm exec -- nx run identity-api:username-install
+npm exec -- nx run identity-api:username-preflight
+```
+
+Run them separately with different `DATABASE_URL` identities, never as an automatic
+install/activate chain. Targets depend on `sqlc-generate`; neither runs migrations.
+Install success reports `{"installed":true,"active":false}`: it inserts immutable
+artifact/key-verifier registry entries only. It cannot open/close admission, change
+the active row, reindex or assign usernames. There is **no activation helper**.
+
+| CLI flags | Exact bounds / meaning |
+|---|---|
+| `--page-size`, `--max-rows`, `--max-issues`, `--timeout` | Defaults `250`, `100000`, `100`, `5m`; permitted ranges `1..1000`, `1..1000000`, `1..1000`, `1s..1h`. A row cap is incomplete, not a clean prefix. An issue cap sets `issues_truncated`; it cannot turn a nonclean scan into clearance. |
+| `--candidate-policy`, `--candidate-regex`, `--candidate-key-id`, `--candidate-key-env` | Optional **preflight-only, all-or-none** comparison against an already inactive-installed candidate. First two are bounded policy-JSON/regex-source file paths; regex bytes are exact, with no trimming. Last two are the candidate key ID and the name of an environment variable holding its base64 key (at least 32 decoded bytes), never the secret itself. Without these flags, candidate equals configured current policy. |
+
+Preflight JSON reports `snapshot_only`, `complete`, `clean`, aggregate counts and
+restricted issue references, with `reason`/`issues_truncated` where applicable.
+Exit `0` requires successful complete **and** clean preflight; exit `1` covers
+nonclean, incomplete, invalid configuration/privileges and operation/report failure.
+Restrict reports and review-key access; no names, raw account IDs, namespace digests
+or keys belong in ordinary logs/artifacts. A clean snapshot is not activation
+approval. These instructions were checked against source/target definitions only;
+no operator command, migration or live-data scan was run for this documentation.
+
+The active database policy/key identity is checked under a shared guard for each
+username read/assignment, held through its deciding transaction. Hard deletion and
+maintenance coordinate before account locking; startup/readiness checks alone are
+not a writer fence. Reservation spans all surviving statuses/soft deletion; only
+physical account deletion releases it. Populated tuples cannot be renamed/cleared.
+Do not assume migrations installed non-owner runtime/maintenance roles: any reindex
+exception stays disabled until reviewed effective ACLs prove the application cannot
+invoke it, alter the guard or assume the maintenance role.
+
+Preflight must be operator-only and read-only, using a bounded
+`REPEATABLE READ READ ONLY` snapshot, keyset pagination and explicit completeness.
+Inventory every surviving claimed row and reviewed reserved name; count NULL
+unclaimed rows separately. Decrypt original display with account/purpose/provenance
+checks, derive candidate keys and detect collisions across pages. Unreadable,
+unknown-policy or inconsistent rows, collisions, timeouts and capped/incomplete
+scans block clearance. A failed inventory is never an empty inventory. Restricted
+review references/counts replace ordinary logs of names/digests; never rename,
+merge, backfill, choose winners or change account status as remediation.
+
+Controlled installation/evolution requires separate operational approval:
+
+1. Install only an inactive immutable candidate and complete preflight against the
+   actual target baseline, including reserved names. Repository NULL legacy rows
+   do not prove a deployed database has no usernames. Uniqueness on discovered
+   populated data must wait for complete collision review.
+2. Prove no protected equivalence class splits: for the retained alphabet/aliases,
+   `C_new(C_old(x)) = C_new(x)`, with NFC/dots unchanged. Additional mergers still
+   require separately approved semantics; a new ID and clean scan are insufficient.
+3. Close the database username-writer gate, drain shared guards and fence/stop
+   pre-feature registration replicas and every ownership-changing writer, including
+   hard deletion. Nullable columns alone cannot stop old username-less registration.
+4. Revalidate the complete current inventory while fenced. An earlier clean snapshot
+   does not close the scan-to-activation race. Any incomplete/colliding/unreadable
+   inventory, changed immutable identity or no-split failure blocks activation.
+5. Preserve the old unique namespace until all candidate rows are verified; atomically
+   switch the complete digest/encrypted-payload/provenance set and active authority.
+   Re-seal when canonical/provenance changes, preserving NFC display/account/purpose/
+   owner; expose no mixed namespace. Failed transition retains the old namespace.
+6. Admit only replicas matching the exact active artifact and key verifier before
+   reopening. Software rollback must support active policy; a downgrade that splits
+   classes is refused. Key replacement uses the same fenced approved path.
+
+These are gates, not claims that activation/reindex tooling, maintenance access or
+live installation has been delivered. Public legacy claim and its username-bound
+fresh-WebAuthn-proof extension remain deferred; neither generic step-up nor a
+shared initial-assignment primitive authorizes a public POST/UI. Keep accepted
+accounts/receipts, original deadlines, history and unrelated session policy intact.
+Real-data inventory, serial disposable-database races/rollback, bilingual browser
+checks, deployed ingress/redaction, real delivery/physical authenticators and
+independent Persian security/legal review require separately observed evidence.
 
 ### Automated Portal Acceptance
 

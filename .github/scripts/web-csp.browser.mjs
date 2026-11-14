@@ -45,7 +45,7 @@ export const authRoutes = [
     heading: 'Create your account',
     submit: 'Start registration and send email',
     registration: true,
-    fields: [email, { name: 'phone', label: 'Iranian mobile number' }],
+    fields: [email, { name: 'phone', label: 'Iranian mobile number' }, { name: 'username', label: 'Username' }],
     back: 'Sign in',
   },
   {
@@ -162,7 +162,7 @@ async function checkPublicAppearance(browser, baseURL, documentPaths) {
         await mkdir(resolve(process.env.WEB_BROWSER_ARTIFACT_DIR), { recursive: true });
         await page.screenshot({
           path: resolve(process.env.WEB_BROWSER_ARTIFACT_DIR, screenshotName(`appearance-${theme}-os-${os}`, { width: 1280, height: 720 }, theme === 'dark' || (theme === 'system' && os === 'dark'))),
-          fullPage: true, caret: 'initial', animations: 'disabled', mask: [page.locator('input, textarea, [data-legal-private]')],
+          fullPage: true, caret: 'initial', animations: 'disabled', mask: [page.locator('input, textarea, [data-legal-private], [data-username-private]')],
         });
       }
       const alternate = theme === 'dark' ? 'light' : 'dark';
@@ -822,7 +822,7 @@ async function checkAuthViewports(page, route) {
           // default caret hiding mutates input.style and leaves empty attributes.
           caret: 'initial',
           animations: 'disabled',
-          mask: [page.locator('input, textarea, [data-legal-private]')],
+          mask: [page.locator('input, textarea, [data-legal-private], [data-username-private]')],
         });
       }
       const action = route.availability
@@ -967,7 +967,7 @@ async function checkExpandedDisplaySettings(page, route) {
             fullPage: true,
             caret: 'initial',
             animations: 'disabled',
-            mask: [page.locator('input, textarea, [data-legal-private]')],
+            mask: [page.locator('input, textarea, [data-legal-private], [data-username-private]')],
           });
         }
       }
@@ -1117,6 +1117,7 @@ export async function validateWebCsp({
     const values = {
       email: `${canary}@example.test`,
       phone: '+989123456789',
+      username: 'علي.مؤمني',
     };
     const secrets = Object.values(values);
     const seenNonces = new Set();
@@ -1251,7 +1252,7 @@ export async function validateWebCsp({
           console.error(JSON.stringify({ check: 'untouched-auth-appearance', path: route.path, locale: browserLocale(), dark, categories }));
           if (process.env.WEB_BROWSER_ARTIFACT_DIR) await page.screenshot({
             path: resolve(process.env.WEB_BROWSER_ARTIFACT_DIR, `appearance-failure-${browserLocale()}.png`),
-            fullPage: true, caret: 'initial', mask: [page.locator('input, textarea, [data-legal-private]')],
+            fullPage: true, caret: 'initial', mask: [page.locator('input, textarea, [data-legal-private], [data-username-private]')],
           });
         }
         assert.deepEqual(
@@ -1276,7 +1277,7 @@ export async function validateWebCsp({
             await form.getByLabel(localizedText(field.label), { exact: true }).fill(invalid);
           expectedSubmissions++;
           await submit.click();
-          for (const field of route.fields)
+          for (const field of route.fields.filter((field) => field.name !== 'username' || !invalid))
             await form
               .getByLabel(localizedText(field.label), { exact: true })
               .and(page.locator('[aria-invalid="true"]'))

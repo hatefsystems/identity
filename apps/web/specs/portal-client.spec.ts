@@ -45,6 +45,33 @@ function client(fetcher: jest.Mock) {
   return new PortalClient({ origin, fetcher, getKey: async () => key });
 }
 
+it.each([null, { display: '\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u064a' }])('reads truthful username state through the existing authenticated GET transport', async (username) => {
+  const fetcher = jest.fn().mockResolvedValueOnce(json(profile())).mockResolvedValueOnce(json({ username }));
+  const api = client(fetcher), signal = new AbortController().signal;
+  await api.bootstrap(signal);
+  expect(await api.username(signal)).toEqual(username);
+  const [url, init] = fetcher.mock.calls[1];
+  expect(url).toBe(`${origin}/api/v1/users/me/username`);
+  expect(init).toMatchObject({ method: 'GET', credentials: 'same-origin', cache: 'no-store', referrerPolicy: 'no-referrer' });
+  expect(init.body).toBeUndefined();
+  expect(new Headers(init.headers).get('X-Portal-Session')).toBe('session-id');
+  expect(new Headers(init.headers).has('DPoP')).toBe(true);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  api.dispose();
+});
+
+it.each([
+  {}, { username: undefined }, { username: { display: '' } }, { username: { display: 4 } },
+  { username: { display: 'a'.repeat(1025) } }, { username: { display: 'name', key: 'private' } },
+  { username: null, owner: 'private' },
+])('rejects malformed username read envelopes without inventing absence', async (response) => {
+  const fetcher = jest.fn().mockResolvedValueOnce(json(profile())).mockResolvedValueOnce(json(response));
+  const api = client(fetcher);
+  await api.bootstrap();
+  await expect(api.username(new AbortController().signal)).rejects.toMatchObject({ code: 'invalid_response' });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+});
+
 describe('bounded same-origin portal transport', () => {
   it('uses cookies/no-store/no-referrer/error redirects and retries one explicit pre-handler nonce challenge with a fresh proof', async () => {
     const fetcher = jest

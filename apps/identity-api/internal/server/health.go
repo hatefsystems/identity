@@ -34,6 +34,18 @@ func (s *Server) handleLiveness() http.HandlerFunc {
 // Enabled admin capabilities require their gates and live dependency probe.
 func (s *Server) handleReadiness() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.deps.Usernames != nil {
+			ready := s.deps.UsernameReady != nil
+			if ready {
+				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+				ready = s.deps.UsernameReady(ctx) == nil
+				cancel()
+			}
+			if !ready {
+				writeJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "not_ready", Service: serviceName, Time: time.Now().UTC().Format(time.RFC3339)})
+				return
+			}
+		}
 		if s.deps.Registration != nil {
 			ready := s.deps.RegistrationReady != nil
 			if ready {

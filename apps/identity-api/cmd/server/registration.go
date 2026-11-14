@@ -16,15 +16,16 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smtptransport"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
-func buildRegistrationService(environment string, pool *pgxpool.Pool, redisClient *redis.Client, passkeys *webauthn.Service, phones *smsotp.Service) (*registration.Service, func(context.Context) error, error) {
+func buildRegistrationService(environment string, pool *pgxpool.Pool, redisClient *redis.Client, passkeys *webauthn.Service, phones *smsotp.Service, usernames *username.Store) (*registration.Service, func(context.Context) error, error) {
 	cfg, err := config.LoadRegistration(environment)
 	if err != nil || !cfg.Enabled {
 		return nil, nil, err
 	}
-	if pool == nil || redisClient == nil || passkeys == nil || phones == nil || !phones.DeliveryEnabled() {
+	if pool == nil || redisClient == nil || passkeys == nil || phones == nil || !phones.DeliveryEnabled() || usernames == nil {
 		return nil, nil, errors.New("main: enabled registration requires durable ownership and passkey dependencies")
 	}
 	crypto, err := config.LoadCrypto()
@@ -43,7 +44,7 @@ func buildRegistrationService(environment string, pool *pgxpool.Pool, redisClien
 	if err != nil {
 		return nil, nil, err
 	}
-	store, err := registration.NewStore(pool, cipher, cfg.PendingCapacity)
+	store, err := registration.NewStore(pool, cipher, cfg.PendingCapacity, usernames)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -60,6 +61,9 @@ func buildRegistrationService(environment string, pool *pgxpool.Pool, redisClien
 		return nil, nil, err
 	}
 	ready := func(ctx context.Context) error {
+		if usernames.CheckReady(ctx) != nil {
+			return errors.New("main: username namespace is not ready")
+		}
 		if store.CheckReady(ctx) != nil {
 			return errors.New("main: registration storage is not ready")
 		}
@@ -95,7 +99,7 @@ func buildRegistrationService(environment string, pool *pgxpool.Pool, redisClien
 	if registration.CheckCleanupReady(ctx, cleanupPool) != nil {
 		return nil, nil, errors.New("main: registration cleanup identity is not ready")
 	}
-	service, err := registration.NewService(registration.Deps{Store: store, Database: pool, Email: email, Phone: phones,
+	service, err := registration.NewService(registration.Deps{Store: store, Usernames: usernames, Database: pool, Email: email, Phone: phones,
 		WebAuthn: passkeys, Encryptor: cipher, Indexer: indexer, Limiter: limiter,
 		GlobalDailyLimit: cfg.GlobalDailyLimit, EmailHourlyLimit: cfg.EmailHourlyLimit})
 	if err != nil {

@@ -315,6 +315,26 @@ export class PortalClient {
     return result;
   }
 
+  username(signal: AbortSignal): Promise<{ display: string } | null> {
+    return this.request(
+      '/api/v1/users/me/username',
+      (value, status) => {
+        const envelope = record(value);
+        if (status !== 200 || Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'username'))
+          throw new PortalError('invalid_response');
+        if (envelope.username === null) return null;
+        const username = record(envelope.username);
+        if (
+          Object.keys(username).length !== 1 || typeof username.display !== 'string' ||
+          !username.display || new TextEncoder().encode(username.display).length > 1024
+        )
+          throw new PortalError('invalid_response');
+        return { display: username.display };
+      },
+      { signal }
+    );
+  }
+
   loginOptions(signal: AbortSignal) {
     return this.request('/api/v1/auth/webauthn/login/generate-options', record, {
       method: 'POST',

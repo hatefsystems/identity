@@ -8,7 +8,7 @@ func TestSignupPhoneAliasesShareCanonicalAdmissionBudget(t *testing.T) {
 			service, authority, _, _, _, _, _ := signupFixture(t)
 			limiter := &signupLimiter{denyAt: 3}
 			service.deps.Limiter = limiter
-			_, err := service.Start(t.Context(), "subscriber@example.com", phone, authority.JKT, "198.51.100.5")
+			_, err := service.Start(t.Context(), "subscriber@example.com", phone, fixtureUsername, authority.JKT, "198.51.100.5")
 			if err != ErrRateLimited {
 				t.Fatalf("Start = %v; want canonical phone admission denial", err)
 			}
@@ -25,7 +25,7 @@ func TestSignupPhoneRejectsUnsupportedIdentifiersBeforeAdmission(t *testing.T) {
 			service, authority, _, _, _, _, _ := signupFixture(t)
 			limiter := &signupLimiter{}
 			service.deps.Limiter = limiter
-			_, err := service.Start(t.Context(), "subscriber@example.com", phone, authority.JKT, "198.51.100.5")
+			_, err := service.Start(t.Context(), "subscriber@example.com", phone, fixtureUsername, authority.JKT, "198.51.100.5")
 			if err != ErrInvalid || len(limiter.keys) != 0 {
 				t.Fatalf("unsupported phone reached admission: %v", err)
 			}

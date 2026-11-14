@@ -14,7 +14,6 @@ import {
   validateRegistration,
   validateTotp,
   type FieldErrors,
-  type RegistrationValues,
 } from '../(auth)/_lib/validation';
 import { errorMessage, isAborted, PortalError, throwIfAborted } from '../_lib/portal/errors';
 import { onOtherTabInvalidation, sensitiveClearEvent } from '../_lib/portal/invalidation';
@@ -24,6 +23,7 @@ import {
   type EmailProof,
   type RegistrationAttempt,
   type RegistrationOutcome,
+  type RegistrationValues,
 } from '../_lib/portal/registration-client';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
 import { normalizeNumericInput } from '../_lib/numeric-input';
@@ -47,6 +47,12 @@ function registrationError(failure: unknown): MessageDescriptor {
       case 'registration_conflict':
       case 'restart_registration':
         return { key: 'registration.conflict' };
+      case 'invalid_username':
+        return { key: 'registration.usernameInvalid' };
+      case 'username_unavailable':
+        return { key: 'registration.usernameUnavailable' };
+      case 'username_policy_changed':
+        return { key: 'registration.usernamePolicyChanged' };
       case 'proof_required':
         return { key: 'registration.proofRequired' };
       case 'restart_phone_proof':
@@ -145,7 +151,7 @@ export function Registration() {
   const [hydrated, setHydrated] = useState(false);
   const [phase, setPhase] = useState<Phase>('contacts');
   const [attempt, setAttempt] = useState<RegistrationAttempt>();
-  const [values, setValues] = useState<RegistrationValues>({ email: '', phone: '' });
+  const [values, setValues] = useState<RegistrationValues>({ email: '', phone: '', username: '' });
   const [errors, setErrors] = useState<FieldErrors<RegistrationValues>>({});
   const [codeError, setCodeError] = useState<Message>('');
   const [smsCode, setSMSCode] = useState('');
@@ -173,7 +179,7 @@ export function Registration() {
     for (const input of form.current?.querySelectorAll('input') ?? []) input.value = '';
     if (alive.current) {
       setAttempt(undefined);
-      setValues({ email: '', phone: '' });
+      setValues({ email: '', phone: '', username: '' });
       setErrors({});
       setCodeError('');
       setSMSCode('');
@@ -250,7 +256,7 @@ export function Registration() {
       deadline.current = null;
       pendingDeadline.current = null;
       setAttempt(undefined);
-      setValues({ email: '', phone: '' });
+      setValues({ email: '', phone: '', username: '' });
       setPhase('completed');
       setMessage(
         { key: 'registration.created' }
@@ -300,6 +306,8 @@ export function Registration() {
             'registration_key_changed',
             'key_unavailable',
             'registration_conflict',
+            'username_unavailable',
+            'username_policy_changed',
             'restart_registration',
             'invalid_response',
             'invalid_dpop_proof',
@@ -307,7 +315,11 @@ export function Registration() {
           !failure.uncertain
         )
           clear(registrationError(failure));
-        else setError(registrationError(failure));
+        else {
+          if (failure instanceof PortalError && failure.code === 'invalid_username')
+            setErrors({ username: { key: 'registration.usernameInvalid' } });
+          setError(registrationError(failure));
+        }
       }
     } finally {
       if (active.current === controller) {
@@ -323,8 +335,10 @@ export function Registration() {
     const contacts = {
       email: String(data.get('email') ?? ''),
       phone: normalizeNumericInput(String(data.get('phone') ?? '')),
+      username: String(data.get('username') ?? ''),
     };
-    const invalid = validateRegistration(contacts);
+    const invalid: FieldErrors<RegistrationValues> = validateRegistration(contacts);
+    if (!contacts.username) invalid.username = { key: 'registration.usernameRequired' };
     setValues(contacts);
     setErrors(invalid);
     if (Object.keys(invalid).length) {
@@ -343,7 +357,7 @@ export function Registration() {
         deadline.current = { wall, monotonic: performance.now() + wall - Date.now() };
         pendingDeadline.current = deadline.current;
         setAttempt(next);
-        setValues({ email: '', phone: '' });
+        setValues({ email: '', phone: '', username: '' });
         setPhase('email');
         setMessage(
           next.email_sent
@@ -446,6 +460,49 @@ export function Registration() {
               setErrors({});
             }}
           />
+          <AuthField
+            name="username"
+            label={t('registration.usernameLabel')}
+            type="text"
+            dir="auto"
+            autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
+            required
+            disabled={disabled}
+            value={values.username}
+            error={errors.username}
+            hint={t('registration.usernameHint')}
+            onChange={(event) => {
+              setValues({ ...values, username: event.target.value });
+              setErrors({});
+              setMessage('');
+              setError('');
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled}
+            className={actionClass}
+            onClick={() => {
+              const username = String(new FormData(form.current ?? undefined).get('username') ?? '');
+              if (!username) {
+                setErrors({ username: { key: 'registration.usernameRequired' } });
+                form.current?.querySelector<HTMLInputElement>('input[name="username"]')?.focus();
+                return;
+              }
+              void run({ key: 'registration.checkingUsername' }, async (client, signal) => {
+                const result = await client.validateUsername(username, signal);
+                throwIfAborted(signal);
+                setValues((current) => ({ ...current, username: result.username_display }));
+                setErrors(result.available ? {} : { username: { key: 'registration.usernameUnavailable' } });
+                setMessage(result.available ? { key: 'registration.usernameAvailable' } : '');
+              });
+            }}
+          >
+            {t('registration.checkUsername')}
+          </Button>
           <Button type="submit" disabled={disabled} className={actionClass}>
             {t('registration.start')}</Button>
         </form>
@@ -606,6 +663,11 @@ export function Registration() {
             {t.rich('registration.canonicalMailbox', {
               email: attempt.canonical_email,
               mailbox: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+            })}
+            <br />
+            {t.rich('registration.acceptedUsername', {
+              username: attempt.username_display,
+              name: (chunks) => <bdi dir="auto" data-username-private>{chunks}</bdi>,
             })}
             <br />
             {t.rich('registration.deadline', {

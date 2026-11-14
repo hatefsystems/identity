@@ -20,6 +20,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // Purpose and lifetime limits bound signup authority and retained receipts.
@@ -55,17 +56,31 @@ type Database interface {
 	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 }
 
+// UsernameNamespace coordinates the single active namespace with caller-owned
+// registration transactions. Availability is advisory, never a reservation.
+type UsernameNamespace interface {
+	Normalizer() *username.Normalizer
+	Guard(context.Context, pgx.Tx) error
+	GuardAuthority(context.Context, pgx.Tx) (username.GuardAuthority, error)
+	Available(context.Context, username.Value) (bool, error)
+	Assign(context.Context, pgx.Tx, uuid.UUID, int64, username.Value) error
+}
+
 // Details is authenticated plaintext inside the existing envelope format.
 // Ceremony is server-produced WebAuthn session data, not an authenticator key.
 type Details struct {
-	AttemptID        uuid.UUID       `json:"attempt_id"`
-	JKT              string          `json:"jkt"`
-	Purpose          string          `json:"purpose"`
-	Email            string          `json:"email"`
-	Phone            string          `json:"phone"`
-	UserHandle       []byte          `json:"user_handle"`
-	Ceremony         json.RawMessage `json:"ceremony,omitempty"`
-	CeremonyRevision int64           `json:"ceremony_revision,omitempty"`
+	AttemptID         uuid.UUID          `json:"attempt_id"`
+	JKT               string             `json:"jkt"`
+	Purpose           string             `json:"purpose"`
+	Email             string             `json:"email"`
+	Phone             string             `json:"phone"`
+	UsernameDisplay   string             `json:"username_display,omitempty"`
+	UsernameSecurity  string             `json:"username_security,omitempty"`
+	UsernameAuthority username.Authority `json:"username_authority,omitzero"`
+	UsernameEpoch     int64              `json:"username_epoch,omitempty"`
+	UserHandle        []byte             `json:"user_handle"`
+	Ceremony          json.RawMessage    `json:"ceremony,omitempty"`
+	CeremonyRevision  int64              `json:"ceremony_revision,omitempty"`
 }
 
 // Attempt contains SQL authority and authenticated pending details, if retained.
@@ -76,18 +91,19 @@ type Attempt struct {
 
 // Store persists purpose-bound signup attempts without granting login authority.
 type Store struct {
-	database Database
-	cipher   Encryptor
-	capacity int32
-	now      func() time.Time
+	database  Database
+	cipher    Encryptor
+	capacity  int32
+	now       func() time.Time
+	usernames UsernameNamespace
 }
 
 // NewStore binds SQL storage and envelope encryption to a finite pending ceiling.
-func NewStore(database Database, cipher Encryptor, capacity int32) (*Store, error) {
-	if database == nil || cipher == nil || capacity < 1 || capacity > MaxPendingCapacity {
+func NewStore(database Database, cipher Encryptor, capacity int32, usernames UsernameNamespace) (*Store, error) {
+	if nilDependency(database) || nilDependency(cipher) || nilDependency(usernames) || usernames.Normalizer() == nil || capacity < 1 || capacity > MaxPendingCapacity {
 		return nil, ErrInvalid
 	}
-	return &Store{database: database, cipher: cipher, capacity: capacity, now: time.Now}, nil
+	return &Store{database: database, cipher: cipher, capacity: capacity, now: time.Now, usernames: usernames}, nil
 }
 
 // NewCapability returns an independent 256-bit secret. Only HashCapability is
@@ -117,8 +133,8 @@ func ValidJKT(jkt string) bool {
 
 // Create commits pending authority before any provider send. The capacity count
 // is read after the shared transaction lock, not from a pre-wait CTE snapshot.
-func (s *Store) Create(ctx context.Context, email, phone, jkt string) (Attempt, []byte, error) {
-	if !emailaddress.ValidCanonicalMailbox(email) || !phonePattern.MatchString(phone) || !ValidJKT(jkt) {
+func (s *Store) Create(ctx context.Context, email, phone, jkt string, chosen username.Value) (Attempt, []byte, error) {
+	if !emailaddress.ValidCanonicalMailbox(email) || !phonePattern.MatchString(phone) || !ValidJKT(jkt) || s.usernames.Normalizer().Validate(chosen) != nil {
 		return Attempt{}, nil, ErrInvalid
 	}
 	capability, err := NewCapability()
@@ -138,15 +154,23 @@ func (s *Store) Create(ctx context.Context, email, phone, jkt string) (Attempt, 
 	}
 	now := s.now().UTC().Truncate(time.Microsecond)
 	details := Details{AttemptID: uuid.New(), JKT: jkt, Purpose: Purpose, Email: email, Phone: phone, UserHandle: handle}
-	blob, err := s.seal(ctx, details)
-	if err != nil {
-		return Attempt{}, nil, err
-	}
+	details.UsernameDisplay = chosen.Display()
+	details.UsernameSecurity = chosen.SecurityName()
+	details.UsernameAuthority = chosen.Authority()
 	tx, err := begin(ctx, s.database)
 	if err != nil {
 		return Attempt{}, nil, err
 	}
 	defer rollback(tx)
+	authority, err := s.usernames.GuardAuthority(ctx, tx)
+	if err != nil || authority.Authority != chosen.Authority() {
+		return Attempt{}, nil, ErrUnavailable
+	}
+	details.UsernameEpoch = authority.Epoch
+	blob, err := s.seal(ctx, details)
+	if err != nil {
+		return Attempt{}, nil, err
+	}
 	q := db.New(tx)
 	if err := q.LockRegistrationAdmission(ctx); err != nil {
 		return Attempt{}, nil, ErrUnavailable
@@ -427,6 +451,15 @@ func validateDetails(d Details) error {
 		len(d.Ceremony) > 24000 || len(d.Ceremony) > 0 && (!json.Valid(d.Ceremony) || d.Ceremony[0] != '{') {
 		return ErrInvalid
 	}
+	// Previously persisted pending envelopes are readable so their bounded result
+	// can be inspected. They cannot enroll or commit without a fresh username.
+	if d.UsernameDisplay == "" {
+		if d.UsernameSecurity != "" || d.UsernameAuthority != (username.Authority{}) || d.UsernameEpoch != 0 {
+			return ErrInvalid
+		}
+	} else if len(d.UsernameDisplay) > username.MaxUsernameBytes || len(d.UsernameSecurity) == 0 || len(d.UsernameSecurity) > username.MaxUsernameBytes || d.UsernameAuthority.PolicyID == uuid.Nil || d.UsernameAuthority.KeyID == "" || d.UsernameEpoch < 1 {
+		return ErrInvalid
+	}
 	return nil
 }
 
@@ -440,7 +473,8 @@ func validateCeremony(d Details, r db.RegistrationAttempt) error {
 
 func sameIdentity(a, b Details) bool {
 	return a.AttemptID == b.AttemptID && a.JKT == b.JKT && a.Purpose == b.Purpose && a.Email == b.Email &&
-		a.Phone == b.Phone && bytes.Equal(a.UserHandle, b.UserHandle)
+		a.Phone == b.Phone && bytes.Equal(a.UserHandle, b.UserHandle) && a.UsernameDisplay == b.UsernameDisplay &&
+		a.UsernameSecurity == b.UsernameSecurity && a.UsernameAuthority == b.UsernameAuthority && a.UsernameEpoch == b.UsernameEpoch
 }
 
 func timestamp(t time.Time) pgtype.Timestamptz {

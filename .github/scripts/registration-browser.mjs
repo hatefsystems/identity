@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
   createHash,
+  createHmac,
   generateKeyPairSync,
   randomBytes,
   randomUUID,
@@ -169,6 +170,8 @@ export { registrationChecks };
 const registrationPersianNames = Object.freeze({
   'Email address': 'نشانی ایمیل',
   'Iranian mobile number': 'شمارهٔ همراه ایران',
+  Username: 'نام کاربری',
+  'Check username': 'بررسی نام کاربری',
   'SMS verification code': 'کد تأیید پیامکی',
   'Start registration and send email': 'شروع ثبت‌نام و ارسال ایمیل',
   'Check email verification': 'بررسی تأیید ایمیل',
@@ -767,6 +770,46 @@ export function registrationPasskeyEnvironment(origin) {
     WEBAUTHN_USER_VERIFICATION: 'required',
     WEBAUTHN_MOCK_CHALLENGE_KEY: randomBytes(32).toString('base64'),
   };
+}
+
+// Test-only authority for the harness's verified run-owned empty database. This
+// mirrors the pinned Go artifact serialization, not username normalization or a
+// deployment activation path. A normalizer/version change must update this fixture.
+export function registrationUsernameFixture() {
+  const policy = {
+    id: randomUUID(),
+    normalization: 'nfc-four-fold-v1',
+    folds: [
+      { from: '\u0624', to: '\u0648' },
+      { from: '\u0626', to: '\u06cc' },
+      { from: '\u0643', to: '\u06a9' },
+      { from: '\u064a', to: '\u06cc' },
+    ],
+    reserved_names: [],
+  };
+  const alphabet = String.raw`[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]`;
+  const regex = `${alphabet}+(?:\\.${alphabet}+)*`;
+  const artifact = Buffer.from(JSON.stringify({
+    policy, regex, implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0',
+    unicode: '17.0.0', max_username_bytes: 1024,
+  }));
+  const fingerprint = createHash('sha256').update(artifact).digest('hex');
+  const lookupKey = randomBytes(32);
+  const keyID = `registration-fixture-${randomUUID()}`;
+  const verifier = createHmac('sha256', lookupKey)
+    .update('hatef.identity.username.key-verifier\0').digest('hex');
+  const environment = {
+    USERNAME_ENABLED: 'true', USERNAME_POLICY_JSON: JSON.stringify(policy),
+    USERNAME_REGEX: regex, USERNAME_LOOKUP_KEY: lookupKey.toString('base64'),
+    USERNAME_LOOKUP_KEY_ID: keyID,
+  };
+  lookupKey.fill(0);
+  const seedSQL = `INSERT INTO public.username_policy_artifacts(policy_id,fingerprint,artifact)
+VALUES('${policy.id}',decode('${fingerprint}','hex'),decode('${artifact.toString('hex')}','hex'));
+INSERT INTO public.username_lookup_keys(key_id,key_verifier) VALUES('${keyID}',decode('${verifier}','hex'));
+UPDATE public.username_active_policy SET policy_id='${policy.id}',fingerprint=decode('${fingerprint}','hex'),
+epoch=1,key_id='${keyID}',key_verifier=decode('${verifier}','hex'),admission_state='open' WHERE singleton;`;
+  return { environment, seedSQL };
 }
 
 export function registrationSecretEnvironmentValues(environment) {
@@ -1769,12 +1812,16 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     sql(`CREATE ROLE registration_api LOGIN NOINHERIT PASSWORD '${apiPassword}'; CREATE ROLE registration_cleanup LOGIN NOINHERIT PASSWORD '${cleanupPassword}';
 GRANT USAGE ON SCHEMA public TO registration_api,registration_cleanup;
 GRANT SELECT,INSERT,UPDATE ON public.users,public.webauthn_credentials TO registration_api;
+GRANT SELECT ON public.username_policy_artifacts,public.username_lookup_keys,public.username_active_policy TO registration_api;
+GRANT UPDATE(guard) ON public.username_active_policy TO registration_api;
 GRANT SELECT ON public.roles,public.permissions,public.role_permissions,public.user_roles TO registration_api;
 GRANT USAGE,SELECT ON SEQUENCE public.account_auth_epoch_seq TO registration_api;
 GRANT SELECT,INSERT ON public.event_outbox TO registration_api;
 GRANT SELECT,INSERT ON public.registration_attempts TO registration_api;
 GRANT UPDATE(details_encrypted,email_token_hash,email_token_issued_at,email_token_expires_at,email_verified_at,sms_verification_ref,phone_verified_at,challenge_revision,row_revision,passkey_created_at,passkey_expires_at,state,terminal_at,receipt_expires_at,completion_fingerprint,result_user_id) ON public.registration_attempts TO registration_api;
 GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRANT SELECT ON public.legal_holds TO registration_cleanup;`);
+    const usernameFixture = registrationUsernameFixture();
+    sql(usernameFixture.seedSQL);
     const connection = (user, pass) => {
       const url = new URL(postgres);
       url.username = user;
@@ -1814,6 +1861,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
         },
       ]),
       ...registrationPasskeyEnvironment(origin),
+      ...usernameFixture.environment,
       ENVELOPE_MASTER_KEK: randomBytes(32).toString('base64'),
       ENVELOPE_MASTER_KEK_VERSION: '1',
       ENVELOPE_BLIND_INDEX_PEPPER: randomBytes(32).toString('base64'),
@@ -1915,7 +1963,7 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
       fixed(typeof email === 'string' && !email.includes("'"), 'Invalid owned mailbox inspection');
       return JSON.parse(
         sql(`SELECT json_build_object('accounts',(SELECT count(*) FROM public.users WHERE email='${email}'),
-'ordinary',(SELECT count(*) FROM public.users WHERE email='${email}' AND status='active' AND password_hash IS NULL AND phone_encrypted IS NOT NULL AND octet_length(phone_encrypted)>0 AND length(phone_blind_index)=64 AND octet_length(webauthn_user_handle)=8 AND lifecycle_revision=1),
+'ordinary',(SELECT count(*) FROM public.users WHERE email='${email}' AND status='active' AND password_hash IS NULL AND phone_encrypted IS NOT NULL AND octet_length(phone_encrypted)>0 AND length(phone_blind_index)=64 AND octet_length(webauthn_user_handle)=8 AND lifecycle_revision=1 AND octet_length(username_key)=32 AND octet_length(username_details_encrypted)>=90 AND username_policy_epoch=1),
 'credentials',(SELECT count(*) FROM public.webauthn_credentials w JOIN public.users u ON u.id=w.user_id WHERE u.email='${email}'),
 'verified',(SELECT count(*) FROM public.webauthn_credentials w JOIN public.users u ON u.id=w.user_id WHERE u.email='${email}' AND w.user_verified AND w.user_present),
 'roles',(SELECT count(*) FROM public.user_roles r JOIN public.users u ON u.id=r.user_id WHERE u.email='${email}'),
@@ -2048,6 +2096,8 @@ function observe(context, harness) {
           );
           const body = request.postDataJSON();
           state.posts.push({ path: url.pathname, body });
+          harness.remember(body.username);
+          harness.remember(body.registration?.username);
           for (const key of ['capability', 'token', 'code', 'verification_id'])
             harness.remember(body[key]);
           for (const value of [
@@ -2084,6 +2134,7 @@ function observe(context, harness) {
           if (response.status() !== 204 && /json/.test(headers['content-type'] || ''))
             value = await harness.registrationResponse(response);
           Object.assign(reply, { value, headers });
+          harness.remember(value?.username_display);
           if (path === root + '/start' && response.status() === 201) {
             fixed(
               uuid.test(value.attempt_id) && capability.test(value.capability),
@@ -2356,9 +2407,13 @@ async function startAttempt(page, observed, harness, suffix) {
     email = `آزمايش${suffix}+tag.name@xn--bcher-kva.example`;
   const phone =
     '091' + String(parseInt(randomBytes(4).toString('hex'), 16) % 100000000).padStart(8, '0');
+  const username = 'علي.مؤمني.' + [...randomBytes(12)].map((byte) => 'ابپتثجچحخدذرزژسش'[byte % 16]).join('');
+  const rawUsername = username.replace('ؤ', 'و\u0654');
   harness.remember(raw);
   harness.remember(email);
   harness.remember(phone);
+  harness.remember(username);
+  harness.remember(rawUsername);
   const deliveryBefore = await harness.control('/summary');
   const count = observed.starts.length;
   const mailbox = field(page, 'Email address');
@@ -2377,6 +2432,12 @@ async function startAttempt(page, observed, harness, suffix) {
     await page.evaluate(() => navigator.clipboard.writeText(''));
   }
   await field(page, 'Iranian mobile number').fill(nativeRegistrationDigits(phone));
+  const chosen = field(page, 'Username');
+  await chosen.fill(rawUsername);
+  fixed(await chosen.getAttribute('pattern') === null && await chosen.getAttribute('dir') === 'auto', 'Username acquired browser syntax authority');
+  await button(page, 'Check username').click();
+  await waitUntil(async () => await chosen.inputValue() === username && await button(page, 'Check username').isEnabled(), harness.lifecycle);
+  fixed(observed.starts.length === count, 'Username validation allocated signup authority');
   fixed(
     (await mailbox.getAttribute('type')) === 'text' &&
       (await mailbox.getAttribute('inputmode')) === 'email' &&
@@ -2390,7 +2451,7 @@ async function startAttempt(page, observed, harness, suffix) {
   }, harness.lifecycle);
   const authority = observed.starts.at(-1);
   fixed(
-    authority.canonical_email === email && authority.email_sent === true,
+    authority.canonical_email === email && authority.email_sent === true && authority.username_display === username,
     'Server canonical Unicode email/delivery contract failed'
   );
   fixed(
@@ -2398,7 +2459,7 @@ async function startAttempt(page, observed, harness, suffix) {
       (request) =>
         request.path === root + '/start' &&
         request.body.email === raw &&
-        request.body.phone === phone
+        request.body.phone === phone && request.body.username === username
     ),
     'Frontend rewrote raw registration identifiers'
   );
@@ -2406,6 +2467,7 @@ async function startAttempt(page, observed, harness, suffix) {
     (await page.locator('bdi[dir="ltr"]').innerText()) === email,
     'Canonical mailbox lacks bidi isolation'
   );
+  fixed(await page.locator('[data-username-private]').innerText() === username, 'Accepted username display was folded or omitted');
   await waitUntil(() => button(page, 'Check email verification').isEnabled(), harness.lifecycle);
   await registrationHeading(page, 'Verify your email');
   const delivered = await harness.control('/summary');
@@ -3053,6 +3115,7 @@ async function exerciseBoundaries(browser, harness, mark) {
     await field(page, 'Email address')
       .fill(`unsupported${randomBytes(6).toString('hex')}@example.test`);
     await field(page, 'Iranian mobile number').fill('09123456789');
+    await field(page, 'Username').fill('علي.مؤمني');
     await button(page, 'Start registration and send email').click();
     await registrationAlert(page).waitFor();
     fixed(observed.starts.length === 0, 'Unsupported passkey allocated an attempt');

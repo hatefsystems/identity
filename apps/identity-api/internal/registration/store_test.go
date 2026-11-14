@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,89 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
+
+const fixtureUsername = "\u0639\u0644\u06cc.\u0645\u0624\u0645\u0646\u06cc"
+
+func usernameNormalizer(t *testing.T) *username.Normalizer {
+	t.Helper()
+	policy, err := username.DecodePolicy([]byte(`{"id":"4793a0e0-60b0-4571-a9b1-3879123819bb","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"reserved_names":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := username.New(policy, `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`, bytes.Repeat([]byte{0x62}, 32), "registration-fixture-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func usernameValue(t *testing.T, n *username.Normalizer, input string) username.Value {
+	t.Helper()
+	v, err := n.Normalize(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+type signupUsernames struct {
+	mu                  sync.Mutex
+	normalizer          *username.Normalizer
+	guardErr            error
+	availableErr        error
+	unavailable         bool
+	guards              int
+	availability        int
+	assignments         int
+	assignedID          uuid.UUID
+	assignedAuthVersion int64
+	assignedValue       username.Value
+	epoch               int64
+	onGuard             func(pgx.Tx)
+}
+
+func (n *signupUsernames) Normalizer() *username.Normalizer { return n.normalizer }
+func (n *signupUsernames) Guard(_ context.Context, tx pgx.Tx) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.guards++
+	if n.onGuard != nil {
+		n.onGuard(tx)
+	}
+	if tx, ok := tx.(*testTx); ok {
+		tx.ops = append(tx.ops, "username_guard")
+		if err := tx.failures["username_guard"]; err != nil {
+			return err
+		}
+	}
+	return n.guardErr
+}
+func (n *signupUsernames) GuardAuthority(ctx context.Context, tx pgx.Tx) (username.GuardAuthority, error) {
+	if err := n.Guard(ctx, tx); err != nil {
+		return username.GuardAuthority{}, err
+	}
+	return username.GuardAuthority{Authority: n.normalizer.Authority(), Epoch: n.epoch}, nil
+}
+func (n *signupUsernames) Available(context.Context, username.Value) (bool, error) {
+	n.availability++
+	return !n.unavailable, n.availableErr
+}
+func (n *signupUsernames) Assign(_ context.Context, tx pgx.Tx, id uuid.UUID, authVersion int64, value username.Value) error {
+	n.assignments++
+	n.assignedID, n.assignedAuthVersion, n.assignedValue = id, authVersion, value
+	if tx, ok := tx.(*testTx); ok {
+		tx.ops = append(tx.ops, "username_assign")
+		return tx.failures["username_assign"]
+	}
+	return errors.New("registration test assignment requires caller test transaction")
+}
+
+func testUsernames(t *testing.T) *signupUsernames {
+	t.Helper()
+	return &signupUsernames{normalizer: usernameNormalizer(t), epoch: 1}
+}
 
 func testCipher(t *testing.T) Encryptor {
 	t.Helper()
@@ -40,9 +123,12 @@ func pendingFixture(t *testing.T) (*Store, Attempt, []byte) {
 	capability := bytes.Repeat([]byte{9}, 32)
 	hash, _ := HashCapability(capability)
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
-	s := &Store{cipher: testCipher(t), now: func() time.Time { return now.Add(time.Minute) }}
+	namespace := testUsernames(t)
+	s := &Store{cipher: testCipher(t), usernames: namespace, now: func() time.Time { return now.Add(time.Minute) }}
+	chosen := usernameValue(t, namespace.normalizer, fixtureUsername)
 	d := Details{AttemptID: uuid.New(), JKT: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)),
-		Purpose: Purpose, Email: "person@example.com", Phone: "+989123456789", UserHandle: bytes.Repeat([]byte{5}, 8)}
+		Purpose: Purpose, Email: "person@example.com", Phone: "+989123456789", UserHandle: bytes.Repeat([]byte{5}, 8),
+		UsernameDisplay: chosen.Display(), UsernameSecurity: chosen.SecurityName(), UsernameAuthority: chosen.Authority(), UsernameEpoch: 1}
 	blob, err := s.seal(context.Background(), d)
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +341,7 @@ func TestEnvelopeBindingCorruptionAndFrozenIdentity(t *testing.T) {
 	}
 	s, a, _ := pendingFixture(t)
 	tx := &testTx{record: a.Record}
-	for _, change := range []string{"email", "phone", "handle", "expiry", "created", "capability", "revision"} {
+	for _, change := range []string{"email", "phone", "handle", "expiry", "created", "capability", "revision", "username display", "username security", "username policy", "username fingerprint", "username key ID", "username key verifier", "username epoch"} {
 		b := a
 		b.Details.UserHandle = bytes.Clone(a.Details.UserHandle)
 		b.Record.CapabilityHash = bytes.Clone(a.Record.CapabilityHash)
@@ -274,6 +360,20 @@ func TestEnvelopeBindingCorruptionAndFrozenIdentity(t *testing.T) {
 			b.Record.CapabilityHash[0]++
 		case "revision":
 			b.Record.ChallengeRevision = 2
+		case "username display":
+			b.Details.UsernameDisplay = "\u0639\u0644\u06cc.\u0645\u0648\u0645\u0646\u06cc"
+		case "username security":
+			b.Details.UsernameSecurity += "\u06cc"
+		case "username policy":
+			b.Details.UsernameAuthority.PolicyID = uuid.New()
+		case "username fingerprint":
+			b.Details.UsernameAuthority.Fingerprint[0] ^= 1
+		case "username key ID":
+			b.Details.UsernameAuthority.KeyID += "-changed"
+		case "username key verifier":
+			b.Details.UsernameAuthority.KeyVerifier[0] ^= 1
+		case "username epoch":
+			b.Details.UsernameEpoch++
 		}
 		if _, err := s.Save(context.Background(), tx, b); err != ErrInvalid {
 			t.Fatalf("frozen %s changed: %v", change, err)
@@ -352,11 +452,12 @@ func TestCompletedReceiptFingerprintAndTransientErasure(t *testing.T) {
 
 func TestAdmissionTransactionCapacityAndFailurePrivacy(t *testing.T) {
 	private := errors.New("private-dsn-email-token")
-	for _, stage := range []string{"success", "capacity", "begin", "lock", "insert", "commit"} {
+	for _, stage := range []string{"success", "capacity", "begin", "policy guard", "lock", "insert", "commit"} {
 		t.Run(stage, func(t *testing.T) {
 			tx := &testTx{failures: map[string]error{}}
 			database := &testDatabase{txs: []*testTx{tx}}
-			s, err := NewStore(database, testCipher(t), 1)
+			namespace := testUsernames(t)
+			s, err := NewStore(database, testCipher(t), 1, namespace)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -365,6 +466,8 @@ func TestAdmissionTransactionCapacityAndFailurePrivacy(t *testing.T) {
 				database.beginErr = private
 			case "lock":
 				tx.failures["LockRegistrationAdmission"] = private
+			case "policy guard":
+				tx.failures["username_guard"] = private
 			case "commit":
 				tx.failures["commit"] = private
 			}
@@ -381,10 +484,14 @@ func TestAdmissionTransactionCapacityAndFailurePrivacy(t *testing.T) {
 				return registrationRow{record: db.RegistrationAttempt{ID: args[0].(uuid.UUID), CapabilityHash: args[1].([]byte), Jkt: args[2].(string), DetailsEncrypted: args[3].([]byte),
 					CreatedAt: args[4].(pgtype.Timestamptz), ExpiresAt: args[5].(pgtype.Timestamptz), State: "pending"}}
 			}
-			a, secret, err := s.Create(context.Background(), "person@example.com", "+989123456789", base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+			chosen := usernameValue(t, namespace.normalizer, fixtureUsername)
+			a, secret, err := s.Create(context.Background(), "person@example.com", "+989123456789", base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)), chosen)
 			if stage == "success" {
 				if err != nil || len(secret) != 32 || len(a.Details.UserHandle) != 8 || tx.commits != 1 || !tx.readCommitted {
 					t.Fatal("valid pending admission failed")
+				}
+				if a.Details.UsernameDisplay != chosen.Display() || a.Details.UsernameSecurity != chosen.SecurityName() || a.Details.UsernameAuthority != chosen.Authority() || a.Details.UsernameEpoch != namespace.epoch || namespace.assignments != 0 {
+					t.Fatal("admission did not freeze exact username authority or reserved early")
 				}
 			} else {
 				if err == nil || len(secret) != 0 || strings.Contains(err.Error(), "private") {
@@ -397,7 +504,7 @@ func TestAdmissionTransactionCapacityAndFailurePrivacy(t *testing.T) {
 			if stage != "begin" && (!tx.rollbackBounded || tx.rollbacks != 1) {
 				t.Fatal("transaction cleanup not detached and bounded")
 			}
-			if stage == "success" && !reflect.DeepEqual(tx.ops, []string{"timeouts", "LockRegistrationAdmission", "CreateRegistrationAttempt"}) {
+			if stage == "success" && !reflect.DeepEqual(tx.ops, []string{"timeouts", "username_guard", "LockRegistrationAdmission", "CreateRegistrationAttempt"}) {
 				t.Fatalf("capacity read before shared lock: %v", tx.ops)
 			}
 		})

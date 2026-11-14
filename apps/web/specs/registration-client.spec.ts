@@ -11,7 +11,8 @@ const capability = 'A'.repeat(43);
 const token = 'B'.repeat(42) + 'A';
 const verificationID = 'C'.repeat(42) + 'A';
 const canonical = '\u0647\u0627\u062a\u0641@example.test';
-const contacts = { email: ` ${canonical.split('@')[0]}@EXAMPLE.test `, phone: '+989123456789' };
+const username = '\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u064a';
+const contacts = { email: ` ${canonical.split('@')[0]}@EXAMPLE.test `, phone: '+989123456789', username };
 let expires: string;
 let key: BrowserKey;
 let otherKey: BrowserKey;
@@ -55,6 +56,7 @@ const startResponse = (override: Record<string, unknown> = {}) =>
       attempt_id: attemptID,
       capability,
       canonical_email: canonical,
+      username_display: username,
       expires_at: expires,
       email_sent: true,
       ...override,
@@ -121,7 +123,7 @@ it('simulates the complete signup contract, keeping canonical email authoritativ
   const api = client(fetcher);
   const signal = new AbortController().signal;
   const view = await api.start(Object.freeze(contacts), signal);
-  expect(view).toEqual({ canonical_email: canonical, expires_at: expires, email_sent: true });
+  expect(view).toEqual({ canonical_email: canonical, username_display: username, expires_at: expires, email_sent: true });
   expect(JSON.stringify(api)).not.toContain(capability);
   expect(fetcher).toHaveBeenCalledTimes(1);
   const emailTab = client(fetcher);
@@ -231,6 +233,9 @@ it.each([
   { canonical_email: 'a@EXAMPLE.test' },
   { expires_at: new Date(Date.now() + 3600000).toISOString() },
   { email_sent: 'yes' },
+  { username_display: '' },
+  { username_display: null },
+  { username_display: 'a'.repeat(1025) },
 ])('rejects malformed/undeclared signup response fields', async (override) => {
   await expect(
     client(jest.fn().mockResolvedValue(startResponse(override))).start(
@@ -396,6 +401,50 @@ it('uses raw UTF-8 bounds and preserves NFC/IDNA-distinct input rather than JS c
   expect(JSON.parse(fetcher.mock.calls[0][1].body).email).toBe(
     'cafe\u0301@\u0645\u062b\u0627\u0644.ir'
   );
+});
+
+it('checks the exact username explicitly without reservation or delivery and preserves the server NFC display', async () => {
+  const raw = '\u0639\u0644\u064a.\u0645\u0648\u0654\u0645\u0646\u064a';
+  const fetcher = jest.fn()
+    .mockResolvedValueOnce(json({ username_display: username, available: true }))
+    .mockResolvedValueOnce(startResponse());
+  const api = client(fetcher), signal = new AbortController().signal;
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(await api.validateUsername(raw, signal)).toEqual({ username_display: username, available: true });
+  expect(fetcher.mock.calls[0][0]).toBe(`${origin}/api/v1/auth/register/validate`);
+  expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ stage: 'username', registration: { username: raw } });
+  expect(fetcher.mock.calls[0][1]).toMatchObject({ method: 'POST', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer' });
+  expect(() => api.result(signal)).toThrow('invalid_registration');
+  await api.start({ ...contacts, username }, signal);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(JSON.parse(fetcher.mock.calls[1][1].body).username).toBe(username);
+  api.dispose();
+});
+
+it.each([
+  { username_display: username, available: false },
+  { username_display: username, available: true },
+])('returns advisory availability without client security folding', async (response) => {
+  const fetcher = jest.fn().mockResolvedValue(json(response));
+  expect(await client(fetcher).validateUsername(username, new AbortController().signal)).toEqual(response);
+  expect(JSON.parse(fetcher.mock.calls[0][1].body).registration.username).toBe(username);
+});
+
+it.each([
+  { username_display: username, available: 'yes' },
+  { username_display: '', available: true },
+  { username_display: username, available: true, username_key: 'private' },
+])('rejects undeclared or malformed username validation responses', async (response) => {
+  await expect(client(jest.fn().mockResolvedValue(json(response))).validateUsername(username, new AbortController().signal))
+    .rejects.toMatchObject({ code: 'invalid_response' });
+});
+
+it.each(['invalid_username', 'username_unavailable'])('accepts only the stable username field-error envelope for %s', async (error) => {
+  const fetcher = jest.fn().mockResolvedValue(json({ error, field_errors: { username: error } }, error === 'invalid_username' ? 400 : 409));
+  await expect(client(fetcher).start(contacts, new AbortController().signal)).rejects.toMatchObject({ code: error, uncertain: false });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  await expect(client(jest.fn().mockResolvedValue(json({ error, field_errors: { username: 'private' } }, 400))).start(contacts, new AbortController().signal))
+    .rejects.toMatchObject({ code: 'invalid_response' });
 });
 
 it('cancellation rejects a late response and cannot restore forgotten authority', async () => {

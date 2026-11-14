@@ -155,9 +155,17 @@ func run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
-	registrationService, registrationReady, err := buildRegistrationService(cfg.Environment, pool, redisClient, webauthnService, smsotpService)
+	usernameService, usernameReady, err := buildUsernameService(pool)
 	if err != nil {
 		return err
+	}
+	registrationService, registrationReady, err := buildRegistrationService(cfg.Environment, pool, redisClient, webauthnService, smsotpService, usernameService)
+	if err != nil {
+		return err
+	}
+	var usernameReader server.UsernameReader
+	if usernameService != nil {
+		usernameReader = usernameService
 	}
 
 	// The TOTP MFA service reuses the WebAuthn database pool. When no database
@@ -254,6 +262,8 @@ func run(logger *slog.Logger) (runErr error) {
 	srv := server.New(cfg, logger, server.Deps{
 		Registration:      registrationService,
 		RegistrationReady: registrationReady,
+		Usernames:         usernameReader,
+		UsernameReady:     usernameReady,
 		AdminActions:      adminDeps.AdminActions,
 		AdminReady:        adminDeps.AdminReady,
 		AdminRevoke: func(ctx context.Context, userID string) error {
@@ -332,9 +342,16 @@ func validateStartupInputs(cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	usernameCfg, err := config.LoadUsername()
+	if err != nil {
+		return err
+	}
+	if registrationCfg.Enabled && !usernameCfg.Enabled {
+		return errors.New("main: enabled registration requires USERNAME_ENABLED and an admitted username policy")
+	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}

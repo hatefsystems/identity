@@ -44,6 +44,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -67,7 +68,7 @@ type signupFailureRow struct {
 }
 
 func signupMutation(sql string) bool {
-	for _, name := range []string{"CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt", "SaveRegistrationAttempt"} {
+	for _, name := range []string{"CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "AssignUsername", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt", "SaveRegistrationAttempt"} {
 		if strings.HasPrefix(sql, "-- name: "+name+" ") {
 			return true
 		}
@@ -166,21 +167,23 @@ func (s *signupIntegrationSender) code(phone string) string {
 }
 
 type signupIntegration struct {
-	ctx      context.Context
-	database *signupIntegrationDB
-	cipher   *envelope.Encryptor
-	index    *blindindex.Indexer
-	limiter  *ratelimit.RedisLimiter
-	mail     *signupIntegrationMail
-	sender   *signupIntegrationSender
-	phone    *smsotp.Service
-	otps     *smsotp.RedisOTPStore
-	wa       *webauthn.Service
-	store    *registration.Store
-	service  *registration.Service
-	server   *Server
-	client   *portalTestClient
-	sequence int
+	ctx       context.Context
+	database  *signupIntegrationDB
+	cipher    *envelope.Encryptor
+	index     *blindindex.Indexer
+	limiter   *ratelimit.RedisLimiter
+	mail      *signupIntegrationMail
+	sender    *signupIntegrationSender
+	phone     *smsotp.Service
+	otps      *smsotp.RedisOTPStore
+	wa        *webauthn.Service
+	store     *registration.Store
+	usernames *username.Store
+	service   *registration.Service
+	server    *Server
+	client    *portalTestClient
+	sequence  uint32
+	subnet    uint32
 }
 
 func newSignupIntegration(t *testing.T) *signupIntegration {
@@ -234,7 +237,8 @@ func newSignupIntegration(t *testing.T) *signupIntegration {
 		t.Fatal(err)
 	}
 	database := &signupIntegrationDB{Pool: pool}
-	store, err := registration.NewStore(database, cipher, 100)
+	usernames := signupIntegrationUsernames(t, ctx, database, cipher)
+	store, err := registration.NewStore(database, cipher, 100, usernames)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,13 +247,67 @@ func newSignupIntegration(t *testing.T) *signupIntegration {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := registration.NewService(registration.Deps{Store: store, Database: database, Email: email, Phone: phone, WebAuthn: wa, Encryptor: cipher, Indexer: index, Limiter: limiter, GlobalDailyLimit: 100000, EmailHourlyLimit: 10})
+	service, err := registration.NewService(registration.Deps{Store: store, Database: database, Email: email, Phone: phone, WebAuthn: wa, Encryptor: cipher, Indexer: index, Limiter: limiter, Usernames: usernames, GlobalDailyLimit: 100000, EmailHourlyLimit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	browser := newPortalTestClient(t, testPortalOrigin)
-	server := New(config.Config{Environment: "production", PortalOrigin: testPortalOrigin}, nil, Deps{Registration: service, WebAuthn: wa, DPoPValidator: browser.validator})
-	return &signupIntegration{ctx: ctx, database: database, cipher: cipher, index: index, limiter: limiter, mail: mail, sender: sender, phone: phone, otps: otps, wa: wa, store: store, service: service, server: server, client: browser}
+	server := New(config.Config{Environment: "production", PortalOrigin: testPortalOrigin}, nil, Deps{Registration: service, Usernames: usernames, WebAuthn: wa, DPoPValidator: browser.validator})
+	network := uuid.New()
+	return &signupIntegration{ctx: ctx, database: database, cipher: cipher, index: index, limiter: limiter, mail: mail, sender: sender, phone: phone, otps: otps, wa: wa, store: store, usernames: usernames, service: service, server: server, client: browser, subnet: binary.BigEndian.Uint32(network[:4])}
+}
+
+func signupIntegrationUsernames(t *testing.T, ctx context.Context, database *signupIntegrationDB, cipher *envelope.Encryptor) *username.Store {
+	t.Helper()
+	policy := username.Policy{
+		ID: uuid.New(), Normalization: username.NormalizationV1,
+		Folds:         []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}},
+		ReservedNames: []string{},
+	}
+	const syntax = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
+	normalizer, err := username.New(policy, syntax, bytes.Repeat([]byte{11}, 32), "signup-integration-only")
+	if err != nil {
+		t.Fatal("construct approved username fixture policy failed")
+	}
+	// Explicit test-only installation in the harness-owned child, never startup
+	// fallback or activation of the supplied provisioning database.
+	a := normalizer.Authority()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO username_policy_artifacts(policy_id,fingerprint,artifact) VALUES($1,$2,$3)`, []any{a.PolicyID, a.Fingerprint[:], normalizer.CanonicalArtifact()}},
+		{`INSERT INTO username_lookup_keys(key_id,key_verifier) VALUES($1,$2)`, []any{a.KeyID, a.KeyVerifier[:]}},
+		{`UPDATE username_active_policy SET policy_id=$1,fingerprint=$2,epoch=1,key_id=$3,key_verifier=$4,admission_state='open' WHERE singleton`, []any{a.PolicyID, a.Fingerprint[:], a.KeyID, a.KeyVerifier[:]}},
+	} {
+		if tag, err := database.Exec(ctx, statement.sql, statement.args...); err != nil || tag.RowsAffected() != 1 {
+			t.Fatal("seed owned username fixture authority failed")
+		}
+	}
+	store, err := username.NewStore(database, cipher, normalizer)
+	if err != nil || store.CheckReady(ctx) != nil {
+		t.Fatal("real username fixture store not ready")
+	}
+	return store
+}
+
+func signupIntegrationUsername() string {
+	// A UUID-derived Persian suffix keeps independent contact/credential races
+	// independent of username collisions while preserving the submitted aliases.
+	const hex = "0123456789abcdef"
+	letters := []rune("\u0627\u0628\u067e\u062a\u062b\u062c\u0686\u062d\u062e\u062f\u0630\u0631\u0632\u0698\u0633\u0634")
+	var suffix strings.Builder
+	for _, scalar := range strings.ReplaceAll(uuid.NewString(), "-", "") {
+		suffix.WriteRune(letters[strings.IndexRune(hex, scalar)])
+	}
+	return "\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u06cc." + suffix.String()
+}
+
+func (f *signupIntegration) ip() string {
+	// Each attempt has an owned documentation /64, so reruns exercise real Redis
+	// rate limits without sharing fixed-IP counters or flushing another fixture.
+	subnet := f.subnet + f.sequence
+	return fmt.Sprintf("2001:db8:%x:%x::9", subnet>>16, subnet&0xffff)
 }
 
 func (f *signupIntegration) request(t *testing.T, operation string, body any, want int) *httptest.ResponseRecorder {
@@ -263,7 +321,7 @@ func (f *signupIntegration) request(t *testing.T, operation string, body any, wa
 		path += "/" + operation
 	}
 	r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
-	r.RemoteAddr = fmt.Sprintf("198.51.%d.9:12345", f.sequence)
+	r.RemoteAddr = "[" + f.ip() + "]:12345"
 	f.client.sign(t, r)
 	w := boundaryServe(t, f.server, r, want)
 	if len(w.Result().Cookies()) != 0 {
@@ -285,15 +343,20 @@ func signupRandomPhone(t *testing.T) string {
 func (f *signupIntegration) start(t *testing.T, email, phone string) registration.Authority {
 	t.Helper()
 	f.sequence++
-	w := f.request(t, "start", map[string]string{"email": email, "phone": phone}, 201)
+	chosen := signupIntegrationUsername()
+	w := f.request(t, "start", map[string]string{"email": email, "phone": phone, "username": chosen}, 201)
 	var response struct {
-		AttemptID      string `json:"attempt_id"`
-		Capability     string `json:"capability"`
-		CanonicalEmail string `json:"canonical_email"`
-		EmailSent      bool   `json:"email_sent"`
+		AttemptID       string `json:"attempt_id"`
+		Capability      string `json:"capability"`
+		CanonicalEmail  string `json:"canonical_email"`
+		UsernameDisplay string `json:"username_display"`
+		EmailSent       bool   `json:"email_sent"`
 	}
 	if json.Unmarshal(w.Body.Bytes(), &response) != nil || !response.EmailSent {
 		t.Fatal("pending proof email not issued")
+	}
+	if response.UsernameDisplay != chosen {
+		t.Fatal("accepted username display changed the submitted NFC spelling")
 	}
 	id, err := uuid.Parse(response.AttemptID)
 	if err != nil {
@@ -349,6 +412,10 @@ func (f *signupIntegration) assertInventory(t *testing.T, wantUsers, wantCredent
 	users, credentials, roles, events := f.inventory(t)
 	if users != wantUsers || credentials != wantCredentials || roles != 0 || events != wantEvents {
 		t.Fatalf("account birth inventory users=%d credentials=%d roles=%d intents=%d", users, credentials, roles, events)
+	}
+	var claimed int
+	if err := f.database.QueryRow(f.ctx, `SELECT count(*) FROM users WHERE username_key IS NOT NULL`).Scan(&claimed); err != nil || claimed != wantEvents {
+		t.Fatal("username ownership did not commit atomically with account birth")
 	}
 }
 
@@ -474,6 +541,10 @@ func TestRegistrationHTTPAtomicBirthAndLostResponseFreshLoginIntegration(t *test
 	if err != nil || user.PasswordHash != nil || user.LifecycleRevision != 1 || !bytes.Equal(user.WebauthnUserHandle, auth.handle) {
 		t.Fatal("account birth mapping incomplete")
 	}
+	name, err := f.usernames.Get(f.ctx, user.ID, user.AuthVersion)
+	if err != nil || name == nil || !strings.HasPrefix(name.Display, "\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u06cc.") {
+		t.Fatal("account-bound username did not preserve the accepted display")
+	}
 	plain, err := f.cipher.Decrypt(f.ctx, user.PhoneEncrypted)
 	if err != nil || string(plain) != phone {
 		t.Fatal("verified encrypted phone did not match frozen proof")
@@ -491,7 +562,7 @@ func TestRegistrationHTTPAtomicBirthAndLostResponseFreshLoginIntegration(t *test
 
 func TestRegistrationSQLFailureAfterEveryBirthWriteIntegration(t *testing.T) {
 	f := newSignupIntegration(t)
-	for write := int32(1); write <= 7; write++ {
+	for write := int32(1); write <= 8; write++ {
 		t.Run(fmt.Sprintf("write_%d", write), func(t *testing.T) {
 			phone := signupRandomPhone(t)
 			a := f.start(t, uuid.NewString()+"@example.com", phone)
@@ -501,6 +572,9 @@ func TestRegistrationSQLFailureAfterEveryBirthWriteIntegration(t *testing.T) {
 			f.database.failAfter.Store(write)
 			if _, err := f.service.Complete(f.ctx, a, auth.credential(t, options, true)); err == nil {
 				t.Fatal("injected write failure reported success")
+			}
+			if f.database.writes.Load() != write {
+				t.Fatal("account birth did not reach the selected SQL failure boundary")
 			}
 			f.database.failAfter.Store(0)
 			f.assertInventory(t, 0, 0, 0)
@@ -520,7 +594,7 @@ func TestRegistrationTwoReplicaAndDuplicateIdentityIntegration(t *testing.T) {
 	options := f.prove(t, a, phone)
 	auth := newSignupAuthenticator(t, options)
 	credential := auth.credential(t, options, true)
-	store, err := registration.NewStore(f.database, f.cipher, 100)
+	store, err := registration.NewStore(f.database, f.cipher, 100, f.usernames)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +602,7 @@ func TestRegistrationTwoReplicaAndDuplicateIdentityIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	replica, err := registration.NewService(registration.Deps{Store: store, Database: f.database, Email: emailSender, Phone: f.phone, WebAuthn: f.wa, Encryptor: f.cipher, Indexer: f.index, Limiter: f.limiter, GlobalDailyLimit: 100000, EmailHourlyLimit: 10})
+	replica, err := registration.NewService(registration.Deps{Store: store, Database: f.database, Email: emailSender, Phone: f.phone, WebAuthn: f.wa, Encryptor: f.cipher, Indexer: f.index, Limiter: f.limiter, Usernames: f.usernames, GlobalDailyLimit: 100000, EmailHourlyLimit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +690,7 @@ func TestRegistrationBindingsExpiryCollisionsAndConsumeFailureIntegration(t *tes
 		t.Fatal("email token became signup capability")
 	}
 	f.request(t, "email/verify", map[string]string{"attempt_id": a.AttemptID.String(), "token": f.mail.token}, 204)
-	id, err := f.service.SendPhone(f.ctx, a, fmt.Sprintf("198.51.%d.9", f.sequence))
+	id, err := f.service.SendPhone(f.ctx, a, f.ip())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +826,7 @@ func TestRegistrationProofExpiryAndUnknownPhoneCommitIntegration(t *testing.T) {
 			if err := f.service.VerifyEmail(f.ctx, a.AttemptID, token, a.JKT); err != nil {
 				t.Fatal(err)
 			}
-			id, err := f.service.SendPhone(f.ctx, a, fmt.Sprintf("198.51.%d.9", f.sequence))
+			id, err := f.service.SendPhone(f.ctx, a, f.ip())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -799,14 +873,14 @@ func TestRegistrationProofExpiryAndUnknownPhoneCommitIntegration(t *testing.T) {
 func TestRegistrationHTTPPublicProofReplayDoesNotAllocateIntegration(t *testing.T) {
 	f := newSignupIntegration(t)
 	f.sequence++
-	body, _ := json.Marshal(map[string]string{"email": uuid.NewString() + "@example.com", "phone": signupRandomPhone(t)})
+	body, _ := json.Marshal(map[string]string{"email": uuid.NewString() + "@example.com", "phone": signupRandomPhone(t), "username": signupIntegrationUsername()})
 	request := httptest.NewRequest(http.MethodPost, registrationPath+"/start", bytes.NewReader(body))
-	request.RemoteAddr = fmt.Sprintf("198.51.%d.9:12345", f.sequence)
+	request.RemoteAddr = "[" + f.ip() + "]:12345"
 	f.client.sign(t, request)
 	proof := request.Header.Get("DPoP")
 	boundaryServe(t, f.server, request, http.StatusCreated)
 	request = httptest.NewRequest(http.MethodPost, registrationPath+"/start", bytes.NewReader(body))
-	request.RemoteAddr = fmt.Sprintf("198.51.%d.9:12345", f.sequence)
+	request.RemoteAddr = "[" + f.ip() + "]:12345"
 	f.client.prepare(request)
 	request.Header.Set("DPoP", proof)
 	boundaryServe(t, f.server, request, http.StatusUnauthorized)

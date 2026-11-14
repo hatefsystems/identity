@@ -22,16 +22,20 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // ErrRateLimited and the following errors expose fixed signup failure reasons.
 var (
-	ErrRateLimited     = errors.New("registration: rate limited")
-	ErrProofRequired   = errors.New("registration: ownership proof required")
-	ErrSendFailed      = errors.New("registration: delivery not confirmed")
-	ErrRestartRequired = errors.New("registration: fresh phone proof required")
-	ErrOutcomeUnknown  = errors.New("registration: inspect durable result")
-	ErrNewCeremony     = errors.New("registration: restart registration with a new ceremony")
+	ErrRateLimited           = errors.New("registration: rate limited")
+	ErrProofRequired         = errors.New("registration: ownership proof required")
+	ErrSendFailed            = errors.New("registration: delivery not confirmed")
+	ErrRestartRequired       = errors.New("registration: fresh phone proof required")
+	ErrOutcomeUnknown        = errors.New("registration: inspect durable result")
+	ErrNewCeremony           = errors.New("registration: restart registration with a new ceremony")
+	ErrInvalidUsername       = errors.New("registration: invalid username")
+	ErrUsernameUnavailable   = errors.New("registration: username unavailable")
+	ErrUsernamePolicyChanged = errors.New("registration: username policy changed; restart required")
 )
 
 // PhoneProof issues and consumes signup-purpose proofs for frozen contacts.
@@ -52,6 +56,7 @@ type PhoneIndexer interface{ Compute(string) string }
 // Deps supplies signup authority, proof services, and finite admission policy.
 type Deps struct {
 	Store                              *Store
+	Usernames                          UsernameNamespace
 	Database                           Database
 	Email                              *Email
 	Phone                              PhoneProof
@@ -94,7 +99,7 @@ type Outcome struct {
 
 // NewService requires complete collaborators and bounded admission limits.
 func NewService(deps Deps) (*Service, error) {
-	if deps.Store == nil || nilDependency(deps.Database) || deps.Email == nil || nilDependency(deps.Phone) || nilDependency(deps.WebAuthn) || nilDependency(deps.Encryptor) || nilDependency(deps.Indexer) || nilDependency(deps.Limiter) || deps.GlobalDailyLimit < 1 || deps.GlobalDailyLimit > 100000 || deps.EmailHourlyLimit < 1 || deps.EmailHourlyLimit > 10 {
+	if deps.Store == nil || nilDependency(deps.Store.usernames) || nilDependency(deps.Usernames) || deps.Usernames.Normalizer() == nil || deps.Store.usernames.Normalizer() != deps.Usernames.Normalizer() || nilDependency(deps.Database) || deps.Email == nil || nilDependency(deps.Phone) || nilDependency(deps.WebAuthn) || nilDependency(deps.Encryptor) || nilDependency(deps.Indexer) || nilDependency(deps.Limiter) || deps.GlobalDailyLimit < 1 || deps.GlobalDailyLimit > 100000 || deps.EmailHourlyLimit < 1 || deps.EmailHourlyLimit > 10 {
 		return nil, ErrInvalid
 	}
 	return &Service{deps: deps, now: time.Now}, nil
@@ -113,7 +118,11 @@ func nilDependency(value any) bool {
 
 // Start charges shared finite admission budgets before generating pending PII.
 // Provider acceptance is never ownership and an uncertain send is not retried.
-func (s *Service) Start(ctx context.Context, email, phone, jkt, ip string) (StartResult, error) {
+func (s *Service) Start(ctx context.Context, email, phone, chosenUsername, jkt, ip string) (StartResult, error) {
+	chosen, err := s.deps.Usernames.Normalizer().Normalize(chosenUsername)
+	if err != nil {
+		return StartResult{}, ErrInvalidUsername
+	}
 	canonical, err := emailaddress.Canonicalize(email)
 	if err != nil {
 		return StartResult{}, ErrInvalid
@@ -147,7 +156,14 @@ func (s *Service) Start(ctx context.Context, email, phone, jkt, ip string) (Star
 			return StartResult{}, err
 		}
 	}
-	attempt, capability, err := s.deps.Store.Create(ctx, canonical, phone, jkt)
+	available, err := s.deps.Usernames.Available(ctx, chosen)
+	if err != nil {
+		return StartResult{}, usernameError(err)
+	}
+	if !available {
+		return StartResult{}, ErrUsernameUnavailable
+	}
+	attempt, capability, err := s.deps.Store.Create(ctx, canonical, phone, jkt, chosen)
 	if err != nil {
 		return StartResult{}, err
 	}
@@ -174,6 +190,57 @@ func (s *Service) allow(ctx context.Context, key string, limit int, window time.
 func digest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// UsernameValidation is a read-only, bounded advisory result. It does not grant
+// proof or reserve a spelling, and never reveals an owner or account status.
+type UsernameValidation struct {
+	Display   string `json:"username_display"`
+	Available bool   `json:"available"`
+}
+
+func (s *Service) ValidateUsername(ctx context.Context, input, ip string) (UsernameValidation, error) {
+	address, err := netip.ParseAddr(ip)
+	if err != nil || address.Zone() != "" {
+		return UsernameValidation{}, ErrInvalid
+	}
+	if err := s.allow(ctx, "rate:registration:username:"+ratelimit.Subnet(ip), 30, time.Minute); err != nil {
+		return UsernameValidation{}, err
+	}
+	value, err := s.deps.Usernames.Normalizer().Normalize(input)
+	if err != nil {
+		return UsernameValidation{}, ErrInvalidUsername
+	}
+	available, err := s.deps.Usernames.Available(ctx, value)
+	if err != nil {
+		return UsernameValidation{}, usernameError(err)
+	}
+	return UsernameValidation{Display: value.Display(), Available: available}, nil
+}
+
+func usernameError(err error) error {
+	switch {
+	case errors.Is(err, username.ErrInvalidUsername):
+		return ErrInvalidUsername
+	case errors.Is(err, username.ErrReserved), errors.Is(err, username.ErrConflict):
+		return ErrUsernameUnavailable
+	default:
+		return ErrUnavailable
+	}
+}
+
+func (s *Service) frozenUsername(d Details, authority username.GuardAuthority) (username.Value, error) {
+	if d.UsernameDisplay == "" || d.UsernameAuthority != authority.Authority || d.UsernameEpoch != authority.Epoch {
+		return username.Value{}, ErrUsernamePolicyChanged
+	}
+	value, err := s.deps.Usernames.Normalizer().Normalize(d.UsernameDisplay)
+	if err != nil || value.Display() != d.UsernameDisplay || value.SecurityName() != d.UsernameSecurity || value.Authority() != d.UsernameAuthority {
+		return username.Value{}, ErrUsernamePolicyChanged
+	}
+	if s.deps.Usernames.Normalizer().IsReserved(value) {
+		return username.Value{}, ErrUsernameUnavailable
+	}
+	return value, nil
 }
 
 // ResendEmail replaces the proof without extending the attempt deadline.
@@ -413,15 +480,15 @@ func (s *Service) PasskeyOptions(ctx context.Context, a Authority) (*protocol.Cr
 		return nil, ErrProofRequired
 	}
 	expires := minTime(s.now().Add(PasskeyLifetime), minTime(snapshot.Record.ExpiresAt.Time, snapshot.Record.EmailTokenExpiresAt.Time))
-	options, ceremony, err := s.deps.WebAuthn.BeginSignup(ctx, snapshot.Details.Email, snapshot.Details.UserHandle, a.JKT, expires)
-	if err != nil {
-		return nil, ErrInvalid
-	}
 	tx, err := begin(ctx, s.deps.Database)
 	if err != nil {
 		return nil, err
 	}
 	defer rollback(tx)
+	authority, err := s.deps.Usernames.GuardAuthority(ctx, tx)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
 	attempt, err := s.deps.Store.Lock(ctx, tx, a.AttemptID, a.Capability, a.JKT)
 	if err != nil {
 		return nil, err
@@ -434,6 +501,13 @@ func (s *Service) PasskeyOptions(ctx context.Context, a Authority) (*protocol.Cr
 	}
 	if !attempt.Record.PhoneVerifiedAt.Valid {
 		return nil, ErrProofRequired
+	}
+	if _, err := s.frozenUsername(attempt.Details, authority); err != nil {
+		return nil, err
+	}
+	options, ceremony, err := s.deps.WebAuthn.BeginSignup(ctx, attempt.Details.Email, attempt.Details.UserHandle, a.JKT, expires)
+	if err != nil {
+		return nil, ErrInvalid
 	}
 	attempt.Record.ChallengeRevision++
 	attempt.Record.PasskeyCreatedAt = timestamp(s.now())
@@ -480,31 +554,24 @@ func (s *Service) Complete(ctx context.Context, a Authority, body []byte) (Outco
 	if snapshot.Record.State != "pending" {
 		return Outcome{}, ErrConflict
 	}
+	if snapshot.Details.UsernameDisplay == "" || snapshot.Details.UsernameAuthority != s.deps.Usernames.Normalizer().Authority() {
+		return Outcome{}, ErrUsernamePolicyChanged
+	}
 	if err = s.requireEmail(snapshot); err != nil {
 		return Outcome{}, err
 	}
 	if !snapshot.Record.PhoneVerifiedAt.Valid || !snapshot.Record.PasskeyExpiresAt.Valid || !s.now().Before(snapshot.Record.PasskeyExpiresAt.Time) || len(snapshot.Details.Ceremony) == 0 {
 		return Outcome{}, ErrProofRequired
 	}
-	credential, err := s.deps.WebAuthn.VerifySignup(ctx, snapshot.Details.Email, snapshot.Details.UserHandle, a.JKT, snapshot.Details.Ceremony, body)
-	if err != nil || !credential.UserVerified || !credential.UserPresent || len(credential.ID) == 0 || len(credential.PublicKey) == 0 || credential.UserID != uuid.Nil {
-		return Outcome{}, ErrInvalid
-	}
-	phone, err := s.deps.Encryptor.Encrypt(ctx, []byte(snapshot.Details.Phone))
-	if err != nil {
-		return Outcome{}, ErrUnavailable
-	}
-	defer clear(phone)
-	index := s.deps.Indexer.Compute(snapshot.Details.Phone)
-	indexBytes, indexErr := hex.DecodeString(index)
-	if indexErr != nil || len(indexBytes) != 32 || hex.EncodeToString(indexBytes) != index {
-		return Outcome{}, ErrUnavailable
-	}
 	tx, err := begin(ctx, s.deps.Database)
 	if err != nil {
 		return Outcome{}, err
 	}
 	defer rollback(tx)
+	authority, err := s.deps.Usernames.GuardAuthority(ctx, tx)
+	if err != nil {
+		return Outcome{}, ErrUnavailable
+	}
 	attempt, err := s.deps.Store.Lock(ctx, tx, a.AttemptID, a.Capability, a.JKT)
 	if err != nil {
 		return Outcome{}, err
@@ -523,6 +590,37 @@ func (s *Service) Complete(ctx context.Context, a Authority, body []byte) (Outco
 	if !attempt.Record.PhoneVerifiedAt.Valid || !attempt.Record.PasskeyExpiresAt.Valid || !s.now().Before(attempt.Record.PasskeyExpiresAt.Time) {
 		return Outcome{}, ErrExpired
 	}
+	chosen, err := s.frozenUsername(attempt.Details, authority)
+	if err != nil {
+		return Outcome{}, err
+	}
+	credential, err := s.deps.WebAuthn.VerifySignup(ctx, attempt.Details.Email, attempt.Details.UserHandle, a.JKT, attempt.Details.Ceremony, body)
+	if err != nil || !credential.UserVerified || !credential.UserPresent || len(credential.ID) == 0 || len(credential.PublicKey) == 0 || credential.UserID != uuid.Nil {
+		return Outcome{}, ErrInvalid
+	}
+	phone, err := s.deps.Encryptor.Encrypt(ctx, []byte(attempt.Details.Phone))
+	if err != nil {
+		return Outcome{}, ErrUnavailable
+	}
+	defer clear(phone)
+	index := s.deps.Indexer.Compute(attempt.Details.Phone)
+	indexBytes, indexErr := hex.DecodeString(index)
+	if indexErr != nil || len(indexBytes) != 32 || hex.EncodeToString(indexBytes) != index {
+		return Outcome{}, ErrUnavailable
+	}
+	fresh, err := s.deps.Store.Lock(ctx, tx, a.AttemptID, a.Capability, a.JKT)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if fresh.Record.State != "pending" || fresh.Record.RowRevision != attempt.Record.RowRevision || !sameIdentity(fresh.Details, attempt.Details) || fresh.Record.ChallengeRevision != attempt.Record.ChallengeRevision || !bytes.Equal(fresh.Details.Ceremony, attempt.Details.Ceremony) {
+		return Outcome{}, ErrConflict
+	}
+	if err := s.requireEmail(fresh); err != nil {
+		return Outcome{}, err
+	}
+	if !s.now().Before(fresh.Record.PasskeyExpiresAt.Time) {
+		return Outcome{}, ErrExpired
+	}
 	q := db.New(tx)
 	user, err := lifecycle.CreateUser(ctx, tx, db.CreateUserParams{Email: attempt.Details.Email, Status: "active"})
 	if err != nil {
@@ -530,6 +628,9 @@ func (s *Service) Complete(ctx context.Context, a Authority, body []byte) (Outco
 			return Outcome{}, ErrConflict
 		}
 		return Outcome{}, ErrUnavailable
+	}
+	if err := s.deps.Usernames.Assign(ctx, tx, user.ID, user.AuthVersion, chosen); err != nil {
+		return Outcome{}, usernameError(err)
 	}
 	affected, err := q.SetWebauthnUserHandle(ctx, db.SetWebauthnUserHandleParams{ID: user.ID, WebauthnUserHandle: attempt.Details.UserHandle})
 	if err != nil || affected != 1 {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomBytes, randomUUID, X509Certificate } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
@@ -31,6 +31,7 @@ import {
   registrationStartupSummary,
   registrationBrowserDiagnostic,
   registrationPasskeyEnvironment,
+  registrationUsernameFixture,
   registrationSecretEnvironmentValues,
   registrationChecks,
   registrationAccessibleName,
@@ -50,6 +51,27 @@ import { registrationJourneys, registrationLocaleChecks, registrationLocales } f
 import { localizedText, setBrowserLocale } from './browser-localization.mjs';
 
 const token = randomBytes(32).toString('base64url');
+
+test('username browser authority is a pinned isolated fixture with a dedicated verifier', () => {
+  const first = registrationUsernameFixture();
+  const second = registrationUsernameFixture();
+  const environment = first.environment;
+  assert.equal(environment.USERNAME_ENABLED, 'true');
+  assert.notEqual(environment.USERNAME_LOOKUP_KEY, second.environment.USERNAME_LOOKUP_KEY);
+  const policy = JSON.parse(environment.USERNAME_POLICY_JSON);
+  assert.deepEqual(policy.reserved_names, []);
+  assert.equal(policy.folds.length, 4);
+  const artifact = Buffer.from(JSON.stringify({ policy, regex: environment.USERNAME_REGEX,
+    implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0', unicode: '17.0.0', max_username_bytes: 1024 }));
+  const fingerprint = createHash('sha256').update(artifact).digest('hex');
+  const key = Buffer.from(environment.USERNAME_LOOKUP_KEY, 'base64');
+  assert.equal(key.length, 32);
+  const verifier = createHmac('sha256', key).update('hatef.identity.username.key-verifier\0').digest('hex');
+  assert(first.seedSQL.includes(fingerprint) && first.seedSQL.includes(verifier));
+  assert(first.seedSQL.includes(artifact.toString('hex')));
+  assert(!first.seedSQL.includes(environment.USERNAME_LOOKUP_KEY));
+  assert(registrationSecretEnvironmentValues(environment).includes(environment.USERNAME_LOOKUP_KEY));
+});
 
 test('registration log guard excludes public resident-key policy but retains every secret environment field', () => {
   const environment = {
@@ -661,6 +683,7 @@ test('registration locale inventory requires both isolated full journeys and no 
 test('registration has explicit independently checked English and Persian accessible names', () => {
   const names = [
     ['Email address', 'نشانی ایمیل'], ['Iranian mobile number', 'شمارهٔ همراه ایران'], ['SMS verification code', 'کد تأیید پیامکی'],
+    ['Username', 'نام کاربری'], ['Check username', 'بررسی نام کاربری'],
     ['Start registration and send email', 'شروع ثبت‌نام و ارسال ایمیل'], ['Verify phone', 'تأیید تلفن'],
     ['Verify email ownership', 'تأیید مالکیت ایمیل'], ['Check email verification', 'بررسی تأیید ایمیل'],
     ['Send SMS code', 'ارسال کد پیامکی'], ['Send a new SMS code', 'ارسال کد پیامکی تازه'],

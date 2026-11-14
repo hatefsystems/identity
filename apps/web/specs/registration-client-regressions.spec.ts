@@ -9,7 +9,7 @@ const attempt_id = '11111111-1111-4111-8111-111111111111';
 const capability = 'A'.repeat(43);
 const verification_id = 'B'.repeat(42) + 'A';
 const replacement = 'C'.repeat(42) + 'A';
-const contacts = { email: 'test@example.test', phone: '+989123456789' };
+const contacts = { email: 'test@example.test', phone: '+989123456789', username: '\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u064a' };
 const credential = {
   id: 'AQID',
   rawId: 'AQID',
@@ -71,6 +71,7 @@ const started = (expires_at: string, email_sent = true) =>
       attempt_id,
       capability,
       canonical_email: contacts.email,
+      username_display: contacts.username,
       expires_at,
       email_sent,
     },

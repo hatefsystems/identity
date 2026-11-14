@@ -24,7 +24,9 @@ jest.mock('../app/_lib/portal/invalidation', () => ({
 const attemptID = '11111111-1111-4111-8111-111111111111';
 const token = 'A'.repeat(43);
 const canonical = '\u0647\u0627\u062a\u0641@example.test';
+const username = '\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u064a';
 const api = {
+  validateUsername: jest.fn(),
   start: jest.fn(),
   verifyEmail: jest.fn(),
   result: jest.fn(),
@@ -59,9 +61,11 @@ beforeEach(() => {
   });
   api.start.mockResolvedValue({
     canonical_email: canonical,
+    username_display: username,
     expires_at: new Date(Date.now() + 890000).toISOString(),
     email_sent: true,
   });
+  api.validateUsername.mockResolvedValue({ username_display: username, available: true });
   api.verifyEmail.mockResolvedValue(undefined);
   api.resendEmail.mockResolvedValue(undefined);
   api.result.mockResolvedValue({
@@ -95,6 +99,10 @@ afterEach(() => {
 });
 function enter(label: string, value: string) {
   const field = screen.getByLabelText<HTMLInputElement>(label);
+  if (field.name === 'phone') {
+    const chosen = document.querySelector<HTMLInputElement>('input[name="username"]');
+    if (chosen && !chosen.value) fireEvent.change(chosen, { target: { value: username } });
+  }
   fireEvent.change(field, { target: { value } });
   return field;
 }
@@ -140,6 +148,108 @@ it('renders safe inert no-JS registration and link pages without fake password s
   expect(RegistrationClient).not.toHaveBeenCalled();
 });
 
+it.each(['en', 'fa-IR'] as const)('requires a chosen username without browser syntax rules or automatic validation in %s', (locale) => {
+  render(<Registration />, { locale });
+  const chosen = screen.getByLabelText<HTMLInputElement>(locale === 'en' ? 'Username' : 'نام کاربری');
+  expect(chosen.required).toBe(true);
+  expect(chosen.dir).toBe('auto');
+  expect(chosen.hasAttribute('pattern')).toBe(false);
+  expect(chosen.hasAttribute('maxlength')).toBe(false);
+  enter(locale === 'en' ? 'Email address' : 'نشانی ایمیل', 'person@example.test');
+  enter(locale === 'en' ? 'Iranian mobile number' : 'شمارهٔ همراه ایران', '09123456789');
+  fireEvent.change(chosen, { target: { value: '' } });
+  fireEvent.submit(screen.getByRole('form', { name: locale === 'en' ? 'Create an account' : 'ساخت حساب' }));
+  expect(chosen.getAttribute('aria-invalid')).toBe('true');
+  expect(document.activeElement).toBe(chosen);
+  expect(api.start).not.toHaveBeenCalled();
+  expect(api.validateUsername).not.toHaveBeenCalled();
+});
+
+it('preserves the explicit username check and NFC accepted spelling through language changes without folding or starting delivery', async () => {
+  const raw = '\u0639\u0644\u064a.\u0645\u0648\u0654\u0645\u0646\u064a';
+  let finish!: (result: unknown) => void;
+  api.validateUsername.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const view = (locale: 'en' | 'fa-IR') => <I18nTestProvider locale={locale}><Registration /></I18nTestProvider>;
+  const { rerender } = render(view('en'));
+  const chosen = enter('Username', raw);
+  expect(api.validateUsername).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Check username' }));
+  expect(api.validateUsername).toHaveBeenCalledWith(raw, expect.any(AbortSignal));
+  const signal = api.validateUsername.mock.calls[0][1] as AbortSignal;
+  rerender(view('fa-IR'));
+  expect(screen.getByLabelText('نام کاربری')).toBe(chosen);
+  expect(chosen.value).toBe(raw);
+  expect(screen.getByRole('status').textContent).toContain('در حال بررسی نگارش');
+  expect(signal.aborted).toBe(false);
+  expect(api.validateUsername).toHaveBeenCalledTimes(1);
+  await act(async () => finish({ username_display: username, available: true }));
+  expect(chosen.value).toBe(username);
+  expect(screen.getByRole('status').textContent).toContain('رزرو نمی‌کند');
+  rerender(view('en'));
+  expect(screen.getByRole('status').textContent).toContain('does not reserve');
+  expect(chosen.value).toBe(username);
+  expect(api.start).not.toHaveBeenCalled();
+  expect(api.sendPhone).not.toHaveBeenCalled();
+  expect(api.dispose).not.toHaveBeenCalled();
+  expect(RegistrationClient).toHaveBeenCalledTimes(1);
+  enter('Username', '\u0643\u06cc\u0648\u0627\u0646');
+  expect(api.validateUsername).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole('status').textContent).toBe('');
+});
+
+it.each(['en', 'fa-IR'] as const)('shows advisory unavailable usernames without owner information or automatic delivery in %s', async (locale) => {
+  api.validateUsername.mockResolvedValueOnce({ username_display: username, available: false });
+  render(<Registration />, { locale });
+  const chosen = enter(locale === 'en' ? 'Username' : 'نام کاربری', username);
+  fireEvent.click(screen.getByRole('button', { name: locale === 'en' ? 'Check username' : 'بررسی نام کاربری' }));
+  await waitFor(() => expect(chosen.getAttribute('aria-invalid')).toBe('true'));
+  expect(chosen.value).toBe(username);
+  expect(api.start).not.toHaveBeenCalled();
+  expect(api.sendPhone).not.toHaveBeenCalled();
+  expect(api.validateUsername).toHaveBeenCalledTimes(1);
+});
+
+it.each(['username_unavailable', 'username_policy_changed'])('clears frozen registration after %s without automatic restart or native enrollment', async (error) => {
+  render(<Registration />);
+  await toPasskey();
+  api.passkeyOptions.mockRejectedValueOnce(new PortalError(error, 409));
+  fireEvent.click(screen.getByRole('button', { name: 'Create passkey and complete registration' }));
+  await screen.findByRole('button', { name: 'Start a new registration' });
+  expect(document.querySelector('[data-username-private], input')).toBeNull();
+  expect(api.dispose).toHaveBeenCalled();
+  expect(api.start).toHaveBeenCalledTimes(1);
+  expect(api.sendPhone).toHaveBeenCalledTimes(1);
+  expect(usePasskey).not.toHaveBeenCalled();
+  expect(api.complete).not.toHaveBeenCalled();
+});
+
+it('uses the server start display and keeps native enrollment stable during locale changes', async () => {
+  const accepted = '\u0643\u06cc\u0648\u0627\u0646';
+  api.start.mockResolvedValueOnce({ canonical_email: canonical, username_display: accepted, expires_at: new Date(Date.now() + 890000).toISOString(), email_sent: true });
+  const view = (locale: 'en' | 'fa-IR') => <I18nTestProvider locale={locale}><Registration /></I18nTestProvider>;
+  const { container, rerender } = render(view('en'));
+  await toPasskey();
+  const display = container.querySelector('[data-username-private]');
+  expect(display?.textContent).toBe(accepted);
+  expect(display?.getAttribute('dir')).toBe('auto');
+  const expiry = container.querySelector('time')?.dateTime;
+  let finish!: (result: Awaited<ReturnType<typeof usePasskey>>) => void;
+  jest.mocked(usePasskey).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  fireEvent.click(screen.getByRole('button', { name: 'Create passkey and complete registration' }));
+  await waitFor(() => expect(usePasskey).toHaveBeenCalledTimes(1));
+  rerender(view('fa-IR'));
+  expect(container.querySelector('[data-username-private]')).toBe(display);
+  expect(display?.textContent).toBe(accepted);
+  expect(container.querySelector('time')?.dateTime).toBe(expiry);
+  expect(api.passkeyOptions).toHaveBeenCalledTimes(1);
+  expect(usePasskey).toHaveBeenCalledTimes(1);
+  expect(api.validateUsername).not.toHaveBeenCalled();
+  await act(async () => finish({ id: 'attestation' } as Awaited<ReturnType<typeof usePasskey>>));
+  await screen.findByRole('link', { name: 'ورود با کلید عبور' });
+  expect(api.complete).toHaveBeenCalledTimes(1);
+  expect(api.start).toHaveBeenCalledTimes(1);
+});
+
 it('simulates the explicit full UI flow, canonical bidi display, leading-zero SMS and create=true passkey with no automatic delivery', async () => {
   const storage = jest.spyOn(Storage.prototype, 'setItem');
   const { container } = render(<Registration />);
@@ -156,6 +266,7 @@ it('simulates the explicit full UI flow, canonical bidi display, leading-zero SM
   expect(api.start.mock.calls[0][0]).toEqual({
     email: ` ${canonical.split('@')[0]}@EXAMPLE.test `,
     phone: '+989123456789',
+    username,
   });
   expect(container.querySelector('bdi')?.textContent).toBe(canonical);
   expect(container.querySelector('bdi')?.dir).toBe('ltr');
@@ -279,6 +390,7 @@ it('shows an opaque restart for a wrong-browser email proof without recovering s
 it('an email/SMS delivery failure is never ownership and never causes a billed automatic resend', async () => {
   api.start.mockResolvedValue({
     canonical_email: canonical,
+    username_display: username,
     expires_at: new Date(Date.now() + 890000).toISOString(),
     email_sent: false,
   });
@@ -326,7 +438,7 @@ async function expiringCompletion() {
   jest.useFakeTimers();
   const timers = jest.spyOn(window, 'setTimeout');
   const expires_at = new Date(Date.now() + 1379).toISOString();
-  api.start.mockResolvedValue({ canonical_email: canonical, expires_at, email_sent: true });
+  api.start.mockResolvedValue({ canonical_email: canonical, username_display: username, expires_at, email_sent: true });
   api.result.mockResolvedValue({
     state: 'pending',
     expires_at,
@@ -613,6 +725,7 @@ it.each(['cancel', 'pagehide', 'popstate', 'invalidation', 'sensitive-clear'])(
     await act(async () =>
       finish({
         canonical_email: canonical,
+        username_display: username,
         expires_at: new Date(Date.now() + 890000).toISOString(),
         email_sent: true,
       })
@@ -788,7 +901,7 @@ it.each([
   expect(api.start).not.toHaveBeenCalled();
   fireEvent.submit(screen.getByRole('form', { name: 'Create an account' }));
   await screen.findByRole('button', { name: 'Check email verification' });
-  expect(api.start.mock.calls[0][0]).toEqual({ email: exactEmail, phone: expected });
+  expect(api.start.mock.calls[0][0]).toEqual({ email: exactEmail, phone: expected, username });
   expect(api.sendPhone).not.toHaveBeenCalled();
   expect(api.resendEmail).not.toHaveBeenCalled();
 });
@@ -797,6 +910,7 @@ it('normalizes phone autofill at the submission boundary even without React chan
   render(<Registration />);
   enter('Email address', 'person@example.test');
   const phone = screen.getByLabelText<HTMLInputElement>('Iranian mobile number');
+  enter('Username', username);
   phone.value = '۰٩۱٢۳٤۵٦۷٨۹';
   fireEvent.submit(screen.getByRole('form', { name: 'Create an account' }));
   await screen.findByRole('button', { name: 'Check email verification' });
@@ -962,7 +1076,7 @@ it.each(['en', 'fa-IR'] as const)('preserves RTL-first international mailbox sel
   fireEvent.input(email, { target: { value: exact }, inputType: 'insertFromPaste' });
   expect(email.value).toBe(exact);
   const canonicalEmail = 'هاتف۱۲+news.!tag+paste@xn--bcher-kva.example';
-  api.start.mockResolvedValueOnce({ canonical_email: canonicalEmail, expires_at: new Date(Date.now() + 890000).toISOString(), email_sent: true });
+  api.start.mockResolvedValueOnce({ canonical_email: canonicalEmail, username_display: username, expires_at: new Date(Date.now() + 890000).toISOString(), email_sent: true });
   enter(other === 'en' ? 'Iranian mobile number' : 'شمارهٔ همراه ایران', '09123456789');
   expect(api.start).not.toHaveBeenCalled();
   fireEvent.submit(screen.getByRole('form', { name: other === 'en' ? 'Create an account' : 'ساخت حساب' }));
@@ -987,7 +1101,7 @@ it.each([
   jest.useFakeTimers();
   jest.setSystemTime(new Date('2026-11-08T20:45:10Z'));
   const expires_at = '2026-11-08T21:00:00Z';
-  api.start.mockResolvedValueOnce({ canonical_email: canonical, expires_at, email_sent: true });
+  api.start.mockResolvedValueOnce({ canonical_email: canonical, username_display: username, expires_at, email_sent: true });
   const view = (displayCalendar: 'gregory' | 'persian', zone: string) => <I18nTestProvider locale={locale} preferences={{ calendar: displayCalendar, timeZone: zone }}><Registration /></I18nTestProvider>;
   const { rerender, container } = render(view('gregory', 'UTC'));
   enter(locale === 'en' ? 'Email address' : 'نشانی ایمیل', 'person@example.test');

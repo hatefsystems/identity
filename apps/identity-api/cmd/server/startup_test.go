@@ -63,6 +63,7 @@ func productionStartupEnvironment(t *testing.T) {
 		"SESSION_IDLE_TTL":                    "2h",
 		"SMS_ENABLED":                         "false",
 		"REGISTRATION_ENABLED":                "false",
+		"USERNAME_ENABLED":                    "false",
 		"ADMIN_ENABLED":                       "false",
 		"GRPC_ENABLED":                        "false",
 		"GDPR_DELETION_ENABLED":               "false",
@@ -142,7 +143,7 @@ func TestDisabledRegistrationCompositionDoesNotLoadDeliveryOrCleanupSecrets(t *t
 	productionStartupEnvironment(t)
 	for _, mode := range []string{"development", "test", "production"} {
 		t.Run(mode, func(t *testing.T) {
-			service, ready, err := buildRegistrationService(mode, nil, nil, nil, nil)
+			service, ready, err := buildRegistrationService(mode, nil, nil, nil, nil, nil)
 			if err != nil || service != nil || ready != nil {
 				t.Fatalf("disabled registration acquired unrelated dependencies: %v", err)
 			}
@@ -175,6 +176,11 @@ func enabledRegistrationEnvironment(t *testing.T) {
 		"REGISTRATION_SMTP_FROM":            "signup@example.test",
 		"REGISTRATION_SMTP_PUBLIC_ORIGIN":   "https://identity.example.test",
 		"REGISTRATION_CLEANUP_DATABASE_URL": "",
+		"USERNAME_ENABLED":                  "true",
+		"USERNAME_POLICY_JSON":              `{"id":"4793a0e0-60b0-4571-a9b1-3879123819bb","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"reserved_names":[]}`,
+		"USERNAME_REGEX":                    `[\x{0639}\x{0644}\x{06CC}]+`,
+		"USERNAME_LOOKUP_KEY":               base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x61}, 32)),
+		"USERNAME_LOOKUP_KEY_ID":            "startup-fixture-v1",
 	} {
 		t.Setenv(name, value)
 	}
@@ -194,9 +200,34 @@ func TestEnabledRegistrationRequiresCleanupConfigurationBeforeDial(t *testing.T)
 
 func TestEnabledRegistrationCompositionNeverFallsBackToMemory(t *testing.T) {
 	enabledRegistrationEnvironment(t)
-	service, ready, err := buildRegistrationService("production", nil, nil, nil, nil)
+	service, ready, err := buildRegistrationService("production", nil, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "durable ownership") || service != nil || ready != nil {
 		t.Fatalf("enabled registration accepted missing authority: %v", err)
+	}
+}
+
+func TestRegistrationUsernamePolicyRequiredBeforeDial(t *testing.T) {
+	for _, setting := range []string{"USERNAME_ENABLED", "USERNAME_POLICY_JSON", "USERNAME_REGEX", "USERNAME_LOOKUP_KEY", "USERNAME_LOOKUP_KEY_ID"} {
+		t.Run(setting, func(t *testing.T) {
+			enabledRegistrationEnvironment(t)
+			t.Setenv("REGISTRATION_CLEANUP_DATABASE_URL", "postgres://127.0.0.1:1/cleanup?sslmode=disable")
+			t.Setenv(setting, "")
+			err := run(slog.New(slog.DiscardHandler))
+			if err == nil || !strings.Contains(err.Error(), "USERNAME") || strings.Contains(err.Error(), "ping redis") || strings.Contains(err.Error(), "ping database") {
+				t.Fatalf("missing username policy did not reject before dial: %v", err)
+			}
+		})
+	}
+}
+
+func TestDisabledUsernameCompositionIgnoresUnusedSecrets(t *testing.T) {
+	productionStartupEnvironment(t)
+	for _, setting := range []string{"USERNAME_POLICY_JSON", "USERNAME_REGEX", "USERNAME_LOOKUP_KEY", "USERNAME_LOOKUP_KEY_ID"} {
+		t.Setenv(setting, "unused-invalid-secret")
+	}
+	service, ready, err := buildUsernameService(nil)
+	if err != nil || service != nil || ready != nil {
+		t.Fatal("disabled usernames acquired dependency or parsed unused secrets", err)
 	}
 }
 

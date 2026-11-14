@@ -18,7 +18,10 @@ import (
 
 func registrationTestBody(operation string) string {
 	if operation == "start" {
-		return `{"email":"person@example.com","phone":"+989123456789"}`
+		return `{"email":"person@example.com","phone":"+989123456789","username":"\u0639\u0644\u06cc"}`
+	}
+	if operation == "validate" {
+		return `{"stage":"username","registration":{"username":"\u0639\u0644\u06cc"}}`
 	}
 	key := "capability"
 	if operation == "email/verify" {
@@ -36,7 +39,7 @@ func registrationTestBody(operation string) string {
 	return string(encoded)
 }
 func TestRegistrationDeclaredFieldsAndAuthority(t *testing.T) {
-	for _, operation := range []string{"start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
+	for _, operation := range []string{"validate", "start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
 		t.Run(operation, func(t *testing.T) {
 			body := registrationTestBody(operation)
 			if _, err := readRegistrationRequest(httptest.NewRequest(http.MethodPost, registrationPath, strings.NewReader(body)), operation); err != nil {
@@ -64,7 +67,7 @@ func TestRegistrationDeclaredFieldsAndAuthority(t *testing.T) {
 func TestRegistrationAllRoutesOriginDPoPNoStoreAndDisabled(t *testing.T) {
 	client := newPortalTestClient(t, testPortalOrigin)
 	s := New(config.Config{PortalOrigin: testPortalOrigin}, nil, Deps{Registration: &registration.Service{}, DPoPValidator: client.validator})
-	for _, operation := range []string{"start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
+	for _, operation := range []string{"validate", "start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
 		path := registrationPath
 		if operation != "" {
 			path += "/" + operation
@@ -89,6 +92,65 @@ func TestRegistrationErrorsNeverExposeDiagnostics(t *testing.T) {
 		s.writeRegistrationError(w, err)
 		if strings.Contains(w.Body.String(), "private") || strings.Contains(w.Body.String(), "secret") {
 			t.Fatal("raw diagnostic exposed")
+		}
+	}
+}
+
+func TestRegistrationUsernameWireRejectsCallerAuthorityAndDeferredFields(t *testing.T) {
+	for _, body := range []string{
+		`{"stage":"full","registration":{"username":"\u0639\u0644\u06cc"}}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc","username_security":"forged"}}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc","username_key":"forged"}}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc","policy_id":"forged"}}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc","given_name":"deferred"}}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc","username":"\u0635"}}`,
+		`{"stage":"username","registration":{"Username":"\u0639\u0644\u06cc"}}`,
+		`{"stage":"username","registration":{"username":null}}`,
+		`{"stage":"username","registration":{"username":"\ud800"}}`,
+		`{"stage":"username","registration":{"username":true}}`,
+		`{"stage":"username","registration":null}`,
+		`{"stage":"username","registration":{"username":"\u0639\u0644\u06cc"},"password":"deferred"}`,
+	} {
+		if _, err := readRegistrationRequest(httptest.NewRequest(http.MethodPost, registrationPath+"/validate", strings.NewReader(body)), "validate"); err == nil {
+			t.Fatal("undeclared username input or malformed Unicode admitted")
+		}
+	}
+	for _, body := range []string{
+		`{"email":"person@example.com","phone":"+989123456789"}`,
+		`{"email":"person@example.com","phone":"+989123456789","username":null}`,
+		`{"email":"person@example.com","phone":"+989123456789","username":"\ud800"}`,
+		strings.TrimSuffix(registrationTestBody("start"), "}") + `,"username_display":"forged"}`,
+	} {
+		if _, err := readRegistrationRequest(httptest.NewRequest(http.MethodPost, registrationPath+"/start", strings.NewReader(body)), "start"); err == nil {
+			t.Fatal("start accepted missing username or caller-normalized authority")
+		}
+	}
+}
+
+func TestRegistrationUsernameErrorStatusAndMinimalFields(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+		field  bool
+	}{
+		{registration.ErrInvalidUsername, http.StatusBadRequest, "invalid_username", true},
+		{registration.ErrUsernameUnavailable, http.StatusConflict, "username_unavailable", true},
+		{registration.ErrUsernamePolicyChanged, http.StatusConflict, "username_policy_changed", false},
+	} {
+		w := httptest.NewRecorder()
+		(&Server{}).writeRegistrationError(w, tc.err)
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || w.Code != tc.status || string(body["error"]) != `"`+tc.code+`"` {
+			t.Fatalf("username error contract changed: status=%d body=%s", w.Code, w.Body.String())
+		}
+		if tc.field {
+			var fields map[string]string
+			if json.Unmarshal(body["field_errors"], &fields) != nil || len(fields) != 1 || fields["username"] != tc.code || len(body) != 2 {
+				t.Fatal("username field error disclosed additional identity data")
+			}
+		} else if len(body) != 1 {
+			t.Fatal("policy mismatch exposed authority or private diagnostics")
 		}
 	}
 }

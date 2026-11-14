@@ -21,12 +21,14 @@ export function Overview() {
     remaining: number;
     low: boolean;
   } | null>(null);
+  const [username, setUsername] = useState<{ display: string } | null>();
   const [error, setError] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     setError('');
     setSummary(null);
+    setUsername(undefined);
     Promise.all([
       client.keys(controller.signal),
       client.sessions(controller.signal),
@@ -40,6 +42,14 @@ export function Overview() {
           remaining: recovery.remaining,
           low: recovery.low,
         });
+      })
+      .catch((failure) => {
+        if (!controller.signal.aborted && !isAborted(failure)) setError(errorMessage(failure));
+      });
+    client.username(controller.signal)
+      .then((result) => {
+        throwIfAborted(controller.signal);
+        setUsername(result);
       })
       .catch((failure) => {
         if (!controller.signal.aborted && !isAborted(failure)) setError(errorMessage(failure));
@@ -65,6 +75,16 @@ export function Overview() {
               {(['active', 'disabled', 'suspended', 'pending_deletion'] as const)
                 .map((value) => (value === profile.status ? t(`portal.status.${value}`) : ''))
                 .join('') || profile.status}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">{t('portal.overview.username')}</dt>
+            <dd className="mt-1 break-words font-medium" data-username-private>
+              {username === undefined
+                ? t('portal.overview.usernameUnknown')
+                : username
+                  ? <bdi dir="auto">{username.display}</bdi>
+                  : t('portal.overview.usernameAbsent')}
             </dd>
           </div>
         </dl>

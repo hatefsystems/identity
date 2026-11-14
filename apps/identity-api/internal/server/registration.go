@@ -22,7 +22,7 @@ import (
 const registrationPath = "/api/v1/auth/register"
 
 func (s *Server) registerRegistrationRoutes() {
-	for _, operation := range []string{"start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
+	for _, operation := range []string{"validate", "start", "email/resend", "email/verify", "phone/send", "phone/verify", "passkey/options", "", "result"} {
 		path := registrationPath
 		if operation != "" {
 			path += "/" + operation
@@ -32,9 +32,9 @@ func (s *Server) registerRegistrationRoutes() {
 }
 
 type registrationRequest struct {
-	Email, Phone, Capability, Token, VerificationID, Code string
-	AttemptID                                             uuid.UUID
-	Credential                                            json.RawMessage
+	Email, Phone, Username, Capability, Token, VerificationID, Code string
+	AttemptID                                                       uuid.UUID
+	Credential                                                      json.RawMessage
 }
 
 // Request bodies are exact, case-sensitive contracts, including nested
@@ -54,8 +54,10 @@ func readRegistrationRequest(r *http.Request, operation string) (registrationReq
 	}
 	names := []string{"attempt_id", "capability"}
 	switch operation {
+	case "validate":
+		names = []string{"stage", "registration"}
 	case "start":
-		names = []string{"email", "phone"}
+		names = []string{"email", "phone", "username"}
 	case "email/verify":
 		names = []string{"attempt_id", "token"}
 	case "phone/verify":
@@ -80,6 +82,14 @@ func readRegistrationRequest(r *http.Request, operation string) (registrationReq
 			request.Credential = raw
 			continue
 		}
+		if name == "registration" {
+			nested, ok := exactObject(raw, []string{"username"}, nil)
+			if !ok {
+				return registrationRequest{}, invalid
+			}
+			raw = nested["username"]
+			name = "username"
+		}
 		var value *string
 		if json.Unmarshal(raw, &value) != nil || value == nil || len(raw) < 2 || raw[0] != '"' || !validNameJSONString(raw) {
 			return registrationRequest{}, invalid
@@ -88,11 +98,15 @@ func readRegistrationRequest(r *http.Request, operation string) (registrationReq
 	}
 	request.Email = values["email"]
 	request.Phone = values["phone"]
+	request.Username = values["username"]
 	request.Capability = values["capability"]
 	request.Token = values["token"]
 	request.VerificationID = values["verification_id"]
 	request.Code = values["code"]
-	if operation != "start" {
+	if operation == "validate" && values["stage"] != "username" {
+		return registrationRequest{}, invalid
+	}
+	if operation != "start" && operation != "validate" {
 		id, err := uuid.Parse(values["attempt_id"])
 		if err != nil || id == uuid.Nil || id.String() != values["attempt_id"] {
 			return registrationRequest{}, invalid
@@ -213,14 +227,23 @@ func (s *Server) handleRegistration(operation string) http.HandlerFunc {
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
+			if operation == "validate" {
+				result, err := s.deps.Registration.ValidateUsername(ctx, request.Username, clientip.FromRequest(r))
+				if err != nil {
+					s.writeRegistrationError(w, err)
+					return
+				}
+				writeJSON(w, http.StatusOK, result)
+				return
+			}
 			if operation == "start" {
-				result, err := s.deps.Registration.Start(ctx, request.Email, request.Phone, proof.JKT, clientip.FromRequest(r))
+				result, err := s.deps.Registration.Start(ctx, request.Email, request.Phone, request.Username, proof.JKT, clientip.FromRequest(r))
 				if err != nil {
 					s.writeRegistrationError(w, err)
 					return
 				}
 				defer clear(result.Capability)
-				writeJSON(w, http.StatusCreated, map[string]any{"attempt_id": result.Attempt.Record.ID.String(), "capability": base64.RawURLEncoding.EncodeToString(result.Capability), "canonical_email": result.Attempt.Details.Email, "expires_at": result.Attempt.Record.ExpiresAt.Time, "email_sent": result.EmailSent})
+				writeJSON(w, http.StatusCreated, map[string]any{"attempt_id": result.Attempt.Record.ID.String(), "capability": base64.RawURLEncoding.EncodeToString(result.Capability), "canonical_email": result.Attempt.Details.Email, "username_display": result.Attempt.Details.UsernameDisplay, "expires_at": result.Attempt.Record.ExpiresAt.Time, "email_sent": result.EmailSent})
 				return
 			}
 			if operation == "email/verify" {
@@ -281,7 +304,14 @@ func (s *Server) handleRegistration(operation string) http.HandlerFunc {
 
 func (s *Server) writeRegistrationError(w http.ResponseWriter, err error) {
 	status, code := http.StatusServiceUnavailable, "temporarily_unavailable"
+	fieldError := ""
 	switch {
+	case errors.Is(err, registration.ErrInvalidUsername):
+		status, code, fieldError = http.StatusBadRequest, "invalid_username", "invalid_username"
+	case errors.Is(err, registration.ErrUsernameUnavailable):
+		status, code, fieldError = http.StatusConflict, "username_unavailable", "username_unavailable"
+	case errors.Is(err, registration.ErrUsernamePolicyChanged):
+		status, code = http.StatusConflict, "username_policy_changed"
 	case errors.Is(err, registration.ErrInvalid):
 		status, code = http.StatusBadRequest, "invalid_request"
 	case errors.Is(err, registration.ErrUnauthorized):
@@ -305,5 +335,9 @@ func (s *Server) writeRegistrationError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", "60")
 	}
 	// Never log the underlying error: DB/provider diagnostics can contain PII.
-	writeJSON(w, status, map[string]string{"error": code})
+	response := map[string]any{"error": code}
+	if fieldError != "" {
+		response["field_errors"] = map[string]string{"username": fieldError}
+	}
+	writeJSON(w, status, response)
 }

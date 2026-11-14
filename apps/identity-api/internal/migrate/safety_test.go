@@ -195,7 +195,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 		// when the provisioning role owns every object.
 		execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 		statuses, err := p.Status(ctx)
-		if err != nil || len(statuses) != 2 || statuses[0].State != goose.StatePending || statuses[1].State != goose.StatePending {
+		if err != nil || len(statuses) != 3 || statuses[0].State != goose.StatePending || statuses[1].State != goose.StatePending || statuses[2].State != goose.StatePending {
 			t.Fatalf("fresh status: %+v, %v", statuses, err)
 		}
 		if version, err := p.GetDBVersion(ctx); err != nil || version != 0 {
@@ -212,18 +212,18 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	before := metadataSnapshot(ctx, t, database)
 	execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 	statuses, err := p.Status(ctx)
-	if err != nil || len(statuses) != 2 || statuses[0].State != goose.StateApplied || statuses[0].AppliedAt.IsZero() ||
-		statuses[1].State != goose.StateApplied || statuses[1].AppliedAt.IsZero() {
+	if err != nil || len(statuses) != 3 || statuses[0].State != goose.StateApplied || statuses[0].AppliedAt.IsZero() ||
+		statuses[1].State != goose.StateApplied || statuses[1].AppliedAt.IsZero() || statuses[2].State != goose.StateApplied || statuses[2].AppliedAt.IsZero() {
 		t.Fatalf("installed read-only status: %+v, %v", statuses, err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 3 {
 		t.Fatalf("installed read-only version: %d, %v", version, err)
 	}
 	execFixture(ctx, t, database, `SET default_transaction_read_only=off`)
 	for _, run := range []func() error{
 		func() error { _, err := p.Up(ctx); return err },
 		func() error { _, err := p.UpTo(ctx, 1); return err },
-		func() error { _, err := p.DownTo(ctx, 2); return err },
+		func() error { _, err := p.DownTo(ctx, 3); return err },
 		func() error { _, err := p.Status(ctx); return err },
 	} {
 		if err := run(); err != nil {
@@ -233,7 +233,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	if _, err := p.UpByOne(ctx); !errors.Is(err, goose.ErrNoNextVersion) {
 		t.Fatalf("up-by-one noop: %v", err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 3 {
 		t.Fatalf("installed version: %d, %v", version, err)
 	}
 	if after := metadataSnapshot(ctx, t, database); before != after {
@@ -392,7 +392,7 @@ func TestRegistrationMigrationFromBaselineAndAtomicFailure(t *testing.T) {
 	if _, err := fresh.Up(ctx); err != nil {
 		t.Fatalf("baseline-only retry to registration schema: %v", err)
 	}
-	if version, err := fresh.GetDBVersion(ctx); err != nil || version != 2 {
+	if version, err := fresh.GetDBVersion(ctx); err != nil || version != 3 {
 		t.Fatalf("retry version: %d, %v", version, err)
 	}
 	before := metadataSnapshot(ctx, t, database)
@@ -407,6 +407,69 @@ func TestRegistrationMigrationFromBaselineAndAtomicFailure(t *testing.T) {
 		if before != metadataSnapshot(ctx, t, database) {
 			t.Fatal("registration down failure modified storage or migration metadata")
 		}
+	}
+}
+
+func TestUsernameMigrationIncrementalAtomicFailureAndUnexpectedSchema(t *testing.T) {
+	for _, legacyColumn := range []string{"none", "username_key", "username"} {
+		t.Run(legacyColumn, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+			database := openTestDB(ctx, t)
+			p := testSources(t, database, false)
+			if _, err := p.Up(ctx); err != nil {
+				t.Fatal(err)
+			}
+			execFixture(ctx, t, database, `INSERT INTO users(email) VALUES('legacy@username.invalid')`)
+			raw, err := db.Migrations.ReadFile("migrations/00003_username_reservations.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if legacyColumn != "none" {
+				// Unexpected populated legacy schema is a blocker, never an implicit
+				// backfill, uniqueness installation or empty-inventory assertion.
+				if legacyColumn == "username_key" {
+					execFixture(ctx, t, database, `ALTER TABLE users ADD COLUMN username_key BYTEA; UPDATE users SET username_key=sha256('legacy-reservation')`)
+				} else {
+					execFixture(ctx, t, database, `ALTER TABLE users ADD COLUMN username TEXT; UPDATE users SET username='legacy-reservation'`)
+				}
+			} else {
+				raw = []byte(strings.Replace(string(raw), "-- +goose Down", "SELECT 1/0;\n-- +goose Down", 1))
+			}
+			p.files.(fstest.MapFS)["00003_username_reservations.sql"] = &fstest.MapFile{Data: raw}
+			if _, err := p.Up(ctx); err == nil {
+				t.Fatal("unsafe/failed username migration succeeded")
+			}
+			if version, err := p.GetDBVersion(ctx); err != nil || version != 2 {
+				t.Fatal("failed migration damaged prior lineage", version, err)
+			}
+			var registry bool
+			if err := database.QueryRowContext(ctx, `SELECT to_regclass('public.username_policy_artifacts') IS NOT NULL`).Scan(&registry); err != nil || registry {
+				t.Fatal("partial username registry survived failed migration")
+			}
+			if legacyColumn != "none" {
+				var preserved bool
+				query := `SELECT username_key=sha256('legacy-reservation') FROM users WHERE email='legacy@username.invalid'`
+				if legacyColumn == "username" {
+					query = `SELECT username='legacy-reservation' FROM users WHERE email='legacy@username.invalid'`
+				}
+				if err := database.QueryRowContext(ctx, query).Scan(&preserved); err != nil || !preserved {
+					t.Fatal("unexpected legacy reservation changed")
+				}
+				return
+			}
+			fresh, err := NewProvider(database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fresh.Up(ctx); err != nil {
+				t.Fatal("safe fresh retry failed", err)
+			}
+			var unclaimed bool
+			if err := database.QueryRowContext(ctx, `SELECT username_key IS NULL AND username_details_encrypted IS NULL AND username_policy_id IS NULL AND username_policy_epoch IS NULL FROM users WHERE email='legacy@username.invalid'`).Scan(&unclaimed); err != nil || !unclaimed {
+				t.Fatal("migration fabricated a legacy username")
+			}
+		})
 	}
 }
 
@@ -594,7 +657,7 @@ func TestCompetingFreshMigratorsSerialize(t *testing.T) {
 		t.Fatal("no competing migrator completed successfully")
 	}
 	var count int
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 3 {
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 4 {
 		t.Fatalf("approved migrations not installed exactly once: %d, %v", count, err)
 	}
 	database.SetMaxOpenConns(1)
