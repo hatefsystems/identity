@@ -662,7 +662,15 @@ async function layout(page, name, evidence, artifactDirectory) {
           await controls.first().focus();
           await page.keyboard.press('Shift+Tab');
           const entryFailures = await page.evaluate(adminAppearance, { focusedOnly: true });
-          if (entryFailures.length) console.error(JSON.stringify({ check: 'admin-table-entry-focus', viewport, dark, failures: entryFailures }));
+          if (entryFailures.length) {
+            const metrics = await page.evaluate(() => {
+              const node = document.activeElement, r = node.getBoundingClientRect();
+              return { tag: node.tagName, width: r.width, height: r.height, left: r.left, right: r.right,
+                top: r.top, bottom: r.bottom, viewportWidth: innerWidth, viewportHeight: innerHeight,
+                resultFrame: node.matches('[role="region"]') && Boolean(node.closest('[data-result-view]')) };
+            });
+            console.error(JSON.stringify({ check: 'admin-table-entry-focus', viewport, dark, failures: entryFailures, metrics }));
+          }
           assert.deepEqual(entryFailures, [], 'Admin table entry focus regressed');
           for (let index = 0; index < await controls.count(); index++) {
             await page.keyboard.press('Tab');
@@ -1217,6 +1225,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     assert(await input.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
       'Legal cancellation left detached narrative input');
     await input.dispose();
+    checkpoint = 'legal-privacy-expiry';
     verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
     const expired = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
     await expired.fill(markers.expiredDraft);
@@ -1224,6 +1233,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     assert(await expired.evaluate((element) => element.value === '' && element.defaultValue === '' && element.textContent === ''),
       'Grant expiry left a detached legal narrative');
     await expired.dispose();
+    checkpoint = 'legal-privacy-intent-resume';
     await second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }).click();
     let dialog = second.page.getByTestId('stepup-dialog');
     await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
@@ -1237,6 +1247,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
     assert.equal(await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).inputValue(), '');
     await second.page.keyboard.press('Escape');
+    checkpoint = 'legal-privacy-hidden-draft';
     verified = await verify(second, second.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
     const hidden = await verified.dialog.getByLabel(localizedText('Reason'), { exact: true }).elementHandle();
     await hidden.fill(markers.backgroundDraft);
@@ -1252,6 +1263,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
 
   // Delay a real successful disclosure at Chromium's response boundary; never
   // fetch/replay it through a second HTTP stack or save its body in an artifact.
+  checkpoint = 'legal-privacy-late-disclosure';
   const cdp = second.authenticator.cdp;
   verified = await prepareLookup(second);
   const arrived = deferred();

@@ -237,7 +237,7 @@ func newSignupIntegration(t *testing.T) *signupIntegration {
 		t.Fatal(err)
 	}
 	database := &signupIntegrationDB{Pool: pool}
-	usernames := signupIntegrationUsernames(t, ctx, database, cipher)
+	usernames := signupIntegrationUsernames(ctx, t, database, cipher)
 	store, err := registration.NewStore(database, cipher, 100, usernames)
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +257,7 @@ func newSignupIntegration(t *testing.T) *signupIntegration {
 	return &signupIntegration{ctx: ctx, database: database, cipher: cipher, index: index, limiter: limiter, mail: mail, sender: sender, phone: phone, otps: otps, wa: wa, store: store, usernames: usernames, service: service, server: server, client: browser, subnet: binary.BigEndian.Uint32(network[:4])}
 }
 
-func signupIntegrationUsernames(t *testing.T, ctx context.Context, database *signupIntegrationDB, cipher *envelope.Encryptor) *username.Store {
+func signupIntegrationUsernames(ctx context.Context, t *testing.T, database *signupIntegrationDB, cipher *envelope.Encryptor) *username.Store {
 	t.Helper()
 	policy := username.Policy{
 		ID: uuid.New(), Normalization: username.NormalizationV1,

@@ -23,6 +23,13 @@
 
 <!-- nx configuration end-->
 
+# Task completion verification
+
+- Before completing any code, configuration or test task, load the `task-verification` skill. If the skill is not available in the current session, read `.agents/skills/task-verification/SKILL.md` directly.
+- Run its required local CI gates once against the final combined working-tree changes, including staged, unstaged and untracked files. Do not run the entire suite after every edit or separately for each collaborating agent; the integrating agent owns the final verification pass.
+- Fix failures before declaring completion. Changes or conflict resolutions after a check invalidate affected evidence; rerun only the invalidated gates. Do not treat skipped tests, cached browser evidence, incomplete teardown or a different source identity as a passing run.
+- Keep `.github/workflows/identity-api.yml` and resolved Nx targets as the command/toolchain authority. Report each required gate as passed, failed or not run with a concrete reason; do not weaken CI or security assertions to obtain a green result.
+
 # Localization conventions
 
 - Read `docs/localization.md` before changing presentation, preferences or notification templates.

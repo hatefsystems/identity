@@ -10,6 +10,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
+// UsernameReader reads ownership after checking the account's current auth version.
 type UsernameReader interface {
 	Get(context.Context, uuid.UUID, int64) (*username.ReadResult, error)
 }

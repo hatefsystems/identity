@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { registrationUsernameFixture } from './registration-browser.mjs';
 
 const require = createRequire(import.meta.url);
 const { parse } = require('yaml');
@@ -31,8 +32,8 @@ const productionEnv = {
   OIDC_SIGNING_KEY_ACTIVE_PEM: 'test-active',
   OIDC_SIGNING_KEY_NEXT_PEM: 'test-next',
 };
-function config(file, env = {}) {
-  const result = spawnSync(
+function renderConfig(file, env = {}) {
+  return spawnSync(
     'docker',
     [
       'compose',
@@ -50,6 +51,9 @@ function config(file, env = {}) {
       windowsHide: true,
     }
   );
+}
+function config(file, env = {}) {
+  const result = renderConfig(file, env);
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
@@ -89,6 +93,7 @@ test('full local Compose renders with gated migration, persistent secrets and on
 });
 
 const registrationEnv = {
+  ...registrationUsernameFixture().environment,
   SMS_GATEWAY_API_KEY: 'test-provider-key',
   SMS_IR_TEMPLATE_ID: '123',
   SMS_IR_CODE_PARAMETER: 'Code',
@@ -109,6 +114,13 @@ test('real signup overlay gates API on a dedicated worker without passing provid
   const { services } = config(['compose.yaml', 'compose.registration.yaml'], registrationEnv);
   const env = services.api.environment;
   assert.equal(env.REGISTRATION_ENABLED, 'true');
+  for (const [key, value] of Object.entries(registrationEnv)) {
+    if (key.startsWith('USERNAME_')) {
+      assert.ok(env[key] === value, `username fixture environment mismatch: ${key}`);
+      assert.ok(services['registration-setup'].environment[key] === undefined, `${key} reached setup`);
+      assert.ok(services['registration-cleanup'].environment[key] === undefined, `${key} reached cleanup`);
+    }
+  }
   assert.equal(env.SMS_ENABLED, 'true');
   assert.equal(env.SMS_IR_KEY_MODE, 'live');
   assert.equal(env.REGISTRATION_PENDING_CAPACITY, env.SMS_OTP_MAX_PENDING_SIGNUP);
@@ -118,6 +130,12 @@ test('real signup overlay gates API on a dedicated worker without passing provid
     services['registration-cleanup'].depends_on['registration-setup'].condition,
     'service_completed_successfully'
   );
+  assert.deepEqual(Object.keys(services['registration-cleanup'].depends_on).sort(), [
+    'postgres',
+    'registration-setup',
+  ]);
+  assert.deepEqual(Object.keys(services['registration-setup'].depends_on), ['migrate']);
+  assert.deepEqual(Object.keys(services.migrate.depends_on), ['postgres']);
   assert.match(env.REGISTRATION_CLEANUP_DATABASE_URL, /\/\/identity_registration_cleanup:/);
   assert.deepEqual(Object.keys(services['registration-cleanup'].environment).sort(), [
     'APP_ENV',
@@ -128,6 +146,38 @@ test('real signup overlay gates API on a dedicated worker without passing provid
   assert.equal(services['registration-cleanup'].ports, undefined);
   assert.equal(services['registration-setup'].ports, undefined);
   assert.equal(config('compose.yaml').services.api.environment.REGISTRATION_ENABLED, 'false');
+});
+
+test('registration overlay refuses every missing username authority input instead of supplying defaults', async (t) => {
+  for (const key of [
+    'USERNAME_REGEX',
+    'USERNAME_POLICY_JSON',
+    'USERNAME_LOOKUP_KEY',
+    'USERNAME_LOOKUP_KEY_ID',
+  ]) {
+    await t.test(key, () => {
+      const result = renderConfig(['compose.yaml', 'compose.registration.yaml'], {
+        ...registrationEnv,
+        [key]: '',
+      });
+      assert.notEqual(result.status, 0);
+      assert.ok(result.stderr.includes(key), 'missing authority must fail interpolation');
+    });
+  }
+  assert.equal(config('compose.yaml').services.api.environment.USERNAME_ENABLED, undefined);
+});
+
+test('worker-only registration acceptance reuses explicit authority inputs without installing or activating them', () => {
+  const source = readFileSync(
+    new URL('../../tools/docker/smoke-registration-config.mjs', import.meta.url),
+    'utf8'
+  );
+  assert.match(source, /import \{ registrationUsernameFixture \} from/);
+  assert.match(source, /\.\.\.registrationUsernameFixture\(\)\.environment/);
+  assert.doesNotMatch(source, /\.seedSQL|INSERT INTO public\.username_|UPDATE public\.username_active_policy/);
+  assert.match(source, /admission_state='uninstalled'/);
+  assert.match(source, /'provider test must not start API'/);
+  assert.match(source, /throw new Error\('Local registration Compose command failed'\)/);
 });
 
 test('registration secrets file is ignored without excluding its public template', () => {

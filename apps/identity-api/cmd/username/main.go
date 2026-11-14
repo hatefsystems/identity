@@ -10,13 +10,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -148,7 +150,7 @@ func run(args []string, out, diagnostic io.Writer) int {
 }
 
 func readBounded(path string, limit int) ([]byte, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}

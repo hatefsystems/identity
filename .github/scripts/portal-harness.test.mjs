@@ -330,7 +330,7 @@ test('portal key storage and clean reject an extra private object store beside a
 
 test('admin appearance rejects undersized pointer targets, weak contrast and invisible or clipped keyboard focus', () => {
   const inspect = ({ checkbox = false, width = 44, labelWidth = 44, labelled = true, focused = true,
-    color = 'rgb(0, 0, 0)', shadow = 'rgb(0, 0, 0) 0px 0px 0px 2px', left = 0, focusedOnly = false,
+    color = 'rgb(0, 0, 0)', shadow = 'rgb(0, 0, 0) 0px 0px 0px 2px', left = 0, top = 0, height = 44, focusedOnly = false,
     forcedColors = false, outlineStyle = 'none', outlineWidth = '0px', forcedColorAdjust = 'auto' } = {}) => {
     const style = {
       color, backgroundColor: 'rgb(255, 255, 255)', fontSize: '16px', fontWeight: '400',
@@ -341,7 +341,7 @@ test('admin appearance rejects undersized pointer targets, weak contrast and inv
       getClientRects: () => [{}], checkVisibility: () => true, closest: () => null,
       matches: (selector) => selector === ':focus-visible' ? focused :
         checkbox && ['input[type=checkbox]', 'input, select, textarea'].includes(selector),
-      getBoundingClientRect: () => ({ left, right: left + size, top: 0, bottom: 44, width: size, height: 44 }),
+      getBoundingClientRect: () => ({ left, right: left + size, top, bottom: top + height, width: size, height }),
     });
     const control = element(checkbox ? 20 : width);
     control.labels = labelled ? [element(labelWidth)] : [];
@@ -364,6 +364,12 @@ test('admin appearance rejects undersized pointer targets, weak contrast and inv
   assert(inspect({ checkbox: true, labelled: false }).includes('Admin checkbox lacks a visible associated label'));
   assert(inspect({ color: 'rgb(200, 200, 200)' }).includes('Admin text contrast is below its readable-size threshold'));
   assert.deepEqual(inspect({ focusedOnly: true }), []);
+  assert.deepEqual(inspect({ focusedOnly: true, top: 2, height: 252 }), []);
+  assert(inspect({ focusedOnly: true, top: 8, height: 252 }).includes('Admin keyboard target is outside the viewport'),
+    'A viewport-fitting frame must not lose its bottom to scroll-margin alignment');
+  assert(inspect({ focusedOnly: true, top: 8, height: 256 }).includes('Admin keyboard target is outside the viewport'));
+  assert.deepEqual(inspect({ focusedOnly: true, top: 8, height: 257 }), [],
+    'An oversized result still requires the existing visible 44px minimum');
   assert(inspect({ focusedOnly: true, forcedColors: true }).includes('Admin keyboard target lacks a 2px, 3:1 focus indicator'));
   assert.deepEqual(inspect({ focusedOnly: true, forcedColors: true, shadow: 'none', outlineStyle: 'solid', outlineWidth: '2px' }), []);
   assert(inspect({ forcedColors: true, forcedColorAdjust: 'none' }).includes('Admin control suppresses forced colors'));

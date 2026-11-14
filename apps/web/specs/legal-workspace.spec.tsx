@@ -668,8 +668,12 @@ describe.each(['en', 'fa-IR'] as const)('stable compact legal results in %s', (l
     expect(within(rows[0]).getByText('2026-11-08 21:00:00.123456789 UTC')).toBeTruthy();
     expect(within(rows[1]).getByText(optional).textContent).toBe(optional);
     expect(rows[1].querySelector('script, a')).toBeNull();
+    frame.focus();
+    expect(document.activeElement).toBe(frame);
+    expect(frame.scrollIntoView).toHaveBeenLastCalledWith({ block: 'center', inline: 'nearest' });
     const select = within(rows[1]).getByRole('button', { name: names.select });
     select.focus();
+    expect(select.scrollIntoView).toHaveBeenLastCalledWith({ block: 'nearest', inline: 'nearest' });
     viewport(false);
     expect(document.activeElement).toBe(select);
     fireEvent.click(select);

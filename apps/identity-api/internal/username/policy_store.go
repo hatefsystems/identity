@@ -6,10 +6,11 @@ import (
 	"crypto/sha256"
 	"regexp"
 
+	"github.com/jackc/pgx/v5"
+
 	schema "github.com/hatefsystems/identity/apps/identity-api/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/dbprivilege"
-	"github.com/jackc/pgx/v5"
 )
 
 // CheckSchema verifies the global nonpartial constraint and enabled immutable

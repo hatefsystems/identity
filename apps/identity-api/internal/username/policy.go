@@ -16,15 +16,17 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+// Username policy limits and versions bound the approved normalization artifacts.
 const (
 	MaxUsernameBytes = 1024
 	MaxRegexBytes    = 4096
 	MaxArtifactBytes = 16 * 1024
 	NormalizationV1  = "nfc-four-fold-v1"
-	// Changes to this implementation or its pinned dependency change the artifact.
+	// ImplementationVersion pins the implementation and dependency in each artifact.
 	ImplementationVersion = "hatef.username.v1;golang.org/x/text@v0.40.0"
 )
 
+// Username errors distinguish invalid input, authority drift and protected data failures.
 var (
 	ErrInvalidPolicy    = errors.New("username: invalid or unsupported policy")
 	ErrInvalidUsername  = errors.New("username: invalid username")

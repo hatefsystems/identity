@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/dbprivilege"
-	"github.com/jackc/pgx/v5"
 )
 
 // ErrIncomplete never denotes clearance, even if the visited prefix was clean.
@@ -173,9 +174,9 @@ func Preflight(ctx context.Context, database Database, cipher Cipher, current, c
 		// Fetch one row past the total ceiling to distinguish exact completion
 		// from a truncated inventory without misclassifying a clean prefix.
 		pageSize := options.PageSize
-		remaining := options.MaxRows - report.Scanned
-		if int64(pageSize) > remaining+1 {
-			pageSize = int32(remaining + 1)
+		remaining := options.MaxRows - report.Scanned + 1
+		if remaining >= 1 && remaining <= 1000 && int64(pageSize) > remaining {
+			pageSize = int32(remaining)
 		}
 		rows, err := q.ScanUsernameInventory(ctx, db.ScanUsernameInventoryParams{AfterID: after, PageSize: pageSize, FirstPage: first})
 		if err != nil {
@@ -254,8 +255,8 @@ func reference(key []byte, kind, value string) string {
 	return hex.EncodeToString(mac.Sum(nil)[:16])
 }
 
-func (r *PreflightReport) addIssue(max int, kind string, refs ...string) {
-	if len(r.Issues) >= max {
+func (r *PreflightReport) addIssue(limit int, kind string, refs ...string) {
+	if len(r.Issues) >= limit {
 		r.IssuesTruncated = true
 		return
 	}

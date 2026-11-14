@@ -525,6 +525,28 @@ describe.each(['en', 'fa-IR'] as const)('stable compact admin results in %s', (l
     ? { rows: 'Compact rows', table: 'Table view', accounts: 'Account results', view: 'Account result view', apply: 'Apply filters' }
     : { rows: 'ردیف‌های فشرده', table: 'نمای جدول', accounts: 'نتایج حساب‌ها', view: 'نمای نتایج حساب‌ها', apply: 'اعمال فیلترها' };
 
+  it.each([-4, 0, 1])('reveals frame focus at viewport height offset %p without changing row focus or querying again', async (extra) => {
+    resultViewport();
+    render(<UsersView />, { locale });
+    fireEvent.click(button(names.apply));
+    const row = (await screen.findAllByTestId('admin-account-row'))[0];
+    const frame = screen.getByRole('region', { name: names.accounts });
+    jest.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 8, 300, window.innerHeight + extra));
+    jest.mocked(frame.scrollIntoView).mockClear();
+    frame.focus();
+    expect(document.activeElement).toBe(frame);
+    expect(frame.scrollIntoView).toHaveBeenLastCalledWith({ block: extra <= 0 ? 'center' : 'nearest', inline: 'nearest' });
+    const link = within(row).getByRole('link', {
+      name: locale === 'en' ? `View account ${account(1).id}` : `مشاهدهٔ حساب ${account(1).id}`,
+    });
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    expect(link.scrollIntoView).toHaveBeenLastCalledWith({ block: 'nearest', inline: 'nearest' });
+    expect(api.users).toHaveBeenCalledTimes(1);
+    expect(api.lookup).not.toHaveBeenCalled();
+    expect(api.user).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('uses the same full references/actions and only granted email with PII=%p', async (pii) => {
     const viewport = resultViewport();
     context({ ...allFlags, users_pii: pii, users_lookup: pii });
@@ -558,7 +580,7 @@ describe.each(['en', 'fa-IR'] as const)('stable compact admin results in %s', (l
     viewport(true);
     expect(document.activeElement).toBe(frame);
     expect(screen.queryByRole('group', { name: names.view })).toBeNull();
-    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
+    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'center', inline: 'nearest' });
     link.focus();
     viewport(false);
     expect(document.activeElement).toBe(link);
@@ -792,7 +814,7 @@ describe('UTC audit query and bounded keyset navigation', () => {
     const frame = screen.getByRole('region', { name: 'Audit results' });
     jest.mocked(frame.scrollIntoView).mockClear();
     frame.focus();
-    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' });
+    expect(frame.scrollIntoView).toHaveBeenCalledWith({ block: 'center', inline: 'nearest' });
     expect(frame.className).toContain('scroll-m-2');
     open.focus();
     fireEvent.click(open);

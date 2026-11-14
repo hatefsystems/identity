@@ -64,12 +64,25 @@ type Value struct {
 	authority Authority
 }
 
-func (v Value) Display() string                 { return v.display }
-func (v Value) SecurityName() string            { return v.security }
-func (v Value) Key() [sha256.Size]byte          { return v.key }
-func (v Value) Authority() Authority            { return v.authority }
-func (n *Normalizer) Authority() Authority      { return n.authority }
+// Display returns the NFC spelling without security folds.
+func (v Value) Display() string { return v.display }
+
+// SecurityName returns the folded spelling used for exact lookup.
+func (v Value) SecurityName() string { return v.security }
+
+// Key returns the domain-separated lookup HMAC.
+func (v Value) Key() [sha256.Size]byte { return v.key }
+
+// Authority returns the policy and key provenance bound to the value.
+func (v Value) Authority() Authority { return v.authority }
+
+// Authority returns the normalizer's immutable policy and key provenance.
+func (n *Normalizer) Authority() Authority { return n.authority }
+
+// CanonicalArtifact returns a copy of the fingerprinted normalization artifact.
 func (n *Normalizer) CanonicalArtifact() []byte { return slices.Clone(n.artifact) }
+
+// Policy returns a defensive copy of the admitted policy.
 func (n *Normalizer) Policy() Policy {
 	p := n.policy
 	p.Folds = slices.Clone(p.Folds)
@@ -161,6 +174,7 @@ func (n *Normalizer) normalize(input string, admission bool) (Value, error) {
 	return Value{display, security, exactHMAC(n.key, lookupDomain, []byte(security)), n.authority}, nil
 }
 
+// IsReserved checks the folded name only for values from this authority.
 func (n *Normalizer) IsReserved(v Value) bool {
 	return n != nil && v.authority == n.authority && n.reserved[v.security]
 }

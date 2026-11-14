@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 )

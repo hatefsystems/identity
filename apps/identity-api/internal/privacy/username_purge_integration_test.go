@@ -223,7 +223,7 @@ func (f usernamePurgeDatabase) user(t *testing.T, input string) db.User {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := f.namespace.Assign(f.ctx, tx, u.ID, u.AuthVersion, v); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestUsernamePurgeAdapterRestrictedPrivilegesIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := tx.LockAccount(f.ctx, u.ID); !errors.Is(err, username.ErrUnavailable) {
 		t.Fatal("adapter acquired account authority without policy-row privilege", err)
 	}
@@ -296,7 +296,7 @@ func TestUsernamePurgeAdapterPolicyBeforeAccountIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer blocker.Rollback(context.Background())
+	defer func() { _ = blocker.Rollback(context.Background()) }()
 	if err := pglock.LockAccount(f.ctx, blocker, u.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestUsernamePurgeAdapterPolicyBeforeAccountIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	lockCtx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
 	defer cancel()
 	result := make(chan error, 1)
@@ -320,7 +320,7 @@ func TestUsernamePurgeAdapterPolicyBeforeAccountIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer observer.Rollback(context.Background())
+	defer func() { _ = observer.Rollback(context.Background()) }()
 	if _, err := observer.Exec(f.ctx, "SET LOCAL lock_timeout='150ms'"); err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestUsernamePurgeAdapterClosedGateIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := tx.LockAccount(f.ctx, u.ID); !errors.Is(err, username.ErrUnavailable) {
 		t.Fatal("adapter ignored the closed ownership gate", err)
 	}
@@ -373,7 +373,7 @@ func TestUsernamePurgeAdapterRollbackAndCommitIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	if err := tx.LockAccount(f.ctx, u.ID); err != nil {
 		t.Fatal(err)
 	}

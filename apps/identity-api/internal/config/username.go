@@ -10,6 +10,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
+// Username environment names configure the immutable normalization and lookup authority.
 const (
 	EnvUsernameEnabled     = "USERNAME_ENABLED"
 	EnvUsernameRegex       = "USERNAME_REGEX"

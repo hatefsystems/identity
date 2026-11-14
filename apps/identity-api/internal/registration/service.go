@@ -199,6 +199,7 @@ type UsernameValidation struct {
 	Available bool   `json:"available"`
 }
 
+// ValidateUsername returns rate-limited advisory availability without reserving a name.
 func (s *Service) ValidateUsername(ctx context.Context, input, ip string) (UsernameValidation, error) {
 	address, err := netip.ParseAddr(ip)
 	if err != nil || address.Zone() != "" {

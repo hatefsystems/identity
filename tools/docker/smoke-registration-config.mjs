@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runCommand } from '../../.github/scripts/release-images.mjs';
+import { registrationUsernameFixture } from '../../.github/scripts/registration-browser.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 process.chdir(root);
@@ -14,6 +15,7 @@ const project = `ldp-registration-check-${randomUUID().replaceAll('-', '')}`;
 const temp = await mkdtemp(join(tmpdir(), 'ldp-registration-check-'));
 const password = randomBytes(32).toString('hex');
 const fixture = {
+  ...registrationUsernameFixture().environment,
   SMS_GATEWAY_API_KEY: 'isolated-test-no-provider',
   SMS_IR_TEMPLATE_ID: '1',
   SMS_IR_CODE_PARAMETER: 'Code',
@@ -53,7 +55,9 @@ const compose = (args, overrides = {}) =>
       ...args,
     ],
     { timeout: 180_000, env: { ...process.env, ...fixture, ...overrides } }
-  );
+  ).catch(() => {
+    throw new Error('Local registration Compose command failed');
+  });
 const sql = (query) =>
   compose([
     'exec',
@@ -92,6 +96,15 @@ try {
     'registration-cleanup',
   ]);
   await check();
+  assert.deepEqual(
+    JSON.parse(await sql(`SELECT json_build_array(
+      (SELECT count(*) FROM public.username_policy_artifacts),
+      (SELECT count(*) FROM public.username_lookup_keys),
+      (SELECT count(*) FROM public.username_active_policy
+        WHERE singleton AND policy_id IS NULL AND admission_state='uninstalled'))`)),
+    [0, 0, 1],
+    'worker-only provisioning must not install or activate a username authority'
+  );
   const before = await sql(
     "SELECT rolpassword FROM pg_authid WHERE rolname='identity_registration_cleanup'"
   );
