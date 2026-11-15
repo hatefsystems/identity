@@ -167,6 +167,56 @@ cosmetic `NormalizeName` validator and its empty/Latin/emoji behavior are unchan
   decompositions that compose into admitted letters remain valid. Validation
   errors are static and redacted, never rejected private values.
 
+### Confirmed Birthday and Gender Validation (T05/T06)
+
+`internal/profile.NormalizeBirthday(calendar, date string, now time.Time)` returns
+one `Birthday` with canonical ASCII `Gregorian` and `Jalali` date-only strings.
+`ValidateGender(raw string)` returns a string-backed `Gender` with explicit
+`GenderFemale` and `GenderMale` constants. These are standalone validators only:
+current endpoints do not accept, require or store birthday/gender, `/validate`
+remains username-only, and `/start` still requires `{email,phone,username}`. No UI
+controls, preselection behavior, private storage or legacy backfill was delivered.
+
+- Require calendar exactly `gregorian` or `jalali`; preference identifiers
+  `gregory`/`persian`, locale/browser inference and missing values are invalid.
+- Require valid UTF-8, at most 18 raw bytes and exactly ten code points in
+  `YYYY-MM-DD`. Convert only ASCII `U+0030..U+0039`, Persian `U+06F0..U+06F9` and
+  Arabic-Indic `U+0660..U+0669` digits, including mixtures, preserving padding.
+  Hyphens must be ASCII. Do not trim, apply NFKC, strip bidi/control marks or accept
+  other digits, slashes, signs, nonpadded fields or timestamp suffixes.
+- Validate actual selected-calendar month/day/leap rules before conversion; derive
+  and reverse-check the other representation with the single integer-only
+  [jalaali-js v1.2.8 core](https://github.com/jalaali/jalaali-js/tree/f592be0e06867d2752f93924fa3e338f366ce4f4).
+  `internal/profile/jalali.go` retains the full MIT notice and exact source pin.
+  Independent source review checked all arithmetic expressions and signed
+  division/remainder semantics; no runtime dependency or alternate converter exists.
+- The core's Jalali years are `-61..3177`; paired conversion conservatively bounds
+  Gregorian years to `560..3798` and rejects dates whose inverse leaves those
+  limits. Birthday grammar has four unsigned year digits; accepted birthdays are
+  further bounded by Gregorian civil components from `1900-01-01` through today.
+  Unsupported dates fail closed without rollover, panic or fallback. Upstream
+  documents divergence from `Intl` after Gregorian 2256. This is a pinned algorithm,
+  not official-calendar certification or unlimited astronomical accuracy.
+- The server supplies one trusted current instant per validation, never a client
+  field. Extract today in explicit `Asia/Tehran`, including historical DST; cache
+  only the immutable location and include standard `time/tzdata` fallback. Zero
+  clocks, Tehran years outside `1900..9999`, or zone failure return static
+  `ErrBirthdayClock`. Input rejection uses separate static `ErrInvalidBirthday`.
+  Every failure returns an entirely zero pair, never DOB-bearing errors/logging.
+  DOBs use only civil integer components, comparison and date-only strings, never
+  timestamp parsing, `time.Date`, Unix time, duration arithmetic or an age policy.
+- Fixed fixtures include pinned upstream vectors and independently sourced
+  [authority-derived year starts/leap flags](https://github.com/roozbehp/persiancalendar/blob/63562e04042fd9735b0aaa555719830311c6981d/kabise.txt),
+  also reproduced in [ICU fixtures](https://github.com/unicode-org/icu/blob/8e0e87c31f34cb9ee028e6487f5199dc607e0f59/icu4j/main/core/src/test/java/com/ibm/icu/dev/test/calendar/PersianTest.java).
+  The original University of Tehran PDF was unavailable during review; the two
+  copies are not separate calendar authorities. Synthetic proleptic anchors and
+  leap-end companions supplement the 46,340-day `1900-01-01..2026-11-15` civil
+  round-trip sweep; round trips alone are not independent correctness evidence.
+- Gender accepts exactly `female` or `male`: no trim, case folding, aliases,
+  localized labels, numeric coercion or default. Invalid/missing new values return
+  zero `Gender` and static `ErrInvalidGender`. Existing profile reads are unchanged;
+  absent legacy attributes remain structurally absent, not validated or inferred.
+
 | Field                       | Required final meaning                                                                                                                                                                                                                                                                                                          |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `given_name`, `family_name` | Private Persian-script names under T02; independent from optional public/cosmetic `display_name`.                                                                                                                                                                                                                               |
