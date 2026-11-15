@@ -23,6 +23,16 @@
 
 <!-- nx configuration end-->
 
+# Command execution environment
+
+- Agent commands run in a non-interactive shell and may inherit a minimal `PATH`, unlike the user's terminal. Command approval does not import the user's terminal environment.
+- Before the first Node/npm/Nx or Go/linter command, check executable resolution and actual versions in the agent's execution environment. Do not fan out commands that depend on an unverified toolchain.
+- If Node/npm is not on `PATH`, inspect `${NVM_DIR:-$HOME/.nvm}` and its installed versions before declaring the tools missing. `.bashrc` may return early for non-interactive shells, so sourcing it is not a reliable NVM bootstrap.
+- Load the verified `nvm.sh` directly or prepend a verified installed Node `bin` directory to the command's `PATH`. Select the version required by the current repository configuration and CI workflow, not an arbitrary latest version or a stale hardcoded machine path.
+- Likewise, resolve the CI-required Go and golangci-lint versions before checks; the host's default Go may be newer. Use a verified installed toolchain and `GOTOOLCHAIN=local` when matching CI, then confirm actual versions.
+- Apply the verified environment prefix to every independent shell, background process and delegated command that needs it. Do not assume an export in one tool invocation carries into another.
+- Keep environment preparation local to commands. Do not edit shell startup files, global settings, dependency manifests or install/reinstall tools merely to work around a missing `PATH` entry.
+
 # Task completion verification
 
 - Before completing any code, configuration or test task, load the `task-verification` skill. If the skill is not available in the current session, read `.agents/skills/task-verification/SKILL.md` directly.
