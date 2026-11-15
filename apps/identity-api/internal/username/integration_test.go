@@ -153,7 +153,7 @@ func usernameChosen(t *testing.T, n *Normalizer, input string) Value {
 }
 
 func usernameAssign(f usernameDatabase, store *Store, id uuid.UUID, version int64, value Value) error {
-	tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := store.database.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}
@@ -208,6 +208,135 @@ func usernameRole(t *testing.T, f usernameDatabase, kind string) *pgxpool.Pool {
 		t.Fatal("fixture is not actual restricted login")
 	}
 	return pool
+}
+
+func TestUsernameActiveReservedEquivalenceAndAuthorityOrderingIntegration(t *testing.T) {
+	f := usernameFixture(t)
+	// Synthetic canonical fixture only, not the proposed official reserved list.
+	const reserved = "\u06a9\u06cc\u0648\u06cc"
+	policy := f.normalizer.Policy()
+	policy.ID = uuid.New()
+	policy.ReservedNames = []string{reserved}
+	n, err := New(policy, fixtureRegex, bytes.Repeat([]byte{0x59}, 32), f.normalizer.Authority().KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.normalizer = n
+	f.store, err = NewStore(f.pool, f.cipher, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usernameActivateFixture(t, f)
+	api := usernameRole(t, f, "api")
+	store, err := NewStore(api, f.cipher, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckReady(f.ctx); err != nil {
+		t.Fatal("active reserved fixture is not ready for restricted API", err)
+	}
+	assertAbsent := func(t *testing.T, q db.DBTX, id uuid.UUID) {
+		t.Helper()
+		var absent bool
+		if err := q.QueryRow(f.ctx, `SELECT username_key IS NULL AND username_details_encrypted IS NULL AND username_policy_id IS NULL AND username_policy_fingerprint IS NULL AND username_policy_epoch IS NULL AND username_lookup_key_id IS NULL FROM users WHERE id=$1`, id).Scan(&absent); err != nil || !absent {
+			t.Fatal("rejected assignment left a username tuple", err)
+		}
+	}
+	assertRejected := func(t *testing.T, s *Store, value Value, want error) {
+		t.Helper()
+		user := usernameUser(t, f)
+		tx, err := api.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rollbackUsername(tx)
+		if err := s.Assign(f.ctx, tx, user.ID, user.AuthVersion, value); !errors.Is(err, want) {
+			t.Fatal("assignment returned the wrong rejection", err)
+		}
+		// Check before rollback can conceal partial writes, then persist the no-op.
+		assertAbsent(t, tx, user.ID)
+		if err := tx.Commit(f.ctx); err != nil {
+			t.Fatal(err)
+		}
+		assertAbsent(t, api, user.ID)
+	}
+	canonical := usernameChosen(t, n, reserved)
+	for _, tc := range []struct{ name, spelling string }{
+		{"canonical", reserved},
+		{"arabic_yeh", "\u06a9\u064a\u0648\u064a"},
+		{"arabic_kaf", "\u0643\u06cc\u0648\u06cc"},
+		{"waw_hamza", "\u06a9\u06cc\u0624\u06cc"},
+		{"yeh_hamza", "\u06a9\u0626\u0648\u0626"},
+		{"all_four_folds", "\u0643\u064a\u0624\u0626"},
+		{"decomposed_waw_hamza", "\u06a9\u06cc\u0648\u0654\u06cc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value := usernameChosen(t, n, tc.spelling)
+			if value.SecurityName() != reserved || value.Key() != canonical.Key() {
+				t.Fatal("reserved spelling did not fold to the canonical fixture")
+			}
+			if available, err := store.Available(f.ctx, value); err != nil || available {
+				t.Fatal("active reserved equivalent was available", err)
+			}
+			assertRejected(t, store, value, ErrConflict)
+		})
+	}
+	for _, tc := range []struct{ name, spelling string }{
+		{"nonreserved", "\u0633"},
+		{"dotted_suffix", reserved + ".\u0633"},
+		{"dotted_prefix", "\u0633." + reserved},
+		{"prefix", "\u0633" + reserved},
+		{"suffix", reserved + "\u0633"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value := usernameChosen(t, n, tc.spelling)
+			if available, err := store.Available(f.ctx, value); err != nil || !available {
+				t.Fatal("exact reservation expanded to a nonreserved name", err)
+			}
+			user := usernameUser(t, f)
+			if err := usernameAssign(f, store, user.ID, user.AuthVersion, value); err != nil {
+				t.Fatal("nonreserved name was not assignable", err)
+			}
+			if result, err := store.Get(f.ctx, user.ID, user.AuthVersion); err != nil || result == nil || result.Display != value.Display() {
+				t.Fatal("nonreserved assignment was not stored", err)
+			}
+		})
+	}
+	t.Run("closed_gate", func(t *testing.T) {
+		usernameExec(t, f, `UPDATE username_active_policy SET admission_state='closed'`)
+		defer usernameExec(t, f, `UPDATE username_active_policy SET admission_state='open'`)
+		if available, err := store.Available(f.ctx, canonical); !errors.Is(err, ErrUnavailable) || available {
+			t.Fatal("reservation concealed a closed gate", err)
+		}
+		assertRejected(t, store, canonical, ErrUnavailable)
+	})
+	for _, kind := range []string{"stale_policy", "wrong_lookup_key", "stale_value"} {
+		t.Run(kind, func(t *testing.T) {
+			p := n.Policy()
+			key := bytes.Repeat([]byte{0x59}, 32)
+			if kind == "wrong_lookup_key" {
+				key = bytes.Repeat([]byte{0x99}, 32)
+			} else {
+				p.ID = uuid.New()
+			}
+			stale, err := New(p, fixtureRegex, key, n.Authority().KeyID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			staleStore, err := NewStore(api, f.cipher, stale)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "stale_value" {
+				staleStore = store
+			}
+			value := usernameChosen(t, stale, reserved)
+			if available, err := staleStore.Available(f.ctx, value); !errors.Is(err, ErrPolicyMismatch) || available {
+				t.Fatal("reservation concealed stale policy/key/value authority", err)
+			}
+			assertRejected(t, staleStore, value, ErrPolicyMismatch)
+		})
+	}
 }
 
 func TestUsernameGlobalReservationsAndOrdinaryImmutabilityIntegration(t *testing.T) {

@@ -8,11 +8,11 @@ It is not deployed acceptance, policy approval or authorization to execute the
 
 ## Delivery Boundaries
 
-| Layer | Contract and limits |
-|---|---|
-| Existing conditional flow | Email-link ownership, then Iranian mobile SMS ownership, then a resident UV-required passkey. Completion returns `next: "login"`; discoverable login is separate. Registration and SMS default disabled. |
-| Username increment | Add one required username to that same flow, explicit advisory username validation, atomic reservation, and an authenticated read of the saved username or truthful absence. No contact choice, password, private-data editor or six-stage shell is activated by this increment. |
-| Deferred final target | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
+| Layer                     | Contract and limits                                                                                                                                                                                                                                                                                                   |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Existing conditional flow | Email-link ownership, then Iranian mobile SMS ownership, then a resident UV-required passkey. Completion returns `next: "login"`; discoverable login is separate. Registration and SMS default disabled.                                                                                                              |
+| Username increment        | Add one required username to that same flow, explicit advisory username validation, atomic reservation, and an authenticated read of the saved username or truthful absence. No contact choice, password, private-data editor or six-stage shell is activated by this increment.                                      |
+| Deferred final target     | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
 
 Do not add a second registration implementation or versioned registration route.
 Do not alter generic BlindIndex/email normalization, signed history, audit/lifecycle
@@ -85,11 +85,11 @@ each normalized representation, 4096 regex-source bytes and 16 KiB for the artif
 Validate UTF-8/bounds, compute `display = NFC(input)`, full-match admission against
 display, then derive a separate `security_name` with exactly these scalar folds:
 
-| Input | Security scalar |
-|---|---|
-| Arabic Yeh `U+064A` | Persian Yeh `U+06CC` |
-| Arabic Kaf `U+0643` | Persian Kaf `U+06A9` |
-| Waw with Hamza `U+0624` | Waw `U+0648` |
+| Input                   | Security scalar      |
+| ----------------------- | -------------------- |
+| Arabic Yeh `U+064A`     | Persian Yeh `U+06CC` |
+| Arabic Kaf `U+0643`     | Persian Kaf `U+06A9` |
+| Waw with Hamza `U+0624` | Waw `U+0648`         |
 | Yeh with Hamza `U+0626` | Persian Yeh `U+06CC` |
 
 Display receives no security folds. NFC-supported decompositions may compose into
@@ -138,16 +138,45 @@ no-split evolution, writer drain and rollback gates are in
 
 ## Deferred Final Fields
 
-| Field | Required final meaning |
-|---|---|
-| `given_name`, `family_name` | Private Persian-script names under T02; independent from optional public/cosmetic `display_name`. |
-| `birthday` | `{calendar: "gregorian" \| "jalali", date: "YYYY-MM-DD"}`. T05 normalizes permitted date digits and derives an atomic equivalent Gregorian/Jalali date-only pair with one pinned/reviewed converter. Gregorian range is `1900-01-01` through today's server-side Tehran civil date. No timestamp or independently trusted pair. |
-| `gender` | Exactly `female` or `male`, explicitly selected; no UI default or invented legacy value. |
-| `username` | Chosen spelling under the namespace above; required for new accounts, immutable after assignment. |
-| `contact` | Exactly `{type: "email" \| "mobile", value: string}`. Verify the exact server-canonical selected destination. Unselected contact is absent, never a fabricated mailbox or empty-email digest. |
-| `authentication_method` | Explicit `passkey`, `password` or `both`, with corresponding primary credentials required. No code-only account creation. Password bytes remain exact, including spaces; confirmation is client-only. T15 owns creation strength and bounded hashing. |
-| `location` | `{country: "IR", province_id: string, locality_id?: string}`; source-preserving opaque IDs with correct ancestry. No fabricated dataset, translation or source labels; T07-T09 and data rights remain separate. |
-| `legal_acceptance` | Separate `terms` and `privacy` entries, each `{version, accepted: true}`, referring to approved server-configured documents. Acceptance time is server-owned; document approval is not supplied here. |
+### Confirmed Private-Name Validation (T02)
+
+`internal/profile.NormalizePersonalName` under `apps/identity-api` is the shared
+standalone validator for required `given_name` and `family_name`. Current
+registration requests and stage selectors do not yet accept these fields; this
+validator does not store names or infer them for existing accounts. The optional
+cosmetic `NormalizeName` validator and its empty/Latin/emoji behavior are unchanged.
+
+- Reject invalid raw UTF-8 and input over 1024 bytes before normalization. Apply
+  NFC and only Arabic Yeh/Kaf-to-Persian Yeh/Kaf normalization. Preserve standalone
+  Hamza, Alef with madda, plain Alef and Waw/Yeh with Hamza distinctions; private
+  names do not receive the username security folds for Waw/Yeh with Hamza.
+- Admit the explicitly defined 32 Persian letters, Alef with madda, standalone
+  Hamza, Waw/Yeh with Hamza and Arabic Yeh/Kaf keyboard aliases. This repertoire
+  is independent of the configured username regex.
+- Trim only leading/trailing ASCII spaces and collapse repeated ASCII spaces.
+  Retain a single internal ASCII space or ZWNJ only directly between admitted
+  letters. Outer/repeated ZWNJ and adjacent separators are invalid. This is a
+  structural rule, not linguistic or legal-name verification.
+- Require 1..80 normalized Unicode code points, including retained separators,
+  and at most 1024 normalized UTF-8 bytes. Empty/space-only values are invalid.
+  The output byte bound is an invariant; its exact boundary is unreachable under
+  the admitted alphabet and code-point limit.
+- Reject Latin/mixed scripts, every numeral script, punctuation, remaining
+  combining/vowel marks, presentation forms, unsupported aliases, ZWJ, controls,
+  bidi formatting and non-ASCII whitespace rather than stripping them. NFC
+  decompositions that compose into admitted letters remain valid. Validation
+  errors are static and redacted, never rejected private values.
+
+| Field                       | Required final meaning                                                                                                                                                                                                                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `given_name`, `family_name` | Private Persian-script names under T02; independent from optional public/cosmetic `display_name`.                                                                                                                                                                                                                               |
+| `birthday`                  | `{calendar: "gregorian" \| "jalali", date: "YYYY-MM-DD"}`. T05 normalizes permitted date digits and derives an atomic equivalent Gregorian/Jalali date-only pair with one pinned/reviewed converter. Gregorian range is `1900-01-01` through today's server-side Tehran civil date. No timestamp or independently trusted pair. |
+| `gender`                    | Exactly `female` or `male`, explicitly selected; no UI default or invented legacy value.                                                                                                                                                                                                                                        |
+| `username`                  | Chosen spelling under the namespace above; required for new accounts, immutable after assignment.                                                                                                                                                                                                                               |
+| `contact`                   | Exactly `{type: "email" \| "mobile", value: string}`. Verify the exact server-canonical selected destination. Unselected contact is absent, never a fabricated mailbox or empty-email digest.                                                                                                                                   |
+| `authentication_method`     | Explicit `passkey`, `password` or `both`, with corresponding primary credentials required. No code-only account creation. Password bytes remain exact, including spaces; confirmation is client-only. T15 owns creation strength and bounded hashing.                                                                           |
+| `location`                  | `{country: "IR", province_id: string, locality_id?: string}`; source-preserving opaque IDs with correct ancestry. No fabricated dataset, translation or source labels; T07-T09 and data rights remain separate.                                                                                                                 |
+| `legal_acceptance`          | Separate `terms` and `privacy` entries, each `{version, accepted: true}`, referring to approved server-configured documents. Acceptance time is server-owned; document approval is not supplied here.                                                                                                                           |
 
 Six stages, in order: names; personal information (birthday/gender); username;
 contact verification; authentication method; location/final review. Back navigation,
@@ -165,15 +194,15 @@ validation above belongs to the increment. Final validation stage selectors are
 `names`, `personal_information`, `username` and `full_review`; these deferred
 selectors do not imply currently mounted branches.
 
-| Operation | Final request / meaning |
-|---|---|
-| `/validate` | `{stage,registration,password?}`. Exact subsets: `names` (`given_name`,`family_name`), `personal_information` (`birthday`,`gender`), `username` (`username`), or `full_review` (all final fields, with password only for password/both). Read-only normalized results/field errors; no proof, reservation or credential creation. |
-| `/start` | `{contact}`. Explicit selected-channel issuance starts a bounded attempt and returns authority, canonical contact, original deadline and bounded code/submission information, never delivery evidence. This is not the increment's `{email,phone,username}` body. |
-| `/email/resend`, `/phone/send` | `A`. Explicit selected-channel replacement preserves original expiry/budgets and invalidates superseded proof/ceremony. |
-| `/email/verify`, `/phone/verify` | `A + {verification_id,code}`. Selected-purpose/destination proof only. T19/T31 own email codes; do not remove the current email-link page in anticipation. |
-| `/passkey/options` | `A + {registration: F,password?}` for passkey/both. Validate and bind the complete candidate before native enrollment; password-bearing intent fingerprints must be keyed. |
-| Registration root | `A + {registration: F,password?,credential?}`. Passkey requires credential/no password; password requires password/no credential; both require both. One atomic creation transaction includes protected attributes, selected verified contact, legal versions, credentials and creation intent. |
-| `/result` | `A`. Bounded pending/failed/completed information; no session issuance or recreation. |
+| Operation                        | Final request / meaning                                                                                                                                                                                                                                                                                                           |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/validate`                      | `{stage,registration,password?}`. Exact subsets: `names` (`given_name`,`family_name`), `personal_information` (`birthday`,`gender`), `username` (`username`), or `full_review` (all final fields, with password only for password/both). Read-only normalized results/field errors; no proof, reservation or credential creation. |
+| `/start`                         | `{contact}`. Explicit selected-channel issuance starts a bounded attempt and returns authority, canonical contact, original deadline and bounded code/submission information, never delivery evidence. This is not the increment's `{email,phone,username}` body.                                                                 |
+| `/email/resend`, `/phone/send`   | `A`. Explicit selected-channel replacement preserves original expiry/budgets and invalidates superseded proof/ceremony.                                                                                                                                                                                                           |
+| `/email/verify`, `/phone/verify` | `A + {verification_id,code}`. Selected-purpose/destination proof only. T19/T31 own email codes; do not remove the current email-link page in anticipation.                                                                                                                                                                        |
+| `/passkey/options`               | `A + {registration: F,password?}` for passkey/both. Validate and bind the complete candidate before native enrollment; password-bearing intent fingerprints must be keyed.                                                                                                                                                        |
+| Registration root                | `A + {registration: F,password?,credential?}`. Passkey requires credential/no password; password requires password/no credential; both require both. One atomic creation transaction includes protected attributes, selected verified contact, legal versions, credentials and creation intent.                                   |
+| `/result`                        | `A`. Bounded pending/failed/completed information; no session issuance or recreation.                                                                                                                                                                                                                                             |
 
 Only deferred T33 may issue a normal session after a known fresh commit, using the
 same browser key and bootstrapping exactly the returned new subject. Result reads

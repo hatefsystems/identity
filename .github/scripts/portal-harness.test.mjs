@@ -978,8 +978,13 @@ test('toolchain startup budget is one lifecycle deadline, including compiler pro
 test('integration runner executes all seven uncached mandatory suites serially and confirms owned service cleanup', async (t) => {
   const docker = mockPortalDocker(t);
   const state = mockIntegrationRunner(t);
-  await runPortalIntegrationSuites({ identify });
+  const report = await runPortalIntegrationSuites({ identify });
+  assert.equal(state.children.length, 7);
   assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
+  const portal = report.results.at(-1);
+  assert.equal(portal.packages, 16);
+  assert.equal(portal.skipped, 0);
+  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/username`, tests: ['TestOwnedFixture'] });
   assert.equal(state.maximumActive, 1);
   assert.equal(state.active, 0);
   assert.equal(state.terminated.length, 0);
@@ -987,6 +992,22 @@ test('integration runner executes all seven uncached mandatory suites serially a
   assert.equal(docker.ownershipViolation, false);
   assert(state.messages.some((message) => message.includes('serial-integration-teardown')));
   assert.doesNotMatch(state.messages.join(''), /PRIVATE/);
+});
+
+test('portal integration rejects missing, duplicate, empty or skipped username evidence', async (t) => {
+  for (const kind of ['missing', 'duplicate', 'empty', 'skipped']) await t.test(kind, async (t) => {
+    const state = mockIntegrationRunner(t, { output(child) {
+      for (const name of integrationPackages['test-portal-integration']) {
+        if (name === 'internal/username' && kind === 'missing') continue;
+        if (name !== 'internal/username' || kind !== 'empty')
+          child.stdout.emit('data', `--- ${name === 'internal/username' && kind === 'skipped' ? 'SKIP' : 'PASS'}: TestOwnedFixture (0.01s)\n`);
+        child.stdout.emit('data', `ok ${identityGoModule}/${name}\t0.01s\n`);
+      }
+      if (kind === 'duplicate') child.stdout.emit('data', `--- PASS: TestOwnedFixture (0.01s)\nok ${identityGoModule}/internal/username\t0.01s\n`);
+    } });
+    await assert.rejects(runPortalIntegrationTarget('test-portal-integration', {}), /Wrong or duplicate executed package inventory|Package produced no tests|skipped a test/);
+    assert.equal(state.active, 0);
+  });
 });
 
 test('integration runner fails closed on a prerequisite failure without running later suites or leaking diagnostics', async (t) => {
@@ -1076,7 +1097,8 @@ test('POSIX integration interruption signals the owned detached process group', 
 
 test('integration runner refuses an unknown suite or an absent, infinite or excessive deadline before spawning', async (t) => {
   const state = mockIntegrationRunner(t);
-  await assert.rejects(runPortalIntegrationTarget('test-unknown', {}), /Unknown required/);
+  for (const target of ['test-unknown', 'test-username-integration', './internal/username'])
+    await assert.rejects(runPortalIntegrationTarget(target, {}), /Unknown required/);
   for (const timeout of [0, -1, NaN, Infinity, 30 * 60_000 + 1])
     await assert.rejects(runPortalIntegrationTarget(integrationTargets[0], {}, timeout), /Invalid integration deadline/);
   assert.equal(state.children.length, 0);
@@ -1987,16 +2009,25 @@ test('portal integration cannot silently omit real dependencies or run in parall
     'REQUIRE_PORTAL_INTEGRATION',
     'REQUIRE_PROFILE_INTEGRATION',
     '-tags=integration',
+    '-count=1',
     '-p=1',
     './internal/profile',
     './internal/webauthn',
     './internal/session',
+    './internal/username',
   ]) {
     assert(
       target.options.command.includes(contract),
       `Missing integration requirement ${contract}`
     );
   }
+  assert.deepEqual(integrationPackages['test-portal-integration'], [
+    'internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn',
+    'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle',
+    'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp',
+    'internal/registration', 'internal/username',
+  ]);
+  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username'\]/);
 });
 
 test('local integration inventory matches all seven mandatory CI suites in order', () => {
@@ -2004,7 +2035,10 @@ test('local integration inventory matches all seven mandatory CI suites in order
   const job = workflow.slice(workflow.indexOf('  integration-cell:'), workflow.indexOf('  security-db:'));
   const targets = job.match(/target: \[([^\]]+)\]/)[1].split(', ');
   assert.equal(targets.length, 7);
+  assert.deepEqual(targets, ['test-security-db', 'test-admin-integration', 'test-retention-integration',
+    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-portal-integration']);
   assert.deepEqual(integrationTargets, targets);
+  assert.deepEqual(Object.keys(integrationPackages), targets);
   assert(Object.isFrozen(integrationTargets));
   assert.match(job, /max-parallel: 1/);
   assert.match(job, /fail-fast: false/);
@@ -2046,7 +2080,7 @@ test('integration invocation rejects all arbitrary selectors and identifies part
   assert.deepEqual(integrationInvocation(['--integration']), { kind: 'integration', scope: 'full', targets: integrationTargets });
   for (const target of integrationTargets) assert.deepEqual(integrationInvocation([`--integration-target=${target}`]), { kind: 'integration', scope: 'partial', targets: [target] });
   for (const name of racePackages) assert.deepEqual(integrationInvocation([`--integration-race-package=${name}`]), { kind: 'race', scope: 'partial', targets: [name] });
-  for (const args of [[], ['--integration', '--integration'], ['--integration-target=identity-api:test-security-db'], ['--integration-target=unknown'], ['--integration-race-package=./...'], ['--integration-race-package=./cmd/server'], ['--integration-target=test-security-db', '--run=TestOne']]) assert.throws(() => integrationInvocation(args));
+  for (const args of [[], ['--integration', '--integration'], ['--integration-target=identity-api:test-security-db'], ['--integration-target=unknown'], ['--integration-target=test-username-integration'], ['--integration-race-package=./internal/username'], ['--integration-race-package=./...'], ['--integration-race-package=./cmd/server'], ['--integration-target=test-security-db', '--run=TestOne']]) assert.throws(() => integrationInvocation(args));
 });
 
 test('all seven nonparallel targets preserve exact package inventories and serial uncached flags', () => {

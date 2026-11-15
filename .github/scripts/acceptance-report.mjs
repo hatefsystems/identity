@@ -21,7 +21,7 @@ export const integrationPackages = Object.freeze({
   'test-legal-workflow-integration': ['internal/legalpolicy', 'internal/legalworkflow', 'internal/legalreport', 'internal/server'],
   'test-grpc-integration': ['internal/identitygrpc', 'internal/session', 'internal/oidc/token', 'internal/oidc/dpop'],
   'test-lifecycle-integration': ['internal/lifecycle'],
-  'test-portal-integration': ['internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn', 'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle', 'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp', 'internal/registration'],
+  'test-portal-integration': ['internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn', 'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle', 'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp', 'internal/registration', 'internal/username'],
 });
 for (const packages of Object.values(integrationPackages)) Object.freeze(packages);
 export const integrationTargets = Object.freeze(Object.keys(integrationPackages));
