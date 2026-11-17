@@ -111,6 +111,9 @@ jobs:
       - name: Build admin operational commands
         run: npm exec -- nx run-many -t build-admin-audit-publisher,build-admin-roles,build-admin-legal -p identity-api --skipNxCache
 
+      - name: Build geography operator and guarded migration commands
+        run: npm exec -- nx run-many -t build-geography,build-migrate -p identity-api --skipNxCache --parallel=1
+
       - name: Build lifecycle broadcast publisher
         run: npm exec -- nx run identity-api:build-lifecycle-publisher --skipNxCache
 
@@ -168,7 +171,7 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        target: [test-security-db, test-admin-integration, test-retention-integration, test-legal-workflow-integration, test-grpc-integration, test-lifecycle-integration, test-portal-integration]
+        target: [test-security-db, test-admin-integration, test-retention-integration, test-legal-workflow-integration, test-grpc-integration, test-lifecycle-integration, test-geography-integration, test-portal-integration]
 
     steps:
       - name: Check out repository
@@ -219,7 +222,7 @@ jobs:
           retention-days: 7
 
   security-db:
-    name: Exactly seven required integration suites
+    name: Exact required integration suite inventory
     needs: [integration-cell]
     if: always()
     runs-on: ubuntu-24.04
@@ -247,7 +250,7 @@ jobs:
           path: ${{ runner.temp }}/integration-evidence
           merge-multiple: true
           digest-mismatch: error
-      - name: Require exact seven-source zero-skip aggregate
+      - name: Require exact source-bound zero-skip aggregate
         run: node .github/scripts/acceptance-report.mjs aggregate integration "$RUNNER_TEMP/integration-evidence" "$RUNNER_TEMP/integration-aggregate.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -272,6 +275,7 @@ jobs:
           - { package: './internal/smsotp', artifact: smsotp }
           - { package: './internal/registration', artifact: registration }
           - { package: './internal/audit/signer', artifact: signer }
+          - { package: './internal/geography', artifact: geography }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -303,7 +307,7 @@ jobs:
           retention-days: 7
 
   security-race:
-    name: Exactly seven affected race packages
+    name: Exact affected race package inventory
     needs: [race-cell]
     if: always()
     runs-on: ubuntu-24.04
@@ -331,7 +335,7 @@ jobs:
           path: ${{ runner.temp }}/race-evidence
           merge-multiple: true
           digest-mismatch: error
-      - name: Require separate exact-seven race aggregate
+      - name: Require separate exact-inventory race aggregate
         run: node .github/scripts/acceptance-report.mjs aggregate race "$RUNNER_TEMP/race-evidence" "$RUNNER_TEMP/race-aggregate.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -562,6 +566,51 @@ jobs:
           retention-days: 7
           overwrite: true
 
+  geography-browser:
+    name: Disposable real API geography selector acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: |
+            apps/identity-api/go.sum
+            libs/schemas/go.sum
+      - name: Prepare pinned tooling and disposable fixture policy checks
+        run: |
+          npm install --global npm@11.21.0
+          npm ci
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          npm exec -- nx run schemas:generate --skipNxCache
+          npm exec -- nx run identity-api:sqlc-generate --skipNxCache
+          npm exec -- nx exec -p schemas -- node --test "$GITHUB_WORKSPACE/.github/scripts/geography-browser.test.mjs"
+          npm exec -- playwright install --with-deps chromium
+      # Only the disposable build mounts LocationSelector. Source data, fixture
+      # routes and fault controls never enter the production Next build/image.
+      - name: Run isolated bilingual geography selector and real catalog API
+        env:
+          GEOGRAPHY_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/geography-browser-evidence
+        run: |
+          npm exec -- nx run web:test-geography-browser --skipNxCache
+          node .github/scripts/acceptance-report.mjs verify-geography "$RUNNER_TEMP/geography-browser-evidence/geography-evidence.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: geography-browser-evidence
+          path: ${{ runner.temp }}/geography-browser-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
   registration-browser:
     name: Exact release API production registration acceptance
     needs: [quality]
@@ -639,7 +688,7 @@ jobs:
 
   publish:
     name: Publish release images
-    needs: [quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser, compose-smoke]
+    needs: [quality, security-db, security-race, frontend, portal-browser, admin-browser, geography-browser, registration-browser, compose-smoke]
     if: >-
       github.repository == 'hatefsystems/identity' &&
       github.event_name == 'push' &&
@@ -706,6 +755,15 @@ jobs:
           digest-mismatch: error
       - name: Bind all acceptance reports to published API
         run: node .github/scripts/acceptance-report.mjs verify-publication "$RUNNER_TEMP/registration-browser-evidence/registration-evidence.json" "$RUNNER_TEMP/acceptance-api/acceptance-api.json" "$RUNNER_TEMP/release/api.json" "$RUNNER_TEMP/aggregates"
+
+      - name: Download source-bound geography acceptance
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: geography-browser-evidence
+          path: ${{ runner.temp }}/geography-browser-evidence
+          digest-mismatch: error
+      - name: Require geography source identity before publication
+        run: node .github/scripts/acceptance-report.mjs verify-geography "$RUNNER_TEMP/geography-browser-evidence/geography-evidence.json" "$RUNNER_TEMP/acceptance-api/acceptance-api.json"
 
       - name: Publish verified versions and promote stable aliases
         env:

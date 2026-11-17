@@ -66,7 +66,24 @@ func TestCheckUsesBoundedReadOnlyCatalogAndNonNullArrays(t *testing.T) {
 		}
 	}
 	var tables []map[string]json.RawMessage
-	if err := json.Unmarshal(encoded["Tables"], &tables); err != nil || string(tables[0]["UpdateColumns"]) != "[]" {
+	if err := json.Unmarshal(encoded["Tables"], &tables); err != nil || string(tables[0]["UpdateColumns"]) != "[]" || string(tables[0]["InsertColumns"]) != "[]" {
 		t.Fatal("column allowance was not normalized")
+	}
+}
+
+func TestCheckPreservesNarrowInsertColumnContract(t *testing.T) {
+	q := &probeDB{value: true}
+	if err := Check(context.Background(), q, Contract{Tables: []Table{{
+		Name: "public.example", Select: true, InsertColumns: []string{"id", "label"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	var encoded Contract
+	if err := json.Unmarshal(q.data, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded.Tables) != 1 || encoded.Tables[0].Insert || len(encoded.Tables[0].InsertColumns) != 2 ||
+		encoded.Tables[0].InsertColumns[0] != "id" || encoded.Tables[0].InsertColumns[1] != "label" {
+		t.Fatal("narrow inserts were promoted to table authority")
 	}
 }

@@ -2,8 +2,8 @@
 
 The implementation remains opt-in. This document describes conditional runtime contracts and outstanding release gates, not production sign-off. The active inventory is `.kilo/plans/1793976266705-preproduction-cleanup-launch-hardening.md`; prior technical-closure and panel plans and their dated evidence remain historical. Existing task statuses are unchanged; they do not certify the current bundle. Fresh final-source evidence and the independently unchecked production/manual gates below remain required.
 
-Active schema installation follows the unchanged baseline plus additive registration
-migration contract below. Dated acceptance records
+Active schema installation follows the unchanged baseline plus additive registration,
+username and geography migration contract below. Dated acceptance records
 and prior plans retain their original migration evidence unchanged; they do not
 certify this bundle. New acceptance must be recorded separately only after actual
 final runs satisfy [current requirements](#automated-validation).
@@ -11,7 +11,7 @@ This documentation update changes no task status or production authorization.
 
 ## Enablement
 
-1. Inventory schema/history first using the migration identity and follow [setup](#migration-and-contraction). Apply unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql` only to a separately approved scoped target, tracked through version 2 in `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked nonempty schemas and contradictory histories are refused. No instruction here authorizes live mutation, resets, adoption, genesis reset or hash rewriting.
+1. Inventory schema/history first using the migration identity and follow [setup](#migration-and-contraction). Apply unchanged `00001_initial_schema.sql` plus additive registration, username and geography migrations through `00004_geography_catalog.sql` only to a separately approved scoped target, tracked through version 4 in `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked nonempty schemas and contradictory histories are refused. No instruction here authorizes live mutation, resets, adoption, genesis reset or hash rewriting.
 2. Deploy account-version-aware issuers on **every** instance and restart old process-local credential stores before moderation is enabled. Ban, suspension, deletion and reactivation advance persistent versions. Old sessions, codes, refresh tokens and step-up grants cannot regain validity. Task 6.2's `ValidateToken` checks that version and live Redis authority; downstream clients using offline JWT verification still retain the configured lifetime, at most ten minutes.
 3. Inject one KEK/version and one blind-index pepper/version through the approved secret delivery mechanism. The adapter holds loaded keys locally, with no live Infisical fetch/cache/hot rotation or historical multi-key reader. Hold encryption is independent of attribution; SMS uses its separate required OTP HMAC pepper only when enabled. Preserve retired backup keys and coordinated recovery/rotation obligations. Exact `APP_ENV=development|test|production` is mandatory; test is not development.
 4. Verify final encrypted-or-legitimately-purged legal storage and actual key/data inventory before intake. Obsolete legal Backfill/plaintext compatibility is removed; unexpected layouts fail closed. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory or restore proof.
@@ -24,9 +24,10 @@ This documentation update changes no task status or production authorization.
 
 The heading is retained for existing links; installation no longer performs a
 staged legacy contraction. The active bundle is unchanged
-`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`.
-`migrate up` applies through version 2 in **`public.identity_schema_version`**, not
-`public.goose_db_version`. Future changes use `00003` and later bundled
+`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`,
+`00003_username_reservations.sql` and `00004_geography_catalog.sql`.
+`migrate up` applies through version 4 in **`public.identity_schema_version`**, not
+`public.goose_db_version`. Future changes use `00005` and later bundled
 migrations in this new lineage; generic `up-to` is not an old-lineage escape hatch.
 
 Before any migration mutation, the guarded wrapper performs fail-closed read-only
@@ -289,7 +290,7 @@ Never capture admin query strings, bodies, cookies, DPoP proofs, step-up/`Idempo
 
 Resolve fresh targets from the repository root using `npm exec -- nx show project
 identity-api --json` and `npm exec -- nx show project web --json`. The mandatory
-normal service matrix has exactly these seven identities:
+normal service matrix has exactly these eight identities:
 
 | Required suite |
 |---|
@@ -299,26 +300,27 @@ normal service matrix has exactly these seven identities:
 | `identity-api:test-legal-workflow-integration` |
 | `identity-api:test-grpc-integration` |
 | `identity-api:test-lifecycle-integration` |
+| `identity-api:test-geography-integration` |
 | `identity-api:test-portal-integration` |
 
 Run one suite per owned-service cell with `max-parallel: 1`, `fail-fast: false`,
 unchanged 30-minute target and 60-minute job deadlines, `-count=1`, `-p=1` and
 mandatory dependency flags. Local exhaustive `--integration` and allowlisted
 partial `--integration-target=<unqualified-target>` modes do not alter the frozen
-seven identities. Only the exact-seven aggregate can satisfy the normal release
+eight identities. Only the exact-eight aggregate can satisfy the normal release
 gate: matching source/generated fingerprints, nonzero package/test evidence,
 zero failures/skips and verified cleanup are mandatory. Missing/stale/duplicate/
 wrong-source/partial reports or zero exit without evidence fail the gate.
 
-Seven affected race packages are a separate serial inventory: `internal/recovery`,
+Eight affected race packages are a separate serial inventory: `internal/recovery`,
 `internal/mfa`, `internal/oidc/clientauth`, `internal/adminaction`, `internal/smsotp`,
-`internal/registration` and `internal/audit/signer`. Owned-service race mode uses
+`internal/registration`, `internal/audit/signer` and `internal/geography`. Owned-service race mode uses
 Linux CGO, `-json -tags=integration -race -count=1 -p=1 -timeout=20m` and a separate
-exact-seven race aggregate; it cannot replace normal suite evidence.
+exact-eight race aggregate; it cannot replace normal suite evidence.
 
 Require final generated-tree reproducibility, lint/vet/typechecks/builds,
 image/entrypoint/fixture-exclusion smoke and existing portal/admin/CSP browsers,
-plus `web:test-registration-browser` against the checksum-attested immutable
+plus `web:test-geography-browser` and `web:test-registration-browser` against the checksum-attested immutable
 `REGISTRATION_BROWSER_API_IMAGE=sha256:<id>` intended for publication. Retain
 sanitized source/generation/image identities and actual exits/counts/cleanup only
 after real runs; no current acceptance record is asserted here. See

@@ -66,8 +66,9 @@ type Config struct {
 	// lives on the base Config rather than being handed to a service because
 	// the values are consumed by the HTTP handlers themselves (page sizes,
 	// time windows), not by any domain package.
-	Admin AdminConfig
-	GRPC  GRPCConfig
+	Admin     AdminConfig
+	GRPC      GRPCConfig
+	Geography GeographyConfig
 }
 
 // Addr returns the host:port address string the server should listen on.
@@ -180,6 +181,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.GRPC, err = LoadGRPC()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Geography, err = LoadGeography()
 	if err != nil {
 		return Config{}, err
 	}

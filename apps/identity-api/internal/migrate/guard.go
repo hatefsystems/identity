@@ -23,7 +23,7 @@ const versionTable = "public.identity_schema_version"
 
 const migrationLockTimeout = 10 * time.Second
 
-var migrationKeys = []int64{pglock.MigrationKey, pglock.PurgeKey, pglock.AuditSignerKey,
+var migrationKeys = []int64{pglock.MigrationKey, pglock.GeographyImportKey, pglock.PurgeKey, pglock.AuditSignerKey,
 	pglock.SecurityLedgerPurgeKey, pglock.LedgerCoordinationKey, pglock.AuditCoordinationKey}
 
 type migrationLocker struct {

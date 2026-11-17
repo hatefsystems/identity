@@ -403,13 +403,13 @@ function cleanEnvironment() {
   // Do not inherit a developer's DATABASE_URL, signing keys, admin/gRPC flags,
   // proxy settings, peppers, or credential state into acceptance fixtures.
   // Go requires LOCALAPPDATA to locate its default build cache on Windows.
-  return Object.fromEntries(
+  return { ...Object.fromEntries(
     Object.entries(process.env).filter(([key]) =>
       /^(?:path|systemroot|windir|comspec|pathext|temp|tmp|home|userprofile|localappdata|lang|lc_all)$/i.test(
         key
       )
     )
-  );
+  ), GOTOOLCHAIN: 'local' };
 }
 
 export async function probeRaceToolchain(lifecycle) {
@@ -564,7 +564,7 @@ export async function runPortalIntegrationTarget(target, environment, timeout = 
         REQUIRE_LIFECYCLE_INTEGRATION: '1', REQUIRE_PORTAL_INTEGRATION: '1',
         REQUIRE_PROFILE_INTEGRATION: '1', REQUIRE_GRPC_INTEGRATION: '1', REQUIRE_LEGAL_WORKFLOW_INTEGRATION: '1',
         REQUIRE_PHASE2_INTEGRATION: '1', REQUIRE_SMS_INTEGRATION: '1', REQUIRE_REGISTRATION_INTEGRATION: '1',
-        REQUIRE_LEGALHOLD_DUMP_RESTORE: '1',
+         REQUIRE_LEGALHOLD_DUMP_RESTORE: '1', REQUIRE_GEOGRAPHY_INTEGRATION: '1',
         APP_ENV: 'test', SMS_ENABLED: 'false', REGISTRATION_ENABLED: 'false', ...(race ? { CGO_ENABLED: '1' } : {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: true,

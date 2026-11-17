@@ -15,6 +15,51 @@
   },
   "tags": ["lang:go", "scope:backend"],
   "targets": {
+    "geography-check": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go run ./cmd/geography check" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "geography-performance": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "node ../../.github/scripts/geography-performance.mjs" },
+      "dependsOn": ["build-geography", "build-migrate"],
+      "cache": false,
+      "parallelism": false
+    },
+    "geography-import": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go run ./cmd/geography import" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "build-geography": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go build -o bin/geography ./cmd/geography" },
+      "dependsOn": ["sqlc-generate"],
+      "outputs": ["{projectRoot}/bin/geography"],
+      "cache": false
+    },
+    "build-migrate": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go build -o bin/migrate ./cmd/migrate" },
+      "outputs": ["{projectRoot}/bin/migrate"],
+      "cache": false
+    },
+    "test-geography": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "go test -count=1 ./internal/geography ./cmd/geography" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false
+    },
+    "test-geography-integration": {
+      "executor": "nx:run-commands",
+      "options": { "cwd": "apps/identity-api", "command": "node -e \"if (!process.env.DATABASE_URL?.trim()) throw new Error('DATABASE_URL provisioning access is required'); const r=require('child_process').spawnSync('go',['test','-tags=integration','-count=1','-timeout=10m','-p=1','./internal/geography'],{stdio:'inherit',env:{...process.env,REQUIRE_GEOGRAPHY_INTEGRATION:'1'}}); if(r.error) throw r.error; process.exit(r.status ?? 1)\"" },
+      "dependsOn": ["sqlc-generate"],
+      "cache": false,
+      "parallelism": false
+    },
     "username-preflight": {
       "executor": "nx:run-commands",
       "options": { "cwd": "apps/identity-api", "command": "go run ./cmd/username preflight" },

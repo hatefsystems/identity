@@ -1,5 +1,9 @@
 .kilo
 
+# Operator-owned geography source snapshots never enter repository artifacts.
+/data/cities.json
+/data/types.json
+
 
 .nx/cache
 .nx/workspace-data

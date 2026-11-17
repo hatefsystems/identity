@@ -500,8 +500,8 @@ func TestForwardOnlyMigrationIsRefused(t *testing.T) {
 	}
 	var history string
 	if err := f.admin.QueryRow(f.ctx, `SELECT jsonb_agg(version_id ORDER BY version_id)::text
-FROM public.identity_schema_version WHERE is_applied`).Scan(&history); err != nil || history != "[0, 1, 2, 3]" {
-		t.Fatalf("expected baseline, registration and username lineage [0, 1, 2, 3], got %s: %v", history, err)
+FROM public.identity_schema_version WHERE is_applied`).Scan(&history); err != nil || history != "[0, 1, 2, 3, 4]" {
+		t.Fatalf("expected baseline, registration, username and geography lineage [0, 1, 2, 3, 4], got %s: %v", history, err)
 	}
 	before := snapshot()
 

@@ -38,8 +38,8 @@ import (
 )
 
 // Deps carries the optional service dependencies injected into the Server.
-// Fields left zero-valued disable the routes that need them, which keeps
-// handler tests lightweight and startup order explicit.
+// Most zero-valued fields disable dependent routes. Geography reads instead
+// remain mounted and report availability failures, including in development.
 type Deps struct {
 	AdminReady   func(context.Context) error
 	AdminRevoke  func(context.Context, string) error
@@ -87,6 +87,9 @@ type Deps struct {
 	RegistrationReady func(context.Context) error
 	Usernames         UsernameReader
 	UsernameReady     func(context.Context) error
+	// Geography reads stay mounted and fail with 503 if either dependency is absent.
+	Geography        GeographyReader
+	GeographyLimiter ratelimit.Limiter
 	// WebAuthnLimiter bounds anonymous ceremony allocation by trusted subnet.
 	WebAuthnLimiter ratelimit.Limiter
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
@@ -150,6 +153,7 @@ type Server struct {
 // New constructs a Server, builds the router and registers routes. If logger is
 // nil, a default JSON logger writing to stderr is used.
 func New(cfg config.Config, logger *slog.Logger, deps Deps) *Server {
+	cfg.Geography = cfg.Geography.WithDefaults()
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -239,6 +243,7 @@ func (s *Server) registerMiddleware() {
 func (s *Server) registerRoutes() {
 	s.router.Get("/healthz", s.handleLiveness())
 	s.router.Get("/readyz", s.handleReadiness())
+	s.registerGeographyRoutes()
 
 	// OIDC discovery and JWKS are only exposed when a signing keystore has
 	// been provisioned; without keys there is nothing meaningful to publish.

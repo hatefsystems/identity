@@ -101,6 +101,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"legal_transparency_years", "legal_transparency_months", "legal_transparency_reports", "legal_transparency_replays",
 			"deletion_notifications", "registration_attempts",
 			"username_policy_artifacts", "username_lookup_keys", "username_active_policy",
+			"geography_catalogs", "geography_types", "geography_places", "geography_place_versions", "geography_catalog_state",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -118,7 +119,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var count int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 38 {
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 43 {
 			t.Fatalf("final application table count: %d, %v", count, err)
 		}
 	})
@@ -135,6 +136,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"idx_security_ledger_retention",
 			"idx_registration_pending_expiry", "idx_registration_receipt_expiry", "idx_registration_result_user",
 			"users_username_key_unique",
+			"idx_geography_provinces", "idx_geography_localities",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -157,7 +159,8 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"users": 0, "user_roles": 0, "audit_log_head": 0, "security_ledger_head": 0,
 			"audit_log_chain": 0, "security_ledger_chain": 0, "security_ledger_retention_settings": 0,
 			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0,
-			"username_policy_artifacts": 0, "username_lookup_keys": 0, "username_active_policy": 1} {
+			"username_policy_artifacts": 0, "username_lookup_keys": 0, "username_active_policy": 1,
+			"geography_catalogs": 0, "geography_types": 0, "geography_places": 0, "geography_place_versions": 0, "geography_catalog_state": 1} {
 			var count int
 			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
 				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)
@@ -165,7 +168,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var functions, sequences int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
-			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 13 {
+			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 14 {
 			t.Fatalf("final function inventory: %d, %v", functions, err)
 		}
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace

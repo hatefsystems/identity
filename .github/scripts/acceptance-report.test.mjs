@@ -20,6 +20,23 @@ function reports(kind) {
   });
 }
 
+test('geography remains a distinct required integration and race cell with no substituted portal evidence', () => {
+  assert.deepEqual(integrationPackages['test-geography-integration'], ['internal/geography']);
+  assert(racePackages.includes('./internal/geography'));
+  assert.equal(integrationTargets.length, Object.keys(integrationPackages).length);
+  for (const kind of ['integration', 'race']) {
+    const cells = reports(kind), name = kind === 'integration' ? 'test-geography-integration' : './internal/geography';
+    const index = cells.findIndex((cell) => cell.results[0].target === `identity-api:${name}`);
+    assert(index >= 0);
+    for (const change of [(cell) => { cell.results[0].skipped = 1; }, (cell) => { cell.results[0].packageEvidence = []; },
+      (cell) => { cell.results[0].packageEvidence[0].package = `${identityGoModule}/internal/server`; }]) {
+      const invalid = structuredClone(cells); change(invalid[index]); assert.throws(() => aggregateReports(invalid, kind, identity));
+    }
+    cells.splice(index, 1);
+    assert.throws(() => aggregateReports(cells, kind, identity), /exactly the allowlisted reports/);
+  }
+});
+
 test('canonical Go package profile is bound to the current source module declaration', async () => {
   assert.equal(identityGoModule, 'github.com/hatefsystems/identity/apps/identity-api');
   assertGoModule(await readFile(new URL('../../apps/identity-api/go.mod', import.meta.url), 'utf8'));
@@ -28,11 +45,11 @@ test('canonical Go package profile is bound to the current source module declara
 });
 
 for (const kind of ['integration', 'race']) {
-  test(`${kind} exact-seven aggregate is full and never substitutes another acceptance lane`, () => {
+  test(`${kind} exact-inventory aggregate is full and never substitutes another acceptance lane`, () => {
     const report = aggregateReports(reports(kind), kind, identity);
     assert.equal(report.scope, 'full');
     assert.equal(report.status, 'passed');
-    assert.equal(report.results.length, 7);
+    assert.equal(report.results.length, (kind === 'integration' ? integrationTargets : racePackages).length);
     assert.equal(report.cleanup.completed, true);
     if (kind === 'race') assert.deepEqual(report.toolchain, toolchain);
     else assert.equal(report.toolchain, undefined);
@@ -89,7 +106,7 @@ test('race toolchain profile admits only stable supported Go and actual GCC Linu
     assert.throws(() => assertRaceToolchain({ ...toolchain, go: { ...toolchain.go, GOVERSION: version } }));
 });
 
-test('exact-seven race aggregate requires matching toolchain proofs, never a caller boolean', () => {
+test('exact-inventory race aggregate requires matching toolchain proofs, never a caller boolean', () => {
   for (const change of [(cell) => delete cell.toolchain, (cell) => cell.toolchain = true,
     (cell) => cell.toolchain = { verified: true }, (cell) => cell.toolchain.go.GOHOSTOS = 'windows',
     (cell) => cell.toolchain.go.CGO_ENABLED = '0', (cell) => cell.toolchain.compiler.target = 'x86_64-w64-mingw32',

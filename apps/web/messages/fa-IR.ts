@@ -13,6 +13,7 @@ import { adminFa } from './admin';
 import { auditFa } from './audit';
 import { integrityFa } from './integrity';
 import { legalFa } from './legal';
+import { locationFa } from './location';
 
 const fa = {
   registration: registrationFa,
@@ -28,6 +29,7 @@ const fa = {
   audit: auditFa,
   integrity: integrityFa,
   legal: legalFa,
+  location: locationFa,
 } as const satisfies CatalogShape<typeof en>;
 
 export default fa;

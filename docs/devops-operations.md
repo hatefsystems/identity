@@ -18,7 +18,8 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 ## Fresh-Baseline Environment Cutover
 
 Current bundled installation uses unchanged `00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql` and `00003_username_reservations.sql`, through version 3 in
+`00002_registration_attempts.sql`, `00003_username_reservations.sql` and
+`00004_geography_catalog.sql`, through version 4 in
 `public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
 are refused regardless of their version or apparent equivalence; untracked nonempty
 application schemas and contradictory histories also fail closed. There is no
@@ -40,7 +41,7 @@ they are not evidence that this baseline passed.
    Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
 3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
    `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
-    fresh `up` records versions 1 through 3; repeated `up` verifies a no-op. Do not stamp, rename
+    fresh `up` records versions 1 through 4; repeated `up` verifies a no-op. Do not stamp, rename
    or clear metadata after refusal. Verify packaged embedded inventory and final
    schema before starting compatible binaries.
 4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
@@ -56,6 +57,133 @@ they are not evidence that this baseline passed.
     coordinator records uncached final-source outcomes separately only after actual
     [required acceptance](admin-operations.md#automated-validation), without reusing
     historical evidence or certifying production readiness.
+
+## Geography Catalog (T08/T09)
+
+The catalog is an independent operator import and anonymous read boundary, not
+registration integration. T10 encrypted location storage and T34/T37 registration
+stages remain deferred. Keep the original source files local: `data/cities.json`
+and `data/types.json` are ignored by Git and excluded from both container contexts.
+Do not attach them, source labels, full query results or provenance containing
+private values to CI/browser artifacts. Only synthetic fixtures may be committed.
+This increment does not repeat T07, replace sources or redistribute data rights.
+
+### Complete-Snapshot Procedure
+
+1. Separately apply the guarded version-4 migration using the migrator identity.
+   `geography check` and `geography import` never migrate or perform runtime DDL.
+   Fresh migration and version-3 upgrades preserve existing accounts/credentials.
+2. Prepare a manifest as an explicit operator assertion of the complete intended
+   snapshot. Its exact fields are `country:"IR"`, `source_release`,
+   `cities_sha256`, `types_sha256` (lowercase SHA-256), `cities_bytes`, `types_bytes`,
+   `place_count`, `type_count`, `province_count`, `expected_current_revision`
+   (`null` initially, otherwise an exact positive decimal string), and
+   `complete_snapshot:true`. A script's valid JSON, hashes or measured counts do
+   not establish completeness or authorize retirement. Review source release and
+   intended coverage before writing that assertion.
+3. Inject a separately provisioned reader URL through
+   `GEOGRAPHY_CHECK_DATABASE_URL` and run the explicit-path command below. Check
+   uses a read-only consistent transaction, emits aggregate additions, edits,
+   reparenting, retirements, reactivations and type edits plus `plan_digest` and
+   `retirement_digest`, and performs no writes or migrations.
+4. Review the aggregate change plan, especially retirements. Inject the importer
+   URL through CLI-only `GEOGRAPHY_IMPORT_DATABASE_URL`, then supply the exact
+   checked `--apply-plan` and, when retiring identities, `--retirement-digest`.
+   Neither CLI falls back to the API's `DATABASE_URL`. Never put credentials in
+   flags, tracked environment files, logs or browser configuration.
+5. Import repeats strict validation/comparison, takes bounded transaction locks,
+   verifies the active pointer and commits the entire immutable snapshot plus
+   identity metadata and pointer atomically. A changed input, stale base or wrong
+   acknowledgement fails closed and rolls back. Review/check again instead of
+   overriding a stale digest. Identical active files are a true no-op, including
+   concurrent identical imports. Reusing an older non-current snapshot requires a
+   new check; it creates a new revision, not a rewrite of history.
+
+```bash
+npm exec -- nx run identity-api:geography-check -- \
+  --cities=/absolute/path/cities.json \
+  --types=/absolute/path/types.json \
+  --manifest=/absolute/path/complete-snapshot.json
+
+npm exec -- nx run identity-api:geography-import -- \
+  --cities=/absolute/path/cities.json \
+  --types=/absolute/path/types.json \
+  --manifest=/absolute/path/complete-snapshot.json \
+  --apply-plan=<checked-plan-digest>
+```
+
+For a retirement plan add `--retirement-digest=<checked-retirement-digest>` to
+import. All operator Nx targets are uncached. File ceilings are 64 MiB for places,
+64 KiB for types, 250,000 places, 64 types, 256 Unicode code points/1024 UTF-8 bytes
+per label and 32 parent edges. Empty/partial snapshots, duplicate JSON keys/IDs,
+invalid UTF-8/numbers/fields, unknown types, missing parents, cycles, self-parenting,
+non-province roots and inconsistent ancestry are refused with bounded diagnostics.
+Variable depth and type-5-under-type-5 are valid. Original labels remain unchanged.
+
+### Separate Permissions
+
+Provision actual non-owner, non-inheriting reader/importer logins independently;
+the application/CLI does not create roles or grant authority. Retain the separately
+provisioned migrator identity. Do not grant membership, schema/database CREATE,
+trigger bypass, deletion/truncation, account access or grant options to importers.
+The operator commands validate their effective restricted privileges.
+
+| Role | Required catalog grants |
+|---|---|
+| Reader / check | `SELECT` on all five geography tables only; schema `USAGE` and database `CONNECT`. |
+| Importer | Reader grants; `INSERT` on types, places and place versions; column `INSERT` on catalogs' revision/country/source/hash/size/count/importer/normalization metadata; `UPDATE(last_seen_revision)` on places; `UPDATE(active_revision)` on state. |
+| Migrator | Existing independently approved schema authority, not an API/importer credential. |
+
+`geography_catalogs.imported_at` and `writing_tx` are server-owned, not importer
+input. No sequence grant is needed: revisions are allocated under import exclusion.
+The SQL guards reject snapshot updates/deletions/truncations and additions after
+the writing transaction closes. Permanent source identity and first-seen revision
+are immutable; retiring an identity removes current snapshot membership, not its
+historical rows. Historical lookups resolve every ancestor in the same revision.
+
+Lock order is shared transaction `MigrationKey` (5300001), exclusive transaction
+`GeographyImportKey` (8000001), then the active state row. Migrators acquire exclusive
+`MigrationKey` before worker exclusions, so imports cannot overlap schema changes.
+Do not reverse this order or take account/worker locks from catalog import code.
+Transaction end releases import locks even on cancellation/error.
+
+### Read Limits And Recovery
+
+The public endpoints retain existing same-origin response headers and trusted
+client-IP resolution. Defaults: pages 20/max50, query timeout1s, limiter timeout250ms,
+120/IP/minute and 600/subnet/minute. Optional `GEOGRAPHY_PAGE_SIZE_DEFAULT`,
+`GEOGRAPHY_PAGE_SIZE_MAX`, `GEOGRAPHY_QUERY_TIMEOUT`, `GEOGRAPHY_LIMITER_TIMEOUT`,
+`GEOGRAPHY_PER_IP_PER_MINUTE` and `GEOGRAPHY_PER_SUBNET_PER_MINUTE` may only tighten
+the implemented ceilings; resolve current config/tests before changing them.
+Uninitialized catalog/database/limiter failures return503, never empty success.
+`catalog_changed` requires explicit browser restart/retry, not cursor rebinding.
+
+Roll back compatible application binaries without deleting immutable catalog
+history or changing stored IDs/revisions. Version4 is forward-only; recovery uses
+an approved consistent backup or a newly reviewed complete import. A lookup
+without revision cannot reconstruct an old reference's original meaning. Future
+T10 must revalidate and encrypt `catalog_revision` with IDs, bound to account/purpose.
+
+### Geography Acceptance
+
+Use `identity-api:test-geography`, the owned
+`--integration-target=test-geography-integration` cell, owned
+`--integration-race-package=./internal/geography` cell and
+`web:test-geography-browser`, in addition to the final required regression gates.
+The browser fixture is built only in a disposable test application, never a
+production route or opt-in production build mode. Source identity, exact nonzero
+package/test inventories, zero unexpected skips and confirmed cleanup are required.
+API unit tests and headless keyboard/RTL/focus assertions do not certify manual
+screen-reader/native-touch or professional Persian review.
+
+`identity-api:geography-performance` requires explicit external source and manifest
+paths, creates run-owned PostgreSQL, imports through the real restricted CLI and
+reports aggregate timings/index sizes and sanitized `EXPLAIN (ANALYZE, BUFFERS)`
+structure only. It never uses inherited/shared database credentials. Warmed query
+p95 target is below200ms across100 representative browse/prefix/empty/later-page
+queries; retain misses as failures and diagnose plans, never weaken bounds. Actual
+local PASS/FAIL/NOT RUN results, hosted CI and unperformed manual/platform/deployed
+ingress gates must be reported separately; test existence is not execution evidence.
 
 ## User Lifecycle Publisher (Task 6.3)
 
@@ -396,11 +524,11 @@ SMS and SMTP listeners bind only to its private interface. JetStream provisionin
 uses the controller's owned private broker address. Do not expose backing services
 or relax production transport admission to repair fixture connectivity.
 
-The final normal service gate is exactly seven one-suite cells under
+The final normal service gate is exactly eight one-suite cells under
 `max-parallel: 1`, `fail-fast: false`, unchanged target/job deadlines (30m/60m),
 nonzero executed evidence, zero failures/skips and verified run-owned cleanup.
-The [seven-suite inventory](admin-operations.md#automated-validation) is frozen;
-new package coverage is additive and overlapping runs must remain. Seven affected
+The [eight-suite inventory](admin-operations.md#automated-validation) is explicit;
+new package coverage is additive and overlapping runs must remain. Eight affected
 Linux CGO race cells/aggregate are separate, with `-json -tags=integration -race
 -count=1 -p=1 -timeout=20m`, never replacements for normal suite evidence.
 
@@ -415,7 +543,7 @@ npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs
 ```
 
 Partial mode identifies itself as partial and cannot satisfy publication. Require
-exact-seven unique expected normal and race results, source/generated/run identity,
+exact-eight unique expected normal and race results, source/generated/run identity,
 test/package evidence and cleanup; missing/stale/duplicate/wrong-source reports,
 zero exit without tests or any skip fail. Resolve final targets before running.
 Never overlap independent service or browser harnesses against the same Docker
@@ -497,7 +625,7 @@ npm exec -- nx run web:test-admin-browser --skipNxCache
 node .github/scripts/portal-harness.mjs --integration
 ```
 
-The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs all seven CI suites in CI order: `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, and `test-portal-integration`, through Nx serially on disposable PostgreSQL 16, Redis 7 and JetStream 2.10; missing configuration or skipped tests fail the run. Its 60-minute total deadline includes startup, with a maximum 30-minute target deadline; interruption/deadline failures terminate the owned process tree before removing services. Migration and retention Go package budgets are explicitly 20 minutes while production transaction/lock limits remain unchanged. `LOCALAPPDATA` is retained solely for the Windows Go build cache; credentials, peppers and feature flags are not inherited. A collision on the reserved restart broker name fails rather than reusing or removing another run's container. Never point reset-schema suites at shared Compose volumes, development or deployed databases. Successful teardown is explicitly confirmed. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
+The browser target builds its API/web/fixture/signer/publisher/notifier dependencies; Task 7.6 also requires `identity-api:build-admin-legal` for the real signer lookup probe. The integration orchestrator runs all eight CI suites in CI order: `test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, `test-geography-integration`, and `test-portal-integration`, through Nx serially on disposable PostgreSQL 16, Redis 7 and JetStream 2.10; missing configuration or skipped tests fail the run. Its 60-minute total deadline includes startup, with a maximum 30-minute target deadline; interruption/deadline failures terminate the owned process tree before removing services. Migration and retention Go package budgets are explicitly 20 minutes while production transaction/lock limits remain unchanged. `LOCALAPPDATA` is retained solely for the Windows Go build cache; credentials, peppers and feature flags are not inherited. A collision on the reserved restart broker name fails rather than reusing or removing another run's container. Never point reset-schema suites at shared Compose volumes, development or deployed databases. Successful teardown is explicitly confirmed. Required API SQL generation/reproducibility checks, unit/race/vet/lint, operator builds, frontend/UI checks (including spec typechecks), helper/fixture-safety checks, existing portal tests, CSP and image smoke remain separate automated gates. Linux race validation requires CGO and a C compiler; use the CI-pinned Go/linter toolchain rather than silently skipping it.
 
 Windows cannot deliver a graceful Go `SIGTERM` using Node's process kill. For Windows admin browser acceptance, first build and inspect the fresh production API image, then set `ADMIN_BROWSER_SIGNER_IMAGE` to its immutable `sha256:` image ID before running `web:test-admin-browser`. The harness uses its real non-root `/usr/local/bin/audit-signer` on the private run-owned service network and `docker stop` for graceful retirement; it still requires exit 0 before destructive fixtures. The signer and publisher receive separate restricted real logins, and publisher reads/delivery updates use its exact subject/marker RLS policies. No production image is inferred from a mutable tag and no forced termination is accepted as clean signer shutdown. Linux CI retains the normal locally built signer binary.
 

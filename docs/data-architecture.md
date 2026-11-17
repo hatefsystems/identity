@@ -13,8 +13,9 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 The following is a selected schema illustration, not executable production
 provisioning or a substitute for the applied migrations in
 `apps/identity-api/db/migrations`. The active forward-only bundle is unchanged
-`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`, tracked
-through version 2 in `public.identity_schema_version`. No legacy history adoption,
+`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`,
+`00003_username_reservations.sql` and `00004_geography_catalog.sql`, tracked
+through version 4 in `public.identity_schema_version`. No legacy history adoption,
 baseline rewrite or Down/reset is implied. Additional columns/state are described
 below and in the bundle. Canonical-v2 payloads do not contain their
 own event UUID or chain digest, and contracted legal requests have no plaintext
@@ -648,6 +649,28 @@ different counts. See the [operational gate](admin-operations.md#legal-review-an
 for actual tombstone fields and pending retention approval.
 
 ### Retained Metadata Inventory
+
+The geography catalog is independent of account personal data. Its five tables
+are `geography_catalogs` (file hashes, sizes, source/importer/normalization versions
+and import provenance), `geography_types` (revision-specific original type labels),
+`geography_places` (permanent numeric source identities and first/last-seen revision),
+`geography_place_versions` (immutable complete snapshots including parent/province
+and separate normalized prefix-search value), and `geography_catalog_state`
+(singleton active revision). No user FK, registration column or encrypted private
+location is added in T08/T09. Retired identities and complete historical snapshots
+have no cleanup in this increment; source redistribution rights remain separate.
+
+Labels remain the original admitted UTF-8 bytes. Search alone uses NFC, Arabic
+Yeh/Kaf folding and collapsed ordinary-space/NBSP/ZWNJ. Composite foreign keys keep
+type, parent and province inside the same revision. Snapshot reads resolve every
+ancestor at the requested revision; an unversioned retired lookup uses its last-seen
+revision, not an invented original meaning. A historical/retired lookup cannot
+authorize a new selection. See [geography operations](devops-operations.md#geography-catalog-t08t09).
+
+Future T10 must encrypt the validated `catalog_revision` together with the exact
+country/province/locality IDs in its account/purpose-bound payload. Saving must
+revalidate and bind the server snapshot; client labels, paths and revisions are
+never authority. Unversioned legacy evidence cannot establish an original revision.
 
 These are actual current inventories, not blanket legal approval. `no_expiry`
 means no implemented finite expiry, not anonymous data, approved indefinite

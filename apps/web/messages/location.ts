@@ -1,0 +1,81 @@
+import type { CatalogShape } from '../i18n/types';
+
+export const locationEn = {
+  province: 'Province (required)',
+  locality: 'City, urban area, or village (optional)',
+  provinceHint:
+    'Browse or search by the beginning of a province name. Choose a result to select it.',
+  localityHint:
+    'Browse or search by the beginning of a city, urban area, or village name in the selected province.',
+  provinceFirst: 'Choose a province before selecting a city, urban area, or village.',
+  search: 'Search by name',
+  chooseProvince: 'Choose a province',
+  chooseLocality: 'Choose a city, urban area, or village',
+  noProvince: 'No province selected.',
+  noLocality: 'No city, urban area, or village selected.',
+  clearProvince: 'Clear province',
+  clearLocality: 'Clear city, urban area, or village',
+  skip: 'Skip city, urban area, or village',
+  close: 'Close picker',
+  more: 'Load more results',
+  retry: 'Retry',
+  loading: 'Loading locations...',
+  empty: 'No matching locations. Try a different name.',
+  unavailable: 'Locations are temporarily unavailable. Retry when you are ready.',
+  rateLimited: 'Too many location requests. Wait before retrying.',
+  catalogChanged: 'The location catalog changed. Retry to browse the current catalog.',
+  queryTooLong: 'Search must be at most 80 characters and 256 bytes, without control characters.',
+  retainedLimit: 'The result limit has been reached. Refine your search to find another location.',
+  results: '{count, plural, one {# location shown.} other {# locations shown.}}',
+  localityCleared: 'The city, urban area, or village was cleared because the province changed.',
+  provinceCleared: 'The province and any city, urban area, or village were cleared.',
+  skipped: 'City, urban area, or village skipped. The selected province is unchanged.',
+  selectionCleared: 'The city, urban area, or village selection was cleared.',
+  selected: 'Location selected: <place>{name}</place>.',
+  selectedUnavailable:
+    'This saved location is not available for a new selection. Choose a current location.',
+  selectedLookupFailed:
+    'The selected location details could not be loaded. Your selection is unchanged.',
+  retryDetails: 'Retry selected location details',
+  selectedId: 'Selected location ID: <value>{id}</value>',
+} as const;
+
+export const locationFa = {
+  province: 'استان (الزامی)',
+  locality: 'شهر، منطقه شهری یا روستا (اختیاری)',
+  provinceHint:
+    'استان‌ها را مرور کنید یا ابتدای نام استان را جست‌وجو کنید. برای انتخاب، یکی از نتایج را انتخاب کنید.',
+  localityHint:
+    'شهر، منطقه شهری یا روستا را در استان انتخاب‌شده مرور کنید یا ابتدای نام آن را جست‌وجو کنید.',
+  provinceFirst: 'پیش از انتخاب شهر، منطقه شهری یا روستا، یک استان انتخاب کنید.',
+  search: 'جست‌وجو بر اساس نام',
+  chooseProvince: 'انتخاب استان',
+  chooseLocality: 'انتخاب شهر، منطقه شهری یا روستا',
+  noProvince: 'استانی انتخاب نشده است.',
+  noLocality: 'شهر، منطقه شهری یا روستایی انتخاب نشده است.',
+  clearProvince: 'پاک کردن استان',
+  clearLocality: 'پاک کردن شهر، منطقه شهری یا روستا',
+  skip: 'رد شدن از انتخاب شهر، منطقه شهری یا روستا',
+  close: 'بستن انتخاب‌گر',
+  more: 'نمایش نتایج بیشتر',
+  retry: 'تلاش دوباره',
+  loading: 'در حال دریافت مکان‌ها...',
+  empty: 'مکانی مطابق جست‌وجو یافت نشد. نام دیگری را امتحان کنید.',
+  unavailable: 'مکان‌ها موقتاً در دسترس نیستند. هر زمان آماده بودید دوباره تلاش کنید.',
+  rateLimited: 'درخواست‌های مکان بیش از حد مجاز است. پیش از تلاش دوباره صبر کنید.',
+  catalogChanged: 'فهرست مکان‌ها تغییر کرده است. برای مرور فهرست فعلی دوباره تلاش کنید.',
+  queryTooLong: 'جست‌وجو باید حداکثر ۸۰ نویسه و ۲۵۶ بایت باشد و نویسهٔ کنترلی نداشته باشد.',
+  retainedLimit:
+    'تعداد نتایج به حد مجاز رسیده است. برای یافتن مکان دیگر، جست‌وجوی خود را دقیق‌تر کنید.',
+  results: '{count, plural, one {# مکان نمایش داده شده است.} other {# مکان نمایش داده شده است.}}',
+  localityCleared: 'به دلیل تغییر استان، انتخاب شهر، منطقه شهری یا روستا پاک شد.',
+  provinceCleared: 'استان و هر شهر، منطقه شهری یا روستای انتخاب‌شده پاک شدند.',
+  skipped: 'از انتخاب شهر، منطقه شهری یا روستا رد شدید. استان انتخاب‌شده تغییر نکرده است.',
+  selectionCleared: 'انتخاب شهر، منطقه شهری یا روستا پاک شد.',
+  selected: 'مکان انتخاب شد: <place>{name}</place>.',
+  selectedUnavailable:
+    'این مکان ذخیره‌شده برای انتخاب جدید در دسترس نیست. یک مکان فعلی انتخاب کنید.',
+  selectedLookupFailed: 'جزئیات مکان انتخاب‌شده دریافت نشد. انتخاب شما تغییر نکرده است.',
+  retryDetails: 'تلاش دوباره برای دریافت جزئیات مکان انتخاب‌شده',
+  selectedId: 'شناسهٔ مکان انتخاب‌شده: <value>{id}</value>',
+} as const satisfies CatalogShape<typeof locationEn>;

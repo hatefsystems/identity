@@ -735,6 +735,7 @@ function mockIntegrationRunner(t, { failAt, hang = false, startError = false, ou
     assert.equal(options.env.REQUIRE_LEGAL_WORKFLOW_INTEGRATION, '1');
     assert.equal(options.env.REQUIRE_PORTAL_INTEGRATION, '1');
     assert.equal(options.env.REQUIRE_GRPC_INTEGRATION, '1');
+    assert.equal(options.env.REQUIRE_GEOGRAPHY_INTEGRATION, '1');
     assert.equal(options.env.NODE_TLS_REJECT_UNAUTHORIZED, undefined);
     assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
     assert.equal(options.detached, true);
@@ -793,10 +794,11 @@ function mockIntegrationRunner(t, { failAt, hang = false, startError = false, ou
   return state;
 }
 
-test('integration runner preserves the Windows Go cache location but excludes inherited credentials', async (t) => {
-  const previous = { LOCALAPPDATA: process.env.LOCALAPPDATA, DATABASE_URL: process.env.DATABASE_URL };
+test('integration runner preserves the Go cache, pins local tooling and excludes inherited credentials', async (t) => {
+  const previous = { LOCALAPPDATA: process.env.LOCALAPPDATA, DATABASE_URL: process.env.DATABASE_URL, GOTOOLCHAIN: process.env.GOTOOLCHAIN };
   process.env.LOCALAPPDATA = 'fixture-local-app-data';
   process.env.DATABASE_URL = 'PRIVATE inherited database';
+  process.env.GOTOOLCHAIN = 'auto';
   t.after(() => {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -806,6 +808,7 @@ test('integration runner preserves the Windows Go cache location but excludes in
   const result = await runPortalIntegrationTarget(integrationTargets[0], { DATABASE_URL: 'PRIVATE owned database' });
   assert.equal(state.children[0].options.env.LOCALAPPDATA, 'fixture-local-app-data');
   assert.equal(state.children[0].options.env.DATABASE_URL, 'PRIVATE owned database');
+  assert.equal(state.children[0].options.env.GOTOOLCHAIN, 'local');
    assert.equal(result.packages, integrationPackages[integrationTargets[0]].length);
    assert.equal(result.tests, result.packages);
    assert.equal(result.failed, 0);
@@ -840,6 +843,7 @@ function mockToolchainProbes(t, { go = fixtureToolchain.go, goOutput = JSON.stri
     assert.equal(options.maxBuffer, 16 * 1024);
     assert(options.timeout > 0 && options.timeout <= 10_000);
     assert.equal(options.env.CGO_ENABLED, '1');
+    assert.equal(options.env.GOTOOLCHAIN, 'local');
     for (const key of ['GOOS', 'GOHOSTOS', 'GOARCH', 'GOVERSION', 'CC', 'GO', 'GCC', 'RACE_TOOLCHAIN_VERIFIED', 'DATABASE_URL', 'NODE_TLS_REJECT_UNAUTHORIZED']) assert.equal(options.env[key], undefined);
     const stdout = [goOutput, version, target][calls.length];
     calls.push({ command, args, options });
@@ -975,11 +979,11 @@ test('toolchain startup budget is one lifecycle deadline, including compiler pro
   });
 });
 
-test('integration runner executes all seven uncached mandatory suites serially and confirms owned service cleanup', async (t) => {
+test('integration runner executes the exact uncached mandatory inventory serially and confirms owned service cleanup', async (t) => {
   const docker = mockPortalDocker(t);
   const state = mockIntegrationRunner(t);
   const report = await runPortalIntegrationSuites({ identify });
-  assert.equal(state.children.length, 7);
+  assert.equal(state.children.length, integrationTargets.length);
   assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
   const portal = report.results.at(-1);
   assert.equal(portal.packages, 16);
@@ -1956,7 +1960,7 @@ test('CI preserves image/CSP coverage and gates release on the real portal suite
   assert.match(workflow, /--integration-target=\$\{\{ matrix\.target \}\}/);
   assert(workflow.includes('test-portal-integration'));
   assert.match(workflow, /nx run web:test-admin-browser --skipNxCache/);
-  assert.match(workflow, /needs: \[quality, security-db, security-race, frontend, portal-browser, admin-browser, registration-browser, compose-smoke\]/);
+  assert.match(workflow, /needs: \[quality, security-db, security-race, frontend, portal-browser, admin-browser, geography-browser, registration-browser, compose-smoke\]/);
 });
 
 test('admin browser is uncached, builds its production dependencies and uses armed fixtures', () => {
@@ -1977,7 +1981,7 @@ test('admin browser is uncached, builds its production dependencies and uses arm
   assert.match(harness, /return \{ runID, origin, tlsSPKI/);
   assert.doesNotMatch(harness, /console\.error\([^\n]*output/);
   assert.deepEqual(integrationTargets, ['test-security-db', 'test-admin-integration', 'test-retention-integration',
-    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-portal-integration']);
+    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-geography-integration', 'test-portal-integration']);
   const browser = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(browser, /route\.fetch\s*\(/);
   assert.match(browser, /Fetch\.failRequest/);
@@ -2030,13 +2034,13 @@ test('portal integration cannot silently omit real dependencies or run in parall
   assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username'\]/);
 });
 
-test('local integration inventory matches all seven mandatory CI suites in order', () => {
+test('local integration inventory matches every mandatory CI suite in order', () => {
   const workflow = readFileSync(new URL('../workflows/identity-api.yml', import.meta.url), 'utf8');
   const job = workflow.slice(workflow.indexOf('  integration-cell:'), workflow.indexOf('  security-db:'));
   const targets = job.match(/target: \[([^\]]+)\]/)[1].split(', ');
-  assert.equal(targets.length, 7);
+  assert.equal(targets.length, integrationTargets.length);
   assert.deepEqual(targets, ['test-security-db', 'test-admin-integration', 'test-retention-integration',
-    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-portal-integration']);
+    'test-legal-workflow-integration', 'test-grpc-integration', 'test-lifecycle-integration', 'test-geography-integration', 'test-portal-integration']);
   assert.deepEqual(integrationTargets, targets);
   assert.deepEqual(Object.keys(integrationPackages), targets);
   assert(Object.isFrozen(integrationTargets));
@@ -2083,7 +2087,7 @@ test('integration invocation rejects all arbitrary selectors and identifies part
   for (const args of [[], ['--integration', '--integration'], ['--integration-target=identity-api:test-security-db'], ['--integration-target=unknown'], ['--integration-target=test-username-integration'], ['--integration-race-package=./internal/username'], ['--integration-race-package=./...'], ['--integration-race-package=./cmd/server'], ['--integration-target=test-security-db', '--run=TestOne']]) assert.throws(() => integrationInvocation(args));
 });
 
-test('all seven nonparallel targets preserve exact package inventories and serial uncached flags', () => {
+test('every nonparallel target preserves exact package inventories and serial uncached flags', () => {
   const { targets } = JSON.parse(readFileSync(new URL('../../apps/identity-api/project.json', import.meta.url)));
   for (const name of integrationTargets) {
     const target = targets[name];

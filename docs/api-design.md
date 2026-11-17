@@ -487,6 +487,49 @@ Unchanged `00001` plus additive `00002` installation and fail-closed history ref
 [admin operations](admin-operations.md#migration-and-contraction); no HTTP, signed
 canonical, wire-format or operator approval contract changes with consolidation.
 
+### Geography Catalog (T08/T09)
+
+Anonymous same-origin GET requests require `country=IR` and retain the existing
+browser API no-store/no-referrer/nosniff headers. They do not bootstrap a session,
+require DPoP, create a CORS exception or expose an import/write endpoint.
+
+| Route | Additional query | Result |
+|---|---|---|
+| `/api/v1/geography/provinces` | Optional `q`, `limit`, `cursor` | Active province roots (source type 2). |
+| `/api/v1/geography/localities` | Required `province_id`; optional `q`, `limit`, `cursor` | Active source types 5 and 7 within the selected active province. |
+| `/api/v1/geography/places/{id}` | Optional `revision` | Current identity or last-seen retired snapshot; explicit revision resolves that complete historical snapshot. |
+
+Lists return `{catalog_revision,items,next_cursor}`. Each item/lookup returns
+`{id,label,type:{id,label},province,ancestors,retired,selectable,catalog_revision}`;
+province/ancestor summaries contain `{id,label,type_id,type_label}`. Ancestors are
+ordered from root toward the immediate parent. IDs, type IDs and revisions are
+exact positive BIGINT decimal strings, never JavaScript numbers. Display original
+labels and paths without translating or normalizing their bytes.
+
+The default page is 20, maximum 50. Prefix-only search uses the separate normalized
+name with deterministic `C` collation and ID keyset tie-breaker. Empty `q` browses;
+`%`, `_` and backslash are literal. Queries are at most 80 Unicode code points and
+256 UTF-8 bytes; cursors at most 2 KiB bind endpoint, revision, province and normalized
+query. They are continuation tokens, not authorization. Database reads have a
+one-second deadline and one consistent catalog snapshot.
+
+| Status | Meaning |
+|---|---|
+| 200 | Valid bounded list, including genuinely empty search results, or resolved identity. |
+| 400 `invalid_request` | Malformed/duplicate/unsupported query, noncanonical ID or invalid province. |
+| 404 `not_found` | Unknown identity or absent requested snapshot membership. |
+| 409 `catalog_changed` | Active revision changed since the supplied continuation; restart browsing explicitly. |
+| 429 `rate_limited` | Geography's separate trusted-IP/subnet Redis budget exceeded; honor `Retry-After`. |
+| 503 `temporarily_unavailable` | Uninitialized catalog, database/deadline or limiter failure; never a successful empty list. |
+
+Default geography budgets are 120 requests/IP/minute and 600/subnet/minute,
+independent of authentication budgets. Trusted proxy handling is unchanged. The
+shared `internal/geography.Service.Validate` accepts only `{country:"IR",
+province_id,locality_id?}` and returns a server-owned `catalog_revision`; active
+province type 2, optional active locality type 5/7 and matching ancestry are checked
+inside one snapshot. It separates invalid selections from availability errors.
+Registration does not yet call this validator or persist location.
+
 ## 2. Internal APIs (gRPC)
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 

@@ -33,3 +33,7 @@
 **/*.crt
 **/*.log
 **/*.dump
+
+# Operator-owned geography data is never a browser build input.
+data/cities.json
+data/types.json

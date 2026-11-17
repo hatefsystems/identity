@@ -23,3 +23,7 @@ libs/schemas/gen/
 **/coverage.html
 **/Dockerfile
 **/*.dockerignore
+
+# Explicit local geography boundary, including future context allowlist changes.
+data/cities.json
+data/types.json

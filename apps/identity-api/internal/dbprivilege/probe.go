@@ -13,14 +13,15 @@ import (
 // ErrUnsafe deliberately omits catalog names, identities and database diagnostics.
 var ErrUnsafe = errors.New("restricted database privileges required")
 
-// Table describes required table grants and the only permitted column updates.
-// A table UPDATE grant is not interchangeable with a narrow column allowance.
+// Table describes required table grants and permitted column inserts/updates.
+// Table-level grants are not interchangeable with narrow column allowances.
 type Table struct {
 	Name          string
 	Select        bool
 	Insert        bool
 	Update        bool
 	Delete        bool
+	InsertColumns []string
 	UpdateColumns []string
 }
 
@@ -60,6 +61,9 @@ func Check(ctx context.Context, q db.DBTX, contract Contract) error {
 		contract.Guards = []Guard{}
 	}
 	for i := range contract.Tables {
+		if contract.Tables[i].InsertColumns == nil {
+			contract.Tables[i].InsertColumns = []string{}
+		}
 		if contract.Tables[i].UpdateColumns == nil {
 			contract.Tables[i].UpdateColumns = []string{}
 		}
@@ -72,7 +76,7 @@ func Check(ctx context.Context, q db.DBTX, contract Contract) error {
 	err = q.QueryRow(ctx, `WITH specification AS (SELECT $1::jsonb AS value),
  allowed AS (SELECT x.*,to_regclass(x."Name") AS oid FROM specification,
    jsonb_to_recordset(value->'Tables') AS x("Name" text,"Select" boolean,"Insert" boolean,
-     "Update" boolean,"Delete" boolean,"UpdateColumns" jsonb)),
+    "Update" boolean,"Delete" boolean,"InsertColumns" jsonb,"UpdateColumns" jsonb)),
  relations AS (SELECT c.* FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
    WHERE n.nspname !~ '^pg_' AND n.nspname<>'information_schema'),
  functions AS (SELECT to_regprocedure(x) AS oid FROM specification,
@@ -105,12 +109,18 @@ func Check(ctx context.Context, q db.DBTX, contract Contract) error {
    (a."Insert" AND NOT pg_catalog.has_table_privilege(r.oid,a.oid,'INSERT')) OR
    (a."Update" AND NOT pg_catalog.has_table_privilege(r.oid,a.oid,'UPDATE')) OR
    (a."Delete" AND NOT pg_catalog.has_table_privilege(r.oid,a.oid,'DELETE')) OR
-   EXISTS(SELECT 1 FROM jsonb_array_elements_text(coalesce(a."UpdateColumns",'[]'::jsonb)) col
+    EXISTS(SELECT 1 FROM jsonb_array_elements_text(coalesce(a."InsertColumns",'[]'::jsonb)) col
+      WHERE NOT pg_catalog.has_column_privilege(r.oid,a.oid,col,'INSERT')) OR
+    EXISTS(SELECT 1 FROM jsonb_array_elements_text(coalesce(a."UpdateColumns",'[]'::jsonb)) col
      WHERE NOT pg_catalog.has_column_privilege(r.oid,a.oid,col,'UPDATE')))
  AND NOT EXISTS(SELECT 1 FROM relations c LEFT JOIN allowed a ON a.oid=c.oid
    WHERE c.relkind IN ('r','p','v','m','f') AND (
      (NOT coalesce(a."Select",false) AND pg_catalog.has_any_column_privilege(r.oid,c.oid,'SELECT')) OR
-     (NOT coalesce(a."Insert",false) AND pg_catalog.has_any_column_privilege(r.oid,c.oid,'INSERT')) OR
+      (NOT coalesce(a."Insert",false) AND (
+        pg_catalog.has_table_privilege(r.oid,c.oid,'INSERT') OR EXISTS(
+          SELECT 1 FROM pg_catalog.pg_attribute col WHERE col.attrelid=c.oid AND col.attnum>0 AND NOT col.attisdropped
+          AND pg_catalog.has_column_privilege(r.oid,c.oid,col.attnum,'INSERT')
+          AND NOT coalesce(a."InsertColumns",'[]'::jsonb) ? col.attname))) OR
      (NOT coalesce(a."Delete",false) AND pg_catalog.has_table_privilege(r.oid,c.oid,'DELETE')) OR
      pg_catalog.has_table_privilege(r.oid,c.oid,'TRUNCATE,TRIGGER,REFERENCES') OR
      pg_catalog.has_any_column_privilege(r.oid,c.oid,'REFERENCES') OR

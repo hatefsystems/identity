@@ -422,7 +422,7 @@ The runtime bounds initial dependency/SVID acquisition to ten seconds, handshake
 Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
 
 The bundled `00001_initial_schema.sql`, `00002_registration_attempts.sql` and
-additive `00003_username_reservations.sql` install uses
+additive `00003_username_reservations.sql` and `00004_geography_catalog.sql` install uses
 `public.identity_schema_version`, refusing all legacy `public.goose_db_version`,
 untracked nonempty application schemas and contradictory histories without
 upgrade/adoption. Stop all old writers before switching to explicitly scoped fresh
@@ -473,3 +473,35 @@ superseded. Preserve mixed v1/v2 replay and terminal legacy tombstones. During
 rollback, keep v2-capable publishing/consumption while v2 outbox or retained broker
 history exists; never run an old strict-v1 worker over those rows. Consumer code and
 deployment outside this repository remain explicit operator release gates.
+
+## 5. Geography Selector (T08/T09)
+
+`apps/web/app/_components/location-selector.tsx` exports controlled
+`LocationSelector` with `value: LocationInput | null`, `onChange`, and optional
+`disabled`. `apps/web/app/_lib/geography-client.ts` owns the bounded anonymous
+same-origin transport; `libs/ui` supplies a locale-agnostic searchable-list
+primitive. Mount inside the stable display provider. English and Persian messages
+belong to the application, not transport/domain/UI-library code.
+
+Province is required; city, urban area or village is optional. Locality remains
+disabled until an explicit province selection. Typed search is draft text, never a
+committed ID. Original name, source type and ancestor path disambiguate repeated
+names. Explicit clear/skip actions do not auto-select a result. Changing/clearing
+province clears incompatible locality and announces it. Retained pages are bounded
+and loaded explicitly; requests debounce 250 ms and use cancellation plus generation
+guards against late responses. Loading, empty, unavailable, rate-limit and catalog
+change states remain distinct. Mobile uses the existing native dialog; desktop
+uses combobox/listbox keyboard interaction. Names/paths use automatic direction,
+technical IDs use LTR isolation, and preference changes do not replay API work.
+
+Future T34/T37 can insert this component into the existing registration component's
+location stage when that stage is separately implemented. Do not insert it into
+the current email/phone/passkey flow or alter current request/completion behavior.
+Client selection is only an advisory draft; future T10 must revalidate and encrypt
+the server-owned snapshot revision with the IDs. A lookup of retired/historical
+data is display-only, not eligibility for a new selection.
+
+`web:test-geography-browser` builds an API-connected fixture only inside a
+run-owned disposable test application. No production route or production build
+flag exposes that fixture. Real source snapshots remain operator-local, outside
+Git/container contexts/browser artifacts; only synthetic fixtures are committed.

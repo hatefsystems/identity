@@ -169,10 +169,11 @@ digests and erasure/receipt material. Minimization is not unconditional anonymit
 or blanket approval of permanent retention. See the [exact retained inventory](data-architecture.md#retained-metadata-inventory)
 and unchecked [production checklist](admin-operations.md#production-checklist).
 Fresh installation uses unchanged `00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql`, tracked through version 2 in
+`00002_registration_attempts.sql`, `00003_username_reservations.sql` and
+`00004_geography_catalog.sql`, tracked through version 4 in
 `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked
 nonempty application schemas and contradictory histories refuse without mutation,
-even if old storage appears equivalent. There is no in-place upgrade/adoption,
+even if old storage appears equivalent. There is no old-lineage upgrade/adoption,
 automatic history stamping or genesis reset. Stop all old writers and pair the
 explicitly scoped fresh PostgreSQL target with matching isolated Redis/NATS state
 so stale authority, queued events and checkpoints cannot enter the new database.

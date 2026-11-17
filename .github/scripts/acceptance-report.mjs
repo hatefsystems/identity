@@ -21,11 +21,12 @@ export const integrationPackages = Object.freeze({
   'test-legal-workflow-integration': ['internal/legalpolicy', 'internal/legalworkflow', 'internal/legalreport', 'internal/server'],
   'test-grpc-integration': ['internal/identitygrpc', 'internal/session', 'internal/oidc/token', 'internal/oidc/dpop'],
   'test-lifecycle-integration': ['internal/lifecycle'],
+  'test-geography-integration': ['internal/geography'],
   'test-portal-integration': ['internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn', 'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle', 'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp', 'internal/registration', 'internal/username'],
 });
 for (const packages of Object.values(integrationPackages)) Object.freeze(packages);
 export const integrationTargets = Object.freeze(Object.keys(integrationPackages));
-export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer']);
+export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer', './internal/geography']);
 export const raceToolchainProfile = 'linux-amd64-cgo-go1.26.5-gcc';
 const digest = /^[0-9a-f]{64}$/;
 const imageDigest = /^sha256:[0-9a-f]{64}$/;
@@ -47,6 +48,19 @@ export const registrationLocaleChecks = Object.freeze([
 export const registrationChecks = Object.freeze([
   'immutable-quality-image', 'isolated-production-services', 'packaged-migration-cleanup',
   ...registrationLocaleChecks, 'proof-storage-console-network-private', 'verified-owned-teardown',
+]);
+export const geographyLocales = Object.freeze(['en', 'fa-IR']);
+export const geographyJourneys = Object.freeze(['desktop', 'mobile']);
+export const geographyLocaleChecks = Object.freeze([
+  'anonymous-real-api', 'required-province-optional-locality', 'draft-never-selects',
+  'keyboard-selection-escape', 'mobile-dialog-focus', 'clear-skip-province-change',
+  'normalized-prefix-literal-search', 'explicit-bounded-pagination', 'stale-response-rejected',
+  'unavailable-retry', 'real-rate-limit-retry-after', 'catalog-revision-change', 'rtl-language-preserves-selection',
+  'responsive-touch-bounds', 'masked-screenshots', 'private-storage-console-network',
+]);
+export const geographyChecks = Object.freeze([
+  'disposable-fixture-production-exclusion', 'owned-postgres-redis-migration-cli-import',
+  ...geographyLocaleChecks, 'verified-source-binaries-teardown',
 ]);
 
 async function treeFiles(root, base = root) {
@@ -142,9 +156,9 @@ export function assertRaceToolchain(toolchain) {
 export function aggregateReports(reports, kind, identity) {
   assert(['integration', 'race'].includes(kind), 'Unknown acceptance aggregate');
   assertIdentity(identity);
-  assert.notEqual(identity.runId, 'local', 'Local aggregation requires an explicit ACCEPTANCE_RUN_ID shared by all seven cells');
+  assert.notEqual(identity.runId, 'local', 'Local aggregation requires an explicit ACCEPTANCE_RUN_ID shared by every required cell');
   const expected = kind === 'integration' ? integrationTargets.map((name) => `identity-api:${name}`) : racePackages.map((name) => `identity-api:${name}`);
-  assert.equal(reports.length, 7, 'Acceptance aggregate requires exactly seven reports');
+  assert.equal(reports.length, expected.length, 'Acceptance aggregate requires exactly the allowlisted reports');
   assert.deepEqual(reports.map((report) => report.results?.[0]?.target).sort(), [...expected].sort(), 'Missing, duplicate or unknown acceptance cell');
   for (const report of reports) {
     assert(report.schema === 1 && report.kind === kind && report.scope === 'partial' && report.status === 'passed' && report.cleanup?.completed === true && report.results.length === 1, 'Invalid/failed partial cell');
@@ -191,6 +205,34 @@ export function assertRegistrationReport(report, manifest) {
   }
   assert.deepEqual(report.providers, providers, 'Aggregate registration provider counts do not match measured locale deltas');
   assert(providers.auth > 0, 'Registration SMTP authentication evidence missing');
+}
+
+export function assertGeographyReport(report, identity = report?.identity) {
+  assert(report?.schema === 1 && report.kind === 'geography-browser' && report.scope === 'full' && report.status === 'passed' &&
+    report.cleanup?.completed === true && report.exit === 0 && report.failed === 0 && report.skipped === 0, 'Geography acceptance did not pass with verified cleanup');
+  assert.deepEqual(Object.keys(report).sort(), ['binaryEvidence', 'checks', 'cleanup', 'exit', 'failed', 'identity', 'kind', 'localeEvidence', 'schema', 'scope', 'skipped', 'status', 'tests'], 'Unexpected private geography report fields');
+  assert.deepEqual(Object.keys(report.cleanup), ['completed'], 'Unexpected private geography cleanup fields');
+  assertIdentity(report.identity, identity);
+  assert.deepEqual(Object.keys(report.binaryEvidence).sort(), ['api', 'geography', 'migrate']);
+  for (const value of Object.values(report.binaryEvidence)) assert(digest.test(value), 'Missing geography binary fingerprint');
+  assert.deepEqual([...report.checks].sort(), [...geographyChecks].sort(), 'Incomplete or duplicate geography checks');
+  assert.equal(report.tests, geographyChecks.length, 'Geography test count mismatch');
+  assert.deepEqual(report.localeEvidence.map((entry) => entry.locale).sort(), [...geographyLocales].sort(), 'Incomplete geography locale inventory');
+  for (const entry of report.localeEvidence) {
+    assert.deepEqual(Object.keys(entry).sort(), ['checks', 'journeys', 'locale', 'services']);
+    assert.deepEqual([...entry.checks].sort(), [...geographyLocaleChecks].sort(), 'Incomplete geography locale checks');
+    assert.deepEqual([...entry.journeys].sort(), [...geographyJourneys].sort(), 'Incomplete geography journey inventory');
+    assert.deepEqual(Object.keys(entry.services).sort(), ['delayed', 'endpoints', 'injected', 'real', 'requests', 'statuses', 'violations']);
+    for (const key of ['delayed', 'injected', 'real', 'requests', 'violations']) assert(Number.isSafeInteger(entry.services[key]) && entry.services[key] >= 0);
+    assert(entry.services.requests > 0 && entry.services.real > 0 && entry.services.delayed > 0 && entry.services.injected === 2 && entry.services.violations === 0, 'Missing real geography lifecycle/fault evidence');
+    for (const [status, count] of Object.entries(entry.services.statuses)) assert(/^[1-5][0-9]{2}$/.test(status) && Number.isSafeInteger(count) && count > 0);
+    assert(entry.services.statuses['200'] > 0 && entry.services.statuses['409'] > 0 && entry.services.statuses['429'] > 0, 'Missing real geography success/catalog-change/rate-limit responses');
+    assert.equal(Object.values(entry.services.statuses).reduce((sum, count) => sum + count, 0), entry.services.real, 'Geography measured response counts mismatch');
+    assert.equal(entry.services.requests, entry.services.real + entry.services.injected, 'Geography requests lacked completed ingress evidence');
+    assert.deepEqual(Object.keys(entry.services.endpoints).sort(), ['localities', 'lookup', 'provinces']);
+    for (const count of Object.values(entry.services.endpoints)) assert(Number.isSafeInteger(count) && count > 0, 'Missing real geography endpoint evidence');
+    assert.equal(Object.values(entry.services.endpoints).reduce((sum, count) => sum + count, 0), entry.services.real);
+  }
 }
 
 export async function exportAcceptanceImage(reference, directory, { identify = acceptanceIdentity, run = runCommand } = {}) {
@@ -243,6 +285,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       const report = aggregateReports(await Promise.all(files.map((name) => readReport(resolve(directory, name)))), kind, await acceptanceIdentity());
       await writeFile(output, JSON.stringify(report) + '\n');
     } else if (command === 'verify-registration' && args.length === 2) assertRegistrationReport(await readReport(args[0]), await readReport(args[1]));
+    else if (command === 'verify-geography' && args.length === 1) assertGeographyReport(await readReport(args[0]), await acceptanceIdentity());
+    else if (command === 'verify-geography' && args.length === 2) assertGeographyReport(await readReport(args[0]), (await readReport(args[1])).identity);
     else if (command === 'verify-publication' && args.length === 4) {
       const [registration, manifestPath, releasePath, aggregates] = args;
       const manifest = await readReport(manifestPath);
@@ -255,7 +299,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       assert.equal(manifest.identity.runAttempt, process.env.GITHUB_RUN_ATTEMPT || '1', 'Stale publication acceptance attempt');
       for (const kind of ['integration', 'race']) {
         const report = await readReport(resolve(aggregates, `${kind}-aggregate.json`));
-        assert(report.schema === 1 && report.scope === 'full' && report.status === 'passed' && report.kind === kind && report.cleanup.completed === true && report.results.length === 7, 'Missing publication aggregate');
+        const expectedCount = kind === 'integration' ? integrationTargets.length : racePackages.length;
+        assert(report.schema === 1 && report.scope === 'full' && report.status === 'passed' && report.kind === kind && report.cleanup.completed === true && report.results.length === expectedCount, 'Missing publication aggregate');
         assertIdentity(report.identity, manifest.identity);
         aggregateReports(report.results.map((result) => ({ schema: 1, kind, scope: 'partial', status: 'passed', identity: report.identity, cleanup: report.cleanup,
           ...(kind === 'race' ? { toolchain: report.toolchain } : {}), results: [result], timings: { startup: 0, cleanup: 0 } })), kind, manifest.identity);

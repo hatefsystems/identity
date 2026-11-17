@@ -253,7 +253,8 @@ be served by old signer/verifier binaries. Task 5.3 operational approval and
 Task 5.5 narrative-retention policy remain separate gates in the runbook.
 
 Install unchanged `00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql`, tracked through version 2 in
+`00002_registration_attempts.sql`, `00003_username_reservations.sql` and
+`00004_geography_catalog.sql`, tracked through version 4 in
 `public.identity_schema_version`, with final head-terminal/coordination behavior
 and encrypted-only legal storage. Supported entrypoints refuse all legacy
 `public.goose_db_version`, untracked nonempty application schemas and contradictory

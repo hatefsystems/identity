@@ -61,8 +61,17 @@ test('maintenance smoke requires structured ERROR logging and exit one', () => {
 test('all packaged entrypoints are covered by the production-configuration smoke', () => {
   assert.deepEqual(maintenanceEntrypoints, [
     'identity-api', 'audit-signer', 'purge-worker', 'migrate', 'security-ledger-purge',
-    'admin-audit-publisher', 'lifecycle-publisher', 'deletion-notifier', 'admin-legal', 'registration-cleanup',
+    'admin-audit-publisher', 'lifecycle-publisher', 'deletion-notifier', 'admin-legal', 'registration-cleanup', 'geography',
   ]);
+});
+
+test('geography smoke requires its dedicated reader configuration failure, not usage, driver detail or generic ERROR', () => {
+  const result = { status: 1, stdout: '', stderr: 'geography: GEOGRAPHY_CHECK_DATABASE_URL is required\n' };
+  assert(maintenanceSucceeded(result, 'geography'));
+  for (const change of [{ status: 0 }, { status: 125 }, { status: null }, { stdout: 'PRIVATE' },
+    { stderr: 'geography: usage: geography <check|import>' }, { stderr: '{"level":"ERROR"}' },
+    { stderr: 'geography: DATABASE_URL is required' }, { stderr: 'geography: connection refused PRIVATE' }])
+    assert(!maintenanceSucceeded({ ...result, ...change }, 'geography'));
 });
 
 test('migration smoke checks its missing-database error instead of a JSON log or usage error', () => {
@@ -363,6 +372,7 @@ test('image smoke publishes success only after every actual owned ID is retired'
         const id = String(created.length + 1).padStart(64, '0');
         const runID = args.find((item) => item.startsWith('ldp.run=')).slice('ldp.run='.length);
         const binary = args.includes('--entrypoint') ? args[args.indexOf('--entrypoint') + 1].split('/').at(-1) : 'inventory';
+        if (binary === 'geography') assert.deepEqual(args.slice(-4), ['check', '--cities=/nonexistent', '--types=/nonexistent', '--manifest=/nonexistent']);
         present.set(id, { runID, binary }); created.push(id);
         return { status: 0, stdout: id };
       }
@@ -370,6 +380,7 @@ test('image smoke publishes success only after every actual owned ID is retired'
       if (args[0] === 'start') {
         const { binary } = present.get(args.at(-1));
         if (binary === 'migrate') return { status: 1, stdout: '', stderr: 'migrate: migrate: DATABASE_URL is empty\n' };
+        if (binary === 'geography') return { status: 1, stdout: '', stderr: 'geography: GEOGRAPHY_CHECK_DATABASE_URL is required\n' };
         return { status: 1, stdout: JSON.stringify({ level: 'ERROR', msg: binary === 'security-ledger-purge' ? 'security ledger purge failed' : 'config: APP_ENV is required', reason: 'config: SECURITY_LEDGER_PURGE_DATABASE_URL is required; API credentials are not a fallback' }), stderr: '' };
       }
       if (args[0] === 'container') return { status: 0, stdout: [...present.keys()].join('\n') };

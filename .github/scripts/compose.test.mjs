@@ -229,6 +229,7 @@ test('workflow publishes only after all existing gates and full-stack acceptance
     'frontend',
     'portal-browser',
     'admin-browser',
+    'geography-browser',
     'registration-browser',
     'compose-smoke',
   ]) {

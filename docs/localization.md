@@ -74,7 +74,7 @@ Unicode email validation and canonical identity bytes remain server-owned.
 
 `apps/web/messages/en.ts` is the `as const` type source. Namespaces are `common`,
 `metadata`, `auth`, `portal`, `security`, `privacy`, `admin`, `audit`, `integrity`,
-`legal`, `preferences`, `registration` and `errors`. Each Persian namespace satisfies the same
+`legal`, `preferences`, `registration`, `location` and `errors`. Each Persian namespace satisfies the same
 recursive string-valued shape. `i18n/types.ts` and the `next-intl` AppConfig
 augmentation type locale, message keys and formats. Committed catalogs must remain
 complete; the runtime merge supplies an English leaf if a deployment accidentally
@@ -237,9 +237,9 @@ and dark OS preferences. It uses representative 320/390/768/1280 widths and shor
 320×256 reflow, plus focused 320/375/390/430/768/1024/1280/1440/1920 boundary probes.
 The short viewport and 200% text-size probes are automated approximations, not
 observed native browser zoom. Forced colors and composited checked/enabled
-destructive-control contrast are separate checks from disabled states. The seven
+destructive-control contrast are separate checks from disabled states. The eight
 serial disposable integration targets are security-db, admin, retention, legal
-workflow, gRPC, lifecycle and portal; the helper must not silently run only five.
+workflow, gRPC, lifecycle, geography and portal; the helper must not silently omit a suite.
 Execution results belong in the delivery evidence/PR, not inferred from test
 existence or historical acceptance notes.
 

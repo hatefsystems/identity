@@ -103,6 +103,10 @@ func run(logger *slog.Logger) (runErr error) {
 	if pool != nil {
 		defer pool.Close()
 	}
+	geographyService, geographyLimiter, err := buildGeographyService(pool, redisClient)
+	if err != nil {
+		return err
+	}
 	var accounts session.AccountState
 	var profileService *profile.Service
 	if pool != nil {
@@ -260,6 +264,8 @@ func run(logger *slog.Logger) (runErr error) {
 	}
 
 	srv := server.New(cfg, logger, server.Deps{
+		Geography:         geographyService,
+		GeographyLimiter:  geographyLimiter,
 		Registration:      registrationService,
 		RegistrationReady: registrationReady,
 		Usernames:         usernameReader,

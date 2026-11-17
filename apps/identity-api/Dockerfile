@@ -18,6 +18,7 @@
 #   purge-worker    Class A GDPR erasure worker (host cron/systemd)
 #   security-ledger-purge  Class B retention worker (host cron/systemd)
 #   migrate         goose migration runner (controlled operator invocation)
+#   geography       checked, complete-snapshot catalog operator command
 #
 # This is deliberate rather than lazy. The API publishes audit envelopes and the
 # signer serializes them into a hash chain; the two must agree byte-for-byte on
@@ -73,7 +74,8 @@ RUN test -x /out/server && test -x /out/purge-worker && test -x /out/migrate \
     && test -x /out/audit-signer && test -x /out/admin-audit-publisher \
     && test -x /out/security-ledger-purge && test -x /out/admin-legal \
     && test -x /out/lifecycle-publisher && test -x /out/deletion-notifier \
-    && test -x /out/registration-cleanup && test -x /out/healthcheck
+    && test -x /out/registration-cleanup && test -x /out/healthcheck \
+    && test -x /out/geography
 
 # Explicit opt-in local target. The final/default production stage stays distroless.
 FROM alpine:3.23 AS local
@@ -113,6 +115,7 @@ COPY --from=builder /out/deletion-notifier /usr/local/bin/deletion-notifier
 COPY --from=builder /out/registration-cleanup /usr/local/bin/registration-cleanup
 COPY --from=builder /out/security-ledger-purge /usr/local/bin/security-ledger-purge
 COPY --from=builder /out/admin-legal /usr/local/bin/admin-legal
+COPY --from=builder /out/geography /usr/local/bin/geography
 
 # The HTTP API's default listen port (config.defaultPort). Informational only.
 EXPOSE 8080

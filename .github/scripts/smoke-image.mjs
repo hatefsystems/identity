@@ -33,6 +33,7 @@ export const maintenanceEntrypoints = [
   'deletion-notifier',
   'admin-legal',
   'registration-cleanup',
+  'geography',
 ];
 
 export function assertRuntimeInventory(files) {
@@ -46,6 +47,8 @@ export function maintenanceSucceeded(result, binary = '') {
   if (binary === 'migrate') {
     return result.stderr.trim() === 'migrate: migrate: DATABASE_URL is empty';
   }
+  if (binary === 'geography') return result.stdout.trim() === '' &&
+    result.stderr.trim() === 'geography: GEOGRAPHY_CHECK_DATABASE_URL is required';
   return `${result.stdout}\n${result.stderr}`.split('\n').some((line) => {
     try {
       const record = JSON.parse(line);
@@ -291,7 +294,8 @@ export async function smokeImage(kind, reference, validateWeb) {
     assert.equal(operation(['start', '--attach', probe], true).status, 1, 'Probe must fail when no API is listening');
     for (const binary of maintenanceEntrypoints) {
       lifecycle.check();
-      const id = create(['--name', `ci-api-${randomUUID()}`, '--pull', 'never', '--network', 'none', '--env', 'APP_ENV=production', '--entrypoint', `/usr/local/bin/${binary}`, imageID, ...(binary === 'migrate' ? ['status'] : [])]);
+      const id = create(['--name', `ci-api-${randomUUID()}`, '--pull', 'never', '--network', 'none', '--env', 'APP_ENV=production', '--entrypoint', `/usr/local/bin/${binary}`, imageID,
+        ...(binary === 'migrate' ? ['status'] : binary === 'geography' ? ['check', '--cities=/nonexistent', '--types=/nonexistent', '--manifest=/nonexistent'] : [])]);
         const result = operation(
           ['start', '--attach', id],
           true

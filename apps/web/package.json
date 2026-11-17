@@ -30,6 +30,15 @@
         "cache": false,
         "parallelism": false
       },
+      "test-geography-browser": {
+        "command": "node .github/scripts/geography-browser.mjs",
+        "dependsOn": [
+          "build",
+          { "projects": ["identity-api"], "target": "sqlc-generate" }
+        ],
+        "cache": false,
+        "parallelism": false
+      },
       "typecheck": {
         "command": "tsc --noEmit --project apps/web/tsconfig.spec.json",
         "dependsOn": [

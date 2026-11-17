@@ -54,6 +54,9 @@ const (
 	AuditCoordinationKey int64 = 5200004
 	// MigrationKey serializes schema changes before worker exclusions are taken.
 	MigrationKey int64 = 5300001
+	// GeographyImportKey serializes imports. Import transactions first take
+	// MigrationKey shared, then this key exclusive, then the active-state row.
+	GeographyImportKey int64 = 8000001
 )
 
 // AdvisoryLocker serialises worker runs across processes.

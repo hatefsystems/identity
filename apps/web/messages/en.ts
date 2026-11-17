@@ -11,6 +11,7 @@ import { adminEn } from './admin';
 import { auditEn } from './audit';
 import { integrityEn } from './integrity';
 import { legalEn } from './legal';
+import { locationEn } from './location';
 
 const en = {
   registration: registrationEn,
@@ -26,6 +27,7 @@ const en = {
   audit: auditEn,
   integrity: integrityEn,
   legal: legalEn,
+  location: locationEn,
 } as const;
 
 export default en;
