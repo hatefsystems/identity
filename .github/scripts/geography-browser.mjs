@@ -75,6 +75,13 @@ async function currentSelection(page) {
   return JSON.parse(await page.getByTestId('selection').textContent());
 }
 
+export function geographySelectedMetadataReady() {
+  // A committed ID renders an LTR bdi before the separate lookup completes.
+  // Wait for original display labels/type/ancestry, not that ID placeholder.
+  return document.querySelector('[data-location-selected=locality]')?.querySelectorAll('bdi[dir="auto"]').length >= 4 &&
+    document.querySelector('[data-location-selected=province]')?.querySelectorAll('bdi[dir="auto"]').length >= 2;
+}
+
 async function openPicker(page, locale, field, mobile) {
   const section = page.locator(`[data-location-field=${field}]`);
   if (mobile) await section.getByRole('button', { name: geographyNames[locale][field], exact: true }).click();
@@ -162,8 +169,7 @@ export async function validateGeographyBrowser(harness, locale, directory) {
     await localityScope.locator('[role=option][id$="-option-12"]').waitFor({ state: 'visible' });
     await localityInput.press('ArrowDown'); await localityInput.press('Enter');
     await selection(page, { country: 'IR', province_id: '1', locality_id: '12' });
-    await page.locator('[data-location-selected=locality] bdi').first().waitFor();
-    await page.locator('[data-location-selected=province] bdi').first().waitFor();
+    await page.waitForFunction(geographySelectedMetadataReady);
     assert(await page.locator('[data-location-selected=locality] bdi').count() >= 4, 'Missing original type/ancestor metadata');
     await page.getByRole('button', { name: names.clearLocality, exact: true }).click();
     await selection(page, { country: 'IR', province_id: '1' });

@@ -8,7 +8,7 @@ import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { acceptanceLifecycle, portalCleanup } from './portal-harness.mjs';
 import { assertGeographyReport, geographyChecks, geographyJourneys, geographyLocaleChecks, geographyLocales, integrationPackages, integrationTargets, racePackages } from './acceptance-report.mjs';
-import { expectedGeographyResourceFailure, geographyBounds, geographyNames, runGeographyBrowser } from './geography-browser.mjs';
+import { expectedGeographyResourceFailure, geographyBounds, geographyNames, geographySelectedMetadataReady, runGeographyBrowser } from './geography-browser.mjs';
 import { geographyEnvironment, geographyIngressPaths, geographyOperatorEnvironment, geographyReadRoute, geographyRoleSQL, superviseGeographyProcess } from './geography-harness.mjs';
 import { assertNoProductionGeographyFixture, createDisposableGeographyApp, geographyFixtureMarker, geographyFixtureRoute, syntheticGeography, writeSyntheticSnapshot } from './geography-fixture.mjs';
 
@@ -242,6 +242,33 @@ test('geography layout probes reject horizontal overflow, escaped modal focus an
   assert(inspect({ scrollWidth: 321.5 }).includes('horizontal-overflow'));
   assert(inspect({ focus: false }).includes('dialog-focus-escaped'));
   assert(inspect({ dialogRight: 322 }).includes('dialog-outside-viewport'));
+});
+
+test('selected IDs cannot satisfy metadata readiness before lookup labels, type and ancestry arrive', () => {
+  const counts = { locality: 0, province: 0 };
+  const inspect = () => runInNewContext(`(${geographySelectedMetadataReady})()`, {
+    document: { querySelector: selector => ({ querySelectorAll: labelSelector => {
+      assert.equal(labelSelector, 'bdi[dir="auto"]');
+      return Array(counts[selector.includes('locality') ? 'locality' : 'province']);
+    } }) },
+  });
+  // Even though both selections have an ID bdi, no original metadata is ready.
+  assert.equal(inspect(), false);
+  counts.province = 2;
+  assert.equal(inspect(), false);
+  counts.locality = 3;
+  assert.equal(inspect(), false);
+  counts.locality = 5;
+  assert.equal(inspect(), true);
+  counts.province = 1;
+  assert.equal(inspect(), false);
+  const absent = runInNewContext(`(${geographySelectedMetadataReady})()`, { document: { querySelector: () => null } });
+  assert.equal(absent, false);
+  const source = readFile(new URL('./geography-browser.mjs', import.meta.url), 'utf8');
+  return source.then(text => {
+    assert.match(text, /await page\.waitForFunction\(geographySelectedMetadataReady\)/);
+    assert.match(text, /bdi'\)\.count\(\) >= 4, 'Missing original type\/ancestor metadata'/);
+  });
 });
 
 test('geography target and CI retain exact separate package inventories and required source-bound browser gate', async () => {
