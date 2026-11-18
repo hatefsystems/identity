@@ -5,7 +5,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { anonymousReclaim, browserFailure, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { anonymousReclaim, browserFailure, fixtureSecretValues, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
@@ -666,6 +666,74 @@ async function preferenceSwitchDuringProfileResponse(page, cdp, origin, method, 
   }
 }
 
+async function privateProfile(page, harness, evidence, publicProfile) {
+  const path = '/api/v1/users/me/private-data';
+  const selection = harness.fixture('private-geography');
+  const initial = await api(page, path);
+  assert.equal(initial.status, 200);
+  assert.equal(initial.body.private_data, null);
+  assert.equal(initial.body.username, null);
+  assert.equal(initial.body.lifecycle_revision, publicProfile.lifecycle_revision);
+  assert(!('private_data' in publicProfile), 'Private attributes entered routine bootstrap');
+  const givenName = '\u0639\u0644\u06cc';
+  const familyName = '\u0631\u0636\u0627\u06cc\u06cc';
+  const birthday = { calendar: 'gregorian', date: '1990-03-21' };
+  const candidate = {
+    given_name: givenName,
+    family_name: familyName,
+    birthday,
+    gender: 'male',
+    location: { country: selection.country, province_id: selection.province_id, locality_id: selection.locality_id },
+  };
+  harness.secrets.push(...fixtureSecretValues(candidate), '1369-01-01');
+  const patch = (body) => api(page, path, { method: 'PATCH', sessionID: publicProfile.session.id, body });
+  const incomplete = await patch({ given_name: givenName, expected_revision: initial.body.lifecycle_revision });
+  assert.equal(incomplete.status, 400, 'Incomplete initial private save was accepted');
+  const first = await patch({ ...candidate, expected_revision: initial.body.lifecycle_revision });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.lifecycle_revision, (BigInt(initial.body.lifecycle_revision) + 1n).toString());
+  assert.deepEqual(first.body.private_data.birthday, { gregorian: birthday.date, jalali: '1369-01-01' });
+  assert.equal(first.body.private_data.location.catalog_revision, selection.catalog_revision);
+  const equivalent = await patch({
+    given_name: `  ${givenName}  `,
+    birthday: { calendar: 'jalali', date: '1369-01-01' },
+    expected_revision: first.body.lifecycle_revision,
+  });
+  assert.equal(equivalent.status, 200);
+  assert.equal(equivalent.body.lifecycle_revision, first.body.lifecycle_revision, 'Equivalent normalized private save advanced revision');
+  const stale = await patch({ gender: 'female', expected_revision: initial.body.lifecycle_revision });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.error, 'profile_conflict');
+  const later = await patch({ gender: 'female', expected_revision: first.body.lifecycle_revision });
+  assert.equal(later.status, 200);
+  assert.equal(later.body.lifecycle_revision, (BigInt(first.body.lifecycle_revision) + 1n).toString());
+  assert.equal(later.body.private_data.given_name, givenName);
+  assert.deepEqual(later.body.private_data.birthday, first.body.private_data.birthday);
+  const forbidden = await patch({ username: givenName, expected_revision: later.body.lifecycle_revision });
+  assert.equal(forbidden.status, 400, 'Private endpoint allowed username editing');
+  const bootstrap = (await api(page, '/api/v1/users/me')).body;
+  assert.equal(bootstrap.display_name, publicProfile.display_name, 'Private edits changed the public display name');
+  assert(!('private_data' in bootstrap), 'Private attributes leaked into routine bootstrap');
+  const saved = await api(page, path);
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body, later.body, 'Private read did not return the committed snapshot');
+  evidence.checks.push('real DPoP private profile absence, complete first save, normalized calendar no-op, exact large revisions, partial edit, stale conflict, forbidden username edit and independent public display name');
+}
+
+async function absentEmail(page, harness, evidence, fixture) {
+  assert.equal(harness.fixture('email-absent', { user_id: fixture.user_id }).absent, true);
+  const profile = await api(page, '/api/v1/users/me');
+  assert.equal(profile.status, 200);
+  assert.equal(profile.body.email, null);
+  await page.reload();
+  await page.getByTestId('portal-ready').waitFor({ state: 'visible' });
+  await page.getByText(browserLocale() === 'en' ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.', { exact: true }).waitFor({ state: 'visible' });
+  await navigate(page, harness.origin, 'Profile', '/dashboard/profile');
+  await page.getByText(browserLocale() === 'en' ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.', { exact: true }).waitFor({ state: 'visible' });
+  assert(!(await page.locator('body').innerText()).includes(fixture.email), 'Absent email rendered a stale mailbox');
+  evidence.checks.push('real fixture without email reads email:null and renders truthful absence in dashboard and profile in the active locale');
+}
+
 async function profileAndSessions(browser, harness, evidence, contexts, initial) {
   // Reuse the concurrent-login fixture to stay below the real shared anonymous
   // admission limit; never raise a production limit or fake a client subnet.
@@ -809,6 +877,9 @@ async function profileAndSessions(browser, harness, evidence, contexts, initial)
     'Stale intent changed the replacement account'
   );
   await page.waitForFunction((email) => !document.body.textContent.includes(email), fixture.email);
+
+  await privateProfile(loginTab, harness, evidence, changed);
+  await absentEmail(loginTab, harness, evidence, other);
 
   await navigate(loginTab, harness.origin, 'Sessions', '/dashboard/sessions');
   await loginTab

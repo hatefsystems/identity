@@ -385,6 +385,9 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID, expecte
 		if err != nil {
 			return err
 		}
+		if len(recipients) == 0 {
+			return errors.New("privacy: notification recipient unavailable")
+		}
 		token, tokenHash, err := NewReclaimToken()
 		if err != nil {
 			return err

@@ -11,8 +11,8 @@ import "hatef/identity/v1/common.proto";
 // schema version and event-specific metadata before applying a notification.
 message UserLifecycleEvent {
   // Exactly 1 or 2. Version 1 retains its strict status/email-only contract;
-  // version 2 additionally permits display_name in changed_fields. Only profile
-  // name updates emit v2 in this rollout; unknown versions must be rejected.
+  // version 2 additionally permits display_name and the coarse private_profile
+  // update marker. Unknown versions must be rejected.
   uint32 schema_version = 1;
   // Canonical nonzero UUID; stable across retries and equal to the outbox ID.
   string event_id = 2;
@@ -31,7 +31,9 @@ message UserLifecycleEvent {
   // Exact resulting account status; absent for terminal deletion tombstones.
   optional UserStatus status = 7;
   // Version 1: at most two unique names from "status", "email", not values.
-  // Version 2: at most three unique names from "status", "email", "display_name".
+  // Version 2: additionally permits "display_name"; "private_profile" is valid
+  // only as the sole marker on an active account update. It discloses neither
+  // individual private field names nor old/new values.
   // Creation includes "status" and "email"; suspension includes only "status". Updates include
   // at least one; deletion omits this field. A transition into suspended uses
   // identity.user.suspended, not identity.user.updated.

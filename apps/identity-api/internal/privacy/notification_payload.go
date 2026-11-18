@@ -43,10 +43,13 @@ func validNotificationAddress(value string) bool {
 }
 
 func (s *Service) deletionRecipients(ctx context.Context, user db.User) ([]notificationRecipient, error) {
-	if !validNotificationAddress(user.Email) {
-		return nil, errors.New("privacy: invalid primary notification address")
+	recipients := []notificationRecipient{}
+	if user.Email != nil {
+		if !validNotificationAddress(*user.Email) {
+			return nil, errors.New("privacy: invalid primary notification address")
+		}
+		recipients = append(recipients, notificationRecipient{role: "primary", address: *user.Email})
 	}
-	recipients := []notificationRecipient{{role: "primary", address: user.Email}}
 	if len(user.BackupEmailEncrypted) == 0 {
 		if user.BackupEmailBlindIndex != nil {
 			return nil, errors.New("privacy: backup notification address unavailable")
@@ -63,7 +66,10 @@ func (s *Service) deletionRecipients(ctx context.Context, user db.User) ([]notif
 	if !validNotificationAddress(backup) {
 		return nil, errors.New("privacy: invalid backup notification address")
 	}
-	primaryLocal, primaryDomain, _ := strings.Cut(user.Email, "@")
+	primaryLocal, primaryDomain := "", ""
+	if user.Email != nil {
+		primaryLocal, primaryDomain, _ = strings.Cut(*user.Email, "@")
+	}
 	backupLocal, backupDomain, _ := strings.Cut(backup, "@")
 	if primaryLocal != backupLocal || !strings.EqualFold(primaryDomain, backupDomain) {
 		recipients = append(recipients, notificationRecipient{role: "backup", address: backup})

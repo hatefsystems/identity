@@ -72,7 +72,9 @@ func newFakeUserStore(users ...db.User) *fakeUserStore {
 	}
 	for _, u := range users {
 		s.byID[u.ID] = u
-		s.byEmail[u.Email] = u.ID
+		if u.Email != nil {
+			s.byEmail[*u.Email] = u.ID
+		}
 	}
 	return s
 }
@@ -617,7 +619,7 @@ func newFixture(t *testing.T) *ceremonyFixture {
 
 	// Only active accounts may authenticate, so the fixture account is active;
 	// the ineligible states are set explicitly by the tests that cover them.
-	user := db.User{ID: uuid.New(), Email: "passkey@example.com", Status: "active"}
+	user := db.User{ID: uuid.New(), Email: new("passkey@example.com"), Status: "active"}
 	users := newFakeUserStore(user)
 	creds := &fakeCredentialStore{}
 
@@ -704,7 +706,7 @@ func (f *ceremonyFixture) register(t *testing.T, auth *softAuthenticator) db.Web
 func (f *ceremonyFixture) login(t *testing.T, auth *softAuthenticator) (uuid.UUID, error) {
 	t.Helper()
 
-	options, err := f.svc.BeginLogin(f.ctx(), f.user.Email)
+	options, err := f.svc.BeginLogin(f.ctx(), *f.user.Email)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -811,11 +813,11 @@ func TestBeginRegistrationOptions(t *testing.T) {
 	if bytes.Equal(handle, fx.user.ID[:]) || strings.Contains(wire.PublicKey.User.ID, fx.user.ID.String()) {
 		t.Error("user.id leaks the account UUID; it must be an unlinkable random handle")
 	}
-	if wire.PublicKey.User.Name != fx.user.Email {
-		t.Errorf("user.name = %q, want %q", wire.PublicKey.User.Name, fx.user.Email)
+	if wire.PublicKey.User.Name != *fx.user.Email {
+		t.Errorf("user.name = %q, want %q", wire.PublicKey.User.Name, *fx.user.Email)
 	}
-	if wire.PublicKey.User.DisplayName != fx.user.Email {
-		t.Errorf("user.displayName = %q, want %q", wire.PublicKey.User.DisplayName, fx.user.Email)
+	if wire.PublicKey.User.DisplayName != *fx.user.Email {
+		t.Errorf("user.displayName = %q, want %q", wire.PublicKey.User.DisplayName, *fx.user.Email)
 	}
 }
 
@@ -1035,9 +1037,9 @@ func TestFinishRegistrationMalformedBody(t *testing.T) {
 // account cannot be completed by the caller, even with a valid signature.
 func TestFinishRegistrationForeignChallenge(t *testing.T) {
 	fx := newFixture(t)
-	victim := db.User{ID: uuid.New(), Email: "victim@example.com", Status: "active"}
+	victim := db.User{ID: uuid.New(), Email: new("victim@example.com"), Status: "active"}
 	fx.users.byID[victim.ID] = victim
-	fx.users.byEmail[victim.Email] = victim.ID
+	fx.users.byEmail[*victim.Email] = victim.ID
 
 	options, err := fx.svc.BeginRegistration(fx.ctx(), victim.ID, "test-session", "")
 	if err != nil {
@@ -1236,7 +1238,7 @@ func TestBeginLoginOptions(t *testing.T) {
 	fx := newFixture(t)
 	fx.register(t, fx.auth)
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -1280,11 +1282,11 @@ func TestBeginLoginAnswersUnusableAccountsWithMock(t *testing.T) {
 		},
 		{
 			name:  "no handle",
-			email: func(fx *ceremonyFixture) string { return fx.user.Email },
+			email: func(fx *ceremonyFixture) string { return *fx.user.Email },
 		},
 		{
 			name:  "handle but no credentials",
-			email: func(fx *ceremonyFixture) string { return fx.user.Email },
+			email: func(fx *ceremonyFixture) string { return *fx.user.Email },
 			arrange: func(t *testing.T, fx *ceremonyFixture) {
 				// A handle survives credential deletion, so this is reachable.
 				user := fx.users.mustGet(t, fx.user.ID)
@@ -1294,7 +1296,7 @@ func TestBeginLoginAnswersUnusableAccountsWithMock(t *testing.T) {
 		},
 		{
 			name:  "suspended account",
-			email: func(fx *ceremonyFixture) string { return fx.user.Email },
+			email: func(fx *ceremonyFixture) string { return *fx.user.Email },
 			arrange: func(t *testing.T, fx *ceremonyFixture) {
 				fx.register(t, fx.auth)
 				fx.setStatus(t, "suspended")
@@ -1302,7 +1304,7 @@ func TestBeginLoginAnswersUnusableAccountsWithMock(t *testing.T) {
 		},
 		{
 			name:  "pending deletion",
-			email: func(fx *ceremonyFixture) string { return fx.user.Email },
+			email: func(fx *ceremonyFixture) string { return *fx.user.Email },
 			arrange: func(t *testing.T, fx *ceremonyFixture) {
 				fx.register(t, fx.auth)
 				fx.setStatus(t, "pending_deletion")
@@ -1358,7 +1360,7 @@ func TestBeginLoginMockIsIndistinguishableFromReal(t *testing.T) {
 	fx := newFixture(t)
 	fx.register(t, fx.auth)
 
-	realOptions, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	realOptions, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin (real): %v", err)
 	}
@@ -1497,7 +1499,7 @@ func TestBeginLoginAppliesTimingFloor(t *testing.T) {
 	fx := newFixture(t)
 	fx.register(t, fx.auth)
 
-	if _, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email); err != nil {
+	if _, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email); err != nil {
 		t.Fatalf("BeginLogin (real): %v", err)
 	}
 	if _, err := fx.svc.BeginLogin(fx.ctx(), "nobody@example.com"); err != nil {
@@ -1523,7 +1525,7 @@ func TestBeginLoginWrapsStoreFailure(t *testing.T) {
 	fx := newFixture(t)
 	fx.users.getByEmailErr = errBoom
 
-	_, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	_, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("error = %v, want it to wrap errBoom", err)
 	}
@@ -1594,7 +1596,7 @@ func TestFinishLoginChallengeIsSingleUse(t *testing.T) {
 	fx.register(t, fx.auth)
 	fx.auth.signCount = 1
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -1613,7 +1615,7 @@ func TestFinishLoginExpiredChallenge(t *testing.T) {
 	fx.register(t, fx.auth)
 	fx.auth.signCount = 1
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -1649,7 +1651,7 @@ func TestFinishLoginRejectsForgedCeremony(t *testing.T) {
 			fx.auth.signCount = 1
 			tc.mutate(fx.auth)
 
-			options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+			options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 			if err != nil {
 				t.Fatalf("BeginLogin: %v", err)
 			}
@@ -1678,7 +1680,7 @@ func TestFinishLoginRejectsForeignSignature(t *testing.T) {
 	impostor.credID = fx.auth.credID
 	impostor.signCount = 1
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -1696,7 +1698,7 @@ func TestFinishLoginRejectsHandleMismatch(t *testing.T) {
 	fx.register(t, fx.auth)
 	fx.auth.signCount = 1
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -1822,7 +1824,7 @@ func TestFinishLoginCredentialRemovedMidCeremony(t *testing.T) {
 	fx.register(t, fx.auth)
 	fx.auth.signCount = 1
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -2145,7 +2147,7 @@ func TestFinishRegistrationRejectsLoginChallenge(t *testing.T) {
 	fx := newFixture(t)
 	fx.register(t, fx.auth)
 
-	options, err := fx.svc.BeginLogin(fx.ctx(), fx.user.Email)
+	options, err := fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
 	if err != nil {
 		t.Fatalf("BeginLogin: %v", err)
 	}
@@ -2187,7 +2189,7 @@ func TestBeginRegistrationHonoursResidentKeyConfig(t *testing.T) {
 	cfg := testConfig()
 	cfg.ResidentKey = "preferred"
 
-	users := newFakeUserStore(db.User{ID: uuid.New(), Email: "pref@example.com", Status: "active"})
+	users := newFakeUserStore(db.User{ID: uuid.New(), Email: new("pref@example.com"), Status: "active"})
 	var userID uuid.UUID
 	for id := range users.byID {
 		userID = id

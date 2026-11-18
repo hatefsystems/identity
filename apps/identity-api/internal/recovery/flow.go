@@ -94,7 +94,7 @@ func (s *FlowService) Start(ctx context.Context, email string) (*StartResult, er
 	userID := decoyRecoverySubject(normalized)
 	user, err := s.users.GetUserByEmail(ctx, normalized)
 	switch {
-	case err == nil && user.Status == "active":
+	case err == nil && user.Status == "active" && user.Email != nil && *user.Email == normalized:
 		userID = user.ID
 	case err == nil:
 		// Non-active accounts intentionally retain the decoy subject.

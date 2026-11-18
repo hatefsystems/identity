@@ -96,6 +96,7 @@ type EnvelopeSecurity struct {
 	// optional: when the pepper is unavailable the signer falls back to a live
 	// lookup, and a purged subject legitimately yields NULL.
 	IdentityBlindIndex *string `json:"identity_blind_index,omitempty"`
+	IdentityAbsent     bool    `json:"identity_absent,omitempty"`
 	// BlindIndexVersion names the pepper generation that produced
 	// IdentityBlindIndex, and is hashed into the ledger body unconditionally.
 	//
@@ -154,6 +155,9 @@ func (e Envelope) Validate() error {
 			}
 		}
 		if security.BlindIndexVersion < 0 {
+			return ErrEnvelopeIndex
+		}
+		if security.IdentityAbsent && security.IdentityBlindIndex != nil {
 			return ErrEnvelopeIndex
 		}
 		if index := security.IdentityBlindIndex; index != nil {
@@ -219,6 +223,7 @@ func NewEnvelope(e Event, eventID uuid.UUID, occurredAt time.Time) (Envelope, er
 			Scope:             e.Security.Scope,
 			DeviceFingerprint: e.Security.DeviceFingerprint,
 			BlindIndexVersion: e.Security.BlindIndexVersion,
+			IdentityAbsent:    e.Security.IdentityAbsent,
 		}
 		if e.Security.IdentityBlindIndex != nil {
 			index := *e.Security.IdentityBlindIndex

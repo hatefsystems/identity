@@ -43,12 +43,14 @@ WHERE id = $1
 
 -- name: GetUserProfile :one
 -- Minimal self-service snapshot; auth_version is checked but never disclosed.
-SELECT id, email, display_name, status, lifecycle_revision, auth_version
+SELECT id, email, display_name, status, lifecycle_revision, auth_version,
+       (SELECT evidence_encrypted FROM contact_verification_evidence e WHERE e.user_id = users.id AND e.channel = 'email') AS email_evidence
 FROM users WHERE id = $1 AND deleted_at IS NULL;
 
 -- name: GetUserProfileForUpdate :one
 -- Acquire the account advisory lock first, then recheck captured authority.
-SELECT id, email, display_name, status, lifecycle_revision, auth_version
+SELECT id, email, display_name, status, lifecycle_revision, auth_version,
+       (SELECT evidence_encrypted FROM contact_verification_evidence e WHERE e.user_id = users.id AND e.channel = 'email') AS email_evidence
 FROM users WHERE id = $1 AND deleted_at IS NULL
 FOR UPDATE;
 
@@ -88,7 +90,7 @@ FOR UPDATE;
 -- name: GetUserByEmail :one
 -- Uses the partial unique index idx_users_email (active accounts only).
 SELECT * FROM users
-WHERE email = $1
+WHERE email = sqlc.arg('email')::text
   AND deleted_at IS NULL;
 
 -- name: GetUserByIDForAdmin :one
@@ -115,7 +117,7 @@ WHERE id = $1;
 -- among soft-deleted rows the most recent wins. LIMIT 1 is redundant given
 -- :one/QueryRow but states the intent at the SQL layer.
 SELECT * FROM users
-WHERE email = $1
+WHERE email = sqlc.arg('email')::text
 ORDER BY (deleted_at IS NULL) DESC, created_at DESC, id
 LIMIT 1;
 

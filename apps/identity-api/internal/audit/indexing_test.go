@@ -20,8 +20,46 @@ func (r *capturedRecorder) Record(_ context.Context, e Event) error { r.event = 
 
 type identitySourceFunc func(context.Context, uuid.UUID) (string, error)
 
-func (f identitySourceFunc) GetUserEmailForBlindIndex(ctx context.Context, id uuid.UUID) (string, error) {
-	return f(ctx, id)
+func (f identitySourceFunc) GetUserEmailForBlindIndex(ctx context.Context, id uuid.UUID) (*string, error) {
+	email, err := f(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &email, nil
+}
+
+type absentIdentitySource struct{}
+
+func (absentIdentitySource) GetUserEmailForBlindIndex(context.Context, uuid.UUID) (*string, error) {
+	return nil, nil
+}
+
+func TestIndexingRecorderCapturesKnownAbsenceWithoutDigest(t *testing.T) {
+	next := &capturedRecorder{}
+	indexer, _ := blindindex.New([]byte(strings.Repeat("p", 32)), 7)
+	r, err := NewIndexingRecorder(next, absentIdentitySource{}, indexer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _, _ := envelopeTestEvent()
+	if err := r.Record(t.Context(), e); err != nil {
+		t.Fatal(err)
+	}
+	if !next.event.Security.IdentityAbsent || next.event.Security.IdentityBlindIndex != nil || e.Security.IdentityAbsent {
+		t.Fatal("absence not captured or fabricated digest")
+	}
+	env, err := NewEnvelope(next.event, uuid.New(), fixedTime)
+	if err != nil || env.Validate() != nil || !env.Security.IdentityAbsent {
+		t.Fatal("absence lost at asynchronous boundary")
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip Envelope
+	if json.Unmarshal(raw, &roundTrip) != nil || !roundTrip.Security.IdentityAbsent || roundTrip.Security.IdentityBlindIndex != nil {
+		t.Fatal("wire absence lost")
+	}
 }
 
 func TestIndexingRecorderCapturesBeforeAsyncBoundary(t *testing.T) {

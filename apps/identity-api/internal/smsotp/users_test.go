@@ -60,6 +60,8 @@ func (tx *userTestTx) Exec(_ context.Context, sql string, args ...any) (pgconn.C
 	step := "lock"
 	if strings.Contains(sql, "SetUserPhoneIfAuthorized") {
 		step = "set"
+	} else if strings.Contains(sql, "PutContactVerificationEvidence") {
+		step = "evidence"
 	} else if strings.Contains(sql, "RemoveUserPhoneIfAuthorized") {
 		step = "remove"
 	}
@@ -120,9 +122,13 @@ func TestSMSPostgresStoreLocksBeforeFencedConditionalWrite(t *testing.T) {
 		if remove {
 			_, err = s.RemovePhoneIfCurrent(context.Background(), id, 7)
 		} else {
-			err = s.SetPhoneIfCurrent(context.Background(), id, 7, []byte("encrypted"), "index")
+			err = s.SetPhoneIfCurrent(context.Background(), id, 7, []byte("encrypted"), "index", make([]byte, 90))
 		}
-		if err != nil || len(tx.steps) != 3 || tx.steps[0] != "lock" || tx.steps[1] != "read" || tx.commits != 1 || !tx.rollbackDetached {
+		wantSteps := 4
+		if remove {
+			wantSteps = 3
+		}
+		if err != nil || len(tx.steps) != wantSteps || tx.steps[0] != "lock" || tx.steps[1] != "read" || tx.commits != 1 || !tx.rollbackDetached {
 			t.Fatalf("unfenced ordering: %v %+v", err, tx)
 		}
 	}
@@ -141,7 +147,7 @@ func TestSMSPostgresStoreStaleInactiveAndFailureHaveNoWrite(t *testing.T) {
 			default:
 				tx.fail = failure
 			}
-			err := s.SetPhoneIfCurrent(context.Background(), uuid.New(), 7, []byte("encrypted"), "index")
+			err := s.SetPhoneIfCurrent(context.Background(), uuid.New(), 7, []byte("encrypted"), "index", make([]byte, 90))
 			if err == nil || tx.commits != 0 || strings.Contains(err.Error(), "private") {
 				t.Fatalf("unsafe failure: %v", err)
 			}
@@ -166,7 +172,7 @@ func TestSMSPostgresRemovalCountAndCommitFailures(t *testing.T) {
 		var changed bool
 		var err error
 		if failure == "set" {
-			err = s.SetPhoneIfCurrent(context.Background(), uuid.New(), 7, nil, "")
+			err = s.SetPhoneIfCurrent(context.Background(), uuid.New(), 7, nil, "", nil)
 		} else {
 			changed, err = s.RemovePhoneIfCurrent(context.Background(), uuid.New(), 7)
 		}

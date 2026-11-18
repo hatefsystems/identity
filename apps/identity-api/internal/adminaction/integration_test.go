@@ -175,7 +175,7 @@ func TestAdminActionAtomicityAndPrivacyIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "INSERT INTO event_outbox(id,subject,payload) VALUES($1,'fixture','{}')", failed.ID); err != nil {
 		t.Fatal(err)
 	}
-	user, err := failed.Queries.CreateUser(ctx, db.CreateUserParams{Email: "rollback-" + uuid.NewString() + "@example.test", Status: "active"})
+	user, err := failed.Queries.CreateUser(ctx, db.CreateUserParams{Email: new("rollback-" + uuid.NewString() + "@example.test"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}

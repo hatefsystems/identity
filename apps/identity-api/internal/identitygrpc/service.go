@@ -19,6 +19,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/grpcauth"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
@@ -281,9 +282,15 @@ func (s *Service) GetInternalUserInfo(ctx context.Context, req *identityv1.GetIn
 	response := &identityv1.GetInternalUserInfoResponse{UserId: id.String()}
 	switch profile.Status {
 	case "active":
+		if profile.Email != nil && !emailaddress.ValidCanonicalMailbox(*profile.Email) {
+			return nil, status.Error(codes.Internal, "invalid stored profile")
+		}
 		response.Status, response.Email = identityv1.UserStatus_USER_STATUS_ACTIVE, profile.Email
 		response.DisplayName = profile.DisplayName
 	case "pending_verification":
+		if profile.Email != nil && !emailaddress.ValidCanonicalMailbox(*profile.Email) {
+			return nil, status.Error(codes.Internal, "invalid stored profile")
+		}
 		response.Status, response.Email = identityv1.UserStatus_USER_STATUS_PENDING_VERIFICATION, profile.Email
 		response.DisplayName = profile.DisplayName
 	case "suspended":
@@ -302,7 +309,7 @@ func (s *Service) GetInternalUserInfo(ctx context.Context, req *identityv1.GetIn
 	event := audit.Event{
 		EventType: audit.EventGRPCProfileRead, ActionStatus: audit.StatusSuccess,
 		ActorSPIFFEID: caller.String(), SubjectID: &id,
-		Payload: map[string]any{"email_disclosed": response.Email != "", "display_name_disclosed": response.DisplayName != ""},
+		Payload: map[string]any{"email_disclosed": response.Email != nil, "display_name_disclosed": response.DisplayName != ""},
 	}
 	if len(event.ActorSPIFFEID) > maxAuditSPIFFEIDLength {
 		event.ActorSPIFFEID = ""

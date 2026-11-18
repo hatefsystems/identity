@@ -22,6 +22,11 @@ sql:
         emit_empty_slices: true
         emit_exact_table_names: false
         overrides:
+          # Prepare optional contact readers before dropping the SQL constraint.
+          - column: "users.email"
+            go_type:
+              type: "string"
+              pointer: true
           # Map PostgreSQL uuid columns to google/uuid rather than sqlc's
           # pgtype wrapper for ergonomic domain code.
           - db_type: "uuid"

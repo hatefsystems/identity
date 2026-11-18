@@ -20,6 +20,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
@@ -132,7 +134,7 @@ func TestLifecycleCommittedFourSubjectBroadcastIntegration(t *testing.T) {
 	first := lifecycleConsumer(f.ctx, t, b.stream, "service_a")
 	second := lifecycleConsumer(f.ctx, t, b.stream, "service_b")
 	tx := lifecycleTx(t, f)
-	user, err := lifecycle.CreateUser(f.ctx, tx, db.CreateUserParams{Email: "not-in-message@lifecycle.invalid", Status: "active"})
+	user, err := lifecycle.CreateUser(f.ctx, tx, db.CreateUserParams{Email: new("not-in-message@lifecycle.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +179,7 @@ func TestLifecycleCommittedFourSubjectBroadcastIntegration(t *testing.T) {
 			if baseline != nil && !proto.Equal(event, baseline[i]) {
 				t.Fatal("independent consumers received different lifecycle envelopes")
 			}
-			if bytes.Contains(contractPayload(t, event), []byte(user.Email)) {
+			if bytes.Contains(contractPayload(t, event), []byte(*user.Email)) {
 				t.Fatal("shared lifecycle event disclosed contact value")
 			}
 		}
@@ -196,7 +198,15 @@ func TestLifecycleMixedV1V2AndLegacyBroadcastIntegration(t *testing.T) {
 	f := newLifecycleDatabase(t)
 	b := newLifecycleBroker(f.ctx, t, 1024*1024)
 	u := lifecycleCreate(t, f)
-	svc, err := profile.New(f.pool)
+	provider, err := kms.NewMockProvider(make([]byte, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := profile.New(f.pool, cipher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +241,7 @@ func TestLifecycleMixedV1V2AndLegacyBroadcastIntegration(t *testing.T) {
 		} else if event.SchemaVersion != 1 {
 			t.Fatal("existing creation/suspension producer changed schema version")
 		}
-		if bytes.Contains(contractPayload(t, event), []byte("Private shared name")) || bytes.Contains(contractPayload(t, event), []byte(u.Email)) {
+		if bytes.Contains(contractPayload(t, event), []byte("Private shared name")) || bytes.Contains(contractPayload(t, event), []byte(*u.Email)) {
 			t.Fatal("profile/contact value entered durable broadcast")
 		}
 	}

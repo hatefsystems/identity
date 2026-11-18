@@ -140,12 +140,12 @@ func TestDeletionQueuesEncryptedNoticeAndRevokes(t *testing.T) {
 	}
 	notice := h.queuedNotice(t)
 	request := h.store.requests[0]
-	if notice.DeliveryID == uuid.Nil || notice.PrimaryEmail != user.Email || notice.BackupEmail != nil ||
+	if notice.DeliveryID == uuid.Nil || notice.PrimaryEmail != *user.Email || notice.BackupEmail != nil ||
 		!validReclaimToken(notice.ReclaimToken) || HashReclaimToken(notice.ReclaimToken) != request.TokenHash || request.NotifiedAt.Valid {
 		t.Fatal("queued token/recipient binding incorrect or falsely reported sent")
 	}
 	row := h.store.notifications[notice.DeliveryID]
-	for _, secret := range []string{user.Email, notice.ReclaimToken} {
+	for _, secret := range []string{*user.Email, notice.ReclaimToken} {
 		if bytes.Contains(row.PayloadEncrypted, []byte(secret)) {
 			t.Fatal("notification material was persisted unencrypted")
 		}

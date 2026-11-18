@@ -200,7 +200,7 @@ func createTestUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email
 		t.Fatalf("clear fixture %q: %v", email, err)
 	}
 
-	user, err := q.CreateUser(ctx, db.CreateUserParams{Email: email, Status: "active"})
+	user, err := q.CreateUser(ctx, db.CreateUserParams{Email: &email, Status: "active"})
 	if err != nil {
 		t.Fatalf("CreateUser %q: %v", email, err)
 	}
@@ -733,7 +733,7 @@ func TestIntegrationIdentifierIsReservedDuringGraceWindow(t *testing.T) {
 
 	// The squatter's registration attempt must be rejected by the index, and this is
 	// exactly the 23505 a registration endpoint has to render as a clean 409.
-	_, err := q.CreateUser(ctx, db.CreateUserParams{Email: email, Status: "active"})
+	_, err := q.CreateUser(ctx, db.CreateUserParams{Email: new(email), Status: "active"})
 	if err == nil {
 		t.Fatal("a third party claimed a reserved pending_deletion email")
 	}

@@ -13,8 +13,8 @@ func TestNamedLoginCanonicalEmailMatchesRealAndDecoyIdentities(t *testing.T) {
 			canonical := "\u00fcser@example.test"
 			if real {
 				f.users.mu.Lock()
-				delete(f.users.byEmail, f.user.Email)
-				f.user.Email = canonical
+				delete(f.users.byEmail, *f.user.Email)
+				f.user.Email = &canonical
 				f.users.byID[f.user.ID] = f.user
 				f.users.byEmail[canonical] = f.user.ID
 				f.users.mu.Unlock()

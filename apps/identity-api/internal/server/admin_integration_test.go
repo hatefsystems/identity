@@ -175,7 +175,7 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 
 func (f *adminIntegration) user(t *testing.T) db.User {
 	t.Helper()
-	u, err := db.New(f.pool).CreateUser(context.Background(), db.CreateUserParams{Email: uuid.NewString() + "@admin-test.invalid", Status: "active"})
+	u, err := db.New(f.pool).CreateUser(context.Background(), db.CreateUserParams{Email: new(uuid.NewString() + "@admin-test.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestAdminAuditFailureRollsBackMutationAndWithholdsReadIntegration(t *testin
 		{"PATCH", "/users/" + f.target.ID.String() + "/status", adminStatusBody(t, "banned", "private case", 0), f.grant(t, "moderator")},
 	} {
 		w := f.request(t, "moderator", call.method, call.path, call.body, call.grant)
-		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), f.target.Email) {
+		if w.Code != 503 || !strings.Contains(w.Body.String(), "audit_unavailable") || strings.Contains(w.Body.String(), *f.target.Email) {
 			t.Fatalf("audit failure disclosed/succeeded: %d %s", w.Code, w.Body.String())
 		}
 		if got := f.sessionStore.touches.Load(); got != touches {

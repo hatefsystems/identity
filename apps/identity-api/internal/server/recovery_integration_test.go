@@ -96,7 +96,7 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 	pool := openRecoveryHandlerIntegrationPool(ctx, t)
 	q := db.New(pool)
 	user, err := q.CreateUser(ctx, db.CreateUserParams{
-		Email:  "recovery-handler-" + uuid.NewString() + "@test.local",
+		Email:  new("recovery-handler-" + uuid.NewString() + "@test.local"),
 		Status: "active",
 	})
 	if err != nil {
@@ -123,11 +123,11 @@ func TestIntegrationRecoveryDoubleSubmissionIssuesOneRestrictedSession(t *testin
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	first, err := flow.Start(ctx, user.Email)
+	first, err := flow.Start(ctx, *user.Email)
 	if err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
-	second, err := flow.Start(ctx, user.Email)
+	second, err := flow.Start(ctx, *user.Email)
 	if err != nil {
 		t.Fatalf("second Start: %v", err)
 	}

@@ -64,6 +64,13 @@ installation, runtime tests, real delivery or physical-authenticator acceptance.
   Explicit resend does not reset attempt expiry or budgets. Same-authority receipt
   replay and `/result` reconcile outcomes, never recreate accounts or issue sessions.
   Lost capability/browser-key authority requires restart or ordinary login.
+- The account-creation transaction persists protected verification evidence for
+  each successfully verified canonical email/mobile destination, bound to account,
+  channel, proof method and the original server-recorded verification time. No OTP
+  or verification token is retained in that evidence. Receipt replay preserves it;
+  changing or removing a destination invalidates its evidence transactionally, and
+  restoring an earlier destination requires fresh verification. Populated contacts
+  and active status are not proof, and no historical evidence is backfilled.
 
 Keep strict field/UTF-8 admission, exact Origin, public DPoP nonce/replay and
 JKT/capability binding, cookie omission for signup, no-store/no-referrer and stable
@@ -262,24 +269,13 @@ committed account eligible for ordinary login, not account recreation. Password,
 username/contact-code login, MFA alternatives, optional-email consumers,
 notifications, private snapshots/editing and broader recovery remain separate tasks.
 
-## Deferred Legacy Claim and Evidence
+## Username Claim Scope and Evidence
 
-The future `POST /api/v1/users/me/username` body is `{username}`, but it remains
-unmounted and no claim UI is offered. A shared NULL-only assignment primitive is
-not public authorization. Existing sessions have no earned `auth_time`; generic
-fresh WebAuthn step-up grants are not username/action-bound and UI intent labels
-are not server-enforced proof. Session/account creation timestamps cannot replace
-fresh authentication evidence.
-
-A separately approved extension must bind real fresh WebAuthn UV to
-`username.initial_claim`, exact NFC display/security assignment, account/session/JKT,
-auth version, active policy, original expiry and one-time redemption. Require strict
-signed authentication-time/lifetime checks and a final locked active-account recheck.
-Reject generic grants and cross-action proof substitution; no usable UV passkey
-means no claim under this proposal, not password/TOTP fallback or fabricated T16
-evidence. Proof consumption, assignment audit/revision and ambiguous-result handling
-remain that future task's explicit design, not existing display-name events or a
-new invented private snapshot format.
+Identity is pre-launch. The legacy one-time username-claim proposal (T12) is out
+of scope and excluded from both launch backlogs. Users choose their username
+during registration with database-enforced uniqueness. Keep the authenticated
+read-only username endpoint; no POST claim endpoint or claim UI is offered. A
+shared NULL-only assignment primitive does not authorize a public claim operation.
 
 Required username evidence includes normalization/idempotence and rejection
 properties; exact crypto/config admission; every-status reservation and SQL

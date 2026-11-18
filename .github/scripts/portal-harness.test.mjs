@@ -121,6 +121,8 @@ test('portal diagnostics use route templates rather than credential/session IDs'
     '/api/v1/users/me/sessions/{id}'
   );
   assert.equal(portalRoute('/api/v1/users/me'), '/api/v1/users/me');
+  assert.equal(portalRoute('/api/v1/users/me/private-data'), '/api/v1/users/me/private-data');
+  assert.equal(portalRoute('/api/v1/users/me/username'), '/api/v1/users/me/username');
   assert.equal(portalRoute('/admin/users/private-subject?email=private%40example.test#secret'), '/admin/users/{id}');
   assert.equal(portalRoute('/api/v1/admin/users/private-subject/status?reason=private'), '/api/v1/admin/users/{id}/status');
   assert.equal(portalRoute('/api/v1/admin/ledger/verify?after_seq=123'), '/api/v1/admin/ledger/verify');
@@ -132,6 +134,13 @@ test('portal diagnostics use route templates rather than credential/session IDs'
   assert.equal(portalRoute('/admin/legal/private-reference'), '[redacted-route]');
   assert.equal(portalRoute('/api/v1/admin/unknown/private?token=secret'), '[redacted-route]');
   assert.equal(portalRoute('/admin/unknown/private'), '[redacted-route]');
+});
+
+test('private profile fixture values are included in privacy scanning without exposing them', () => {
+  const values = { given_name: 'private-given', family_name: 'private-family', birthday: { gregorian: '1990-01-01', jalali: '1368-10-11' } };
+  const secrets = fixtureSecretValues(values);
+  for (const value of ['private-given', 'private-family', '1990-01-01', '1368-10-11']) assert(secrets.includes(value));
+  assert.equal(privateLogSummary(JSON.stringify(values), secrets).matches, 5);
 });
 
 const legalAccount = 'a8c97c4a-81ed-4aef-bc8f-6c572fd53e90';

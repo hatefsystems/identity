@@ -45,6 +45,40 @@ function client(fetcher: jest.Mock) {
   return new PortalClient({ origin, fetcher, getKey: async () => key });
 }
 
+it.each([null, 'user@example.test', '\u0647\u0627\u062a\u0641@example.test'])(
+  'preserves typed email %p through bootstrap and display-name saves without fetching private data',
+  async (email) => {
+    const initial = { ...profile(), email };
+    const saved = { ...initial, display_name: 'Updated', lifecycle_revision: '9007199254740994' };
+    const fetcher = jest.fn().mockResolvedValueOnce(json(initial)).mockResolvedValueOnce(json(saved));
+    const api = client(fetcher);
+    expect((await api.bootstrap()).email).toBe(email);
+    expect(api.assertSession().email).toBe(email);
+    expect((await api.saveProfile('Updated', initial.lifecycle_revision)).email).toBe(email);
+    expect(api.profile?.email).toBe(email);
+    expect(fetcher.mock.calls.map(([url, init]) => [url, init.method])).toEqual([
+      [`${origin}/api/v1/users/me`, 'GET'],
+      [`${origin}/api/v1/users/me`, 'PATCH'],
+    ]);
+    expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({
+      display_name: 'Updated', expected_revision: initial.lifecycle_revision,
+    });
+    api.dispose();
+  }
+);
+
+it.each([undefined, '', 7, {}, []])(
+  'rejects missing, empty or malformed email %p instead of inventing absence',
+  async (email) => {
+    const fetcher = jest.fn().mockResolvedValue(json({ ...profile(), email }));
+    const api = client(fetcher);
+    await expect(api.bootstrap()).rejects.toMatchObject({ code: 'invalid_response' });
+    expect(api.profile).toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    api.dispose();
+  }
+);
+
 it.each([null, { display: '\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u064a' }])('reads truthful username state through the existing authenticated GET transport', async (username) => {
   const fetcher = jest.fn().mockResolvedValueOnce(json(profile())).mockResolvedValueOnce(json({ username }));
   const api = client(fetcher), signal = new AbortController().signal;

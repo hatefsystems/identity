@@ -43,7 +43,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	}
 	f.srv.deps.LegalHold = holds
 	f.srv = New(f.srv.cfg, nil, f.srv.deps)
-	index := indexer.Compute(f.target.Email)
+	index := indexer.Compute(*f.target.Email)
 	ip, agent := "203.0.113.42", "private-client-agent"
 	eventID := uuid.New()
 	timestamp := audit.NormalizeChainTime(time.Now())
@@ -93,7 +93,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 	if len(response.Items) != 1 || response.Items[0].ID != eventID || response.Items[0].AccountRef != f.target.ID || response.Coverage.Note == "" {
 		t.Fatalf("wrong disclosure or absent coverage: %s", w.Body.String())
 	}
-	for _, forbidden := range []string{f.target.Email, index, ip, agent, "identity_blind_index", "client_ip", "user_agent", "private-case-123"} {
+	for _, forbidden := range []string{*f.target.Email, index, ip, agent, "identity_blind_index", "client_ip", "user_agent", "private-case-123"} {
 		if strings.Contains(w.Body.String(), forbidden) {
 			t.Fatalf("default disclosure leaked %q", forbidden)
 		}
@@ -111,7 +111,7 @@ func TestAdminLegalPostDeletionDisclosureIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clear(plain)
-	for _, secret := range []string{f.target.Email, index} {
+	for _, secret := range []string{*f.target.Email, index} {
 		if bytes.Contains(payload, []byte(secret)) || bytes.Contains(plain, []byte(secret)) {
 			t.Fatal("lookup identity persisted in audit or restricted action context")
 		}
@@ -353,7 +353,7 @@ func TestAdminLegalLookupExactHighSequencesIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.srv.deps.LegalHold = holds
-	index := indexer.Compute(f.target.Email)
+	index := indexer.Compute(*f.target.Email)
 	seqs := []int64{9007199254740993, math.MaxInt64 - 1, math.MaxInt64}
 	at := audit.NormalizeChainTime(time.Now())
 	retain := at.Add(time.Hour)
@@ -380,7 +380,7 @@ func TestAdminLegalLookupExactHighSequencesIntegration(t *testing.T) {
 	if n, err := q.InsertSecurityEvents(t.Context(), records); err != nil || n != int64(len(records)) {
 		t.Fatalf("insert high-position payloads: %d %v", n, err)
 	}
-	body := adminLegalInquiryRequest{IdentifierType: "email", Identifier: f.target.Email, RequestingAuthority: "court", CaseReference: "case",
+	body := adminLegalInquiryRequest{IdentifierType: "email", Identifier: *f.target.Email, RequestingAuthority: "court", CaseReference: "case",
 		Purpose: "exact coordinates", StartTime: at.Add(-time.Hour).Format(time.RFC3339Nano), EndTime: at.Format(time.RFC3339Nano), Limit: 1, Fields: []string{}}
 	actor := uuid.MustParse(f.actors["dpo"].UserID)
 	var observed time.Time
@@ -559,7 +559,7 @@ func TestAdminLegalLookupRequiresFreshGrantPerPageIntegration(t *testing.T) {
 	}
 	f.srv.deps.LegalHold = holds
 	f.srv = New(f.srv.cfg, nil, f.srv.deps)
-	index := indexer.Compute(f.target.Email)
+	index := indexer.Compute(*f.target.Email)
 	at := audit.NormalizeChainTime(time.Now())
 	for range 2 {
 		id, account := uuid.New(), uuid.New()
@@ -575,7 +575,7 @@ func TestAdminLegalLookupRequiresFreshGrantPerPageIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	body := adminLegalInquiryRequest{IdentifierType: "email", Identifier: f.target.Email, RequestingAuthority: "court", CaseReference: "case", Purpose: "inquiry",
+	body := adminLegalInquiryRequest{IdentifierType: "email", Identifier: *f.target.Email, RequestingAuthority: "court", CaseReference: "case", Purpose: "inquiry",
 		StartTime: at.Add(-time.Hour).Format(time.RFC3339Nano), EndTime: at.Format(time.RFC3339Nano), Limit: 1, Fields: []string{}}
 	send := func(role, grant string) *httptest.ResponseRecorder {
 		encoded, err := json.Marshal(body)

@@ -294,6 +294,9 @@ type SecurityContext struct {
 	DeviceFingerprint string
 	// IdentityBlindIndex is captured synchronously, never copied to Payload.
 	IdentityBlindIndex *string
+	// IdentityAbsent captures a successful lookup of a NULL contact. It prevents
+	// later signer fallback from attributing this event to a newly added email.
+	IdentityAbsent bool
 	// BlindIndexVersion names the pepper generation that produced
 	// IdentityBlindIndex. Callers that derive the index must set it from the same
 	// Indexer, because the pair is what makes a historical row re-derivable after

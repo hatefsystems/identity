@@ -12,7 +12,7 @@ import (
 // IdentitySource is the narrow live-account lookup used before asynchronous
 // signing. *db.Queries implements it. No identity text leaves this call.
 type IdentitySource interface {
-	GetUserEmailForBlindIndex(context.Context, uuid.UUID) (string, error)
+	GetUserEmailForBlindIndex(context.Context, uuid.UUID) (*string, error)
 }
 
 // IdentityIndexer computes the shared email blind index.
@@ -55,16 +55,21 @@ func (r *IndexingRecorder) Record(ctx context.Context, e Event) error {
 	// crossing the asynchronous boundary.
 	security := *e.Security
 	e.Security = &security
-	if security.IdentityBlindIndex == nil {
+	if security.IdentityBlindIndex == nil && !security.IdentityAbsent {
 		captureCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		email, err := r.source.GetUserEmailForBlindIndex(captureCtx, security.AccountRef)
-		if err != nil || email == "" {
+		if err != nil {
 			// Database error text can contain identifiers; log only bounded metadata.
 			r.logger.Warn("audit: identity capture unavailable; signer fallback required",
 				slog.String("marker", "audit_index_capture_missing"), slog.String("event_type", e.EventType))
+		} else if email == nil {
+			security.IdentityAbsent = true
+		} else if *email == "" {
+			r.logger.Warn("audit: identity capture invalid; signer fallback required",
+				slog.String("marker", "audit_index_capture_missing"), slog.String("reason", "invalid_email"))
 		} else {
-			digest, err := r.indexer.ComputeEmail(email)
+			digest, err := r.indexer.ComputeEmail(*email)
 			if err != nil {
 				r.logger.Warn("audit: identity capture invalid; signer fallback required",
 					slog.String("marker", "audit_index_capture_missing"), slog.String("reason", "invalid_email"))
@@ -73,7 +78,7 @@ func (r *IndexingRecorder) Record(ctx context.Context, e Event) error {
 				security.BlindIndexVersion = r.indexer.Version()
 			}
 		}
-	} else {
+	} else if security.IdentityBlindIndex != nil {
 		digest := *security.IdentityBlindIndex
 		security.IdentityBlindIndex = &digest
 	}

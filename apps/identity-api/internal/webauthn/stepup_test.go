@@ -344,7 +344,7 @@ func TestLoginChallengeCannotSatisfyStepUp(t *testing.T) {
 		{
 			name: "user-named login challenge",
 			begin: func() (string, error) {
-				options, err := f.svc.BeginLogin(f.ctx(), f.user.Email)
+				options, err := f.svc.BeginLogin(f.ctx(), *f.user.Email)
 				if err != nil {
 					return "", err
 				}
@@ -489,7 +489,7 @@ func TestDeleteCredentialIsScopedToTheOwner(t *testing.T) {
 	// A second credential so the last-factor guard is not what rejects this.
 	f.register(t, newSoftAuthenticator(t))
 
-	attacker := db.User{ID: uuid.New(), Email: "attacker@example.com", Status: "active"}
+	attacker := db.User{ID: uuid.New(), Email: new("attacker@example.com"), Status: "active"}
 	f.users.byID[attacker.ID] = attacker
 
 	if err := f.svc.DeleteCredential(f.ctx(), attacker.ID, victim.ID); !errors.Is(err, ErrCredentialNotFound) {

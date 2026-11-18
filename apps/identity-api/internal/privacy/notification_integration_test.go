@@ -386,7 +386,7 @@ func TestPrivacyNotificationRestartAndRecipientRetryIntegration(t *testing.T) {
 		t.Fatal("duplicate enqueue was not harmless", err)
 	}
 	firstToken := integrationQueuedNotice(ctx, t, env, u.ID).ReclaimToken
-	if bytes.Contains(before.PayloadEncrypted, []byte(firstToken)) || bytes.Contains(before.PayloadEncrypted, []byte(u.Email)) || env.notifier.count() != 0 {
+	if bytes.Contains(before.PayloadEncrypted, []byte(firstToken)) || bytes.Contains(before.PayloadEncrypted, []byte(*u.Email)) || env.notifier.count() != 0 {
 		t.Fatal("API sent synchronously or persisted plaintext delivery material")
 	}
 	var attempts []DeletionNotice

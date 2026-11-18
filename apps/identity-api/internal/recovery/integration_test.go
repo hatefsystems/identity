@@ -117,7 +117,7 @@ func createTestUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email
 	q := db.New(pool)
 	// Allocate run-owned identities; never adopt or clear a previous fixture.
 	email = uuid.NewString() + "." + email
-	user, err := q.CreateUser(ctx, db.CreateUserParams{Email: email, Status: "active"})
+	user, err := q.CreateUser(ctx, db.CreateUserParams{Email: &email, Status: "active"})
 	if err != nil {
 		t.Fatalf("CreateUser %s: %v", email, err)
 	}

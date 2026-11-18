@@ -253,21 +253,50 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID, expectedAuthVersion int64
 	if user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != expectedAuthVersion {
 		return nil, ErrUnauthorized
 	}
+	result, err := s.GetInTx(ctx, tx, id, expectedAuthVersion, authority)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, ErrUnavailable
+	}
+	return result, nil
+}
+
+// GetInTx projects protected username data in the caller's locked transaction.
+// The caller acquires GuardAuthority BEFORE the account advisory/row lock and
+// holds both through commit. This must not open an independent read snapshot.
+// A nil Store permits only a genuinely all-null tuple under OwnershipGuard;
+// populated data still requires an admitted normalizer and actual authority.
+func (s *Store) GetInTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, expectedAuthVersion int64, authority GuardAuthority) (*ReadResult, error) {
+	if tx == nil || id == uuid.Nil || expectedAuthVersion < 0 || s != nil && (authority.Authority != s.normalizer.Authority() || authority.Epoch < 1) {
+		return nil, ErrUnavailable
+	}
+	user, err := db.New(tx).GetAccountAuthState(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUnauthorized
+	}
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	if user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != expectedAuthVersion {
+		return nil, ErrUnauthorized
+	}
 	row, err := db.New(tx).ReadUsername(ctx, id)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
 	var result *ReadResult
 	if row.UsernameKey != nil {
+		if s == nil {
+			return nil, ErrUnavailable
+		}
 		value, err := s.openStorage(ctx, row, authority)
 		if err != nil {
 			return nil, err
 		}
 		result = &ReadResult{Display: value.Display()}
 	} else if !nullStorageTuple(row) {
-		return nil, ErrUnavailable
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return nil, ErrUnavailable
 	}
 	return result, nil

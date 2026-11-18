@@ -31,7 +31,7 @@ func (s *Service) BeginSignup(ctx context.Context, email string, handle []byte, 
 	if !emailaddress.ValidCanonicalMailbox(email) || len(handle) != userHandleByteLen || jkt == "" || !s.now().Before(expires) || expires.After(s.now().Add(5*time.Minute)) {
 		return nil, nil, ErrInvalidResponse
 	}
-	creation, session, err := s.wa.BeginRegistration(newUserAdapter(db.User{Email: email}, handle, nil),
+	creation, session, err := s.wa.BeginRegistration(newUserAdapter(db.User{Email: &email}, handle, nil),
 		gowebauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			RequireResidentKey: protocol.ResidentKeyRequired(), ResidentKey: protocol.ResidentKeyRequirementRequired, UserVerification: protocol.VerificationRequired,
 		}))
@@ -62,7 +62,7 @@ func (s *Service) VerifySignup(ctx context.Context, email string, handle []byte,
 	if err != nil {
 		return db.CreateWebauthnCredentialParams{}, ErrInvalidResponse
 	}
-	cred, err := s.wa.CreateCredential(newUserAdapter(db.User{Email: email}, handle, nil), frozen.Session, parsed)
+	cred, err := s.wa.CreateCredential(newUserAdapter(db.User{Email: &email}, handle, nil), frozen.Session, parsed)
 	if err != nil {
 		return db.CreateWebauthnCredentialParams{}, ErrVerification
 	}

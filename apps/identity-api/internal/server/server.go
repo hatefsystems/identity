@@ -75,6 +75,8 @@ type Deps struct {
 	SessionManager *session.Manager
 	// Profile exposes the minimized shared account projection and revisioned edits.
 	Profile *profile.Service
+	// PrivateProfile provides an explicit, locked protected read/edit boundary.
+	PrivateProfile PrivateProfileReader
 	// WebAuthn drives the passkey ceremonies at /api/v1/auth/webauthn. It
 	// requires a database, so when nil (no DATABASE_URL configured) those
 	// routes are not mounted. The enrolment subset additionally requires
@@ -258,6 +260,9 @@ func (s *Server) registerRoutes() {
 	}
 	if s.deps.Profile != nil {
 		s.registerProfileRoutes()
+	}
+	if s.deps.PrivateProfile != nil {
+		s.registerPrivateProfileRoutes()
 	}
 	if s.deps.Usernames != nil {
 		s.registerUsernameRoutes()

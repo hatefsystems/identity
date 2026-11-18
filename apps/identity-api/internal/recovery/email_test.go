@@ -14,7 +14,7 @@ func TestRecoveryUsesCanonicalEmailForRealAndDecoySubjects(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		t.Run(map[bool]string{false: "decoy", true: "active"}[active], func(t *testing.T) {
 			canonical := "\u00fcser@example.test"
-			user := db.User{ID: uuid.New(), Email: canonical, Status: "suspended"}
+			user := db.User{ID: uuid.New(), Email: &canonical, Status: "suspended"}
 			if active {
 				user.Status = "active"
 			}
@@ -42,7 +42,7 @@ func TestRecoveryUsesCanonicalEmailForRealAndDecoySubjects(t *testing.T) {
 }
 
 func TestRecoveryRejectsInvalidEmailBeforeSavingAuthority(t *testing.T) {
-	store := newFlowStore(db.User{ID: uuid.New(), Email: "known@example.test", Status: "active"})
+	store := newFlowStore(db.User{ID: uuid.New(), Email: new("known@example.test"), Status: "active"})
 	codes, err := New(Config{}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -56,5 +56,24 @@ func TestRecoveryRejectsInvalidEmailBeforeSavingAuthority(t *testing.T) {
 		if _, err := flow.Start(context.Background(), input); !errors.Is(err, ErrInvalidCode) || transactions.hash != "" {
 			t.Fatalf("invalid recovery identity allocated authority: %v", err)
 		}
+	}
+}
+
+func TestRecoveryAbsentEmailCannotResolveAccount(t *testing.T) {
+	user := db.User{ID: uuid.New(), Status: "active"}
+	store := newFlowStore(user)
+	// A stale or faulty lookup adapter cannot turn a missing contact into identity.
+	store.byEmail["old@example.test"] = user.ID
+	codes, err := New(Config{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactions := &flowTransactionSpy{}
+	flow, err := NewFlowService(codes, store, transactions, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Start(t.Context(), "old@example.test"); err != nil || transactions.userID == user.ID {
+		t.Fatal("absent contact fabricated recovery attribution", err)
 	}
 }

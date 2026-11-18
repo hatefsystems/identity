@@ -75,7 +75,7 @@ func newFakeStore(now func() time.Time) *fakeStore {
 func (f *fakeStore) addActiveUser(email string) db.User {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	u := db.User{ID: uuid.New(), Email: email, Status: "active"}
+	u := db.User{ID: uuid.New(), Email: &email, Status: "active"}
 	f.users[u.ID] = u
 	return u
 }

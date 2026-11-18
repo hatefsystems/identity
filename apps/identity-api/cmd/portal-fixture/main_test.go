@@ -141,7 +141,7 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
-	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
+	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "email-absent", "private-geography", "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
 			if run([]string{action}) == nil {
@@ -349,7 +349,7 @@ func (s *seedTransaction) Rollback(context.Context) error {
 }
 func (s *seedTransaction) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "INSERT INTO users") {
-		s.user = db.User{ID: args[0].(uuid.UUID), Email: args[1].(string), Status: "active"}
+		s.user = db.User{ID: args[0].(uuid.UUID), Email: new(args[1].(string)), Status: "active"}
 	}
 	if strings.Contains(sql, "is_mfa_enabled = TRUE") {
 		if s.failMFA {
@@ -450,7 +450,7 @@ func TestFixtureTOTPMatchesProductionMFAAndCrossReplicaReplay(t *testing.T) {
 	if err != nil || len(ciphertext) == 0 || ciphertext[0] != 37 {
 		t.Fatal("fixture must use the configured production envelope version")
 	}
-	user := db.User{ID: uuid.New(), Email: "portal@" + fixtureRunID + ".example.test", Status: "active", IsMfaEnabled: true, MfaTotpSecretEncrypted: ciphertext}
+	user := db.User{ID: uuid.New(), Email: new("portal@" + fixtureRunID + ".example.test"), Status: "active", IsMfaEnabled: true, MfaTotpSecretEncrypted: ciphertext}
 	enc, err := fixtureEncryptor()
 	if err != nil {
 		t.Fatal("cannot construct production-compatible decryptor")
@@ -536,8 +536,9 @@ func TestFixtureTOTPRefusesForeignInactiveMissingAndCorruptFactors(t *testing.T)
 		t.Fatal("cannot create test ciphertext")
 	}
 	for name, mutate := range map[string]func(*testing.T, *db.User){
-		"foreign":    func(_ *testing.T, u *db.User) { u.Email = "portal@another-run.example.test" },
-		"suffix":     func(_ *testing.T, u *db.User) { u.Email += ".invalid" },
+		"foreign":    func(_ *testing.T, u *db.User) { u.Email = new("portal@another-run.example.test") },
+		"suffix":     func(_ *testing.T, u *db.User) { u.Email = new(*u.Email + ".invalid") },
+		"absent":     func(_ *testing.T, u *db.User) { u.Email = nil },
 		"deleted":    func(_ *testing.T, u *db.User) { u.DeletedAt.Valid = true },
 		"missing":    func(_ *testing.T, u *db.User) { u.ID = uuid.Nil },
 		"inactive":   func(_ *testing.T, u *db.User) { u.Status = "suspended" },
@@ -549,7 +550,7 @@ func TestFixtureTOTPRefusesForeignInactiveMissingAndCorruptFactors(t *testing.T)
 		"bad config": func(t *testing.T, _ *db.User) { t.Setenv(config.EnvMasterKEKVersion, "private invalid version") },
 	} {
 		t.Run(name, func(t *testing.T) {
-			user := db.User{ID: uuid.New(), Email: "portal@" + fixtureRunID + ".example.test", Status: "active", IsMfaEnabled: true, MfaTotpSecretEncrypted: bytes.Clone(ciphertext)}
+			user := db.User{ID: uuid.New(), Email: new("portal@" + fixtureRunID + ".example.test"), Status: "active", IsMfaEnabled: true, MfaTotpSecretEncrypted: bytes.Clone(ciphertext)}
 			mutate(t, &user)
 			output, err := currentTOTPCode(context.Background(), user, fixtureRunID, time.Now(), false)
 			if err == nil || output != (totpCode{}) || strings.Contains(err.Error(), "private") {
@@ -568,7 +569,7 @@ func TestFixturePendingTOTPIsExplicitOwnedAndWithinOriginalWindow(t *testing.T) 
 	}
 	now := time.Now()
 	user := db.User{
-		ID: uuid.New(), Email: "pending@" + fixtureRunID + ".example.test", Status: "pending_deletion",
+		ID: uuid.New(), Email: new("pending@" + fixtureRunID + ".example.test"), Status: "pending_deletion",
 		DeletedAt:    pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
 		IsMfaEnabled: true, MfaTotpSecretEncrypted: ciphertext,
 	}
@@ -591,7 +592,8 @@ func TestFixturePendingTOTPIsExplicitOwnedAndWithinOriginalWindow(t *testing.T) 
 	for name, mutate := range map[string]func(*db.User){
 		"active":    func(u *db.User) { u.Status = "active"; u.DeletedAt.Valid = false },
 		"suspended": func(u *db.User) { u.Status = "suspended" },
-		"foreign":   func(u *db.User) { u.Email = "foreign@another.example.test" },
+		"foreign":   func(u *db.User) { u.Email = new("foreign@another.example.test") },
+		"absent":    func(u *db.User) { u.Email = nil },
 		"no-date":   func(u *db.User) { u.DeletedAt.Valid = false },
 		"future":    func(u *db.User) { u.DeletedAt.Time = now.Add(time.Second) },
 		"deadline":  func(u *db.User) { u.DeletedAt.Time = now.Add(-720 * time.Hour) },

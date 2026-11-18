@@ -195,8 +195,13 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 		// when the provisioning role owns every object.
 		execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 		statuses, err := p.Status(ctx)
-		if err != nil || len(statuses) != 4 || statuses[0].State != goose.StatePending || statuses[1].State != goose.StatePending || statuses[2].State != goose.StatePending || statuses[3].State != goose.StatePending {
+		if err != nil || len(statuses) != 6 {
 			t.Fatalf("fresh status: %+v, %v", statuses, err)
+		}
+		for _, status := range statuses {
+			if status.State != goose.StatePending {
+				t.Fatalf("fresh migration not pending: %+v", status)
+			}
 		}
 		if version, err := p.GetDBVersion(ctx); err != nil || version != 0 {
 			t.Fatalf("fresh version: %d, %v", version, err)
@@ -212,18 +217,22 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	before := metadataSnapshot(ctx, t, database)
 	execFixture(ctx, t, database, `SET default_transaction_read_only=on`)
 	statuses, err := p.Status(ctx)
-	if err != nil || len(statuses) != 4 || statuses[0].State != goose.StateApplied || statuses[0].AppliedAt.IsZero() ||
-		statuses[1].State != goose.StateApplied || statuses[1].AppliedAt.IsZero() || statuses[2].State != goose.StateApplied || statuses[2].AppliedAt.IsZero() || statuses[3].State != goose.StateApplied || statuses[3].AppliedAt.IsZero() {
+	if err != nil || len(statuses) != 6 {
 		t.Fatalf("installed read-only status: %+v, %v", statuses, err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 4 {
+	for _, status := range statuses {
+		if status.State != goose.StateApplied || status.AppliedAt.IsZero() {
+			t.Fatalf("installed migration not applied: %+v", status)
+		}
+	}
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 6 {
 		t.Fatalf("installed read-only version: %d, %v", version, err)
 	}
 	execFixture(ctx, t, database, `SET default_transaction_read_only=off`)
 	for _, run := range []func() error{
 		func() error { _, err := p.Up(ctx); return err },
 		func() error { _, err := p.UpTo(ctx, 1); return err },
-		func() error { _, err := p.DownTo(ctx, 4); return err },
+		func() error { _, err := p.DownTo(ctx, 6); return err },
 		func() error { _, err := p.Status(ctx); return err },
 	} {
 		if err := run(); err != nil {
@@ -233,7 +242,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	if _, err := p.UpByOne(ctx); !errors.Is(err, goose.ErrNoNextVersion) {
 		t.Fatalf("up-by-one noop: %v", err)
 	}
-	if version, err := p.GetDBVersion(ctx); err != nil || version != 4 {
+	if version, err := p.GetDBVersion(ctx); err != nil || version != 6 {
 		t.Fatalf("installed version: %d, %v", version, err)
 	}
 	if after := metadataSnapshot(ctx, t, database); before != after {
@@ -392,7 +401,7 @@ func TestRegistrationMigrationFromBaselineAndAtomicFailure(t *testing.T) {
 	if _, err := fresh.Up(ctx); err != nil {
 		t.Fatalf("baseline-only retry to registration schema: %v", err)
 	}
-	if version, err := fresh.GetDBVersion(ctx); err != nil || version != 4 {
+	if version, err := fresh.GetDBVersion(ctx); err != nil || version != 6 {
 		t.Fatalf("retry version: %d, %v", version, err)
 	}
 	before := metadataSnapshot(ctx, t, database)

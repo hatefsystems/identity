@@ -114,7 +114,8 @@ type adminPage[T any] struct {
 // still confirm the field exists and invite a client to depend on it).
 type adminUserResponse struct {
 	ID                uuid.UUID  `json:"id"`
-	Email             *string    `json:"email,omitempty"`
+	Email             *string    `json:"email"`
+	EmailRedacted     bool       `json:"-"`
 	Status            string     `json:"status"`
 	IsMFAEnabled      bool       `json:"is_mfa_enabled"`
 	CreatedAt         *time.Time `json:"created_at"`
@@ -134,12 +135,24 @@ func newAdminUserResponse(u db.User, includePII bool) adminUserResponse {
 		UpdatedAt:         timePtr(u.UpdatedAt),
 		DeletedAt:         timePtr(u.DeletedAt),
 		LifecycleRevision: u.LifecycleRevision,
+		EmailRedacted:     !includePII,
 	}
 	if includePII {
-		email := u.Email
-		resp.Email = &email
+		resp.Email = u.Email
 	}
 	return resp
+}
+
+// Redaction omits the key; an authorized absent contact is explicit JSON null.
+func (u adminUserResponse) MarshalJSON() ([]byte, error) {
+	type projection adminUserResponse
+	if !u.EmailRedacted {
+		return json.Marshal(projection(u))
+	}
+	return json.Marshal(struct {
+		projection
+		Email *string `json:"email,omitempty"`
+	}{projection: projection(u)})
 }
 
 // adminAuditLogResponse is the audit-row DTO.

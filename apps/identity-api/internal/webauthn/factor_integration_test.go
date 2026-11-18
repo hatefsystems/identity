@@ -130,7 +130,7 @@ func createFactorIntegrationUser(ctx context.Context, t *testing.T, pool *pgxpoo
 
 	q := db.New(pool)
 	user, err := q.CreateUser(ctx, db.CreateUserParams{
-		Email:  fmt.Sprintf("factor-%s-%s@test.local", label, uuid.NewString()),
+		Email:  new(fmt.Sprintf("factor-%s-%s@test.local", label, uuid.NewString())),
 		Status: "active",
 	})
 	if err != nil {

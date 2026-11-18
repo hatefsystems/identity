@@ -12,7 +12,7 @@ import {
 
 export type Profile = {
   id: string;
-  email: string;
+  email: string | null;
   display_name: string;
   status: string;
   deletion_enabled: boolean;
@@ -28,9 +28,11 @@ export function profileResponse(value: unknown): Profile {
     throw new PortalError('invalid_response');
   const name = text(profile.display_name, 160);
   if (normalizeName(name) !== name) throw new PortalError('invalid_response');
+  const email = profile.email === null ? null : text(profile.email, 320);
+  if (email === '') throw new PortalError('invalid_response');
   return {
     id: identifier(profile.id),
-    email: text(profile.email, 320),
+    email,
     display_name: name,
     status: text(profile.status, 64),
     deletion_enabled:

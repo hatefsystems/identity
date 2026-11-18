@@ -145,7 +145,7 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 		for _, ordering := range []string{"revocation_first", "fresh", "mutation_first"} {
 			t.Run(operation+"/"+ordering, func(t *testing.T) {
 				q := db.New(pool)
-				user, err := q.CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@mutation.invalid", Status: "active"})
+				user, err := q.CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@mutation.invalid"), Status: "active"})
 				if err != nil {
 					t.Fatal(err)
 				}

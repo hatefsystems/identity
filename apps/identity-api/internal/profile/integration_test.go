@@ -80,7 +80,7 @@ func newProfileDatabase(t *testing.T) profileDatabase {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := New(pool)
+	service, err := New(pool, privateCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func profileExec(t *testing.T, f profileDatabase, sql string, args ...any) {
 
 func profileUser(t *testing.T, f profileDatabase) db.User {
 	t.Helper()
-	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@profile.invalid", Status: "active"})
+	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@profile.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestProfileUpdateNoopConflictAndRollbackIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			event, err := lifecycle.UnmarshalEvent([]byte(payload))
-			if err != nil || event.SchemaVersion != lifecycle.SchemaVersionV2 || event.GetRevision() != 1<<53+2 || strings.Contains(payload, "Private name") || strings.Contains(payload, u.Email) {
+			if err != nil || event.SchemaVersion != lifecycle.SchemaVersionV2 || event.GetRevision() != 1<<53+2 || strings.Contains(payload, "Private name") || strings.Contains(payload, *u.Email) {
 				t.Fatal("stored profile intent is not exact metadata-only v2")
 			}
 			noop, err := f.service.Update(f.ctx, u.ID, u.AuthVersion, " Private name ", result.Profile.LifecycleRevision)

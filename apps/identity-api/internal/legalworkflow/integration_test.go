@@ -119,7 +119,7 @@ func integrationFixture(t *testing.T) *integration {
 	}
 	f := &integration{ctx: ctx, pool: pool, actions: actions, service: svc, policy: p, dsn: dsn}
 	for i := range f.actors {
-		u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@workflow.test", Status: "active"})
+		u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@workflow.test"), Status: "active"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -968,7 +968,7 @@ func TestWorkflowConcurrentCreateReplayIntegration(t *testing.T) {
 
 func TestWorkflowDeletedSubjectsHistoricLimitAndAssociationsIntegration(t *testing.T) {
 	f := integrationFixture(t)
-	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@deleted-workflow.test", Status: "active"})
+	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@deleted-workflow.test"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}

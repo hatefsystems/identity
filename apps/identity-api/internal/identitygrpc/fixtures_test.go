@@ -117,7 +117,7 @@ func testConfig(t *testing.T) Config {
 		Queries: queryFuncs{
 			permission: func(context.Context, db.UserHasPermissionParams) (bool, error) { return true, nil },
 			profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
-				return db.GetInternalUserInfoRow{ID: id, Status: "active", Email: "profile@example.invalid"}, nil
+				return db.GetInternalUserInfoRow{ID: id, Status: "active", Email: new("profile@example.invalid")}, nil
 			},
 		},
 		DPoP:     validator,

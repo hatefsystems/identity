@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
@@ -176,10 +179,10 @@ func TestProfileAndPermissionDatabaseIntegration(t *testing.T) {
 				}
 				want := &identityv1.GetInternalUserInfoResponse{UserId: id.String(), Status: tc.status, LifecycleRevision: wireRevision}
 				if tc.email {
-					want.Email = email
+					want.Email = &email
 					want.DisplayName = "Private display name"
 				}
-				if queryErr != nil || row.ID != id || row.Email != want.Email || row.DisplayName != want.DisplayName || row.LifecycleRevision != revision || !proto.Equal(response, want) {
+				if queryErr != nil || row.ID != id || !reflect.DeepEqual(row.Email, want.Email) || row.DisplayName != want.DisplayName || row.LifecycleRevision != revision || !proto.Equal(response, want) {
 					t.Fatalf("SQL or RPC profile minimization failed: %v", queryErr)
 				}
 			}
@@ -242,7 +245,7 @@ func TestDPoPRealRedisIntegration(t *testing.T) {
 func TestDisplayNameRevisionSnapshotDatabaseIntegration(t *testing.T) {
 	ctx, pool := integrationDatabase(t)
 	queries := db.New(pool)
-	u, err := queries.CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@grpc-integration.invalid", Status: "active"})
+	u, err := queries.CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@grpc-integration.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +253,15 @@ func TestDisplayNameRevisionSnapshotDatabaseIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "UPDATE users SET display_name=$2,lifecycle_revision=$3 WHERE id=$1", u.ID, strconv.FormatInt(base, 10), base); err != nil {
 		t.Fatal(err)
 	}
-	svc, err := profile.New(pool)
+	provider, err := kms.NewMockProvider(make([]byte, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := profile.New(pool, cipher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,5 +290,21 @@ func TestDisplayNameRevisionSnapshotDatabaseIntegration(t *testing.T) {
 	response, err := client.GetInternalUserInfo(ctx, &identityv1.GetInternalUserInfoRequest{UserId: u.ID.String()})
 	if err != nil || response.LifecycleRevision != uint64(base+20) || response.DisplayName != strconv.FormatInt(base+20, 10) {
 		t.Fatal("latest shared profile snapshot was not visible")
+	}
+}
+
+func TestAbsentEmailDatabaseGRPCIntegration(t *testing.T) {
+	ctx, pool := integrationDatabase(t)
+	q := db.New(pool)
+	u, err := q.CreateUser(ctx, db.CreateUserParams{Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t)
+	cfg.Queries = q
+	client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
+	response, err := client.GetInternalUserInfo(ctx, &identityv1.GetInternalUserInfoRequest{UserId: u.ID.String()})
+	if err != nil || response.Email != nil || response.UserId != u.ID.String() || response.Status != identityv1.UserStatus_USER_STATUS_ACTIVE {
+		t.Fatal("NULL email lost through actual SQL/gRPC adapter", err)
 	}
 }

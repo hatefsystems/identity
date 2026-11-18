@@ -26,6 +26,7 @@ export const portalEn = {
   overview: {
     title: 'Account overview', description: 'Manage your shared identity, sign-in methods, and active browser sessions.', profile: 'Your profile',
     email: 'Primary email', status: 'Account status', edit: 'Edit display name', loading: 'Loading current account summaries...', refresh: 'Refresh overview',
+    emailAbsent: 'No email address is set for this account.',
     username: 'Username', usernameAbsent: 'No username is assigned to this account.', usernameUnknown: 'Username has not been loaded.',
     passkeys: 'Passkeys', passkeysDescription: 'Registered sign-in credentials.', managePasskeys: 'Manage passkeys',
     sessions: 'Sessions', sessionsDescription: 'Active server-side browser sessions.', manageSessions: 'Review sessions',
@@ -85,6 +86,7 @@ export const portalFa = {
   overview: {
     title: 'نمای کلی حساب', description: 'هویت مشترک، روش‌های ورود و نشست‌های فعال مرورگر خود را مدیریت کنید.', profile: 'نمایهٔ شما',
     email: 'ایمیل اصلی', status: 'وضعیت حساب', edit: 'ویرایش نام نمایشی', loading: 'در حال بارگیری خلاصهٔ فعلی حساب...', refresh: 'تازه‌سازی نمای کلی',
+    emailAbsent: 'نشانی ایمیلی برای این حساب ثبت نشده است.',
     username: 'نام کاربری', usernameAbsent: 'نام کاربری به این حساب اختصاص داده نشده است.', usernameUnknown: 'نام کاربری هنوز دریافت نشده است.',
     passkeys: 'کلیدهای عبور', passkeysDescription: 'کلیدهای ثبت‌شده برای ورود.', managePasskeys: 'مدیریت کلیدهای عبور',
     sessions: 'نشست‌ها', sessionsDescription: 'نشست‌های فعال مرورگر در سرور.', manageSessions: 'بررسی نشست‌ها',

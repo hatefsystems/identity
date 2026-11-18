@@ -111,7 +111,7 @@ func run(logger *slog.Logger) (runErr error) {
 	var profileService *profile.Service
 	if pool != nil {
 		accounts = session.NewDBAccountState(pool)
-		profileService, err = profile.New(pool)
+		profileService, err = buildProfileService(pool)
 		if err != nil {
 			return err
 		}
@@ -162,6 +162,14 @@ func run(logger *slog.Logger) (runErr error) {
 	usernameService, usernameReady, err := buildUsernameService(pool)
 	if err != nil {
 		return err
+	}
+	privateProfileService, err := buildPrivateProfileService(pool, usernameService, sessionManager)
+	if err != nil {
+		return err
+	}
+	var privateProfileReader server.PrivateProfileReader
+	if privateProfileService != nil {
+		privateProfileReader = privateProfileService
 	}
 	registrationService, registrationReady, err := buildRegistrationService(cfg.Environment, pool, redisClient, webauthnService, smsotpService, usernameService)
 	if err != nil {
@@ -290,6 +298,7 @@ func run(logger *slog.Logger) (runErr error) {
 		DPoPValidator:          dpopValidator,
 		SessionManager:         sessionManager,
 		Profile:                profileService,
+		PrivateProfile:         privateProfileReader,
 		WebAuthn:               webauthnService,
 		WebAuthnLimiter:        webAuthnLimiter,
 		MFA:                    mfaService,

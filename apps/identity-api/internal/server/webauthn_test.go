@@ -212,10 +212,10 @@ func newWebAuthnTestServerWithStepUp(t *testing.T, withStepUp bool) *webAuthnTes
 	}
 
 	// Only active accounts may authenticate, so the seeded account is active.
-	user := db.User{ID: uuid.New(), Email: "passkey@example.com", Status: "active"}
+	user := db.User{ID: uuid.New(), Email: new("passkey@example.com"), Status: "active"}
 	users := &fakeWebAuthnUserStore{
 		byID:    map[uuid.UUID]db.User{user.ID: user},
-		byEmail: map[string]uuid.UUID{user.Email: user.ID},
+		byEmail: map[string]uuid.UUID{*user.Email: user.ID},
 	}
 	creds := &fakeWebAuthnCredentialStore{byUser: make(map[uuid.UUID][]db.WebauthnCredential)}
 
@@ -563,8 +563,8 @@ func TestRegisterOptionsReturns200(t *testing.T) {
 	if options.PublicKey.RP.ID != "localhost" {
 		t.Errorf("publicKey.rp.id = %q, want %q", options.PublicKey.RP.ID, "localhost")
 	}
-	if options.PublicKey.User.Name != fx.user.Email {
-		t.Errorf("publicKey.user.name = %q, want %q", options.PublicKey.User.Name, fx.user.Email)
+	if options.PublicKey.User.Name != *fx.user.Email {
+		t.Errorf("publicKey.user.name = %q, want %q", options.PublicKey.User.Name, *fx.user.Email)
 	}
 	// The user handle on the wire is the anonymised value, never the account
 	// UUID (docs/architecture.md, "Anonymized user.id Mapping").
@@ -784,12 +784,12 @@ func TestLoginOptionsIsNotAnEnumerationOracle(t *testing.T) {
 	// ceremony rather than two flavours of failure.
 	enrolled := db.User{
 		ID:                 uuid.New(),
-		Email:              "enrolled@example.com",
+		Email:              new("enrolled@example.com"),
 		Status:             "active",
 		WebauthnUserHandle: bytes.Repeat([]byte{0x11}, 8),
 	}
 	fx.users.byID[enrolled.ID] = enrolled
-	fx.users.byEmail[enrolled.Email] = enrolled.ID
+	fx.users.byEmail[*enrolled.Email] = enrolled.ID
 	fx.creds.byUser[enrolled.ID] = []db.WebauthnCredential{{
 		ID:     bytes.Repeat([]byte{0x22}, 32),
 		UserID: enrolled.ID,
@@ -797,7 +797,7 @@ func TestLoginOptionsIsNotAnEnumerationOracle(t *testing.T) {
 
 	shapes := make(map[string][]string)
 	for _, email := range []string{
-		enrolled.Email,        // real, usable
+		*enrolled.Email,       // real, usable
 		"passkey@example.com", // real, no passkey
 		"nobody@example.com",  // never registered
 	} {
@@ -843,7 +843,7 @@ func TestLoginOptionsIsNotAnEnumerationOracle(t *testing.T) {
 		shapes[email] = fingerprint
 	}
 
-	want := shapes[enrolled.Email]
+	want := shapes[*enrolled.Email]
 	for email, got := range shapes {
 		if !slices.Equal(got, want) {
 			t.Errorf("%s response shape = %v, enrolled-account shape = %v; they must be identical",

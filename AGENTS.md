@@ -23,6 +23,12 @@
 
 <!-- nx configuration end-->
 
+# Pre-launch product scope
+
+Identity has not launched. Plan and implement against the current product requirements. Add compatibility or migration work for legacy users only when the project owner identifies a concrete population to support. This decision supersedes older plans that assume such users exist.
+
+T12 (a one-time username claim for an existing account) is out of scope. Usernames are selected during registration, with uniqueness enforced by the database.
+
 # Command execution environment
 
 - Agent commands run in a non-interactive shell and may inherit a minimal `PATH`, unlike the user's terminal. Command approval does not import the user's terminal environment.

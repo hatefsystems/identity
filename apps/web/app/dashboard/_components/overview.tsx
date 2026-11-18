@@ -65,8 +65,10 @@ export function Overview() {
         <dl className="grid gap-4 text-sm sm:grid-cols-2">
           <div>
             <dt className="text-muted-foreground">{t('portal.overview.email')}</dt>
-            <dd dir="ltr" className="mt-1 break-all font-medium isolate">
-              {profile.email}
+            <dd className="mt-1 break-words font-medium">
+              {profile.email === null
+                ? t('portal.overview.emailAbsent')
+                : <bdi dir="ltr" className="break-all">{profile.email}</bdi>}
             </dd>
           </div>
           <div>

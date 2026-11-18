@@ -74,7 +74,7 @@ func (w *fakePurgeWorld) addPendingUser(now time.Time, age time.Duration) uuid.U
 	id := uuid.New()
 	w.users[id] = db.User{
 		ID:        id,
-		Email:     id.String() + "@test.local",
+		Email:     new(id.String() + "@test.local"),
 		Status:    "pending_deletion",
 		DeletedAt: ts(now.Add(-age)),
 	}

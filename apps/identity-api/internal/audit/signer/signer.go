@@ -512,7 +512,7 @@ func (s *Signer) processBatch(ctx context.Context, msgs []jetstream.Msg) error {
 		}
 		blindIndex := lc.identityBlindIndex
 		version := lc.blindIndexVersion
-		if blindIndex == nil {
+		if blindIndex == nil && !lc.identityAbsent {
 			blindIndex, err = s.blindIndexFor(batchCtx, store, blindIndexes, lc.accountRef)
 			if err != nil {
 				s.nakAll(msgs)
@@ -823,6 +823,7 @@ type ledgerContext struct {
 	scope              string
 	deviceFingerprint  string
 	identityBlindIndex *string
+	identityAbsent     bool
 	blindIndexVersion  int16
 }
 
@@ -877,6 +878,7 @@ func (s *Signer) resolveLedgerContext(env audit.Envelope) (ledgerContext, bool, 
 		scope:              env.Security.Scope,
 		deviceFingerprint:  env.Security.DeviceFingerprint,
 		identityBlindIndex: env.Security.IdentityBlindIndex,
+		identityAbsent:     env.Security.IdentityAbsent,
 		blindIndexVersion:  env.Security.BlindIndexVersion,
 	}, true, nil
 }
@@ -916,9 +918,15 @@ func (s *Signer) blindIndexFor(ctx context.Context, store Store, cache map[uuid.
 		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("signer: resolve email for blind index: %w", err)
+	case email == nil:
+		cache[accountRef] = nil
+		return nil, nil
+	}
+	if *email == "" {
+		return nil, errors.New("signer: invalid email for blind index")
 	}
 
-	digest, err := s.indexer.ComputeEmail(email)
+	digest, err := s.indexer.ComputeEmail(*email)
 	if err != nil {
 		return nil, errors.New("signer: invalid email for blind index")
 	}

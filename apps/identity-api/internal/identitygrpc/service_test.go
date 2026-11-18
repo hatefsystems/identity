@@ -87,7 +87,7 @@ func TestProfileRevisionAdditiveWireCompatibility(t *testing.T) {
 	}
 	legacyDescriptor := legacyFile.Messages().Get(0)
 	wantLegacy := &identityv1.GetInternalUserInfoResponse{
-		UserId: testUserID, Email: "profile@example.invalid", Status: identityv1.UserStatus_USER_STATUS_ACTIVE,
+		UserId: testUserID, Email: new("profile@example.invalid"), Status: identityv1.UserStatus_USER_STATUS_ACTIVE,
 	}
 	wantCurrent := proto.Clone(wantLegacy).(*identityv1.GetInternalUserInfoResponse)
 	wantCurrent.LifecycleRevision = 1<<53 + 1
@@ -427,7 +427,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
-				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: "profile@example.invalid", DisplayName: "Private display name", LifecycleRevision: 42}, tc.queryErr
+				return db.GetInternalUserInfoRow{ID: id, Status: tc.stored, Email: new("profile@example.invalid"), DisplayName: "Private display name", LifecycleRevision: 42}, tc.queryErr
 			}}
 			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 			response, err := client.GetInternalUserInfo(rpcContext(t), &identityv1.GetInternalUserInfoRequest{UserId: testUserID})
@@ -443,7 +443,7 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 			}
 			want := &identityv1.GetInternalUserInfoResponse{UserId: testUserID, Status: tc.status, LifecycleRevision: 42}
 			if tc.email {
-				want.Email = "profile@example.invalid"
+				want.Email = new("profile@example.invalid")
 				want.DisplayName = "Private display name"
 			}
 			if !proto.Equal(response, want) {
@@ -466,6 +466,26 @@ func TestProfilesMinimizeEveryStatusAndAuditMTLS(t *testing.T) {
 	}
 }
 
+func TestProfileAbsentEmailPreservesProtobufPresenceAndAudit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
+		return db.GetInternalUserInfoRow{ID: id, Status: "active", DisplayName: "Shared name", LifecycleRevision: 3}, nil
+	}}
+	client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
+	response, err := client.GetInternalUserInfo(rpcContext(t), &identityv1.GetInternalUserInfoRequest{UserId: testUserID})
+	if err != nil || response.Email != nil || response.DisplayName != "Shared name" {
+		t.Fatal("missing email broke approved profile projection", err)
+	}
+	field := response.ProtoReflect().Descriptor().Fields().ByName("email")
+	if field.Number() != 2 || !field.HasPresence() || response.ProtoReflect().Has(field) {
+		t.Fatal("canonical email field lost explicit presence/number")
+	}
+	events := cfg.Recorder.(*testRecorder).snapshot()
+	if len(events) != 1 || events[0].Payload["email_disclosed"] != false || events[0].Payload["display_name_disclosed"] != true {
+		t.Fatal("absent email fabricated disclosure attribution")
+	}
+}
+
 func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
 	for _, storedStatus := range []string{"active", "pending_verification", "suspended", "banned"} {
 		t.Run(storedStatus, func(t *testing.T) {
@@ -474,7 +494,7 @@ func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
 			cfg.Queries = queryFuncs{profile: func(_ context.Context, id uuid.UUID) (db.GetInternalUserInfoRow, error) {
 				calls.Add(1)
 				value := revision.Load()
-				return db.GetInternalUserInfoRow{ID: id, Status: storedStatus, Email: "profile@example.invalid", DisplayName: strconv.FormatInt(value, 10), LifecycleRevision: value}, nil
+				return db.GetInternalUserInfoRow{ID: id, Status: storedStatus, Email: new("profile@example.invalid"), DisplayName: strconv.FormatInt(value, 10), LifecycleRevision: value}, nil
 			}}
 			client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 			values := []int64{0, 1, 1<<53 + 1, math.MaxInt64, -1, math.MinInt64, 2}
@@ -495,7 +515,7 @@ func TestProfileRevisionIsLiveAndRejectsCorruptSignedStateMTLS(t *testing.T) {
 					t.Fatalf("live snapshot revision=%d response=%v err=%v", value, response, err)
 				}
 				if storedStatus == "suspended" || storedStatus == "banned" {
-					if response.Email != "" || response.DisplayName != "" {
+					if response.Email != nil || response.DisplayName != "" {
 						t.Fatal("revision disclosure bypassed status-dependent profile redaction")
 					}
 				} else if response.DisplayName != strconv.FormatInt(value, 10) {
@@ -514,7 +534,7 @@ func TestProfileInputAndQueryInvariantsMTLS(t *testing.T) {
 	var calls atomic.Int64
 	cfg.Queries = queryFuncs{profile: func(context.Context, uuid.UUID) (db.GetInternalUserInfoRow, error) {
 		calls.Add(1)
-		return db.GetInternalUserInfoRow{ID: uuid.New(), Status: "active", Email: "private@example.invalid"}, nil
+		return db.GetInternalUserInfoRow{ID: uuid.New(), Status: "active", Email: new("private@example.invalid")}, nil
 	}}
 	client := newMTLSHarness(t, cfg, allGrants(testCaller)).client(t, testCaller)
 	for _, rawID := range []string{"", "not-a-uuid", uuid.Nil.String(), " " + testUserID} {

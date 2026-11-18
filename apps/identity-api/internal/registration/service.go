@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
@@ -623,7 +624,7 @@ func (s *Service) Complete(ctx context.Context, a Authority, body []byte) (Outco
 		return Outcome{}, ErrExpired
 	}
 	q := db.New(tx)
-	user, err := lifecycle.CreateUser(ctx, tx, db.CreateUserParams{Email: attempt.Details.Email, Status: "active"})
+	user, err := lifecycle.CreateUser(ctx, tx, db.CreateUserParams{Email: &attempt.Details.Email, Status: "active"})
 	if err != nil {
 		if errors.Is(err, lifecycle.ErrIdentityConflict) {
 			return Outcome{}, ErrConflict
@@ -648,6 +649,23 @@ func (s *Service) Complete(ctx context.Context, a Authority, body []byte) (Outco
 	}
 	if affected, err = q.SetUserPhone(ctx, db.SetUserPhoneParams{ID: user.ID, PhoneEncrypted: phone, PhoneBlindIndex: &index}); err != nil || affected != 1 {
 		return Outcome{}, writeError(err)
+	}
+	for _, proof := range []struct {
+		channel, destination, method string
+		at                           time.Time
+	}{
+		{contactproof.Email, attempt.Details.Email, contactproof.EmailLink, fresh.Record.EmailVerifiedAt.Time},
+		{contactproof.Phone, attempt.Details.Phone, contactproof.SMSOTP, fresh.Record.PhoneVerifiedAt.Time},
+	} {
+		blob, err := contactproof.Seal(ctx, s.deps.Encryptor, user.ID, proof.channel, proof.destination, proof.method, proof.at)
+		if err != nil {
+			return Outcome{}, ErrUnavailable
+		}
+		err = q.PutContactVerificationEvidence(ctx, db.PutContactVerificationEvidenceParams{UserID: user.ID, Channel: proof.channel, EvidenceEncrypted: blob})
+		clear(blob)
+		if err != nil {
+			return Outcome{}, ErrUnavailable
+		}
 	}
 	completed, err := s.deps.Store.Complete(ctx, tx, attempt, user.ID, fingerprint)
 	if err != nil {

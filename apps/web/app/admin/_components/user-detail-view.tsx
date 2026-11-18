@@ -247,8 +247,10 @@ export function UserDetailView() {
                 {access.users_pii && user.email !== undefined && (
                   <>
                     <dt className="text-muted-foreground">{t('detail.email')}</dt>
-                    <dd className="break-all">
-                      <bdi dir="ltr">{user.email}</bdi>
+                    <dd className="break-words">
+                      {user.email === null
+                        ? t('accounts.emailAbsent')
+                        : <bdi dir="ltr" className="break-all">{user.email}</bdi>}
                     </dd>
                   </>
                 )}

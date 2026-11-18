@@ -58,7 +58,7 @@ func TestLoginCeremoniesCannotReviveAcrossInstances(t *testing.T) {
 				if discoverable {
 					options, err = svc.BeginDiscoverableLogin(f.ctx())
 				} else {
-					options, err = svc.BeginLogin(f.ctx(), f.user.Email)
+					options, err = svc.BeginLogin(f.ctx(), *f.user.Email)
 				}
 				if err != nil {
 					t.Fatal(err)
@@ -141,7 +141,7 @@ func TestCeremonyCommitRechecksVersionAfterConcurrentReactivation(t *testing.T) 
 				var options *protocol.CredentialAssertion
 				var err error
 				if flow == FlowLoginNamed {
-					options, err = f.svc.BeginLogin(ctx, f.user.Email)
+					options, err = f.svc.BeginLogin(ctx, *f.user.Email)
 				} else {
 					options, err = f.svc.BeginDiscoverableLogin(ctx)
 				}

@@ -155,7 +155,7 @@ func lifecycleCount(t *testing.T, f lifecycleDatabase, query string, args ...any
 func lifecycleCreate(t *testing.T, f lifecycleDatabase) db.User {
 	t.Helper()
 	tx := lifecycleTx(t, f)
-	user, err := lifecycle.CreateUser(f.ctx, tx, db.CreateUserParams{Email: uuid.NewString() + "@lifecycle.invalid", Status: "active"})
+	user, err := lifecycle.CreateUser(f.ctx, tx, db.CreateUserParams{Email: new(uuid.NewString() + "@lifecycle.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestLifecycleCreationTransactionIntegration(t *testing.T) {
 				lifecycleExec(t, f, `ALTER TABLE event_outbox ADD CONSTRAINT reject_created CHECK (subject <> 'identity.user.created')`)
 			}
 			tx := lifecycleTx(t, f)
-			params := db.CreateUserParams{Email: uuid.NewString() + "@lifecycle.invalid", Status: "active"}
+			params := db.CreateUserParams{Email: new(uuid.NewString() + "@lifecycle.invalid"), Status: "active"}
 			var user db.User
 			var err error
 			if mode == "synthetic raw query" {

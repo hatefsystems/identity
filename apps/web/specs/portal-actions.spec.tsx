@@ -1,5 +1,6 @@
 import { act, fireEvent, I18nTestProvider, render, screen, waitFor, within } from '../i18n/testing';
 import { ProfileEditor } from '../app/dashboard/_components/profile-editor';
+import { Overview } from '../app/dashboard/_components/overview';
 import { PasskeysPanel } from '../app/dashboard/_components/passkeys-panel';
 import { SessionsView } from '../app/dashboard/_components/sessions-view';
 import { PrivacyView } from '../app/dashboard/_components/privacy-view';
@@ -45,10 +46,13 @@ const api = {
   renameKey: jest.fn(),
   removeKey: jest.fn(),
   sessions: jest.fn(),
+  recoveryStatus: jest.fn(),
+  username: jest.fn(),
   revokeSession: jest.fn(),
 };
 const updateProfile = jest.fn();
 const signOut = jest.fn();
+let portal: ReturnType<typeof usePortal>;
 const grant = () =>
   new StepUpGrant(
     { token: 'single-use-grant', token_type: 'StepUp', expires_in: 60 },
@@ -89,7 +93,7 @@ beforeAll(() => {
 });
 beforeEach(() => {
   jest.resetAllMocks();
-  jest.mocked(usePortal).mockReturnValue({
+  portal = {
     profile,
     client: api as unknown as PortalClient,
     updateProfile,
@@ -99,10 +103,14 @@ beforeEach(() => {
     reportPermissionLoss: jest.fn(),
     reportModerationInterruption: jest.fn(),
     reportLegalInterruption: jest.fn(),
-  });
+  };
+  jest.mocked(usePortal).mockReturnValue(portal);
   api.assertSession.mockReturnValue(profile);
   api.bootstrap.mockResolvedValue(profile);
   api.keys.mockResolvedValue([firstKey, secondKey]);
+  api.sessions.mockResolvedValue([]);
+  api.recoveryStatus.mockResolvedValue({ remaining: 5, low: false });
+  api.username.mockResolvedValue(null);
   api.stepUpChallenge.mockResolvedValue({
     methods: ['webauthn', 'totp'],
     webauthn: { publicKey: { challenge: 'AA' } },
@@ -126,6 +134,55 @@ async function verifyPasskey() {
 }
 
 describe('repeated profile edits and conflicts', () => {
+  describe.each([['overview', Overview], ['profile', ProfileEditor]] as const)(
+    '%s email presentation', (_view, Component) => {
+      it.each([
+        ['en', null], ['fa-IR', null],
+        ['en', '\u0647\u0627\u062a\u0641@example.test'], ['fa-IR', '\u0647\u0627\u062a\u0641@example.test'],
+      ] as const)('renders truthful email in %s for %p and changes language without replaying work', async (locale, email) => {
+        jest.mocked(usePortal).mockReturnValue({ ...portal, profile: { ...profile, email } });
+        const content = (language: 'en' | 'fa-IR') => (
+          <I18nTestProvider locale={language}><Component /></I18nTestProvider>
+        );
+        const view = render(content(locale));
+        await act(async () => Promise.resolve());
+        const label = locale === 'en' ? 'Primary email' : 'ایمیل اصلی';
+        const value = screen.getByText(label).nextElementSibling;
+        expect(value?.textContent).toBe(email ?? (locale === 'en'
+          ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.'));
+        expect(value?.getAttribute('dir')).toBeNull();
+        expect(value?.querySelector('bdi[dir="ltr"]')?.textContent ?? null).toBe(email);
+        const draft = screen.queryByLabelText<HTMLInputElement>(locale === 'en' ? 'Display name' : 'نام نمایشی');
+        if (draft) fireEvent.change(draft, { target: { value: 'Unsaved draft' } });
+        const requests = [api.keys.mock.calls.length, api.sessions.mock.calls.length, api.recoveryStatus.mock.calls.length, api.username.mock.calls.length];
+        const other = locale === 'en' ? 'fa-IR' : 'en';
+        view.rerender(content(other));
+        expect(value?.textContent).toBe(email ?? (other === 'en'
+          ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.'));
+        if (draft) {
+          expect(screen.getByLabelText(other === 'en' ? 'Display name' : 'نام نمایشی')).toBe(draft);
+          expect(draft.value).toBe('Unsaved draft');
+        }
+        expect([api.keys.mock.calls.length, api.sessions.mock.calls.length, api.recoveryStatus.mock.calls.length, api.username.mock.calls.length]).toEqual(requests);
+        expect(api.bootstrap).not.toHaveBeenCalled();
+        expect(api.saveProfile).not.toHaveBeenCalled();
+      });
+    }
+  );
+
+  it.each(['en', 'fa-IR'] as const)('keeps absent email through a display-name save in %s', async (locale) => {
+    const absent = { ...profile, email: null };
+    jest.mocked(usePortal).mockReturnValue({ ...portal, profile: absent });
+    api.saveProfile.mockResolvedValueOnce({ ...absent, display_name: 'Updated', lifecycle_revision: '9007199254740994' });
+    render(<ProfileEditor />, { locale });
+    fireEvent.change(screen.getByLabelText(locale === 'en' ? 'Display name' : 'نام نمایشی'), { target: { value: 'Updated' } });
+    fireEvent.submit(screen.getByRole('form', { name: locale === 'en' ? 'Edit profile' : 'ویرایش نمایه' }));
+    await waitFor(() => expect(updateProfile).toHaveBeenCalledWith({ ...absent, display_name: 'Updated', lifecycle_revision: '9007199254740994' }));
+    expect(screen.getByText(locale === 'en' ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.')).toBeTruthy();
+    expect(api.saveProfile).toHaveBeenCalledWith('Updated', profile.lifecycle_revision, expect.any(AbortSignal));
+    expect(api.bootstrap).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['en', 'Display name', 'Save profile', 'Refresh saved profile', 'Last loaded saved name:'],
     ['fa-IR', 'نام نمایشی', 'ذخیرهٔ نمایه', 'تازه‌سازی نمایهٔ ذخیره‌شده', 'نام ذخیره‌شده در آخرین دریافت:'],

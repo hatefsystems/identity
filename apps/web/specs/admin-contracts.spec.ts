@@ -4,6 +4,7 @@ import {
   auditLogResponse,
   auditPageResponse,
   capabilitiesResponse,
+  lookupResponse,
   userResponse,
   usersResponse,
   verificationResponse,
@@ -167,7 +168,9 @@ describe('exact bounded admin DTOs', () => {
     ).toEqual({ ...user, email: 'operator@example.test' });
     expect(userResponse(user)).not.toHaveProperty('email');
     for (const patch of [
-      { email: null },
+      { email: '' },
+      { email: 7 },
+      { email: {} },
       { created_at: undefined },
       { deleted_at: undefined },
       { is_mfa_enabled: 'false' },
@@ -179,6 +182,23 @@ describe('exact bounded admin DTOs', () => {
     ])
       expect(() => userResponse({ ...user, ...patch })).toThrow('invalid_response');
   });
+
+  it.each([null, 'operator@example.test', '\u0647\u0627\u062a\u0641@example.test'])(
+    'preserves explicit email %p in account detail and directory DTOs', (email) => {
+      const value = { ...user, email };
+      expect(userResponse(value)).toEqual(value);
+      expect(usersResponse({ items: [value], total: 1, limit: 50, offset: 0 }).items).toEqual([value]);
+    }
+  );
+
+  it.each([null, undefined, '', 'other@example.test'])(
+    'never matches email %p to a supplied exact lookup address', (email) => {
+      expect(() => lookupResponse({
+        items: [{ ...user, email }], total: 1, limit: 1, offset: 0,
+        canonical_email: 'operator@example.test',
+      })).toThrow('invalid_response');
+    }
+  );
 
   it('requires every boolean and bounded numeric effective capability limit', () => {
     expect(

@@ -176,7 +176,7 @@ VALUES($1,$2,$3,'completed',$4,$5,$6,$7,$8,$9,3,4,$10,$11)`, completedID, comple
 		t.Fatal("read terminal restore fixture failed")
 	}
 	f.user, err = db.New(pool).GetUserByID(ctx, userID)
-	if err != nil || f.user.Email != completedEmail || !bytes.Equal(f.user.WebauthnUserHandle, handle) {
+	if err != nil || f.user.Email == nil || *f.user.Email != completedEmail || !bytes.Equal(f.user.WebauthnUserHandle, handle) {
 		t.Fatal("read bound local signup user fixture failed")
 	}
 	return f
@@ -247,7 +247,7 @@ func checkRegistrationRestoredState(ctx context.Context, t *testing.T, pool *pgx
 	t.Helper()
 	var tables, appliedRegistration, appliedUsername, attemptCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 43 {
+WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 45 {
 		t.Fatal("restore lost the exact 43-table application inventory")
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM identity_schema_version WHERE version_id=2 AND is_applied`).Scan(&appliedRegistration); err != nil || appliedRegistration != 1 {
@@ -324,7 +324,7 @@ WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_versi
 	}
 	phone, err := cipher.Decrypt(ctx, boundUser.PhoneEncrypted)
 	defer clear(phone)
-	if err != nil || string(phone) != f.phone || !emailaddress.ValidCanonicalMailbox(boundUser.Email) ||
+	if err != nil || string(phone) != f.phone || boundUser.Email == nil || !emailaddress.ValidCanonicalMailbox(*boundUser.Email) ||
 		len(boundUser.WebauthnUserHandle) != 8 || !bytes.Equal(boundUser.WebauthnUserHandle, f.user.WebauthnUserHandle) || boundUser.LifecycleRevision != 1 {
 		t.Fatal("restored canonical signup contacts, encrypted phone, handle or user revision differ")
 	}

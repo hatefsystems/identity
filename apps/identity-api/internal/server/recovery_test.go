@@ -50,7 +50,7 @@ func newRecoveryFakeStore() *recoveryFakeStore {
 // addUser registers an active account and returns its id.
 func (f *recoveryFakeStore) addUser() uuid.UUID {
 	id := uuid.New()
-	f.users[id] = db.User{ID: id, Email: id.String() + "@example.com", Status: "active"}
+	f.users[id] = db.User{ID: id, Email: new(id.String() + "@example.com"), Status: "active"}
 	return id
 }
 
@@ -72,7 +72,7 @@ func (f *recoveryFakeStore) GetUserByID(_ context.Context, id uuid.UUID) (db.Use
 
 func (f *recoveryFakeStore) GetUserByEmail(_ context.Context, email string) (db.User, error) {
 	for _, user := range f.users {
-		if user.Email == email {
+		if user.Email != nil && *user.Email == email {
 			return user, nil
 		}
 	}
@@ -257,7 +257,7 @@ func verifyBody(t *testing.T, transactionID, code string) []byte {
 
 func (fx *recoveryTestFixture) startTransaction(t *testing.T) string {
 	t.Helper()
-	body, err := json.Marshal(recoveryStartRequest{Email: fx.store.users[fx.userID].Email})
+	body, err := json.Marshal(recoveryStartRequest{Email: *fx.store.users[fx.userID].Email})
 	if err != nil {
 		t.Fatalf("marshal recovery start: %v", err)
 	}
@@ -330,9 +330,9 @@ func TestRecoveryStartIsOpaqueForKnownUnknownAndInactiveAccounts(t *testing.T) {
 		email string
 		setup func()
 	}{
-		{name: "active", email: fx.store.users[fx.userID].Email, setup: func() { fx.store.setStatus(fx.userID, "active") }},
+		{name: "active", email: *fx.store.users[fx.userID].Email, setup: func() { fx.store.setStatus(fx.userID, "active") }},
 		{name: "unknown", email: "nobody@example.com", setup: func() {}},
-		{name: "inactive", email: fx.store.users[fx.userID].Email, setup: func() { fx.store.setStatus(fx.userID, "suspended") }},
+		{name: "inactive", email: *fx.store.users[fx.userID].Email, setup: func() { fx.store.setStatus(fx.userID, "suspended") }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -837,7 +837,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	transaction, err := recoveryFlow.Start(context.Background(), recoveryStore.users[userID].Email)
+	transaction, err := recoveryFlow.Start(context.Background(), *recoveryStore.users[userID].Email)
 	if err != nil {
 		t.Fatalf("Start recovery transaction: %v", err)
 	}

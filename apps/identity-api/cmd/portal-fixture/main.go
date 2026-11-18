@@ -91,7 +91,7 @@ func run(args []string) error {
 		return errors.New("expected one fixture action")
 	}
 	switch args[0] {
-	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only":
+	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "email-absent", "private-geography":
 	case "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
 	case "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup":
 	default:
@@ -196,6 +196,9 @@ func run(args []string) error {
 	if args[0] == "notifier-role" {
 		return notifierRole(ctx, pool, runID, dsn)
 	}
+	if args[0] == "private-geography" {
+		return privateGeography(ctx, pool)
+	}
 	userID, err := uuid.Parse(input.UserID)
 	if err != nil || userID == uuid.Nil {
 		return errors.New("invalid fixture subject")
@@ -203,6 +206,12 @@ func run(args []string) error {
 	var owned bool
 	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND email LIKE $2)`, userID, "%@"+runID+".example.test").Scan(&owned); err != nil || !owned {
 		return errors.New("subject does not belong to this fixture run")
+	}
+	if args[0] == "email-absent" {
+		if _, err := pool.Exec(ctx, `UPDATE users SET email=NULL WHERE id=$1`, userID); err != nil {
+			return errors.New("cannot remove owned fixture email")
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]bool{"absent": true})
 	}
 	if args[0] == "deletion-state" {
 		var state struct {
@@ -328,6 +337,34 @@ func validSessionHash(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && base64.RawURLEncoding.EncodeToString(decoded) == value
 }
 
+func privateGeography(ctx context.Context, pool *pgxpool.Pool) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return errors.New("cannot begin owned geography fixture")
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var empty bool
+	if err := tx.QueryRow(ctx, `SELECT active_revision IS NULL FROM geography_catalog_state WHERE singleton FOR UPDATE`).Scan(&empty); err != nil || !empty {
+		return errors.New("refusing to replace an installed geography catalog")
+	}
+	// Synthetic reference data, not an imported or redistributed source dataset.
+	for _, statement := range []string{
+		`INSERT INTO geography_catalogs(revision,country,source_release,cities_sha256,types_sha256,cities_bytes,types_bytes,place_count,type_count,province_count,importer_version,normalization_version) VALUES(1,'IR','portal-private-fixture',decode(repeat('01',32),'hex'),decode(repeat('02',32),'hex'),1,1,2,2,1,'portal-fixture','nfc-yeh-kaf-space-v1')`,
+		`INSERT INTO geography_types(revision,id,label) VALUES(1,2,'Synthetic province'),(1,5,'Synthetic locality')`,
+		`INSERT INTO geography_places(id,first_seen_revision,last_seen_revision) VALUES(7001,1,1),(7002,1,1)`,
+		`INSERT INTO geography_place_versions(revision,id,label,type_id,parent_id,province_id,search_label) VALUES(1,7001,'Synthetic province',2,NULL,7001,'synthetic province'),(1,7002,'Synthetic locality',5,7001,7001,'synthetic locality')`,
+		`UPDATE geography_catalog_state SET active_revision=1 WHERE singleton`,
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return errors.New("cannot install owned synthetic geography fixture")
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return errors.New("cannot commit owned geography fixture")
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]string{"country": "IR", "province_id": "7001", "locality_id": "7002", "catalog_revision": "1"})
+}
+
 func loopback(host string) bool {
 	if host == "localhost" {
 		return true
@@ -445,7 +482,7 @@ func newTOTPSecret(ctx context.Context) ([]byte, error) {
 }
 
 func currentTOTPCode(ctx context.Context, user db.User, runID string, now time.Time, reclaim bool) (totpCode, error) {
-	if !runIDPattern.MatchString(runID) || user.ID == uuid.Nil || !strings.HasSuffix(user.Email, "@"+runID+".example.test") {
+	if !runIDPattern.MatchString(runID) || user.ID == uuid.Nil || user.Email == nil || !strings.HasSuffix(*user.Email, "@"+runID+".example.test") {
 		return totpCode{}, errors.New("subject does not belong to this fixture run")
 	}
 	eligible := user.Status == "active" && !user.DeletedAt.Valid

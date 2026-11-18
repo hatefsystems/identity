@@ -68,7 +68,7 @@ func (f *fakeUserStore) mutate(id uuid.UUID, version int64, phone []byte, index 
 	}
 	return changed, nil
 }
-func (f *fakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, v int64, p []byte, i string) error {
+func (f *fakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, v int64, p []byte, i string, _ []byte) error {
 	_, err := f.mutate(id, v, p, i, false)
 	return err
 }

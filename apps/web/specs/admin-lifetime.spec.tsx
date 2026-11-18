@@ -1227,6 +1227,65 @@ function localizedDetail(locale: 'en' | 'fa-IR') {
   );
 }
 
+describe.each(['en', 'fa-IR'] as const)('typed email presentation in %s', (locale) => {
+  const absent = locale === 'en' ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.';
+
+  it.each([null, 'target@example.test', '\u0647\u0627\u062a\u0641@example.test'])(
+    'shows account detail email %p without inventing a mailbox', async (email) => {
+      serverUser.email = email;
+      nextBootstrap = async () => ({ ...profile(), email: null });
+      const view = render(localizedDetail(locale));
+      const value = await screen.findByText(email ?? absent);
+      expect(value.tagName).toBe(email === null ? 'DD' : 'BDI');
+      expect(value.getAttribute('dir')).toBe(email === null ? null : 'ltr');
+      expect(screen.queryByText(email === null ? 'target@example.test' : absent)).toBeNull();
+      const other = locale === 'en' ? 'fa-IR' : 'en';
+      view.rerender(localizedDetail(other));
+      expect(screen.getByText(email ?? (other === 'en' ? 'No email address is set for this account.' : 'نشانی ایمیلی برای این حساب ثبت نشده است.'))).toBe(value);
+      expect(clients).toHaveLength(1);
+      expect(clients[0].bootstrap).toHaveBeenCalledTimes(1);
+      expect(clients[0].admin.capabilities).toHaveBeenCalledTimes(1);
+      expect(clients[0].admin.user).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each([null, 'target@example.test', '\u0647\u0627\u062a\u0641@example.test'])(
+    'shows directory email %p in compact and table results without refetching', async (email) => {
+      mockPathname = '/admin/users';
+      serverUser.email = email;
+      render(<PortalProvider surface="admin"><UsersView /></PortalProvider>, { locale });
+      fireEvent.click(await screen.findByRole('button', { name: locale === 'en' ? 'Apply filters' : 'اعمال فیلترها' }));
+      let row = within(await screen.findByTestId('admin-account-row'));
+      expect(row.getByText(email ?? absent).getAttribute('dir')).toBe(email === null ? null : 'ltr');
+      expect(row.queryByText(email === null ? 'target@example.test' : absent)).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: locale === 'en' ? 'Table view' : 'نمای جدول' }));
+      row = within(screen.getByTestId('admin-account-row'));
+      expect(row.getByText(email ?? absent).getAttribute('dir')).toBe(email === null ? null : 'ltr');
+      expect(clients[0].admin.users).toHaveBeenCalledTimes(1);
+      expect(clients[0].bootstrap).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('keeps omitted PII distinct from explicit absence in account details', async () => {
+    delete serverUser.email;
+    render(localizedDetail(locale));
+    await screen.findByText(serverUser.lifecycle_revision);
+    expect(screen.queryByText(locale === 'en' ? 'Email' : 'ایمیل')).toBeNull();
+    expect(screen.queryByText(absent)).toBeNull();
+  });
+
+  it('does not expose an absent-email state to a metadata-only session', async () => {
+    serverUser.email = null;
+    nextCapabilities = async () => ({ ...permissions(), capabilities: { ...permissions().capabilities, users_pii: false, users_lookup: false } });
+    render(<PortalProvider surface="admin"><UserDetailView /><UsersView /></PortalProvider>, { locale });
+    await screen.findByText(serverUser.lifecycle_revision);
+    fireEvent.click(screen.getByRole('button', { name: locale === 'en' ? 'Apply filters' : 'اعمال فیلترها' }));
+    await screen.findByTestId('admin-account-row');
+    expect(screen.queryByText(locale === 'en' ? 'Email' : 'ایمیل')).toBeNull();
+    expect(screen.queryByText(absent)).toBeNull();
+  });
+});
+
 it('preserves a pending moderation read, one-use grant, final draft and in-flight write across languages', async () => {
   const view = render(localizedDetail('en'));
   await startAction();

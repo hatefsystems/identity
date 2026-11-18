@@ -15,8 +15,14 @@ func TestBundledBaselineInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 4 || entries[0].Name() != "00001_initial_schema.sql" || entries[1].Name() != "00002_registration_attempts.sql" || entries[2].Name() != "00003_username_reservations.sql" || entries[3].Name() != "00004_geography_catalog.sql" {
-		t.Fatalf("binary must embed the baseline, registration, username and geography migrations: %v", entries)
+	expected := []string{"00001_initial_schema.sql", "00002_registration_attempts.sql", "00003_username_reservations.sql", "00004_geography_catalog.sql", "00005_private_account_data.sql", "00006_optional_email_contact_evidence.sql"}
+	if len(entries) != len(expected) {
+		t.Fatalf("binary must embed the complete launch migration inventory: %v", entries)
+	}
+	for i, name := range expected {
+		if entries[i].Name() != name {
+			t.Fatalf("unexpected bundled migration: %s", entries[i].Name())
+		}
 	}
 	// Provider construction and source listing must not connect to PostgreSQL.
 	database, err := sql.Open("pgx", "postgres://localhost/unused?sslmode=disable")
@@ -33,10 +39,13 @@ func TestBundledBaselineInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	sources := r.ListSources()
-	if len(sources) != 4 || sources[0].Version != 1 || sources[0].Path != "00001_initial_schema.sql" ||
-		sources[1].Version != 2 || sources[1].Path != "00002_registration_attempts.sql" ||
-		sources[2].Version != 3 || sources[2].Path != "00003_username_reservations.sql" || sources[3].Version != 4 || sources[3].Path != "00004_geography_catalog.sql" {
+	if len(sources) != len(expected) {
 		t.Fatalf("unexpected bundled runner sources: %+v", sources)
+	}
+	for i, name := range expected {
+		if sources[i].Version != int64(i+1) || sources[i].Path != name {
+			t.Fatalf("unexpected bundled runner source: %+v", sources[i])
+		}
 	}
 }
 

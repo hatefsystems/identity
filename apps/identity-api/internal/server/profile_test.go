@@ -19,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
@@ -70,7 +72,7 @@ func (d *profileHandlerDB) QueryRow(_ context.Context, sql string, args ...any) 
 		d.row.LifecycleRevision++
 		return profileHandlerRow{values: []any{d.row.LifecycleRevision}}
 	}
-	return profileHandlerRow{values: []any{d.row.ID, d.row.Email, d.row.DisplayName, d.row.Status, d.row.LifecycleRevision, d.row.AuthVersion}}
+	return profileHandlerRow{values: []any{d.row.ID, d.row.Email, d.row.DisplayName, d.row.Status, d.row.LifecycleRevision, d.row.AuthVersion, d.row.EmailEvidence}}
 }
 func (d *profileHandlerDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "-- name: UpdateUserDisplayName") {
@@ -92,9 +94,17 @@ func (r *profileAuditRecorder) Record(_ context.Context, e audit.Event) error {
 
 func profileHandlerFixture(t *testing.T) (*Server, *profileHandlerDB, *profileAuditRecorder, session.Session) {
 	t.Helper()
-	d := &profileHandlerDB{row: db.GetUserProfileRow{ID: uuid.New(), Email: "owner@example.invalid", DisplayName: "Old name",
+	d := &profileHandlerDB{row: db.GetUserProfileRow{ID: uuid.New(), Email: new("owner@example.invalid"), DisplayName: "Old name",
 		Status: "active", LifecycleRevision: 1<<53 + 1, AuthVersion: 7}}
-	svc, err := profile.New(d)
+	provider, err := kms.NewMockProvider(bytes.Repeat([]byte{7}, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := profile.New(d, cipher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,15 +127,15 @@ func TestProfileHTTPMinimalSnapshotAndRevision(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleProfileGet().ServeHTTP(w, profileHandlerRequest(sess, http.MethodGet, ""))
 	var result profileResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || w.Code != http.StatusOK || result.ID != d.row.ID || result.Email != d.row.Email ||
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || w.Code != http.StatusOK || result.ID != d.row.ID || !reflect.DeepEqual(result.Email, d.row.Email) ||
 		result.DisplayName != "Old name" || result.Status != "active" || result.LifecycleRevision != "9007199254740993" || result.Session.ID != sess.ID || !result.Session.ExpiresAt.Equal(sess.AbsoluteExpiry) {
 		t.Fatalf("profile snapshot mismatch: status=%d err=%v", w.Code, err)
 	}
 	var raw map[string]json.RawMessage
-	if json.Unmarshal(w.Body.Bytes(), &raw) != nil || len(raw) != 7 {
+	if json.Unmarshal(w.Body.Bytes(), &raw) != nil || len(raw) != 9 {
 		t.Fatal("profile exposed extra fields")
 	}
-	for _, key := range []string{"id", "email", "display_name", "status", "lifecycle_revision", "session", "deletion_enabled"} {
+	for _, key := range []string{"id", "email", "email_verified", "email_verified_at", "display_name", "status", "lifecycle_revision", "session", "deletion_enabled"} {
 		if _, ok := raw[key]; !ok {
 			t.Fatalf("missing projection field %s", key)
 		}
@@ -197,7 +207,7 @@ func TestProfileHTTPUpdateNoopConflictAndAudit(t *testing.T) {
 	encoded, err := json.Marshal(event)
 	if err != nil || event.EventType != profileUpdatedEvent || event.Security != nil || audit.IsLedgerEventType(event.EventType) ||
 		event.ActorID != d.row.ID || event.SubjectID == nil || *event.SubjectID != d.row.ID ||
-		bytes.Contains(encoded, []byte("New private name")) || bytes.Contains(encoded, []byte("Old name")) || bytes.Contains(encoded, []byte(d.row.Email)) {
+		bytes.Contains(encoded, []byte("New private name")) || bytes.Contains(encoded, []byte("Old name")) || bytes.Contains(encoded, []byte(*d.row.Email)) {
 		t.Fatal("name change audit disclosed Class A values or invented a ledger category")
 	}
 	if len(event.Payload) != 2 || event.Payload["lifecycle_revision"] != "9007199254740994" {

@@ -75,6 +75,7 @@ func (s *Server) handleAdminListUsers() http.HandlerFunc {
 		if !includePII {
 			for i := range items {
 				items[i].Email = nil
+				items[i].EmailRedacted = true
 			}
 		}
 		fields := []string{"id", "status", "mfa_enabled", "created_at", "updated_at", "deleted_at", "lifecycle_revision"}

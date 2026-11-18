@@ -112,14 +112,14 @@ func TestUsersQueries(t *testing.T) {
 func testUsersCreateAndGetByEmail(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "create@test.local",
+			Email:  new("create@test.local"),
 			Status: "active",
 		})
 		if err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}
-		if u.Email != "create@test.local" {
-			t.Errorf("email mismatch: got %q", u.Email)
+		if u.Email == nil || *u.Email != "create@test.local" {
+			t.Errorf("email mismatch: got %v", u.Email)
 		}
 
 		got, err := q.GetUserByEmail(ctx, "create@test.local")
@@ -144,7 +144,7 @@ func testUsersCreateAndGetByEmail(ctx context.Context, q *Queries) func(*testing
 func testUsersGetByID(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "getbyid@test.local",
+			Email:  new("getbyid@test.local"),
 			Status: "active",
 		})
 		if err != nil {
@@ -175,7 +175,7 @@ func testUsersGetByID(ctx context.Context, q *Queries) func(*testing.T) {
 func testUsersBlindIndexLookups(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "blind@test.local",
+			Email:  new("blind@test.local"),
 			Status: "active",
 		})
 		if err != nil {
@@ -233,7 +233,7 @@ func testUsersBlindIndexLookups(ctx context.Context, q *Queries) func(*testing.T
 func testUsersMFALifecycle(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "mfa@test.local",
+			Email:  new("mfa@test.local"),
 			Status: "active",
 		})
 		if err != nil {
@@ -289,7 +289,7 @@ func testUsersMFALifecycle(ctx context.Context, q *Queries) func(*testing.T) {
 func testUsersSoftDeleteAndReclaim(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "reclaim@test.local",
+			Email:  new("reclaim@test.local"),
 			Status: "active",
 		})
 		if err != nil {
@@ -334,7 +334,7 @@ func testUsersSoftDeleteAndReclaim(ctx context.Context, q *Queries) func(*testin
 func testUsersHardDeleteGDPR(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		u, err := q.CreateUser(ctx, CreateUserParams{
-			Email:  "harddelete@test.local",
+			Email:  new("harddelete@test.local"),
 			Status: "active",
 		})
 		if err != nil {
@@ -381,11 +381,11 @@ func testUsersHardDeleteGDPR(ctx context.Context, q *Queries) func(*testing.T) {
 func testUsersAdminList(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
 		// Create two users in distinct statuses.
-		u1, err := q.CreateUser(ctx, CreateUserParams{Email: "list1@test.local", Status: "active"})
+		u1, err := q.CreateUser(ctx, CreateUserParams{Email: new("list1@test.local"), Status: "active"})
 		if err != nil {
 			t.Fatalf("CreateUser u1: %v", err)
 		}
-		u2, err := q.CreateUser(ctx, CreateUserParams{Email: "list2@test.local", Status: "suspended"})
+		u2, err := q.CreateUser(ctx, CreateUserParams{Email: new("list2@test.local"), Status: "suspended"})
 		if err != nil {
 			t.Fatalf("CreateUser u2: %v", err)
 		}
@@ -506,7 +506,7 @@ func testRBACRoleCRUD(ctx context.Context, q *Queries) func(*testing.T) {
 
 func testRBACUserHasPermission(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		u, err := q.CreateUser(ctx, CreateUserParams{Email: "rbac-perm@test.local", Status: "active"})
+		u, err := q.CreateUser(ctx, CreateUserParams{Email: new("rbac-perm@test.local"), Status: "active"})
 		if err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}
@@ -589,7 +589,7 @@ func TestWebauthnQueries(t *testing.T) {
 
 func testWebauthnCredentialLifecycle(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		u, err := q.CreateUser(ctx, CreateUserParams{Email: "webauthn@test.local", Status: "active"})
+		u, err := q.CreateUser(ctx, CreateUserParams{Email: new("webauthn@test.local"), Status: "active"})
 		if err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}
@@ -703,7 +703,7 @@ func TestRecoveryCodesQueries(t *testing.T) {
 
 func testRecoveryCodesAtomicVerifyDelete(ctx context.Context, conn pgx.Tx, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		u, err := q.CreateUser(ctx, CreateUserParams{Email: "codes-atomic@test.local", Status: "active"})
+		u, err := q.CreateUser(ctx, CreateUserParams{Email: new("codes-atomic@test.local"), Status: "active"})
 		if err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}
@@ -765,7 +765,7 @@ func testRecoveryCodesAtomicVerifyDelete(ctx context.Context, conn pgx.Tx, q *Qu
 
 func testRecoveryCodesBatchCreateCount(ctx context.Context, q *Queries) func(*testing.T) {
 	return func(t *testing.T) {
-		u, err := q.CreateUser(ctx, CreateUserParams{Email: "codes-batch@test.local", Status: "active"})
+		u, err := q.CreateUser(ctx, CreateUserParams{Email: new("codes-batch@test.local"), Status: "active"})
 		if err != nil {
 			t.Fatalf("CreateUser: %v", err)
 		}

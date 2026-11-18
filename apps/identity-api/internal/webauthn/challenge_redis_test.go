@@ -329,7 +329,7 @@ func exerciseRedisChallengeServiceFlows(t *testing.T, newStores func(*testing.T)
 				if flow == FlowLoginDiscoverable {
 					options, err = f.svc.BeginDiscoverableLogin(ctx)
 				} else {
-					email := f.user.Email
+					email := *f.user.Email
 					if flow == FlowLoginMock {
 						email = "absent@example.com"
 					}
@@ -385,7 +385,7 @@ func TestLoginRequiresContextDPoPBinding(t *testing.T) {
 	if _, err := f.svc.BeginDiscoverableLogin(t.Context()); !errors.Is(err, ErrDPoPBindingRequired) {
 		t.Fatalf("unbound discoverable options: %v", err)
 	}
-	if _, err := f.svc.BeginLogin(t.Context(), f.user.Email); !errors.Is(err, ErrDPoPBindingRequired) {
+	if _, err := f.svc.BeginLogin(t.Context(), *f.user.Email); !errors.Is(err, ErrDPoPBindingRequired) {
 		t.Fatalf("unbound named options: %v", err)
 	}
 	options, err := f.svc.BeginDiscoverableLogin(f.ctx())

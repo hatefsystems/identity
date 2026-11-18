@@ -136,7 +136,7 @@ func usernameActivateFixture(t *testing.T, f usernameDatabase) {
 
 func usernameUser(t *testing.T, f usernameDatabase) db.User {
 	t.Helper()
-	user, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@username.invalid", Status: "active"})
+	user, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@username.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}

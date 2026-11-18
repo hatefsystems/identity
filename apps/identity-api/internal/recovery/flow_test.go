@@ -44,9 +44,13 @@ type flowStore struct {
 }
 
 func newFlowStore(user db.User) *flowStore {
+	byEmail := map[string]uuid.UUID{}
+	if user.Email != nil {
+		byEmail[*user.Email] = user.ID
+	}
 	return &flowStore{
 		users:   map[uuid.UUID]db.User{user.ID: user},
-		byEmail: map[string]uuid.UUID{user.Email: user.ID},
+		byEmail: byEmail,
 	}
 }
 
@@ -132,7 +136,7 @@ func (s *flowStore) DeleteRecoveryCodePhysically(_ context.Context, id uuid.UUID
 }
 
 func TestFlowStartStoresOnlyAHashAddressedOpaqueTransaction(t *testing.T) {
-	user := db.User{ID: uuid.New(), Email: "known@example.com", Status: "active"}
+	user := db.User{ID: uuid.New(), Email: new("known@example.com"), Status: "active"}
 	store := newFlowStore(user)
 	codes, err := New(Config{}, store)
 	if err != nil {
@@ -161,7 +165,7 @@ func TestFlowStartStoresOnlyAHashAddressedOpaqueTransaction(t *testing.T) {
 }
 
 func TestFlowStartUsesDecoySubjectsForUnknownAndInactiveAccounts(t *testing.T) {
-	user := db.User{ID: uuid.New(), Email: "inactive@example.com", Status: "suspended"}
+	user := db.User{ID: uuid.New(), Email: new("inactive@example.com"), Status: "suspended"}
 	store := newFlowStore(user)
 	codes, err := New(Config{}, store)
 	if err != nil {
@@ -189,7 +193,7 @@ func TestFlowStartUsesDecoySubjectsForUnknownAndInactiveAccounts(t *testing.T) {
 }
 
 func TestFlowVerifyConcurrentSubmissionHasOnePhysicalDelete(t *testing.T) {
-	user := db.User{ID: uuid.New(), Email: "recover@example.com", Status: "active"}
+	user := db.User{ID: uuid.New(), Email: new("recover@example.com"), Status: "active"}
 	store := newFlowStore(user)
 	codes, err := New(Config{}, store)
 	if err != nil {
@@ -204,7 +208,7 @@ func TestFlowVerifyConcurrentSubmissionHasOnePhysicalDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	tx, err := flow.Start(context.Background(), user.Email)
+	tx, err := flow.Start(context.Background(), *user.Email)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -252,7 +256,7 @@ func (f failingTransactionStore) Take(context.Context, string) (uuid.UUID, error
 }
 
 func TestFlowVerifyDoesNotDisguiseTransactionStoreOutageAsBadCredentials(t *testing.T) {
-	user := db.User{ID: uuid.New(), Email: "recover@example.com", Status: "active"}
+	user := db.User{ID: uuid.New(), Email: new("recover@example.com"), Status: "active"}
 	store := newFlowStore(user)
 	codes, err := New(Config{}, store)
 	if err != nil {

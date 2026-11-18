@@ -55,7 +55,7 @@ func TestAdminLifecycleTransitionsIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		event, err := lifecycle.UnmarshalEvent([]byte(payload))
-		if err != nil || event.EventType != tc.subject || strconv.FormatUint(event.GetRevision(), 10) != strconv.FormatInt(tc.revision, 10) || strings.Contains(payload, user.Email) || strings.Contains(payload, "restricted lifecycle test reason") {
+		if err != nil || event.EventType != tc.subject || strconv.FormatUint(event.GetRevision(), 10) != strconv.FormatInt(tc.revision, 10) || strings.Contains(payload, *user.Email) || strings.Contains(payload, "restricted lifecycle test reason") {
 			t.Fatalf("invalid or sensitive lifecycle metadata: %v", err)
 		}
 	}

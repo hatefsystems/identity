@@ -155,7 +155,7 @@ func TestAuditSignerEndToEndIntegration(t *testing.T) {
 	}
 	testEmail := fmt.Sprintf("audit-user-%s@test.local", uid)
 	testUser, err := queries.CreateUser(ctx, db.CreateUserParams{
-		Email:  testEmail,
+		Email:  &testEmail,
 		Status: "active",
 	})
 	if err != nil {

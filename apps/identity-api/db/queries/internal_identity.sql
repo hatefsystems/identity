@@ -1,10 +1,11 @@
 -- name: GetInternalUserInfo :one
-SELECT id,
-       status,
-       (CASE WHEN status IN ('active', 'pending_verification') THEN email ELSE '' END)::text AS email,
-       (CASE WHEN status IN ('active', 'pending_verification') THEN display_name ELSE '' END)::text AS display_name,
-       lifecycle_revision
-FROM users
-WHERE id = $1
-  AND deleted_at IS NULL
-  AND status <> 'pending_deletion';
+SELECT u.id,
+       u.status,
+       visible.email,
+       (CASE WHEN u.status IN ('active', 'pending_verification') THEN u.display_name ELSE '' END)::text AS display_name,
+       u.lifecycle_revision
+FROM users u
+LEFT JOIN users visible ON visible.id = u.id AND u.status IN ('active', 'pending_verification')
+WHERE u.id = $1
+  AND u.deleted_at IS NULL
+  AND u.status <> 'pending_deletion';

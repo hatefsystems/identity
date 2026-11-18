@@ -359,6 +359,7 @@ function AccountQuery({
                 {t(`statuses.${account.status}`)}
               </span>,
               ...(canPII ? [account.email === undefined ? t('accounts.notProvided') :
+                account.email === null ? t('accounts.emailAbsent') :
                 <bdi key="email" dir="ltr" className="break-all">{account.email}</bdi>] : []),
               <QueryUtcTime key="created" value={account.created_at} />,
               <Link key="actions" href={`/admin/users/${account.id}`} prefetch={false}

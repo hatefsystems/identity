@@ -32,7 +32,7 @@ func TestNotificationPayloadVersionsAndFrozenLocale(t *testing.T) {
 			if err := json.Unmarshal(plaintext, &payload); err != nil || payload.Version != 2 {
 				t.Fatal("writer did not emit payload v2")
 			}
-			if bytes.Contains(row.PayloadEncrypted, []byte(before.ReclaimToken)) || bytes.Contains(row.PayloadEncrypted, []byte(u.Email)) {
+			if bytes.Contains(row.PayloadEncrypted, []byte(before.ReclaimToken)) || bytes.Contains(row.PayloadEncrypted, []byte(*u.Email)) {
 				t.Fatal("queue contains plaintext delivery material")
 			}
 			// An already admitted duplicate cannot rewrite the original language.
@@ -52,6 +52,41 @@ func TestNotificationPayloadVersionsAndFrozenLocale(t *testing.T) {
 				t.Fatal("v1 did not decode to original English delivery")
 			}
 		})
+	}
+}
+
+func TestDeletionRecipientsOptionalPrimaryEmail(t *testing.T) {
+	h := newHarness(t, Config{})
+	u := h.store.addActiveUser("present@example.test")
+	recipients, err := h.svc.deletionRecipients(t.Context(), u)
+	if err != nil || len(recipients) != 1 || recipients[0].address != *u.Email {
+		t.Fatal("present primary recipient changed", err)
+	}
+	u.Email = nil
+	recipients, err = h.svc.deletionRecipients(t.Context(), u)
+	if err != nil || len(recipients) != 0 {
+		t.Fatal("absent primary caused fabricated delivery", err)
+	}
+	u.BackupEmailEncrypted, err = h.cipher.Encrypt(t.Context(), []byte("backup@example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipients, err = h.svc.deletionRecipients(t.Context(), u)
+	if err != nil || len(recipients) != 1 || recipients[0].role != "backup" || recipients[0].address != "backup@example.test" {
+		t.Fatal("backup-only delivery unavailable", err)
+	}
+}
+
+func TestDeletionWithoutAnyEmailFailsBeforeMutation(t *testing.T) {
+	h := newHarness(t, Config{})
+	u := h.store.addActiveUser("removed@example.test")
+	u.Email = nil
+	h.store.users[u.ID] = u
+	if _, err := h.svc.RequestDeletion(t.Context(), u.ID, 0, ""); err == nil {
+		t.Fatal("deactivated account without recoverable notice")
+	}
+	if h.store.user(u.ID).Status != "active" || len(h.store.requests) != 0 || len(h.store.notifications) != 0 {
+		t.Fatal("unavailable recipient changed account or fabricated outbox")
 	}
 }
 

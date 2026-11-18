@@ -211,7 +211,7 @@ func (f usernamePurgeDatabase) exec(t *testing.T, query string, args ...any) {
 
 func (f usernamePurgeDatabase) user(t *testing.T, input string) db.User {
 	t.Helper()
-	u, err := db.New(f.owner).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@username-purge.invalid", Status: "active"})
+	u, err := db.New(f.owner).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@username-purge.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}

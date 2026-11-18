@@ -42,7 +42,7 @@ func TestAuditSubjectLockAgainstConcurrentDeletionIntegration(t *testing.T) {
 	defer pool.Close()
 	for _, deleteFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "signer locks first", true: "deletion locks first"}[deleteFirst], func(t *testing.T) {
-			user, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@test.invalid", Status: "active"})
+			user, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@test.invalid"), Status: "active"})
 			if err != nil {
 				t.Fatal(err)
 			}

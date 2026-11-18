@@ -181,7 +181,7 @@ func setupTestService() (*Service, *fakeUserStore, *fakeEncryptor, db.User) {
 	enc := &fakeEncryptor{}
 	user := db.User{
 		ID:     uuid.New(),
-		Email:  "user@example.com",
+		Email:  new("user@example.com"),
 		Status: "active",
 	}
 	store.users[user.ID] = user

@@ -25,7 +25,9 @@ const profileUpdatedEvent = "profile.updated"
 
 type profileResponse struct {
 	ID                uuid.UUID              `json:"id"`
-	Email             string                 `json:"email"`
+	Email             *string                `json:"email"`
+	EmailVerified     bool                   `json:"email_verified"`
+	EmailVerifiedAt   *time.Time             `json:"email_verified_at"`
 	DisplayName       string                 `json:"display_name"`
 	Status            string                 `json:"status"`
 	LifecycleRevision string                 `json:"lifecycle_revision"`
@@ -68,6 +70,7 @@ func profileSession(w http.ResponseWriter, r *http.Request) (session.Session, uu
 func (s *Server) writeProfile(w http.ResponseWriter, p profile.Profile, sess session.Session) {
 	writeJSON(w, http.StatusOK, profileResponse{
 		ID: p.ID, Email: p.Email, DisplayName: p.DisplayName, Status: p.Status,
+		EmailVerified: p.EmailVerifiedAt != nil, EmailVerifiedAt: p.EmailVerifiedAt,
 		LifecycleRevision: p.LifecycleRevision,
 		DeletionEnabled: s.deps.PrivacyDeletionEnabled && s.deps.Privacy != nil &&
 			s.deps.StepUp != nil && s.deps.SessionManager != nil && s.deps.DPoPValidator != nil,

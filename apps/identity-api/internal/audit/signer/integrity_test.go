@@ -252,6 +252,22 @@ func TestSignerCapturedAndFallbackGeneration(t *testing.T) {
 	}
 }
 
+func TestSignerKnownAbsentEmailNeverUsesLaterContact(t *testing.T) {
+	account := uuid.New()
+	store := &fakeStore{head: genesisLedgerHead(), userEmails: map[uuid.UUID]string{account: "later-added@example.test"}, userEmailErrs: map[uuid.UUID]error{account: errors.New("known absence must not query later contact")}}
+	s, err := New(Config{BatchSize: 1, FlushInterval: time.Second, LedgerRetention: time.Hour}, store, &fakeBatchTxOpener{tx: &fakeBatchTx{store: store}}, &fakeFetcher{}, WithBlindIndexer(&fakeBlindIndexer{pepper: "test"}), WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := integrityMessage(t, audit.Envelope{SchemaVersion: audit.EnvelopeSchemaVersion, EventID: uuid.New(), ActorID: uuid.Nil.String(), OccurredAt: time.Now(), EventType: audit.EventLoginSucceeded, Security: &audit.EnvelopeSecurity{AccountRef: account.String(), IdentityAbsent: true}})
+	if err := s.processBatch(t.Context(), []jetstream.Msg{msg}); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.insertedSecurityEvents) != 1 || store.insertedSecurityEvents[0].IdentityBlindIndex != nil || !msg.acked {
+		t.Fatal("absence fabricated digest or lost ledger event")
+	}
+}
+
 func TestSignerInvalidFallbackEmailFailsClosedAndRedacted(t *testing.T) {
 	account := uuid.New()
 	sentinel := "sensitive@example.test-secret-token"

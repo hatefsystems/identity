@@ -1816,6 +1816,7 @@ export async function startRegistrationHarness(inputs, lifecycle, identity) {
     sql(`CREATE ROLE registration_api LOGIN NOINHERIT PASSWORD '${apiPassword}'; CREATE ROLE registration_cleanup LOGIN NOINHERIT PASSWORD '${cleanupPassword}';
 GRANT USAGE ON SCHEMA public TO registration_api,registration_cleanup;
 GRANT SELECT,INSERT,UPDATE ON public.users,public.webauthn_credentials TO registration_api;
+GRANT SELECT,INSERT,UPDATE,DELETE ON public.private_profile,public.contact_verification_evidence TO registration_api;
 GRANT SELECT ON public.username_policy_artifacts,public.username_lookup_keys,public.username_active_policy TO registration_api;
 GRANT UPDATE(guard) ON public.username_active_policy TO registration_api;
 GRANT SELECT ON public.roles,public.permissions,public.role_permissions,public.user_roles TO registration_api;
@@ -1977,7 +1978,9 @@ GRANT SELECT,DELETE ON public.registration_attempts TO registration_cleanup; GRA
 'credentials',(SELECT count(*) FROM public.webauthn_credentials w JOIN public.users u ON u.id=w.user_id WHERE u.email='${email}'),
 'verified',(SELECT count(*) FROM public.webauthn_credentials w JOIN public.users u ON u.id=w.user_id WHERE u.email='${email}' AND w.user_verified AND w.user_present),
 'roles',(SELECT count(*) FROM public.user_roles r JOIN public.users u ON u.id=r.user_id WHERE u.email='${email}'),
-'created',(SELECT count(*) FROM public.event_outbox o JOIN public.users u ON u.id=o.lifecycle_user_id WHERE u.email='${email}' AND o.subject='identity.user.created'));`)
+'created',(SELECT count(*) FROM public.event_outbox o JOIN public.users u ON u.id=o.lifecycle_user_id WHERE u.email='${email}' AND o.subject='identity.user.created'),
+'contact_evidence',(SELECT count(*) FROM public.contact_verification_evidence e JOIN public.users u ON u.id=e.user_id WHERE u.email='${email}'),
+'evidence_snapshot',(SELECT md5(string_agg(encode(e.evidence_encrypted,'hex'),',' ORDER BY e.channel)) FROM public.contact_verification_evidence e JOIN public.users u ON u.id=e.user_id WHERE u.email='${email}'));`)
       );
     };
     const expire = (id) => {
@@ -2943,7 +2946,9 @@ async function exerciseSuccessfulSignup(
         created.credentials === 1 &&
         created.verified === 1 &&
         created.roles === 0 &&
-        created.created === 1,
+        created.created === 1 &&
+        created.contact_evidence === 2 &&
+        typeof created.evidence_snapshot === 'string',
       'Signup birth was not one unprivileged atomic result'
     );
     assertOnlyPreferenceCookies(await context.cookies());
@@ -2969,6 +2974,8 @@ async function exerciseSuccessfulSignup(
       completionReceipt,
       'Completion replay extended or changed the original receipt'
     );
+    fixed((await harness.inspect(authority.email)).evidence_snapshot === created.evidence_snapshot,
+      'Receipt replay rewrote the original contact verification evidence');
     if (lost) {
       await Promise.all(observed.pending);
       fixed(

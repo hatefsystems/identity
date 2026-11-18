@@ -21,6 +21,8 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
@@ -123,7 +125,7 @@ func TestAdminPanelExactSnapshotsAndQueryKeysIntegration(t *testing.T) {
 	for _, request := range []struct{ method, path, body string }{
 		{http.MethodGet, "/users", ""},
 		{http.MethodGet, "/users/" + f.target.ID.String(), ""},
-		{http.MethodPost, "/users/lookup", `{"email":"` + f.target.Email + `"}`},
+		{http.MethodPost, "/users/lookup", `{"email":"` + *f.target.Email + `"}`},
 	} {
 		response := f.request(t, "moderator", request.method, request.path, request.body, "")
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"lifecycle_revision":"9223372036854775807"`) {
@@ -288,7 +290,15 @@ func TestAdminConcurrentModeratorsRejectStaleRevisionIntegration(t *testing.T) {
 func TestAdminProfileAndABAChangesInvalidatePinnedRevisionIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	grant := f.grant(t, "moderator")
-	profiles, err := profile.New(f.pool)
+	provider, err := kms.NewMockProvider(make([]byte, 32), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := profile.New(f.pool, cipher)
 	if err != nil {
 		t.Fatal(err)
 	}

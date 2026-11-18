@@ -45,7 +45,7 @@ func TestPersistentAccountCutoffIntegration(t *testing.T) {
 	q := db.New(pool)
 	newUser := func(t *testing.T) db.User {
 		t.Helper()
-		u, err := q.CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@auth-cutoff.invalid", Status: "active"})
+		u, err := q.CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@auth-cutoff.invalid"), Status: "active"})
 		if err != nil {
 			t.Fatal(err)
 		}

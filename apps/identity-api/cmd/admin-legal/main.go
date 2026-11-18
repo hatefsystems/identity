@@ -310,7 +310,7 @@ func lookupProbe(ctx context.Context, pool *pgxpool.Pool, environment string) er
 	}
 	defer nc.Close()
 	id := uuid.New()
-	u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: legalhold.LookupFixtureEmail(id), Status: "active"})
+	u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: new(legalhold.LookupFixtureEmail(id)), Status: "active"})
 	if err != nil {
 		return err
 	}

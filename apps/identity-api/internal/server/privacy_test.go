@@ -286,7 +286,7 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 	fx := &privacyFixture{
 		userID:   userID,
 		browser:  newPortalTestClient(t, testPortalOrigin),
-		store:    newPrivacyFakeStore(db.User{ID: userID, Email: "delete@example.com", Status: "active"}),
+		store:    newPrivacyFakeStore(db.User{ID: userID, Email: new("delete@example.com"), Status: "active"}),
 		cipher:   cipher,
 		passkeys: &privacyFakePasskeys{},
 		limiter:  &privacyFakeLimiter{deny: make(map[string]bool)},

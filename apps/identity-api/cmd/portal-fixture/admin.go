@@ -230,7 +230,11 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 		if err := pool.QueryRow(ctx, `SELECT auth_version,lifecycle_revision FROM users WHERE id=$1`, userID).Scan(&version, &revision); err != nil {
 			return nil, errors.New("cannot read owned account revision")
 		}
-		profiles, err := profile.New(pool)
+		cipher, err := fixtureEncryptor()
+		if err != nil {
+			return nil, errors.New("cannot create fixture profile cipher")
+		}
+		profiles, err := profile.New(pool, cipher)
 		if err != nil {
 			return nil, errors.New("cannot create real profile service")
 		}

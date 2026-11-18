@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 )
@@ -24,7 +25,7 @@ import (
 // NewUserStore is the production implementation; tests can inject bounded fakes.
 type UserStore interface {
 	GetUserByID(context.Context, uuid.UUID) (db.User, error)
-	SetPhoneIfCurrent(context.Context, uuid.UUID, int64, []byte, string) error
+	SetPhoneIfCurrent(context.Context, uuid.UUID, int64, []byte, string, []byte) error
 	RemovePhoneIfCurrent(context.Context, uuid.UUID, int64) (bool, error)
 }
 
@@ -209,11 +210,17 @@ func (s *Service) Verify(ctx context.Context, userID uuid.UUID, authVersion int6
 	if err != nil {
 		return err
 	}
+	verifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	evidence, err := contactproof.Seal(ctx, s.encryptor, userID, contactproof.Phone, phone, contactproof.SMSOTP, verifiedAt)
+	if err != nil {
+		return ErrRestartRequired
+	}
+	defer clear(evidence)
 	encrypted, err := s.encryptor.Encrypt(ctx, []byte(phone))
 	if err != nil || len(encrypted) == 0 {
 		return errors.Join(ErrRestartRequired, ErrEncryptFailed)
 	}
-	err = s.users.SetPhoneIfCurrent(ctx, userID, authVersion, encrypted, s.indexer.Compute(phone))
+	err = s.users.SetPhoneIfCurrent(ctx, userID, authVersion, encrypted, s.indexer.Compute(phone), evidence)
 	if err != nil {
 		for _, known := range []error{ErrStaleSession, ErrAccountNotActive, ErrUserNotFound} {
 			if errors.Is(err, known) {

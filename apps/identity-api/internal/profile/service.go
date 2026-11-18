@@ -10,7 +10,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
@@ -32,7 +34,8 @@ type Database interface {
 // Profile contains only the fields approved for first-party self-service.
 type Profile struct {
 	ID                uuid.UUID
-	Email             string
+	Email             *string
+	EmailVerifiedAt   *time.Time
 	DisplayName       string
 	Status            string
 	LifecycleRevision string
@@ -48,14 +51,18 @@ type UpdateResult struct {
 type Service struct {
 	database Database
 	queries  *db.Queries
+	cipher   contactproof.Cipher
 }
 
 // New uses the primary pool and opens no connections of its own.
-func New(database Database) (*Service, error) {
+func New(database Database, cipher contactproof.Cipher) (*Service, error) {
 	if database == nil || (reflect.ValueOf(database).Kind() == reflect.Pointer && reflect.ValueOf(database).IsNil()) {
 		return nil, ErrUnavailable
 	}
-	return &Service{database: database, queries: db.New(database)}, nil
+	if cipher == nil {
+		return nil, ErrUnavailable
+	}
+	return &Service{database: database, queries: db.New(database), cipher: cipher}, nil
 }
 
 func parseRevision(raw string) (int64, error) {
@@ -69,16 +76,28 @@ func parseRevision(raw string) (int64, error) {
 	return revision, nil
 }
 
-func projection(row db.GetUserProfileRow, id uuid.UUID, authVersion int64) (Profile, error) {
+func (s *Service) projection(ctx context.Context, row db.GetUserProfileRow, id uuid.UUID, authVersion int64) (Profile, error) {
 	if row.ID != id || row.Status != "active" || row.AuthVersion != authVersion {
 		return Profile{}, ErrUnauthorized
 	}
 	name, err := NormalizeName(row.DisplayName)
-	if err != nil || name != row.DisplayName || row.LifecycleRevision < 0 {
+	if err != nil || name != row.DisplayName || row.LifecycleRevision < 0 || row.Email != nil && !emailaddress.ValidCanonicalMailbox(*row.Email) {
 		return Profile{}, ErrUnavailable
 	}
-	return Profile{ID: row.ID, Email: row.Email, DisplayName: row.DisplayName, Status: row.Status,
-		LifecycleRevision: strconv.FormatInt(row.LifecycleRevision, 10)}, nil
+	result := Profile{ID: row.ID, Email: row.Email, DisplayName: row.DisplayName, Status: row.Status,
+		LifecycleRevision: strconv.FormatInt(row.LifecycleRevision, 10)}
+	destination := ""
+	if row.Email != nil {
+		destination = *row.Email
+	}
+	evidence, err := contactproof.Open(ctx, s.cipher, row.EmailEvidence, row.ID, contactproof.Email, destination)
+	if err != nil {
+		return Profile{}, ErrUnavailable
+	}
+	if evidence != nil {
+		result.EmailVerifiedAt = &evidence.VerifiedAt
+	}
+	return result, nil
 }
 
 // Get checks the captured authentication version and profile in one DB snapshot.
@@ -95,7 +114,7 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID, authVersion int64) (Pro
 	if err != nil {
 		return Profile{}, ErrUnavailable
 	}
-	return projection(row, id, authVersion)
+	return s.projection(ctx, row, id, authVersion)
 }
 
 // Update requires a canonical decimal-string revision and the authentication
@@ -134,7 +153,7 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, authVersion int64, d
 	if err != nil {
 		return UpdateResult{}, ErrUnavailable
 	}
-	current, err := projection(db.GetUserProfileRow(locked), id, authVersion)
+	current, err := s.projection(ctx, db.GetUserProfileRow(locked), id, authVersion)
 	if err != nil {
 		return UpdateResult{}, err
 	}

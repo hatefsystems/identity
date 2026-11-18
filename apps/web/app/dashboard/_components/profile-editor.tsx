@@ -119,8 +119,10 @@ export function ProfileEditor() {
         <dl className="grid gap-4 text-sm sm:grid-cols-2">
           <div>
             <dt className="text-muted-foreground">{t('portal.overview.email')}</dt>
-            <dd dir="ltr" className="mt-1 break-all font-medium isolate">
-              {saved.email}
+            <dd className="mt-1 break-words font-medium">
+              {saved.email === null
+                ? t('portal.overview.emailAbsent')
+                : <bdi dir="ltr" className="break-all">{saved.email}</bdi>}
             </dd>
           </div>
           <div>

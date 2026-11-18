@@ -41,7 +41,7 @@ func (f *mfaFakeStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, er
 	}
 	return db.User{
 		ID:                     u.id,
-		Email:                  u.email,
+		Email:                  &u.email,
 		MfaTotpSecretEncrypted: u.secret,
 		IsMfaEnabled:           u.mfaOn,
 		Status:                 "active",

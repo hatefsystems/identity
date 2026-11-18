@@ -186,14 +186,18 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersi
 		return nil, err
 	}
 
-	uri := totp.GenerateURI(secret, user.Email, s.issuer)
+	accountName := user.ID.String()
+	if user.Email != nil {
+		accountName = *user.Email
+	}
+	uri := totp.GenerateURI(secret, accountName, s.issuer)
 
 	return &SetupResponse{
 		EnrollmentID: enrollment.ID.String(),
 		Secret:       secret,
 		OtpauthURL:   uri,
 		Issuer:       s.issuer,
-		AccountName:  user.Email,
+		AccountName:  accountName,
 	}, nil
 }
 

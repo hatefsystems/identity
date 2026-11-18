@@ -119,7 +119,7 @@ func signupFixture(t *testing.T) (*Service, Authority, *testDatabase, *testTx, *
 		t.Fatal(err)
 	}
 	service.now = store.now
-	user := db.User{ID: uuid.New(), Email: attempt.Details.Email, Status: "active", AuthVersion: 1}
+	user := db.User{ID: uuid.New(), Email: &attempt.Details.Email, Status: "active", AuthVersion: 1}
 	tx.onQuery = func(name string, args []any) pgx.Row {
 		if err := tx.failures[name]; err != nil {
 			return valueRow{err: err}
@@ -154,7 +154,7 @@ func signupFixture(t *testing.T) (*Service, Authority, *testDatabase, *testTx, *
 }
 
 func TestSignupAtomicBirthWriteOrderAndFailureIsolation(t *testing.T) {
-	for _, failure := range []string{"", "username_guard", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt", "commit"} {
+	for _, failure := range []string{"", "username_guard", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "PutContactVerificationEvidence", "CompleteRegistrationAttempt", "commit"} {
 		t.Run("failure_"+failure, func(t *testing.T) {
 			s, a, _, tx, _, _, _ := signupFixture(t)
 			if failure != "" {
@@ -165,7 +165,7 @@ func TestSignupAtomicBirthWriteOrderAndFailureIsolation(t *testing.T) {
 				if err != nil || result.State != "completed" || result.Next != "login" || tx.commits != 1 {
 					t.Fatalf("complete: %v", err)
 				}
-				want := []string{"username_guard", "LockRegistrationAttempt", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "CompleteRegistrationAttempt"}
+				want := []string{"username_guard", "LockRegistrationAttempt", "CreateUser", "AdvanceUserLifecycleRevision", "InsertLifecycleEvent", "username_assign", "SetWebauthnUserHandle", "CreateWebauthnCredential", "SetUserPhone", "PutContactVerificationEvidence", "CompleteRegistrationAttempt"}
 				last := -1
 				for _, op := range want {
 					index := -1

@@ -48,20 +48,20 @@ func (s *PostgresUserStore) GetUserByID(ctx context.Context, id uuid.UUID) (db.U
 }
 
 // SetPhoneIfCurrent writes encrypted phone data only under current account authority.
-func (s *PostgresUserStore) SetPhoneIfCurrent(ctx context.Context, id uuid.UUID, version int64, encrypted []byte, index string) error {
-	_, err := s.mutate(ctx, id, version, encrypted, index, false)
+func (s *PostgresUserStore) SetPhoneIfCurrent(ctx context.Context, id uuid.UUID, version int64, encrypted []byte, index string, evidence []byte) error {
+	_, err := s.mutate(ctx, id, version, encrypted, index, evidence, false)
 	return err
 }
 
 // RemovePhoneIfCurrent conditionally removes the phone and reports a committed change.
 func (s *PostgresUserStore) RemovePhoneIfCurrent(ctx context.Context, id uuid.UUID, version int64) (bool, error) {
-	return s.mutate(ctx, id, version, nil, "", true)
+	return s.mutate(ctx, id, version, nil, "", nil, true)
 }
-func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version int64, encrypted []byte, index string, remove bool) (bool, error) {
+func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version int64, encrypted []byte, index string, evidence []byte, remove bool) (bool, error) {
 	if id == uuid.Nil || version < 0 {
 		return false, ErrStaleSession
 	}
-	if !remove && (len(encrypted) == 0 || index == "") {
+	if !remove && (len(encrypted) == 0 || index == "" || len(evidence) < 90 || len(evidence) > 4096) {
 		return false, ErrUnavailable
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -100,6 +100,11 @@ func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version in
 	}
 	if err != nil || count < 0 || count > 1 || !remove && count != 1 {
 		return false, ErrUnavailable
+	}
+	if !remove {
+		if err := q.PutContactVerificationEvidence(ctx, db.PutContactVerificationEvidenceParams{UserID: id, Channel: "phone", EvidenceEncrypted: evidence}); err != nil {
+			return false, ErrUnavailable
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, ErrUnavailable

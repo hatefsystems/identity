@@ -1,6 +1,8 @@
 package webauthn
 
 import (
+	"encoding/base64"
+
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -19,7 +21,7 @@ import (
 type userAdapter struct {
 	// handle is the CSPRNG 64-bit WebAuthn user handle.
 	handle []byte
-	// name is the human-palatable account name (the email).
+	// name is the email when present, otherwise the RP-scoped opaque handle.
 	name string
 	// credentials are the user's registered credentials in library form; empty
 	// during the first registration ceremony.
@@ -31,9 +33,15 @@ type userAdapter struct {
 // the first registration ceremony it is freshly generated and not yet persisted
 // on the user row.
 func newUserAdapter(user db.User, handle []byte, creds []gowebauthn.Credential) *userAdapter {
+	// An absent mailbox uses the existing RP-scoped opaque handle, not a fake
+	// address or the correlatable account UUID.
+	name := base64.RawURLEncoding.EncodeToString(handle)
+	if user.Email != nil {
+		name = *user.Email
+	}
 	return &userAdapter{
 		handle:      handle,
-		name:        user.Email,
+		name:        name,
 		credentials: creds,
 	}
 }

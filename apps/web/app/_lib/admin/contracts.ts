@@ -40,7 +40,7 @@ export type AdminUserStatus =
 export type AdminModerationStatus = 'active' | 'suspended' | 'banned';
 export type AdminUser = {
   id: string;
-  email?: string;
+  email?: string | null;
   status: AdminUserStatus;
   is_mfa_enabled: boolean;
   created_at: string | null;
@@ -174,9 +174,11 @@ export function capabilitiesResponse(value: unknown): AdminCapabilities {
 
 export function userResponse(value: unknown): AdminUser {
   const item = record(value);
+  const email = item.email === undefined ? undefined : nullable(item.email, (value) => text(value, 320));
+  if (email === '') throw new PortalError('invalid_response');
   return {
     id: uuid(item.id),
-    ...(item.email === undefined ? {} : { email: text(item.email, 320) }),
+    ...(email === undefined ? {} : { email }),
     status: userStatus(item.status),
     is_mfa_enabled: boolean(item.is_mfa_enabled),
     created_at: nullable(item.created_at, adminTimestamp),

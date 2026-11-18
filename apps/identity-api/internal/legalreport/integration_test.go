@@ -132,7 +132,7 @@ func newReportFixture(t *testing.T) *reportFixture {
 	}
 	f := &reportFixture{ctx: ctx, pool: pool, actions: actions, service: svc, policy: p, dsn: dsn, year: time.Now().UTC().Year() - 1}
 	for i := range f.actors {
-		u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: uuid.NewString() + "@report.test", Status: "active"})
+		u, err := db.New(pool).CreateUser(ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@report.test"), Status: "active"})
 		if err != nil {
 			t.Fatal(err)
 		}

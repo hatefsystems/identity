@@ -161,7 +161,7 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 	if len(event.ChangedFields) == 0 || len(event.ChangedFields) > maxFields {
 		return fmt.Errorf("%w: invalid changed fields", ErrInvalidEvent)
 	}
-	var changedStatus, changedEmail, changedDisplayName bool
+	var changedStatus, changedEmail, changedDisplayName, changedPrivateProfile bool
 	for _, field := range event.ChangedFields {
 		switch {
 		case field == "status" && !changedStatus:
@@ -170,6 +170,8 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 			changedEmail = true
 		case field == "display_name" && event.SchemaVersion == SchemaVersionV2 && !changedDisplayName:
 			changedDisplayName = true
+		case field == "private_profile" && event.SchemaVersion == SchemaVersionV2 && event.EventType == SubjectUpdated && !changedPrivateProfile:
+			changedPrivateProfile = true
 		default:
 			return fmt.Errorf("%w: unknown or duplicate changed field", ErrInvalidEvent)
 		}
@@ -184,6 +186,9 @@ func validateEvent(event *identityv1.UserLifecycleEvent) error {
 			return fmt.Errorf("%w: invalid suspension metadata", ErrInvalidEvent)
 		}
 	case SubjectUpdated:
+		if changedPrivateProfile && (len(event.ChangedFields) != 1 || event.GetStatus() != identityv1.UserStatus_USER_STATUS_ACTIVE) {
+			return fmt.Errorf("%w: invalid private profile metadata", ErrInvalidEvent)
+		}
 		if changedStatus && event.GetStatus() == identityv1.UserStatus_USER_STATUS_SUSPENDED {
 			return fmt.Errorf("%w: suspension requires its own event type", ErrInvalidEvent)
 		}

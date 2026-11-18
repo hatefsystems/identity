@@ -109,7 +109,7 @@ func smsIntegration(t *testing.T) smsIntegrationFixture {
 }
 func (f smsIntegrationFixture) user(t *testing.T) db.User {
 	t.Helper()
-	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@sms.invalid", Status: "active"})
+	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@sms.invalid"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}

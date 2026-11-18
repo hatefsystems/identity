@@ -41,14 +41,14 @@ func TestLegalLookupFixtureCanonicalV2Integration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := uuid.New()
-			u, err := q.CreateUser(f.ctx, db.CreateUserParams{Email: LookupFixtureEmail(id), Status: "active"})
+			u, err := q.CreateUser(f.ctx, db.CreateUserParams{Email: new(LookupFixtureEmail(id)), Status: "active"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), "DELETE FROM users WHERE id=$1", u.ID) })
 			var index, client *string
 			if tc.indexed {
-				value := f.svc.indexer.Compute(u.Email)
+				value := f.svc.indexer.Compute(*u.Email)
 				index = &value
 			}
 			if tc.client != "" {
@@ -131,7 +131,7 @@ func newLegalIntegration(t *testing.T) *legalIntegration {
 
 func (f *legalIntegration) user(t *testing.T) db.User {
 	t.Helper()
-	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: uuid.NewString() + "@legal.test", Status: "active"})
+	u, err := db.New(f.pool).CreateUser(f.ctx, db.CreateUserParams{Email: new(uuid.NewString() + "@legal.test"), Status: "active"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func (f *legalIntegration) ledger(t *testing.T, account uuid.UUID, index *string
 func TestLegalPostDeletionRetentionCursorIntegration(t *testing.T) {
 	f := newLegalIntegration(t)
 	u := f.user(t)
-	index := f.svc.indexer.Compute(u.Email)
+	index := f.svc.indexer.Compute(*u.Email)
 	now := f.svc.now()
 	f.ledger(t, uuid.New(), &index, now.Add(-time.Microsecond))
 	boundary := f.ledger(t, u.ID, &index, now)
@@ -468,7 +468,7 @@ func TestLegalPostDeletionRetentionCursorIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, op = f.operation(t, 0)
-	req := LookupRequest{IdentifierType: IdentifierTypeEmail, Identifier: " " + u.Email + " ", ActorID: f.actors[0].ID,
+	req := LookupRequest{IdentifierType: IdentifierTypeEmail, Identifier: " " + *u.Email + " ", ActorID: f.actors[0].ID,
 		RequestingAuthority: "court", CaseReference: "case", Purpose: "investigation", StartTime: now.Add(-time.Hour), EndTime: now, Limit: 1}
 	allReq := req
 	allReq.Limit = 200

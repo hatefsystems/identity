@@ -2,6 +2,7 @@ package webauthn
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -13,6 +14,15 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
+
+func TestAbsentEmailAuthenticatorLabelUsesOpaqueHandle(t *testing.T) {
+	user := db.User{ID: uuid.New()}
+	handle := bytes.Repeat([]byte{7}, userHandleByteLen)
+	adapter := newUserAdapter(user, handle, nil)
+	if adapter.WebAuthnName() != base64.RawURLEncoding.EncodeToString(handle) || strings.Contains(adapter.WebAuthnName(), "@") || strings.Contains(adapter.WebAuthnName(), user.ID.String()) || !bytes.Equal(adapter.WebAuthnID(), handle) {
+		t.Fatal("absent email fabricated mailbox or exposed account UUID")
+	}
+}
 
 func TestRegistrationNameFrozenAcrossRedisInstances(t *testing.T) {
 	f := newFixture(t)
@@ -74,7 +84,7 @@ func TestRenameCredentialIsCosmeticAndOwnerScoped(t *testing.T) {
 	if after := f.users.mustGet(t, f.user.ID); after.AuthVersion != before.AuthVersion || after.LifecycleRevision != before.LifecycleRevision || f.creds.count(f.user.ID) != 1 {
 		t.Fatal("cosmetic rename changed account authority or final-key count")
 	}
-	foreign := db.User{ID: uuid.New(), Email: "other@example.invalid", Status: "active"}
+	foreign := db.User{ID: uuid.New(), Email: new("other@example.invalid"), Status: "active"}
 	f.users.byID[foreign.ID] = foreign
 	for _, target := range []struct {
 		user uuid.UUID

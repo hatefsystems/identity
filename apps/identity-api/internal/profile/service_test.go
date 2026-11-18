@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/lifecycle"
 )
@@ -38,7 +39,7 @@ func (r testRow) Scan(dest ...any) error {
 }
 
 func rowValues(row db.GetUserProfileRow) []any {
-	return []any{row.ID, row.Email, row.DisplayName, row.Status, row.LifecycleRevision, row.AuthVersion}
+	return []any{row.ID, row.Email, row.DisplayName, row.Status, row.LifecycleRevision, row.AuthVersion, row.EmailEvidence}
 }
 
 type testDatabase struct {
@@ -162,9 +163,9 @@ func (tx *testTx) Rollback(ctx context.Context) error {
 
 func fixture(t *testing.T) (*Service, *testDatabase) {
 	t.Helper()
-	d := &testDatabase{row: db.GetUserProfileRow{ID: uuid.New(), Email: "private@example.invalid", DisplayName: "Old name",
+	d := &testDatabase{row: db.GetUserProfileRow{ID: uuid.New(), Email: new("private@example.invalid"), DisplayName: "Old name",
 		Status: "active", AuthVersion: 7, LifecycleRevision: 1<<53 + 1}, tx: &testTx{updateCount: 1}}
-	s, err := New(d)
+	s, err := New(d, privateCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +182,39 @@ func TestProfileServiceReadsCurrentProjection(t *testing.T) {
 	got, err = s.Get(context.Background(), d.row.ID, d.row.AuthVersion)
 	if err != nil || got.DisplayName != "New name" || got.LifecycleRevision != "9007199254740994" || d.reads != 2 {
 		t.Fatal("profile values/revision were cached")
+	}
+}
+
+func TestProfileServiceOptionalEmail(t *testing.T) {
+	for _, email := range []*string{nil, new("person@example.test")} {
+		s, d := fixture(t)
+		d.row.Email = email
+		got, err := s.Get(t.Context(), d.row.ID, d.row.AuthVersion)
+		if err != nil || !reflect.DeepEqual(got.Email, email) {
+			t.Fatal("optional email projection lost presence", err)
+		}
+	}
+}
+
+func TestProfileEmailVerificationRequiresExactEvidence(t *testing.T) {
+	s, d := fixture(t)
+	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	blob, err := contactproof.Seal(t.Context(), s.cipher, d.row.ID, contactproof.Email, *d.row.Email, contactproof.EmailLink, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.row.EmailEvidence = blob
+	p, err := s.Get(t.Context(), d.row.ID, d.row.AuthVersion)
+	if err != nil || p.EmailVerifiedAt == nil || !p.EmailVerifiedAt.Equal(at) {
+		t.Fatal("verified proof original time lost", err)
+	}
+	d.row.Email = new("other@example.test")
+	if _, err := s.Get(t.Context(), d.row.ID, d.row.AuthVersion); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("proof for A verified B")
+	}
+	d.row.Email = nil
+	if _, err := s.Get(t.Context(), d.row.ID, d.row.AuthVersion); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("unremoved evidence verified absent email")
 	}
 }
 
@@ -226,7 +260,7 @@ func TestProfileServiceUpdateTransactionAndExactRevision(t *testing.T) {
 	event, err := lifecycle.UnmarshalEvent([]byte(d.tx.intents[0]))
 	if err != nil || event.SchemaVersion != lifecycle.SchemaVersionV2 || event.GetRevision() != 1<<53+2 ||
 		event.EventType != lifecycle.SubjectUpdated || !reflect.DeepEqual(event.ChangedFields, []string{"display_name"}) ||
-		strings.Contains(d.tx.intents[0], "New name") || strings.Contains(d.tx.intents[0], d.row.Email) {
+		strings.Contains(d.tx.intents[0], "New name") || strings.Contains(d.tx.intents[0], *d.row.Email) {
 		t.Fatal("profile change lacked exact metadata-only v2 intent")
 	}
 }
@@ -241,7 +275,7 @@ func TestProfileServiceNoopAndConflict(t *testing.T) {
 			}
 			result, err := s.Update(context.Background(), d.row.ID, d.row.AuthVersion, " Old name ", strconv.FormatInt(expected, 10))
 			if stale && !errors.Is(err, ErrConflict) || !stale && err != nil || result.Changed || d.tx.commits != 0 ||
-				!reflect.DeepEqual(d.tx.statements, []string{"account_lock", "GetUserProfileForUpdate"}) || d.tx.row != d.row {
+				!reflect.DeepEqual(d.tx.statements, []string{"account_lock", "GetUserProfileForUpdate"}) || !reflect.DeepEqual(d.tx.row, d.row) {
 				t.Fatalf("stale/noop edited state: %v", err)
 			}
 		})
@@ -304,11 +338,11 @@ func TestProfileServiceRejectsInputBeforeTransaction(t *testing.T) {
 			t.Fatal("invalid profile input reached database")
 		}
 	}
-	if _, err := New(nil); !errors.Is(err, ErrUnavailable) {
+	if _, err := New(nil, privateCipher(t)); !errors.Is(err, ErrUnavailable) {
 		t.Fatal("nil database accepted")
 	}
 	var typedNil *testDatabase
-	if _, err := New(typedNil); !errors.Is(err, ErrUnavailable) {
+	if _, err := New(typedNil, privateCipher(t)); !errors.Is(err, ErrUnavailable) {
 		t.Fatal("typed nil database accepted")
 	}
 }

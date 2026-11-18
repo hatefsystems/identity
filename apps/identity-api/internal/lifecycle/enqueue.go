@@ -38,11 +38,13 @@ func CreateUser(ctx context.Context, tx pgx.Tx, arg db.CreateUserParams) (db.Use
 	if tx == nil || (arg.Status != "active" && arg.Status != "pending_verification") {
 		return db.User{}, ErrInvalidEvent
 	}
-	canonical, err := emailaddress.Canonicalize(arg.Email)
-	if err != nil {
-		return db.User{}, ErrInvalidEvent
+	if arg.Email != nil {
+		canonical, err := emailaddress.Canonicalize(*arg.Email)
+		if err != nil {
+			return db.User{}, ErrInvalidEvent
+		}
+		arg.Email = &canonical
 	}
-	arg.Email = canonical
 	q := db.New(tx)
 	user, err := q.CreateUser(ctx, arg)
 	if err != nil {
@@ -95,6 +97,22 @@ func EnqueueDisplayNameChange(ctx context.Context, store Store, id uuid.UUID, st
 		return 0, ErrEnqueue
 	}
 	if err := enqueue(ctx, store, id, revision, SubjectUpdated, status, []string{"display_name"}, SchemaVersionV2); err != nil {
+		return 0, err
+	}
+	return revision, nil
+}
+
+// EnqueuePrivateProfileChange emits only a coarse marker, never field names or
+// values. The protected child, one revision and this intent share the caller tx.
+func EnqueuePrivateProfileChange(ctx context.Context, store Store, id uuid.UUID, status string) (int64, error) {
+	if store == nil || id == uuid.Nil || status != "active" {
+		return 0, ErrInvalidEvent
+	}
+	revision, err := store.AdvanceUserLifecycleRevision(ctx, id)
+	if err != nil {
+		return 0, ErrEnqueue
+	}
+	if err := enqueue(ctx, store, id, revision, SubjectUpdated, status, []string{"private_profile"}, SchemaVersionV2); err != nil {
 		return 0, err
 	}
 	return revision, nil

@@ -157,16 +157,16 @@ func (s *fakeStore) FilterExistingSecurityEventIDs(_ context.Context, ids []uuid
 	return res, nil
 }
 
-func (s *fakeStore) GetUserEmailForBlindIndex(_ context.Context, id uuid.UUID) (string, error) {
+func (s *fakeStore) GetUserEmailForBlindIndex(_ context.Context, id uuid.UUID) (*string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err, ok := s.userEmailErrs[id]; ok {
-		return "", err
+		return nil, err
 	}
 	if email, ok := s.userEmails[id]; ok {
-		return email, nil
+		return &email, nil
 	}
-	return "", pgx.ErrNoRows
+	return nil, pgx.ErrNoRows
 }
 
 func (s *fakeStore) LockAuditSubjects(_ context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {

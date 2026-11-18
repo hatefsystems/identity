@@ -59,7 +59,7 @@ func (f *phoneFakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.Us
 	return db.User{ID: id, Status: "active", AuthVersion: f.version}, nil
 }
 
-func (f *phoneFakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, version int64, encrypted []byte, index string) error {
+func (f *phoneFakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, version int64, encrypted []byte, index string, _ []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if version != f.version {
