@@ -96,11 +96,13 @@ func phoneIntegrationServices(t *testing.T) (context.Context, *pgxpool.Pool, *sm
 type phoneIntegrationEncryptor struct {
 	admitted chan struct{}
 	release  chan struct{}
+	once     sync.Once
 }
 
-func (e phoneIntegrationEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
+func (e *phoneIntegrationEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
 	if e.admitted != nil {
-		close(e.admitted)
+		// Contact and evidence are separate envelopes in one admitted operation.
+		e.once.Do(func() { close(e.admitted) })
 		select {
 		case <-e.release:
 		case <-ctx.Done():
@@ -120,7 +122,7 @@ func TestPhoneHTTPRealRedisPostgresRevocationFenceIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gate := phoneIntegrationEncryptor{make(chan struct{}), make(chan struct{})}
+	gate := &phoneIntegrationEncryptor{admitted: make(chan struct{}), release: make(chan struct{})}
 	svc, err := smsotp.New(smsotp.Config{HashPepper: []byte(strings.Repeat("p", 32))}, users, gate, phoneFakeIndexer{}, &phoneFakeLimiter{true}, otps, fx.sender)
 	if err != nil {
 		t.Fatal(err)

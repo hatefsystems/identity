@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,10 +207,12 @@ func TestSMSRedisPostgresVerificationAndRemovalOneWinnerIntegration(t *testing.T
 type smsBarrierEncryptor struct {
 	admitted chan struct{}
 	release  chan struct{}
+	once     sync.Once
 }
 
-func (e smsBarrierEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
-	close(e.admitted)
+func (e *smsBarrierEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
+	// The phone and its proof have separate envelopes but one admission barrier.
+	e.once.Do(func() { close(e.admitted) })
 	select {
 	case <-e.release:
 		return append([]byte("enc_"), p...), nil
@@ -220,7 +223,7 @@ func (e smsBarrierEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, err
 func TestSMSRevocationAfterProofAdmissionRejectsFinalMutationIntegration(t *testing.T) {
 	f := smsIntegration(t)
 	u := f.user(t)
-	gate := smsBarrierEncryptor{make(chan struct{}), make(chan struct{})}
+	gate := &smsBarrierEncryptor{admitted: make(chan struct{}), release: make(chan struct{})}
 	s, sender := f.service(t, f.users, gate)
 	id := f.challenge(t, s, u)
 	result := make(chan error, 1)

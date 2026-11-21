@@ -102,6 +102,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"deletion_notifications", "registration_attempts",
 			"username_policy_artifacts", "username_lookup_keys", "username_active_policy",
 			"geography_catalogs", "geography_types", "geography_places", "geography_place_versions", "geography_catalog_state",
+			"private_profile", "contact_verification_evidence",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -160,7 +161,8 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"audit_log_chain": 0, "security_ledger_chain": 0, "security_ledger_retention_settings": 0,
 			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0,
 			"username_policy_artifacts": 0, "username_lookup_keys": 0, "username_active_policy": 1,
-			"geography_catalogs": 0, "geography_types": 0, "geography_places": 0, "geography_place_versions": 0, "geography_catalog_state": 1} {
+			"geography_catalogs": 0, "geography_types": 0, "geography_places": 0, "geography_place_versions": 0, "geography_catalog_state": 1,
+			"private_profile": 0, "contact_verification_evidence": 0} {
 			var count int
 			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
 				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)
@@ -168,7 +170,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var functions, sequences int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
-			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 14 {
+			WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid='pg_catalog.pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')`).Scan(&functions); err != nil || functions != 15 {
 			t.Fatalf("final function inventory: %d, %v", functions, err)
 		}
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace

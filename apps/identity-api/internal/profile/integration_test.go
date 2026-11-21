@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -188,7 +189,7 @@ func TestProfileUpdateNoopConflictAndRollbackIntegration(t *testing.T) {
 				t.Fatal("stored profile intent is not exact metadata-only v2")
 			}
 			noop, err := f.service.Update(f.ctx, u.ID, u.AuthVersion, " Private name ", result.Profile.LifecycleRevision)
-			if err != nil || noop.Changed || noop.Profile != result.Profile {
+			if err != nil || noop.Changed || !reflect.DeepEqual(noop.Profile, result.Profile) {
 				t.Fatalf("no-op changed the profile: %v", err)
 			}
 			if _, err := f.service.Update(f.ctx, u.ID, u.AuthVersion, "Private name", "9007199254740993"); !errors.Is(err, ErrConflict) {
