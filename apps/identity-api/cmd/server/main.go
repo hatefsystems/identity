@@ -207,6 +207,18 @@ func run(logger *slog.Logger) (runErr error) {
 	if deletionProofService != nil {
 		deletionProofs = deletionProofService
 	}
+	passwordProofService, err := buildPasswordChangeProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
+	if err != nil {
+		return err
+	}
+	var passwordProofs server.AccountDeletionProofs
+	if passwordProofService != nil {
+		passwordProofs = passwordChangeCeremony{service: passwordProofService}
+	}
+	passwordService, err := buildPasswordManager(pool, sessionManager, webAuthnLimiter, protection, passwordProofService)
+	if err != nil {
+		return err
+	}
 
 	// The recovery-code service reuses the WebAuthn database pool and, when
 	// present, the Redis client for its optional rate limits. When no database
@@ -320,6 +332,8 @@ func run(logger *slog.Logger) (runErr error) {
 		Login:                  loginService,
 		PasswordLoginEnabled:   passwordLoginEnabled,
 		AccountDeletionProofs:  deletionProofs,
+		PasswordChangeProofs:   passwordProofs,
+		Passwords:              passwordService,
 		Profile:                profileService,
 		PrivateProfile:         privateProfileReader,
 		WebAuthn:               webauthnService,
@@ -345,6 +359,14 @@ func run(logger *slog.Logger) (runErr error) {
 			maintainAccountDeletionProofs(ctx, deletionProofService, logger)
 		}()
 	}
+	var passwordProofCleanupDone chan struct{}
+	if passwordProofService != nil {
+		passwordProofCleanupDone = make(chan struct{})
+		go func() {
+			defer close(passwordProofCleanupDone)
+			maintainPasswordChangeProofs(ctx, passwordProofService, logger)
+		}()
+	}
 
 	// Run the server in a goroutine so we can wait on the signal context.
 	serverErr := make(chan error, 2)
@@ -365,6 +387,9 @@ func run(logger *slog.Logger) (runErr error) {
 	if proofCleanupDone != nil {
 		<-proofCleanupDone
 	}
+	if passwordProofCleanupDone != nil {
+		<-passwordProofCleanupDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
@@ -378,6 +403,10 @@ func validateStartupInputs(cfg config.Config) error {
 		return err
 	}
 	deletionProofCfg, err := config.LoadAccountDeletionProofs(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	passwordProofCfg, err := config.LoadPasswordChangeProofs(cfg.Environment)
 	if err != nil {
 		return err
 	}
@@ -411,7 +440,7 @@ func validateStartupInputs(cfg config.Config) error {
 	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}
@@ -883,19 +912,24 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 			return nil, err
 		}
 	}
+	passwordChangeSender, err := buildPasswordChangeSMSSender(environment)
+	if err != nil {
+		return nil, err
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
-		CodeTTL:           smsCfg.CodeTTL,
-		MaxAttempts:       smsCfg.MaxAttempts,
-		LockoutTTL:        smsCfg.LockoutTTL,
-		PerPhonePerMinute: smsCfg.PerPhonePerMinute,
-		PerPhonePerHour:   smsCfg.PerPhonePerHour,
-		PerSubnetPerHour:  smsCfg.PerSubnetPerHour,
-		HashPepper:        smsCfg.HashPepper,
-		SignupEnabled:     registrationCfg.Enabled,
-		GlobalPerDay:      smsCfg.GlobalPerDay,
-		MaxPendingSignup:  smsCfg.MaxPendingSignup,
-		DeletionSender:    deletionSender,
+		CodeTTL:              smsCfg.CodeTTL,
+		MaxAttempts:          smsCfg.MaxAttempts,
+		LockoutTTL:           smsCfg.LockoutTTL,
+		PerPhonePerMinute:    smsCfg.PerPhonePerMinute,
+		PerPhonePerHour:      smsCfg.PerPhonePerHour,
+		PerSubnetPerHour:     smsCfg.PerSubnetPerHour,
+		HashPepper:           smsCfg.HashPepper,
+		SignupEnabled:        registrationCfg.Enabled,
+		GlobalPerDay:         smsCfg.GlobalPerDay,
+		MaxPendingSignup:     smsCfg.MaxPendingSignup,
+		DeletionSender:       deletionSender,
+		PasswordChangeSender: passwordChangeSender,
 	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)

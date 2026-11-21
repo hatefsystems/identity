@@ -1,4 +1,4 @@
-// Package actionproof authorizes one account-deletion mutation, never step-up.
+// Package actionproof authorizes fixed-purpose, single-use mutations, never step-up.
 package actionproof
 
 import (
@@ -68,16 +68,33 @@ type Service struct {
 
 // New rejects missing protection; deletion channels remain independently enabled.
 func New(cfg Config, deps Deps) (*Service, error) {
+	return newService(cfg, deps, contactcode.PurposeAccountDeletion)
+}
+
+// NewPasswordChange requires independent password-change delivery, not deletion.
+func NewPasswordChange(cfg Config, deps Deps) (*Service, error) {
+	return newService(cfg, deps, contactcode.PurposePasswordChange)
+}
+
+func newService(cfg Config, deps Deps, purpose string) (*Service, error) {
 	if len(cfg.BindingKey) < 32 || len(cfg.BindingKey) > 64 {
 		return nil, ErrInvalid
 	}
 	if missing(deps.DB) || deps.Queries == nil || deps.Codes == nil || missing(deps.Cipher) || missing(deps.Limiter) || missing(deps.Sessions) {
 		return nil, ErrUnavailable
 	}
-	if !deps.Codes.DeletionChannelEnabled(contactcode.ChannelEmail) && !deps.Codes.DeletionChannelEnabled(contactcode.ChannelSMS) {
+	s := &Service{key: append([]byte(nil), cfg.BindingKey...), deps: deps}
+	if !s.channelEnabled(purpose, contactcode.ChannelEmail) && !s.channelEnabled(purpose, contactcode.ChannelSMS) {
 		return nil, ErrUnavailable
 	}
-	return &Service{key: append([]byte(nil), cfg.BindingKey...), deps: deps}, nil
+	return s, nil
+}
+
+func (s *Service) channelEnabled(purpose, channel string) bool {
+	if purpose == contactcode.PurposePasswordChange {
+		return s.deps.Codes.PasswordChangeChannelEnabled(channel)
+	}
+	return purpose == contactcode.PurposeAccountDeletion && s.deps.Codes.DeletionChannelEnabled(channel)
 }
 
 func missing(v any) bool {
@@ -157,21 +174,28 @@ func (s *Service) locked(ctx context.Context, tx pgx.Tx, sess session.Session) (
 	if err != nil {
 		return contactcode.DeletionBinding{}, ErrUnavailable
 	}
-	if u.ID != id || u.Status != "active" || u.DeletedAt.Valid || u.PasswordHash == nil || *u.PasswordHash == "" || u.IsMfaEnabled || u.AuthVersion != sess.AuthVersion {
-		return contactcode.DeletionBinding{}, ErrUnauthorized
+	if err := s.eligible(ctx, q, u, id, sess.AuthVersion); err != nil {
+		return contactcode.DeletionBinding{}, err
+	}
+	return s.live(ctx, sess)
+}
+
+func (s *Service) eligible(ctx context.Context, q *db.Queries, u db.User, id uuid.UUID, version int64) error {
+	if u.ID != id || u.Status != "active" || u.DeletedAt.Valid || u.PasswordHash == nil || *u.PasswordHash == "" || u.IsMfaEnabled || u.AuthVersion != version {
+		return ErrUnauthorized
 	}
 	count, err := q.CountWebauthnCredentialsByUser(ctx, id)
 	if err != nil {
-		return contactcode.DeletionBinding{}, ErrUnavailable
+		return ErrUnavailable
 	}
 	privileged, err := q.UserHasPrivilegedRole(ctx, id)
 	if err != nil {
-		return contactcode.DeletionBinding{}, ErrUnavailable
+		return ErrUnavailable
 	}
 	if count != 0 || privileged {
-		return contactcode.DeletionBinding{}, ErrUnauthorized
+		return ErrUnauthorized
 	}
-	return s.live(ctx, sess)
+	return nil
 }
 
 func (s *Service) contact(ctx context.Context, q *db.Queries, binding contactcode.DeletionBinding, channel string) (*contactproof.Evidence, error) {
@@ -189,6 +213,10 @@ func (s *Service) contact(ctx context.Context, q *db.Queries, binding contactcod
 }
 
 func (s *Service) contactBinding(binding contactcode.DeletionBinding, channel string, evidence contactproof.Evidence) []byte {
+	return s.contactBindingFor(binding, contactcode.PurposeAccountDeletion, channel, evidence)
+}
+
+func (s *Service) contactBindingFor(binding contactcode.DeletionBinding, purpose, channel string, evidence contactproof.Evidence) []byte {
 	// Whole typed evidence preserves purpose, method, channel and original time,
 	// not merely destination. Structured encoding prevents boundary ambiguity.
 	bound, _ := json.Marshal(struct {
@@ -196,7 +224,7 @@ func (s *Service) contactBinding(binding contactcode.DeletionBinding, channel st
 		Action   string
 		Channel  string
 		Evidence contactproof.Evidence
-	}{binding, "account_deletion", channel, evidence})
+	}{binding, purpose, channel, evidence})
 	defer clear(bound)
 	mac := hmac.New(sha256.New, s.key)
 	_, _ = mac.Write([]byte("actionproof:v1:contact\x00"))
@@ -207,6 +235,15 @@ func (s *Service) contactBinding(binding contactcode.DeletionBinding, channel st
 // Challenge verifies the exact password outside locks, then freezes authority.
 // Provider I/O happens only after the account transaction has finished.
 func (s *Service) Challenge(ctx context.Context, sess session.Session, secret, channel, sourceIP string) (string, time.Time, error) {
+	return s.challenge(ctx, sess, secret, channel, sourceIP, contactcode.PurposeAccountDeletion)
+}
+
+// ChallengePasswordChange verifies the current exact password without holding locks.
+func (s *Service) ChallengePasswordChange(ctx context.Context, sess session.Session, secret, channel, sourceIP string) (string, time.Time, error) {
+	return s.challenge(ctx, sess, secret, channel, sourceIP, contactcode.PurposePasswordChange)
+}
+
+func (s *Service) challenge(ctx context.Context, sess session.Session, secret, channel, sourceIP, purpose string) (string, time.Time, error) {
 	if s == nil {
 		return "", time.Time{}, ErrUnavailable
 	}
@@ -214,7 +251,7 @@ func (s *Service) Challenge(ctx context.Context, sess session.Session, secret, c
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	if !s.deps.Codes.DeletionChannelEnabled(channel) {
+	if !s.channelEnabled(purpose, channel) {
 		return "", time.Time{}, contactcode.ErrDisabled
 	}
 	if err := s.limitPassword(ctx, binding.AccountID, sourceIP); err != nil {
@@ -258,9 +295,12 @@ func (s *Service) Challenge(ctx context.Context, sess session.Session, secret, c
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	contactBinding := hex.EncodeToString(s.contactBinding(binding, channel, *e))
+	contactBinding := hex.EncodeToString(s.contactBindingFor(binding, purpose, channel, *e))
 	if err := tx.Commit(ctx); err != nil {
 		return "", time.Time{}, ErrOutcomeUnknown
+	}
+	if purpose == contactcode.PurposePasswordChange {
+		return s.deps.Codes.RequestPasswordChange(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
 	}
 	return s.deps.Codes.RequestDeletion(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
 }
@@ -268,6 +308,15 @@ func (s *Service) Challenge(ctx context.Context, sess session.Session, secret, c
 // Verify consumes the OTP once, then commits one digest-only deletion proof.
 // No retry or proof escapes after a failed/ambiguous issuance or commit.
 func (s *Service) Verify(ctx context.Context, sess session.Session, challenge, code string) (string, time.Time, error) {
+	return s.verify(ctx, sess, challenge, code, contactcode.PurposeAccountDeletion)
+}
+
+// VerifyPasswordChange issues one digest-only proof with the OTP's original deadline.
+func (s *Service) VerifyPasswordChange(ctx context.Context, sess session.Session, challenge, code string) (string, time.Time, error) {
+	return s.verify(ctx, sess, challenge, code, contactcode.PurposePasswordChange)
+}
+
+func (s *Service) verify(ctx context.Context, sess session.Session, challenge, code, purpose string) (string, time.Time, error) {
 	if s == nil {
 		return "", time.Time{}, ErrUnavailable
 	}
@@ -275,7 +324,12 @@ func (s *Service) Verify(ctx context.Context, sess session.Session, challenge, c
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	rec, err := s.deps.Codes.VerifyDeletion(ctx, binding, challenge, code)
+	var rec contactcode.Record
+	if purpose == contactcode.PurposePasswordChange {
+		rec, err = s.deps.Codes.VerifyPasswordChange(ctx, binding, challenge, code)
+	} else {
+		rec, err = s.deps.Codes.VerifyDeletion(ctx, binding, challenge, code)
+	}
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -295,8 +349,8 @@ func (s *Service) Verify(ctx context.Context, sess session.Session, challenge, c
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	contactBinding := s.contactBinding(binding, rec.Channel, *e)
-	if rec.Purpose != contactcode.PurposeAccountDeletion || rec.AccountID != binding.AccountID || rec.AuthVersion != binding.AuthVersion || rec.SessionID != binding.SessionID || rec.JKT != binding.JKT || rec.Destination != e.Destination || !hmac.Equal([]byte(rec.ContactBinding), []byte(hex.EncodeToString(contactBinding))) {
+	contactBinding := s.contactBindingFor(binding, purpose, rec.Channel, *e)
+	if rec.Purpose != purpose || rec.AccountID != binding.AccountID || rec.AuthVersion != binding.AuthVersion || rec.SessionID != binding.SessionID || rec.JKT != binding.JKT || rec.Destination != e.Destination || !hmac.Equal([]byte(rec.ContactBinding), []byte(hex.EncodeToString(contactBinding))) {
 		return "", time.Time{}, ErrUnauthorized
 	}
 	var raw [32]byte
@@ -305,10 +359,16 @@ func (s *Service) Verify(ctx context.Context, sess session.Session, challenge, c
 	}
 	proof := base64.RawURLEncoding.EncodeToString(raw[:])
 	digest := sha256.Sum256([]byte(proof))
-	rows, err := q.CreateAccountDeletionActionProof(ctx, db.CreateAccountDeletionActionProofParams{
+	params := db.CreateAccountDeletionActionProofParams{
 		ProofDigest: digest[:], UserID: binding.AccountID, SessionID: binding.SessionID, Jkt: binding.JKT, AuthVersion: binding.AuthVersion,
 		Channel: rec.Channel, ContactBinding: contactBinding, ExpiresAt: pgtype.Timestamptz{Time: rec.ExpiresAt, Valid: true},
-	})
+	}
+	var rows int64
+	if purpose == contactcode.PurposePasswordChange {
+		rows, err = q.CreatePasswordChangeActionProof(ctx, db.CreatePasswordChangeActionProofParams(params))
+	} else {
+		rows, err = q.CreateAccountDeletionActionProof(ctx, params)
+	}
 	if err != nil || rows != 1 {
 		return "", time.Time{}, ErrOutcomeUnknown
 	}
@@ -321,6 +381,16 @@ func (s *Service) Verify(ctx context.Context, sess session.Session, challenge, c
 // ConsumeTx requires READ COMMITTED and never begins, commits or rolls back a
 // transaction. The caller's action and this deletion therefore share one outcome.
 func (s *Service) ConsumeTx(ctx context.Context, tx pgx.Tx, sess session.Session, proof string) error {
+	return s.consumeTx(ctx, tx, sess, proof, contactcode.PurposeAccountDeletion)
+}
+
+// ConsumePasswordChangeTx consumes even an authorized no-op in the caller's
+// READ COMMITTED transaction. It never begins, commits or rolls back that transaction.
+func (s *Service) ConsumePasswordChangeTx(ctx context.Context, tx pgx.Tx, sess session.Session, proof string) error {
+	return s.consumeTx(ctx, tx, sess, proof, contactcode.PurposePasswordChange)
+}
+
+func (s *Service) consumeTx(ctx context.Context, tx pgx.Tx, sess session.Session, proof, purpose string) error {
 	if s == nil {
 		return ErrUnavailable
 	}
@@ -343,7 +413,76 @@ func (s *Service) ConsumeTx(ctx context.Context, tx pgx.Tx, sess session.Session
 	}
 	digest := sha256.Sum256([]byte(proof))
 	q := s.deps.Queries.WithTx(tx)
-	row, err := q.GetAccountDeletionActionProofBinding(ctx, db.GetAccountDeletionActionProofBindingParams{
+	params := db.GetAccountDeletionActionProofBindingParams{
+		ProofDigest: digest[:], UserID: binding.AccountID, SessionID: binding.SessionID, Jkt: binding.JKT, AuthVersion: binding.AuthVersion,
+	}
+	var row db.GetAccountDeletionActionProofBindingRow
+	if purpose == contactcode.PurposePasswordChange {
+		var changeRow db.GetPasswordChangeActionProofBindingRow
+		changeRow, err = q.GetPasswordChangeActionProofBinding(ctx, db.GetPasswordChangeActionProofBindingParams(params))
+		row = db.GetAccountDeletionActionProofBindingRow(changeRow)
+	} else {
+		row, err = q.GetAccountDeletionActionProofBinding(ctx, params)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrInvalid
+	}
+	if err != nil {
+		return ErrUnavailable
+	}
+	e, err := s.contact(ctx, q, binding, row.Channel)
+	if err != nil {
+		return err
+	}
+	contactBinding := s.contactBindingFor(binding, purpose, row.Channel, *e)
+	if !hmac.Equal(row.ContactBinding, contactBinding) {
+		return ErrUnauthorized
+	}
+	consume := db.ConsumeAccountDeletionActionProofParams{
+		ProofDigest: digest[:], UserID: binding.AccountID, SessionID: binding.SessionID, Jkt: binding.JKT, AuthVersion: binding.AuthVersion,
+		Channel: row.Channel, ContactBinding: contactBinding,
+	}
+	var rows int64
+	if purpose == contactcode.PurposePasswordChange {
+		rows, err = q.ConsumePasswordChangeActionProof(ctx, db.ConsumePasswordChangeActionProofParams(consume))
+	} else {
+		rows, err = q.ConsumeAccountDeletionActionProof(ctx, consume)
+	}
+	if err != nil {
+		return ErrUnavailable
+	}
+	if rows != 1 {
+		return ErrInvalid
+	}
+	return nil
+}
+
+// CheckPasswordChange is a non-consuming preflight before password hashing.
+// It takes no account lock and cannot replace the transactional consumer recheck.
+func (s *Service) CheckPasswordChange(ctx context.Context, sess session.Session, proof string) error {
+	if s == nil {
+		return ErrUnavailable
+	}
+	if !capability(proof) {
+		return ErrInvalid
+	}
+	binding, err := s.live(ctx, sess)
+	if err != nil {
+		return err
+	}
+	q := s.deps.Queries
+	u, err := q.GetUserByID(ctx, binding.AccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrUnauthorized
+	}
+	if err != nil {
+		return ErrUnavailable
+	}
+	if err := s.eligible(ctx, q, u, binding.AccountID, binding.AuthVersion); err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(proof))
+	row, err := q.GetPasswordChangeActionProofBinding(ctx, db.GetPasswordChangeActionProofBindingParams{
 		ProofDigest: digest[:], UserID: binding.AccountID, SessionID: binding.SessionID, Jkt: binding.JKT, AuthVersion: binding.AuthVersion,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -356,32 +495,36 @@ func (s *Service) ConsumeTx(ctx context.Context, tx pgx.Tx, sess session.Session
 	if err != nil {
 		return err
 	}
-	contactBinding := s.contactBinding(binding, row.Channel, *e)
-	if !hmac.Equal(row.ContactBinding, contactBinding) {
+	if !hmac.Equal(row.ContactBinding, s.contactBindingFor(binding, contactcode.PurposePasswordChange, row.Channel, *e)) {
 		return ErrUnauthorized
-	}
-	rows, err := q.ConsumeAccountDeletionActionProof(ctx, db.ConsumeAccountDeletionActionProofParams{
-		ProofDigest: digest[:], UserID: binding.AccountID, SessionID: binding.SessionID, Jkt: binding.JKT, AuthVersion: binding.AuthVersion,
-		Channel: row.Channel, ContactBinding: contactBinding,
-	})
-	if err != nil {
-		return ErrUnavailable
-	}
-	if rows != 1 {
-		return ErrInvalid
 	}
 	return nil
 }
 
 // CleanupExpired reclaims one bounded batch, exposing only the affected count.
 func (s *Service) CleanupExpired(ctx context.Context, batchSize int32) (int64, error) {
+	return s.cleanupExpired(ctx, batchSize, contactcode.PurposeAccountDeletion)
+}
+
+// CleanupExpiredPasswordChange reclaims at most 1000 expired password-change proofs.
+func (s *Service) CleanupExpiredPasswordChange(ctx context.Context, batchSize int32) (int64, error) {
+	return s.cleanupExpired(ctx, batchSize, contactcode.PurposePasswordChange)
+}
+
+func (s *Service) cleanupExpired(ctx context.Context, batchSize int32, purpose string) (int64, error) {
 	if s == nil {
 		return 0, ErrUnavailable
 	}
 	if batchSize < 1 || batchSize > 1000 {
 		return 0, ErrInvalid
 	}
-	rows, err := s.deps.Queries.CleanupExpiredAccountDeletionActionProofs(ctx, batchSize)
+	var rows int64
+	var err error
+	if purpose == contactcode.PurposePasswordChange {
+		rows, err = s.deps.Queries.CleanupExpiredPasswordChangeActionProofs(ctx, batchSize)
+	} else {
+		rows, err = s.deps.Queries.CleanupExpiredAccountDeletionActionProofs(ctx, batchSize)
+	}
 	if err != nil {
 		return 0, ErrUnavailable
 	}

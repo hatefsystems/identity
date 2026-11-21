@@ -133,6 +133,14 @@ func (s deletionSMSSender) SendCode(ctx context.Context, destination, code strin
 }
 
 func deletionCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool) *contactcode.Service {
+	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, false)
+}
+
+func passwordChangeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool) *contactcode.Service {
+	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, true)
+}
+
+func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled, change bool) *contactcode.Service {
 	t.Helper()
 	store, err := contactcode.NewRedisStore(client)
 	if err != nil {
@@ -149,14 +157,24 @@ func deletionCodes(t *testing.T, client *redis.Client, delivery *captureDelivery
 			t.Fatal(err)
 		}
 		sender := deletionSMSSender{delivery}
-		phones, err = smsotp.New(smsotp.Config{HashPepper: bytes.Repeat([]byte{5}, 32), DeletionSender: sender}, unusedSMSUsers{}, unusedSMSEncryptor{}, unusedSMSIndexer{}, limiter, otpStore, sender)
+		cfg := smsotp.Config{HashPepper: bytes.Repeat([]byte{5}, 32)}
+		if change {
+			cfg.PasswordChangeSender = sender
+		} else {
+			cfg.DeletionSender = sender
+		}
+		phones, err = smsotp.New(cfg, unusedSMSUsers{}, unusedSMSEncryptor{}, unusedSMSIndexer{}, limiter, otpStore, sender)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 	cfg := contactcode.Config{HashKey: bytes.Repeat([]byte{3}, 32)}
 	if emailEnabled {
-		cfg.DeletionEmail = delivery
+		if change {
+			cfg.PasswordChangeEmail = delivery
+		} else {
+			cfg.DeletionEmail = delivery
+		}
 	}
 	codes, err := contactcode.New(cfg, store, phones, nil)
 	if err != nil {
@@ -187,27 +205,30 @@ func (r proofRow) Scan(dest ...any) error {
 // scripts run unchanged; real PostgreSQL semantics are tested separately.
 type proofDB struct {
 	pgx.Tx
-	user        db.User
-	evidence    map[string][]byte
-	passkeys    int64
-	privileged  bool
-	events      []string
-	inTx        bool
-	beginErr    error
-	commitErr   error
-	createErr   error
-	createZero  bool
-	deleteZero  bool
-	onLock      func()
-	saved       *db.CreateAccountDeletionActionProofParams
-	pending     *db.CreateAccountDeletionActionProofParams
-	deleted     bool
-	commits     int
-	rollbacks   int
-	beginCalls  int
-	deleteCalls int
-	createCalls int
-	isolation   string
+	user          db.User
+	evidence      map[string][]byte
+	passkeys      int64
+	privileged    bool
+	events        []string
+	inTx          bool
+	beginErr      error
+	commitErr     error
+	createErr     error
+	createZero    bool
+	deleteZero    bool
+	onLock        func()
+	saved         *db.CreateAccountDeletionActionProofParams
+	pending       *db.CreateAccountDeletionActionProofParams
+	changeSaved   *db.CreatePasswordChangeActionProofParams
+	changePending *db.CreatePasswordChangeActionProofParams
+	changeDeleted bool
+	deleted       bool
+	commits       int
+	rollbacks     int
+	beginCalls    int
+	deleteCalls   int
+	createCalls   int
+	isolation     string
 }
 
 func (f *proofDB) BeginTx(_ context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
@@ -236,6 +257,13 @@ func (f *proofDB) Commit(context.Context) error {
 	if f.deleted {
 		f.saved = nil
 	}
+	if f.changePending != nil {
+		f.changeSaved = f.changePending
+		f.changePending = nil
+	}
+	if f.changeDeleted {
+		f.changeSaved = nil
+	}
 	return nil
 }
 
@@ -244,6 +272,8 @@ func (f *proofDB) Rollback(context.Context) error {
 	f.inTx = false
 	f.pending = nil
 	f.deleted = false
+	f.changePending = nil
+	f.changeDeleted = false
 	return nil
 }
 
@@ -277,6 +307,11 @@ func (f *proofDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 			return proofRow{err: pgx.ErrNoRows}
 		}
 		return proofRow{values: []any{f.saved.Channel, f.saved.ContactBinding}}
+	case strings.Contains(sql, "-- name: GetPasswordChangeActionProofBinding"):
+		if f.changeSaved == nil || !bytes.Equal(args[0].([]byte), f.changeSaved.ProofDigest) || args[1] != f.changeSaved.UserID || args[2] != f.changeSaved.SessionID || args[3] != f.changeSaved.Jkt || args[4] != f.changeSaved.AuthVersion || !time.Now().Before(f.changeSaved.ExpiresAt.Time) {
+			return proofRow{err: pgx.ErrNoRows}
+		}
+		return proofRow{values: []any{f.changeSaved.Channel, f.changeSaved.ContactBinding}}
 	default:
 		return proofRow{err: errors.New("unexpected fixture query")}
 	}
@@ -290,7 +325,7 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 			f.onLock()
 		}
 		return pgconn.NewCommandTag("SELECT 1"), nil
-	case strings.Contains(sql, "-- name: CreateAccountDeletionActionProof"):
+	case strings.Contains(sql, "-- name: CreateAccountDeletionActionProof"), strings.Contains(sql, "-- name: CreatePasswordChangeActionProof"):
 		f.createCalls++
 		if f.createErr != nil {
 			return pgconn.CommandTag{}, f.createErr
@@ -298,7 +333,12 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 		if f.createZero {
 			return pgconn.NewCommandTag("INSERT 0 0"), nil
 		}
-		f.pending = &db.CreateAccountDeletionActionProofParams{ProofDigest: args[0].([]byte), UserID: args[1].(uuid.UUID), SessionID: args[2].(string), Jkt: args[3].(string), AuthVersion: args[4].(int64), Channel: args[5].(string), ContactBinding: args[6].([]byte), ExpiresAt: args[7].(pgtype.Timestamptz)}
+		params := db.CreateAccountDeletionActionProofParams{ProofDigest: args[0].([]byte), UserID: args[1].(uuid.UUID), SessionID: args[2].(string), Jkt: args[3].(string), AuthVersion: args[4].(int64), Channel: args[5].(string), ContactBinding: args[6].([]byte), ExpiresAt: args[7].(pgtype.Timestamptz)}
+		if strings.Contains(sql, "CreatePasswordChangeActionProof") {
+			f.changePending = new(db.CreatePasswordChangeActionProofParams(params))
+		} else {
+			f.pending = &params
+		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case strings.Contains(sql, "-- name: ConsumeAccountDeletionActionProof"):
 		f.deleteCalls++
@@ -307,7 +347,14 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 		}
 		f.deleted = true
 		return pgconn.NewCommandTag("DELETE 1"), nil
-	case strings.Contains(sql, "-- name: CleanupExpiredAccountDeletionActionProofs"):
+	case strings.Contains(sql, "-- name: ConsumePasswordChangeActionProof"):
+		f.deleteCalls++
+		if f.deleteZero {
+			return pgconn.NewCommandTag("DELETE 0"), nil
+		}
+		f.changeDeleted = true
+		return pgconn.NewCommandTag("DELETE 1"), nil
+	case strings.Contains(sql, "-- name: CleanupExpiredAccountDeletionActionProofs"), strings.Contains(sql, "-- name: CleanupExpiredPasswordChangeActionProofs"):
 		return pgconn.NewCommandTag("DELETE 2"), nil
 	default:
 		return pgconn.CommandTag{}, errors.New("unexpected fixture execution")

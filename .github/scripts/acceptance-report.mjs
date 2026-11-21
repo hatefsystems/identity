@@ -22,11 +22,11 @@ export const integrationPackages = Object.freeze({
   'test-grpc-integration': ['internal/identitygrpc', 'internal/session', 'internal/oidc/token', 'internal/oidc/dpop'],
   'test-lifecycle-integration': ['internal/lifecycle'],
   'test-geography-integration': ['internal/geography'],
-  'test-portal-integration': ['internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn', 'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle', 'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp', 'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof'],
+  'test-portal-integration': ['internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn', 'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle', 'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp', 'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof', 'internal/passwordmanager'],
 });
 for (const packages of Object.values(integrationPackages)) Object.freeze(packages);
 export const integrationTargets = Object.freeze(Object.keys(integrationPackages));
-export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer', './internal/geography', './internal/contactcode', './internal/actionproof']);
+export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer', './internal/geography', './internal/contactcode', './internal/actionproof', './internal/passwordmanager']);
 export const raceToolchainProfile = 'linux-amd64-cgo-go1.26.5-gcc';
 const digest = /^[0-9a-f]{64}$/;
 const imageDigest = /^sha256:[0-9a-f]{64}$/;

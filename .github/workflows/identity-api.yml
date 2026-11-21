@@ -278,6 +278,7 @@ jobs:
           - { package: './internal/geography', artifact: geography }
           - { package: './internal/contactcode', artifact: contactcode }
           - { package: './internal/actionproof', artifact: actionproof }
+          - { package: './internal/passwordmanager', artifact: passwordmanager }
     steps:
       - uses: actions/checkout@v7
         with:

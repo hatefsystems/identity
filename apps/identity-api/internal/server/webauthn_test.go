@@ -316,7 +316,7 @@ func (w *webAuthnTestServer) doWithGrantBody(t *testing.T, method, path string, 
 	}
 	req := httptest.NewRequest(method, path, reader)
 	w.browser.authorize(t, req, sess, cookies...)
-	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, w.stepUp, sess.UserID, sess.ID))
+	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, w.stepUp, sess))
 	rec := httptest.NewRecorder()
 	w.srv.Handler().ServeHTTP(rec, req)
 	return rec

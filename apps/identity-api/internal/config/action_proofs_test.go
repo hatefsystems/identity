@@ -79,3 +79,79 @@ func TestAccountDeletionProofProtectionKeysAndSwitches(t *testing.T) {
 		t.Fatal("noncanonical proof rollout gate accepted")
 	}
 }
+
+func passwordChangeProofEnvironment(t *testing.T) {
+	t.Helper()
+	deletionProofEnvironment(t)
+	for _, key := range []string{"PASSWORD_CHANGE_PROOFS_ENABLED", "PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "PASSWORD_CHANGE_PROOFS_SMS_ENABLED", "PASSWORD_CHANGE_PROOFS_BINDING_KEY", "PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID"} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestPasswordChangeProofDefaultOffAndIndependentChannels(t *testing.T) {
+	passwordChangeProofEnvironment(t)
+	cfg, err := LoadPasswordChangeProofs("production")
+	if err != nil || cfg.Enabled || cfg.EmailEnabled || cfg.SMSEnabled || len(cfg.BindingKey) != 0 {
+		t.Fatal("default password-change configuration acquired proof authority")
+	}
+	t.Setenv("PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "true")
+	if _, err := LoadPasswordChangeProofs("production"); err == nil {
+		t.Fatal("delivery enabled without password-change ceremony")
+	}
+	t.Setenv("PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "false")
+	t.Setenv("PASSWORD_CHANGE_PROOFS_ENABLED", "true")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("PASSWORD_CHANGE_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	if _, err := LoadPasswordChangeProofs("production"); err == nil {
+		t.Fatal("password change enabled without delivery")
+	}
+	t.Setenv("PASSWORD_CHANGE_PROOFS_SMS_ENABLED", "true")
+	t.Setenv("SMS_ENABLED", "true")
+	t.Setenv("SMS_IR_TEMPLATE_ID", "123")
+	t.Setenv("PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID", "125")
+	cfg, err = LoadPasswordChangeProofs("production")
+	if err != nil || !cfg.SMSEnabled || cfg.EmailEnabled || cfg.ChangeTemplateID != 125 {
+		t.Fatal("SMS-only password change requires deletion/login/email", err)
+	}
+	t.Setenv("PASSWORD_CHANGE_PROOFS_SMS_ENABLED", "false")
+	t.Setenv("SMS_ENABLED", "false")
+	t.Setenv("PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "true")
+	t.Setenv("LOGIN_SMTP_HOST", "smtp.example.test")
+	t.Setenv("LOGIN_SMTP_PORT", "465")
+	t.Setenv("LOGIN_SMTP_TLS_MODE", "implicit")
+	t.Setenv("LOGIN_SMTP_FROM", "identity@example.test")
+	t.Setenv("LOGIN_SMTP_USERNAME", "isolated-user")
+	t.Setenv("LOGIN_SMTP_PASSWORD", "isolated-password")
+	cfg, err = LoadPasswordChangeProofs("production")
+	if err != nil || !cfg.EmailEnabled || cfg.SMSEnabled {
+		t.Fatal("email-only password change depends on SMS or deletion", err)
+	}
+}
+
+func TestPasswordChangeProofDistinctTemplatesAndProtection(t *testing.T) {
+	passwordChangeProofEnvironment(t)
+	t.Setenv("PASSWORD_CHANGE_PROOFS_ENABLED", "true")
+	t.Setenv("PASSWORD_CHANGE_PROOFS_SMS_ENABLED", "true")
+	t.Setenv("SMS_ENABLED", "true")
+	t.Setenv("SMS_IR_TEMPLATE_ID", "123")
+	t.Setenv("ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID", "124")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("PASSWORD_CHANGE_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	for _, template := range []string{"", "123", "124", "0", "-1", "invalid"} {
+		t.Setenv("PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID", template)
+		if _, err := LoadPasswordChangeProofs("production"); err == nil {
+			t.Fatal("password change admitted missing/reused template")
+		}
+	}
+	t.Setenv("PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID", "125")
+	for _, key := range []string{"", "invalid", base64.StdEncoding.EncodeToString(make([]byte, 32)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))} {
+		t.Setenv("PASSWORD_CHANGE_PROOFS_BINDING_KEY", key)
+		if _, err := LoadPasswordChangeProofs("production"); err == nil {
+			t.Fatal("password change admitted invalid/reused protection key")
+		}
+	}
+	t.Setenv("PASSWORD_CHANGE_PROOFS_ENABLED", "TRUE")
+	if _, err := LoadPasswordChangeProofs("development"); err == nil {
+		t.Fatal("password change admitted noncanonical switch")
+	}
+}

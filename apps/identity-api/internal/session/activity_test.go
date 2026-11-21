@@ -169,3 +169,50 @@ func TestCommittedSecurityChangePreservesOutcomeWithoutRenewal(t *testing.T) {
 		t.Fatal("security mutation extended session authority")
 	}
 }
+
+func TestCommittedOneUseOutcomeSurvivesRenewalFailureWithoutInvalidation(t *testing.T) {
+	for _, failure := range []string{"touch", "cancellation"} {
+		for _, status := range []int{http.StatusOK, http.StatusNoContent} {
+			t.Run(failure+http.StatusText(status), func(t *testing.T) {
+				now := time.Now()
+				m := newTestManager(t, &now)
+				store := &activityTestStore{Store: m.store}
+				m.store = store
+				issue := httptest.NewRecorder()
+				issued, err := m.Issue(issue, IssueParams{UserID: "user", DPoPJKT: "key"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				now = now.Add(time.Minute)
+				r := requestWithCookies(issue)
+				r = r.WithContext(dpop.WithProof(r.Context(), &dpop.Proof{JKT: "key"}))
+				ctx, cancel := context.WithCancel(r.Context())
+				defer cancel()
+				r = r.WithContext(ctx)
+				response := httptest.NewRecorder()
+				newGuard(t, m).Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					OutcomeCommitted(r.Context())
+					if failure == "touch" {
+						store.touchErr = errors.New("renewal failed")
+					} else {
+						cancel()
+					}
+					w.WriteHeader(status)
+					if status == http.StatusOK {
+						_, _ = w.Write([]byte(`{"handle":"confirmed-fixture"}`))
+					}
+				})).ServeHTTP(response, r)
+				if response.Code != status || response.Header().Get(HeaderAuthInvalidated) != "" || len(response.Result().Cookies()) != 0 {
+					t.Fatal("confirmed one-use result was hidden or session invalidated")
+				}
+				if status == http.StatusOK && response.Body.String() != `{"handle":"confirmed-fixture"}` {
+					t.Fatal("confirmed ceremony handle was withheld")
+				}
+				current, err := m.Resolve(r.WithContext(context.Background()))
+				if err != nil || current.ID != issued.ID || current.AuthVersion != issued.AuthVersion || !current.IdleExpiry.Equal(issued.IdleExpiry) {
+					t.Fatal("failed renewal restored or extended session authority", err)
+				}
+			})
+		}
+	}
+}

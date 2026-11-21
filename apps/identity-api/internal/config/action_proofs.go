@@ -22,6 +22,71 @@ type AccountDeletionProofsConfig struct {
 	DeletionTemplateID int64
 }
 
+// PasswordChangeProofsConfig enables T24 independently of deletion and login.
+type PasswordChangeProofsConfig struct {
+	Enabled          bool
+	EmailEnabled     bool
+	SMSEnabled       bool
+	CodeKey          []byte
+	BindingKey       []byte
+	SMTP             smtptransport.Config
+	ChangeTemplateID int64
+}
+
+// LoadPasswordChangeProofs shares contact quotas, never switches or purpose keys.
+func LoadPasswordChangeProofs(environment string) (PasswordChangeProofsConfig, error) {
+	var cfg PasswordChangeProofsConfig
+	if err := ValidateEnvironment(environment); err != nil {
+		return cfg, err
+	}
+	for _, key := range []string{"PASSWORD_CHANGE_PROOFS_ENABLED", "PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "PASSWORD_CHANGE_PROOFS_SMS_ENABLED"} {
+		if raw := os.Getenv(key); raw != "" && raw != "true" && raw != "false" {
+			return cfg, errors.New("config: password change proof switches must be true or false")
+		}
+	}
+	cfg.Enabled = os.Getenv("PASSWORD_CHANGE_PROOFS_ENABLED") == "true"
+	cfg.EmailEnabled = os.Getenv("PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED") == "true"
+	cfg.SMSEnabled = os.Getenv("PASSWORD_CHANGE_PROOFS_SMS_ENABLED") == "true"
+	if !cfg.Enabled {
+		if cfg.EmailEnabled || cfg.SMSEnabled {
+			return cfg, errors.New("config: password change proof delivery requires enabled ceremony")
+		}
+		return cfg, nil
+	}
+	if !cfg.EmailEnabled && !cfg.SMSEnabled {
+		return cfg, errors.New("config: password change proofs require at least one delivery channel")
+	}
+	var err error
+	if cfg.CodeKey, err = actionProofKey("LOGIN_CODE_HMAC_KEY"); err != nil {
+		return cfg, err
+	}
+	if cfg.BindingKey, err = actionProofKey("PASSWORD_CHANGE_PROOFS_BINDING_KEY"); err != nil {
+		return cfg, err
+	}
+	if bytes.Equal(cfg.CodeKey, cfg.BindingKey) {
+		return cfg, errors.New("config: password change proof keys must be independent")
+	}
+	if cfg.EmailEnabled {
+		cfg.SMTP = smtptransport.Config{Host: os.Getenv("LOGIN_SMTP_HOST"), TLSMode: os.Getenv("LOGIN_SMTP_TLS_MODE"), Username: os.Getenv("LOGIN_SMTP_USERNAME"), Password: os.Getenv("LOGIN_SMTP_PASSWORD"), From: os.Getenv("LOGIN_SMTP_FROM"), CABundlePath: os.Getenv("LOGIN_SMTP_CA_BUNDLE"), Timeout: 5 * time.Second}
+		cfg.SMTP.Port, err = strconv.Atoi(os.Getenv("LOGIN_SMTP_PORT"))
+		if err != nil || cfg.SMTP.Validate() != nil {
+			return cfg, errors.New("config: invalid password change proof TLS SMTP configuration")
+		}
+	}
+	if cfg.SMSEnabled {
+		if os.Getenv(EnvSMSEnabled) != "true" {
+			return cfg, errors.New("config: password change SMS proofs require enabled SMS delivery")
+		}
+		cfg.ChangeTemplateID, err = strconv.ParseInt(os.Getenv("PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID"), 10, 32)
+		loginID, loginErr := strconv.ParseInt(os.Getenv(EnvSMSIRTemplateID), 10, 32)
+		deletionID, _ := strconv.ParseInt(os.Getenv("ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID"), 10, 32)
+		if err != nil || cfg.ChangeTemplateID <= 0 || loginErr != nil || cfg.ChangeTemplateID == loginID || cfg.ChangeTemplateID == deletionID {
+			return cfg, errors.New("config: password change SMS requires a distinct explicit password-change template")
+		}
+	}
+	return cfg, nil
+}
+
 // LoadAccountDeletionProofs keeps delivery independent of the login rollout.
 // The shared contact-code key preserves cross-purpose quotas and lockouts.
 func LoadAccountDeletionProofs(environment string) (AccountDeletionProofsConfig, error) {
@@ -79,11 +144,11 @@ func LoadAccountDeletionProofs(environment string) (AccountDeletionProofsConfig,
 func actionProofKey(name string) ([]byte, error) {
 	raw := os.Getenv(name)
 	if len(raw) > 88 {
-		return nil, errors.New("config: invalid account deletion proof protection key")
+		return nil, errors.New("config: invalid action proof protection key")
 	}
 	key, err := base64.StdEncoding.Strict().DecodeString(raw)
 	if err != nil || len(key) < 32 || len(key) > 64 || bytes.Equal(key, make([]byte, len(key))) {
-		return nil, errors.New("config: account deletion proof keys must encode 32..64 nonzero bytes")
+		return nil, errors.New("config: action proof keys must encode 32..64 nonzero bytes")
 	}
 	return key, nil
 }

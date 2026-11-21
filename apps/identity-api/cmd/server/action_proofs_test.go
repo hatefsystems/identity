@@ -39,3 +39,30 @@ func TestAccountDeletionProofMaintenanceIsBoundedAndStops(t *testing.T) {
 		t.Fatal("canceled maintenance started another operation")
 	}
 }
+
+func (c *cancelProofCleanup) CleanupExpiredPasswordChange(ctx context.Context, batch int32) (int64, error) {
+	return c.CleanupExpired(ctx, batch)
+}
+
+func TestPasswordChangeProofMaintenanceIsBoundedAndStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleanup := &cancelProofCleanup{t: t, stop: cancel}
+	maintainPasswordChangeProofs(ctx, cleanup, slog.New(slog.DiscardHandler))
+	maintainPasswordChangeProofs(ctx, cleanup, slog.New(slog.DiscardHandler))
+	if cleanup.calls != 1 {
+		t.Fatal("password-change maintenance retried after cancellation")
+	}
+}
+
+func TestPasswordChangeProofBuilderDefaultOff(t *testing.T) {
+	for _, key := range []string{"PASSWORD_CHANGE_PROOFS_ENABLED", "PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED", "PASSWORD_CHANGE_PROOFS_SMS_ENABLED"} {
+		t.Setenv(key, "")
+	}
+	if svc, err := buildPasswordChangeProofs("production", nil, nil, nil, nil); err != nil || svc != nil {
+		t.Fatal("disabled builder required dependencies or acquired authority")
+	}
+	if sender, err := buildPasswordChangeSMSSender("production"); err != nil || sender != nil {
+		t.Fatal("disabled builder required provider or enabled SMS")
+	}
+}

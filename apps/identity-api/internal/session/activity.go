@@ -9,6 +9,7 @@ import (
 )
 
 type securityChangeKey struct{}
+type committedOutcomeKey struct{}
 
 // HeaderAuthInvalidated reports a committed security change, never new authority.
 const HeaderAuthInvalidated = "X-Identity-Auth-Invalidated"
@@ -17,6 +18,14 @@ const HeaderAuthInvalidated = "X-Identity-Auth-Invalidated"
 // It never renews, restamps or otherwise restores the initiating authority.
 func SecurityChangeCommitted(ctx context.Context) {
 	if committed, ok := ctx.Value(securityChangeKey{}).(*atomic.Bool); ok {
+		committed.Store(true)
+	}
+}
+
+// OutcomeCommitted preserves a confirmed one-use result if renewal later fails.
+// Unlike a security change, it neither invalidates nor restores session authority.
+func OutcomeCommitted(ctx context.Context) {
+	if committed, ok := ctx.Value(committedOutcomeKey{}).(*atomic.Bool); ok {
 		committed.Store(true)
 	}
 }
@@ -33,7 +42,9 @@ func (m *Manager) TrackActivity(next http.Handler) http.Handler {
 			return
 		}
 		committed := &atomic.Bool{}
+		outcome := &atomic.Bool{}
 		r = r.WithContext(context.WithValue(r.Context(), securityChangeKey{}, committed))
+		r = r.WithContext(context.WithValue(r.Context(), committedOutcomeKey{}, outcome))
 		writer := &activityWriter{ResponseWriter: w, renew: func() error {
 			if committed.Load() {
 				w.Header().Set(HeaderAuthInvalidated, "true")
@@ -44,6 +55,11 @@ func (m *Manager) TrackActivity(next http.Handler) http.Handler {
 				return nil
 			}
 			_, err := m.renew(r, s)
+			if err != nil && outcome.Load() {
+				// Renewal cannot turn confirmed delivery/proof consumption into a
+				// retryable failure or withhold the only usable ceremony handle.
+				return nil
+			}
 			return err
 		}}
 		next.ServeHTTP(writer, r)

@@ -210,7 +210,7 @@ func (f *adminIntegration) passkey(t *testing.T, id uuid.UUID) {
 func (f *adminIntegration) grant(t *testing.T, role string) string {
 	t.Helper()
 	s := f.actors[role]
-	grant, _, err := f.step.MintContext(context.Background(), stepup.MintParams{UserID: s.UserID, SessionID: s.ID, AMR: []string{"otp"}, AuthVersion: s.AuthVersion, AuthVersionSet: true})
+	grant, _, err := f.step.MintContext(context.Background(), stepup.MintParams{UserID: s.UserID, SessionID: s.ID, AMR: []string{"otp"}, AuthVersion: s.AuthVersion, AuthVersionSet: true, DPoPJKT: s.DPoPJKT})
 	if err != nil {
 		t.Fatal(err)
 	}

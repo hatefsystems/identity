@@ -163,7 +163,7 @@ func newStepUpServiceForUser(t *testing.T, userID uuid.UUID) *stepup.Service {
 // signImpostorToken signs a token carrying every claim a valid grant carries, but
 // with a caller-chosen typ header and acr claim, using the same key the step-up
 // validator trusts. It is how the token-substitution defences are exercised.
-func signImpostorToken(t *testing.T, km *keys.Manager, typ, sub, sid, acr string) string {
+func signImpostorToken(t *testing.T, km *keys.Manager, typ, sub, sid, acr, jkt string) string {
 	t.Helper()
 
 	now := time.Now()
@@ -178,6 +178,7 @@ func signImpostorToken(t *testing.T, km *keys.Manager, typ, sub, sid, acr string
 		"jti":       uuid.NewString(),
 		"iat":       now.Unix(),
 		"exp":       now.Add(5 * time.Minute).Unix(),
+		"cnf":       map[string]string{"jkt": jkt},
 	})
 	if err != nil {
 		t.Fatalf("token.Sign: %v", err)
@@ -186,13 +187,16 @@ func signImpostorToken(t *testing.T, km *keys.Manager, typ, sub, sid, acr string
 }
 
 // mintTestGrant signs a fresh single-use grant bound to the given session.
-func mintTestGrant(t *testing.T, svc *stepup.Service, userID, sessionID string) string {
+func mintTestGrant(t *testing.T, svc *stepup.Service, sess session.Session) string {
 	t.Helper()
 
 	token, _, err := svc.Mint(stepup.MintParams{
-		UserID:    userID,
-		SessionID: sessionID,
-		AMR:       []string{"otp"},
+		UserID:         sess.UserID,
+		SessionID:      sess.ID,
+		DPoPJKT:        sess.DPoPJKT,
+		AuthVersion:    sess.AuthVersion,
+		AuthVersionSet: sess.AuthVersionSet,
+		AMR:            []string{"otp"},
 	})
 	if err != nil {
 		t.Fatalf("stepup.Mint: %v", err)
@@ -494,7 +498,7 @@ func TestStepUpGrantIsSingleUse(t *testing.T) {
 	svc := newStepUpServiceForUser(t, userID)
 	fx := newStepUpFixture(t, userID, svc)
 
-	grant := mintTestGrant(t, svc, fx.sess.UserID, fx.sess.ID)
+	grant := mintTestGrant(t, svc, fx.sess)
 
 	if code := fx.sendWithGrant(t, grant); code == http.StatusForbidden {
 		t.Fatal("first use of a fresh grant was rejected")
@@ -511,7 +515,9 @@ func TestStepUpGrantIsBoundToItsSession(t *testing.T) {
 	svc := newStepUpServiceForUser(t, userID)
 	fx := newStepUpFixture(t, userID, svc)
 
-	foreign := mintTestGrant(t, svc, fx.sess.UserID, uuid.NewString())
+	otherSession := fx.sess
+	otherSession.ID = uuid.NewString()
+	foreign := mintTestGrant(t, svc, otherSession)
 	if code := fx.sendWithGrant(t, foreign); code != http.StatusForbidden {
 		t.Fatalf("expected 403 for a foreign-session grant, got %d", code)
 	}
@@ -533,13 +539,13 @@ func TestStepUpGrantRejectsAccessToken(t *testing.T) {
 	fx := newStepUpFixture(t, userID, svc)
 
 	// A token with every claim a valid grant carries, but the access-token typ.
-	impostor := signImpostorToken(t, km, token.TypAccessToken, fx.sess.UserID, fx.sess.ID, stepup.ACRStepUp)
+	impostor := signImpostorToken(t, km, token.TypAccessToken, fx.sess.UserID, fx.sess.ID, stepup.ACRStepUp, fx.sess.DPoPJKT)
 	if code := fx.sendWithGrant(t, impostor); code != http.StatusForbidden {
 		t.Fatalf("an at+jwt token was accepted as a step-up grant (status %d)", code)
 	}
 
 	// And the mirror case: correct typ, but not the step-up ACR.
-	noACR := signImpostorToken(t, km, token.TypStepUpToken, fx.sess.UserID, fx.sess.ID, "urn:example:weak")
+	noACR := signImpostorToken(t, km, token.TypStepUpToken, fx.sess.UserID, fx.sess.ID, "urn:example:weak", fx.sess.DPoPJKT)
 	if code := fx.sendWithGrant(t, noACR); code != http.StatusForbidden {
 		t.Fatalf("a token without the step-up acr was accepted (status %d)", code)
 	}
@@ -547,7 +553,7 @@ func TestStepUpGrantRejectsAccessToken(t *testing.T) {
 	// Control: the same helper with the right typ and acr must be accepted, so
 	// the two rejections above are attributable to the checks under test rather
 	// than to the impostor being malformed.
-	valid := signImpostorToken(t, km, token.TypStepUpToken, fx.sess.UserID, fx.sess.ID, stepup.ACRStepUp)
+	valid := signImpostorToken(t, km, token.TypStepUpToken, fx.sess.UserID, fx.sess.ID, stepup.ACRStepUp, fx.sess.DPoPJKT)
 	if code := fx.sendWithGrant(t, valid); code == http.StatusForbidden {
 		t.Fatal("a correctly formed grant was rejected; the impostor tests prove nothing")
 	}

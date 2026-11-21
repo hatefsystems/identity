@@ -236,7 +236,7 @@ func (fx *mfaTestFixture) grantHeader(t *testing.T) string {
 	if fx.stepUp == nil {
 		t.Fatal("fixture has no step-up service")
 	}
-	return mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID)
+	return mintTestGrant(t, fx.stepUp, fx.sess)
 }
 
 func setupMFATestFixture(t *testing.T) *mfaTestFixture {

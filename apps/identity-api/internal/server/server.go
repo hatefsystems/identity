@@ -26,6 +26,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/keys"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/token"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/passwordmanager"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/privacy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
@@ -126,6 +127,8 @@ type Deps struct {
 	// AccountDeletionProofs is default-off until explicitly injected. It grants
 	// only deletion-specific authority, never Step-up or a new session.
 	AccountDeletionProofs AccountDeletionProofs
+	PasswordChangeProofs  AccountDeletionProofs
+	Passwords             *passwordmanager.Service
 	// Privacy serves anonymous recovery even when new deletion requests are off.
 	Privacy *privacy.Service
 	// PrivacyDeletionEnabled is the default-off rollout gate for new requests.
@@ -310,6 +313,12 @@ func (s *Server) registerRoutes() {
 	}
 	if s.deps.AccountDeletionProofs != nil {
 		s.registerActionProofRoutes()
+	}
+	if s.deps.PasswordChangeProofs != nil {
+		s.registerPasswordChangeProofRoutes()
+	}
+	if s.deps.Passwords != nil {
+		s.registerPasswordRoutes()
 	}
 
 	// GDPR privacy routes are mounted when the service is provisioned, which

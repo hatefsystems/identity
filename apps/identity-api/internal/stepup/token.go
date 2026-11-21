@@ -20,6 +20,10 @@ import (
 // request context by RequireStepUp so handlers and the audit pipeline can record
 // which factor authorised a sensitive operation.
 type Grant struct {
+	// Earned bindings are retained for a caller's transactional write boundary.
+	AuthVersion    int64
+	AuthVersionSet bool
+	DPoPJKT        string
 	// UserID is the subject the grant was minted for (the sub claim).
 	UserID string
 	// SessionID is the session the grant is pinned to (the sid claim).
@@ -227,6 +231,26 @@ func (s *Service) Validate(ctx context.Context, compact string, sess session.Ses
 	if sub != sess.UserID || sid != sess.ID {
 		return nil, ErrGrantNotForSession
 	}
+	var jkt string
+	if cnf, exists := claims["cnf"]; exists {
+		confirmation, ok := cnf.(map[string]any)
+		if !ok || len(confirmation) != 1 {
+			return nil, ErrInvalidGrant
+		}
+		jkt, ok = confirmation["jkt"].(string)
+		if !ok || jkt == "" {
+			return nil, ErrInvalidGrant
+		}
+	}
+	if jkt != sess.DPoPJKT {
+		return nil, ErrGrantNotForSession
+	}
+	versionText := stringClaim(claims, "auth_version")
+	version, versionErr := strconv.ParseInt(versionText, 10, 64)
+	versionSet := versionErr == nil && version >= 0 && strconv.FormatInt(version, 10) == versionText
+	if sess.AuthVersionSet && (!versionSet || version != sess.AuthVersion) {
+		return nil, ErrGrantNotForSession
+	}
 	if s.accounts != nil {
 		if sess.Kind != session.KindAuthenticated || !sess.AuthVersionSet || stringClaim(claims, "auth_version") != strconv.FormatInt(sess.AuthVersion, 10) {
 			return nil, ErrGrantNotForSession
@@ -250,6 +274,7 @@ func (s *Service) Validate(ctx context.Context, compact string, sess session.Ses
 	authTime, _ := timeClaim(claims, "auth_time")
 
 	return &Grant{
+		AuthVersion: version, AuthVersionSet: versionSet, DPoPJKT: jkt,
 		UserID:    sub,
 		SessionID: sid,
 		AMR:       stringSliceClaim(claims, "amr"),

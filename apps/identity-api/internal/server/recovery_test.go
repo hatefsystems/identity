@@ -219,7 +219,7 @@ func (fx *recoveryTestFixture) generate(t *testing.T) *httptest.ResponseRecorder
 
 	req := httptest.NewRequest(http.MethodPost, recoveryGeneratePath, nil)
 	fx.browser.authorize(t, req, fx.sess, fx.cookie)
-	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
+	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, fx.stepUp, fx.sess))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 	return rec
@@ -817,7 +817,7 @@ func TestRecoveryAndMFACoMountedRoutes(t *testing.T) {
 	// back, which only the MFA handler can produce.
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/generate", nil)
 	browser.authorize(t, req, sess, cookies...)
-	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, stepUpSvc, sess.UserID, sess.ID))
+	req.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, stepUpSvc, sess))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

@@ -70,6 +70,9 @@ func productionStartupEnvironment(t *testing.T) {
 		"ACCOUNT_DELETION_PROOFS_ENABLED":       "false",
 		"ACCOUNT_DELETION_PROOFS_EMAIL_ENABLED": "false",
 		"ACCOUNT_DELETION_PROOFS_SMS_ENABLED":   "false",
+		"PASSWORD_CHANGE_PROOFS_ENABLED":        "false",
+		"PASSWORD_CHANGE_PROOFS_EMAIL_ENABLED":  "false",
+		"PASSWORD_CHANGE_PROOFS_SMS_ENABLED":    "false",
 	} {
 		t.Setenv(name, value)
 	}
@@ -94,6 +97,7 @@ func TestComposedStartupRejectsInvalidSettingsBeforeDial(t *testing.T) {
 		{"SMS_ENABLED", "true", "SMS_PROVIDER"},
 		{"REGISTRATION_ENABLED", "true", "REGISTRATION_PENDING_CAPACITY"},
 		{"ACCOUNT_DELETION_PROOFS_ENABLED", "TRUE", "account deletion proof switches"},
+		{"PASSWORD_CHANGE_PROOFS_ENABLED", "TRUE", "password change proof switches"},
 	} {
 		t.Run(test.name+"/"+test.want, func(t *testing.T) {
 			productionStartupEnvironment(t)
@@ -170,6 +174,18 @@ func TestDisabledAccountDeletionProofsNeedNoDependencies(t *testing.T) {
 	t.Setenv("ACCOUNT_DELETION_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
 	if _, err := buildAccountDeletionProofs("production", nil, nil, nil, nil); err == nil {
 		t.Fatal("enabled proof ceremony admitted without live dependencies")
+	}
+}
+
+func TestDisabledPasswordChangeCompositionNeedsNoDeliveryDependencies(t *testing.T) {
+	productionStartupEnvironment(t)
+	proofs, err := buildPasswordChangeProofs("production", nil, nil, nil, nil)
+	if err != nil || proofs != nil {
+		t.Fatal("disabled password proof ceremony acquired dependencies", err)
+	}
+	sender, err := buildPasswordChangeSMSSender("production")
+	if err != nil || sender != nil {
+		t.Fatal("disabled password proof ceremony selected SMS delivery", err)
 	}
 }
 

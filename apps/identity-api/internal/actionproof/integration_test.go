@@ -87,6 +87,14 @@ type realProofFixture struct {
 }
 
 func newRealProofFixture(t *testing.T) realProofFixture {
+	return newRealProofFixtureFor(t, false)
+}
+
+func newRealPasswordChangeFixture(t *testing.T) realProofFixture {
+	return newRealProofFixtureFor(t, true)
+}
+
+func newRealProofFixtureFor(t *testing.T, passwordChange bool) realProofFixture {
 	t.Helper()
 	dsn, redisURL := strings.TrimSpace(os.Getenv("DATABASE_URL")), strings.TrimSpace(os.Getenv("REDIS_URL"))
 	if dsn == "" || redisURL == "" {
@@ -179,6 +187,9 @@ func newRealProofFixture(t *testing.T) realProofFixture {
 	})
 	delivery := &captureDelivery{}
 	codes := deletionCodes(t, client, delivery, true, true)
+	if passwordChange {
+		codes = passwordChangeCodes(t, client, delivery, true, true)
+	}
 	limiter, err := ratelimit.NewRedisLimiter(client)
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +263,7 @@ func newRealProofFixture(t *testing.T) realProofFixture {
 		"GRANT USAGE ON SCHEMA public TO ",
 		"GRANT SELECT ON public.users,public.webauthn_credentials,public.user_roles,public.contact_verification_evidence TO ",
 		"GRANT UPDATE(id) ON public.users TO ", // Required by SELECT ... FOR UPDATE, not proof mutation.
-		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs TO ",
+		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs,public.password_change_action_proofs TO ",
 		"GRANT INSERT ON public.proof_test_actions TO ",
 		"GRANT USAGE ON SEQUENCE public.proof_test_actions_id_seq TO ",
 	} {
@@ -271,6 +282,9 @@ func newRealProofFixture(t *testing.T) realProofFixture {
 	}
 	t.Cleanup(runtimePool.Close)
 	svc, err := New(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions})
+	if passwordChange {
+		svc, err = NewPasswordChange(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions})
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -759,7 +773,7 @@ func TestAccountDeletionProofSchemaCleanupAndForwardOnlyIntegration(t *testing.T
 	if _, err := provider.ApplyVersion(f.ctx, 7, false); err == nil {
 		t.Fatal("forward-only proof migration allowed rollback")
 	}
-	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 7 {
+	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 8 {
 		t.Fatal("forward-only refusal changed final lineage")
 	}
 }

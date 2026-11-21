@@ -18,6 +18,7 @@ import (
 )
 
 const accountDeletionProofPath = "/api/v1/auth/action-proofs/account-deletion"
+const passwordChangeProofPath = "/api/v1/auth/action-proofs/password-change" //nolint:gosec // G101: fixed public API route, not a credential.
 
 // AccountDeletionProofs earns deletion-only authority for the request's live
 // browser session. Consumption belongs to the eventual deletion transaction.
@@ -33,6 +34,15 @@ func (s *Server) registerActionProofRoutes() {
 	}
 	s.router.With(guard.Handler).Post(accountDeletionProofPath+"/challenge", s.handleActionProof(false))
 	s.router.With(guard.Handler).Post(accountDeletionProofPath+"/verify", s.handleActionProof(true))
+}
+
+func (s *Server) registerPasswordChangeProofRoutes() {
+	guard, ok := s.sessionGuard("password change proofs")
+	if !ok {
+		return
+	}
+	s.router.With(guard.Handler).Post(passwordChangeProofPath+"/challenge", s.handleProofCeremony(false, true))
+	s.router.With(guard.Handler).Post(passwordChangeProofPath+"/verify", s.handleProofCeremony(true, true))
 }
 
 func readActionProofRequest(r *http.Request, verify bool) (map[string]string, bool) {
@@ -79,6 +89,10 @@ func readActionProofRequest(r *http.Request, verify bool) (map[string]string, bo
 }
 
 func (s *Server) handleActionProof(verify bool) http.HandlerFunc {
+	return s.handleProofCeremony(verify, false)
+}
+
+func (s *Server) handleProofCeremony(verify, passwordChange bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, _, ok := profileSession(w, r)
 		if !ok {
@@ -89,7 +103,11 @@ func (s *Server) handleActionProof(verify bool) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, sessionErrorResponse{Error: "invalid_request"})
 			return
 		}
-		if s.deps.AccountDeletionProofs == nil {
+		service := s.deps.AccountDeletionProofs
+		if passwordChange {
+			service = s.deps.PasswordChangeProofs
+		}
+		if service == nil {
 			writeActionProofError(w, actionproof.ErrUnavailable)
 			return
 		}
@@ -97,9 +115,9 @@ func (s *Server) handleActionProof(verify bool) http.HandlerFunc {
 		var deadline time.Time
 		var err error
 		if verify {
-			handle, deadline, err = s.deps.AccountDeletionProofs.Verify(r.Context(), sess, values["challenge"], values["code"])
+			handle, deadline, err = service.Verify(r.Context(), sess, values["challenge"], values["code"])
 		} else {
-			handle, deadline, err = s.deps.AccountDeletionProofs.Challenge(r.Context(), sess, values["password"], values["channel"], clientip.FromRequest(r))
+			handle, deadline, err = service.Challenge(r.Context(), sess, values["password"], values["channel"], clientip.FromRequest(r))
 		}
 		// An uncertain service outcome cannot expose even a tentative handle.
 		if err != nil {
@@ -110,6 +128,7 @@ func (s *Server) handleActionProof(verify bool) http.HandlerFunc {
 			writeActionProofError(w, actionproof.ErrUnavailable)
 			return
 		}
+		session.OutcomeCommitted(r.Context())
 		if verify {
 			writeJSON(w, http.StatusOK, struct {
 				Proof     string    `json:"action_proof"`

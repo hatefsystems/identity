@@ -66,6 +66,27 @@ func (s *Service) ContactDeletionPolicy(phone, sourceIP string) (LoginPolicy, er
 	return s.contactPolicy(phone, sourceIP)
 }
 
+// PasswordChangeDeliveryEnabled requires its separately configured sender.
+func (s *Service) PasswordChangeDeliveryEnabled() bool {
+	return s != nil && s.cfg.PasswordChangeSender != nil
+}
+
+// ContactPasswordChangeTTL exposes shared SMS bounds without issuing a proof.
+func (s *Service) ContactPasswordChangeTTL() time.Duration {
+	if !s.PasswordChangeDeliveryEnabled() {
+		return 0
+	}
+	return s.cfg.CodeTTL
+}
+
+// ContactPasswordChangePolicy shares login/signup/enrollment quotas and lockout.
+func (s *Service) ContactPasswordChangePolicy(phone, sourceIP string) (LoginPolicy, error) {
+	if !s.PasswordChangeDeliveryEnabled() {
+		return LoginPolicy{}, ErrDisabled
+	}
+	return s.contactPolicy(phone, sourceIP)
+}
+
 func (s *Service) contactPolicy(phone, sourceIP string) (LoginPolicy, error) {
 	canonical, err := NormalizePhone(phone)
 	if err != nil || canonical != phone {
@@ -99,6 +120,14 @@ func (s *Service) DeliverContactDeletionCode(ctx context.Context, phone, code st
 		return ErrDisabled
 	}
 	return deliverContactCode(ctx, s.cfg.DeletionSender, phone, code, expiresAt)
+}
+
+// DeliverContactPasswordChangeCode submits once after shared spend reservation.
+func (s *Service) DeliverContactPasswordChangeCode(ctx context.Context, phone, code string, expiresAt time.Time) error {
+	if !s.PasswordChangeDeliveryEnabled() {
+		return ErrDisabled
+	}
+	return deliverContactCode(ctx, s.cfg.PasswordChangeSender, phone, code, expiresAt)
 }
 
 func deliverContactCode(ctx context.Context, sender Sender, phone, code string, expiresAt time.Time) error {

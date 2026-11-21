@@ -201,6 +201,49 @@ func TestMintBindsDPoPThumbprintWhenPresent(t *testing.T) {
 	}
 }
 
+func TestValidateRetainsAndEnforcesEarnedBindings(t *testing.T) {
+	svc, _ := newTestService(t)
+	sess := testSession()
+	sess.DPoPJKT, sess.AuthVersion, sess.AuthVersionSet = "earning-thumbprint", 4, true
+	compact, _, err := svc.Mint(MintParams{UserID: sess.UserID, SessionID: sess.ID,
+		AMR: amrWebAuthnUV, DPoPJKT: sess.DPoPJKT, AuthVersion: sess.AuthVersion, AuthVersionSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mismatch := range []string{"key", "version"} {
+		foreign := sess
+		if mismatch == "key" {
+			foreign.DPoPJKT = "other-thumbprint"
+		} else {
+			foreign.AuthVersion++
+		}
+		if _, err := svc.Validate(context.Background(), compact, foreign); !errors.Is(err, ErrGrantNotForSession) {
+			t.Fatalf("foreign %s binding accepted: %v", mismatch, err)
+		}
+	}
+	grant, err := svc.Validate(context.Background(), compact, sess)
+	if err != nil || !grant.AuthVersionSet || grant.AuthVersion != sess.AuthVersion || grant.DPoPJKT != sess.DPoPJKT {
+		t.Fatalf("earned bindings lost or legitimate grant consumed on mismatch: %v", err)
+	}
+}
+
+func TestValidateRejectsMalformedConfirmationAndMissingVersion(t *testing.T) {
+	for _, confirmation := range []any{nil, "thumb", map[string]any{}, map[string]any{"jkt": 1}, map[string]any{"jkt": "thumb", "extra": true}} {
+		svc, km := newTestService(t)
+		claims := validClaims()
+		claims["cnf"] = confirmation
+		if _, err := svc.Validate(context.Background(), signWith(t, km, token.TypStepUpToken, claims), testSession()); !errors.Is(err, ErrInvalidGrant) {
+			t.Fatalf("malformed confirmation accepted: %v", err)
+		}
+	}
+	svc, _ := newTestService(t)
+	sess := testSession()
+	sess.AuthVersionSet = true
+	if _, err := svc.Validate(context.Background(), mint(t, svc), sess); !errors.Is(err, ErrGrantNotForSession) {
+		t.Fatalf("unstamped grant authorized a versioned session: %v", err)
+	}
+}
+
 func TestMintRequiresSubjectAndSession(t *testing.T) {
 	svc, _ := newTestService(t)
 

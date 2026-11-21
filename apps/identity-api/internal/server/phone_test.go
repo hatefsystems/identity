@@ -336,7 +336,7 @@ func (fx *phoneTestFixture) deletePhone(t *testing.T, withGrant bool) *httptest.
 	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	if withGrant {
 		req.Header.Set(stepup.HeaderStepUpAuth,
-			mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
+			mintTestGrant(t, fx.stepUp, fx.sess))
 	}
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
@@ -373,7 +373,7 @@ func (fx *phoneTestFixture) doPhone(t *testing.T, path string, body any, current
 
 func (fx *phoneTestFixture) freshGrant(t *testing.T) string {
 	t.Helper()
-	return mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID)
+	return mintTestGrant(t, fx.stepUp, fx.sess)
 }
 
 func (fx *phoneTestFixture) issueSession(t *testing.T) (session.Session, *http.Cookie) {
@@ -653,7 +653,7 @@ func TestPhoneRemoveWithGrant(t *testing.T) {
 // the second attempt with the same header is refused.
 func TestPhoneRemoveIsSingleUsePerGrant(t *testing.T) {
 	fx := setupPhoneTestFixture(t, true)
-	grant := mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID)
+	grant := mintTestGrant(t, fx.stepUp, fx.sess)
 
 	send := func() int {
 		req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
@@ -681,7 +681,7 @@ func TestPhoneRemoveRequiresSessionBeforeStepUp(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
 	fx.browser.prepare(req)
 	req.Header.Set(stepup.HeaderStepUpAuth,
-		mintTestGrant(t, fx.stepUp, fx.sess.UserID, fx.sess.ID))
+		mintTestGrant(t, fx.stepUp, fx.sess))
 	rec := httptest.NewRecorder()
 	fx.server.Handler().ServeHTTP(rec, req)
 

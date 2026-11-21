@@ -259,7 +259,7 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 				request := httptest.NewRequest(method, path, bytes.NewReader(body)).WithContext(ctx)
 				browser.authorize(t, request, current, cookies...)
 				if operation != "enable" {
-					request.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, grants, current.UserID, current.ID))
+					request.Header.Set(stepup.HeaderStepUpAuth, mintTestGrant(t, grants, current))
 				}
 				response := httptest.NewRecorder()
 				done := make(chan struct{})

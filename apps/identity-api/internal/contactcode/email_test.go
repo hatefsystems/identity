@@ -98,3 +98,24 @@ func TestDeletionEmailCopyIsExplicitAndPreservesExactDelivery(t *testing.T) {
 		t.Fatal("deletion accepted missing transport")
 	}
 }
+
+func TestPasswordChangeEmailCopyAndOriginalDeadline(t *testing.T) {
+	transport := &captureMail{}
+	email, err := NewPasswordChangeEmail("security@example.test", transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute).Truncate(time.Millisecond)
+	if err := email.SendCode(t.Context(), "owner@example.test", "000042", expires); err != nil {
+		t.Fatal(err)
+	}
+	message := string(transport.message)
+	for _, text := range []string{"Subject: Your password-change code\r\n", "authorizes one password change", "cannot sign you in, add or remove a password, delete your account", "000042\r\n", expires.Format(time.RFC3339Nano)} {
+		if !strings.Contains(message, text) {
+			t.Fatal("password-change copy lost fixed security meaning/deadline")
+		}
+	}
+	if !transport.deadline.Equal(expires) || transport.calls != 1 || strings.Contains(message, "Subject: Your account-deletion") || strings.Contains(message, "#token=") {
+		t.Fatal("password change reused deletion copy or changed delivery lifetime")
+	}
+}

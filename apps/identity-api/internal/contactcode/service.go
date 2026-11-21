@@ -33,6 +33,8 @@ const (
 	PurposeLogin = "login"
 	// PurposeAccountDeletion authorizes only an account-deletion request.
 	PurposeAccountDeletion = "account_deletion"
+	// PurposePasswordChange authorizes only a password replacement.
+	PurposePasswordChange = "password_change"
 )
 
 var (
@@ -66,6 +68,7 @@ type Sender interface {
 type Config struct {
 	// DeletionEmail must identify deletion, never reuse sign-in copy as a fallback.
 	DeletionEmail           Sender
+	PasswordChangeEmail     Sender
 	HashKey                 []byte
 	CodeTTL                 time.Duration
 	MaxAttempts             int
@@ -159,6 +162,9 @@ func New(cfg Config, store Store, sms *smsotp.Service, email Sender) (*Service, 
 	if missing(cfg.DeletionEmail) {
 		cfg.DeletionEmail = nil
 	}
+	if missing(cfg.PasswordChangeEmail) {
+		cfg.PasswordChangeEmail = nil
+	}
 	cfg.HashKey = append([]byte(nil), cfg.HashKey...)
 	return &Service{cfg, store, sms, email}, nil
 }
@@ -196,17 +202,49 @@ func (s *Service) ChallengeTTL(channel string) time.Duration {
 
 // DeletionChannelEnabled requires an explicitly configured deletion transport.
 func (s *Service) DeletionChannelEnabled(channel string) bool {
-	return s != nil && (channel == ChannelEmail && s.cfg.DeletionEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.DeletionDeliveryEnabled())
+	return s.actionChannelEnabled(PurposeAccountDeletion, channel)
+}
+
+// PasswordChangeChannelEnabled never falls back to login or deletion delivery.
+func (s *Service) PasswordChangeChannelEnabled(channel string) bool {
+	return s.actionChannelEnabled(PurposePasswordChange, channel)
+}
+
+func (s *Service) actionChannelEnabled(purpose, channel string) bool {
+	if s == nil {
+		return false
+	}
+	switch purpose {
+	case PurposeAccountDeletion:
+		return channel == ChannelEmail && s.cfg.DeletionEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.DeletionDeliveryEnabled()
+	case PurposePasswordChange:
+		return channel == ChannelEmail && s.cfg.PasswordChangeEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.PasswordChangeDeliveryEnabled()
+	default:
+		return false
+	}
 }
 
 // DeletionChallengeTTL cannot exceed the channel lifetime or five minutes.
 func (s *Service) DeletionChallengeTTL(channel string) time.Duration {
-	if !s.DeletionChannelEnabled(channel) {
+	return s.actionChallengeTTL(PurposeAccountDeletion, channel)
+}
+
+// PasswordChangeChallengeTTL retains the same stricter shared channel bounds.
+func (s *Service) PasswordChangeChallengeTTL(channel string) time.Duration {
+	return s.actionChallengeTTL(PurposePasswordChange, channel)
+}
+
+func (s *Service) actionChallengeTTL(purpose, channel string) time.Duration {
+	if !s.actionChannelEnabled(purpose, channel) {
 		return 0
 	}
 	ttl := min(s.cfg.CodeTTL, 5*time.Minute)
 	if channel == ChannelSMS {
-		ttl = min(ttl, s.sms.ContactDeletionTTL())
+		if purpose == PurposePasswordChange {
+			ttl = min(ttl, s.sms.ContactPasswordChangeTTL())
+		} else {
+			ttl = min(ttl, s.sms.ContactDeletionTTL())
+		}
 	}
 	return ttl
 }
@@ -223,14 +261,23 @@ func (s *Service) Request(ctx context.Context, account uuid.UUID, version int64,
 // RequestDeletion freezes the coordinator's hex HMAC of exact verified contact
 // evidence. The coordinator must authorize the verified destination before calling.
 func (s *Service) RequestDeletion(ctx context.Context, binding DeletionBinding, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
-	if !s.DeletionChannelEnabled(channel) {
+	return s.requestAction(ctx, binding, PurposeAccountDeletion, channel, destination, contactBinding, sourceIP)
+}
+
+// RequestPasswordChange uses the exact verified-contact HMAC and live binding.
+func (s *Service) RequestPasswordChange(ctx context.Context, binding DeletionBinding, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
+	return s.requestAction(ctx, binding, PurposePasswordChange, channel, destination, contactBinding, sourceIP)
+}
+
+func (s *Service) requestAction(ctx context.Context, binding DeletionBinding, purpose, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
+	if !s.actionChannelEnabled(purpose, channel) {
 		return "", time.Time{}, ErrDisabled
 	}
 	contact, err := hex.DecodeString(contactBinding)
 	if !validDeletionBinding(binding) || err != nil || len(contact) != 32 || hex.EncodeToString(contact) != contactBinding {
 		return "", time.Time{}, ErrInvalid
 	}
-	return s.request(ctx, binding, PurposeAccountDeletion, channel, destination, contactBinding, sourceIP)
+	return s.request(ctx, binding, purpose, channel, destination, contactBinding, sourceIP)
 }
 
 func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
@@ -239,8 +286,8 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 		return "", time.Time{}, ErrInvalid
 	}
 	ttl, attempts := s.ChallengeTTL(channel), s.cfg.MaxAttempts
-	if purpose == PurposeAccountDeletion {
-		ttl = s.DeletionChallengeTTL(channel)
+	if purpose != PurposeLogin {
+		ttl = s.actionChallengeTTL(purpose, channel)
 	}
 	lockKey := "contact:login:email:lock:" + s.digest("destination", channel, destination)
 	lockTTL := 15 * time.Minute
@@ -255,9 +302,12 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 	if channel == ChannelSMS {
 		var p smsotp.LoginPolicy
 		var err error
-		if purpose == PurposeAccountDeletion {
+		switch purpose {
+		case PurposeAccountDeletion:
 			p, err = s.sms.ContactDeletionPolicy(destination, sourceIP)
-		} else {
+		case PurposePasswordChange:
+			p, err = s.sms.ContactPasswordChangePolicy(destination, sourceIP)
+		default:
 			p, err = s.sms.ContactLoginPolicy(destination, sourceIP)
 		}
 		if err != nil {
@@ -278,7 +328,7 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 	}
 	code := fmt.Sprintf("%06d", n.Int64())
 	rec := Record{Result: Result{account, version, channel, destination}, Purpose: purpose, JKT: jkt, Operation: handle, ExpiresAt: time.Now().UTC().Add(ttl).Truncate(time.Millisecond), MaxAttempts: attempts, LockoutTTL: lockTTL}
-	if purpose == PurposeAccountDeletion {
+	if purpose != PurposeLogin {
 		rec.SessionID = binding.SessionID
 		rec.ContactBinding = contactBinding
 	}
@@ -287,15 +337,21 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 		return "", time.Time{}, safeError(err)
 	}
 	if channel == ChannelSMS {
-		if purpose == PurposeAccountDeletion {
+		switch purpose {
+		case PurposeAccountDeletion:
 			err = s.sms.DeliverContactDeletionCode(ctx, destination, code, rec.ExpiresAt)
-		} else {
+		case PurposePasswordChange:
+			err = s.sms.DeliverContactPasswordChangeCode(ctx, destination, code, rec.ExpiresAt)
+		default:
 			err = s.sms.DeliverContactLoginCode(ctx, destination, code, rec.ExpiresAt)
 		}
 	} else {
 		sender := s.email
-		if purpose == PurposeAccountDeletion {
+		switch purpose {
+		case PurposeAccountDeletion:
 			sender = s.cfg.DeletionEmail
+		case PurposePasswordChange:
+			sender = s.cfg.PasswordChangeEmail
 		}
 		deliveryCtx, cancel := context.WithDeadline(ctx, rec.ExpiresAt)
 		err = sender.SendCode(deliveryCtx, destination, code, rec.ExpiresAt)
@@ -340,6 +396,15 @@ func (s *Service) Verify(ctx context.Context, handle, jkt, code string) (Result,
 // VerifyDeletion rejects all foreign bindings before spending an attempt. The
 // full frozen record, including its original deadline, needs a SQL recheck.
 func (s *Service) VerifyDeletion(ctx context.Context, binding DeletionBinding, handle, code string) (Record, error) {
+	return s.verifyAction(ctx, binding, PurposeAccountDeletion, handle, code)
+}
+
+// VerifyPasswordChange rejects foreign purposes/bindings without spending attempts.
+func (s *Service) VerifyPasswordChange(ctx context.Context, binding DeletionBinding, handle, code string) (Record, error) {
+	return s.verifyAction(ctx, binding, PurposePasswordChange, handle, code)
+}
+
+func (s *Service) verifyAction(ctx context.Context, binding DeletionBinding, purpose, handle, code string) (Record, error) {
 	if s == nil {
 		return Record{}, ErrDisabled
 	}
@@ -350,7 +415,7 @@ func (s *Service) VerifyDeletion(ctx context.Context, binding DeletionBinding, h
 	if err != nil {
 		return Record{}, safeError(err)
 	}
-	if !validRecord(rec) || rec.Operation != handle || rec.Purpose != PurposeAccountDeletion || rec.AccountID != binding.AccountID || rec.AuthVersion != binding.AuthVersion || rec.SessionID != binding.SessionID || rec.JKT != binding.JKT || !s.DeletionChannelEnabled(rec.Channel) {
+	if !validRecord(rec) || rec.Operation != handle || rec.Purpose != purpose || rec.AccountID != binding.AccountID || rec.AuthVersion != binding.AuthVersion || rec.SessionID != binding.SessionID || rec.JKT != binding.JKT || !s.actionChannelEnabled(purpose, rec.Channel) {
 		return Record{}, ErrNoActiveCode
 	}
 	if err := s.consume(ctx, rec, code); err != nil {
@@ -367,9 +432,12 @@ func (s *Service) consume(ctx context.Context, rec Record, code string) error {
 	if rec.Channel == ChannelSMS {
 		var p smsotp.LoginPolicy
 		var err error
-		if rec.Purpose == PurposeAccountDeletion {
+		switch rec.Purpose {
+		case PurposeAccountDeletion:
 			p, err = s.sms.ContactDeletionPolicy(rec.Destination, "")
-		} else {
+		case PurposePasswordChange:
+			p, err = s.sms.ContactPasswordChangePolicy(rec.Destination, "")
+		default:
 			p, err = s.sms.ContactLoginPolicy(rec.Destination, "")
 		}
 		if err != nil {
@@ -418,7 +486,7 @@ func validDestination(channel, destination string) bool {
 func validRecord(rec Record) bool {
 	raw, err := hex.DecodeString(rec.CodeHash)
 	purposeValid := rec.Purpose == PurposeLogin && rec.SessionID == "" && rec.ContactBinding == ""
-	if rec.Purpose == PurposeAccountDeletion {
+	if rec.Purpose == PurposeAccountDeletion || rec.Purpose == PurposePasswordChange {
 		contact, contactErr := hex.DecodeString(rec.ContactBinding)
 		purposeValid = validDeletionBinding(DeletionBinding{rec.AccountID, rec.AuthVersion, rec.SessionID, rec.JKT}) && contactErr == nil && len(contact) == 32 && hex.EncodeToString(contact) == rec.ContactBinding
 	}
