@@ -385,14 +385,33 @@ func (s *Server) handleWebAuthnLoginVerify() http.HandlerFunc {
 		}
 
 		userID := login.ID
-		if _, err := s.deps.SessionManager.IssueContext(r.Context(), w, session.IssueParams{
+		uv := session.UVNotVerified
+		if login.UserVerified {
+			uv = session.UVVerified
+		}
+		params := session.IssueParams{
 			AuthVersion:    login.AuthVersion,
 			AuthVersionSet: true,
+			Evidence:       session.Evidence{PrimaryMethod: session.MethodPasskey, UV: uv, TOTPSet: true, AuthenticatedAt: login.AuthenticatedAt},
 			UserID:         userID.String(),
 			DPoPJKT:        login.DPoPJKT,
 			IP:             clientip.FromRequest(r),
 			UserAgent:      r.UserAgent(),
-		}); err != nil {
+		}
+		if s.deps.Login != nil {
+			result, err := s.deps.Login.Prepare(r.Context(), params)
+			if err != nil {
+				s.writeLoginError(w, err)
+				return
+			}
+			s.finishLogin(w, r, result)
+			return
+		}
+		if _, err := s.deps.SessionManager.IssueContext(r.Context(), w, params); err != nil {
+			if errors.Is(err, session.ErrAccountIneligible) {
+				writeJSON(w, http.StatusUnauthorized, webauthnErrorResponse{Error: "invalid_credentials"})
+				return
+			}
 			s.logger.Error("webauthn: issue session after login failed", "error", err.Error())
 			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
 			return

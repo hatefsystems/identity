@@ -71,6 +71,11 @@ func ProvisionRole(ctx context.Context, actions *adminaction.Service, operator u
 	if err != nil {
 		return err
 	}
+	if had == revoke {
+		if _, err := op.Tx.Exec(ctx, `UPDATE users SET auth_version=auth_version+1, updated_at=NOW() WHERE id=$1`, target); err != nil {
+			return err
+		}
+	}
 	op.Event = audit.Event{EventType: eventType, ActorID: operator, ActorSPIFFEID: identity,
 		ActionStatus: audit.StatusSuccess, SubjectID: &target,
 		Payload: map[string]any{"role_id": role, "noop": had != revoke}}

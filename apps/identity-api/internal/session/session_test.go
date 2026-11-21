@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/base64"
 	"testing"
+	"time"
 )
 
 func TestNewTokenUniqueAndHashed(t *testing.T) {
@@ -26,6 +27,27 @@ func TestNewTokenUniqueAndHashed(t *testing.T) {
 	}
 	if token1 == hash1 {
 		t.Fatal("hash must not equal the raw token")
+	}
+}
+
+func TestEvidenceAdminEligibilityRequiresPositiveProof(t *testing.T) {
+	for _, method := range []string{"", MethodPassword, MethodContactCode, MethodPasskey} {
+		for _, uv := range []UV{"", UVUnknown, UVNotApplicable, UVVerified, UVNotVerified} {
+			for _, totpSet := range []bool{false, true} {
+				for _, totp := range []bool{false, true} {
+					evidence := Evidence{PrimaryMethod: method, UV: uv, TOTP: totp, TOTPSet: totpSet, AuthenticatedAt: time.Now().UTC()}
+					want := (!totp || totpSet) && ((method == MethodPasskey && uv == UVVerified) ||
+						(method == MethodPassword && uv == UVNotApplicable && totpSet && totp))
+					if got := evidence.AdminEligible(); got != want {
+						t.Fatalf("eligibility %+v = %t, want %t", evidence, got, want)
+					}
+					evidence.AuthenticatedAt = time.Time{}
+					if evidence.AdminEligible() {
+						t.Fatalf("unknown authentication time admitted: %+v", evidence)
+					}
+				}
+			}
+		}
 	}
 }
 

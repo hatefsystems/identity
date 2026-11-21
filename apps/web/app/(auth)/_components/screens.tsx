@@ -6,9 +6,16 @@ import Link from 'next/link';
 
 import { PasskeyLogin } from '../../_components/passkey-login';
 import { Registration } from '../../_components/registration';
+import { Login } from '../../_components/login';
 
-export function LoginScreen() {
+export function LoginScreen({ enabled = false }: { enabled?: boolean }) {
   const t = useTranslations();
+  if (enabled) return <div className="space-y-5">
+    <Button asChild className="h-auto min-h-11 w-full whitespace-normal">
+      <Link href="/login/webauthn">{t('auth.passkey.continue')}</Link>
+    </Button>
+    <Login />
+  </div>;
   return <PasskeyLogin label={t('auth.passkey.continue')} />;
 }
 

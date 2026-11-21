@@ -65,6 +65,37 @@ func TestNewManagerValidation(t *testing.T) {
 	}
 }
 
+func TestManagerNeverSynthesizesOrRefreshesAuthenticationEvidence(t *testing.T) {
+	for _, evidence := range []Evidence{
+		{},
+		{PrimaryMethod: MethodPassword, UV: UVNotApplicable, TOTPSet: true, AuthenticatedAt: time.Now().UTC().Add(-time.Hour)},
+		{PrimaryMethod: MethodPasskey, UV: UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC().Add(-time.Hour)},
+	} {
+		now := time.Now().UTC()
+		manager := newTestManager(t, &now)
+		w := httptest.NewRecorder()
+		issued, err := manager.Issue(w, IssueParams{UserID: "subject", Evidence: evidence})
+		if err != nil || issued.Evidence != evidence {
+			t.Fatalf("issue changed evidence: %+v %v", issued.Evidence, err)
+		}
+		for range 2 {
+			now = now.Add(time.Minute)
+			current, err := manager.Authenticate(requestWithCookies(w))
+			if err != nil || current.Evidence != evidence || current.CreatedAt != issued.CreatedAt {
+				t.Fatalf("activity changed authentication: %+v %v", current.Evidence, err)
+			}
+			persisted, err := manager.LookupByID(t.Context(), issued.UserID, issued.ID)
+			if err != nil || persisted.Evidence != evidence {
+				t.Fatalf("touch changed stored proof: %+v %v", persisted.Evidence, err)
+			}
+		}
+		future := httptest.NewRecorder()
+		if _, err := manager.Issue(future, IssueParams{UserID: "subject", Evidence: Evidence{PrimaryMethod: MethodPasskey, UV: UVVerified, AuthenticatedAt: now.Add(time.Nanosecond)}}); !errors.Is(err, ErrAccountIneligible) || len(future.Result().Cookies()) != 0 {
+			t.Fatalf("future evidence admitted: %v", err)
+		}
+	}
+}
+
 func TestManagerIssueRequiresUserID(t *testing.T) {
 	now := time.Now()
 	m := newTestManager(t, &now)

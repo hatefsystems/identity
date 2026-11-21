@@ -45,6 +45,30 @@ function client(fetcher: jest.Mock) {
   return new PortalClient({ origin, fetcher, getKey: async () => key });
 }
 
+it('strictly decodes passkey MFA without establishing a session or exposing profile authority', async () => {
+  const result = { status: 'mfa_required', preauthentication: 'private-preauth', expires_at: new Date(Date.now() + 300000).toISOString() };
+  const fetcher = jest.fn().mockResolvedValue(json(result));
+  const api = client(fetcher);
+  expect(await api.loginVerify({ response: 'assertion' }, new AbortController().signal)).toEqual(result);
+  expect(api.profile).toBeUndefined();
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  api.dispose();
+});
+
+it.each([
+  { status: 'mfa_required', preauthentication: 'private-preauth' },
+  { status: 'session' },
+  { status: 'mfa_required', preauthentication: 'private-preauth', expires_at: 'invalid' },
+  { status: 'mfa_required', preauthentication: 'private-preauth', expires_at: new Date(Date.now() + 300000).toISOString(), session: 'forbidden' },
+])('rejects malformed passkey MFA success as an uncertain mutation without replay', async (result) => {
+  const fetcher = jest.fn().mockResolvedValue(json(result));
+  const api = client(fetcher);
+  await expect(api.loginVerify({ response: 'assertion' }, new AbortController().signal)).rejects.toMatchObject({ code: 'invalid_response', uncertain: true });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(api.profile).toBeUndefined();
+  api.dispose();
+});
+
 it.each([null, 'user@example.test', '\u0647\u0627\u062a\u0641@example.test'])(
   'preserves typed email %p through bootstrap and display-name saves without fetching private data',
   async (email) => {

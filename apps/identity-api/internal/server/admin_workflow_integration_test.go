@@ -26,7 +26,6 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalreport"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalworkflow"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 )
 
@@ -97,12 +96,7 @@ func newWorkflowHTTPIntegration(t *testing.T) *adminIntegration {
 	if err := rbac.ProvisionRole(ctx, deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", user.ID, "dpo", false, "test"); err != nil {
 		t.Fatal(err)
 	}
-	w := httptest.NewRecorder()
-	sess, err := f.sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.actors["reviewer"], f.cookies["reviewer"] = sess, w.Result().Cookies()[0]
+	f.signIn(t, "reviewer", user.ID)
 	return f
 }
 

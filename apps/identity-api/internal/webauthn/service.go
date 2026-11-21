@@ -411,12 +411,14 @@ func (s *Service) FinishLogin(ctx context.Context, body []byte) (uuid.UUID, erro
 	return user.ID, err
 }
 
-// LoginResult contains only the account identity and the version earned by the
-// challenge. The session issuer must use this version, never reload it.
+// LoginResult carries the authority and actual assertion UV earned by sign-in.
+// The session issuer must preserve these values, never infer UV from enrollment.
 type LoginResult struct {
-	ID          uuid.UUID
-	AuthVersion int64
-	DPoPJKT     string
+	ID              uuid.UUID
+	AuthVersion     int64
+	DPoPJKT         string
+	UserVerified    bool
+	AuthenticatedAt time.Time
 }
 
 // FinishLoginVersioned returns the account version validated by the ceremony.
@@ -622,7 +624,7 @@ func (s *Service) completeLogin(
 	if err := s.commitSignCountChecked(ctx, cred, &user); err != nil {
 		return LoginResult{}, err
 	}
-	return LoginResult{ID: user.ID, AuthVersion: user.AuthVersion}, nil
+	return LoginResult{ID: user.ID, AuthVersion: user.AuthVersion, UserVerified: cred.Flags.UserVerified, AuthenticatedAt: s.now().UTC()}, nil
 }
 
 // commitSignCount re-reads the credential with SELECT ... FOR UPDATE and

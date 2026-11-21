@@ -156,6 +156,40 @@ func TestPersistentAccountCutoffIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("current MFA policy and issuance lock", func(t *testing.T) {
+		u := newUser(t)
+		accounts := session.NewDBAccountState(pool)
+		evidence := session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()}
+		if err := accounts.ValidateEvidence(ctx, u.ID.String(), u.AuthVersion, session.KindAuthenticated, session.Evidence{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", u.ID); err != nil {
+			t.Fatal(err)
+		}
+		for _, unknownOrUnverified := range []session.Evidence{{}, evidence} {
+			issued := false
+			err := accounts.WithActiveEvidence(ctx, u.ID.String(), u.AuthVersion, session.KindAuthenticated, unknownOrUnverified, func() error { issued = true; return nil })
+			if !errors.Is(err, session.ErrAccountIneligible) || issued {
+				t.Fatalf("MFA policy accepted unknown or UV-only evidence: issued=%t err=%v", issued, err)
+			}
+		}
+		evidence.TOTP = true
+		if err := accounts.WithActiveEvidence(ctx, u.ID.String(), u.AuthVersion, session.KindAuthenticated, evidence, func() error {
+			blocked, stop := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer stop()
+			_, err := pool.Exec(blocked, "UPDATE users SET is_mfa_enabled=false WHERE id=$1", u.ID)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return errors.New("MFA policy change did not wait for issuance lock")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := accounts.ValidateEvidence(ctx, u.ID.String(), u.AuthVersion, session.KindRecoveryEnrollment, session.Evidence{}); err != nil {
+			t.Fatalf("restricted recovery incorrectly requires normal-session MFA: %v", err)
+		}
+	})
+
 	t.Run("mutation rechecks live permission after waiting", func(t *testing.T) {
 		u := newUser(t)
 		if err := q.AssignRoleToUser(ctx, db.AssignRoleToUserParams{UserID: u.ID, RoleID: "moderator"}); err != nil {

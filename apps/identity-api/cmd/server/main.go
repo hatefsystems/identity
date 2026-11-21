@@ -187,6 +187,10 @@ func run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
+	loginService, passwordLoginEnabled, err := buildLoginService(cfg.Environment, pool, redisClient, usernameService, mfaService, smsotpService)
+	if err != nil {
+		return err
+	}
 
 	// The recovery-code service reuses the WebAuthn database pool and, when
 	// present, the Redis client for its optional rate limits. When no database
@@ -297,6 +301,8 @@ func run(logger *slog.Logger) (runErr error) {
 		TokenService:           tokenService,
 		DPoPValidator:          dpopValidator,
 		SessionManager:         sessionManager,
+		Login:                  loginService,
+		PasswordLoginEnabled:   passwordLoginEnabled,
 		Profile:                profileService,
 		PrivateProfile:         privateProfileReader,
 		WebAuthn:               webauthnService,
@@ -339,6 +345,10 @@ func run(logger *slog.Logger) (runErr error) {
 // Validate mode-dependent settings before constructing adapters or dialing any
 // service. A dependency outage must not hide a configuration admission failure.
 func validateStartupInputs(cfg config.Config) error {
+	loginCfg, err := config.LoadLogin(cfg.Environment)
+	if err != nil {
+		return err
+	}
 	if _, err := config.LoadSession(); err != nil {
 		return err
 	}
@@ -364,9 +374,12 @@ func validateStartupInputs(cfg config.Config) error {
 	if registrationCfg.Enabled && !usernameCfg.Enabled {
 		return errors.New("main: enabled registration requires USERNAME_ENABLED and an admitted username policy")
 	}
+	if loginCfg.Enabled && !usernameCfg.Enabled {
+		return errors.New("main: enabled username login requires USERNAME_ENABLED")
+	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}

@@ -15,6 +15,8 @@ import { errorMessage, isAborted, PortalError, throwIfAborted } from '../_lib/po
 import { invalidateOtherTabs } from '../_lib/portal/invalidation';
 import { safeReturnPath } from '../_lib/portal/validation';
 import { requireWebAuthn, usePasskey } from '../_lib/portal/webauthn';
+import { LoginCoordinator } from '../_lib/portal/login-coordinator';
+import { Login } from './login';
 
 export function PasskeyLogin({
   label,
@@ -30,6 +32,8 @@ export function PasskeyLogin({
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState<Message>('');
   const [error, setError] = useState<Message>('');
+  const [mfa, setMfa] = useState<LoginCoordinator>();
+  const mfaLifetime = useRef<LoginCoordinator | undefined>(undefined);
   const active = useRef<{ controller: AbortController; verificationStarted: boolean } | null>(null);
   const feedback = useRef<HTMLParagraphElement>(null);
   const button = useRef<HTMLButtonElement>(null);
@@ -39,6 +43,7 @@ export function PasskeyLogin({
     return () => {
       active.current?.controller.abort();
       active.current = null;
+      mfaLifetime.current?.dispose();
     };
   }, []);
   useEffect(() => {
@@ -67,7 +72,16 @@ export function PasskeyLogin({
       try {
         // No send callback is exposed here: verification may be sent from this point.
         operation.verificationStarted = true;
-        await client.loginVerify(assertion, controller.signal);
+        const result = await client.loginVerify(assertion, controller.signal);
+        throwIfAborted(controller.signal);
+        if (result) {
+          const coordinator = new LoginCoordinator(client);
+          coordinator.acceptPasskeyMfa(result);
+          mfaLifetime.current = coordinator;
+          setMfa(coordinator);
+          client = undefined;
+          return;
+        }
       } finally {
         // A lost verify response may still have changed the shared cookie.
         invalidateOtherTabs();
@@ -111,6 +125,13 @@ export function PasskeyLogin({
       key: operation.verificationStarted ? 'auth.passkey.unconfirmed' : 'auth.passkey.cancelled',
     });
   }
+
+  if (mfa) return <Login coordinator={mfa} onRestart={() => {
+    mfaLifetime.current = undefined;
+    setMfa(undefined);
+    setStatus('');
+    setError('');
+  }} />;
 
   return (
     <div className="space-y-4">

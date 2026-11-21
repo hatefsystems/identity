@@ -184,7 +184,7 @@ func (v *AccessValidator) Validate(ctx context.Context, compact, audience string
 			return empty, ErrInactiveToken
 		}
 		authorityExpiry = minTime(authorityExpiry, minTime(parent.AbsoluteExpiry, parent.IdleExpiry))
-		if err := v.cfg.Accounts.Validate(ctx, claims.Subject, *claims.AuthVersion); err != nil {
+		if err := session.ValidateAuthority(ctx, v.cfg.Accounts, claims.Subject, *claims.AuthVersion, parent.Kind, parent.Evidence); err != nil {
 			if errors.Is(err, session.ErrAccountIneligible) {
 				return empty, ErrInactiveToken
 			}

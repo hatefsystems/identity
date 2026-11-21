@@ -4,11 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readlink, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
 import { browserFailure, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { validateIntegratedLogin } from './login-browser.mjs';
 import {
-  addAuthenticator, api, clean, hidePortal, newContext, operationResponse as waitForOperation, signIn, visit,
+  addAuthenticator, api, clean, freshTOTP, hidePortal, newContext, operationResponse as waitForOperation, signIn, visit,
 } from './web-portal.browser.mjs';
 
 let checkpoint = 'startup';
@@ -316,7 +318,7 @@ export async function runAdminBrowser({
       run.invocation = { ...invocation(), environment: root ? { ADMIN_BROWSER_ARTIFACT_DIR: root } : {} };
       run.worktree = await identity();
       if (root) run.artifactDirectory = artifactDirectory;
-      harness = await start({ admin: true });
+      harness = await start({ admin: true, login: true });
       assert(/^[a-f0-9]{32}$/.test(harness.runID), 'Missing run-owned service identifier');
       run.serviceRunID = harness.runID;
       releaseGuard = guard(async () => {
@@ -377,7 +379,7 @@ async function confirmForm(page, action = 'Suspend', method = 'passkey', harness
   await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
   if (method === 'totp') {
     await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
-    const current = harness.fixture('totp-code', { user_id: fixture.user_id });
+    const current = await freshTOTP(harness, fixture);
     await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill(current.code);
     await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
   } else {
@@ -776,7 +778,8 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   });
   const response = async (page, path, method, status) => {
     const body = status === 204 ? null : harness.captureJSON(path, method, status);
-    const result = await waitForOperation(page, path, method);
+    const result = await (status === 401 ? page.waitForResponse((result) => new URL(result.url()).pathname === path &&
+      result.request().method() === method && result.status() === 401 && !result.headers()['dpop-nonce']) : waitForOperation(page, path, method));
     assert.equal(result.status(), status, 'Unexpected legal API outcome');
     const grant = result.request().headers()['x-step-up-auth'];
     if (method !== 'GET') {
@@ -821,7 +824,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     verificationCount++;
     if (method === 'totp') {
       await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
-      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill(harness.fixture('totp-code', { user_id: actor.fixture.user_id }).code);
+      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill((await freshTOTP(harness, actor.fixture)).code);
       await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
     } else await dialog.getByRole('button', { name: localizedText('Verify with a passkey'), exact: true }).click();
     const grant = await captured;
@@ -1096,7 +1099,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   assert.equal(challenge.status, 200);
   assert(challenge.body.methods.includes('totp'));
   const remoteGrant = await api(combined.page, '/api/v1/auth/stepup/verify', {
-    method: 'POST', sessionID: remoteSession, body: { method: 'totp', code: harness.fixture('totp-code', { user_id: combined.fixture.user_id }).code },
+    method: 'POST', sessionID: remoteSession, body: { method: 'totp', code: (await freshTOTP(harness, combined.fixture)).code },
   });
   assert.equal(remoteGrant.status, 200);
   verificationCount++;
@@ -1311,11 +1314,16 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   verified = await verify(combined, combined.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }));
   await fillCreate(verified.dialog, hold, randomUUID());
   harness.fixture('admin-revoke', { user_id: combined.fixture.user_id, role: 'dpo' });
-  const denied = response(combined.page, holdsPath, 'POST', 403);
+  const denied = response(combined.page, holdsPath, 'POST', 401);
   await confirm(verified.dialog, 'Confirm Legal Hold');
-  assert.equal((await denied).body.error, 'forbidden');
+  assert.equal((await denied).response.status(), 401);
   await combined.page.getByTestId('stepup-dialog').waitFor({ state: 'hidden' });
-  assert.equal((await api(combined.page, '/api/v1/users/me')).status, 200);
+  assert.equal((await api(combined.page, '/api/v1/users/me')).status, 401);
+  // Revocation denies the stored session; it need not delete its browser cookie.
+  // Retire only that proven-invalid cookie before the anonymous MFA ceremony.
+  await combined.context.clearCookies({ name: '__Host-session' });
+  assertOnlyPreferenceCookies(await combined.context.cookies(harness.origin));
+  await signIn(combined.page, harness.origin, '/login/webauthn', { harness, fixture: combined.fixture, mfa: true });
   await open(combined.page, harness, '/admin/legal');
   assert.equal(await combined.page.getByRole('button', { name: localizedText('Apply Legal Hold'), exact: true }).count(), 0);
 
@@ -1334,7 +1342,7 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
   assert.equal(await second.page.getByTestId('legal-outcome').count(), 0);
   assert.equal(await second.page.getByRole('link', { name: localizedText('Sign in with a passkey'), exact: true }).getAttribute('href'), '/login?returnTo=%2Fadmin%2Flegal');
   evidence.legalVerifications = verificationCount;
-  evidence.checks.push('live legal capability revocation after fresh verification clears privileged controls without normal logout; real legal-session expiry drops pending input and returns only the fixed legal path');
+  evidence.checks.push('real legal role revocation invalidates captured session authority and clears privileged controls; explicit fresh passkey/TOTP login observes remaining grants; real legal-session expiry drops pending input and returns only the fixed legal path');
 }
 
 export async function validateAdmin(harness, { artifactDirectory } = {}) {
@@ -1364,6 +1372,12 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     };
   }
   try {
+    checkpoint = 'integrated-login';
+    evidence.login = await validateIntegratedLogin(browser, harness, { artifactDirectory });
+    evidence.checks.push('real integrated username/password, verified-contact code and passkey MFA on mobile/desktop; earned session evidence and post-grant authority; contact-code plus TOTP denied administrative access');
+    // These independent matrices share the real 30/minute subnet admission
+    // budget, including nonce denials. Let it age naturally; never reset counters.
+    await delay(60_000);
     checkpoint = 'admin-bootstrap';
     for (const role of ['ordinary', 'support', 'moderator', 'dpo', 'super_admin', 'combined', 'legal_operator']) {
       const fixture = harness.fixture('admin-seed', { role: role === 'legal_operator' ? 'dpo' : role });
@@ -1374,7 +1388,7 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
       const page = await context.newPage();
       const authenticator = await addAuthenticator(page, fixture.credentials[0]);
       await authenticator.cdp.send('Network.enable', { maxPostDataSize: 64 * 1024 });
-      await signIn(page, harness.origin);
+      await signIn(page, harness.origin, '/login/webauthn', { harness, fixture, mfa: role !== 'ordinary' });
       actors[role] = { fixture, page, context, observed, authenticator };
     }
     const target = actors.ordinary.fixture;
@@ -1678,13 +1692,18 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     checkpoint = 'admin-revocation';
     dialog = await confirmForm(combined);
     harness.fixture('admin-revoke', { user_id: actors.combined.fixture.user_id, role: 'moderator' });
-    const revoked = operationResponse(combined, `/api/v1/admin/users/${actors.ordinary.fixture.user_id}/status`, 'PATCH');
+    const revoked = combined.waitForResponse((response) => response.request().method() === 'PATCH' &&
+      new URL(response.url()).pathname === `/api/v1/admin/users/${actors.ordinary.fixture.user_id}/status` &&
+      response.status() === 401 && !response.headers()['dpop-nonce']);
     await finalSubmit(dialog, markers.reason);
-    assert.equal((await revoked).status(), 403);
+    assert.equal((await revoked).status(), 401);
     await combined.getByTestId('admin-ready').waitFor({ state: 'hidden' });
     assert.equal(await combined.getByLabel(localizedText('Moderation reason'), { exact: true }).count(), 0);
-    assert.equal((await api(combined, '/api/v1/users/me')).status, 200);
-    evidence.checks.push('permission revocation after grant clears private state without logging out the normal session');
+    assert.equal((await api(combined, '/api/v1/users/me')).status, 401);
+    await actors.combined.context.clearCookies({ name: '__Host-session' });
+    assertOnlyPreferenceCookies(await actors.combined.context.cookies(harness.origin));
+    await signIn(combined, harness.origin, '/login/webauthn', { harness, fixture: actors.combined.fixture, mfa: true });
+    evidence.checks.push('real permission revocation after step-up invalidates the old normal session and clears private state; an explicit fresh passkey/TOTP login captures current remaining authority');
 
     checkpoint = 'admin-audit';
     await open(dpo, harness, '/admin/audit-logs');
@@ -1718,7 +1737,9 @@ export async function validateAdmin(harness, { artifactDirectory } = {}) {
     const initialQuery = new URL(logsResponse.url()).searchParams;
     assert.deepEqual([initialQuery.get('start_time'), initialQuery.get('end_time')], draft, 'UTC query changed the normalized native draft');
     assert(initialQuery.get('start_time').endsWith('Z') && initialQuery.get('end_time').endsWith('Z'));
-    await dpo.getByRole('button', { name: localizedText(/^View details for sequence /) }).first().click();
+    const controlledAudit = logBody.items.find((row) => JSON.stringify(row).includes(markers.auditPayload));
+    assert(controlledAudit, 'Signed audit items did not contain the controlled payload row');
+    await dpo.getByRole('button', { name: localizedText(`View details for sequence ${controlledAudit.seq}`), exact: true }).click();
     const details = dpo.getByRole('dialog', { name: localizedText('Audit record details'), exact: true });
     await details.waitFor();
     assert((await details.textContent()).includes(markers.auditPayload), 'Audit details did not render the controlled payload as text');

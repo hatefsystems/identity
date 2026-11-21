@@ -136,7 +136,7 @@ export function portalRoute(path) {
   ]) {
     if (pattern.test(pathname)) return template;
   }
-  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify|legal-holds|preservation-requests|legal-inquiry\/lookup)|users\/me(?:\/(?:sessions|profile|private-data|username|deletion))?|auth\/(?:logout|session|stepup\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
+  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify|legal-holds|preservation-requests|legal-inquiry\/lookup)|users\/me(?:\/(?:sessions|profile|private-data|username|deletion))?|auth\/(?:login(?:\/(?:code\/(?:request|verify)|mfa))?|logout|session|stepup\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
       /^\/(?:admin(?:\/(?:users|audit-logs|integrity|legal))?|dashboard(?:\/(?:profile|security|sessions|privacy))?|login(?:\/webauthn)?|recover-account)$/.test(pathname)) return pathname;
   return '[redacted-route]';
 }
@@ -192,6 +192,8 @@ export function secretEnvironmentValues(environment) {
 export function fixtureSecretValues(value) {
   if (!value || typeof value !== 'object') return [];
   return Object.entries(value).flatMap(([key, item]) => {
+    if (/^(?:username|phone|preauthentication|challenge|USERNAME_LOOKUP_KEY)$/.test(key))
+      return typeof item === 'string' && item ? [item] : [];
     if (key === 'database_url' && typeof item === 'string') {
       try {
         return [item, decodeURIComponent(new URL(item).password)].filter(Boolean);
@@ -261,7 +263,7 @@ export function failureCategories(output) {
 export function browserFailure(error, stage = 'unknown') {
   const kind = error?.name === 'AssertionError' ? 'assertion' : 'operation';
   const location = typeof error?.stack === 'string'
-    ? error.stack.match(/(?:web-(?:portal|admin|csp)\.browser|portal-harness|browser-localization)\.mjs:\d+:\d+/)?.[0]
+    ? error.stack.match(/(?:web-(?:portal|admin|csp)\.browser|portal-harness|browser-localization|login-browser)\.mjs:\d+:\d+/)?.[0]
     : undefined;
   const checkpoint = /^[a-z-]{1,64}$/.test(stage) ? stage : 'unknown';
   // Browser exception messages can embed full Cookie/DPoP/grant headers or DOM
@@ -756,8 +758,9 @@ export async function runPortalIntegrationSuites({ invocation = integrationInvoc
   return report;
 }
 
-export async function startPortalHarness({ admin = false } = {}) {
+export async function startPortalHarness({ admin = false, login = false } = {}) {
   assert.equal(typeof admin, 'boolean', 'Admin harness mode must be explicit');
+  assert.equal(typeof login, 'boolean', 'Login harness mode must be explicit');
   let apiBinary = resolve(backend, 'bin/identity-api');
   let fixtureBinary = resolve(backend, 'bin/portal-fixture');
   let notifierBinary = resolve(backend, 'bin/deletion-notifier');
@@ -942,6 +945,10 @@ export async function startPortalHarness({ admin = false } = {}) {
       return state;
     };
     fixture('migrate');
+    if (login) {
+      Object.assign(storeEnv, fixture('login-policy'));
+      secrets.push(...secretEnvironmentValues(storeEnv));
+    }
     const adminPolicy = admin ? fixture('admin-policy') : undefined;
     const tls = fixture('tls');
     secrets.push(tls.key);
@@ -970,6 +977,10 @@ export async function startPortalHarness({ admin = false } = {}) {
         'POST /api/v1/auth/stepup/verify',
         'POST /api/v1/auth/deletion/reclaim/options',
         'POST /api/v1/auth/deletion/reclaim/',
+        'POST /api/v1/auth/login',
+        'POST /api/v1/auth/login/code/request',
+        'POST /api/v1/auth/login/code/verify',
+        'POST /api/v1/auth/webauthn/login/verify',
       ].includes(key), 'Unsupported response capture');
       assert(!captures.has(key), 'Response capture already armed');
       let timer;
@@ -1095,7 +1106,7 @@ export async function startPortalHarness({ admin = false } = {}) {
     secrets.push(smtpUsername, smtpPassword);
     const mail = await startMailSink({
       ...tls, username: smtpUsername, password: smtpPassword, from: smtpFrom,
-      runID, origin, onSecrets: (values) => secrets.push(...values),
+      runID, origin, acceptLogin: login, onSecrets: (values) => secrets.push(...values),
     });
     cleanup.push(() => mail.close());
     const workerDatabase = fixture('notifier-role');
@@ -1161,6 +1172,15 @@ export async function startPortalHarness({ admin = false } = {}) {
       STEPUP_REPLAY_HMAC_KEY: randomBytes(32).toString('base64'),
       SMS_ENABLED: 'false',
       REGISTRATION_ENABLED: 'false',
+      LOGIN_ENABLED: login ? 'true' : 'false',
+      LOGIN_EMAIL_ENABLED: login ? 'true' : 'false',
+      ...(login ? {
+        LOGIN_CODE_HMAC_KEY: randomBytes(32).toString('base64'),
+        LOGIN_SMTP_HOST: '127.0.0.1', LOGIN_SMTP_PORT: String(mail.port),
+        LOGIN_SMTP_TLS_MODE: 'implicit', LOGIN_SMTP_USERNAME: smtpUsername,
+        LOGIN_SMTP_PASSWORD: smtpPassword, LOGIN_SMTP_FROM: smtpFrom,
+        LOGIN_SMTP_CA_BUNDLE: caBundle,
+      } : {}),
       SESSION_COOKIE_NAME: '__Host-session',
       SESSION_COOKIE_SECURE: 'true',
       SESSION_ABSOLUTE_TTL: '2h',
@@ -1292,16 +1312,13 @@ export async function startPortalHarness({ admin = false } = {}) {
       assert(code === 0 && signal === null, 'Owned signer did not exit cleanly');
       retired.add(signer);
     };
-    const setLegalLookup = async (enabled) => {
-      assert(admin && typeof enabled === 'boolean' && canonicalUUID(lookupFixture), 'Invalid owned legal startup scenario');
+    const restartAPIs = async () => {
       for (const child of apiChildren) {
         retired.add(child);
         const exited = once(child, 'exit');
         child.kill('SIGTERM');
         await Promise.race([exited, delay(10_000, undefined, { ref: false }).then(() => { throw new Error('Owned API did not stop'); })]);
       }
-      if (enabled) apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture;
-      else delete apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID;
       startAPIs();
       for (const port of apiPorts) await waitForPortal(async () => {
         assertHealthy();
@@ -1310,7 +1327,18 @@ export async function startPortalHarness({ admin = false } = {}) {
           await response.arrayBuffer();
           return response.ok;
         } catch { return false; }
-      }, 'owned legal API configuration');
+      }, 'owned API configuration');
+    };
+    const setLegalLookup = async (enabled) => {
+      assert(admin && typeof enabled === 'boolean' && canonicalUUID(lookupFixture), 'Invalid owned legal startup scenario');
+      if (enabled) apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID = lookupFixture;
+      else delete apiEnvironment.ADMIN_LOOKUP_FIXTURE_ID;
+      await restartAPIs();
+    };
+    const setLoginEmail = async (enabled) => {
+      assert(login && typeof enabled === 'boolean', 'Invalid owned login channel configuration');
+      apiEnvironment.LOGIN_EMAIL_ENABLED = enabled ? 'true' : 'false';
+      await restartAPIs();
     };
     const assertPrivateLogs = () => {
       for (const { label, output } of children) {
@@ -1331,7 +1359,7 @@ export async function startPortalHarness({ admin = false } = {}) {
     };
     lifecycle.check();
     starting = false;
-    return { runID, origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, waitForAdminDelivery, assertHealthy, assertPrivateLogs, setLegalLookup, stopSignerForDestructiveFixtures, routeEvidence, originEvidence, close, diagnostics, secrets, routeReferences, legalReferences, legalSecrets };
+    return { runID, origin, tlsSPKI, fixture, mail, captureJSON, startNotifier, stopNotifier, waitForNoticeCleanup, waitForAdminDelivery, assertHealthy, assertPrivateLogs, setLegalLookup, setLoginEmail, stopSignerForDestructiveFixtures, routeEvidence, originEvidence, close, diagnostics, secrets, routeReferences, legalReferences, legalSecrets };
   } catch (error) {
     try { diagnostics(); } finally { await close(); }
     throw error;

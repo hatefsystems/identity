@@ -96,3 +96,82 @@ func TestAccountStateFailsClosedOnMissingSnapshotAndStorageFailure(t *testing.T)
 		t.Fatal(err)
 	}
 }
+
+type testEvidenceAccountState struct {
+	*testAccountState
+	required bool
+	checks   int
+}
+
+func (a *testEvidenceAccountState) ValidateEvidence(ctx context.Context, id string, version int64, kind Kind, evidence Evidence) error {
+	a.checks++
+	if err := a.Validate(ctx, id, version); err != nil {
+		return err
+	}
+	if kind == KindAuthenticated && a.required && (!evidence.TOTPSet || !evidence.TOTP || evidence.AuthenticatedAt.IsZero()) {
+		return ErrAccountIneligible
+	}
+	return nil
+}
+
+func (a *testEvidenceAccountState) WithActiveEvidence(ctx context.Context, id string, version int64, kind Kind, evidence Evidence, fn func() error) error {
+	if err := a.ValidateEvidence(ctx, id, version, kind, evidence); err != nil {
+		return err
+	}
+	return fn()
+}
+
+func TestCurrentMFAPolicyAtIssuanceUseAndRenewal(t *testing.T) {
+	for _, method := range []string{MethodPassword, MethodContactCode, MethodPasskey, ""} {
+		t.Run(method, func(t *testing.T) {
+			now := time.Now().UTC()
+			manager := newTestManager(t, &now)
+			accounts := &testEvidenceAccountState{testAccountState: &testAccountState{active: true}}
+			manager.accounts = accounts
+			evidence := Evidence{}
+			if method != "" {
+				evidence = Evidence{PrimaryMethod: method, UV: UVNotApplicable, TOTPSet: true, AuthenticatedAt: now}
+				if method == MethodPasskey {
+					evidence.UV = UVVerified
+				}
+			}
+			params := IssueParams{UserID: "subject", AuthVersionSet: true, Evidence: evidence}
+			if method == MethodContactCode {
+				if _, err := manager.Issue(httptest.NewRecorder(), params); !errors.Is(err, ErrAccountIneligible) {
+					t.Fatal("contact context was optional")
+				}
+				params.CheckPrimaryFactor = func(ctx context.Context) error { return ctx.Err() }
+			}
+			w := httptest.NewRecorder()
+			issued, err := manager.Issue(w, params)
+			if err != nil || issued.Evidence != evidence {
+				t.Fatalf("evidence changed at issuance: %+v %v", issued.Evidence, err)
+			}
+			accounts.required = true
+			denied := httptest.NewRecorder()
+			if _, err := manager.Issue(denied, params); !errors.Is(err, ErrAccountIneligible) || len(denied.Result().Cookies()) != 0 {
+				t.Fatalf("required MFA issued session/cookie: %v", err)
+			}
+			request := requestWithCookies(w)
+			if _, err := manager.Resolve(request); !errors.Is(err, ErrAccountIneligible) {
+				t.Fatalf("current MFA bypass on use: %v", err)
+			}
+			if _, err := manager.renew(request, issued); !errors.Is(err, ErrAccountIneligible) {
+				t.Fatalf("current MFA bypass after resolve: %v", err)
+			}
+			if method == "" {
+				return
+			}
+			params.Evidence.TOTP = true
+			fresh := httptest.NewRecorder()
+			if _, err := manager.Issue(fresh, params); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(time.Minute)
+			resolved, err := manager.Authenticate(requestWithCookies(fresh))
+			if err != nil || resolved.Evidence != params.Evidence || accounts.checks < 6 {
+				t.Fatalf("earned evidence lost on renewal: %+v %v", resolved.Evidence, err)
+			}
+		})
+	}
+}

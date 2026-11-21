@@ -227,6 +227,10 @@ func (s *Service) IssueCode(data AuthorizationCodeData) (string, error) {
 
 // IssueCodeContext requires the version captured by the authenticated session.
 func (s *Service) IssueCodeContext(ctx context.Context, data AuthorizationCodeData) (string, error) {
+	parent, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet)
+	if err != nil {
+		return "", err
+	}
 	code, hash, err := NewSecret()
 	if err != nil {
 		return "", err
@@ -246,7 +250,7 @@ func (s *Service) IssueCodeContext(ctx context.Context, data AuthorizationCodeDa
 		if !data.AuthVersionSet {
 			return "", session.ErrAccountIneligible
 		}
-		err = s.cfg.AccountState.WithActive(ctx, data.UserID, data.AuthVersion, persist)
+		err = session.WithActiveAuthority(ctx, s.cfg.AccountState, data.UserID, data.AuthVersion, parent.Kind, parent.Evidence, persist)
 	} else {
 		err = persist()
 	}
@@ -328,7 +332,7 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 		}
 	}
 
-	return s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+	return s.withAccount(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
 		parent, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet)
 		if err != nil {
 			return nil, s.sessionError(err)
@@ -344,7 +348,7 @@ func (s *Service) exchangeAuthorizationCode(ctx context.Context, form url.Values
 		if err != nil {
 			return nil, s.serverError("sign access token", err)
 		}
-		idToken, err := s.signIDToken(data.UserID, clientID, data.Nonce, now)
+		idToken, err := s.signIDToken(data.UserID, clientID, data.Nonce, now, parent.Evidence.AuthenticatedAt)
 		if err != nil {
 			return nil, s.serverError("sign id token", err)
 		}
@@ -427,7 +431,7 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 	}
 
 	breach := false
-	response, err := s.withAccount(ctx, data.UserID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
+	response, err := s.withAccount(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet, func() (*Response, error) {
 		if _, err := s.parentSession(ctx, data.UserID, data.SessionID, data.AuthVersion, data.AuthVersionSet); err != nil {
 			return nil, s.sessionError(err)
 		}
@@ -479,15 +483,19 @@ func (s *Service) exchangeRefreshToken(ctx context.Context, form url.Values) (*R
 	return response, err
 }
 
-func (s *Service) withAccount(ctx context.Context, userID string, version int64, captured bool, issue func() (*Response, error)) (*Response, error) {
+func (s *Service) withAccount(ctx context.Context, userID, sessionID string, version int64, captured bool, issue func() (*Response, error)) (*Response, error) {
 	if s.cfg.AccountState == nil {
 		return issue()
 	}
 	if !captured {
 		return nil, newError(ErrCodeInvalidGrant, "account authentication is no longer valid", 400)
 	}
+	parent, err := s.parentSession(ctx, userID, sessionID, version, captured)
+	if err != nil {
+		return nil, s.sessionError(err)
+	}
 	var response *Response
-	err := s.cfg.AccountState.WithActive(ctx, userID, version, func() error {
+	err = session.WithActiveAuthority(ctx, s.cfg.AccountState, userID, version, parent.Kind, parent.Evidence, func() error {
 		var err error
 		response, err = issue()
 		return err
@@ -672,13 +680,16 @@ func (s *Service) tokenBinding(ctx context.Context) (jkt, tokenType string) {
 }
 
 // signIDToken builds and signs the OIDC ID token for the auth-code grant.
-func (s *Service) signIDToken(sub, clientID, nonce string, now time.Time) (string, error) {
+func (s *Service) signIDToken(sub, clientID, nonce string, now, authenticatedAt time.Time) (string, error) {
 	claims := Claims{
 		"iss": s.cfg.Issuer,
 		"sub": sub,
 		"aud": clientID,
 		"iat": now.Unix(),
 		"exp": now.Add(s.cfg.IDTokenTTL).Unix(),
+	}
+	if !authenticatedAt.IsZero() {
+		claims["auth_time"] = authenticatedAt.Unix()
 	}
 	if nonce != "" {
 		claims["nonce"] = nonce

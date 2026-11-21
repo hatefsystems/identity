@@ -1,6 +1,6 @@
 import type { ReactElement, ReactNode } from 'react';
 import { createTranslator } from 'next-intl';
-import { render as testingRender, type RenderOptions } from '@testing-library/react';
+import { render as testingRender, type RenderOptions, type RenderResult } from '@testing-library/react';
 import { defaultPreferences, type DisplayPreferences, type Locale } from './config';
 import { getMessagesForLocale, type Messages } from './messages';
 import { DisplayProvider } from './provider';
@@ -30,7 +30,7 @@ export function render(
     locale?: Locale;
     preferences?: Partial<DisplayPreferences>;
   } = {}
-) {
+): RenderResult {
   const { locale, preferences, wrapper: Wrapper, ...rest } = options;
   return testingRender(ui, {
     ...rest,

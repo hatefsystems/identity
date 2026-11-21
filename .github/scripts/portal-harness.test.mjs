@@ -995,9 +995,9 @@ test('integration runner executes the exact uncached mandatory inventory seriall
   assert.equal(state.children.length, integrationTargets.length);
   assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
   const portal = report.results.at(-1);
-  assert.equal(portal.packages, 16);
+  assert.equal(portal.packages, 18);
   assert.equal(portal.skipped, 0);
-  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/username`, tests: ['TestOwnedFixture'] });
+  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/login`, tests: ['TestOwnedFixture'] });
   assert.equal(state.maximumActive, 1);
   assert.equal(state.active, 0);
   assert.equal(state.terminated.length, 0);
@@ -1007,16 +1007,17 @@ test('integration runner executes the exact uncached mandatory inventory seriall
   assert.doesNotMatch(state.messages.join(''), /PRIVATE/);
 });
 
-test('portal integration rejects missing, duplicate, empty or skipped username evidence', async (t) => {
-  for (const kind of ['missing', 'duplicate', 'empty', 'skipped']) await t.test(kind, async (t) => {
+test('portal integration rejects missing, duplicate, empty or skipped username and login evidence', async (t) => {
+  for (const expected of ['internal/username', 'internal/contactcode', 'internal/login'])
+  for (const kind of ['missing', 'duplicate', 'empty', 'skipped']) await t.test(expected + '-' + kind, async (t) => {
     const state = mockIntegrationRunner(t, { output(child) {
       for (const name of integrationPackages['test-portal-integration']) {
-        if (name === 'internal/username' && kind === 'missing') continue;
-        if (name !== 'internal/username' || kind !== 'empty')
-          child.stdout.emit('data', `--- ${name === 'internal/username' && kind === 'skipped' ? 'SKIP' : 'PASS'}: TestOwnedFixture (0.01s)\n`);
+        if (name === expected && kind === 'missing') continue;
+        if (name !== expected || kind !== 'empty')
+          child.stdout.emit('data', `--- ${name === expected && kind === 'skipped' ? 'SKIP' : 'PASS'}: TestOwnedFixture (0.01s)\n`);
         child.stdout.emit('data', `ok ${identityGoModule}/${name}\t0.01s\n`);
       }
-      if (kind === 'duplicate') child.stdout.emit('data', `--- PASS: TestOwnedFixture (0.01s)\nok ${identityGoModule}/internal/username\t0.01s\n`);
+      if (kind === 'duplicate') child.stdout.emit('data', `--- PASS: TestOwnedFixture (0.01s)\nok ${identityGoModule}/${expected}\t0.01s\n`);
     } });
     await assert.rejects(runPortalIntegrationTarget('test-portal-integration', {}), /Wrong or duplicate executed package inventory|Package produced no tests|skipped a test/);
     assert.equal(state.active, 0);
@@ -2028,6 +2029,8 @@ test('portal integration cannot silently omit real dependencies or run in parall
     './internal/webauthn',
     './internal/session',
     './internal/username',
+    './internal/contactcode',
+    './internal/login',
   ]) {
     assert(
       target.options.command.includes(contract),
@@ -2038,9 +2041,23 @@ test('portal integration cannot silently omit real dependencies or run in parall
     'internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn',
     'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle',
     'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp',
-    'internal/registration', 'internal/username',
+    'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login',
   ]);
-  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username'\]/);
+  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login'\]/);
+});
+
+test('role-revocation reauthentication removes only a proven-invalid cookie before fresh MFA', () => {
+  const source = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
+  for (const stage of ['legal-revocation', 'admin-revocation']) {
+    const start = source.indexOf(`checkpoint = '${stage}'`);
+    const end = stage === 'legal-revocation' ? source.indexOf('evidence.legalVerifications', start)
+      : source.indexOf("checkpoint = 'admin-audit'", start);
+    assert(start >= 0 && end > start, 'Missing exact revocation acceptance stage');
+    const scenario = source.slice(start, end);
+    assert.match(scenario, /assert\.equal\(\(await api\([^\n]+, '\/api\/v1\/users\/me'\)\)\.status, 401\);[\s\S]*?\.context\.clearCookies\(\{ name: '__Host-session' \}\);\s*assertOnlyPreferenceCookies\(await [^\n]+\.context\.cookies\(harness\.origin\)\);\s*await signIn\([^\n]+mfa: true \}\);/);
+    assert.equal((scenario.match(/\.clearCookies\(/g) || []).length, 1, 'Revocation must retire only one named browser cookie');
+    assert.doesNotMatch(scenario, /\.clearCookies\(\s*\)|\.clearCookies\(\{\s*\}\)/);
+  }
 });
 
 test('local integration inventory matches every mandatory CI suite in order', () => {

@@ -67,6 +67,7 @@ func TestAdminCapabilitiesLegalOnlyAdmissionAndIndependentMounts(t *testing.T) {
 			}}}
 			op := &adminaction.Operation{Queries: db.New(d)}
 			current := session.Session{ID: "capability-session", UserID: d.actor.String(), Kind: session.KindAuthenticated,
+				Evidence:       session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, AuthenticatedAt: time.Now().UTC()},
 				AuthVersionSet: true, DPoPJKT: "bound-key", AbsoluteExpiry: time.Now().Add(time.Hour), IdleExpiry: time.Now().Add(time.Hour)}
 			request := profileHandlerRequest(current, http.MethodGet, "")
 			request = request.WithContext(adminaction.WithContext(request.Context(), op))
@@ -116,5 +117,25 @@ func TestAdminCapabilitiesLegalOnlyAdmissionAndIndependentMounts(t *testing.T) {
 				t.Fatal("permission outage returned presentation authority")
 			}
 		})
+	}
+}
+
+func TestAdminCapabilitiesRejectUnknownAndContactAuthenticationBeforePermissionRead(t *testing.T) {
+	for _, evidence := range []session.Evidence{
+		{},
+		{PrimaryMethod: session.MethodContactCode, UV: session.UVNotApplicable, TOTP: true, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVNotVerified, AuthenticatedAt: time.Now().UTC()},
+	} {
+		d := &adminCapabilitiesDB{actor: uuid.New(), grants: map[string]bool{permAdminUsersRead: true}}
+		current := session.Session{ID: "ineligible", UserID: d.actor.String(), Kind: session.KindAuthenticated,
+			AuthVersionSet: true, DPoPJKT: "bound-key", Evidence: evidence,
+			AbsoluteExpiry: time.Now().Add(time.Hour), IdleExpiry: time.Now().Add(time.Hour)}
+		request := profileHandlerRequest(current, http.MethodGet, "")
+		request = request.WithContext(adminaction.WithContext(request.Context(), &adminaction.Operation{Queries: db.New(d)}))
+		w := httptest.NewRecorder()
+		(&Server{}).handleAdminCapabilities(adminCapabilities{UsersRead: true}).ServeHTTP(w, request)
+		if w.Code != http.StatusForbidden || d.reads != 0 {
+			t.Fatalf("ineligible capability discovery read permissions: method=%q status=%d reads=%d", evidence.PrimaryMethod, w.Code, d.reads)
+		}
 	}
 }

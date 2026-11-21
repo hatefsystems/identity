@@ -242,17 +242,17 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 			return nil, errors.New("cannot advance owned account revision")
 		}
 		return map[string]bool{"changed": true}, nil
-	case "admin-revoke":
+	case "admin-grant", "admin-revoke":
 		roles, err := fixtureRoles(input.Role)
 		if err != nil || len(roles) == 0 {
 			return nil, errors.New("explicit fixture role required for revocation")
 		}
 		for _, role := range roles {
-			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, true, "test"); err != nil {
-				return nil, errors.New("cannot revoke fixture operator grant")
+			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, action == "admin-revoke", "test"); err != nil {
+				return nil, errors.New("cannot change fixture operator grant")
 			}
 		}
-		return map[string]bool{"revoked": true}, nil
+		return map[string]bool{"changed": true, "revoked": action == "admin-revoke"}, nil
 	case "admin-state":
 		var state struct {
 			Status   string `json:"status"`

@@ -193,12 +193,18 @@ func (s *Service) verifyPasskey(ctx context.Context, p VerifyParams) error {
 // cost is that a wrong code also consumes its guard slot, which is harmless — a
 // wrong code was never usable.
 func (s *Service) verifyTOTP(ctx context.Context, p VerifyParams) error {
-	canonicalCode, err := totp.CanonicalizeCode(p.Code)
+	return VerifyLoginTOTP(ctx, s.totp, s.guard, p.UserID, p.Code, s.now())
+}
+
+// VerifyLoginTOTP shares the exact replay identity with authenticated step-up.
+// The guard is claimed before validation, never in a login-specific namespace.
+func VerifyLoginTOTP(ctx context.Context, verifier TOTPVerifier, guard ReplayGuard, userID uuid.UUID, code string, now time.Time) error {
+	canonicalCode, err := totp.CanonicalizeCode(code)
 	if err != nil {
 		return ErrInvalidCredentials
 	}
 
-	fresh, err := s.guard.Remember(ctx, totpGuardKey(p.UserID, canonicalCode), s.now().Add(totpReplayWindow))
+	fresh, err := guard.Remember(ctx, totpGuardKey(userID, canonicalCode), now.Add(totpReplayWindow))
 	if err != nil {
 		return fmt.Errorf("stepup: claim passcode: %w", err)
 	}
@@ -206,7 +212,7 @@ func (s *Service) verifyTOTP(ctx context.Context, p VerifyParams) error {
 		return ErrCodeReplayed
 	}
 
-	switch err := s.totp.VerifyEnabledCode(ctx, p.UserID, canonicalCode); {
+	switch err := verifier.VerifyEnabledCode(ctx, userID, canonicalCode); {
 	case err == nil:
 		return nil
 	case errors.Is(err, mfa.ErrInvalidCode):

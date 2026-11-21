@@ -44,6 +44,39 @@ const (
 	KindRecoveryEnrollment Kind = "recovery_enrollment"
 )
 
+// UV is the user-verification result of this authentication, not enrollment.
+type UV string
+
+// Authentication methods and UV states retain unknown evidence explicitly.
+const (
+	UVUnknown         UV = "unknown"
+	UVNotApplicable   UV = "not_applicable"
+	UVVerified        UV = "verified"
+	UVNotVerified     UV = "not_verified"
+	MethodPassword       = "password"
+	MethodContactCode    = "contact_code"
+	MethodPasskey        = "passkey"
+)
+
+// Evidence records only proof earned during sign-in. Zero values preserve
+// unknown evidence in existing records; activity and refresh never update it.
+type Evidence struct {
+	PrimaryMethod   string
+	UV              UV
+	TOTP            bool
+	TOTPSet         bool
+	AuthenticatedAt time.Time
+}
+
+// AdminEligible is authentication eligibility, never permission authorization.
+func (e Evidence) AdminEligible() bool {
+	if !e.valid() || e.AuthenticatedAt.IsZero() {
+		return false
+	}
+	return (e.PrimaryMethod == MethodPasskey && e.UV == UVVerified) ||
+		(e.PrimaryMethod == MethodPassword && e.UV == UVNotApplicable && e.TOTPSet && e.TOTP)
+}
+
 // Store sentinel errors.
 var (
 	// ErrSessionNotFound indicates the session token is unknown, was revoked,
@@ -72,6 +105,7 @@ type Session struct {
 	// AuthVersion is captured by the authentication ceremony, never restamped.
 	AuthVersion    int64
 	AuthVersionSet bool
+	Evidence       Evidence
 	// IP is the client source address captured at session creation.
 	IP string
 	// UserAgent identifies the client device/browser (data-architecture §3.1
@@ -146,6 +180,9 @@ func validSession(s Session) bool {
 		(s.EnrollmentClaimed && s.Kind != KindRecoveryEnrollment) {
 		return false
 	}
+	if !s.Evidence.valid() || (!s.Evidence.AuthenticatedAt.IsZero() && s.Evidence.AuthenticatedAt.After(s.CreatedAt)) {
+		return false
+	}
 	for _, at := range []time.Time{s.CreatedAt, s.LastSeenAt, s.AbsoluteExpiry, s.IdleExpiry} {
 		if at.UnixNano() <= 0 || !time.Unix(0, at.UnixNano()).Equal(at) {
 			return false
@@ -153,6 +190,33 @@ func validSession(s Session) bool {
 	}
 	return !s.LastSeenAt.Before(s.CreatedAt) && s.LastSeenAt.Before(s.IdleExpiry) &&
 		!s.IdleExpiry.After(s.AbsoluteExpiry)
+}
+
+func (e Evidence) valid() bool {
+	if e.TOTP && !e.TOTPSet {
+		return false
+	}
+	switch e.UV {
+	case "", UVUnknown, UVNotApplicable, UVVerified, UVNotVerified:
+	default:
+		return false
+	}
+	switch e.PrimaryMethod {
+	case "":
+		return (e.UV == "" || e.UV == UVUnknown) && !e.TOTPSet && e.AuthenticatedAt.IsZero()
+	case MethodPassword, MethodContactCode:
+		if e.UV != UVNotApplicable {
+			return false
+		}
+	case MethodPasskey:
+		if e.UV == UVNotApplicable {
+			return false
+		}
+	default:
+		return false
+	}
+	return e.AuthenticatedAt.IsZero() || (e.AuthenticatedAt.UnixNano() > 0 &&
+		time.Unix(0, e.AuthenticatedAt.UnixNano()).Equal(e.AuthenticatedAt))
 }
 
 // NewToken generates a 256-bit random session token encoded as base64url, plus

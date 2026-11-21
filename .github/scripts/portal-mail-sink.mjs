@@ -71,9 +71,21 @@ export function deletionMail(message, { origin, recipient, from }) {
   return { recipient, locale, message_id: messageID, token, link: link.href, expires_at: expires };
 }
 
+export function loginMail(message, { recipient, from }) {
+  assert(Buffer.byteLength(message) <= limit, 'Unbounded fixture login mail');
+  const split = message.indexOf('\r\n\r\n');
+  assert(split > 0, 'Invalid fixture login message');
+  const headers = message.slice(0, split), body = message.slice(split + 4);
+  assert(headers === `From: <${from}>\r\nTo: <${recipient}>\r\nSubject: Your account sign-in code\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit`,
+    'Unexpected fixture login headers');
+  const matched = body.match(/^Enter this code only in the browser where you started signing in:\r\n([0-9]{6})\r\n\r\nThis sign-in code expires at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)\. It cannot verify a signup or change your contacts\. If you did not request it, ignore this message\.\r\n$/);
+  assert(matched && Number.isFinite(Date.parse(matched[2])), 'Invalid bounded login code or deadline');
+  return { kind: 'login', recipient, code: matched[1], expires_at: matched[2] };
+}
+
 // Implicit TLS only: no plaintext listener, external relay, transcript, or spool.
 // Fault injection is recipient-scoped, and cannot deliver outside this run.
-export async function startMailSink({ key, cert, username, password, from, runID, origin, onSecrets = () => {} }) {
+export async function startMailSink({ key, cert, username, password, from, runID, origin, acceptLogin = false, onSecrets = () => {} }) {
   assert(/^[a-f0-9]{32}$/.test(runID), 'Mail sink requires a fixture run');
   const publicOrigin = new URL(origin);
   assert(publicOrigin.hostname === 'localhost' && publicOrigin.protocol === 'https:' &&
@@ -119,8 +131,10 @@ export async function startMailSink({ key, cert, username, password, from, runID
           }
           try {
             assert(messages.length < 64, 'Fixture mail capture limit');
-            const notice = deletionMail(data.join('\r\n') + '\r\n', { origin, recipient, from });
-            onSecrets([notice.recipient, notice.token, notice.link]);
+            const message = data.join('\r\n') + '\r\n';
+            const notice = acceptLogin && /^Subject: Your account sign-in code\r?$/m.test(message)
+              ? loginMail(message, { recipient, from }) : deletionMail(message, { origin, recipient, from });
+            onSecrets([notice.recipient, notice.code, notice.token, notice.link].filter(Boolean));
             const remaining = faults.get(recipient) || 0;
             const accepted = remaining === 0;
             messages.push({ ...notice, accepted });
@@ -141,7 +155,7 @@ export async function startMailSink({ key, cert, username, password, from, runID
           sender = false;
           recipient = '';
         } else if (/^EHLO [^\r\n]+$/.test(line)) {
-          reply('250-localhost\r\n250 AUTH PLAIN');
+          reply(`250-localhost\r\n${acceptLogin ? '250-SMTPUTF8\r\n' : ''}250 AUTH PLAIN`);
         } else if (line.startsWith('AUTH PLAIN ')) {
           const presented = Buffer.from(line.slice(11), 'base64');
           authenticated = presented.length === expected.length && timingSafeEqual(presented, expected);
@@ -153,7 +167,7 @@ export async function startMailSink({ key, cert, username, password, from, runID
           socket.end('221 closing\r\n');
         } else if (!authenticated) {
           reply('530 authentication required');
-        } else if (line === `MAIL FROM:<${from}>`) {
+        } else if (line === `MAIL FROM:<${from}>` || acceptLogin && line === `MAIL FROM:<${from}> SMTPUTF8`) {
           sender = true;
           recipient = '';
           reply('250 sender accepted');
@@ -193,11 +207,12 @@ export async function startMailSink({ key, cert, username, password, from, runID
       assert(owned(recipient), 'Cannot inject a fault for a foreign recipient');
       faults.set(recipient, (faults.get(recipient) || 0) + 1);
     },
-    async waitFor(recipient, count = 1) {
-      assert(owned(recipient) && count >= 1 && count <= 16, 'Invalid fixture mail wait');
+    async waitFor(recipient, count = 1, kind = 'deletion') {
+      assert(owned(recipient) && count >= 1 && count <= 16 && ['deletion', 'login'].includes(kind), 'Invalid fixture mail wait');
       const end = Date.now() + 15_000;
       while (Date.now() < end) {
-        const accepted = messages.filter((message) => message.recipient === recipient && message.accepted);
+        const accepted = messages.filter((message) => message.recipient === recipient && message.accepted &&
+          (kind === 'login' ? message.kind === 'login' : message.kind === undefined));
         if (accepted.length >= count) return accepted[count - 1];
         await delay(50);
       }

@@ -66,11 +66,16 @@ func (r *RedisStore) Create(ctx context.Context, tokenHash string, s Session) er
 		}
 		return "0"
 	}
+	authenticatedAt := ""
+	if !s.Evidence.AuthenticatedAt.IsZero() {
+		authenticatedAt = strconv.FormatInt(s.Evidence.AuthenticatedAt.UnixNano(), 10)
+	}
 	_, err := r.run(ctx, "create", tokenHash, s.UserID, s.ID,
 		s.ID, string(s.Kind), s.UserID, strconv.FormatInt(s.AuthVersion, 10), bit(s.AuthVersionSet),
 		s.IP, s.UserAgent, s.DPoPJKT, strconv.FormatInt(s.CreatedAt.UnixNano(), 10),
 		strconv.FormatInt(s.LastSeenAt.UnixNano(), 10), strconv.FormatInt(s.AbsoluteExpiry.UnixNano(), 10),
-		strconv.FormatInt(s.IdleExpiry.UnixNano(), 10), bit(s.EnrollmentClaimed))
+		strconv.FormatInt(s.IdleExpiry.UnixNano(), 10), bit(s.EnrollmentClaimed),
+		s.Evidence.PrimaryMethod, string(s.Evidence.UV), bit(s.Evidence.TOTP), bit(s.Evidence.TOTPSet), authenticatedAt)
 	return err
 }
 
@@ -194,7 +199,7 @@ func (r *RedisStore) run(ctx context.Context, op, hash, userID, sessionID string
 
 func decodeRedisSession(value any) (Session, error) {
 	values, ok := value.([]any)
-	if !ok || len(values) != 13 {
+	if !ok || (len(values) != 13 && len(values) != 18) {
 		return Session{}, ErrStoreUnavailable
 	}
 	fields := make([]string, len(values))
@@ -224,6 +229,22 @@ func decodeRedisSession(value any) (Session, error) {
 	if !validSession(s) || (fields[4] != "0" && fields[4] != "1") || (fields[12] != "0" && fields[12] != "1") {
 		return Session{}, ErrStoreUnavailable
 	}
+	if len(fields) == 18 {
+		if (fields[15] != "0" && fields[15] != "1") || (fields[16] != "0" && fields[16] != "1") {
+			return Session{}, ErrStoreUnavailable
+		}
+		s.Evidence = Evidence{PrimaryMethod: fields[13], UV: UV(fields[14]), TOTP: fields[15] == "1", TOTPSet: fields[16] == "1"}
+		if fields[17] != "" {
+			ns, err := strconv.ParseInt(fields[17], 10, 64)
+			if err != nil || ns <= 0 {
+				return Session{}, ErrStoreUnavailable
+			}
+			s.Evidence.AuthenticatedAt = time.Unix(0, ns).UTC()
+		}
+		if !validSession(s) {
+			return Session{}, ErrStoreUnavailable
+		}
+	}
 	return s, nil
 }
 
@@ -234,7 +255,8 @@ var redisSessionOperations = redis.NewScript(`
 local prefix = 'identity:session:v1:'
 local op, hash, user, id = ARGV[1], ARGV[3], ARGV[4], ARGV[5]
 local fields = {'id', 'kind', 'user_id', 'auth_version', 'auth_version_set', 'ip', 'user_agent',
-                'dpop_jkt', 'created_at', 'last_seen_at', 'absolute_expiry', 'idle_expiry', 'enrollment_claimed'}
+                'dpop_jkt', 'created_at', 'last_seen_at', 'absolute_expiry', 'idle_expiry', 'enrollment_claimed',
+                'primary_method', 'uv', 'totp', 'totp_set', 'authenticated_at'}
 
 local function corrupt() error('SESSION_CORRUPT') end
 local function uint(s)
@@ -275,14 +297,32 @@ local function valid(s)
     end
     if before(s.last_seen_at, s.created_at) or not before(s.last_seen_at, s.idle_expiry)
         or before(s.absolute_expiry, s.idle_expiry) then corrupt() end
+    if (s.totp ~= '0' and s.totp ~= '1') or (s.totp_set ~= '0' and s.totp_set ~= '1')
+        or (s.totp == '1' and s.totp_set ~= '1') then corrupt() end
+    if s.uv ~= '' and s.uv ~= 'unknown' and s.uv ~= 'not_applicable'
+        and s.uv ~= 'verified' and s.uv ~= 'not_verified' then corrupt() end
+    if s.primary_method == '' then
+        if (s.uv ~= '' and s.uv ~= 'unknown') or s.totp_set ~= '0' or s.authenticated_at ~= '' then corrupt() end
+    elseif s.primary_method == 'password' or s.primary_method == 'contact_code' then
+        if s.uv ~= 'not_applicable' then corrupt() end
+    elseif s.primary_method == 'passkey' then
+        if s.uv == 'not_applicable' then corrupt() end
+    else corrupt() end
+    if s.authenticated_at ~= '' and (not uint(s.authenticated_at) or s.authenticated_at == '0'
+        or before(s.created_at, s.authenticated_at)) then corrupt() end
 end
 local function record(h, uid, sid)
     local key = tokenKey(h)
     if not present(key, 'hash') then return nil end
-    if redis.call('HLEN', key) ~= #fields then corrupt() end
+    local count = redis.call('HLEN', key)
+    if count ~= 13 and count ~= #fields then corrupt() end
     local values = redis.call('HMGET', key, unpack(fields))
     local s = {}
     for i, field in ipairs(fields) do s[field] = values[i] end
+    -- Existing records have no earned evidence. Never infer it from creation.
+    if count == 13 then
+        s.primary_method, s.uv, s.totp, s.totp_set, s.authenticated_at = '', '', '0', '0', ''
+    end
     valid(s)
     if (uid and s.user_id ~= uid) or (sid and s.id ~= sid) then corrupt() end
     return s

@@ -162,15 +162,29 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 				t.Fatal(err)
 			}
 		}
-		w := httptest.NewRecorder()
-		sess, err := sessions.IssueContext(ctx, w, session.IssueParams{UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt})
-		if err != nil {
-			t.Fatal(err)
-		}
-		f.actors[role], f.cookies[role] = sess, w.Result().Cookies()[0]
+		f.signIn(t, role, user.ID)
 	}
 	f.target = f.user(t)
 	return f
+}
+
+// signIn models a fresh password authentication with independently verified
+// TOTP. Role provisioning precedes authentication, so its cutoff is captured.
+func (f *adminIntegration) signIn(t *testing.T, role string, userID uuid.UUID) {
+	t.Helper()
+	user, err := db.New(f.pool).GetUserByID(t.Context(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	sess, err := f.sessions.IssueContext(t.Context(), w, session.IssueParams{
+		UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt,
+		Evidence: session.Evidence{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTP: true, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.actors[role], f.cookies[role] = sess, w.Result().Cookies()[0]
 }
 
 func (f *adminIntegration) user(t *testing.T) db.User {
@@ -268,7 +282,7 @@ func TestAdminRolePrivacyAndLiveRevocationIntegration(t *testing.T) {
 	if err := rbac.ProvisionRole(context.Background(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", uuid.MustParse(f.actors["support"].UserID), "support", true, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if w := f.request(t, "support", "GET", "/users", "", ""); w.Code != 403 {
+	if w := f.request(t, "support", "GET", "/users", "", ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked role retained access: %d", w.Code)
 	}
 	for _, path := range []string{"/roles/assign", "/users/" + f.target.ID.String() + "/trigger-reset"} {

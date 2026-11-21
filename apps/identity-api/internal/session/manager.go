@@ -51,6 +51,10 @@ type ManagerConfig struct {
 type IssueParams struct {
 	AuthVersion    int64
 	AuthVersionSet bool
+	Evidence       Evidence
+	// CheckPrimaryFactor revalidates mutable first-factor context under the same
+	// account lock as creation. It is not persisted as authentication evidence.
+	CheckPrimaryFactor func(context.Context) error `json:"-"`
 	// UserID is the authenticated subject the session belongs to (required).
 	UserID string
 	// IP is the client source address at authentication time.
@@ -151,6 +155,7 @@ func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p Iss
 	s := Session{
 		AuthVersion:    p.AuthVersion,
 		AuthVersionSet: p.AuthVersionSet,
+		Evidence:       p.Evidence,
 		ID:             uuid.NewString(),
 		Kind:           kind,
 		UserID:         p.UserID,
@@ -162,13 +167,26 @@ func (m *Manager) IssueContext(ctx context.Context, w http.ResponseWriter, p Iss
 		AbsoluteExpiry: absoluteExpiry,
 		IdleExpiry:     idleExpiry,
 	}
+	if !validSession(s) {
+		return Session{}, ErrAccountIneligible
+	}
 
-	persist := func() error { return m.store.Create(ctx, hash, s) }
+	persist := func() error {
+		if p.Evidence.PrimaryMethod == MethodContactCode && p.CheckPrimaryFactor == nil {
+			return ErrAccountIneligible
+		}
+		if p.CheckPrimaryFactor != nil {
+			if err := p.CheckPrimaryFactor(ctx); err != nil {
+				return err
+			}
+		}
+		return m.store.Create(ctx, hash, s)
+	}
 	if m.accounts != nil {
 		if !p.AuthVersionSet {
 			return Session{}, ErrAccountIneligible
 		}
-		err = m.accounts.WithActive(ctx, p.UserID, p.AuthVersion, persist)
+		err = WithActiveAuthority(ctx, m.accounts, p.UserID, p.AuthVersion, kind, p.Evidence, persist)
 	} else {
 		err = persist()
 	}
@@ -206,7 +224,7 @@ func (m *Manager) Resolve(r *http.Request) (Session, error) {
 		if !s.AuthVersionSet {
 			return Session{}, ErrAccountIneligible
 		}
-		if err := m.accounts.Validate(r.Context(), s.UserID, s.AuthVersion); err != nil {
+		if err := ValidateAuthority(r.Context(), m.accounts, s.UserID, s.AuthVersion, s.Kind, s.Evidence); err != nil {
 			return Session{}, err
 		}
 	}
@@ -228,6 +246,9 @@ func (m *Manager) renew(r *http.Request, s Session) (Session, error) {
 	if err := r.Context().Err(); err != nil {
 		return Session{}, err
 	}
+	if m.accounts != nil && !s.AuthVersionSet {
+		return Session{}, ErrAccountIneligible
+	}
 	token, err := m.cookie.Read(r)
 	if err != nil {
 		return Session{}, ErrNoSession
@@ -244,7 +265,8 @@ func (m *Manager) renew(r *http.Request, s Session) (Session, error) {
 	if newIdle.Before(s.IdleExpiry) {
 		newIdle = s.IdleExpiry
 	}
-	if err := m.store.Touch(r.Context(), HashToken(token), newIdle); err != nil {
+	touch := func() error { return m.store.Touch(r.Context(), HashToken(token), newIdle) }
+	if err := WithActiveAuthority(r.Context(), m.accounts, s.UserID, s.AuthVersion, s.Kind, s.Evidence, touch); err != nil {
 		// The session lapsed between Get and Touch; treat as not found.
 		return Session{}, err
 	}
@@ -257,7 +279,7 @@ func (m *Manager) renew(r *http.Request, s Session) (Session, error) {
 
 // LookupByID reads live browser authority without extending its lifetime or
 // consulting account state. Token callers must check the session kind and the
-// captured version, then call AccountState.Validate once for their whole flow.
+// captured version, then use the shared evidence-aware authority boundary.
 func (m *Manager) LookupByID(ctx context.Context, userID, sessionID string) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return Session{}, err

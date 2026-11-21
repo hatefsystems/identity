@@ -43,7 +43,7 @@ func (w *activityWriter) WriteHeader(status int) {
 	if status >= 200 && status < 300 {
 		// An admitted request may race remote revocation, or may be signing out
 		// itself. Neither case resurrects authority or cancels committed work.
-		if err := w.renew(); err != nil && !errors.Is(err, ErrSessionNotFound) {
+		if err := w.renew(); err != nil && !errors.Is(err, ErrSessionNotFound) && !errors.Is(err, ErrAccountIneligible) {
 			w.failed = true
 			writeActivityUnavailable(w.ResponseWriter)
 			return

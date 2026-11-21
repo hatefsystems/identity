@@ -5,6 +5,7 @@ import { browserKey } from '../app/_lib/portal/dpop';
 import { PortalError } from '../app/_lib/portal/errors';
 import { invalidateOtherTabs } from '../app/_lib/portal/invalidation';
 import { requireWebAuthn, usePasskey } from '../app/_lib/portal/webauthn';
+import { StrictMode } from 'react';
 
 const replace = jest.fn();
 jest.mock('next/navigation', () => ({ useRouter: () => ({ replace }) }));
@@ -17,6 +18,7 @@ jest.mock('../app/_lib/portal/webauthn', () => ({
 }));
 
 const api = {
+  request: jest.fn(),
   loginOptions: jest.fn(),
   loginVerify: jest.fn(),
   bootstrap: jest.fn(),
@@ -63,6 +65,24 @@ beforeEach(() => {
 });
 
 describe('live discoverable passkey entry', () => {
+  it('hands required MFA to in-place authenticator verification and bootstraps only after completion', async () => {
+    api.loginVerify.mockResolvedValueOnce({ status: 'mfa_required', preauthentication: 'private-preauth', expires_at: new Date(Date.now() + 300000).toISOString() });
+    api.request.mockImplementationOnce(async (_path, decode) => decode(undefined, 204));
+    render(<StrictMode><PasskeyLogin /></StrictMode>);
+    fireEvent.click(screen.getByRole('button', { name: 'Use a passkey' }));
+    const input = await screen.findByLabelText<HTMLInputElement>('Authenticator code');
+    expect(api.bootstrap).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+    expect(api.dispose).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe('/login');
+    fireEvent.change(input, { target: { value: '۰۱٢۳٤۵' } });
+    fireEvent.submit(screen.getByRole('form', { name: 'Authenticator verification' }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/dashboard'));
+    expect(api.request.mock.calls[0][0]).toBe('/api/v1/auth/login/mfa');
+    expect(api.request.mock.calls[0][2]).toMatchObject({ anonymous: true, body: { preauthentication: 'private-preauth', code: '012345' } });
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(api.loginVerify).toHaveBeenCalledTimes(1);
+  });
   it('does not initialize storage or contact APIs/authenticators until a user action, then bootstraps before navigation', async () => {
     const persistent = [
       jest.spyOn(window, 'localStorage', 'get'),

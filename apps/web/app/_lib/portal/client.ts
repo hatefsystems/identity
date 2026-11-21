@@ -11,7 +11,7 @@ import {
   StepUpGrant,
   type Profile,
 } from './contracts';
-import { identifier, list, normalizeName, record } from './validation';
+import { identifier, list, normalizeName, record, timestamp } from './validation';
 import { emptyResponse, readResponse } from './json-response';
 import { nonzeroUUID } from '../admin/validation';
 
@@ -27,6 +27,7 @@ type RequestOptions = {
   notificationLocale?: Locale;
 };
 type Decoder<T> = (value: unknown, status: number) => T;
+export type LoginMfa = { status: 'mfa_required'; preauthentication: string; expires_at: string };
 
 const adminQueryKeys: Readonly<Record<string, readonly string[]>> = {
   '/api/v1/admin/users': ['limit', 'offset', 'status'],
@@ -344,7 +345,21 @@ export class PortalClient {
     });
   }
   loginVerify(assertion: unknown, signal: AbortSignal) {
-    return this.request('/api/v1/auth/webauthn/login/verify', emptyResponse, {
+    const requestedAt = Date.now();
+    return this.request('/api/v1/auth/webauthn/login/verify', (value, status): LoginMfa | undefined => {
+      if (status === 204) {
+        emptyResponse(value);
+        return undefined;
+      }
+      const item = record(value);
+      if (status !== 200 || item.status !== 'mfa_required' || Object.keys(item).length !== 3 ||
+        !Object.hasOwn(item, 'preauthentication') || !Object.hasOwn(item, 'expires_at'))
+        throw new PortalError('invalid_response');
+      const expires_at = timestamp(item.expires_at);
+      if (Date.parse(expires_at) <= Date.now() || Date.parse(expires_at) > requestedAt + 320000)
+        throw new PortalError('invalid_response');
+      return { status: 'mfa_required', preauthentication: identifier(item.preauthentication, 1024), expires_at };
+    }, {
       method: 'POST',
       body: assertion,
       signal,

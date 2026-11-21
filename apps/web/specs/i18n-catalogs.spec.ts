@@ -99,4 +99,15 @@ describe('complete and compatible committed translation catalogs', () => {
       })).toContain(kind);
     }
   });
+
+  it('keeps delivered-code and authenticator-login controls distinct without private catalog values', () => {
+    expect(en.auth.login.deliveredCode).toBe('Delivered sign-in code');
+    expect(fa.auth.login.deliveredCode).toBe('کد ارسال‌شدهٔ ورود');
+    expect(en.auth.fields.code).toBe('Authenticator code');
+    expect(fa.auth.fields.code).toBe('کد رمزساز');
+    for (const messages of [en, fa]) {
+      expect(messages.auth.login.deliveredCode).not.toBe(messages.auth.fields.code);
+      expect(JSON.stringify(messages.auth.login)).not.toMatch(/private-challenge|private-preauth|@example/);
+    }
+  });
 });

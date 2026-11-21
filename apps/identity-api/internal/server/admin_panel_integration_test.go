@@ -61,6 +61,10 @@ func TestAdminCapabilitiesMatrixAndAvailabilityIntegration(t *testing.T) {
 	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "dpo", false, "test"); err != nil {
 		t.Fatal(err)
 	}
+	if response := f.request(t, "moderator", http.MethodGet, "/capabilities", "", ""); response.Code != http.StatusUnauthorized {
+		t.Fatalf("role grant failed to invalidate earlier session: %d", response.Code)
+	}
+	f.signIn(t, "moderator", actor)
 	response := f.request(t, "moderator", http.MethodGet, "/capabilities", "", "")
 	var combined adminCapabilitiesResponse
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &combined) != nil || combined.Capabilities != (adminCapabilities{
@@ -94,7 +98,7 @@ func TestAdminCapabilitiesRevocationAndRestrictedSessionsIntegration(t *testing.
 	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, "support", true, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if response := f.request(t, "support", http.MethodGet, "/capabilities", "", ""); response.Code != http.StatusForbidden {
+	if response := f.request(t, "support", http.MethodGet, "/capabilities", "", ""); response.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked capability remained: %d", response.Code)
 	}
 	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET status='suspended' WHERE id=$1", uuid.MustParse(f.actors["moderator"].UserID)); err != nil {
@@ -114,6 +118,114 @@ func TestAdminCapabilitiesRevocationAndRestrictedSessionsIntegration(t *testing.
 	f.actors["recovery"], f.cookies["recovery"] = current, w.Result().Cookies()[0]
 	if response := f.request(t, "recovery", http.MethodGet, "/capabilities", "", ""); response.Code != http.StatusUnauthorized {
 		t.Fatalf("recovery session discovered capabilities: %d", response.Code)
+	}
+}
+
+func TestRoleChangesInvalidateAuthorityButNoOpsDoNotIntegration(t *testing.T) {
+	f := newAdminIntegration(t)
+	actor := uuid.MustParse(f.actors["support"].UserID)
+	state := func() db.GetAccountAuthStateRow {
+		row, err := db.New(f.pool).GetAccountAuthState(t.Context(), actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+	before := state()
+	for _, tc := range []struct {
+		role   string
+		revoke bool
+		change bool
+	}{
+		{"support", false, false},
+		{"moderator", false, true},
+		{"moderator", false, false},
+		{"moderator", true, true},
+		{"moderator", true, false},
+	} {
+		if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", actor, tc.role, tc.revoke, "test"); err != nil {
+			t.Fatal(err)
+		}
+		after := state()
+		wantVersion := before.AuthVersion
+		if tc.change {
+			wantVersion++
+		}
+		if after.AuthVersion != wantVersion || (tc.change && after.AuthEpoch <= before.AuthEpoch) || (!tc.change && after.AuthEpoch != before.AuthEpoch) {
+			t.Fatalf("role cutoff change=%t before=%+v after=%+v", tc.change, before, after)
+		}
+		wantStatus := http.StatusOK
+		if tc.change {
+			wantStatus = http.StatusUnauthorized
+		}
+		if response := f.request(t, "support", http.MethodGet, "/capabilities", "", ""); response.Code != wantStatus {
+			t.Fatalf("role cutoff request change=%t status=%d", tc.change, response.Code)
+		}
+		if tc.change {
+			f.signIn(t, "support", actor)
+		}
+		before = after
+	}
+}
+
+func TestAdminEvidenceEligibilityAndDisabledAdminAuthorityIntegration(t *testing.T) {
+	f := newAdminIntegration(t)
+	actor := uuid.MustParse(f.actors["support"].UserID)
+	// Disable the factor policy only to isolate administrative proof eligibility.
+	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=false WHERE id=$1", actor); err != nil {
+		t.Fatal(err)
+	}
+	for _, evidence := range []session.Evidence{
+		{},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVNotVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodContactCode, UV: session.UVNotApplicable, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+	} {
+		w := httptest.NewRecorder()
+		current, err := f.sessions.IssueContext(t.Context(), w, session.IssueParams{
+			UserID: actor.String(), AuthVersion: f.actors["support"].AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt, Evidence: evidence,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.actors["evidence"], f.cookies["evidence"] = current, w.Result().Cookies()[0]
+		want := http.StatusForbidden
+		if evidence.AdminEligible() {
+			want = http.StatusOK
+		}
+		for _, path := range []string{"/capabilities", "/users"} {
+			if response := f.request(t, "evidence", http.MethodGet, path, "", ""); response.Code != want {
+				t.Fatalf("admin method=%q UV=%q TOTP=%t path=%s status=%d, want %d", evidence.PrimaryMethod, evidence.UV, evidence.TOTP, path, response.Code, want)
+			}
+		}
+	}
+	cfg := f.srv.cfg
+	cfg.Admin.Enabled = false
+	f.srv = New(cfg, nil, f.srv.deps)
+	request := httptest.NewRequest(http.MethodGet, f.browser.origin+"/api/v1/users/me/sessions", nil)
+	f.browser.authorize(t, request, f.actors["evidence"], f.cookies["evidence"])
+	if _, err := f.sessions.Resolve(request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=true WHERE id=$1", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sessions.Resolve(request); !errors.Is(err, session.ErrAccountIneligible) {
+		t.Fatalf("disabled admin bypassed MFA policy: %v", err)
+	}
+	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=false, status='suspended' WHERE id=$1", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sessions.Resolve(request); !errors.Is(err, session.ErrAccountIneligible) {
+		t.Fatalf("disabled admin bypassed inactive status: %v", err)
+	}
+	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET status='active' WHERE id=$1", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sessions.Resolve(request); !errors.Is(err, session.ErrAccountIneligible) {
+		t.Fatalf("disabled admin restamped stale version: %v", err)
 	}
 }
 
@@ -241,6 +353,7 @@ func TestAdminConcurrentModeratorsRejectStaleRevisionIntegration(t *testing.T) {
 	if err := rbac.ProvisionRole(t.Context(), f.srv.deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", otherActor, "moderator", false, "test"); err != nil {
 		t.Fatal(err)
 	}
+	f.signIn(t, "ordinary", otherActor)
 	var before int64
 	if err := f.pool.QueryRow(t.Context(), "SELECT count(*) FROM event_outbox WHERE admin_action").Scan(&before); err != nil {
 		t.Fatal(err)
@@ -346,7 +459,7 @@ func TestAdminPinnedTargetsRemainServerAuthoritativeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := f.request(t, "moderator", http.MethodPatch, "/users/"+f.target.ID.String()+"/status", adminStatusBody(t, "banned", "revoked", 0), grant)
-	if response.Code != http.StatusForbidden {
+	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("grant bypassed revoked live permission: %d", response.Code)
 	}
 }

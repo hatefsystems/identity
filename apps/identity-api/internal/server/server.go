@@ -20,6 +20,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalhold"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalreport"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalworkflow"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/login"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/clients"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
@@ -41,11 +42,13 @@ import (
 // Most zero-valued fields disable dependent routes. Geography reads instead
 // remain mounted and report availability failures, including in development.
 type Deps struct {
-	AdminReady   func(context.Context) error
-	AdminRevoke  func(context.Context, string) error
-	GRPCReady    func(context.Context) error
-	AdminActions *adminaction.Service
-	AdminStore   AdminStore
+	Login                *login.Service
+	PasswordLoginEnabled bool
+	AdminReady           func(context.Context) error
+	AdminRevoke          func(context.Context, string) error
+	GRPCReady            func(context.Context) error
+	AdminActions         *adminaction.Service
+	AdminStore           AdminStore
 	// LedgerProofDB opens a snapshot separate from the admin audit transaction.
 	LedgerProofDB ledgerproof.Beginner
 	RBAC          rbac.PermissionChecker
@@ -257,6 +260,9 @@ func (s *Server) registerRoutes() {
 	// only mounted when a session manager has been provisioned.
 	if s.deps.SessionManager != nil {
 		s.registerSessionRoutes()
+	}
+	if s.deps.Login != nil && s.deps.SessionManager != nil {
+		s.registerLoginRoutes()
 	}
 	if s.deps.Profile != nil {
 		s.registerProfileRoutes()

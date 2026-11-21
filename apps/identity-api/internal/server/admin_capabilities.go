@@ -35,8 +35,12 @@ type adminCapabilitiesResponse struct {
 
 func (s *Server) handleAdminCapabilities(available adminCapabilities) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, actor, ok := profileSession(w, r)
+		current, actor, ok := profileSession(w, r)
 		if !ok {
+			return
+		}
+		if !current.Evidence.AdminEligible() {
+			s.writeAdminError(w, http.StatusForbidden, "forbidden")
 			return
 		}
 		if !validAdminQuery(r) {

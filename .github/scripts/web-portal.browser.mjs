@@ -126,6 +126,9 @@ function observe(context, harness) {
             assert.match(headers['www-authenticate'] || '', /use_dpop_nonce/);
             state.nonceChallenges++;
           }
+          if ((url.pathname === '/api/v1/auth/webauthn/login/verify' ||
+            url.pathname === '/api/v1/auth/login' || url.pathname.startsWith('/api/v1/auth/login/')) && response.status() !== 204)
+            assert(!headers['set-cookie'], 'Failed or preauthentication login response set a normal session cookie');
           if (anonymousReclaim(url.pathname, response.request().method())) {
             const requestHeaders = await response.request().allHeaders();
             for (const header of ['cookie', 'authorization', 'dpop', 'x-portal-session', 'x-step-up-auth', 'referer'])
@@ -208,10 +211,42 @@ async function visit(page, origin, path) {
   return response;
 }
 
-async function signIn(page, origin, path = '/login/webauthn') {
+async function freshTOTP(harness, fixture) {
+  let current = harness.fixture('totp-code', { user_id: fixture.user_id });
+  const previous = fixture.__lastEarnedTOTP;
+  // Login and step-up share the real replay guard. Wait for the next server
+  // step instead of rotating factors, clearing Redis or weakening that guard.
+  if (current.code === previous || Date.parse(current.expires_at) - Date.now() < 2000) {
+    await new Promise((resolve) => setTimeout(resolve, Math.max(1, Date.parse(current.expires_at) - Date.now() + 100)));
+    current = harness.fixture('totp-code', { user_id: fixture.user_id });
+  }
+  assert.match(current.code, /^[0-9]{6}$/);
+  fixture.__lastEarnedTOTP = current.code;
+  return current;
+}
+
+async function signIn(page, origin, path = '/login/webauthn', { harness, fixture, mfa = false } = {}) {
   await page.bringToFront();
   await visit(page, origin, path);
+  const completed = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/auth/webauthn/login/verify' &&
+    response.request().method() === 'POST' && !response.headers()['dpop-nonce']);
+  const pending = mfa ? harness.captureJSON('/api/v1/auth/webauthn/login/verify', 'POST', 200) : null;
   await page.getByTestId('passkey-login').click();
+  const verified = await completed;
+  if (mfa) {
+    assert.equal(verified.status(), 200, 'MFA account must not receive a first-factor session');
+    const preauth = await pending;
+    assert(preauth.status === 'mfa_required' && typeof preauth.preauthentication === 'string');
+    harness.secrets.push(...fixtureSecretValues(preauth));
+    assert(!(await verified.allHeaders())['set-cookie'], 'Preauthentication set a normal session cookie');
+    assertOnlyPreferenceCookies(await page.context().cookies(origin));
+    assert.equal((await api(page, '/api/v1/users/me')).status, 401, 'Preauthentication granted protected access');
+    const factor = await freshTOTP(harness, fixture);
+    await page.getByLabel(localizedText('Authenticator code'), { exact: true }).fill(factor.code);
+    const completedMFA = operationResponse(page, '/api/v1/auth/login/mfa', 'POST');
+    await page.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
+    assert.equal((await completedMFA).status(), 204, 'Real passkey login TOTP did not complete');
+  } else assert.equal(verified.status(), 204, 'Passkey sign-in did not earn a normal session');
   await page.waitForURL(origin + '/dashboard');
   await page.getByTestId('portal-ready').waitFor({ state: 'visible' });
   const cookie = (await page.context().cookies(origin)).find(
@@ -529,7 +564,7 @@ async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
   const input = dialog.getByLabel(localizedText('Authenticator code'), { exact: true });
   await input.waitFor({ state: 'visible' });
   assert.equal(await input.inputValue(), '', 'A factor code survived background suspension');
-  let current = harness.fixture('totp-code', { user_id: fixture.user_id });
+  let current = await freshTOTP(harness, fixture);
   assert.match(current.code, /^\d{6}$/);
   await input.fill(current.code);
   const verified = operationResponse(page, '/api/v1/auth/stepup/verify', 'POST');
@@ -1160,7 +1195,7 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   contexts.push(context);
   const page = await context.newPage();
   const authenticator = await addAuthenticator(page, fixture.credentials[0]);
-  await signIn(page, harness.origin);
+  await signIn(page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
   await navigate(page, harness.origin, 'Security', '/dashboard/security');
   const originalID = Buffer.from(fixture.credentials[0].credentialId, 'base64').toString(
     'base64url'
@@ -1507,7 +1542,7 @@ async function deletionPolicy(page, harness, fixture, authenticator, evidence) {
     method: 'POST', sessionID: profile.session.id, body: {},
   });
   assert(challenge.body.methods.includes('totp'), 'Fixture did not advertise real TOTP');
-  let factor = harness.fixture('totp-code', { user_id: fixture.user_id });
+  let factor = await freshTOTP(harness, fixture);
   const grant = await api(page, '/api/v1/auth/stepup/verify', {
     method: 'POST', sessionID: profile.session.id, body: { method: 'totp', code: factor.code },
   });
@@ -1854,7 +1889,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   contexts.push(current.context);
   current.page = await current.context.newPage();
   current.authenticator = await addAuthenticator(current.page, fixture.credentials[0]);
-  await signIn(current.page, harness.origin);
+  await signIn(current.page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
   const tab = await current.context.newPage();
   await visit(tab, harness.origin, '/dashboard/privacy');
   await tab.getByTestId('portal-ready').waitFor({ state: 'visible' });
@@ -1862,7 +1897,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   contexts.push(remote.context);
   const remotePage = await remote.context.newPage();
   await addAuthenticator(remotePage, fixture.credentials[1]);
-  await signIn(remotePage, harness.origin);
+  await signIn(remotePage, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
   const remoteCookies = await remote.context.cookies(harness.origin);
   harness.secrets.push(...remoteCookies.map((cookie) => cookie.value));
   await current.page.bringToFront();
@@ -1875,7 +1910,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   for (const [index, mode] of ['confirmed', 'lost-response', 'post-send-abort'].entries()) {
     const { page, context, authenticator, observed } = current;
     if (index > 0) {
-      await signIn(page, harness.origin);
+      await signIn(page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
       await navigate(page, harness.origin, 'Privacy', '/dashboard/privacy');
     }
     const oldCookies = await context.cookies(harness.origin);
@@ -2067,7 +2102,7 @@ export async function validatePortal(harness) {
   }
 }
 
-export { addAuthenticator, api, clean, hidePortal, keyStorage, newContext, operationResponse, signIn, visit };
+export { addAuthenticator, api, clean, freshTOTP, hidePortal, keyStorage, newContext, operationResponse, signIn, visit };
 
 export async function runPortalBrowser({
   directory = process.env.PORTAL_BROWSER_ARTIFACT_DIR,

@@ -29,6 +29,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
@@ -141,6 +142,18 @@ func TestFixtureCertificateIsLocalAndShortLived(t *testing.T) {
 }
 
 func TestFixtureRejectsUnarmedAndProductionRuns(t *testing.T) {
+	for _, action := range []string{"login-policy", "login-seed", "login-session-state", "admin-grant"} {
+		t.Setenv("PORTAL_FIXTURE_ALLOW", "")
+		if run([]string{action}) == nil {
+			t.Fatal("unarmed login fixture accepted")
+		}
+		t.Setenv("PORTAL_FIXTURE_ALLOW", "1")
+		t.Setenv("PORTAL_FIXTURE_RUN_ID", fixtureRunID)
+		t.Setenv("APP_ENV", "production")
+		if run([]string{action}) == nil {
+			t.Fatal("production login fixture accepted")
+		}
+	}
 	for _, action := range []string{"seed", "totp-code", "migrate", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "email-absent", "private-geography", "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision", "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup"} {
 		t.Run(action, func(t *testing.T) {
 			t.Setenv("PORTAL_FIXTURE_ALLOW", "")
@@ -332,10 +345,11 @@ func TestFixtureTLSRunsInExplicitLocalModesWithoutServices(t *testing.T) {
 
 type seedTransaction struct {
 	pgx.Tx
-	user       db.User
-	committed  bool
-	rolledBack bool
-	failMFA    bool
+	user        db.User
+	committed   bool
+	rolledBack  bool
+	failMFA     bool
+	credentials int
 }
 
 func (s *seedTransaction) Begin(context.Context) (pgx.Tx, error) { return s, nil }
@@ -348,6 +362,9 @@ func (s *seedTransaction) Rollback(context.Context) error {
 	return nil
 }
 func (s *seedTransaction) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "INSERT INTO webauthn_credentials") {
+		s.credentials++
+	}
 	if strings.Contains(sql, "INSERT INTO users") {
 		s.user = db.User{ID: args[0].(uuid.UUID), Email: new(args[1].(string)), Status: "active"}
 	}
@@ -362,6 +379,64 @@ func (s *seedTransaction) Exec(_ context.Context, sql string, args ...any) (pgco
 		s.user.MfaTotpSecretEncrypted = args[1].([]byte)
 	}
 	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func TestLoginFixtureCredentialConfigurations(t *testing.T) {
+	for _, tc := range []struct {
+		scenario string
+		count    int
+		password bool
+	}{{"password-only", 0, true}, {"passkey-only", 1, false}, {"dual", 1, true}} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			count, password, err := loginCredentialCount(tc.scenario)
+			if err != nil || count != tc.count || password != tc.password {
+				t.Fatal("wrong credential configuration")
+			}
+			tx := &seedTransaction{}
+			account, err := seedCredentialAccount(context.Background(), tx, fixtureRunID, count, false)
+			if err != nil || !tx.committed || len(account.Credentials) != count || tx.credentials != count || tx.user.IsMfaEnabled {
+				t.Fatal("fixture did not seed exact credential configuration")
+			}
+		})
+	}
+	if _, _, err := loginCredentialCount("legacy"); err == nil {
+		t.Fatal("unrequested legacy account population admitted")
+	}
+	for _, count := range []int{-1, 3} {
+		tx := &seedTransaction{}
+		if _, err := seedCredentialAccount(context.Background(), tx, fixtureRunID, count, false); err == nil || tx.committed {
+			t.Fatal("unbounded fixture credential count admitted")
+		}
+	}
+}
+
+func TestLoginFixtureVerifiedContactsUseProductionEvidenceBindings(t *testing.T) {
+	fixtureKEK(t)
+	ctx := context.Background()
+	cipher, err := fixtureEncryptor()
+	if err != nil {
+		t.Fatal("cannot build fixture envelope")
+	}
+	id := uuid.New()
+	for _, proof := range []struct{ channel, destination, method string }{
+		{contactproof.Email, "login@" + fixtureRunID + ".example.test", contactproof.EmailLink},
+		{contactproof.Phone, "+989123456789", contactproof.SMSOTP},
+	} {
+		blob, err := contactproof.Seal(ctx, cipher, id, proof.channel, proof.destination, proof.method, time.Now())
+		if err != nil || bytes.Contains(blob, []byte(proof.destination)) {
+			t.Fatal("contact proof was not protected")
+		}
+		opened, err := contactproof.Open(ctx, cipher, blob, id, proof.channel, proof.destination)
+		if err != nil || opened == nil || opened.Method != proof.method {
+			t.Fatal("fixture contact cannot be read by production verifier")
+		}
+		if _, err := contactproof.Open(ctx, cipher, blob, uuid.New(), proof.channel, proof.destination); err == nil {
+			t.Fatal("another account accepted fixture contact evidence")
+		}
+		if _, err := contactproof.Open(ctx, cipher, blob, id, proof.channel, proof.destination+"0"); err == nil {
+			t.Fatal("changed contact accepted prior proof")
+		}
+	}
 }
 
 func TestFixtureSeedTOTPIsOptInAndTransactional(t *testing.T) {

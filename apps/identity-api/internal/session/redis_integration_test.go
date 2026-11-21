@@ -46,6 +46,7 @@ func TestRedisStoreIntegration(t *testing.T) {
 	first, second := stores[0], stores[1]
 	s := liveSession(time.Now().UTC(), uuid.NewString(), uuid.NewString())
 	s.Kind, s.AuthVersion, s.AuthVersionSet = KindRecoveryEnrollment, math.MaxInt64, true
+	s.Evidence = Evidence{PrimaryMethod: MethodPasskey, UV: UVVerified, TOTPSet: true, AuthenticatedAt: s.CreatedAt.Add(-time.Minute)}
 	s.AbsoluteExpiry, s.IdleExpiry = s.CreatedAt.Add(30*time.Second), s.CreatedAt.Add(15*time.Second)
 	hash := HashToken(uuid.NewString())
 	t.Cleanup(func() { _ = first.DeleteAllForUser(context.Background(), s.UserID) })

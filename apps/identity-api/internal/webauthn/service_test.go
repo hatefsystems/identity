@@ -767,6 +767,37 @@ func TestRegistrationThenLoginHappyPath(t *testing.T) {
 	}
 }
 
+func TestLoginResultRecordsActualAssertionUVNotEnrollment(t *testing.T) {
+	for _, discoverable := range []bool{false, true} {
+		for _, verified := range []bool{false, true} {
+			fx := newFixture(t)
+			row := fx.register(t, fx.auth)
+			if !row.UserVerified {
+				t.Fatal("fixture enrollment must have UV")
+			}
+			fx.auth.signCount = 1
+			var options *protocol.CredentialAssertion
+			var err error
+			if discoverable {
+				options, err = fx.svc.BeginDiscoverableLogin(fx.ctx())
+			} else {
+				options, err = fx.svc.BeginLogin(fx.ctx(), *fx.user.Email)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := fx.auth.assertionPresenceOnly(challengeOf(options.Response.Challenge), fx.handle(t))
+			if verified {
+				body = fx.auth.assertion(challengeOf(options.Response.Challenge), fx.handle(t))
+			}
+			result, err := fx.svc.FinishLoginVersioned(fx.ctx(), body)
+			if err != nil || result.UserVerified != verified || result.AuthenticatedAt != fx.svc.now().UTC() {
+				t.Fatalf("actual assertion UV discoverable=%t verified=%t: %+v %v", discoverable, verified, result, err)
+			}
+		}
+	}
+}
+
 // TestBeginRegistrationOptions locks in the RP binding and the anonymised
 // 64-bit user handle carried in the creation options.
 func TestBeginRegistrationOptions(t *testing.T) {

@@ -103,9 +103,12 @@ export function PasskeyForm({ submit }: { submit?: () => Promise<FormOutcome> })
   );
 }
 
-export function TotpForm({ submit }: { submit?: FormSubmit<TotpValues> }) {
+export function TotpForm({ submit, clearAfterSubmit = false }: {
+  submit?: FormSubmit<TotpValues>;
+  clearAfterSubmit?: boolean;
+}) {
   const t = useTranslations();
-  const form = useAuthForm({ code: '' }, validateTotp, submit);
+  const form = useAuthForm({ code: '' }, validateTotp, submit, clearAfterSubmit);
   const code = form.field('code');
 
   return (

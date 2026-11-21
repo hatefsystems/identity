@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -65,7 +66,8 @@ func newRequest(sess *session.Session) *http.Request {
 }
 
 func authenticatedSession(userID string) *session.Session {
-	return &session.Session{ID: "sess-1", Kind: session.KindAuthenticated, UserID: userID}
+	return &session.Session{ID: "sess-1", Kind: session.KindAuthenticated, UserID: userID,
+		Evidence: session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, AuthenticatedAt: time.Now().UTC()}}
 }
 
 func TestNewRequirePermissionValidation(t *testing.T) {
@@ -83,6 +85,38 @@ func TestNewRequirePermissionValidation(t *testing.T) {
 	}
 	if g.Permission() != testPermission {
 		t.Fatalf("Permission() = %q, want %q", g.Permission(), testPermission)
+	}
+}
+
+func TestAuthenticationEvidenceCannotBeReplacedByRoleOrStepUp(t *testing.T) {
+	actor := uuid.New()
+	for _, evidence := range []session.Evidence{
+		{},
+		{PrimaryMethod: session.MethodContactCode, UV: session.UVNotApplicable, TOTP: true, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVUnknown, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVNotVerified, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTP: true, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, AuthenticatedAt: time.Now().UTC()},
+	} {
+		checker := &fakeChecker{allowed: true}
+		guard, err := NewRequirePermission(checker, testPermission, discardLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := authenticatedSession(actor.String())
+		current.Evidence = evidence
+		request := newRequest(current)
+		request.Header.Set(stepup.HeaderStepUpAuth, "later-step-up-does-not-upgrade-login")
+		w := httptest.NewRecorder()
+		guard.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(w, request)
+		if evidence.AdminEligible() {
+			if w.Code != http.StatusOK || len(checker.calls) != 1 {
+				t.Fatalf("eligible evidence denied: %+v status=%d", evidence, w.Code)
+			}
+		} else if w.Code != http.StatusForbidden || len(checker.calls) != 0 || w.Body.String() != "{\"error\":\"forbidden\"}\n" {
+			t.Fatalf("ineligible evidence checked role or escaped denial: %+v status=%d", evidence, w.Code)
+		}
 	}
 }
 

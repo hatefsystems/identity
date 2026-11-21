@@ -2,12 +2,16 @@ package token
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
@@ -34,6 +38,121 @@ func (a *tokenAccountState) WithActive(ctx context.Context, id string, version i
 	return fn()
 }
 func (*tokenAccountState) Epoch(context.Context) (int64, error) { return 1, nil }
+
+type tokenEvidenceAccountState struct {
+	*tokenAccountState
+	required bool
+}
+
+func (a *tokenEvidenceAccountState) ValidateEvidence(ctx context.Context, id string, version int64, kind session.Kind, evidence session.Evidence) error {
+	if err := a.Validate(ctx, id, version); err != nil {
+		return err
+	}
+	if kind != session.KindAuthenticated || (a.required && (!evidence.TOTPSet || !evidence.TOTP || evidence.AuthenticatedAt.IsZero())) {
+		return session.ErrAccountIneligible
+	}
+	return nil
+}
+
+func (a *tokenEvidenceAccountState) WithActiveEvidence(ctx context.Context, id string, version int64, kind session.Kind, evidence session.Evidence, fn func() error) error {
+	if err := a.ValidateEvidence(ctx, id, version, kind, evidence); err != nil {
+		return err
+	}
+	return fn()
+}
+
+func TestTokenBoundariesRequireCurrentMFAEvidence(t *testing.T) {
+	for _, evidence := range []session.Evidence{
+		{},
+		{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodContactCode, UV: session.UVNotApplicable, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+		{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
+	} {
+		svc, store := newTestService(t, nil, nil)
+		accounts := &tokenEvidenceAccountState{tokenAccountState: &tokenAccountState{active: true}}
+		svc.cfg.AccountState = accounts
+		userID := uuid.NewString()
+		seedTestSession(svc, userID, "evidence-session", 0)
+		sessions := svc.cfg.Sessions.(*testSessions)
+		parent := sessions.values["evidence-session"]
+		parent.Evidence = evidence
+		sessions.values[parent.ID] = parent
+		verifier := strings.Repeat("v", 50)
+		data := AuthorizationCodeData{UserID: userID, SessionID: parent.ID, AuthVersionSet: true,
+			ClientID: testPublicID, RedirectURI: testRedirectURI, Scope: "openid", CodeChallenge: challengeFor(verifier)}
+		code, err := svc.IssueCode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldCode, err := svc.IssueCode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := svc.Exchange(t.Context(), authCodeForm(code, verifier))
+		if err != nil {
+			t.Fatal(err)
+		}
+		validator, err := NewAccessValidator(AccessValidatorConfig{Issuer: testIssuer, Keys: svc.keys.(VerificationKeys), Clients: svc.registry,
+			Grants: store, Sessions: sessions, Accounts: accounts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		accounts.required = true
+		if _, err := svc.IssueCode(data); !errors.Is(err, session.ErrAccountIneligible) {
+			t.Fatalf("MFA code issuance bypass method=%q: %v", evidence.PrimaryMethod, err)
+		}
+		if denied, err := svc.Exchange(t.Context(), authCodeForm(oldCode, verifier)); denied != nil || wantTokenError(t, err, ErrCodeInvalidGrant) != 400 {
+			t.Fatal("MFA auth-code exchange returned tokens")
+		}
+		form := url.Values{"grant_type": {GrantRefreshToken}, "client_id": {testPublicID}, "refresh_token": {response.RefreshToken}}
+		if denied, err := svc.Exchange(t.Context(), form); denied != nil || wantTokenError(t, err, ErrCodeInvalidGrant) != 400 {
+			t.Fatal("MFA refresh returned tokens")
+		}
+		if _, err := validator.Validate(t.Context(), response.AccessToken, testIssuer); !errors.Is(err, ErrInactiveToken) {
+			t.Fatalf("MFA access-use bypass: %v", err)
+		}
+		if got, err := sessions.LookupByID(t.Context(), userID, parent.ID); err != nil || got.Evidence != evidence {
+			t.Fatalf("token boundary fabricated evidence: %+v %v", got.Evidence, err)
+		}
+	}
+}
+
+func TestTokenRefreshPreservesAuthenticationTimeAndUnknownEvidence(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		svc, _ := newTestService(t, nil, nil)
+		now := time.Now().UTC()
+		svc.now = func() time.Time { return now }
+		sessions := svc.cfg.Sessions.(*testSessions)
+		parent := sessions.values["session-1"]
+		if known {
+			parent.Evidence = session.Evidence{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTP: true, TOTPSet: true, AuthenticatedAt: now.Add(-time.Hour)}
+			sessions.values[parent.ID] = parent
+		}
+		for round := range 2 {
+			code, verifier := issueTestCode(t, svc)
+			response, err := svc.Exchange(t.Context(), authCodeForm(code, verifier))
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims := decodeTestClaims(t, response.IDToken)
+			if known {
+				if got := claims["auth_time"]; got == nil || got.(json.Number).String() != strconv.FormatInt(parent.Evidence.AuthenticatedAt.Unix(), 10) {
+					t.Fatalf("auth_time advanced on round %d: %v", round, got)
+				}
+			} else if _, exists := claims["auth_time"]; exists {
+				t.Fatal("unknown auth_time was synthesized")
+			}
+			form := url.Values{"grant_type": {GrantRefreshToken}, "client_id": {testPublicID}, "refresh_token": {response.RefreshToken}}
+			if _, err := svc.Exchange(t.Context(), form); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(time.Minute)
+			if current, err := sessions.LookupByID(t.Context(), parent.UserID, parent.ID); err != nil || current.Evidence != parent.Evidence {
+				t.Fatalf("refresh changed evidence: %+v %v", current.Evidence, err)
+			}
+		}
+	}
+}
 
 func TestCredentialVersionsPersistThroughCodeAndRotation(t *testing.T) {
 	svc, refresh := newTestService(t, nil, nil)
@@ -98,7 +217,7 @@ func TestTokenAccountStateUnavailableOrUnstamped(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.err = errors.New("db down")
-	_, err = svc.withAccount(context.Background(), "user-1", 0, true, func() (*Response, error) { t.Fatal("issued during outage"); return nil, nil })
+	_, err = svc.withAccount(context.Background(), "user-1", "session-1", 0, true, func() (*Response, error) { t.Fatal("issued during outage"); return nil, nil })
 	wantTokenError(t, err, ErrCodeServerError)
 }
 

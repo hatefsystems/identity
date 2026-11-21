@@ -9,10 +9,11 @@ export async function generateMetadata() {
 
 export default async function LoginPage() {
   const t = await getTranslations('auth');
+  const loginEnabled = process.env.NEXT_PUBLIC_LOGIN_ENABLED === 'true';
   return (
     <AuthCard
       title={t('pages.login.title')}
-      description={t('pages.login.description')}
+      description={t(loginEnabled ? 'login.description' : 'pages.login.description')}
       footer={
         <>
           <span>{t('pages.login.new')}</span>
@@ -20,7 +21,7 @@ export default async function LoginPage() {
         </>
       }
     >
-      <LoginScreen />
+      <LoginScreen enabled={loginEnabled} />
     </AuthCard>
   );
 }

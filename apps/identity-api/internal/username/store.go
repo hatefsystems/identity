@@ -341,6 +341,15 @@ func (s *Store) Lookup(ctx context.Context, input string) (uuid.UUID, error) {
 	return row.ID, nil
 }
 
+// NormalizeLookup exposes the same frozen lookup identity for quota keys. It
+// grants no authority; resolving an account still requires Lookup's DB guard.
+func (s *Store) NormalizeLookup(input string) (Value, error) {
+	if s == nil || s.normalizer == nil {
+		return Value{}, ErrUnavailable
+	}
+	return s.normalizer.NormalizeLookup(input)
+}
+
 func (s *Store) sealStorage(ctx context.Context, id uuid.UUID, v Value, a GuardAuthority) ([]byte, error) {
 	raw, err := json.Marshal(storageDetails{AccountID: id, Purpose: storagePurpose, Display: v.Display(), SecurityName: v.SecurityName(), Authority: a})
 	if err != nil {

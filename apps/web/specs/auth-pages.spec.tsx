@@ -219,3 +219,34 @@ describe('availability-page safety', () => {
     for (const request of requests) expect(request).not.toHaveBeenCalled();
   });
 });
+
+describe('explicit login rollout availability', () => {
+  const previous = process.env.NEXT_PUBLIC_LOGIN_ENABLED;
+  afterEach(() => {
+    if (previous === undefined) delete process.env.NEXT_PUBLIC_LOGIN_ENABLED;
+    else process.env.NEXT_PUBLIC_LOGIN_ENABLED = previous;
+  });
+  it.each([undefined, '', 'false', '1', 'TRUE'])('keeps new credential controls unavailable for %p', async (value) => {
+    if (value === undefined) delete process.env.NEXT_PUBLIC_LOGIN_ENABLED;
+    else process.env.NEXT_PUBLIC_LOGIN_ENABLED = value;
+    const { container } = render(await LoginPage());
+    expect(screen.getByRole('button', { name: 'Continue with a passkey' })).toBeTruthy();
+    expect(container.querySelector('input, form')).toBeNull();
+  });
+  it.each(['en', 'fa-IR'] as const)('exposes username/password and delivered-code controls only for true in %s', async (locale) => {
+    mockPageLocale = locale;
+    process.env.NEXT_PUBLIC_LOGIN_ENABLED = 'true';
+    const { container } = render(await LoginPage(), { locale });
+    expect(screen.getByLabelText(locale === 'en' ? 'Username' : 'نام کاربری')).toBeTruthy();
+    expect(screen.getByLabelText(locale === 'en' ? 'Password' : 'گذرواژه')).toBeTruthy();
+    expect(screen.getByRole('button', { name: locale === 'en' ? 'Username and delivered code' : 'نام کاربری و کد ارسال‌شده' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: locale === 'en' ? 'Continue with a passkey' : 'ادامه با کلید عبور' }).getAttribute('href')).toBe('/login/webauthn');
+    expect(container.querySelector('input[name="email"], input[name="phone"]')).toBeNull();
+  });
+  it('renders no username/password/code controls or submitting form before hydration', async () => {
+    process.env.NEXT_PUBLIC_LOGIN_ENABLED = 'true';
+    const doc = new DOMParser().parseFromString(staticMarkup(await LoginPage(), 'en'), 'text/html');
+    expect(doc.querySelector('input, form, button[type="submit"]')).toBeNull();
+    expect(doc.querySelector('noscript')?.textContent).toContain('JavaScript is required for secure sign-in');
+  });
+});

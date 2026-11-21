@@ -91,8 +91,8 @@ func run(args []string) error {
 		return errors.New("expected one fixture action")
 	}
 	switch args[0] {
-	case "tls", "migrate", "seed", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "email-absent", "private-geography":
-	case "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
+	case "tls", "migrate", "seed", "login-policy", "login-seed", "login-session-state", "totp-code", "expire-session", "consume-code", "notifier-role", "deletion-state", "reclaim-totp-code", "reclaim-totp-only", "email-absent", "private-geography":
+	case "admin-policy", "admin-worker-roles", "admin-seed", "admin-audit", "admin-delivery", "admin-grant", "admin-revoke", "admin-state", "admin-audit-failure", "admin-tamper", "admin-chain-state", "admin-revision":
 	case "admin-legal-probe", "admin-legal-seed", "admin-legal-state", "admin-legal-append", "admin-legal-cleanup":
 	default:
 		return errors.New("unsupported fixture action")
@@ -176,6 +176,13 @@ func run(args []string) error {
 		return errors.New("cannot open disposable PostgreSQL")
 	}
 	defer pool.Close()
+	if args[0] == "login-policy" || args[0] == "login-seed" {
+		output, err := loginFixture(ctx, pool, runID, args[0], input)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(output)
+	}
 	if strings.HasPrefix(args[0], "admin-") {
 		if strings.HasPrefix(args[0], "admin-legal-") {
 			output, err := legalFixture(ctx, pool, runID, args[0], input)
@@ -292,8 +299,16 @@ func run(args []string) error {
 	if err != nil {
 		return errors.New("cannot open fixture session store")
 	}
-	if _, err := store.GetByID(ctx, input.UserID, input.SessionID); err != nil {
+	currentSession, err := store.GetByID(ctx, input.UserID, input.SessionID)
+	if err != nil {
 		return errors.New("fixture session is not live or owner-scoped")
+	}
+	if args[0] == "login-session-state" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"primary_method": currentSession.Evidence.PrimaryMethod, "uv": currentSession.Evidence.UV,
+			"totp": currentSession.Evidence.TOTP, "totp_set": currentSession.Evidence.TOTPSet,
+			"authenticated_at": currentSession.Evidence.AuthenticatedAt, "auth_version": strconv.FormatInt(currentSession.AuthVersion, 10),
+		})
 	}
 	// Exercise native expiry, not a public revocation bypass. This test-only
 	// knowledge of the versioned layout must track internal/session/redis.go.
@@ -562,6 +577,15 @@ func seedAccount(ctx context.Context, pool interface {
 	}
 	if count < 1 || count > 2 {
 		return fixtureAccount{}, errors.New("fixture credential count must be one or two")
+	}
+	return seedCredentialAccount(ctx, pool, runID, count, enableTOTP)
+}
+
+func seedCredentialAccount(ctx context.Context, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, runID string, count int, enableTOTP bool) (fixtureAccount, error) {
+	if !runIDPattern.MatchString(runID) || count < 0 || count > 2 {
+		return fixtureAccount{}, errors.New("invalid owned credential fixture")
 	}
 	handle := make([]byte, 8)
 	if _, err := rand.Read(handle); err != nil {

@@ -160,6 +160,13 @@ it('limits reviewed form-state exceptions to their owner and setter', () => {
   expect(uncatalogued(fixture(owner, "setStatus('Ready'); setError('idle'); const ui = <p>{'idle'}</p>;"))).toHaveLength(3);
 });
 
+it('accepts login feedback descriptors without exempting raw or eagerly translated feedback', () => {
+  const fixture = (text: string) => ts.createSourceFile('app/_components/login.tsx', text,
+    ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  expect(uncatalogued(fixture("setNotice({ key: 'auth.login.unconfirmed' }); const ui = <p>{message(notice)}</p>;"))).toEqual([]);
+  expect(uncatalogued(fixture("setNotice('unconfirmed'); setNotice(t('auth.login.unconfirmed'));"))).toHaveLength(2);
+});
+
 function leaves(value: object, prefix = ''): Record<string, string> {
   return Object.fromEntries(
     Object.entries(value).flatMap(([key, entry]) => {

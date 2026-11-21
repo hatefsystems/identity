@@ -39,12 +39,13 @@ const (
 // own behaviour is covered in internal/privacy; here only routing, middleware order,
 // and status/response shapes are exercised.
 type privacyFakeStore struct {
-	users         map[uuid.UUID]db.User
-	requests      []db.DeletionRequest
-	intents       []db.InsertLifecycleEventParams
-	notifications []db.CreateDeletionNotificationParams
-	beforeRead    func()
-	now           func() time.Time
+	users              map[uuid.UUID]db.User
+	requests           []db.DeletionRequest
+	intents            []db.InsertLifecycleEventParams
+	notifications      []db.CreateDeletionNotificationParams
+	beforeRead         func()
+	renewalUnavailable bool
+	now                func() time.Time
 }
 
 func newPrivacyFakeStore(users ...db.User) *privacyFakeStore {
@@ -93,6 +94,11 @@ func (f *privacyFakeStore) Validate(_ context.Context, userID string, version in
 
 func (f *privacyFakeStore) WithActive(ctx context.Context, id string, version int64, fn func() error) error {
 	if err := f.Validate(ctx, id, version); err != nil {
+		// Renewal now checks account authority before touching Redis. Inject the
+		// dependency outage at that first post-commit boundary, not an unreachable Touch.
+		if f.renewalUnavailable {
+			return session.ErrStoreUnavailable
+		}
 		return err
 	}
 	return fn()
@@ -301,6 +307,7 @@ func newPrivacyFixture(t *testing.T, opts privacyOptions) *privacyFixture {
 		var sessionStore session.Store = session.NewMemoryStore()
 		if opts.activityUnavailable {
 			sessionStore = &privacyUnavailableActivityStore{Store: sessionStore}
+			fx.store.renewalUnavailable = true
 		}
 		sessMgr, err = session.NewManager(sessionStore, codec, session.ManagerConfig{
 			AccountState: fx.store, AbsoluteTTL: 24 * time.Hour, IdleTTL: 2 * time.Hour,

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import type { FieldErrors } from './validation';
 
-// Presentation outcomes, not an API contract. Public screens supply no submit handler.
+// Presentation outcomes, not an API contract.
 export type FormOutcome = 'success' | 'error' | 'cancelled' | 'unsupported' | 'rate-limited';
 export type FormStatus = 'idle' | 'pending' | FormOutcome;
 export type FormSubmit<T> = (values: T) => Promise<FormOutcome>;
@@ -9,7 +9,8 @@ export type FormSubmit<T> = (values: T) => Promise<FormOutcome>;
 export function useAuthForm<T extends Record<string, string>>(
   initialValues: T,
   validate: (values: T) => FieldErrors<T>,
-  submit?: FormSubmit<T>
+  submit?: FormSubmit<T>,
+  clearAfterSubmit = false
 ) {
   const [values, setValues] = useState(initialValues);
   const [errors, setErrors] = useState<FieldErrors<T>>({});
@@ -75,6 +76,7 @@ export function useAuthForm<T extends Record<string, string>>(
 
     inFlight.current = true;
     setStatus('pending');
+    if (clearAfterSubmit) setValues(initialValues);
     try {
       const outcome = await submit(submittedValues);
       if (!mounted.current) return;

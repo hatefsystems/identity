@@ -28,6 +28,9 @@ var (
 	ErrDisabled = errors.New("smsotp: delivery disabled")
 	// ErrUnavailable indicates a required dependency failed or is missing.
 	ErrUnavailable = errors.New("smsotp: dependency unavailable")
+	// ErrOutcomeUnknown is an unconfirmed delivery or Redis mutation result.
+	// Do not retry the mutation or treat it as earned authentication evidence.
+	ErrOutcomeUnknown = errors.New("smsotp: outcome unknown")
 	// ErrStaleSession indicates the captured account authorization is no longer current.
 	ErrStaleSession = errors.New("smsotp: stale session")
 	// ErrRestartRequired means the proof was consumed but persistence failed or

@@ -72,6 +72,7 @@ func TestRedisStorePreservesEveryFieldAndExactVersions(t *testing.T) {
 					s := liveSession(f.now, "owner", name)
 					s.Kind, s.AuthVersion, s.AuthVersionSet = kind, version, captured
 					s.IP, s.UserAgent, s.DPoPJKT = "203.0.113.15", "browser \"quoted\"\nagent", "jkt-fingerprint"
+					s.Evidence = Evidence{PrimaryMethod: MethodPasskey, UV: UVVerified, TOTPSet: true, AuthenticatedAt: f.now.Add(-time.Minute)}
 					hash := HashToken(name)
 					if err := f.first.Create(t.Context(), hash, s); err != nil {
 						t.Fatal(err)
@@ -99,6 +100,36 @@ func TestRedisStorePreservesEveryFieldAndExactVersions(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestRedisStoreLegacyEvidenceRemainsUnknownAfterTouch(t *testing.T) {
+	f := newRedisFixture(t)
+	s := liveSession(f.now, "owner", "legacy")
+	if err := f.first.Create(t.Context(), "hash", s); err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{"primary_method", "uv", "totp", "totp_set", "authenticated_at"}
+	if err := f.first.client.HDel(t.Context(), redisTokenKey("hash"), fields...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(time.Minute)
+	if err := f.second.Touch(t.Context(), "hash", f.now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.first.Get(t.Context(), "hash")
+	if err != nil || got.Evidence != (Evidence{}) || got.Evidence.AdminEligible() {
+		t.Fatalf("legacy touch fabricated evidence: %+v %v", got.Evidence, err)
+	}
+	if count := f.first.client.HLen(t.Context(), redisTokenKey("hash")).Val(); count != 13 {
+		t.Fatalf("touch rewrote unknown evidence: fields=%d", count)
+	}
+	// Partially present evidence is corrupt, not legacy authority.
+	if err := f.first.client.HSet(t.Context(), redisTokenKey("hash"), "uv", "verified").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.second.Get(t.Context(), "hash"); !errors.Is(err, ErrStoreUnavailable) {
+		t.Fatalf("partial evidence was admitted: %v", err)
 	}
 }
 

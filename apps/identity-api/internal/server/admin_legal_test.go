@@ -321,7 +321,8 @@ func TestAdminLegalPreflightBeforeStepUpConsumption(t *testing.T) {
 		{"session denial", "POST", "", "", strings.NewReader(exact + " "), -1, true, false, 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			current := session.Session{ID: "legal-preflight", Kind: session.KindAuthenticated, UserID: actor.String()}
+			current := session.Session{ID: "legal-preflight", Kind: session.KindAuthenticated, UserID: actor.String(),
+				Evidence: session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, AuthenticatedAt: time.Now().UTC()}}
 			grant, _, err := steps.Mint(stepup.MintParams{UserID: current.UserID, SessionID: current.ID, AMR: []string{"otp"}})
 			if err != nil {
 				t.Fatal(err)

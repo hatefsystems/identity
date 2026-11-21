@@ -22,13 +22,15 @@ func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
 	ctx := t.Context()
 	operator := uuid.New()
 	q := db.New(f.pool)
-	counts := func(target uuid.UUID) [3]int64 {
+	counts := func(target uuid.UUID) [5]int64 {
 		t.Helper()
-		var counts [3]int64
+		var counts [5]int64
 		if err := f.pool.QueryRow(ctx, `SELECT
 			(SELECT count(*) FROM user_roles WHERE user_id=$1),
 			(SELECT count(*) FROM admin_action_contexts WHERE account_ref=$1),
-			(SELECT count(*) FROM event_outbox WHERE admin_action AND payload::jsonb->>'actor_id'=$2)`, target, operator.String()).Scan(&counts[0], &counts[1], &counts[2]); err != nil {
+			(SELECT count(*) FROM event_outbox WHERE admin_action AND payload::jsonb->>'actor_id'=$2),
+			(SELECT auth_version FROM users WHERE id=$1),
+			(SELECT auth_epoch FROM users WHERE id=$1)`, target, operator.String()).Scan(&counts[0], &counts[1], &counts[2], &counts[3], &counts[4]); err != nil {
 			t.Fatal(err)
 		}
 		return counts
@@ -70,16 +72,28 @@ func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
 				}
 				return
 			}
+			granted := counts(target)
+			if granted[3] != before[3]+1 || granted[4] <= before[4] {
+				t.Fatal("real grant did not atomically advance authority")
+			}
 			if err := rbac.ProvisionRole(ctx, f.srv.deps.AdminActions, operator, "spiffe://identity.test/operator", target, "dpo", false, "test"); err != nil {
 				t.Fatal(err)
+			}
+			if noop := counts(target); noop[3] != granted[3] || noop[4] != granted[4] {
+				t.Fatal("no-op grant invalidated authority")
 			}
 			// Revocation remains possible after the target loses eligibility.
 			if _, err := f.pool.Exec(ctx, "UPDATE users SET status='banned',is_mfa_enabled=false WHERE id=$1", target); err != nil {
 				t.Fatal(err)
 			}
-			for range 2 {
+			revoking := counts(target)
+			for attempt := range 2 {
 				if err := rbac.ProvisionRole(ctx, f.srv.deps.AdminActions, operator, "spiffe://identity.test/operator", target, "dpo", true, "test"); err != nil {
 					t.Fatal(err)
+				}
+				revoked := counts(target)
+				if revoked[3] != revoking[3]+1 || revoked[4] <= revoking[4] {
+					t.Fatalf("revoke authority transition failed on attempt %d", attempt)
 				}
 			}
 			if held, err := q.UserHasRole(ctx, db.UserHasRoleParams{UserID: target, RoleID: "dpo"}); err != nil || held {

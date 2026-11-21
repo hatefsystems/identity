@@ -178,6 +178,10 @@ func (g *RequirePermission) Handler(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if !sess.Evidence.AdminEligible() {
+			g.deny(w, r, actor, "authentication_ineligible")
+			return
+		}
 
 		checker := g.checker
 		if op, ok := adminaction.FromContext(r.Context()); ok {
