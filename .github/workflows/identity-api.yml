@@ -276,6 +276,8 @@ jobs:
           - { package: './internal/registration', artifact: registration }
           - { package: './internal/audit/signer', artifact: signer }
           - { package: './internal/geography', artifact: geography }
+          - { package: './internal/contactcode', artifact: contactcode }
+          - { package: './internal/actionproof', artifact: actionproof }
     steps:
       - uses: actions/checkout@v7
         with:

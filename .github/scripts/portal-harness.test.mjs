@@ -995,9 +995,9 @@ test('integration runner executes the exact uncached mandatory inventory seriall
   assert.equal(state.children.length, integrationTargets.length);
   assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
   const portal = report.results.at(-1);
-  assert.equal(portal.packages, 18);
+  assert.equal(portal.packages, 19);
   assert.equal(portal.skipped, 0);
-  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/login`, tests: ['TestOwnedFixture'] });
+  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/actionproof`, tests: ['TestOwnedFixture'] });
   assert.equal(state.maximumActive, 1);
   assert.equal(state.active, 0);
   assert.equal(state.terminated.length, 0);
@@ -1008,7 +1008,7 @@ test('integration runner executes the exact uncached mandatory inventory seriall
 });
 
 test('portal integration rejects missing, duplicate, empty or skipped username and login evidence', async (t) => {
-  for (const expected of ['internal/username', 'internal/contactcode', 'internal/login'])
+  for (const expected of ['internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof'])
   for (const kind of ['missing', 'duplicate', 'empty', 'skipped']) await t.test(expected + '-' + kind, async (t) => {
     const state = mockIntegrationRunner(t, { output(child) {
       for (const name of integrationPackages['test-portal-integration']) {
@@ -2031,6 +2031,7 @@ test('portal integration cannot silently omit real dependencies or run in parall
     './internal/username',
     './internal/contactcode',
     './internal/login',
+    './internal/actionproof',
   ]) {
     assert(
       target.options.command.includes(contract),
@@ -2041,9 +2042,9 @@ test('portal integration cannot silently omit real dependencies or run in parall
     'internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn',
     'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle',
     'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp',
-    'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login',
+    'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof',
   ]);
-  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login'\]/);
+  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login','\.\/internal\/actionproof'\]/);
 });
 
 test('TOTP browser response deadlines begin after factor rollover and before submission', () => {

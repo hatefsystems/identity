@@ -15,7 +15,7 @@ func TestBundledBaselineInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []string{"00001_initial_schema.sql", "00002_registration_attempts.sql", "00003_username_reservations.sql", "00004_geography_catalog.sql", "00005_private_account_data.sql", "00006_optional_email_contact_evidence.sql"}
+	expected := []string{"00001_initial_schema.sql", "00002_registration_attempts.sql", "00003_username_reservations.sql", "00004_geography_catalog.sql", "00005_private_account_data.sql", "00006_optional_email_contact_evidence.sql", "00007_account_deletion_action_proofs.sql"}
 	if len(entries) != len(expected) {
 		t.Fatalf("binary must embed the complete launch migration inventory: %v", entries)
 	}

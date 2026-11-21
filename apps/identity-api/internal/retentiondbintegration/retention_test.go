@@ -494,6 +494,7 @@ func TestForwardOnlyMigrationIsRefused(t *testing.T) {
   'username_authority', (SELECT jsonb_agg(to_jsonb(p)) FROM public.username_active_policy p),
   'private_profiles', (SELECT jsonb_agg(to_jsonb(p) ORDER BY account_id) FROM public.private_profile p),
   'contact_evidence', (SELECT jsonb_agg(to_jsonb(e) ORDER BY user_id,channel) FROM public.contact_verification_evidence e),
+  'action_proofs', (SELECT jsonb_agg(to_jsonb(p) ORDER BY proof_digest) FROM public.account_deletion_action_proofs p),
  'legacy_history', to_regclass('public.goose_db_version')::text
 )::text`).Scan(&state); err != nil {
 			t.Fatal(err)
@@ -502,8 +503,8 @@ func TestForwardOnlyMigrationIsRefused(t *testing.T) {
 	}
 	var history string
 	if err := f.admin.QueryRow(f.ctx, `SELECT jsonb_agg(version_id ORDER BY version_id)::text
-FROM public.identity_schema_version WHERE is_applied`).Scan(&history); err != nil || history != "[0, 1, 2, 3, 4, 5, 6]" {
-		t.Fatalf("expected complete private-account lineage [0, 1, 2, 3, 4, 5, 6], got %s: %v", history, err)
+FROM public.identity_schema_version WHERE is_applied`).Scan(&history); err != nil || history != "[0, 1, 2, 3, 4, 5, 6, 7]" {
+		t.Fatalf("expected complete action-proof lineage [0, 1, 2, 3, 4, 5, 6, 7], got %s: %v", history, err)
 	}
 	before := snapshot()
 

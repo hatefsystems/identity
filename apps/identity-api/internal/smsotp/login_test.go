@@ -3,6 +3,7 @@ package smsotp
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -75,5 +76,73 @@ func TestContactLoginAdapterValidatesBeforeDelivery(t *testing.T) {
 	var disabled *Service
 	if _, err := disabled.ContactLoginPolicy(testPhone, "203.0.113.8"); err != ErrDisabled {
 		t.Fatal("nil SMS service enabled login delivery")
+	}
+}
+
+func TestDeletionPolicyAndDeliveryRequireSeparateSender(t *testing.T) {
+	f := fixture(t, Config{CodeTTL: time.Minute, MaxAttempts: 1, LockoutTTL: 30 * time.Minute, GlobalPerDay: 4})
+	if f.svc.DeletionDeliveryEnabled() || f.svc.ContactDeletionTTL() != 0 {
+		t.Fatal("login sender implicitly enabled deletion")
+	}
+	if _, err := f.svc.ContactDeletionPolicy(testPhone, "203.0.113.8"); err != ErrDisabled {
+		t.Fatal("deletion policy enabled without separate sender")
+	}
+	if err := f.svc.DeliverContactDeletionCode(context.Background(), testPhone, "000042", time.Now().Add(time.Minute)); err != ErrDisabled || f.sender.calls != 0 {
+		t.Fatal("deletion used sign-in sender")
+	}
+	sender := &fakeSender{}
+	f.svc.cfg.DeletionSender = sender
+	login, err := f.svc.ContactLoginPolicy(testPhone, "203.0.113.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletion, err := f.svc.ContactDeletionPolicy(testPhone, "203.0.113.8")
+	if err != nil || !reflect.DeepEqual(login, deletion) || f.svc.ContactDeletionTTL() != time.Minute {
+		t.Fatal("deletion created separate spend/lockout or loosened SMS policy")
+	}
+	if err := f.svc.DeliverContactDeletionCode(context.Background(), testPhone, "000042", time.Now().Add(time.Minute)); err != nil || sender.calls != 1 || f.sender.calls != 0 || f.users.writes != 0 || len(f.limiter.calls) != 0 {
+		t.Fatal("deletion did not use the explicitly separate transport only")
+	}
+	for _, phone := range []string{"invalid", "+98 9123456789"} {
+		if _, err := f.svc.ContactDeletionPolicy(phone, "203.0.113.8"); err != ErrInvalidPhone {
+			t.Fatal("deletion normalized exact phone bytes")
+		}
+		if err := f.svc.DeliverContactDeletionCode(context.Background(), phone, "000042", time.Now().Add(time.Minute)); err != ErrNoActiveCode {
+			t.Fatal("deletion sent invalid destination")
+		}
+	}
+	for _, code := range []string{"", "12345", "\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6"} {
+		if err := f.svc.DeliverContactDeletionCode(context.Background(), testPhone, code, time.Now().Add(time.Minute)); err != ErrNoActiveCode {
+			t.Fatal("deletion sent invalid code")
+		}
+	}
+	if err := f.svc.DeliverContactDeletionCode(context.Background(), testPhone, "000042", time.Now().Add(-time.Second)); err != ErrNoActiveCode || sender.calls != 1 {
+		t.Fatal("deletion sent expired code")
+	}
+	var typedNil *fakeSender
+	f = fixture(t, Config{DeletionSender: typedNil})
+	if f.svc.DeletionDeliveryEnabled() {
+		t.Fatal("typed nil enabled deletion delivery")
+	}
+	var disabled *Service
+	if disabled.DeletionDeliveryEnabled() || disabled.ContactDeletionTTL() != 0 {
+		t.Fatal("nil service enabled deletion")
+	}
+}
+
+func TestDeletionSMSDeliveryClassifiesUnknownAndNeverRetries(t *testing.T) {
+	for _, reason := range []string{"credentials", "account", "egress", "template", "parameters", "credit", "throttle", "recipient", "unavailable", "rejected", "private"} {
+		t.Run(reason, func(t *testing.T) {
+			sender := &fakeSender{err: loginDeliveryError(reason)}
+			f := fixture(t, Config{DeletionSender: sender})
+			err := f.svc.DeliverContactDeletionCode(context.Background(), testPhone, "000042", time.Now().Add(time.Minute))
+			want := ErrSendFailed
+			if reason == "unavailable" || reason == "rejected" || reason == "private" {
+				want = ErrOutcomeUnknown
+			}
+			if !errors.Is(err, want) || sender.calls != 1 || f.sender.calls != 0 || strings.Contains(err.Error(), "private") || f.users.writes != 0 {
+				t.Fatal("deletion transport uncertainty was hidden, leaked or retried")
+			}
+		})
 	}
 }

@@ -123,6 +123,9 @@ type Deps struct {
 	// be reachable without the gate, so an absent service fails closed
 	// (404/route-absent) rather than open.
 	StepUp *stepup.Service
+	// AccountDeletionProofs is default-off until explicitly injected. It grants
+	// only deletion-specific authority, never Step-up or a new session.
+	AccountDeletionProofs AccountDeletionProofs
 	// Privacy serves anonymous recovery even when new deletion requests are off.
 	Privacy *privacy.Service
 	// PrivacyDeletionEnabled is the default-off rollout gate for new requests.
@@ -304,6 +307,9 @@ func (s *Server) registerRoutes() {
 	// provisioned (it requires a database and at least one verifiable factor).
 	if s.deps.StepUp != nil {
 		s.registerStepUpRoutes()
+	}
+	if s.deps.AccountDeletionProofs != nil {
+		s.registerActionProofRoutes()
 	}
 
 	// GDPR privacy routes are mounted when the service is provisioned, which

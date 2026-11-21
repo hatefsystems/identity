@@ -63,3 +63,38 @@ func TestEmailValidationDoesNotSubmit(t *testing.T) {
 		t.Fatal("invalid input sent email")
 	}
 }
+
+func TestDeletionEmailCopyIsExplicitAndPreservesExactDelivery(t *testing.T) {
+	transport := &captureMail{}
+	email, err := NewDeletionEmail("security@example.test", transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute).Truncate(time.Millisecond)
+	destination := "\u0645\u0627\u0644\u06a9@example.test"
+	if err := email.SendCode(context.Background(), destination, "000042", expires); err != nil {
+		t.Fatal(err)
+	}
+	message := string(transport.message)
+	if transport.calls != 1 || transport.recipient != destination || !transport.deadline.Equal(expires) || !strings.Contains(message, "Subject: Your account-deletion request code\r\n") || !strings.Contains(message, "authorizes one account-deletion request") || !strings.Contains(message, "000042\r\n") || !strings.Contains(message, expires.Format(time.RFC3339Nano)) || strings.Contains(message, "Your account sign-in code") || strings.Contains(message, "started signing in") || strings.Contains(message, "#token=") || strings.Contains(message, "https://") {
+		t.Fatal("deletion copy reused login or changed exact delivery bytes/deadline")
+	}
+	transport.err = errPrivate
+	if err := email.SendCode(context.Background(), destination, "000042", expires); err != ErrOutcomeUnknown || transport.calls != 2 {
+		t.Fatal("deletion SMTP unknown acceptance was retried or hidden")
+	}
+	for _, code := range []string{"12345", "1234567", "\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6"} {
+		if err := email.SendCode(context.Background(), destination, code, expires); err != ErrInvalid {
+			t.Fatal("invalid deletion code sent")
+		}
+	}
+	if transport.calls != 2 {
+		t.Fatal("invalid deletion delivery invoked SMTP")
+	}
+	if _, err := NewDeletionEmail("security@example.test\r\nBcc: private@example.test", transport); err != ErrInvalid {
+		t.Fatal("deletion accepted unsafe system sender")
+	}
+	if _, err := NewDeletionEmail("security@example.test", nil); err != ErrInvalid {
+		t.Fatal("deletion accepted missing transport")
+	}
+}

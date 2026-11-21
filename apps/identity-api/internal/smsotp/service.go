@@ -39,6 +39,9 @@ type BlindIndexer interface{ Compute(string) string }
 
 // Config defines bounded OTP policy and explicit signup delivery budgets.
 type Config struct {
+	// DeletionSender uses an explicitly separate account-deletion provider template.
+	// A missing sender disables deletion, never falling back to enrollment/login.
+	DeletionSender    Sender
 	CodeTTL           time.Duration
 	MaxAttempts       int
 	LockoutTTL        time.Duration
@@ -100,6 +103,9 @@ func New(cfg Config, users UserStore, enc Encryptor, idx BlindIndexer, limiter r
 		return nil, errors.New("smsotp: invalid bounded policy")
 	}
 	cfg.HashPepper = append([]byte(nil), cfg.HashPepper...)
+	if missingDependency(cfg.DeletionSender) {
+		cfg.DeletionSender = nil
+	}
 	return &Service{users: users, encryptor: enc, indexer: idx, limiter: limiter, otps: otps, sender: sender, cfg: cfg}, nil
 }
 func missingDependency(value any) bool {

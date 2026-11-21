@@ -41,6 +41,32 @@ func (s *Service) ContactLoginPolicy(phone, sourceIP string) (LoginPolicy, error
 	if !s.DeliveryEnabled() {
 		return LoginPolicy{}, ErrDisabled
 	}
+	return s.contactPolicy(phone, sourceIP)
+}
+
+// DeletionDeliveryEnabled requires the separate deletion-template sender.
+func (s *Service) DeletionDeliveryEnabled() bool {
+	return s != nil && s.cfg.DeletionSender != nil
+}
+
+// ContactDeletionTTL exposes the same stricter SMS lifetime, without delivery.
+func (s *Service) ContactDeletionTTL() time.Duration {
+	if !s.DeletionDeliveryEnabled() {
+		return 0
+	}
+	return s.cfg.CodeTTL
+}
+
+// ContactDeletionPolicy reuses the exact login/signup/enrollment spend and lockout
+// keys. The caller must reserve them atomically with its deletion challenge.
+func (s *Service) ContactDeletionPolicy(phone, sourceIP string) (LoginPolicy, error) {
+	if !s.DeletionDeliveryEnabled() {
+		return LoginPolicy{}, ErrDisabled
+	}
+	return s.contactPolicy(phone, sourceIP)
+}
+
+func (s *Service) contactPolicy(phone, sourceIP string) (LoginPolicy, error) {
 	canonical, err := NormalizePhone(phone)
 	if err != nil || canonical != phone {
 		return LoginPolicy{}, ErrInvalidPhone
@@ -63,13 +89,26 @@ func (s *Service) DeliverContactLoginCode(ctx context.Context, phone, code strin
 	if !s.DeliveryEnabled() {
 		return ErrDisabled
 	}
+	return deliverContactCode(ctx, s.sender, phone, code, expiresAt)
+}
+
+// DeliverContactDeletionCode sends once using only the deletion-template sender.
+// It never issues an enrollment proof, retries, refunds spend or extends expiry.
+func (s *Service) DeliverContactDeletionCode(ctx context.Context, phone, code string, expiresAt time.Time) error {
+	if !s.DeletionDeliveryEnabled() {
+		return ErrDisabled
+	}
+	return deliverContactCode(ctx, s.cfg.DeletionSender, phone, code, expiresAt)
+}
+
+func deliverContactCode(ctx context.Context, sender Sender, phone, code string, expiresAt time.Time) error {
 	canonical, err := NormalizePhone(phone)
 	if err != nil || canonical != phone || len(code) != 6 || strings.IndexFunc(code, func(r rune) bool { return r < '0' || r > '9' }) >= 0 || !expiresAt.After(time.Now()) {
 		return ErrNoActiveCode
 	}
 	ctx, cancel := context.WithDeadline(ctx, expiresAt)
 	defer cancel()
-	if err := s.sender.SendCode(ctx, phone, code); err != nil {
+	if err := sender.SendCode(ctx, phone, code); err != nil {
 		switch reason := SendFailureReason(err); reason {
 		case "credentials", "account", "egress", "template", "parameters", "credit", "throttle", "recipient":
 			return &sendError{reason: reason}

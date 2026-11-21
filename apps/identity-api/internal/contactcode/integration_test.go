@@ -214,3 +214,185 @@ func TestContactLoginRealRedisUnknownCommittedConsumeIntegration(t *testing.T) {
 		t.Fatal("unknown committed consume retried, restored proof or granted authority")
 	}
 }
+
+func realDeletionFixture(t *testing.T, cfg Config) (deletionFixture, string) {
+	t.Helper()
+	sender := &captureSender{}
+	cfg.DeletionEmail = sender
+	f, prefix := realRedisFixture(t, cfg)
+	return deletionFixture{fixture: f, mail: sender, binding: DeletionBinding{f.id, 9, uuid.NewString(), f.jkt}, evidence: strings.Repeat("a", 64)}, prefix
+}
+
+func TestContactDeletionRealRedisBoundSnapshotAndOneWinnerIntegration(t *testing.T) {
+	f, prefix := realDeletionFixture(t, Config{PerDestinationPerMinute: 2})
+	login, _ := f.request(t, ChannelEmail, "owner@example.test")
+	loginCode := f.email.last().code
+	handle, expires := f.requestDeletion(t, ChannelEmail, "owner@example.test")
+	code := f.mail.last().code
+	rec, err := f.store.Get(f.ctx, handle)
+	if err != nil || !rec.ExpiresAt.Equal(expires) || rec.ContactBinding != f.evidence || rec.SessionID != f.binding.SessionID {
+		t.Fatal("deletion record did not freeze exact original bindings/deadline")
+	}
+	if _, err := f.svc.Verify(f.ctx, handle, f.jkt, code); err != ErrNoActiveCode {
+		t.Fatal("deletion record authorized login")
+	}
+	if _, err := f.svc.VerifyDeletion(f.ctx, f.binding, login, loginCode); err != ErrNoActiveCode {
+		t.Fatal("login record authorized deletion")
+	}
+	for _, field := range []string{"account", "version", "session", "jkt"} {
+		binding := f.binding
+		switch field {
+		case "account":
+			binding.AccountID = uuid.New()
+		case "version":
+			binding.AuthVersion++
+		case "session":
+			binding.SessionID = uuid.NewString()
+		case "jkt":
+			binding.JKT = capability(2)
+		}
+		if _, err := f.svc.VerifyDeletion(f.ctx, binding, handle, code); err != ErrNoActiveCode {
+			t.Fatalf("foreign %s accepted deletion", field)
+		}
+	}
+	for _, field := range []string{"session", "contact"} {
+		other := rec
+		if field == "session" {
+			other.SessionID = uuid.NewString()
+		} else {
+			other.ContactBinding = strings.Repeat("b", 64)
+		}
+		if err := f.store.Consume(f.ctx, other, rec.CodeHash, "test:lock"); err != ErrNoActiveCode {
+			t.Fatal("changed deletion snapshot spent an attempt")
+		}
+	}
+	for _, purpose := range []string{PurposeLogin, "signup", "enrollment"} {
+		other := rec
+		other.Purpose = purpose
+		if err := f.client.HSet(f.ctx, prefix+challengePrefix+handle, "payload", recordPayload(other)).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.svc.VerifyDeletion(f.ctx, f.binding, handle, code); err != ErrNoActiveCode {
+			t.Fatal("foreign purpose authorized deletion")
+		}
+	}
+	if err := f.client.HSet(f.ctx, prefix+challengePrefix+handle, "payload", recordPayload(rec)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if f.client.HGet(f.ctx, prefix+challengePrefix+handle, "attempts").Val() != "0" || f.client.HGet(f.ctx, prefix+challengePrefix+login, "attempts").Val() != "0" {
+		t.Fatal("foreign binding/purpose spent an attempt")
+	}
+	results := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			result, err := f.svc.VerifyDeletion(f.ctx, f.binding, handle, code)
+			if err == nil && result != rec {
+				err = ErrInvalid
+			}
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if err != ErrNoActiveCode {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.svc.Verify(f.ctx, login, f.jkt, loginCode); err != nil {
+		t.Fatal("deletion consumption affected independent login")
+	}
+	if winners != 1 || f.client.Exists(f.ctx, prefix+challengePrefix+handle).Val() != 0 || f.client.ZCard(f.ctx, prefix+capacityKey).Val() != 0 {
+		t.Fatal("real Redis deletion completion did not have one atomic winner")
+	}
+}
+
+func TestContactDeletionRealRedisConcurrentAttemptsAndSharedLockoutIntegration(t *testing.T) {
+	f, prefix := realDeletionFixture(t, Config{})
+	handle, _ := f.requestDeletion(t, ChannelEmail, "owner@example.test")
+	results := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			_, err := f.svc.VerifyDeletion(f.ctx, f.binding, handle, "invalid")
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	wrong, exhausted := 0, 0
+	for err := range results {
+		switch err {
+		case ErrInvalidCode:
+			wrong++
+		case ErrLockedOut:
+			exhausted++
+		case ErrNoActiveCode:
+		default:
+			t.Fatal(err)
+		}
+	}
+	if wrong != 2 || exhausted != 1 || f.client.Exists(f.ctx, prefix+challengePrefix+handle).Val() != 0 || f.client.ZCard(f.ctx, prefix+capacityKey).Val() != 0 {
+		t.Fatal("real Redis deletion concurrent attempts exceeded captured limit")
+	}
+	if _, _, err := f.svc.Request(f.ctx, f.id, 9, f.jkt, ChannelEmail, "owner@example.test", "198.51.100.8"); err != ErrLockedOut {
+		t.Fatal("login bypassed deletion lockout")
+	}
+	if _, _, err := f.svc.RequestDeletion(f.ctx, f.binding, ChannelEmail, "owner@example.test", f.evidence, "198.51.100.8"); err != ErrLockedOut {
+		t.Fatal("deletion bypassed shared destination lockout")
+	}
+}
+
+func TestContactDeletionRealRedisMixedPurposeQuotasAndCapacityIntegration(t *testing.T) {
+	f, prefix := realDeletionFixture(t, Config{MaxPending: 2, PerDestinationPerMinute: 2, PerSourcePerHour: 100})
+	results := make(chan error, 20)
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			var err error
+			if i%2 == 0 {
+				_, _, err = f.svc.Request(f.ctx, f.id, 9, f.jkt, ChannelEmail, "owner@example.test", "203.0.113.8")
+			} else {
+				_, _, err = f.svc.RequestDeletion(f.ctx, f.binding, ChannelEmail, "owner@example.test", f.evidence, "203.0.113.8")
+			}
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if err != ErrRateLimited {
+			t.Fatal(err)
+		}
+	}
+	if winners != 2 || f.email.calls()+f.mail.calls() != 2 || f.client.ZCard(f.ctx, prefix+capacityKey).Val() != 2 || f.client.ZCard(f.ctx, prefix+"contact:login:global:1d").Val() != 2 {
+		t.Fatal("mixed purpose requests obtained separate Redis quota/capacity")
+	}
+}
+
+func TestContactDeletionRealRedisOriginalExpiryAndUnknownConsumeIntegration(t *testing.T) {
+	f, prefix := realDeletionFixture(t, Config{CodeTTL: time.Second})
+	handle, expires := f.requestDeletion(t, ChannelEmail, "owner@example.test")
+	if err := f.client.PExpire(f.ctx, prefix+challengePrefix+handle, 3*time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Until(expires) + 10*time.Millisecond)
+	if _, err := f.svc.VerifyDeletion(f.ctx, f.binding, handle, f.mail.last().code); err != ErrNoActiveCode {
+		t.Fatal("extended Redis TTL bypassed deletion original deadline")
+	}
+	f, prefix = realDeletionFixture(t, Config{})
+	handle, _ = f.requestDeletion(t, ChannelEmail, "owner@example.test")
+	client := &uncertainRedis{Cmdable: f.store.client, script: consumeScript}
+	f.store.client = client
+	result, err := f.svc.VerifyDeletion(f.ctx, f.binding, handle, f.mail.last().code)
+	if err != ErrOutcomeUnknown || result != (Record{}) || client.calls != 1 || f.mail.calls() != 1 || f.client.Exists(f.ctx, prefix+challengePrefix+handle).Val() != 0 {
+		t.Fatal("unknown committed deletion consume retried, restored proof or granted authority")
+	}
+}

@@ -191,6 +191,14 @@ func run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
+	deletionProofService, err := buildAccountDeletionProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
+	if err != nil {
+		return err
+	}
+	var deletionProofs server.AccountDeletionProofs
+	if deletionProofService != nil {
+		deletionProofs = deletionProofService
+	}
 
 	// The recovery-code service reuses the WebAuthn database pool and, when
 	// present, the Redis client for its optional rate limits. When no database
@@ -303,6 +311,7 @@ func run(logger *slog.Logger) (runErr error) {
 		SessionManager:         sessionManager,
 		Login:                  loginService,
 		PasswordLoginEnabled:   passwordLoginEnabled,
+		AccountDeletionProofs:  deletionProofs,
 		Profile:                profileService,
 		PrivateProfile:         privateProfileReader,
 		WebAuthn:               webauthnService,
@@ -320,6 +329,14 @@ func run(logger *slog.Logger) (runErr error) {
 	// Listen for OS termination signals to trigger graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var proofCleanupDone chan struct{}
+	if deletionProofService != nil {
+		proofCleanupDone = make(chan struct{})
+		go func() {
+			defer close(proofCleanupDone)
+			maintainAccountDeletionProofs(ctx, deletionProofService, logger)
+		}()
+	}
 
 	// Run the server in a goroutine so we can wait on the signal context.
 	serverErr := make(chan error, 2)
@@ -337,6 +354,9 @@ func run(logger *slog.Logger) (runErr error) {
 	case <-ctx.Done():
 	}
 	stop()
+	if proofCleanupDone != nil {
+		<-proofCleanupDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
@@ -346,6 +366,10 @@ func run(logger *slog.Logger) (runErr error) {
 // service. A dependency outage must not hide a configuration admission failure.
 func validateStartupInputs(cfg config.Config) error {
 	loginCfg, err := config.LoadLogin(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	deletionProofCfg, err := config.LoadAccountDeletionProofs(cfg.Environment)
 	if err != nil {
 		return err
 	}
@@ -379,7 +403,7 @@ func validateStartupInputs(cfg config.Config) error {
 	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}
@@ -834,6 +858,18 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 	if err != nil {
 		return nil, err
 	}
+	deletionCfg, err := config.LoadAccountDeletionProofs(environment)
+	if err != nil {
+		return nil, err
+	}
+	var deletionSender smsotp.Sender
+	if deletionCfg.SMSEnabled {
+		deletionSender, err = smsir.New(smsir.Config{APIKey: smsCfg.GatewayAPIKey,
+			TemplateID: deletionCfg.DeletionTemplateID, CodeParameter: smsCfg.CodeParameter})
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
 		CodeTTL:           smsCfg.CodeTTL,
@@ -846,6 +882,7 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		SignupEnabled:     registrationCfg.Enabled,
 		GlobalPerDay:      smsCfg.GlobalPerDay,
 		MaxPendingSignup:  smsCfg.MaxPendingSignup,
+		DeletionSender:    deletionSender,
 	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)

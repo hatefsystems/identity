@@ -39,34 +39,37 @@ func productionStartupEnvironment(t *testing.T) {
 	}
 	encodedNextKey := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: nextDER}))
 	for name, value := range map[string]string{
-		"APP_ENV":                             "production",
-		"PORTAL_ORIGIN":                       "https://identity.example.test",
-		"OIDC_ISSUER":                         "https://identity.example.test",
-		"OIDC_SIGNING_KEY_ACTIVE_PEM":         encodedKey,
-		"OIDC_SIGNING_KEY_NEXT_PEM":           encodedNextKey,
-		"OIDC_SIGNING_KEY_PREVIOUS_PEM":       "",
-		"OIDC_CLIENTS_JSON":                   `[{"client_id":"portal","redirect_uris":["https://identity.example.test/callback"],"token_endpoint_auth_method":"none","allowed_scopes":["openid"]}]`,
-		"WEBAUTHN_RP_ID":                      "identity.example.test",
-		"WEBAUTHN_RP_ORIGINS":                 "https://identity.example.test",
-		"WEBAUTHN_MOCK_CHALLENGE_KEY":         base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x31}, 32)),
-		"DATABASE_URL":                        "postgres://127.0.0.1:1/invalid?sslmode=disable",
-		"REDIS_URL":                           "redis://127.0.0.1:1/0",
-		"NATS_URL":                            "nats://127.0.0.1:1",
-		"ENVELOPE_MASTER_KEK":                 base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32)),
-		"ENVELOPE_MASTER_KEK_VERSION":         "1",
-		"ENVELOPE_BLIND_INDEX_PEPPER":         base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x43}, 32)),
-		"ENVELOPE_BLIND_INDEX_PEPPER_VERSION": "7",
-		"STEPUP_REPLAY_HMAC_KEY":              base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x44}, 32)),
-		"SESSION_COOKIE_SECURE":               "true",
-		"SESSION_COOKIE_NAME":                 "__Host-session",
-		"SESSION_ABSOLUTE_TTL":                "24h",
-		"SESSION_IDLE_TTL":                    "2h",
-		"SMS_ENABLED":                         "false",
-		"REGISTRATION_ENABLED":                "false",
-		"USERNAME_ENABLED":                    "false",
-		"ADMIN_ENABLED":                       "false",
-		"GRPC_ENABLED":                        "false",
-		"GDPR_DELETION_ENABLED":               "false",
+		"APP_ENV":                               "production",
+		"PORTAL_ORIGIN":                         "https://identity.example.test",
+		"OIDC_ISSUER":                           "https://identity.example.test",
+		"OIDC_SIGNING_KEY_ACTIVE_PEM":           encodedKey,
+		"OIDC_SIGNING_KEY_NEXT_PEM":             encodedNextKey,
+		"OIDC_SIGNING_KEY_PREVIOUS_PEM":         "",
+		"OIDC_CLIENTS_JSON":                     `[{"client_id":"portal","redirect_uris":["https://identity.example.test/callback"],"token_endpoint_auth_method":"none","allowed_scopes":["openid"]}]`,
+		"WEBAUTHN_RP_ID":                        "identity.example.test",
+		"WEBAUTHN_RP_ORIGINS":                   "https://identity.example.test",
+		"WEBAUTHN_MOCK_CHALLENGE_KEY":           base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x31}, 32)),
+		"DATABASE_URL":                          "postgres://127.0.0.1:1/invalid?sslmode=disable",
+		"REDIS_URL":                             "redis://127.0.0.1:1/0",
+		"NATS_URL":                              "nats://127.0.0.1:1",
+		"ENVELOPE_MASTER_KEK":                   base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32)),
+		"ENVELOPE_MASTER_KEK_VERSION":           "1",
+		"ENVELOPE_BLIND_INDEX_PEPPER":           base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x43}, 32)),
+		"ENVELOPE_BLIND_INDEX_PEPPER_VERSION":   "7",
+		"STEPUP_REPLAY_HMAC_KEY":                base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x44}, 32)),
+		"SESSION_COOKIE_SECURE":                 "true",
+		"SESSION_COOKIE_NAME":                   "__Host-session",
+		"SESSION_ABSOLUTE_TTL":                  "24h",
+		"SESSION_IDLE_TTL":                      "2h",
+		"SMS_ENABLED":                           "false",
+		"REGISTRATION_ENABLED":                  "false",
+		"USERNAME_ENABLED":                      "false",
+		"ADMIN_ENABLED":                         "false",
+		"GRPC_ENABLED":                          "false",
+		"GDPR_DELETION_ENABLED":                 "false",
+		"ACCOUNT_DELETION_PROOFS_ENABLED":       "false",
+		"ACCOUNT_DELETION_PROOFS_EMAIL_ENABLED": "false",
+		"ACCOUNT_DELETION_PROOFS_SMS_ENABLED":   "false",
 	} {
 		t.Setenv(name, value)
 	}
@@ -90,6 +93,7 @@ func TestComposedStartupRejectsInvalidSettingsBeforeDial(t *testing.T) {
 		{"STEPUP_REPLAY_HMAC_KEY", "", "STEPUP_REPLAY_HMAC_KEY"},
 		{"SMS_ENABLED", "true", "SMS_PROVIDER"},
 		{"REGISTRATION_ENABLED", "true", "REGISTRATION_PENDING_CAPACITY"},
+		{"ACCOUNT_DELETION_PROOFS_ENABLED", "TRUE", "account deletion proof switches"},
 	} {
 		t.Run(test.name+"/"+test.want, func(t *testing.T) {
 			productionStartupEnvironment(t)
@@ -148,6 +152,24 @@ func TestDisabledRegistrationCompositionDoesNotLoadDeliveryOrCleanupSecrets(t *t
 				t.Fatalf("disabled registration acquired unrelated dependencies: %v", err)
 			}
 		})
+	}
+}
+
+func TestDisabledAccountDeletionProofsNeedNoDependencies(t *testing.T) {
+	productionStartupEnvironment(t)
+	svc, err := buildAccountDeletionProofs("production", nil, nil, nil, nil)
+	if err != nil || svc != nil {
+		t.Fatal("disabled proof ceremony acquired dependencies")
+	}
+	t.Setenv("ACCOUNT_DELETION_PROOFS_ENABLED", "true")
+	t.Setenv("ACCOUNT_DELETION_PROOFS_SMS_ENABLED", "true")
+	t.Setenv("SMS_ENABLED", "true")
+	t.Setenv("SMS_IR_TEMPLATE_ID", "123")
+	t.Setenv("ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID", "124")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("ACCOUNT_DELETION_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	if _, err := buildAccountDeletionProofs("production", nil, nil, nil, nil); err == nil {
+		t.Fatal("enabled proof ceremony admitted without live dependencies")
 	}
 }
 
