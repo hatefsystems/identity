@@ -23,7 +23,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { PortalClient } from '../_lib/portal/client';
+import { PortalClient, type SecurityChange } from '../_lib/portal/client';
 import { AdminClient } from '../_lib/admin/client';
 import type { AdminCapabilities } from '../_lib/admin/contracts';
 import type { Profile, StepUpGrant } from '../_lib/portal/contracts';
@@ -78,11 +78,12 @@ export function PortalProvider({
   const preferences = useDisplayPreferences();
   const [state, setState] = useState<PortalState | null>(null);
   const [phase, setPhase] = useState<
-    'checking' | 'ready' | 'failed' | 'signing-out' | 'no-access' | 'disabled'
+    'checking' | 'ready' | 'failed' | 'signing-out' | 'no-access' | 'disabled' | 'security-settling'
   >('checking');
   const [error, setError] = useState<Message>('');
   const [attempt, setAttempt] = useState(0);
   const [deletionOutcome, setDeletionOutcome] = useState<DeletionOutcome | null>(null);
+  const [securityOutcome, setSecurityOutcome] = useState<SecurityChange | null>(null);
   const [moderationInterrupted, setModerationInterrupted] = useState(false);
   const [legalInterrupted, setLegalInterrupted] = useState<LegalOperation | null>(null);
   const [navigationOpen, setNavigationOpen] = useState(false);
@@ -90,11 +91,12 @@ export function PortalProvider({
   const navigationLinks = useRef<HTMLDivElement>(null);
   const navigationFocus = useRef<HTMLElement | null>(null);
   const navigationID = useId();
-  const terminal = useRef<DeletionOutcome | null>(null);
+  const terminal = useRef<DeletionOutcome | SecurityChange | null>(null);
   const deleting = useRef<{ sent: boolean; interrupt: () => void } | null>(null);
   const alive = useRef(false);
   const outcomeHeading = useRef<HTMLHeadingElement>(null);
   const active = useRef<PortalClient | null>(null);
+  const settlingSecurity = useRef<PortalClient | null>(null);
   const signingOut = useRef(false);
   const requireReconciliation = useRef(false);
   const wasHidden = useRef(false);
@@ -110,6 +112,8 @@ export function PortalProvider({
     wasHidden.current = false;
     active.current?.dispose();
     active.current = null;
+    settlingSecurity.current?.dispose();
+    settlingSecurity.current = null;
     clearSensitiveViews();
     if (alive.current) setState(null);
   }, []);
@@ -132,8 +136,8 @@ export function PortalProvider({
   }, []);
 
   useEffect(() => {
-    if (deletionOutcome) outcomeHeading.current?.focus();
-  }, [deletionOutcome]);
+    if (deletionOutcome || securityOutcome) outcomeHeading.current?.focus();
+  }, [deletionOutcome, securityOutcome]);
 
   useEffect(() => {
     // A waiting TOTP marker is only meaningful on the route where it started.
@@ -185,13 +189,28 @@ export function PortalProvider({
     const client = new PortalClient();
     active.current = client;
     let expiry: ReturnType<typeof setTimeout> | undefined;
-    function lost(failure: PortalError) {
-      if (active.current !== client) return;
+    function lost(failure: PortalError, settling = false) {
+      if (active.current !== client && settlingSecurity.current !== client) return;
       if (deleting.current?.sent) {
         deleting.current.interrupt();
         return;
       }
-      const hadSession = Boolean(client.profile);
+      if (settling) {
+        requireReconciliation.current = true;
+        suspended.current = null;
+        active.current = null;
+        settlingSecurity.current = client;
+        clearSensitiveViews();
+        setState(null);
+        setError('');
+        setPhase('security-settling');
+        return;
+      }
+      const hadSession = Boolean(client.profile) || settlingSecurity.current === client;
+      if (settlingSecurity.current === client) {
+        settlingSecurity.current = null;
+        requireReconciliation.current = false;
+      }
       suspended.current = null;
       active.current = null;
       client.dispose();
@@ -212,6 +231,15 @@ export function PortalProvider({
         invalidateOtherTabs();
     }
     client.onSessionLoss = lost;
+    client.onSecurityChange = (outcome) => {
+      if ((active.current !== client && settlingSecurity.current !== client) || terminal.current) return;
+      terminal.current = outcome;
+      requireReconciliation.current = true;
+      clear();
+      setError('');
+      setSecurityOutcome(outcome);
+      invalidateOtherTabs();
+    };
     client
       .bootstrap()
       .then(async (profile) => {
@@ -236,6 +264,7 @@ export function PortalProvider({
         // still uses the absolute deadline; never fabricate a sliding expiry.
         const deadline = Date.parse(profile.session.expires_at);
         function checkExpiry() {
+          if (settlingSecurity.current === client) return;
           if (Date.now() >= deadline) lost(new PortalError('session_expired', 401));
           else expiry = setTimeout(checkExpiry, Math.min(deadline - Date.now(), 2147483647));
         }
@@ -249,6 +278,7 @@ export function PortalProvider({
       if (expiry) clearTimeout(expiry);
       client.dispose();
       if (active.current === client) active.current = null;
+      if (settlingSecurity.current === client) settlingSecurity.current = null;
     };
   }, [attempt, admin, sessionRoute]);
 
@@ -272,6 +302,7 @@ export function PortalProvider({
       setPhase('checking');
     }
     function changedSession() {
+      if (terminal.current) return;
       invalidate();
       if (signingOut.current || requireReconciliation.current) return;
       wasHidden.current = document.visibilityState === 'hidden';
@@ -302,7 +333,7 @@ export function PortalProvider({
       else discardIntent();
     }
     function visibility() {
-      if (requireReconciliation.current || signingOut.current) return;
+      if (terminal.current || requireReconciliation.current || signingOut.current) return;
       if (document.visibilityState === 'hidden') {
         if (deleting.current?.sent) {
           deleting.current.interrupt();
@@ -538,7 +569,7 @@ export function PortalProvider({
                 : t('portal.shell.adminTitle')}
             </span>
           )}
-          {ready && !deletionOutcome && (
+          {ready && !deletionOutcome && !securityOutcome && (
             <Button
               type="button"
               variant="outline"
@@ -553,7 +584,7 @@ export function PortalProvider({
       <div
         className={cn(
           'mx-auto grid max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:gap-10 lg:py-10',
-          !deletionOutcome && 'lg:grid-cols-[12rem_minmax(0,1fr)]'
+          !deletionOutcome && !securityOutcome && 'lg:grid-cols-[12rem_minmax(0,1fr)]'
         )}
       >
         <nav
@@ -561,7 +592,7 @@ export function PortalProvider({
             admin ? t('portal.shell.adminNavigation') : t('portal.shell.accountNavigation')
           }
           className="min-w-0"
-          hidden={Boolean(deletionOutcome)}
+          hidden={Boolean(deletionOutcome || securityOutcome)}
         >
           <p className="mb-3 hidden px-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground lg:block">
             {admin ? t('portal.shell.adminTitle') : t('portal.shell.accountTitle')}
@@ -646,7 +677,25 @@ export function PortalProvider({
               />
             </div>
           )}
-          {deletionOutcome ? (
+          {securityOutcome ? (
+            <section
+              data-testid="security-outcome"
+              data-outcome={securityOutcome}
+              className="mx-auto max-w-2xl space-y-5 rounded-xl border bg-card p-6 sm:p-8"
+            >
+              <h1
+                ref={outcomeHeading}
+                tabIndex={-1}
+                className="text-2xl font-semibold tracking-tight focus:outline-none"
+              >
+                {t('security.outcome.title')}
+              </h1>
+              <Feedback status={{ key: `security.outcome.${securityOutcome}` }} />
+              <Link href="/login" prefetch={false} className={linkClass}>
+                {t('security.outcome.login')}
+              </Link>
+            </section>
+          ) : deletionOutcome ? (
             <section
               data-testid="deletion-outcome"
               data-outcome={deletionOutcome}
@@ -719,9 +768,11 @@ export function PortalProvider({
                     ? admin
                       ? t('portal.shell.checkingAdmin')
                       : t('portal.shell.checking')
-                    : phase === 'signing-out'
-                      ? t('portal.shell.signingOut')
-                      : ''
+                    : phase === 'security-settling'
+                      ? t('security.stepUp.applying')
+                      : phase === 'signing-out'
+                        ? t('portal.shell.signingOut')
+                        : ''
                 }
                 error={
                   requireReconciliation.current && error

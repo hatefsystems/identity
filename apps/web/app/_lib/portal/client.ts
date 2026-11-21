@@ -3,6 +3,7 @@ import { browserKey, signProof, type BrowserKey } from './dpop';
 import { isSessionLoss, parseRetryAfter, PortalError, throwIfAborted } from './errors';
 import {
   passkeyResponse,
+  passkeyListEntryResponse,
   profileResponse,
   recoveryBatchResponse,
   recoveryStatusResponse,
@@ -28,6 +29,9 @@ type RequestOptions = {
 };
 type Decoder<T> = (value: unknown, status: number) => T;
 export type LoginMfa = { status: 'mfa_required'; preauthentication: string; expires_at: string };
+export type SecurityChange =
+  | 'passkeyAdded' | 'passkeyRemoved' | 'totpEnabled' | 'totpDisabled'
+  | 'phoneVerified' | 'phoneRemoved';
 
 const adminQueryKeys: Readonly<Record<string, readonly string[]>> = {
   '/api/v1/admin/users': ['limit', 'offset', 'status'],
@@ -40,10 +44,18 @@ const adminQueryKeys: Readonly<Record<string, readonly string[]>> = {
 export class PortalClient {
   #lifetime = new AbortController();
   #profile?: Profile;
+  #securityRequests = new Set<{
+    sent: boolean;
+    preserved: boolean;
+    controller: AbortController;
+    detach: () => void;
+  }>();
+  #pendingSessionLoss?: PortalError;
   readonly origin: string;
   private readonly fetcher: typeof fetch;
   private readonly getKey: () => Promise<BrowserKey>;
-  onSessionLoss?: (error: PortalError) => void;
+  onSessionLoss?: (error: PortalError, settlingSecurity?: boolean) => void;
+  onSecurityChange?: (outcome: SecurityChange) => void;
 
   constructor(
     options: { origin?: string; fetcher?: typeof fetch; getKey?: () => Promise<BrowserKey> } = {}
@@ -64,7 +76,7 @@ export class PortalClient {
     throwIfAborted(this.#lifetime.signal);
     if (!this.#profile || Date.now() >= Date.parse(this.#profile.session.expires_at)) {
       const error = new PortalError('session_expired', 401);
-      this.onSessionLoss?.(error);
+      this.loseSession(error);
       throw error;
     }
     return this.#profile;
@@ -72,7 +84,28 @@ export class PortalClient {
 
   dispose(): void {
     this.#profile = undefined;
+    this.#pendingSessionLoss = undefined;
     this.#lifetime.abort();
+    for (const request of this.#securityRequests) request.controller.abort();
+  }
+
+  private loseSession(error: PortalError): void {
+    if (this.#pendingSessionLoss) return;
+    const pending = [...this.#securityRequests].filter(
+      (request) => request.sent && !request.controller.signal.aborted
+    );
+    if (pending.length) {
+      this.#pendingSessionLoss = error;
+      for (const request of pending) {
+        request.preserved = true;
+        request.detach();
+      }
+      // Withdraw authority now, preserving only bounded, already-sent responses.
+      // Dialog teardown cannot cancel them, but explicit disposal still can.
+      this.#profile = undefined;
+      this.#lifetime.abort();
+    }
+    this.onSessionLoss?.(error, pending.length > 0);
   }
 
   async request<T>(path: string, decode: Decoder<T>, options: RequestOptions = {}): Promise<T> {
@@ -162,6 +195,21 @@ export class PortalClient {
       legalLookup
         ? 4 * 1024 * 1024
         : undefined;
+    let securityTarget: SecurityChange | undefined;
+    if (!options.anonymous) {
+      if (method === 'POST' && path === '/api/v1/auth/webauthn/register/verify')
+        securityTarget = 'passkeyAdded';
+      else if (method === 'DELETE' && /^\/api\/v1\/auth\/webauthn\/keys\/[^/]+$/.test(path))
+        securityTarget = 'passkeyRemoved';
+      else if (method === 'POST' && path === '/api/v1/auth/mfa/verify')
+        securityTarget = 'totpEnabled';
+      else if (method === 'DELETE' && path === '/api/v1/auth/mfa')
+        securityTarget = 'totpDisabled';
+      else if (method === 'POST' && path === '/api/v1/users/me/phone/verify')
+        securityTarget = 'phoneVerified';
+      else if (method === 'DELETE' && path === '/api/v1/users/me/phone')
+        securityTarget = 'phoneRemoved';
+    }
     const snapshot = options.anonymous ? this.#profile : this.assertSession();
     throwIfAborted(options.signal);
     throwIfAborted(this.#lifetime.signal);
@@ -171,9 +219,18 @@ export class PortalClient {
       (signal): signal is AbortSignal => Boolean(signal)
     );
     for (const signal of signals) signal.addEventListener('abort', abort, { once: true });
+    const securityRequest = securityTarget ? {
+      sent: false,
+      preserved: false,
+      controller,
+      detach: () => {
+        for (const signal of signals) signal.removeEventListener('abort', abort);
+      },
+    } : undefined;
     const timer = setTimeout(abort, 20000);
     let sent = false;
     let response: Response | undefined;
+    let securityChange: SecurityChange | undefined;
     try {
       let body: string | undefined;
       try {
@@ -198,12 +255,17 @@ export class PortalClient {
         headers.set('X-Step-Up-Auth', options.grant.take(this.assertSession().session.id));
       let nonce: string | undefined;
       for (let attempt = 0; attempt < 2; attempt++) {
+        throwIfAborted(this.#lifetime.signal);
         const key = await this.getKey();
         throwIfAborted(controller.signal);
         headers.set('DPoP', await signProof(key, method, proofURL, nonce));
         throwIfAborted(controller.signal);
         if (!sent) options.onSend?.();
         sent = true;
+        if (securityRequest) {
+          securityRequest.sent = true;
+          this.#securityRequests.add(securityRequest);
+        }
         response = await this.fetcher(url.href, {
           method,
           headers: new Headers(headers),
@@ -224,9 +286,14 @@ export class PortalClient {
         const value = await readResponse(response, controller.signal, responseLimit);
         throwIfAborted(controller.signal);
         if (response.ok) {
-          if (snapshot && this.#profile?.session.id !== snapshot.session.id)
+          if (snapshot && this.#profile?.session.id !== snapshot.session.id && !securityRequest?.preserved)
             throw new PortalError('session_changed', 409);
-          return decode(value, response.status);
+          const result = decode(value, response.status);
+          if (securityTarget && (
+            securityTarget === 'passkeyAdded' || securityTarget === 'passkeyRemoved' ||
+            response.headers.get('X-Identity-Auth-Invalidated') === 'true'
+          )) securityChange = securityTarget;
+          return result;
         }
         const errorCode = record(value).error;
         const code =
@@ -258,7 +325,9 @@ export class PortalClient {
       }
       throw new PortalError('use_dpop_nonce', 401);
     } catch (failure) {
-      for (const signal of signals) throwIfAborted(signal);
+      if (!securityRequest?.preserved) {
+        for (const signal of signals) throwIfAborted(signal);
+      }
       const error =
         failure instanceof PortalError
           ? failure
@@ -275,11 +344,22 @@ export class PortalClient {
             (!response || response.status < 400 || response.status >= 500)),
         error.retryAfterSeconds ?? parseRetryAfter(response?.headers.get('Retry-After') ?? null)
       );
-      if (isSessionLoss(reported)) this.onSessionLoss?.(reported);
+      if (isSessionLoss(reported)) this.loseSession(reported);
       throw reported;
     } finally {
       clearTimeout(timer);
       for (const signal of signals) signal.removeEventListener('abort', abort);
+      if (securityRequest) this.#securityRequests.delete(securityRequest);
+      if (securityChange) {
+        // Decode the committed response before clearing authority. Never refresh
+        // a revoked session or reinterpret its subsequent 401 as mutation failure.
+        this.dispose();
+        this.onSecurityChange?.(securityChange);
+      } else if (this.#pendingSessionLoss && this.#securityRequests.size === 0) {
+        const failure = this.#pendingSessionLoss;
+        this.dispose();
+        this.onSessionLoss?.(failure);
+      }
     }
   }
 
@@ -288,12 +368,13 @@ export class PortalClient {
       signal,
       anonymous: true,
     });
+    throwIfAborted(this.#lifetime.signal);
     if (
       this.#profile &&
       (result.session.id !== this.#profile.session.id || result.id !== this.#profile.id)
     ) {
       const error = new PortalError('session_changed', 409);
-      this.onSessionLoss?.(error);
+      this.loseSession(error);
       throw error;
     }
     this.#profile = result;
@@ -309,7 +390,7 @@ export class PortalClient {
     const snapshot = this.assertSession();
     if (result.id !== snapshot.id || result.session.id !== snapshot.session.id) {
       const error = new PortalError('session_changed', 409);
-      this.onSessionLoss?.(error);
+      this.loseSession(error);
       throw error;
     }
     this.#profile = result;
@@ -367,7 +448,7 @@ export class PortalClient {
     });
   }
   keys(signal: AbortSignal) {
-    return this.request('/api/v1/auth/webauthn/keys', (value) => list(value, passkeyResponse), {
+    return this.request('/api/v1/auth/webauthn/keys', (value) => list(value, passkeyListEntryResponse), {
       signal,
     });
   }

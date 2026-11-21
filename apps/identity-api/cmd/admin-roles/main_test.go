@@ -53,6 +53,9 @@ func TestRoleCommandValidatesOnlyOwnedDependenciesBeforePool(t *testing.T) {
 	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(key))
 	t.Setenv(config.EnvMasterKEKVersion, "")
 	t.Setenv(config.EnvAuditSubject, "identity.audit.logs")
+	t.Setenv("LOGIN_ENABLED", "false")
+	t.Setenv("LOGIN_EMAIL_ENABLED", "false")
+	t.Setenv(config.EnvUsernameEnabled, "invalid-unused-username-setting")
 	for _, field := range []string{config.EnvBlindIndexPepper, config.EnvBlindIndexPepperVersion, config.EnvOIDCIssuer, config.EnvOIDCClients, config.EnvOIDCSigningKey, "SMS_GATEWAY_API_KEY", config.EnvAuditBatchSize, config.EnvAuditAckWait} {
 		t.Setenv(field, "unrelated-invalid-setting")
 	}
@@ -71,6 +74,34 @@ func TestRoleCommandValidatesOnlyOwnedDependenciesBeforePool(t *testing.T) {
 	err := run(t.Context(), uuid.NewString(), "support", false)
 	if err == nil || !strings.Contains(err.Error(), config.EnvMasterKEK) {
 		t.Fatalf("public key not rejected before pool: %v", err)
+	}
+}
+
+func TestRoleCommandValidatesEnabledPasswordPolicyBeforePool(t *testing.T) {
+	key := make([]byte, 32)
+	key[0] = 1
+	t.Setenv("APP_ENV", "test")
+	t.Setenv("ADMIN_OPERATOR_ID", uuid.NewString())
+	t.Setenv("ADMIN_OPERATOR_SPIFFE_ID", "spiffe://identity.test/operator")
+	t.Setenv("DATABASE_URL", "invalid-owned-role-dsn")
+	t.Setenv(config.EnvMasterKEK, base64.StdEncoding.EncodeToString(key))
+	t.Setenv(config.EnvMasterKEKVersion, "")
+	t.Setenv(config.EnvAuditSubject, "identity.audit.logs")
+	t.Setenv("LOGIN_ENABLED", "true")
+	t.Setenv("LOGIN_EMAIL_ENABLED", "invalid-unused-delivery-setting")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", "invalid-unused-delivery-secret")
+	t.Setenv(config.EnvUsernameEnabled, "false")
+	if err := run(t.Context(), uuid.NewString(), "support", false); err == nil || !strings.Contains(err.Error(), "username configuration") {
+		t.Fatalf("password login without username support reached the pool: %v", err)
+	}
+	t.Setenv(config.EnvUsernameEnabled, "true")
+	t.Setenv(config.EnvUsernamePolicyJSON, "invalid-fixture-policy")
+	if err := run(t.Context(), uuid.NewString(), "support", false); err == nil || strings.Contains(err.Error(), "invalid-owned-role-dsn") {
+		t.Fatalf("invalid admitted username configuration reached the pool: %v", err)
+	}
+	t.Setenv("LOGIN_ENABLED", "invalid-unused-login-setting")
+	if err := run(t.Context(), uuid.NewString(), "support", true); err == nil || !strings.Contains(err.Error(), "invalid-owned-role-dsn") {
+		t.Fatalf("role revocation was blocked by unrelated login/username policy: %v", err)
 	}
 }
 

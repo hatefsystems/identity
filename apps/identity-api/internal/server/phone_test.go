@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -48,6 +49,7 @@ type phoneFakeUserStore struct {
 
 	removeCalled bool
 	removeUserID uuid.UUID
+	removeErr    error
 }
 
 func (f *phoneFakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.User, error) {
@@ -59,7 +61,7 @@ func (f *phoneFakeUserStore) GetUserByID(_ context.Context, id uuid.UUID) (db.Us
 	return db.User{ID: id, Status: "active", AuthVersion: f.version}, nil
 }
 
-func (f *phoneFakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, version int64, encrypted []byte, index string, _ []byte) error {
+func (f *phoneFakeUserStore) SetPhoneIfCurrent(ctx context.Context, id uuid.UUID, version int64, encrypted []byte, index string, _ []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if version != f.version {
@@ -70,6 +72,7 @@ func (f *phoneFakeUserStore) SetPhoneIfCurrent(_ context.Context, id uuid.UUID, 
 	f.setEncrypted = encrypted
 	f.setBlindIndex = &index
 	f.phonePresent = true
+	session.SecurityChangeCommitted(ctx)
 	return nil
 }
 
@@ -78,6 +81,9 @@ func (f *phoneFakeUserStore) RemovePhoneIfCurrent(_ context.Context, id uuid.UUI
 	defer f.mu.Unlock()
 	if version != f.version {
 		return false, smsotp.ErrStaleSession
+	}
+	if f.removeErr != nil {
+		return false, f.removeErr
 	}
 	f.removeCalled = true
 	f.removeUserID = id
@@ -732,6 +738,34 @@ func TestPhoneDisabledDeliveryKeepsAuthorizedRemoval(t *testing.T) {
 	fx.users.phonePresent = true
 	if rec := fx.deletePhone(t, true); rec.Code != 204 || fx.users.phonePresent {
 		t.Fatalf("disabled removal failed: %d", rec.Code)
+	}
+}
+
+func TestPhoneLastVerifiedContactConflictConsumesGrantWithoutSuccess(t *testing.T) {
+	fx := setupPhoneTestFixture(t, true)
+	fx.users.phonePresent = true
+	fx.users.removeErr = accountpolicy.ErrLastVerifiedContact
+	disabled, err := smsotp.NewDisabled(fx.users)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &phoneAuditRecorder{}
+	fx.server = New(config.Config{Environment: "development", PortalOrigin: fx.browser.origin}, nil, Deps{SessionManager: fx.sessionManager, DPoPValidator: fx.browser.validator, SMSOTP: disabled, StepUp: fx.stepUp, AuditRecorder: recorder})
+	grant := fx.freshGrant(t)
+	send := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me/phone", nil)
+		fx.browser.authorize(t, req, fx.sess, fx.cookie)
+		req.Header.Set(stepup.HeaderStepUpAuth, grant)
+		w := httptest.NewRecorder()
+		fx.server.Handler().ServeHTTP(w, req)
+		return w
+	}
+	w := send()
+	if w.Code != http.StatusConflict || errorBody(t, w) != "last_verified_contact" || !fx.users.phonePresent || recorder.count(audit.EventPhoneRemoved) != 0 {
+		t.Fatal("last-contact conflict removed phone or recorded success")
+	}
+	if w := send(); w.Code != http.StatusForbidden {
+		t.Fatal("last-contact rejection restored consumed step-up grant")
 	}
 }
 

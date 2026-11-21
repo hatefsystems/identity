@@ -229,6 +229,12 @@ func computeKey(ctx context.Context, derive func() []byte) ([]byte, error) {
 	}
 }
 
+// SupportedHash uses the verifier's exact parser without performing a derivation.
+func SupportedHash(encodedHash string) bool {
+	_, _, _, err := decode(encodedHash)
+	return err == nil
+}
+
 // NeedsRehash reports whether the stored hash was produced with parameters
 // weaker than the current strict values, signalling that the password should
 // be transparently re-hashed on the next successful login. It returns true for

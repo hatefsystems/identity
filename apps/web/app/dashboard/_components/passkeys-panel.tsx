@@ -80,6 +80,8 @@ export function PasskeysPanel() {
             pending.kind === 'add' ? undefined : items.find((item) => item.id === pending.id);
           if (pending.kind !== 'add' && !target) {
             setError({ key: 'security.passkeys.missing' });
+          } else if (pending.kind === 'remove' && !target?.can_remove) {
+            setError({ key: 'errors.lastCredential' });
           } else {
             const restored =
               pending.kind === 'remove' ? { ...pending, name: target?.name ?? '' } : pending;
@@ -169,17 +171,16 @@ export function PasskeysPanel() {
         const attestation = await usePasskey(options, signal, true);
         throwIfAborted(signal);
         // Starting registration spends the grant, but only verify can add a key.
-        const key = await client.registerVerify(attestation, signal, onSend);
+        await client.registerVerify(attestation, signal, onSend);
         throwIfAborted(signal);
         invalidateRead();
-        setKeys((items) => [...(items ?? []), key]);
         setName('');
         setStatus({ key: 'security.passkeys.added' });
       } else if (target.kind === 'rename') {
         const key = await client.renameKey(target.id, target.name, grant, signal, onSend);
         throwIfAborted(signal);
         invalidateRead();
-        setKeys((items) => items?.map((item) => (item.id === key.id ? key : item)) ?? null);
+        setKeys((items) => items?.map((item) => (item.id === key.id ? { ...item, ...key } : item)) ?? null);
         renamed.current = key.id;
         setEditing(null);
         setStatus({ key: 'security.passkeys.renamed' });
@@ -285,7 +286,7 @@ export function PasskeysPanel() {
                     aria-label={t('security.passkeys.removeLabel', {
                       name: key.name || t('security.passkeys.unnamedLabel'),
                     })}
-                    disabled={keys.length === 1 || needsRefresh}
+                    disabled={!key.can_remove || needsRefresh}
                     onClick={() => open({ kind: 'remove', id: key.id, name: key.name })}
                   >
                     {t('security.passkeys.remove')}
@@ -348,7 +349,9 @@ export function PasskeysPanel() {
       )}
       {keys?.length === 0 && <p className="text-sm">{t('security.passkeys.empty')}</p>}
       {keys?.length === 1 && (
-        <p className="text-sm text-muted-foreground">{t('security.passkeys.last')}</p>
+        <p className="text-sm text-muted-foreground">
+          {t(keys[0].can_remove ? 'security.passkeys.lastAllowed' : 'security.passkeys.lastProtected')}
+        </p>
       )}
       <form
         aria-label={t('security.passkeys.add')}

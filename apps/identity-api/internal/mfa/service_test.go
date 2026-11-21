@@ -12,6 +12,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 type fakeUserStore struct {
@@ -38,6 +39,13 @@ func (f *fakeUserStore) GetUserByIDForUpdate(ctx context.Context, id uuid.UUID) 
 
 func (f *fakeUserStore) CountWebauthnCredentialsByUser(context.Context, uuid.UUID) (int64, error) {
 	return f.passkeys, nil
+}
+
+func (f *fakeUserStore) RevokeUserCredentials(_ context.Context, id uuid.UUID) error {
+	u := f.users[id]
+	u.AuthVersion++
+	f.users[id] = u
+	return nil
 }
 
 func (f *fakeUserStore) DeleteMfaTotpEnrollmentsForUser(_ context.Context, userID uuid.UUID) (int64, error) {
@@ -259,6 +267,9 @@ func TestVerifyAndEnableHappyPath(t *testing.T) {
 	if !updatedUser.IsMfaEnabled {
 		t.Error("expected IsMfaEnabled to be true after verification")
 	}
+	if updatedUser.AuthVersion != user.AuthVersion+1 {
+		t.Fatal("completed enrollment did not revoke exactly once")
+	}
 }
 
 func TestVerifyAndEnableInvalidCode(t *testing.T) {
@@ -353,8 +364,12 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 		t.Fatalf("VerifyEnabledCode: %v", err)
 	}
 
-	// Disable MFA
-	if err := svc.Disable(ctx, user.ID, user.AuthVersion); err != nil {
+	// The previous authentication cannot authorize another security change.
+	if err := svc.Disable(ctx, user.ID, user.AuthVersion); !errors.Is(err, ErrAccountNotActive) {
+		t.Fatalf("old authority survived enrollment: %v", err)
+	}
+	// Disable with fresh authentication at the committed version.
+	if err := svc.Disable(ctx, user.ID, store.users[user.ID].AuthVersion); err != nil {
 		t.Fatalf("Disable: %v", err)
 	}
 
@@ -365,11 +380,45 @@ func TestVerifyCodeAndDisable(t *testing.T) {
 	if len(disabledUser.MfaTotpSecretEncrypted) != 0 {
 		t.Error("expected secret to be wiped after disable")
 	}
+	if disabledUser.AuthVersion != user.AuthVersion+2 {
+		t.Fatal("factor disable did not revoke exactly once")
+	}
+	if err := svc.Disable(ctx, user.ID, disabledUser.AuthVersion); err != nil || store.users[user.ID].AuthVersion != disabledUser.AuthVersion {
+		t.Fatal("absent TOTP disable changed authority")
+	}
 
 	// Verify code after disable should fail
 	err = svc.VerifyEnabledCode(ctx, user.ID, code)
 	if !errors.Is(err, ErrMfaNotSetup) {
 		t.Errorf("expected ErrMfaNotSetup, got %v", err)
+	}
+}
+
+func TestTOTPDisableStillRequiresPasskey(t *testing.T) {
+	svc, store, _, user := setupTestService()
+	u := user
+	u.IsMfaEnabled = true
+	u.MfaTotpSecretEncrypted = []byte("configured-secret")
+	store.users[u.ID] = u
+	store.passkeys = 0
+	if err := svc.Disable(t.Context(), u.ID, u.AuthVersion); !errors.Is(err, ErrLastFactor) {
+		t.Fatalf("TOTP disable without passkey: %v", err)
+	}
+	if !store.users[u.ID].IsMfaEnabled || store.users[u.ID].AuthVersion != u.AuthVersion {
+		t.Fatal("rejected TOTP removal wrote factor or version")
+	}
+}
+
+func TestDatabaseMaintenanceCannotBypassTransaction(t *testing.T) {
+	svc, _, _, user := setupTestService()
+	svc.users = db.New(nil)
+	called := false
+	err := svc.runInTx(t.Context(), user.ID, func(UserStore, pgx.Tx, username.GuardAuthority) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatal("database maintenance executed without transaction-bound policy")
 	}
 }
 

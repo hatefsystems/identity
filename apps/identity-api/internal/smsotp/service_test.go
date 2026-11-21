@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 )
@@ -388,6 +390,23 @@ func TestSMSSignupPurposeSharesBudgetsAndDoesNotCreateUser(t *testing.T) {
 	}
 	if err := f.svc.ConsumeSignupCode(context.Background(), attempt, jkt, testPhone, id, f.sender.code); !errors.Is(err, ErrNoActiveCode) {
 		t.Fatal("signup replay")
+	}
+}
+
+func TestSMSDisabledRemovalPreservesPolicyErrorAndRedactsDependencies(t *testing.T) {
+	for _, failure := range []error{accountpolicy.ErrLastVerifiedContact, contactproof.ErrInvalid, errPrivate} {
+		users := &fakeUserStore{id: uuid.New(), status: "active", version: 7, err: failure}
+		s, err := NewDisabled(users)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := ErrUnavailable
+		if errors.Is(failure, accountpolicy.ErrLastVerifiedContact) {
+			want = accountpolicy.ErrLastVerifiedContact
+		}
+		if changed, err := s.RemovePhone(context.Background(), users.id, 7); changed || !errors.Is(err, want) || strings.Contains(err.Error(), "private") || users.writes != 0 {
+			t.Fatal("policy/dependency failure changed phone or leaked details")
+		}
 	}
 }
 func TestSMSHashBindsPhoneAndPepper(t *testing.T) {

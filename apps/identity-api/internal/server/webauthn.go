@@ -83,6 +83,11 @@ type webauthnCredentialResponse struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
+type webauthnCredentialPolicyResponse struct {
+	webauthnCredentialResponse
+	CanRemove bool `json:"can_remove"`
+}
+
 // registerWebAuthnRoutes mounts the passkey ceremony endpoints from
 // docs/api-design.md §1.3. It is only called when a WebAuthn service is
 // configured (Deps.WebAuthn != nil).
@@ -198,6 +203,7 @@ func (s *Server) handleWebAuthnRegisterVerify() http.HandlerFunc {
 			s.writeWebAuthnRegistrationError(w, "finish registration", err)
 			return
 		}
+		session.SecurityChangeCommitted(r.Context())
 		s.recordCredentialRegistered(r, userID, row, webauthnFlowSelfService)
 		writeJSON(w, http.StatusCreated, toWebAuthnCredentialResponse(row))
 	}
@@ -252,6 +258,7 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 			return
 		}
 
+		session.SecurityChangeCommitted(r.Context())
 		// Recorded before the session teardown below: the credential now exists and
 		// is usable, so a failure to clear the enrollment session must not cost the
 		// ledger its record of a new authenticator being bound to the account.
@@ -261,9 +268,10 @@ func (s *Server) handleRecoveryWebAuthnRegisterVerify() http.HandlerFunc {
 		// recovery enrollment, not a user-initiated logout, and the account-level
 		// state change was already recorded above.
 		if _, _, err := s.deps.SessionManager.Revoke(w, r); err != nil {
-			s.logger.Error("webauthn: clear completed recovery session failed", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
-			return
+			// The database version cutoff already revoked this authority. Redis
+			// cleanup must not replace a committed enrollment's login return.
+			s.logger.Error("webauthn: clear completed recovery session failed")
+			s.deps.SessionManager.ClearCookie(w)
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, recoveryEnrollmentResponse{Next: "login"})
@@ -289,16 +297,18 @@ func (s *Server) handleWebAuthnListKeys() http.HandlerFunc {
 			return
 		}
 
-		rows, err := s.deps.WebAuthn.ListCredentials(r.Context(), userID)
+		rows, err := s.deps.WebAuthn.ListCredentialsWithPolicy(r.Context(), userID)
 		if err != nil {
-			s.logger.Error("webauthn: list credentials failed", "error", err.Error())
-			writeJSON(w, http.StatusInternalServerError, webauthnErrorResponse{Error: "server_error"})
+			s.writeWebAuthnDeleteError(w, err)
 			return
 		}
 
-		out := make([]webauthnCredentialResponse, 0, len(rows))
+		out := make([]webauthnCredentialPolicyResponse, 0, len(rows))
 		for _, row := range rows {
-			out = append(out, toWebAuthnCredentialResponse(row))
+			out = append(out, webauthnCredentialPolicyResponse{
+				webauthnCredentialResponse: toWebAuthnCredentialResponse(row.WebauthnCredential),
+				CanRemove:                  row.CanRemove,
+			})
 		}
 		writeJSON(w, http.StatusOK, out)
 	}
@@ -469,9 +479,8 @@ func (s *Server) handleWebAuthnRenameKey() http.HandlerFunc {
 //
 // The {id} path parameter is the unpadded base64url credential ID exactly as
 // returned by GET /keys. Deletion is scoped to the caller's account inside the
-// service, and refuses to remove the account's last remaining passkey. WebAuthn
-// is currently the only session-issuing login method, so secondary factors do
-// not satisfy this invariant.
+// service, and checks the remaining primary credential and privileged factor
+// protection under the shared policy before mutating the account.
 func (s *Server) handleWebAuthnDeleteKey() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, ok := s.webauthnSessionUser(w, r)
@@ -492,6 +501,7 @@ func (s *Server) handleWebAuthnDeleteKey() http.HandlerFunc {
 			s.writeWebAuthnDeleteError(w, err)
 			return
 		}
+		session.SecurityChangeCommitted(r.Context())
 		s.record(r, audit.Event{
 			EventType:    audit.EventWebAuthnCredentialDeleted,
 			ActionStatus: audit.StatusSuccess,
@@ -640,6 +650,8 @@ func (s *Server) writeWebAuthnDeleteError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusNotFound, webauthnErrorResponse{Error: "credential_not_found"})
 	case errors.Is(err, webauthn.ErrLastCredential):
 		writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "last_credential"})
+	case errors.Is(err, webauthn.ErrLastFactor):
+		writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "last_factor"})
 	case errors.Is(err, profile.ErrInvalidName):
 		writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
 	case errors.Is(err, webauthn.ErrUserNotFound), errors.Is(err, webauthn.ErrAccountNotActive):

@@ -42,7 +42,7 @@ export function profileResponse(value: unknown): Profile {
   };
 }
 
-export type Passkey = {
+export type PasskeyCredential = {
   id: string;
   name: string;
   created_at: string;
@@ -52,7 +52,9 @@ export type Passkey = {
   backup_state: boolean;
 };
 
-export function passkeyResponse(value: unknown): Passkey {
+export type Passkey = PasskeyCredential & { can_remove: boolean };
+
+export function passkeyResponse(value: unknown): PasskeyCredential {
   const item = record(value);
   const name = text(item.name, 160);
   if (normalizeName(name) !== name) throw new PortalError('invalid_response');
@@ -65,6 +67,10 @@ export function passkeyResponse(value: unknown): Passkey {
     backup_eligible: boolean(item.backup_eligible),
     backup_state: boolean(item.backup_state),
   };
+}
+
+export function passkeyListEntryResponse(value: unknown): Passkey {
+  return { ...passkeyResponse(value), can_remove: boolean(record(value).can_remove) };
 }
 
 export type BrowserSession = {

@@ -22,6 +22,9 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
@@ -97,6 +100,7 @@ type phoneIntegrationEncryptor struct {
 	admitted chan struct{}
 	release  chan struct{}
 	once     sync.Once
+	cipher   contactproof.Cipher
 }
 
 func (e *phoneIntegrationEncryptor) Encrypt(ctx context.Context, p []byte) ([]byte, error) {
@@ -109,7 +113,20 @@ func (e *phoneIntegrationEncryptor) Encrypt(ctx context.Context, p []byte) ([]by
 			return nil, ctx.Err()
 		}
 	}
-	return append([]byte("enc_"), p...), nil
+	return e.cipher.Encrypt(ctx, p)
+}
+
+func phoneIntegrationCipher(t *testing.T) contactproof.Cipher {
+	t.Helper()
+	provider, err := kms.NewMockProvider([]byte(strings.Repeat("k", 32)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := envelope.New(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cipher
 }
 
 func TestPhoneHTTPRealRedisPostgresRevocationFenceIntegration(t *testing.T) {
@@ -118,11 +135,12 @@ func TestPhoneHTTPRealRedisPostgresRevocationFenceIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "INSERT INTO users(id,email,status) VALUES($1,$2,'active')", fx.userID, uuid.NewString()+"@phone.invalid"); err != nil {
 		t.Fatal(err)
 	}
-	users, err := smsotp.NewUserStore(pool)
+	cipher := phoneIntegrationCipher(t)
+	users, err := smsotp.NewUserStore(pool, cipher)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gate := &phoneIntegrationEncryptor{admitted: make(chan struct{}), release: make(chan struct{})}
+	gate := &phoneIntegrationEncryptor{admitted: make(chan struct{}), release: make(chan struct{}), cipher: cipher}
 	svc, err := smsotp.New(smsotp.Config{HashPepper: []byte(strings.Repeat("p", 32))}, users, gate, phoneFakeIndexer{}, &phoneFakeLimiter{true}, otps, fx.sender)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +204,7 @@ func TestPhoneHTTPDisabledRealPostgresRemovalOneAuditIntegration(t *testing.T) {
 	if _, err := pool.Exec(ctx, "INSERT INTO users(id,email,status,phone_encrypted,phone_blind_index) VALUES($1,$2,'active',$3,$4)", fx.userID, uuid.NewString()+"@phone.invalid", []byte("encrypted"), "index-"+uuid.NewString()); err != nil {
 		t.Fatal(err)
 	}
-	users, err := smsotp.NewUserStore(pool)
+	users, err := smsotp.NewUserStore(pool, phoneIntegrationCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +215,7 @@ func TestPhoneHTTPDisabledRealPostgresRemovalOneAuditIntegration(t *testing.T) {
 	recorder := &phoneAuditRecorder{}
 	fx.server.deps.SMSOTP = disabled
 	fx.server.deps.AuditRecorder = recorder
+	statuses := make(chan int, 2)
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
@@ -204,13 +223,77 @@ func TestPhoneHTTPDisabledRealPostgresRemovalOneAuditIntegration(t *testing.T) {
 			defer wg.Done()
 			w := httptest.NewRecorder()
 			fx.server.handlePhoneRemove().ServeHTTP(w, profileHandlerRequest(fx.sess, http.MethodDelete, ""))
-			if w.Code != 204 {
-				t.Errorf("removal status=%d", w.Code)
-			}
+			statuses <- w.Code
 		}()
 	}
 	wg.Wait()
+	a, b := <-statuses, <-statuses
+	if (a != http.StatusNoContent || b != http.StatusUnauthorized) && (a != http.StatusUnauthorized || b != http.StatusNoContent) {
+		t.Fatalf("removal must commit once and fence stale request: %d %d", a, b)
+	}
 	if recorder.count(audit.EventPhoneRemoved) != 1 {
 		t.Fatal("real SQL removal emitted duplicate audit event")
+	}
+	u, err := db.New(pool).GetUserByID(ctx, fx.userID)
+	if err != nil || u.AuthVersion != fx.sess.AuthVersion+1 || u.PhoneEncrypted != nil || u.PhoneBlindIndex != nil {
+		t.Fatal("disabled removal did not revoke exactly once")
+	}
+}
+
+func TestPhoneHTTPDisabledLastVerifiedContactRequiresCurrentEmailEvidenceIntegration(t *testing.T) {
+	ctx, pool, _ := phoneIntegrationServices(t)
+	fx := setupPhoneTestFixture(t, true)
+	cipher := phoneIntegrationCipher(t)
+	phone, err := cipher.Encrypt(ctx, []byte("+989123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	email := uuid.NewString() + "@phone.invalid"
+	if _, err := pool.Exec(ctx, "INSERT INTO users(id,email,status,phone_encrypted,phone_blind_index) VALUES($1,$2,'active',$3,$4)", fx.userID, email, phone, "index-"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	q := db.New(pool)
+	proof, err := contactproof.Seal(ctx, cipher, fx.userID, contactproof.Phone, "+989123456789", contactproof.SMSOTP, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PutContactVerificationEvidence(ctx, db.PutContactVerificationEvidenceParams{UserID: fx.userID, Channel: contactproof.Phone, EvidenceEncrypted: proof}); err != nil {
+		t.Fatal(err)
+	}
+	users, err := smsotp.NewUserStore(pool, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := smsotp.NewDisabled(users)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &phoneAuditRecorder{}
+	fx.server.deps.SMSOTP = disabled
+	fx.server.deps.AuditRecorder = recorder
+	w := httptest.NewRecorder()
+	fx.server.handlePhoneRemove().ServeHTTP(w, profileHandlerRequest(fx.sess, http.MethodDelete, ""))
+	if w.Code != http.StatusConflict || errorBody(t, w) != "last_verified_contact" || recorder.count(audit.EventPhoneRemoved) != 0 {
+		t.Fatal("populated email permitted verified phone removal")
+	}
+	u, err := q.GetUserByID(ctx, fx.userID)
+	if err != nil || u.AuthVersion != fx.sess.AuthVersion || len(u.PhoneEncrypted) == 0 {
+		t.Fatal("policy rejection changed phone or authority")
+	}
+	proof, err = contactproof.Seal(ctx, cipher, fx.userID, contactproof.Email, email, contactproof.EmailLink, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.PutContactVerificationEvidence(ctx, db.PutContactVerificationEvidenceParams{UserID: fx.userID, Channel: contactproof.Email, EvidenceEncrypted: proof}); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	fx.server.handlePhoneRemove().ServeHTTP(w, profileHandlerRequest(fx.sess, http.MethodDelete, ""))
+	if w.Code != http.StatusNoContent || recorder.count(audit.EventPhoneRemoved) != 1 {
+		t.Fatal("verified current email did not permit disabled-SMS removal")
+	}
+	u, err = q.GetUserByID(ctx, fx.userID)
+	if err != nil || u.AuthVersion != fx.sess.AuthVersion+1 || u.PhoneEncrypted != nil {
+		t.Fatal("verified removal did not clear phone and revoke once")
 	}
 }

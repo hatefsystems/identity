@@ -12,8 +12,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 type operatorPolicyTx struct {
@@ -108,5 +110,33 @@ func TestProvisionRoleRequiresInstalledBaselineBeforeAccountMutation(t *testing.
 				}
 			})
 		}
+	}
+}
+
+func TestProvisionRoleGuardsPasswordAuthorityBeforeAccountLockButNotRevocation(t *testing.T) {
+	policy := legalpolicy.Policy{ID: uuid.New(), ApprovalReference: "fixture-policy", Fixture: true,
+		ContextRetentionSeconds: 3600, ReleasedHoldRetentionSeconds: 7200,
+		ContextClock: legalpolicy.ClockCreatedAt, ReleasedHoldClock: legalpolicy.ClockReleasedAt,
+		HoldTombstoneFields: legalpolicy.HoldTombstoneFields(), HoldTombstoneLifetime: legalpolicy.LifetimeNoExpiry}
+	artifact, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, revoke := range []bool{false, true} {
+		t.Run(map[bool]string{false: "grant", true: "revoke"}[revoke], func(t *testing.T) {
+			tx := &operatorPolicyTx{id: policy.ID, artifact: artifact}
+			actions, err := adminaction.New(operatorPolicyBeginner{tx}, operatorPolicyEncryptor{}, "identity.audit.operator", time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ProvisionRole(t.Context(), actions, uuid.New(), "spiffe://identity.test/operator", uuid.New(), "dpo", revoke, "test", accountpolicy.Policy{PasswordLoginEnabled: true})
+			want, locks := username.ErrUnavailable, 0
+			if revoke {
+				want, locks = errOperatorAccountLock, 1
+			}
+			if !errors.Is(err, want) || tx.locks != locks || !tx.rolledBack {
+				t.Fatalf("password authority boundary err=%v locks=%d rollback=%v", err, tx.locks, tx.rolledBack)
+			}
+		})
 	}
 }

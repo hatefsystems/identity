@@ -26,7 +26,8 @@ export const errorsEn = {
   noFactor: 'No supported verification factor is available for this account.',
   deletionDisabled: 'Account deletion is currently unavailable.',
   freshVerification: 'Fresh verification is required. Start the action again.',
-  lastCredential: 'Your last passkey cannot be removed. Add another passkey first.',
+  lastCredential: 'The account-protection policy has changed or no eligible alternative remains. Your last passkey was not removed. Refresh passkeys before choosing another action.',
+  lastFactor: 'The account-protection policy has changed or no eligible alternative remains. Your last strong authentication factor was not removed. Check the current security settings before choosing another action.',
   notFound: 'This item is no longer available. Refresh the list to see its current state.',
   profileConflict:
     'The saved profile changed. Refresh the saved profile, review your draft, then save again.',
@@ -83,7 +84,8 @@ export const errorsFa = {
   noFactor: 'هیچ عامل تأیید هویت پشتیبانی‌شده‌ای برای این حساب در دسترس نیست.',
   deletionDisabled: 'حذف حساب در حال حاضر در دسترس نیست.',
   freshVerification: 'تأیید هویت تازه لازم است. عملیات را دوباره آغاز کنید.',
-  lastCredential: 'آخرین کلید عبور شما قابل حذف نیست. ابتدا کلید عبور دیگری اضافه کنید.',
+  lastCredential: 'سیاست حفاظت از حساب تغییر کرده است یا جایگزین واجد شرایطی باقی نمانده است. آخرین کلید عبور شما حذف نشد. پیش از انتخاب عملیات دیگر، کلیدهای عبور را تازه‌سازی کنید.',
+  lastFactor: 'سیاست حفاظت از حساب تغییر کرده است یا جایگزین واجد شرایطی باقی نمانده است. آخرین عامل احراز هویت قوی شما حذف نشد. پیش از انتخاب عملیات دیگر، تنظیمات امنیتی فعلی را بررسی کنید.',
   notFound: 'این مورد دیگر در دسترس نیست. برای مشاهدهٔ وضعیت فعلی، فهرست را تازه‌سازی کنید.',
   profileConflict:
     'نمایهٔ ذخیره‌شده تغییر کرده است. نمایه را تازه‌سازی کنید، پیش‌نویس خود را بررسی کنید و دوباره ذخیره کنید.',

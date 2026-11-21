@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -131,6 +132,7 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 			s.writeMFAError(w, "verify and enable mfa", err)
 			return
 		}
+		session.SecurityChangeCommitted(r.Context())
 
 		// This endpoint is enrolment-completing: reaching here means TOTP went from
 		// "pending secret" to "required at login", which is the state change worth
@@ -192,6 +194,10 @@ func (s *Server) writeMFAError(w http.ResponseWriter, op string, err error) {
 		writeJSON(w, http.StatusUnauthorized, mfaErrorResponse{Error: "unauthorized"})
 	case errors.Is(err, mfa.ErrLastFactor):
 		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "last_factor"})
+	case errors.Is(err, accountpolicy.ErrLastFactor):
+		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "last_factor"})
+	case errors.Is(err, accountpolicy.ErrLastCredential):
+		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "last_credential"})
 	case errors.Is(err, mfa.ErrMfaAlreadyEnabled):
 		writeJSON(w, http.StatusConflict, mfaErrorResponse{Error: "mfa_already_enabled"})
 	case errors.Is(err, mfa.ErrMfaNotSetup):
@@ -201,8 +207,8 @@ func (s *Server) writeMFAError(w http.ResponseWriter, op string, err error) {
 	case errors.Is(err, mfa.ErrInvalidCode):
 		writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_code"})
 	default:
-		s.logger.Error("mfa: "+op+" failed", "error", err.Error())
-		writeJSON(w, http.StatusInternalServerError, mfaErrorResponse{Error: "server_error"})
+		s.logger.Error("mfa: " + op + " failed")
+		writeJSON(w, http.StatusServiceUnavailable, mfaErrorResponse{Error: "temporarily_unavailable"})
 	}
 }
 

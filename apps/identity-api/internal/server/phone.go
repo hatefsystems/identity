@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
@@ -211,6 +212,7 @@ func (s *Server) handlePhoneRemove() http.HandlerFunc {
 		// recording that would put a second Class B row in the chain asserting a
 		// factor was torn down that was already gone.
 		if removed {
+			session.SecurityChangeCommitted(r.Context())
 			s.record(r, audit.Event{
 				EventType:    audit.EventPhoneRemoved,
 				ActionStatus: audit.StatusSuccess,
@@ -229,6 +231,8 @@ func (s *Server) handlePhoneRemove() http.HandlerFunc {
 // return 400; a missing account maps to 401.
 func (s *Server) writePhoneError(w http.ResponseWriter, op string, err error) {
 	switch {
+	case errors.Is(err, accountpolicy.ErrLastVerifiedContact):
+		writeJSON(w, http.StatusConflict, phoneErrorResponse{Error: "last_verified_contact"})
 	case errors.Is(err, smsotp.ErrUserNotFound), errors.Is(err, smsotp.ErrAccountNotActive), errors.Is(err, smsotp.ErrStaleSession):
 		writeJSON(w, http.StatusUnauthorized, phoneErrorResponse{Error: "unauthorized"})
 	case errors.Is(err, smsotp.ErrInvalidPhone):

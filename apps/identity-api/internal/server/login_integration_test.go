@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
@@ -353,22 +354,24 @@ func (f *realLoginFixture) account(t *testing.T, credential string, mfaEnabled b
 			t.Error("owned login session teardown incomplete")
 		}
 	})
-	value, err := f.names.Normalizer().Normalize(name)
-	if err != nil {
-		t.Fatal(err)
+	if credential != "password_unclaimed" {
+		value, err := f.names.Normalizer().Normalize(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(f.ctx) }()
+		if err := f.names.Assign(f.ctx, tx, user.ID, user.AuthVersion, value); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(f.ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
-	tx, err := f.pool.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(f.ctx) }()
-	if err := f.names.Assign(f.ctx, tx, user.ID, user.AuthVersion, value); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	if credential != "password_only" {
+	if credential != "password_only" && credential != "password_unclaimed" {
 		if _, err := f.pool.Exec(f.ctx, `INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), user.ID, []byte("credential-presence-fixture"), uuid.Nil); err != nil {
 			t.Fatal(err)
 		}
@@ -787,7 +790,7 @@ func TestLoginRealServicesRoleAndStatusBetweenFactorsIntegration(t *testing.T) {
 			a := f.account(t, "dual", true)
 			operator := uuid.New()
 			if change == "revoke" {
-				if err := rbac.ProvisionRole(f.ctx, actions, operator, "spiffe://identity.test/login-role-operator", a.user.ID, "dpo", false, "test"); err != nil {
+				if err := rbac.ProvisionRole(f.ctx, actions, operator, "spiffe://identity.test/login-role-operator", a.user.ID, "dpo", false, "test", accountpolicy.Policy{PasswordLoginEnabled: true, Usernames: f.names}); err != nil {
 					t.Fatal(err)
 				}
 				a.user, err = db.New(f.pool).GetUserByID(f.ctx, a.user.ID)
@@ -798,7 +801,7 @@ func TestLoginRealServicesRoleAndStatusBetweenFactorsIntegration(t *testing.T) {
 			first := f.preauth(t, a, session.MethodPassword)
 			switch change {
 			case "grant", "revoke":
-				if err := rbac.ProvisionRole(f.ctx, actions, operator, "spiffe://identity.test/login-role-operator", a.user.ID, "dpo", change == "revoke", "test"); err != nil {
+				if err := rbac.ProvisionRole(f.ctx, actions, operator, "spiffe://identity.test/login-role-operator", a.user.ID, "dpo", change == "revoke", "test", accountpolicy.Policy{PasswordLoginEnabled: true, Usernames: f.names}); err != nil {
 					t.Fatal(err)
 				}
 				var version int64

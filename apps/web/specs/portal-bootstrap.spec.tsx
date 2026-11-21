@@ -10,8 +10,8 @@ import { I18nTestProvider } from '../i18n/testing';
 const renderToStaticMarkup = (element: ReactElement) =>
   renderStatic(<I18nTestProvider>{element}</I18nTestProvider>);
 import { PortalProvider, usePortal } from '../app/dashboard/_components/portal-provider';
-import { PortalClient } from '../app/_lib/portal/client';
-import type { Profile } from '../app/_lib/portal/contracts';
+import { PortalClient, type SecurityChange } from '../app/_lib/portal/client';
+import { passkeyResponse, type Profile } from '../app/_lib/portal/contracts';
 import { PortalError } from '../app/_lib/portal/errors';
 import { clearSensitiveViews, invalidateOtherTabs, onOtherTabInvalidation } from '../app/_lib/portal/invalidation';
 
@@ -46,12 +46,18 @@ function makeClient() {
     dispose: jest.fn(),
     logout: jest.fn().mockResolvedValue(undefined),
     revokeSession: jest.fn().mockResolvedValue(undefined),
-    profile: value,
-    onSessionLoss: undefined as ((error: PortalError) => void) | undefined,
+    profile: value as Profile | undefined,
+    onSessionLoss: undefined as ((error: PortalError, settlingSecurity?: boolean) => void) | undefined,
+    onSecurityChange: undefined as ((outcome: SecurityChange) => void) | undefined,
   };
 }
 function PrivateContent() {
   return <p>{usePortal().profile.email}</p>;
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((finish) => { resolve = finish; });
+  return { promise, resolve };
 }
 let api: ReturnType<typeof makeClient>;
 let invalidate: () => void;
@@ -167,6 +173,125 @@ describe('compact account navigation', () => {
 });
 
 describe('protected portal bootstrap', () => {
+  it.each(['en', 'fa-IR'] as const)('withdraws private authority after concurrent401 but lets a deferred decoded security outcome win in %s', async (locale) => {
+    jest.useFakeTimers();
+    api.profile = { ...profile(), session: { id: 'session-id', expires_at: new Date(Date.now() + 1000).toISOString() } };
+    api.bootstrap.mockResolvedValueOnce(api.profile);
+    const body = deferred<unknown>();
+    const content = (language: 'en' | 'fa-IR') => (
+      <I18nTestProvider locale={language}><PortalProvider><PrivateContent /></PortalProvider></I18nTestProvider>
+    );
+    const view = render(content(locale));
+    await screen.findByText('private@example.test');
+    const pending = body.promise.then((value) => {
+      passkeyResponse(value);
+      api.onSecurityChange?.('passkeyAdded');
+    });
+    // Transport withdraws the shared profile before notifying the provider.
+    api.profile = undefined;
+    act(() => api.onSessionLoss?.(new PortalError('session_required', 401), true));
+    expect(screen.queryByTestId('portal-ready')).toBeNull();
+    expect(screen.queryByText('private@example.test')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByTestId('security-outcome')).toBeNull();
+    expect(screen.queryByRole('link', { name: locale === 'en' ? 'Sign in with a passkey' : 'ورود با کلید عبور' })).toBeNull();
+    expect(screen.queryByRole('button', { name: locale === 'en' ? 'Check current session' : 'بررسی نشست فعلی' })).toBeNull();
+    expect(screen.getByText(locale === 'en' ? 'Applying the confirmed action...' : 'در حال اعمال عملیات تأییدشده...')).toBeTruthy();
+    expect(api.dispose).not.toHaveBeenCalled();
+    act(() => {
+      invalidate();
+      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+      jest.advanceTimersByTime(1001);
+    });
+    const other = locale === 'en' ? 'fa-IR' : 'en';
+    view.rerender(content(other));
+    expect(api.dispose).not.toHaveBeenCalled();
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      body.resolve({ id: 'key-id', name: 'Device', created_at: '2026-01-01T00:00:00Z', user_verified: true, backup_eligible: false, backup_state: false });
+      await pending;
+    });
+    const outcome = screen.getByTestId('security-outcome');
+    expect(outcome.getAttribute('data-outcome')).toBe('passkeyAdded');
+    expect(within(outcome).getByRole('heading', { name: other === 'en' ? 'Security change saved' : 'تغییر امنیتی ذخیره شد' })).toBe(document.activeElement);
+    expect(within(outcome).getByRole('status').textContent).toBe(other === 'en'
+      ? 'Your passkey was added. Existing sessions, including this browser session, are no longer valid. Sign in again to continue.'
+      : 'کلید عبور شما اضافه شد. نشست‌های موجود، از جمله نشست این مرورگر، دیگر معتبر نیستند. برای ادامه دوباره وارد شوید.');
+    const login = within(outcome).getAllByRole('link', { name: other === 'en' ? 'Return to sign in' : 'بازگشت به ورود' });
+    expect(login).toHaveLength(1);
+    expect(login[0].getAttribute('href')).toBe('/login');
+    expect(api.dispose).toHaveBeenCalledTimes(1);
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(api.logout).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(invalidateOtherTabs).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['en', 'fa-IR'] as const)('falls back to localized session loss in %s only after a deferred security body fails strict decoding', async (locale) => {
+    const body = deferred<unknown>();
+    const failure = new PortalError('session_required', 401);
+    render(<PortalProvider><PrivateContent /></PortalProvider>, { locale });
+    await screen.findByText('private@example.test');
+    const pending = body.promise.then((value) => {
+      try {
+        passkeyResponse(value);
+        api.onSecurityChange?.('passkeyAdded');
+      } catch {
+        api.onSessionLoss?.(failure);
+      }
+    });
+    api.profile = undefined;
+    act(() => api.onSessionLoss?.(failure, true));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(api.dispose).not.toHaveBeenCalled();
+    await act(async () => { body.resolve({}); await pending; });
+    expect(screen.queryByTestId('security-outcome')).toBeNull();
+    expect(screen.queryByTestId('portal-ready')).toBeNull();
+    expect(screen.getByRole('alert').textContent).toBe(locale === 'en'
+      ? 'Your session is no longer available. Sign in again to continue.'
+      : 'نشست شما دیگر در دسترس نیست. برای ادامه دوباره وارد شوید.');
+    expect(screen.getByRole('link', { name: locale === 'en' ? 'Sign in with a passkey' : 'ورود با کلید عبور' })).toBeTruthy();
+    expect(api.dispose).toHaveBeenCalledTimes(1);
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(api.logout).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+    expect(invalidateOtherTabs).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['en', 'fa-IR'] as const)('keeps a committed security outcome visible in %s before one explicit login return', async (locale) => {
+    const content = (language: 'en' | 'fa-IR') => (
+      <I18nTestProvider locale={language}><PortalProvider><PrivateContent /></PortalProvider></I18nTestProvider>
+    );
+    const view = render(content(locale));
+    await screen.findByText('private@example.test');
+    act(() => api.onSecurityChange?.('passkeyAdded'));
+    expect(screen.getByTestId('security-outcome').getAttribute('data-outcome')).toBe('passkeyAdded');
+    expect(screen.getByRole('heading', { name: locale === 'en' ? 'Security change saved' : 'تغییر امنیتی ذخیره شد' })).toBe(document.activeElement);
+    expect(within(screen.getByTestId('security-outcome')).getByRole('status').textContent).toBe(locale === 'en'
+      ? 'Your passkey was added. Existing sessions, including this browser session, are no longer valid. Sign in again to continue.'
+      : 'کلید عبور شما اضافه شد. نشست‌های موجود، از جمله نشست این مرورگر، دیگر معتبر نیستند. برای ادامه دوباره وارد شوید.');
+    expect(screen.queryByText('private@example.test')).toBeNull();
+    expect(screen.queryByTestId('portal-ready')).toBeNull();
+    act(() => {
+      api.onSessionLoss?.(new PortalError('session_required', 401));
+      invalidate();
+      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    });
+    const otherLocale = locale === 'en' ? 'fa-IR' : 'en';
+    view.rerender(content(otherLocale));
+    expect(screen.getByRole('heading', { name: otherLocale === 'en' ? 'Security change saved' : 'تغییر امنیتی ذخیره شد' })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(api.bootstrap).toHaveBeenCalledTimes(1);
+    expect(api.logout).not.toHaveBeenCalled();
+    expect(api.revokeSession).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+    expect(invalidateOtherTabs).toHaveBeenCalledTimes(1);
+    const login = screen.getByRole('link', { name: otherLocale === 'en' ? 'Return to sign in' : 'بازگشت به ورود' });
+    expect(login.getAttribute('href')).toBe('/login');
+    expect(screen.getAllByRole('link', { name: otherLocale === 'en' ? 'Return to sign in' : 'بازگشت به ورود' })).toHaveLength(1);
+  });
+
   it('server-renders only a non-sensitive shell and does not instantiate an API client', () => {
     const html = renderToStaticMarkup(
       <PortalProvider>
@@ -302,7 +427,7 @@ describe('display preferences preserve session authority', () => {
   it('keeps the same bootstrap, private draft, client and expiry timer across language changes', async () => {
     jest.useFakeTimers();
     const value = api.profile;
-    const expiry = Date.parse(value.session.expires_at);
+    if (!value) throw new Error('Expected fixture profile');
     function view(locale: 'en' | 'fa-IR') {
       return (
         <I18nTestProvider locale={locale}>
@@ -332,7 +457,7 @@ describe('display preferences preserve session authority', () => {
     expect(api.bootstrap).toHaveBeenCalledTimes(1);
     expect(api.dispose).not.toHaveBeenCalled();
     expect(invalidateOtherTabs).not.toHaveBeenCalled();
-    expect(Date.parse(api.profile.session.expires_at)).toBe(expiry);
+    expect(api.profile?.session.expires_at).toBe(value.session.expires_at);
     act(() => jest.advanceTimersByTime(1001));
     expect(screen.queryByText('private@example.test')).toBeNull();
     expect(screen.getByRole('alert').textContent).toBe(

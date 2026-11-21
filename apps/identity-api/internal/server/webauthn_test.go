@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -16,12 +19,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -504,6 +510,93 @@ func TestRecoveryEnrollmentClaimUsesRequestContext(t *testing.T) {
 	}
 }
 
+type webauthnRecoveryCleanupStore struct {
+	session.Store
+	unavailable bool
+}
+
+func (s *webauthnRecoveryCleanupStore) Delete(ctx context.Context, hash string) error {
+	if s.unavailable {
+		return errors.New("cleanup unavailable")
+	}
+	return s.Store.Delete(ctx, hash)
+}
+
+func TestRecoveryWebAuthnCommittedEnrollmentReturnsLoginDespiteCleanupFailure(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		fx := newWebAuthnTestServer(t)
+		codec, err := session.NewCookieCodec(session.CookieConfig{Name: "session", TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := &webauthnRecoveryCleanupStore{Store: session.NewMemoryStore(), unavailable: unavailable}
+		mgr, err := session.NewManager(store, codec, session.ManagerConfig{AbsoluteTTL: time.Hour, IdleTTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fx.srv.deps.SessionManager = mgr
+		current, cookies := issueSession(t, mgr, session.IssueParams{UserID: fx.user.ID.String(), Kind: session.KindRecoveryEnrollment})
+		ctx := session.WithSession(t.Context(), current)
+		options, err := fx.srv.deps.WebAuthn.BeginRecoveryRegistration(ctx, fx.user.ID, current.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := webauthnNoneAttestation(t, base64.RawURLEncoding.EncodeToString(options.Response.Challenge))
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/enrollment/webauthn/register/verify", bytes.NewReader(body)).WithContext(ctx)
+		addCookies(req, cookies)
+		rec := httptest.NewRecorder()
+		fx.srv.handleRecoveryWebAuthnRegisterVerify().ServeHTTP(rec, req)
+		var result recoveryEnrollmentResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &result) != nil || result.Next != "login" || len(fx.creds.byUser[fx.user.ID]) != 1 {
+			t.Fatalf("cleanup unavailable=%v lost committed enrollment: status=%d body=%s", unavailable, rec.Code, rec.Body.String())
+		}
+		cleared := rec.Result().Cookies()
+		if len(cleared) != 1 || cleared[0].Name != "session" || cleared[0].MaxAge != -1 || rec.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("completed recovery did not clear cookie and preserve no-store")
+		}
+	}
+}
+
+// Minimal UV-performed none attestation for the real HTTP enrollment verifier.
+func webauthnNoneAttestation(t *testing.T, challenge string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	point, err := key.PublicKey.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cose, err := webauthncbor.Marshal(map[int]any{1: 2, 3: -7, -1: 1, -2: point[1:33], -3: point[33:65]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := bytes.Repeat([]byte{0x42}, 32)
+	rpHash := sha256.Sum256([]byte("localhost"))
+	data := append(rpHash[:], 0x45, 0, 0, 0, 0) // UP, UV and attested data; zero sign count.
+	data = append(data, make([]byte, 16)...)
+	data = append(data, 0, 32)
+	data = append(data, id...)
+	data = append(data, cose...)
+	attestation, err := webauthncbor.Marshal(map[string]any{"fmt": "none", "authData": data, "attStmt": map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientData, err := json.Marshal(map[string]any{"type": "webauthn.create", "challenge": challenge, "origin": "http://localhost:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"id": base64.RawURLEncoding.EncodeToString(id), "rawId": base64.RawURLEncoding.EncodeToString(id), "type": "public-key",
+		"response": map[string]any{"clientDataJSON": base64.RawURLEncoding.EncodeToString(clientData), "attestationObject": base64.RawURLEncoding.EncodeToString(attestation)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
 // TestWebAuthnLoginRoutesAreUnauthenticated proves the login endpoints are
 // reachable without a session — they are how a user signs in — rather than being
 // short-circuited by the session guard that protects the enrolment routes.
@@ -940,7 +1033,7 @@ func TestListKeysProjectsStoredCredentials(t *testing.T) {
 		t.Error("the credential public key leaked into the listing response")
 	}
 
-	var list []webauthnCredentialResponse
+	var list []webauthnCredentialPolicyResponse
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
@@ -948,6 +1041,9 @@ func TestListKeysProjectsStoredCredentials(t *testing.T) {
 		t.Fatalf("len(keys) = %d, want 1", len(list))
 	}
 	got := list[0]
+	if got.CanRemove || !bytes.Contains(raw, []byte(`"can_remove":false`)) {
+		t.Fatal("final passkey listing did not include explicit false removal policy")
+	}
 	if got.ID != "3q2-7w" { // base64url(unpadded) of DE AD BE EF
 		t.Errorf("id = %q, want the unpadded base64url credential id %q", got.ID, "3q2-7w")
 	}
@@ -962,6 +1058,42 @@ func TestListKeysProjectsStoredCredentials(t *testing.T) {
 	}
 	if got.LastUsedAt != nil {
 		t.Errorf("last_used_at = %v, want nil for a never-used credential", got.LastUsedAt)
+	}
+}
+
+func TestListKeysIncludesTruePolicyForEveryRemovableEntry(t *testing.T) {
+	fx := newWebAuthnTestServer(t)
+	fx.seedCredential([]byte("first"))
+	fx.seedCredential([]byte("second"))
+	rec := fx.do(http.MethodGet, "/api/v1/auth/webauthn/keys", nil, fx.login(t))
+	var list []map[string]json.RawMessage
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &list) != nil || len(list) != 2 {
+		t.Fatalf("list policy response: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, row := range list {
+		if string(row["can_remove"]) != "true" {
+			t.Fatal("removable entry lacks exact boolean true")
+		}
+	}
+}
+
+func TestWebAuthnSharedPolicyErrorsHTTPOutcome(t *testing.T) {
+	fx := newWebAuthnTestServer(t)
+	for _, tc := range []struct {
+		err    error
+		code   string
+		status int
+	}{
+		{accountpolicy.ErrLastCredential, "last_credential", http.StatusConflict},
+		{accountpolicy.ErrLastFactor, "last_factor", http.StatusConflict},
+		{username.ErrUnavailable, "temporarily_unavailable", http.StatusServiceUnavailable},
+		{username.ErrPolicyMismatch, "temporarily_unavailable", http.StatusServiceUnavailable},
+	} {
+		rec := httptest.NewRecorder()
+		fx.srv.writeWebAuthnDeleteError(rec, fmt.Errorf("policy: %w", tc.err))
+		if rec.Code != tc.status || decodeWebAuthnError(t, rec).Error != tc.code {
+			t.Fatalf("policy refusal: status=%d body=%s", rec.Code, rec.Body.String())
+		}
 	}
 }
 

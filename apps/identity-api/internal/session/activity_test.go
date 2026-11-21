@@ -96,6 +96,9 @@ func TestActivityOnlyAfterFullAuthorization(t *testing.T) {
 			if response.Code != tc.want || store.touches != tc.touch {
 				t.Fatalf("status=%d touches=%d, want %d/%d", response.Code, store.touches, tc.want, tc.touch)
 			}
+			if response.Header().Get(HeaderAuthInvalidated) != "" {
+				t.Fatal("ordinary request or rejected mutation claimed committed invalidation")
+			}
 			current, err := m.Resolve(r)
 			if err != nil {
 				t.Fatal(err)
@@ -133,5 +136,36 @@ func TestActivityDependencyFailureWithholdsHandlerBody(t *testing.T) {
 	newGuard(t, m).Handler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("handler admitted") })).ServeHTTP(response, r)
 	if response.Code != 503 || response.Header().Get("WWW-Authenticate") != "" {
 		t.Fatal("dependency error was misclassified as cookie/session loss")
+	}
+}
+
+func TestCommittedSecurityChangePreservesOutcomeWithoutRenewal(t *testing.T) {
+	now := time.Now()
+	m := newTestManager(t, &now)
+	store := &activityTestStore{Store: m.store, touchErr: errors.New("dependency lost after commit")}
+	m.store = store
+	issue := httptest.NewRecorder()
+	issued, err := m.Issue(issue, IssueParams{UserID: "user", DPoPJKT: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	r := requestWithCookies(issue)
+	r = r.WithContext(dpop.WithProof(r.Context(), &dpop.Proof{JKT: "key"}))
+	response := httptest.NewRecorder()
+	newGuard(t, m).Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SecurityChangeCommitted(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(response, r)
+	if response.Code != http.StatusNoContent || store.touches != 0 || response.Header().Get(HeaderAuthInvalidated) != "true" {
+		t.Fatal("committed security outcome was lost or authority renewed")
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != m.cookie.Name() || cookies[0].MaxAge != -1 {
+		t.Fatal("security mutation did not clear only the initiating cookie")
+	}
+	current, err := m.Resolve(r)
+	if err != nil || !current.IdleExpiry.Equal(issued.IdleExpiry) || !current.LastSeenAt.Equal(issued.LastSeenAt) {
+		t.Fatal("security mutation extended session authority")
 	}
 }

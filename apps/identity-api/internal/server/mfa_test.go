@@ -109,6 +109,11 @@ func (f *mfaFakeStore) CountWebauthnCredentialsByUser(context.Context, uuid.UUID
 	return 1, nil
 }
 
+func (f *mfaFakeStore) RevokeUserCredentials(_ context.Context, id uuid.UUID) error {
+	f.users[id].version++
+	return nil
+}
+
 func (f *mfaFakeStore) DeleteMfaTotpEnrollmentsForUser(_ context.Context, userID uuid.UUID) (int64, error) {
 	var count int64
 	for id, row := range f.enrollments {
@@ -391,6 +396,9 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 	if !fx.user.mfaOn {
 		t.Error("expected user mfaOn = true")
 	}
+	if fx.user.version != 1 || rec.Header().Get(session.HeaderAuthInvalidated) != "true" {
+		t.Fatal("successful TOTP enrollment did not revoke initiating authority")
+	}
 
 	// 4. The former public enabled-code oracle is absent.
 	verifyCodeBody, _ := json.Marshal(map[string]string{"code": validCode})
@@ -403,9 +411,22 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 		t.Errorf("verify-code: expected 404 Not Found, got %d", rec.Code)
 	}
 
-	// 5. Disable MFA. This route is step-up gated, so it needs both the session
-	// cookie and a fresh grant; the fixture is built with a step-up service for
-	// exactly this step.
+	// 5. Disable rejects the old earned account version, even with a fresh grant.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa", nil)
+	fx.browser.authorize(t, req, fx.sess, fx.cookie)
+	req.Header.Set(stepup.HeaderStepUpAuth, fx.grantHeader(t))
+	rec = httptest.NewRecorder()
+	fx.server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || !fx.user.mfaOn || fx.user.version != 1 {
+		t.Fatal("earlier authentication survived committed TOTP enrollment")
+	}
+	// The fresh sign-in fixture carries the newly earned version and TOTP evidence.
+	var cookies []*http.Cookie
+	fx.sess, cookies = fx.browser.issueSession(t, fx.sessMgr, session.IssueParams{
+		UserID: fx.user.id.String(), AuthVersion: fx.user.version, AuthVersionSet: true,
+		Evidence: session.Evidence{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()},
+	})
+	fx.cookie = cookies[0]
 	req = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/mfa", nil)
 	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	req.Header.Set(stepup.HeaderStepUpAuth, fx.grantHeader(t))
@@ -418,6 +439,9 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 
 	if fx.user.mfaOn {
 		t.Error("expected user mfaOn = false after disable")
+	}
+	if fx.user.version != 2 || rec.Header().Get(session.HeaderAuthInvalidated) != "true" {
+		t.Fatal("TOTP disable did not revoke exactly once")
 	}
 }
 

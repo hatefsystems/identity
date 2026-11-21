@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
@@ -20,6 +21,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 func main() {
@@ -74,11 +76,33 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 	if err != nil {
 		return err
 	}
+	loginSwitch := os.Getenv("LOGIN_ENABLED")
+	if !revoke && loginSwitch != "" && loginSwitch != "true" && loginSwitch != "false" {
+		return errors.New("operator LOGIN_ENABLED must be true or false")
+	}
+	passwordLoginEnabled := !revoke && loginSwitch == "true"
+	var usernameCfg config.UsernameConfig
+	if passwordLoginEnabled {
+		usernameCfg, err = config.LoadUsername()
+		if err != nil {
+			return err
+		}
+		if !usernameCfg.Enabled {
+			return errors.New("operator password login policy requires enabled username configuration")
+		}
+	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
+	policy := accountpolicy.Policy{PasswordLoginEnabled: passwordLoginEnabled}
+	if passwordLoginEnabled {
+		policy.Usernames, err = username.NewStore(pool, enc, usernameCfg.Normalizer)
+		if err != nil {
+			return err
+		}
+	}
 	baseline, err := loadOperatorBaseline(ctx, pool, cfg, environment)
 	if err != nil {
 		return err
@@ -87,7 +111,7 @@ func run(ctx context.Context, user, role string, revoke bool) error {
 	if err != nil {
 		return err
 	}
-	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke, environment)
+	return rbac.ProvisionRole(ctx, actions, operator, identity, target, role, revoke, environment, policy)
 }
 
 func loadOperatorBaseline(ctx context.Context, q db.DBTX, cfg config.AdminConfig, environment string) (legalpolicy.Policy, error) {

@@ -27,6 +27,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 )
 
 // Rewrite only the owned client's script keys. Production Lua/budgets remain
@@ -302,6 +303,49 @@ func (f realProofFixture) counts(t *testing.T) (int, int) {
 		t.Fatal("read test-only proof/action counts failed")
 	}
 	return proofs, actions
+}
+
+func TestCommittedPhoneRepairRejectsEarlierDeletionProofIntegration(t *testing.T) {
+	f := newRealProofFixture(t)
+	proof := f.issue(t)
+	cipher := f.service.deps.Cipher
+	const destination = "+989123456789"
+	encrypted, err := cipher.Encrypt(f.ctx, []byte(destination))
+	if err != nil {
+		t.Fatal("encrypt repaired contact failed")
+	}
+	evidence, err := contactproof.Seal(f.ctx, cipher, f.user.ID, contactproof.Phone, destination, contactproof.SMSOTP, time.Now().UTC())
+	if err != nil {
+		t.Fatal("seal repaired contact failed")
+	}
+	users, err := smsotp.NewUserStore(f.pool, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := users.SetPhoneIfCurrent(f.ctx, f.user.ID, f.sess.AuthVersion, encrypted, "owned-repair-index", evidence); err != nil {
+		t.Fatal("verified contact repair failed", err)
+	}
+	current, err := db.New(f.pool).GetUserByID(f.ctx, f.user.ID)
+	if err != nil || current.AuthVersion != f.sess.AuthVersion+1 {
+		t.Fatal("contact repair did not commit exactly one authority change")
+	}
+	if err := session.ValidateAuthority(f.ctx, session.NewDBAccountState(f.pool), f.sess.UserID, f.sess.AuthVersion, f.sess.Kind, f.sess.Evidence); !errors.Is(err, session.ErrAccountIneligible) {
+		t.Fatal("earlier session survived verified contact change")
+	}
+	tx, err := f.runtime.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(f.ctx) }()
+	if err := f.service.ConsumeTx(f.ctx, tx, f.sess, proof); err != ErrUnauthorized {
+		t.Fatal("earlier eligible deletion proof survived actual contact change", err)
+	}
+	if err := tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if proofs, actions := f.counts(t); proofs != 1 || actions != 0 {
+		t.Fatal("rejected earlier proof partially consumed or performed an action")
+	}
 }
 
 func TestAccountDeletionProofRollbackAndConcurrentConsumersIntegration(t *testing.T) {

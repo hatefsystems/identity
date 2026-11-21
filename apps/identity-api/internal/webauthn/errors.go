@@ -1,6 +1,10 @@
 package webauthn
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+)
 
 // Package-level sentinel errors. Following the convention established by the
 // session package, each carries a "webauthn: " prefix so a wrapped error is
@@ -81,11 +85,9 @@ var (
 	// accounts.
 	ErrCredentialNotFound = errors.New("webauthn: credential not found")
 
-	// ErrLastCredential indicates the credential targeted for deletion is the
-	// account's only remaining authentication factor, so removing it would lock
-	// the owner out permanently. The account must enrol another passkey, enable
-	// TOTP, or set a password first.
-	ErrLastCredential = errors.New("webauthn: cannot remove the account's last authentication factor")
+	// ErrLastCredential and ErrLastFactor preserve shared policy error identity.
+	ErrLastCredential = accountpolicy.ErrLastCredential
+	ErrLastFactor     = accountpolicy.ErrLastFactor
 )
 
 // isDomainError reports whether err is one of this package's sentinels, i.e. an

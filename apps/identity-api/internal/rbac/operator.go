@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -19,7 +20,11 @@ import (
 // provisioned database credentials. Operator identity is attested by that
 // process's launcher, never accepted from HTTP. Both grants and revocations
 // serialize with moderation and commit their durable audit intent atomically.
-func ProvisionRole(ctx context.Context, actions *adminaction.Service, operator uuid.UUID, identity string, target uuid.UUID, role string, revoke bool, environment string) error {
+// Without an explicit password-login policy, grants require a passkey.
+func ProvisionRole(ctx context.Context, actions *adminaction.Service, operator uuid.UUID, identity string, target uuid.UUID, role string, revoke bool, environment string, policies ...accountpolicy.Policy) error {
+	if len(policies) > 1 {
+		return errors.New("rbac: at most one account policy required")
+	}
 	u, err := url.Parse(identity)
 	if actions == nil || operator == uuid.Nil || target == uuid.Nil || err != nil || u.Scheme != "spiffe" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(identity) > 255 || strings.ContainsAny(identity, " \t\r\n") {
 		return errors.New("rbac: trusted operator identity and target required")
@@ -41,6 +46,14 @@ func ProvisionRole(ctx context.Context, actions *adminaction.Service, operator u
 	if baseline.ContextRetention() != actions.ContextRetention() {
 		return legalpolicy.ErrMismatch
 	}
+	policy := accountpolicy.Policy{}
+	if !revoke && len(policies) != 0 {
+		policy = policies[0]
+	}
+	authority, err := policy.Guard(ctx, op.Tx)
+	if err != nil {
+		return err
+	}
 	if err := pglock.LockAccount(ctx, op.Tx, target); err != nil {
 		return err
 	}
@@ -49,12 +62,16 @@ func ProvisionRole(ctx context.Context, actions *adminaction.Service, operator u
 		return err
 	}
 	if !revoke {
-		var hasPasskey bool
-		if err := op.Tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id=$1)`, target).Scan(&hasPasskey); err != nil {
+		if user.Status != "active" || user.DeletedAt.Valid {
+			return errors.New("rbac: grants require an active account")
+		}
+		state, err := policy.Read(ctx, op.Tx, user, authority)
+		if err != nil {
 			return err
 		}
-		if user.Status != "active" || user.DeletedAt.Valid || (!user.IsMfaEnabled && !hasPasskey) {
-			return errors.New("rbac: grants require an active account with enrolled MFA")
+		state.Privileged = true
+		if err := state.Check(); err != nil {
+			return err
 		}
 	}
 	had, err := op.Queries.UserHasRole(ctx, db.UserHasRoleParams{UserID: target, RoleID: role})

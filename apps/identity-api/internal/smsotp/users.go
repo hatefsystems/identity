@@ -1,6 +1,7 @@
 package smsotp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -9,8 +10,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // Database provides queries and transactions required for locked account mutations.
@@ -23,14 +27,22 @@ type Database interface {
 type PostgresUserStore struct {
 	database Database
 	queries  *db.Queries
+	cipher   contactproof.Cipher
 }
 
 // NewUserStore constructs the transactional user store without querying the database.
-func NewUserStore(database Database) (*PostgresUserStore, error) {
+func NewUserStore(database Database, ciphers ...contactproof.Cipher) (*PostgresUserStore, error) {
 	if database == nil || (reflect.ValueOf(database).Kind() == reflect.Pointer && reflect.ValueOf(database).IsNil()) {
 		return nil, ErrUnavailable
 	}
-	return &PostgresUserStore{database, db.New(database)}, nil
+	if len(ciphers) > 1 || len(ciphers) == 1 && missingDependency(ciphers[0]) {
+		return nil, ErrUnavailable
+	}
+	s := &PostgresUserStore{database: database, queries: db.New(database)}
+	if len(ciphers) == 1 {
+		s.cipher = ciphers[0]
+	}
+	return s, nil
 }
 
 // GetUserByID loads a nondeleted account with a bounded database deadline.
@@ -79,7 +91,7 @@ func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version in
 		return false, ErrUnavailable
 	}
 	q := db.New(tx)
-	u, err := q.GetAccountAuthStateForUpdate(ctx, id)
+	u, err := q.GetUserByIDForUpdate(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrUserNotFound
 	}
@@ -94,8 +106,38 @@ func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version in
 	}
 	var count int64
 	if remove {
+		if err := accountpolicy.CheckPhoneRemoval(ctx, q, s.cipher, u); err != nil {
+			if errors.Is(err, accountpolicy.ErrLastVerifiedContact) {
+				return false, accountpolicy.ErrLastVerifiedContact
+			}
+			return false, ErrUnavailable
+		}
 		count, err = q.RemoveUserPhoneIfAuthorized(ctx, db.RemoveUserPhoneIfAuthorizedParams{ID: id, AuthVersion: version})
 	} else {
+		if s.cipher == nil {
+			return false, ErrUnavailable
+		}
+		plain, proofErr := s.cipher.Decrypt(ctx, encrypted)
+		if proofErr != nil {
+			clear(plain)
+			return false, ErrUnavailable
+		}
+		proof, proofErr := contactproof.Open(ctx, s.cipher, evidence, id, contactproof.Phone, string(plain))
+		clear(plain)
+		if proofErr != nil || proof == nil {
+			return false, ErrUnavailable
+		}
+		// Read raw prior evidence so a fresh OTP can repair unknown provenance.
+		current, readErr := q.GetCurrentContactEvidence(ctx, db.GetCurrentContactEvidenceParams{UserID: id, Channel: contactproof.Phone})
+		if readErr != nil || current.ID != id {
+			return false, ErrUnavailable
+		}
+		if bytes.Equal(u.PhoneEncrypted, encrypted) && u.PhoneBlindIndex != nil && *u.PhoneBlindIndex == index && bytes.Equal(current.EvidenceEncrypted, evidence) {
+			if err := tx.Commit(ctx); err != nil {
+				return false, ErrUnavailable
+			}
+			return false, nil
+		}
 		count, err = q.SetUserPhoneIfAuthorized(ctx, db.SetUserPhoneIfAuthorizedParams{ID: id, AuthVersion: version, PhoneEncrypted: encrypted, PhoneBlindIndex: &index})
 	}
 	if err != nil || count < 0 || count > 1 || !remove && count != 1 {
@@ -106,8 +148,16 @@ func (s *PostgresUserStore) mutate(ctx context.Context, id uuid.UUID, version in
 			return false, ErrUnavailable
 		}
 	}
+	if count == 1 {
+		if err := q.RevokeUserCredentials(ctx, id); err != nil {
+			return false, ErrUnavailable
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, ErrUnavailable
+	}
+	if count == 1 {
+		session.SecurityChangeCommitted(ctx)
 	}
 	return count == 1, nil
 }

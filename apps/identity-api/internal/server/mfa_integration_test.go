@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -156,6 +157,10 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 						t.Errorf("clean owned mutation user: %v", err)
 					}
 				})
+				// Factor maintenance must retain an independently usable primary credential.
+				if _, err := pool.Exec(ctx, `INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), user.ID, []byte("fixture-public-key"), uuid.Nil); err != nil {
+					t.Fatal(err)
+				}
 				browser := newPortalTestClient(t, testPortalOrigin)
 				codec, err := session.NewCookieCodec(session.CookieConfig{Name: "session", TTL: time.Hour})
 				if err != nil {
@@ -183,6 +188,10 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 					if err := initialMFA.VerifyAndEnable(ctx, user.ID, user.AuthVersion, current.ID, pending.EnrollmentID, code); err != nil {
 						t.Fatal(err)
 					}
+					user, err = q.GetUserByID(ctx, user.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
 					loginCode, err := totp.GenerateCode(pending.Secret, time.Now())
 					if err != nil {
 						t.Fatal(err)
@@ -195,9 +204,6 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 						UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true,
 						Evidence: session.Evidence{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()},
 					})
-					if _, err := pool.Exec(ctx, `INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), user.ID, []byte("fixture-public-key"), uuid.Nil); err != nil {
-						t.Fatal(err)
-					}
 				}
 				initialRecovery, err := recovery.New(recovery.Config{}, q, recovery.WithTransacter(pool))
 				if err != nil {
@@ -205,6 +211,15 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 				}
 				if _, err := initialRecovery.Generate(ctx, user.ID, user.AuthVersion, ""); err != nil {
 					t.Fatal(err)
+				}
+				_, signingKeys := newTestStepUpService(t, q, nil, initialMFA)
+				earnedGrants, err := stepup.New(stepup.Config{Issuer: testStepUpIssuer, AccountState: session.NewDBAccountState(pool)}, signingKeys, q, nil, initialMFA, stepup.NewMemoryReplayGuard())
+				if err != nil {
+					t.Fatal(err)
+				}
+				earlierGrant, _, err := earnedGrants.MintContext(ctx, stepup.MintParams{UserID: current.UserID, SessionID: current.ID, AuthVersion: current.AuthVersion, AuthVersionSet: true, DPoPJKT: current.DPoPJKT, AMR: []string{"webauthn"}})
+				if err != nil {
+					t.Fatal("earlier step-up fixture could not earn authority", err)
 				}
 				before := credentialSnapshot(ctx, t, pool, user.ID)
 				barrier := &credentialMutationBarrier{pool: pool, phase: ordering, entered: make(chan struct{}), release: make(chan struct{})}
@@ -285,6 +300,30 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 					t.Fatal("mutation response timed out")
 				}
 				after := credentialSnapshot(ctx, t, pool, user.ID)
+				locked, err := q.GetUserByID(ctx, user.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var versionChanges int64
+				if ordering != "fresh" {
+					versionChanges++
+				}
+				if ordering != "revocation_first" && (operation == "enable" || operation == "disable") {
+					versionChanges++
+					if response.Header().Get(session.HeaderAuthInvalidated) != "true" {
+						t.Fatal("committed factor change did not report invalidated initiating authority")
+					}
+				}
+				if locked.AuthVersion != user.AuthVersion+versionChanges {
+					t.Fatal("factor mutation/revocation version transition was not exactly once per change")
+				}
+				_, grantErr := earnedGrants.Validate(ctx, earlierGrant, current)
+				if versionChanges > 0 && !errors.Is(grantErr, stepup.ErrGrantNotForSession) {
+					t.Fatal("earlier step-up grant survived committed authority change", grantErr)
+				}
+				if versionChanges == 0 && grantErr != nil {
+					t.Fatal("pending/non-factor operation invalidated earlier step-up authority", grantErr)
+				}
 				if ordering == "revocation_first" {
 					if response.Code != http.StatusUnauthorized || !reflect.DeepEqual(before, after) ||
 						bytes.Contains(response.Body.Bytes(), []byte(`"secret"`)) || bytes.Contains(response.Body.Bytes(), []byte(`"codes"`)) {
@@ -317,13 +356,87 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 				if successes != wantSuccesses {
 					t.Fatalf("success audits = %d, want %d", successes, wantSuccesses)
 				}
-				if ordering == "mutation_first" {
-					locked, err := q.GetUserByID(ctx, user.ID)
-					if err != nil || locked.AuthVersion != user.AuthVersion+1 {
-						t.Fatalf("subsequent revocation failed: %v", err)
-					}
-				}
 			})
 		}
+	}
+}
+
+type mfaRollbackBegin struct{ pool *pgxpool.Pool }
+
+func (b mfaRollbackBegin) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return mfaRollbackTx{tx}, nil
+}
+
+type mfaRollbackTx struct{ pgx.Tx }
+
+var errMfaForcedRollback = errors.New("forced MFA rollback after write")
+
+func (tx mfaRollbackTx) Commit(context.Context) error { return errMfaForcedRollback }
+
+func TestTOTPChangesRollbackFactorPendingAndAuthorityIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	pool := openRecoveryHandlerIntegrationPool(ctx, t)
+	q := db.New(pool)
+	for _, operation := range []string{"enable", "disable"} {
+		t.Run(operation, func(t *testing.T) {
+			user, err := q.CreateUser(ctx, db.CreateUserParams{Status: "active"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stop()
+				if _, err := pool.Exec(cleanup, "DELETE FROM users WHERE id=$1", user.ID); err != nil {
+					t.Error("owned MFA rollback account teardown failed")
+				}
+			})
+			if _, err := pool.Exec(ctx, `INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), user.ID, []byte("fixture-public-key"), uuid.Nil); err != nil {
+				t.Fatal(err)
+			}
+			svc, err := mfa.New(mfa.Config{}, q, &mfaTestEncryptor{}, mfa.WithTransacter(pool))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessionID := uuid.NewString()
+			pending, err := svc.GenerateSetup(ctx, user.ID, user.AuthVersion, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, err := totp.GenerateCode(pending.Secret, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == "disable" {
+				if err := svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, pending.EnrollmentID, code); err != nil {
+					t.Fatal(err)
+				}
+				user, err = q.GetUserByID(ctx, user.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := credentialSnapshot(ctx, t, pool, user.ID)
+			svc, err = mfa.New(mfa.Config{}, q, &mfaTestEncryptor{}, mfa.WithTransacter(mfaRollbackBegin{pool}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation == "enable" {
+				err = svc.VerifyAndEnable(ctx, user.ID, user.AuthVersion, sessionID, pending.EnrollmentID, code)
+			} else {
+				err = svc.Disable(ctx, user.ID, user.AuthVersion)
+			}
+			if !errors.Is(err, errMfaForcedRollback) {
+				t.Fatal("forced post-write rollback was not reached", err)
+			}
+			after, err := q.GetUserByID(ctx, user.ID)
+			if err != nil || after.AuthVersion != user.AuthVersion || !reflect.DeepEqual(before, credentialSnapshot(ctx, t, pool, user.ID)) {
+				t.Fatal("rolled-back MFA change retained partial factor, enrollment or authority writes")
+			}
+		})
 	}
 }

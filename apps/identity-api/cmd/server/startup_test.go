@@ -280,9 +280,9 @@ func TestAuditCompositionUsesConfiguredGenerationAndCanonicalEmail(t *testing.T)
 	}
 }
 
-func TestDisabledSMSCompositionKeepsDBOnlyRemovalWithoutDeliverySecrets(t *testing.T) {
+func TestDisabledSMSCompositionKeepsEvidencedRemovalWithoutDeliverySecrets(t *testing.T) {
 	productionStartupEnvironment(t)
-	for _, name := range []string{"SMS_GATEWAY_API_KEY", "SMS_OTP_HASH_PEPPER", "ENVELOPE_MASTER_KEK", "ENVELOPE_BLIND_INDEX_PEPPER"} {
+	for _, name := range []string{"SMS_GATEWAY_API_KEY", "SMS_OTP_HASH_PEPPER", "ENVELOPE_BLIND_INDEX_PEPPER"} {
 		t.Setenv(name, "invalid-and-unused-when-delivery-is-disabled")
 	}
 	// pgxpool is lazy with zero minimum connections. No dependency is dialed by
@@ -295,5 +295,9 @@ func TestDisabledSMSCompositionKeepsDBOnlyRemovalWithoutDeliverySecrets(t *testi
 	service, err := buildSMSOTPService("production", pool, nil, slog.New(slog.DiscardHandler))
 	if err != nil || service == nil || service.DeliveryEnabled() {
 		t.Fatalf("disabled SMS lost independent phone removal: %v", err)
+	}
+	t.Setenv(config.EnvMasterKEK, "invalid-required-evidence-key")
+	if service, err := buildSMSOTPService("production", pool, nil, slog.New(slog.DiscardHandler)); err == nil || service != nil {
+		t.Fatal("disabled SMS bypassed required contact-evidence crypto")
 	}
 }

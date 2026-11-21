@@ -21,12 +21,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/natsjs"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 func fixturePolicy() legalpolicy.Policy {
@@ -127,8 +130,12 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 			return nil, err
 		}
 		id := uuid.MustParse(account.UserID)
+		policy, err := fixtureRolePolicy(pool, enc)
+		if err != nil {
+			return nil, err
+		}
 		for _, role := range roles {
-			if err := rbac.ProvisionRole(ctx, actions, operator, identity, id, role, false, "test"); err != nil {
+			if err := rbac.ProvisionRole(ctx, actions, operator, identity, id, role, false, "test", policy); err != nil {
 				return nil, errors.New("cannot provision fixture operator grant")
 			}
 		}
@@ -247,8 +254,12 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 		if err != nil || len(roles) == 0 {
 			return nil, errors.New("explicit fixture role required for revocation")
 		}
+		policy, err := fixtureRolePolicy(pool, enc)
+		if err != nil {
+			return nil, err
+		}
 		for _, role := range roles {
-			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, action == "admin-revoke", "test"); err != nil {
+			if err := rbac.ProvisionRole(ctx, actions, operator, identity, userID, role, action == "admin-revoke", "test", policy); err != nil {
 				return nil, errors.New("cannot change fixture operator grant")
 			}
 		}
@@ -324,6 +335,25 @@ func adminFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 		}
 	}
 	return nil, errors.New("unsupported administrative fixture operation")
+}
+
+func fixtureRolePolicy(pool *pgxpool.Pool, cipher username.Cipher) (accountpolicy.Policy, error) {
+	loginCfg, err := config.LoadLogin("test")
+	if err != nil {
+		return accountpolicy.Policy{}, err
+	}
+	policy := accountpolicy.Policy{PasswordLoginEnabled: loginCfg.Enabled}
+	if loginCfg.Enabled {
+		cfg, err := config.LoadUsername()
+		if err != nil || !cfg.Enabled {
+			return accountpolicy.Policy{}, errors.New("role fixture requires admitted username configuration")
+		}
+		policy.Usernames, err = username.NewStore(pool, cipher, cfg.Normalizer)
+		if err != nil {
+			return accountpolicy.Policy{}, err
+		}
+	}
+	return policy, nil
 }
 
 func adminWorkerRoles(ctx context.Context, pool *pgxpool.Pool, runID, subject string) (any, error) {

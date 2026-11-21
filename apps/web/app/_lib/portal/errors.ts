@@ -79,6 +79,8 @@ export function errorMessage(error: unknown, method?: 'webauthn'): MessageDescri
         return { key: 'errors.freshVerification' };
       case 'last_credential':
         return { key: 'errors.lastCredential' };
+      case 'last_factor':
+        return { key: 'errors.lastFactor' };
       case 'credential_not_found':
       case 'user_not_found':
       case 'not_found':

@@ -35,6 +35,7 @@ const key = {
   user_verified: true,
   backup_eligible: true,
   backup_state: true,
+  can_remove: true,
 };
 const codes = ['ABCDE-FGHJK-MNPQR-STVWX-YZ012-34567-89', '12345-6789A-BCDEF-GHJKM-NPQRS-TVWXY-Z0'];
 let nextBootstrap: () => Promise<Profile>;

@@ -1229,9 +1229,15 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   // The fixture injects the existing credential directly into the virtual
   // authenticator. Remove it only after step-up reaches registration so the
   // device can create a distinct credential while the server keeps the original.
+  let originalCredential;
   await page.route(
     '**/api/v1/auth/webauthn/register/generate-options',
     async (route) => {
+      const { credentials } = await authenticator.cdp.send('WebAuthn.getCredentials', {
+        authenticatorId: authenticator.authenticatorId,
+      });
+      originalCredential = credentials.find((credential) => credential.credentialId === fixture.credentials[0].credentialId);
+      assert(originalCredential, 'Original authenticator credential was unavailable for later reauthentication');
       await authenticator.cdp.send('WebAuthn.removeCredential', {
         authenticatorId: authenticator.authenticatorId,
         credentialId: fixture.credentials[0].credentialId,
@@ -1245,8 +1251,14 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   await stepUp(page, () => add.click());
   const createResponse = await created;
   assert.equal(createResponse.status(), 201);
+  assert.equal((await createResponse.allHeaders())['x-identity-auth-invalidated'], 'true');
   const key = await createdBody;
   assert(key.name === passkeyName, 'Registration did not preserve the pending name');
+  await page.getByTestId('security-outcome').waitFor({ state: 'visible' });
+  assert.equal(await page.getByTestId('security-outcome').getAttribute('data-outcome'), 'passkeyAdded');
+  assert.equal((await api(page, '/api/v1/users/me')).status, 401, 'Passkey enrollment kept the initiating session valid');
+  await signIn(page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
+  await navigate(page, harness.origin, 'Security', '/dashboard/security');
   const row = page.locator(`[data-key-id="${key.id}"]`);
   await row.waitFor({ state: 'visible' });
   await row.getByRole('button', { name: localizedText(/^Rename /) }).click();
@@ -1258,20 +1270,34 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   assert.equal(renamed.status(), 200);
   const removed = operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'DELETE');
   await stepUp(page, () => row.getByRole('button', { name: localizedText(/remove/i) }).click());
-  assert.equal((await removed).status(), 204);
+  const removeResponse = await removed;
+  assert.equal(removeResponse.status(), 204);
+  assert.equal((await removeResponse.allHeaders())['x-identity-auth-invalidated'], 'true');
   await row.waitFor({ state: 'detached' });
+  await page.getByTestId('security-outcome').waitFor({ state: 'visible' });
+  assert.equal(await page.getByTestId('security-outcome').getAttribute('data-outcome'), 'passkeyRemoved');
+  assert.equal((await api(page, '/api/v1/users/me')).status, 401, 'Passkey removal kept the initiating session valid');
+  await authenticator.cdp.send('WebAuthn.removeCredential', {
+    authenticatorId: authenticator.authenticatorId,
+    credentialId: Buffer.from(key.id, 'base64url').toString('base64'),
+  });
+  await authenticator.cdp.send('WebAuthn.addCredential', {
+    authenticatorId: authenticator.authenticatorId, credential: originalCredential,
+  });
+  await signIn(page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
+  await navigate(page, harness.origin, 'Security', '/dashboard/security');
 
   const original = page.locator(`[data-key-id="${originalID}"]`);
   assert(
     await original.getByRole('button', { name: localizedText(/^Remove /) }).isDisabled(),
-    'UI offered to remove the final passkey'
+    'UI offered to remove a server-protected final passkey'
   );
   await page
-    .getByText(localizedText('Add another passkey before removing your last one.'), { exact: true })
+    .getByText(localizedText('Your last passkey is protected because eligible username-and-password sign-in would not remain available or a privileged-account factor requirement would be unmet. Add another passkey or establish the required sign-in and factor alternatives before removing it.'), { exact: true })
     .waitFor({ state: 'visible' });
   await clean(page, observed);
   evidence.checks.push(
-    'native modal focus/escape/return, UV step-up, named registration across replicas, rename/delete, disabled final-passkey removal, strict CSP'
+    'native modal focus/escape/return, UV step-up, named registration across replicas, committed enrollment/deletion outcomes with real reauthentication, rename/delete, server-protected final-passkey removal, strict CSP'
   );
 }
 

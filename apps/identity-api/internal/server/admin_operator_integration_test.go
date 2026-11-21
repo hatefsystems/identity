@@ -3,18 +3,25 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/legalpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/rbac"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
 func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
@@ -40,7 +47,7 @@ func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
 		mfa, passkey, deleted, allowed bool
 	}{
 		{"no MFA", "active", false, false, false, false},
-		{"TOTP", "active", true, false, false, true},
+		{"TOTP flag only", "active", true, false, false, false},
 		{"passkey", "active", false, true, false, true},
 		{"banned", "banned", true, false, false, false},
 		{"suspended", "suspended", true, false, false, false},
@@ -54,12 +61,7 @@ func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.passkey {
-				// Enrollment validity is tested by WebAuthn; provisioning consumes
-				// the persisted credential-presence fact, not a new ceremony.
-				if _, err := f.pool.Exec(ctx, `INSERT INTO webauthn_credentials
-					(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), target, []byte{1}, uuid.New()); err != nil {
-					t.Fatal(err)
-				}
+				f.passkey(t, target)
 			}
 			before := counts(target)
 			err := rbac.ProvisionRole(ctx, f.srv.deps.AdminActions, operator, "spiffe://identity.test/operator", target, "dpo", false, "test")
@@ -133,9 +135,7 @@ func TestAdminOperatorRoleEligibilityNoopsAndRollbackIntegration(t *testing.T) {
 		})
 	}
 	target := f.user(t).ID
-	if _, err := f.pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", target); err != nil {
-		t.Fatal(err)
-	}
+	f.passkey(t, target)
 	before := counts(target)
 	for _, tc := range []struct {
 		name    string
@@ -165,4 +165,191 @@ func operatorTestActions(t *testing.T, f *adminIntegration, reject bool, retenti
 		t.Fatal(err)
 	}
 	return actions
+}
+
+func TestAdminOperatorPrimaryCredentialAndConfiguredFactorIntegration(t *testing.T) {
+	f, actions := newRoleProtectionFixture(t)
+	policy := accountpolicy.Policy{PasswordLoginEnabled: true, Usernames: f.names}
+	for _, tc := range []struct {
+		name, credential, mutation string
+		totp, enabled              bool
+		want                       error
+	}{
+		{"password and configured TOTP", "password_only", "", true, true, nil},
+		{"password without TOTP", "password_only", "", false, true, accountpolicy.ErrLastFactor},
+		{"TOTP flag without secret", "password_only", "flag", false, true, accountpolicy.ErrLastFactor},
+		{"TOTP secret without enabled flag", "password_only", "disabled", true, true, accountpolicy.ErrLastFactor},
+		{"TOTP without primary credential", "password_only", "missing verifier", true, true, accountpolicy.ErrLastCredential},
+		{"TOTP and malformed password", "password_only", "unsupported verifier", true, true, accountpolicy.ErrLastCredential},
+		{"password login disabled", "password_only", "", true, false, accountpolicy.ErrLastCredential},
+		{"password without admitted username", "password_unclaimed", "", true, true, accountpolicy.ErrLastCredential},
+		{"password authority unavailable", "password_only", "no authority", true, true, username.ErrUnavailable},
+		{"passkey default policy", "passkey_only", "", false, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := f.account(t, tc.credential, tc.totp)
+			statement := map[string]string{
+				"flag":                 `UPDATE users SET is_mfa_enabled=true WHERE id=$1`,
+				"disabled":             `UPDATE users SET is_mfa_enabled=false WHERE id=$1`,
+				"missing verifier":     `UPDATE users SET password_hash=NULL WHERE id=$1`,
+				"unsupported verifier": `UPDATE users SET password_hash=$2 WHERE id=$1`,
+			}[tc.mutation]
+			if statement != "" {
+				args := []any{a.user.ID}
+				if tc.mutation == "unsupported verifier" {
+					args = append(args, "not-an-admitted-verifier")
+				}
+				if _, err := f.pool.Exec(f.ctx, statement, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p := policy
+			p.PasswordLoginEnabled = tc.enabled
+			if tc.mutation == "no authority" {
+				p.Usernames = nil
+			}
+			var beforeVersion, beforeEvents int64
+			if err := f.pool.QueryRow(f.ctx, `SELECT auth_version,(SELECT count(*) FROM event_outbox WHERE admin_action) FROM users WHERE id=$1`, a.user.ID).Scan(&beforeVersion, &beforeEvents); err != nil {
+				t.Fatal(err)
+			}
+			err := rbac.ProvisionRole(f.ctx, actions, uuid.New(), "spiffe://identity.test/role-protection", a.user.ID, "support", false, "test", p)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("grant protection err=%v want=%v", err, tc.want)
+			}
+			var held bool
+			var version, events, contexts int64
+			if err := f.pool.QueryRow(f.ctx, `SELECT auth_version,
+				EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1),
+				(SELECT count(*) FROM event_outbox WHERE admin_action),
+				(SELECT count(*) FROM admin_action_contexts WHERE account_ref=$1) FROM users WHERE id=$1`, a.user.ID).Scan(&version, &held, &events, &contexts); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want != nil {
+				if held || version != beforeVersion || events != beforeEvents || contexts != 0 {
+					t.Fatal("rejected protection predicate wrote role, authority or audit intent")
+				}
+			} else if !held || version != beforeVersion+1 || events != beforeEvents+1 || contexts != 1 {
+				t.Fatal("eligible role grant did not atomically commit authority and audit intent")
+			}
+		})
+	}
+}
+
+func TestAdminOperatorGrantVersusLastPasskeyRemovalIntegration(t *testing.T) {
+	f, _ := newRoleProtectionFixture(t)
+	policy := accountpolicy.Policy{PasswordLoginEnabled: true, Usernames: f.names}
+	for _, ordering := range []string{"grant_first", "removal_first"} {
+		t.Run(ordering, func(t *testing.T) {
+			a := f.account(t, "dual", false)
+			credentials, err := db.New(f.pool).ListWebauthnCredentialsByUser(f.ctx, a.user.ID)
+			if err != nil || len(credentials) != 1 {
+				t.Fatal("race requires exactly one persisted passkey")
+			}
+			ctx, cancel := context.WithTimeout(f.ctx, 10*time.Second)
+			barrier := &credentialMutationBarrier{pool: f.pool, phase: "mutation_first", entered: make(chan struct{}), release: make(chan struct{})}
+			release := sync.OnceFunc(func() { close(barrier.release) })
+			var workers sync.WaitGroup
+			defer func() { release(); cancel(); workers.Wait() }()
+			secondPID := make(chan uint32, 1)
+			second := adminIntegrationBeginFunc(func(ctx context.Context) (pgx.Tx, error) {
+				tx, err := f.pool.Begin(ctx)
+				if err == nil {
+					secondPID <- tx.Conn().PgConn().PID()
+				}
+				return tx, err
+			})
+			var grantTx adminaction.Beginner = barrier
+			var removalTx webauthn.Transacter = second
+			if ordering == "removal_first" {
+				grantTx, removalTx = second, barrier
+			}
+			actions, err := adminaction.New(grantTx, f.cipher, "identity.audit.role-race", time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := db.New(f.pool)
+			keys, err := webauthn.New(webauthn.Config{RPID: "identity.example", RPDisplayName: "Identity", RPOrigins: []string{"https://identity.example"}, ChallengeTTL: time.Minute, MockChallengeKey: make([]byte, 32)}, q, q, webauthn.NewMemoryChallengeStore(), webauthn.WithTransacter(removalTx))
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys.SetAccountPolicy(policy)
+			current := session.Session{UserID: a.user.ID.String(), AuthVersion: a.user.AuthVersion, AuthVersionSet: true, Kind: session.KindAuthenticated}
+			grant := func() error {
+				return rbac.ProvisionRole(ctx, actions, uuid.New(), "spiffe://identity.test/role-race", a.user.ID, "support", false, "test", policy)
+			}
+			remove := func() error {
+				return keys.DeleteCredential(session.WithSession(ctx, current), a.user.ID, credentials[0].ID)
+			}
+			first, next := grant, remove
+			if ordering == "removal_first" {
+				first, next = remove, grant
+			}
+			firstResult, secondResult := make(chan error, 1), make(chan error, 1)
+			workers.Add(1)
+			go func() { defer workers.Done(); firstResult <- first() }()
+			select {
+			case <-barrier.entered:
+			case err := <-firstResult:
+				t.Fatalf("first policy writer failed before commit barrier: %v", err)
+			case <-ctx.Done():
+				t.Fatal("first policy writer did not reach commit barrier")
+			}
+			workers.Add(1)
+			go func() { defer workers.Done(); secondResult <- next() }()
+			select {
+			case pid := <-secondPID:
+				waitCredentialRevocationLock(ctx, t, f.pool, pid)
+			case <-ctx.Done():
+				t.Fatal("second policy writer did not begin")
+			}
+			release()
+			if err := <-firstResult; err != nil {
+				t.Fatalf("first policy writer failed: %v", err)
+			}
+			want := webauthn.ErrAccountNotActive
+			if ordering == "removal_first" {
+				want = accountpolicy.ErrLastFactor
+			}
+			if err := <-secondResult; !errors.Is(err, want) {
+				t.Fatalf("waiting policy writer err=%v want=%v", err, want)
+			}
+			var held bool
+			var count, version, contexts int64
+			if err := f.pool.QueryRow(ctx, `SELECT auth_version,
+				EXISTS(SELECT 1 FROM user_roles WHERE user_id=$1),
+				(SELECT count(*) FROM webauthn_credentials WHERE user_id=$1),
+				(SELECT count(*) FROM admin_action_contexts WHERE account_ref=$1) FROM users WHERE id=$1`, a.user.ID).Scan(&version, &held, &count, &contexts); err != nil {
+				t.Fatal(err)
+			}
+			if version != a.user.AuthVersion+1 || ordering == "grant_first" && (!held || count != 1 || contexts != 1) || ordering == "removal_first" && (held || count != 0 || contexts != 0) {
+				t.Fatal("role/removal race committed an unprotected grant or invalid authority transition")
+			}
+		})
+	}
+}
+
+func newRoleProtectionFixture(t *testing.T) (*realLoginFixture, *adminaction.Service) {
+	t.Helper()
+	f := newRealLoginFixture(t, false, false)
+	actions, err := adminaction.New(f.pool, f.cipher, "identity.audit.role-protection", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := actions.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = op.Rollback(f.ctx) }()
+	op.Event = audit.Event{ActorID: uuid.New(), ActorSPIFFEID: "spiffe://identity.test/role-policy"}
+	policy := legalpolicy.Policy{ID: uuid.New(), ApprovalReference: "role-fixture-only", Fixture: true,
+		ContextRetentionSeconds: 3600, ReleasedHoldRetentionSeconds: 3600,
+		ContextClock: legalpolicy.ClockCreatedAt, ReleasedHoldClock: legalpolicy.ClockReleasedAt,
+		HoldTombstoneFields: legalpolicy.HoldTombstoneFields(), HoldTombstoneLifetime: legalpolicy.LifetimeNoExpiry}
+	if err := legalpolicy.Install(f.ctx, op, policy, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	return f, actions
 }

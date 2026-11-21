@@ -158,6 +158,7 @@ func newAdminIntegration(t *testing.T) *adminIntegration {
 			if _, err := pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", user.ID); err != nil {
 				t.Fatal(err)
 			}
+			f.passkey(t, user.ID)
 			if err := rbac.ProvisionRole(ctx, actions, uuid.New(), "spiffe://identity.test/operator", user.ID, role, false, "test"); err != nil {
 				t.Fatal(err)
 			}
@@ -195,6 +196,15 @@ func (f *adminIntegration) user(t *testing.T) db.User {
 	}
 	t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), "DELETE FROM users WHERE id=$1", u.ID) })
 	return u
+}
+
+func (f *adminIntegration) passkey(t *testing.T, id uuid.UUID) {
+	t.Helper()
+	// Provisioning consumes persisted enrollment; ceremonies have separate tests.
+	if _, err := f.pool.Exec(t.Context(), `INSERT INTO webauthn_credentials
+		(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), id, []byte{1}, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *adminIntegration) grant(t *testing.T, role string) string {

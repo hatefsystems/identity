@@ -32,6 +32,7 @@ const firstKey = {
   user_verified: true,
   backup_eligible: true,
   backup_state: true,
+  can_remove: true,
 };
 const secondKey = { ...firstKey, id: 'second-key', name: 'Backup' };
 const api = {
@@ -757,6 +758,63 @@ describe('native verification dialog', () => {
 });
 
 describe('passkey and session management', () => {
+  it.each(['en', 'fa-IR'] as const)(
+    'uses the server hint for allowed and protected last-key removal in %s without replay on language changes',
+    async (locale) => {
+      api.keys.mockResolvedValueOnce([{ ...firstKey, can_remove: true }])
+        .mockResolvedValueOnce([{ ...firstKey, can_remove: false }]);
+      const content = (language: 'en' | 'fa-IR') => (
+        <I18nTestProvider locale={language}><PasskeysPanel /></I18nTestProvider>
+      );
+      const view = render(content(locale));
+      const removeName = locale === 'en' ? 'Remove My key' : 'حذف My key';
+      expect((await screen.findByRole<HTMLButtonElement>('button', { name: removeName })).disabled).toBe(false);
+      expect(screen.getByText(locale === 'en'
+        ? 'The server currently allows removing your last passkey because eligible username-and-password sign-in remains available and any privileged-account factor requirement is satisfied. Removing it disables passkey sign-in until you enroll another; verified contacts and recovery codes do not replace sign-in credentials.'
+        : 'سرور در حال حاضر حذف آخرین کلید عبور شما را مجاز می‌داند، زیرا ورود واجد شرایط با نام کاربری و گذرواژه در دسترس می‌ماند و الزام عامل احراز هویت حساب دارای نقش ویژه نیز رعایت می‌شود. حذف آن، ورود با کلید عبور را تا ثبت کلید دیگری غیرفعال می‌کند؛ راه‌های تماس تأییدشده و کدهای بازیابی جایگزین اعتبارنامهٔ ورود نیستند.')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: locale === 'en' ? 'Refresh passkeys' : 'تازه‌سازی کلیدهای عبور' }));
+      await waitFor(() => expect(screen.getByRole<HTMLButtonElement>('button', { name: removeName }).disabled).toBe(true));
+      expect(screen.getByText(locale === 'en'
+        ? 'Your last passkey is protected because eligible username-and-password sign-in would not remain available or a privileged-account factor requirement would be unmet. Add another passkey or establish the required sign-in and factor alternatives before removing it.'
+        : 'آخرین کلید عبور شما محافظت می‌شود، زیرا ورود واجد شرایط با نام کاربری و گذرواژه در دسترس نخواهد ماند یا الزام عامل احراز هویت حساب دارای نقش ویژه رعایت نخواهد شد. پیش از حذف آن، کلید عبور دیگری اضافه کنید یا جایگزین‌های لازم برای ورود و عامل احراز هویت را برقرار کنید.')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: removeName }));
+      expect(screen.queryByRole('dialog')).toBeNull();
+      const otherLocale = locale === 'en' ? 'fa-IR' : 'en';
+      view.rerender(content(otherLocale));
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: otherLocale === 'en' ? 'Remove My key' : 'حذف My key' }).disabled).toBe(true);
+      expect(api.keys).toHaveBeenCalledTimes(2);
+      expect(api.stepUpChallenge).not.toHaveBeenCalled();
+      expect(api.removeKey).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    ['en', 'last_credential', 'Your last passkey was not removed'],
+    ['fa-IR', 'last_credential', 'آخرین کلید عبور شما حذف نشد'],
+    ['en', 'last_factor', 'Your last strong authentication factor was not removed'],
+    ['fa-IR', 'last_factor', 'آخرین عامل احراز هویت قوی شما حذف نشد'],
+  ] as const)('localizes a stale allowed hint in %s for %s without automatic replay', async (locale, code, expected) => {
+    api.keys.mockResolvedValueOnce([{ ...firstKey, can_remove: true }]);
+    api.removeKey.mockRejectedValueOnce(new PortalError(code, 409));
+    render(<PasskeysPanel />, { locale });
+    fireEvent.click(await screen.findByRole('button', { name: locale === 'en' ? 'Remove My key' : 'حذف My key' }));
+    fireEvent.click(screen.getByRole('button', { name: locale === 'en' ? 'Continue to verification' : 'ادامه برای تأیید هویت' }));
+    fireEvent.click(await screen.findByRole('button', { name: locale === 'en' ? 'Verify with a passkey' : 'تأیید با کلید عبور' }));
+    expect((await screen.findByRole('alert')).textContent).toContain(expected);
+    expect(screen.getByRole('button', { name: locale === 'en' ? 'Start new verification' : 'آغاز تأیید هویت جدید' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'My key' })).toBeTruthy();
+    expect(api.removeKey).toHaveBeenCalledTimes(1);
+    expect(api.keys).toHaveBeenCalledTimes(1);
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it('honors a protected hint even when multiple passkeys are listed', async () => {
+    api.keys.mockResolvedValueOnce([{ ...firstKey, can_remove: false }, secondKey]);
+    render(<PasskeysPanel />);
+    expect((await screen.findByRole<HTMLButtonElement>('button', { name: 'Remove My key' })).disabled).toBe(true);
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Remove Backup' }).disabled).toBe(false);
+  });
+
   async function openAction(kind: 'add' | 'rename' | 'remove') {
     if (kind === 'add') {
       fireEvent.change(screen.getByLabelText('New passkey name'), { target: { value: 'New key' } });
@@ -782,7 +840,7 @@ describe('passkey and session management', () => {
     fireEvent.change(input, { target: { value: ' New key ' } });
     fireEvent.submit(screen.getByRole('form', { name: 'Add passkey' }));
     await verifyPasskey();
-    await screen.findByRole('heading', { name: 'New key' });
+    await screen.findByText('Passkey added.');
     expect(api.registerOptions).toHaveBeenCalledWith(
       'New key',
       expect.any(StepUpGrant),
@@ -825,7 +883,7 @@ describe('passkey and session management', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Remove Chosen label' }));
     await verifyPasskey();
     expect((await screen.findByRole('alert')).textContent).toContain(
-      'last passkey cannot be removed'
+      'Your last passkey was not removed'
     );
     expect(screen.getByRole('button', { name: 'Start new verification' })).toBeTruthy();
     expect(api.removeKey).toHaveBeenCalledTimes(1);

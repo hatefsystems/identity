@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,10 +18,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/migrate"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 const factorIntegrationTimeout = 2 * time.Minute
@@ -94,9 +97,38 @@ func openFactorIntegrationPool(ctx context.Context, t *testing.T) *pgxpool.Pool 
 		t.Fatal("DATABASE_URL is required for integration-tag factor concurrency tests")
 	}
 
-	sqldb, err := migrate.Open(ctx, url)
+	admin, err := pgxpool.New(ctx, url)
 	if err != nil {
-		t.Fatalf("open migration database: %v", err)
+		t.Fatal("open provisioning database failed")
+	}
+	t.Cleanup(admin.Close)
+	name := "passkey_fixture_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quoted := pgx.Identifier{name}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quoted+" TEMPLATE template0"); err != nil {
+		t.Fatal("create run-owned passkey database failed")
+	}
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
+		defer stop()
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+quoted); err != nil {
+			t.Error("drop run-owned passkey database failed")
+		}
+		var exists bool
+		if err := admin.QueryRow(cleanup, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)`, name).Scan(&exists); err != nil || exists {
+			t.Error("run-owned passkey database teardown not confirmed")
+		}
+	})
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatal("parse provisioning configuration failed")
+	}
+	cfg.ConnConfig.Database = name
+	cfg.ConnConfig.RuntimeParams["search_path"] = "public"
+	sqldb := stdlib.OpenDB(*cfg.ConnConfig)
+	var actual string
+	if err := sqldb.QueryRowContext(ctx, "SELECT current_database()").Scan(&actual); err != nil || actual != name {
+		_ = sqldb.Close()
+		t.Fatal("migration target is not run-owned")
 	}
 	if err := migrate.Up(ctx, sqldb); err != nil {
 		_ = sqldb.Close()
@@ -106,10 +138,6 @@ func openFactorIntegrationPool(ctx context.Context, t *testing.T) *pgxpool.Pool 
 		t.Fatalf("close migration database: %v", err)
 	}
 
-	cfg, err := pgxpool.ParseConfig(url)
-	if err != nil {
-		t.Fatalf("parse DATABASE_URL: %v", err)
-	}
 	if cfg.MaxConns < 8 {
 		cfg.MaxConns = 8
 	}
@@ -180,6 +208,13 @@ func newFactorIntegrationWebAuthn(t *testing.T, q *db.Queries, tx Transacter) *S
 	return svc
 }
 
+func factorSessionContext(ctx context.Context, user db.User) context.Context {
+	return session.WithSession(ctx, session.Session{
+		ID: "factor-session", UserID: user.ID.String(), Kind: session.KindAuthenticated,
+		AuthVersion: user.AuthVersion, AuthVersionSet: true,
+	})
+}
+
 func TestIntegrationConcurrentPasskeyDeletionsLeaveOneCredential(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), factorIntegrationTimeout)
 	defer cancel()
@@ -189,6 +224,11 @@ func TestIntegrationConcurrentPasskeyDeletionsLeaveOneCredential(t *testing.T) {
 	userID := createFactorIntegrationUser(ctx, t, pool, "delete-delete")
 	first := createFactorIntegrationCredential(ctx, t, q, userID)
 	second := createFactorIntegrationCredential(ctx, t, q, userID)
+	admitted, err := q.GetUserByID(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = factorSessionContext(ctx, admitted)
 
 	barrier := newFactorBeginBarrier(pool, 2)
 	svc := newFactorIntegrationWebAuthn(t, q, barrier)
@@ -210,7 +250,7 @@ func TestIntegrationConcurrentPasskeyDeletionsLeaveOneCredential(t *testing.T) {
 		switch {
 		case err == nil:
 			succeeded++
-		case errors.Is(err, ErrLastCredential):
+		case errors.Is(err, ErrAccountNotActive):
 			refused++
 		default:
 			t.Fatalf("concurrent DeleteCredential returned unexpected error: %v", err)
@@ -226,6 +266,14 @@ func TestIntegrationConcurrentPasskeyDeletionsLeaveOneCredential(t *testing.T) {
 	}
 	if len(remaining) != 1 {
 		t.Fatalf("credentials after simultaneous deletion = %d, want exactly 1", len(remaining))
+	}
+	current, err := q.GetUserByID(ctx, userID)
+	if err != nil || current.AuthVersion != admitted.AuthVersion+1 {
+		t.Fatalf("delete race changed version other than once: %v", err)
+	}
+	svc.tx = pool
+	if err := svc.DeleteCredential(factorSessionContext(ctx, current), userID, remaining[0].ID); !errors.Is(err, ErrLastCredential) {
+		t.Fatalf("fresh final-passkey deletion = %v, want ErrLastCredential", err)
 	}
 }
 
@@ -255,6 +303,7 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	if err != nil {
 		t.Fatal("read admitted MFA version failed")
 	}
+	ctx = factorSessionContext(ctx, admitted)
 	barrier := newFactorBeginBarrier(pool, 2)
 	webAuthnService := newFactorIntegrationWebAuthn(t, q, barrier)
 	mfaService, err := mfa.New(mfa.Config{}, q, factorTestEncryptor{}, mfa.WithTransacter(barrier))
@@ -275,8 +324,8 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	}()
 	close(start)
 
-	if err := <-deleteResult; !errors.Is(err, ErrLastCredential) {
-		t.Fatalf("racing final-passkey deletion = %v, want ErrLastCredential", err)
+	if err := <-deleteResult; !errors.Is(err, ErrLastCredential) && !errors.Is(err, ErrAccountNotActive) {
+		t.Fatalf("racing final-passkey deletion = %v, want policy or stale authority refusal", err)
 	}
 	if err := <-disableResult; err != nil {
 		t.Fatalf("racing MFA disable: %v", err)

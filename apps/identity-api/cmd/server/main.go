@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/config"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/blindindex"
@@ -190,6 +191,13 @@ func run(logger *slog.Logger) (runErr error) {
 	loginService, passwordLoginEnabled, err := buildLoginService(cfg.Environment, pool, redisClient, usernameService, mfaService, smsotpService)
 	if err != nil {
 		return err
+	}
+	protection := accountpolicy.Policy{PasswordLoginEnabled: passwordLoginEnabled, Usernames: usernameService}
+	if webauthnService != nil {
+		webauthnService.SetAccountPolicy(protection)
+	}
+	if mfaService != nil {
+		mfaService.SetAccountPolicy(protection)
 	}
 	deletionProofService, err := buildAccountDeletionProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
 	if err != nil {
@@ -810,7 +818,20 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		}
 		return nil, nil
 	}
-	users, err := smsotp.NewUserStore(pool)
+	// Contact evidence must be readable even when SMS delivery is disabled.
+	envelopeCfg, err := config.LoadEnvelopeCrypto()
+	if err != nil {
+		return nil, err
+	}
+	provider, err := kms.NewMockProvider(envelopeCfg.MasterKEK, envelopeCfg.MasterKEKVersion)
+	if err != nil {
+		return nil, fmt.Errorf("main: build KMS provider: %w", err)
+	}
+	encryptor, err := envelope.New(provider)
+	if err != nil {
+		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
+	}
+	users, err := smsotp.NewUserStore(pool, encryptor)
 	if err != nil {
 		return nil, err
 	}
@@ -830,14 +851,6 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		return nil, err
 	}
 
-	provider, err := kms.NewMockProvider(cryptoCfg.MasterKEK, cryptoCfg.MasterKEKVersion)
-	if err != nil {
-		return nil, fmt.Errorf("main: build KMS provider: %w", err)
-	}
-	encryptor, err := envelope.New(provider)
-	if err != nil {
-		return nil, fmt.Errorf("main: build envelope encryptor: %w", err)
-	}
 	indexer, err := blindindex.New(cryptoCfg.BlindIndexPepper, cryptoCfg.BlindIndexPepperVersion)
 	if err != nil {
 		return nil, fmt.Errorf("main: build blind indexer: %w", err)

@@ -209,6 +209,7 @@ type fakeTransacter struct {
 	rollbackCalled bool
 	beginErr       error
 	commitErr      error
+	statements     []string
 }
 
 type fakeTx struct {
@@ -245,7 +246,8 @@ func (f *fakeTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescr
 	return nil, nil
 }
 
-func (f *fakeTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+func (f *fakeTx) Exec(_ context.Context, statement string, _ ...any) (pgconn.CommandTag, error) {
+	f.ft.statements = append(f.ft.statements, statement)
 	return pgconn.CommandTag{}, nil
 }
 

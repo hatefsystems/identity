@@ -32,6 +32,25 @@ func TestParameterConstants(t *testing.T) {
 	}
 }
 
+func TestSupportedHashMatchesVerifierAdmission(t *testing.T) {
+	const valid = "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for encoded, want := range map[string]bool{
+		valid: true,
+		strings.Replace(valid, "m=65536,t=3,p=4", "m=32,t=1,p=1", 1): true,
+		strings.Replace(valid, "m=65536", "m=8", 1):                  false,
+		"":                false,
+		"legacy-password": false,
+		strings.Replace(valid, "argon2id", "argon2i", 1): false,
+		strings.Replace(valid, "v=19", "v=16", 1):        false,
+		strings.Replace(valid, "m=65536", "m=999999", 1): false,
+		valid + "$extra": false,
+	} {
+		if SupportedHash(encoded) != want {
+			t.Fatal("primary credential admission differs from supported verifier formats")
+		}
+	}
+}
+
 func TestHashVerifyRoundTrip(t *testing.T) {
 	cases := map[string]string{
 		"ascii":      "correct horse battery compass",

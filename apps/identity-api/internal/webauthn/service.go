@@ -14,11 +14,14 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // BeginRegistration starts an attestation ceremony for an already-authenticated
@@ -176,16 +179,9 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 	}
 
 	var row db.WebauthnCredential
-	err = s.runInTx(ctx, func(users UserStore, creds CredentialStore) error {
-		locked, err := users.GetUserByIDForUpdate(ctx, user.ID)
-		if err != nil {
-			return err
-		}
+	err = s.runAccountPolicyTx(ctx, user.ID, true, func(users UserStore, creds CredentialStore, locked db.User, _ accountpolicy.State) error {
 		if !isLoginEligible(locked.Status) || locked.AuthVersion != pending.AuthVersion {
 			return ErrAccountNotActive
-		}
-		if err := s.checkSessionVersion(ctx, locked); err != nil {
-			return err
 		}
 		user = locked
 		// Persist the handle only after a successful ceremony, so a failed or
@@ -687,8 +683,20 @@ func (s *Service) commitSignCountChecked(ctx context.Context, cred *gowebauthn.C
 // runInTx executes fn inside a database transaction if a Transacter is
 // configured, or directly against s.users and s.creds otherwise.
 func (s *Service) runInTx(ctx context.Context, fn func(users UserStore, creds CredentialStore) error) error {
+	return s.runInTxContext(ctx, func(users UserStore, creds CredentialStore, _ pgx.Tx) error {
+		return fn(users, creds)
+	})
+}
+
+func (s *Service) runInTxContext(ctx context.Context, fn func(UserStore, CredentialStore, pgx.Tx) error) error {
 	if s.tx == nil {
-		return fn(s.users, s.creds)
+		if _, production := s.users.(*db.Queries); production {
+			return errors.New("webauthn: database transaction opener is required")
+		}
+		if _, production := s.creds.(*db.Queries); production {
+			return errors.New("webauthn: database transaction opener is required")
+		}
+		return fn(s.users, s.creds, nil)
 	}
 
 	tx, err := s.tx.Begin(ctx)
@@ -704,7 +712,7 @@ func (s *Service) runInTx(ctx context.Context, fn func(users UserStore, creds Cr
 	}()
 
 	txQueries := db.New(tx)
-	if err := fn(txQueries, txQueries); err != nil {
+	if err := fn(txQueries, txQueries, tx); err != nil {
 		return err
 	}
 
@@ -715,6 +723,62 @@ func (s *Service) runInTx(ctx context.Context, fn func(users UserStore, creds Cr
 	return nil
 }
 
+// runAccountPolicyTx serializes protection reads and mutations with every other
+// credential writer. The policy authority precedes the account advisory and row
+// locks; separate READ COMMITTED statements observe a preceding writer's commit.
+func (s *Service) runAccountPolicyTx(ctx context.Context, userID uuid.UUID, revoke bool, fn func(UserStore, CredentialStore, db.User, accountpolicy.State) error) error {
+	return s.runInTxContext(ctx, func(users UserStore, creds CredentialStore, tx pgx.Tx) error {
+		var state accountpolicy.State
+		var authority username.GuardAuthority
+		if tx != nil {
+			if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+				return err
+			}
+			var err error
+			authority, err = s.policy.Guard(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if err := pglock.LockAccount(ctx, tx, userID); err != nil {
+				return err
+			}
+		}
+		user, err := users.GetUserByIDForUpdate(ctx, userID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("webauthn: lock credential owner: %w", err)
+		}
+		if !isLoginEligible(user.Status) {
+			return ErrAccountNotActive
+		}
+		if err := s.checkSessionVersion(ctx, user); err != nil {
+			return err
+		}
+		if tx != nil {
+			state, err = s.policy.Read(ctx, tx, user, authority)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Pure-memory stores cannot assert admitted password authority.
+			rows, err := creds.ListWebauthnCredentialsByUser(ctx, userID)
+			if err != nil {
+				return err
+			}
+			state = accountpolicy.State{Passkeys: int64(len(rows)), TOTP: user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0}
+		}
+		if err := fn(users, creds, user, state); err != nil {
+			return err
+		}
+		if revoke && tx != nil {
+			return db.New(tx).RevokeUserCredentials(ctx, userID)
+		}
+		return nil
+	})
+}
+
 // ListCredentials returns the credentials registered for an account, ordered by
 // the underlying query, for the self-service key listing endpoint.
 func (s *Service) ListCredentials(ctx context.Context, userID uuid.UUID) ([]db.WebauthnCredential, error) {
@@ -723,6 +787,34 @@ func (s *Service) ListCredentials(ctx context.Context, userID uuid.UUID) ([]db.W
 		return nil, fmt.Errorf("webauthn: list credentials: %w", err)
 	}
 	return rows, nil
+}
+
+// CredentialPolicy carries an advisory removal decision, not mutation authority.
+type CredentialPolicy struct {
+	db.WebauthnCredential
+	CanRemove bool
+}
+
+// ListCredentialsWithPolicy projects the same resulting-state check as deletion.
+// A later delete must recheck policy under its own locks and captured authority.
+func (s *Service) ListCredentialsWithPolicy(ctx context.Context, userID uuid.UUID) ([]CredentialPolicy, error) {
+	out := make([]CredentialPolicy, 0)
+	err := s.runAccountPolicyTx(ctx, userID, false, func(_ UserStore, creds CredentialStore, _ db.User, state accountpolicy.State) error {
+		rows, err := creds.ListWebauthnCredentialsByUser(ctx, userID)
+		if err != nil {
+			return err
+		}
+		state.Passkeys--
+		canRemove := state.Check() == nil
+		for _, row := range rows {
+			out = append(out, CredentialPolicy{WebauthnCredential: row, CanRemove: canRemove})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // BeginStepUp starts a re-authentication assertion ceremony for an account the
@@ -921,33 +1013,14 @@ func (s *Service) RenameCredential(ctx context.Context, userID uuid.UUID, creden
 // DeleteCredential removes one of an account's registered credentials
 // (DELETE /api/v1/auth/webauthn/keys/{id}, step-up gated).
 //
-// It always refuses to remove the account's last passkey. WebAuthn is currently
-// the only flow that can issue a full login session; TOTP, phone, password data,
-// and recovery codes therefore do not make final-passkey deletion safe.
-//
-// The count and the delete run in one transaction over row-locked credential IDs
-// so two concurrent deletions of different credentials cannot both observe "two
-// remain" and leave the account with none.
+// The resulting state must retain a usable primary credential and, for privileged
+// accounts, a strong factor. Advisory listing decisions are never trusted here.
 func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, credentialID []byte) error {
 	if len(credentialID) == 0 {
 		return ErrCredentialNotFound
 	}
 
-	return s.runInTx(ctx, func(users UserStore, creds CredentialStore) error {
-		user, err := users.GetUserByIDForUpdate(ctx, userID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrUserNotFound
-			}
-			return fmt.Errorf("webauthn: load user: %w", err)
-		}
-		if !isLoginEligible(user.Status) {
-			return ErrAccountNotActive
-		}
-		if err := s.checkSessionVersion(ctx, user); err != nil {
-			return err
-		}
-
+	return s.runAccountPolicyTx(ctx, userID, true, func(_ UserStore, creds CredentialStore, _ db.User, state accountpolicy.State) error {
 		locked, err := creds.LockWebauthnCredentialsByUser(ctx, userID)
 		if err != nil {
 			return fmt.Errorf("webauthn: lock credentials: %w", err)
@@ -955,8 +1028,9 @@ func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, creden
 		if !containsCredentialID(locked, credentialID) {
 			return ErrCredentialNotFound
 		}
-		if len(locked) == 1 {
-			return ErrLastCredential
+		state.Passkeys--
+		if err := state.Check(); err != nil {
+			return err
 		}
 
 		affected, err := creds.DeleteWebauthnCredential(ctx, db.DeleteWebauthnCredentialParams{
@@ -974,7 +1048,7 @@ func (s *Service) DeleteCredential(ctx context.Context, userID uuid.UUID, creden
 }
 
 func (s *Service) checkSessionVersion(ctx context.Context, user db.User) error {
-	if s.accounts == nil {
+	if s.accounts == nil && s.tx == nil {
 		return nil
 	}
 	current, ok := session.FromContext(ctx)

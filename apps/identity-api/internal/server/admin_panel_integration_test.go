@@ -374,6 +374,7 @@ func TestAdminAuditPageExactHighSequencesIntegration(t *testing.T) {
 func TestAdminConcurrentModeratorsRejectStaleRevisionIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
 	otherActor := uuid.MustParse(f.actors["ordinary"].UserID)
+	f.passkey(t, otherActor)
 	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=true WHERE id=$1", otherActor); err != nil {
 		t.Fatal(err)
 	}
@@ -509,6 +510,7 @@ func (tx adminCommitBarrierTx) Commit(ctx context.Context) error {
 
 func TestAdminPrivilegedTargetGrantWinsModerationRaceIntegration(t *testing.T) {
 	f := newAdminIntegration(t)
+	f.passkey(t, f.target.ID)
 	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=true WHERE id=$1", f.target.ID); err != nil {
 		t.Fatal(err)
 	}

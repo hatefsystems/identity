@@ -1,10 +1,25 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"sync/atomic"
 )
+
+type securityChangeKey struct{}
+
+// HeaderAuthInvalidated reports a committed security change, never new authority.
+const HeaderAuthInvalidated = "X-Identity-Auth-Invalidated"
+
+// SecurityChangeCommitted preserves an already committed mutation's result.
+// It never renews, restamps or otherwise restores the initiating authority.
+func SecurityChangeCommitted(ctx context.Context) {
+	if committed, ok := ctx.Value(securityChangeKey{}).(*atomic.Bool); ok {
+		committed.Store(true)
+	}
+}
 
 // TrackActivity renews only requests which pass the downstream authorization
 // gates. In particular a nonce challenge, failed step-up, RBAC denial, or invalid
@@ -17,7 +32,17 @@ func (m *Manager) TrackActivity(next http.Handler) http.Handler {
 			writeActivityUnavailable(w)
 			return
 		}
+		committed := &atomic.Bool{}
+		r = r.WithContext(context.WithValue(r.Context(), securityChangeKey{}, committed))
 		writer := &activityWriter{ResponseWriter: w, renew: func() error {
+			if committed.Load() {
+				w.Header().Set(HeaderAuthInvalidated, "true")
+				// Recovery completion already clears its restricted cookie explicitly.
+				if s.Kind != KindRecoveryEnrollment {
+					m.ClearCookie(w)
+				}
+				return nil
+			}
 			_, err := m.renew(r, s)
 			return err
 		}}

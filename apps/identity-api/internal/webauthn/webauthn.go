@@ -34,6 +34,7 @@ import (
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
@@ -116,6 +117,7 @@ type Service struct {
 	challenges ChallengeStore
 	tx         Transacter
 	accounts   session.AccountState
+	policy     accountpolicy.Policy
 	// challengeTTL is the validity window stamped onto each pending ceremony.
 	challengeTTL time.Duration
 	// residentKey is the residentKey requirement applied to registration.
@@ -129,6 +131,11 @@ type Service struct {
 	now func() time.Time
 	// sleep is injectable so the timing floor does not slow the test suite.
 	sleep func(time.Duration)
+}
+
+// SetAccountPolicy configures account protection before serving requests.
+func (s *Service) SetAccountPolicy(policy accountpolicy.Policy) {
+	s.policy = policy
 }
 
 // residentKeyRequirement maps a configured string onto the library's enum,

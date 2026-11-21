@@ -93,6 +93,7 @@ func newWorkflowHTTPIntegration(t *testing.T) *adminIntegration {
 	if _, err := f.pool.Exec(ctx, "UPDATE users SET is_mfa_enabled=true WHERE id=$1", user.ID); err != nil {
 		t.Fatal(err)
 	}
+	f.passkey(t, user.ID)
 	if err := rbac.ProvisionRole(ctx, deps.AdminActions, uuid.New(), "spiffe://identity.test/operator", user.ID, "dpo", false, "test"); err != nil {
 		t.Fatal(err)
 	}

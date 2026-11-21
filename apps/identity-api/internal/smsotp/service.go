@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
@@ -284,7 +285,7 @@ func (s *Service) RemovePhone(ctx context.Context, id uuid.UUID, authVersion int
 	}
 	changed, err := s.users.RemovePhoneIfCurrent(ctx, id, authVersion)
 	if err != nil {
-		for _, known := range []error{ErrStaleSession, ErrAccountNotActive, ErrUserNotFound} {
+		for _, known := range []error{ErrStaleSession, ErrAccountNotActive, ErrUserNotFound, accountpolicy.ErrLastVerifiedContact} {
 			if errors.Is(err, known) {
 				return false, known
 			}

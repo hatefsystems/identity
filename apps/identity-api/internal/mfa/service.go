@@ -10,9 +10,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 const defaultIssuer = "Hatef Identity"
@@ -33,6 +36,7 @@ type UserStore interface {
 	IncrementMfaTotpEnrollmentAttempts(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteMfaTotpEnrollment(ctx context.Context, id uuid.UUID) (int64, error)
 	CompleteMfaTotpEnrollment(ctx context.Context, arg db.CompleteMfaTotpEnrollmentParams) (int64, error)
+	RevokeUserCredentials(ctx context.Context, id uuid.UUID) error
 }
 
 // Transacter opens PostgreSQL transactions for enrollment completion and
@@ -75,10 +79,14 @@ type Service struct {
 	now                   func() time.Time
 	enrollmentTTL         time.Duration
 	maxEnrollmentAttempts int
+	policy                accountpolicy.Policy
 }
 
 // Option configures optional service behavior.
 type Option func(*Service)
+
+// SetAccountPolicy binds maintenance to the login route's admitted authority at startup.
+func (s *Service) SetAccountPolicy(policy accountpolicy.Policy) { s.policy = policy }
 
 // WithTransacter enables the production ACID paths.
 func WithTransacter(tx Transacter) Option {
@@ -153,7 +161,7 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersi
 
 	var user db.User
 	var enrollment db.MfaTotpEnrollment
-	err = s.runInTx(ctx, userID, func(store UserStore) error {
+	err = s.runInTx(ctx, userID, func(store UserStore, _ pgx.Tx, _ username.GuardAuthority) error {
 		user, err = store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -216,7 +224,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 		return ErrMfaNotSetup
 	}
 	var outcome error
-	err = s.runInTx(ctx, userID, func(store UserStore) error {
+	err = s.runInTx(ctx, userID, func(store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -270,6 +278,14 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 			return nil
 		}
 
+		state, err := s.protection(ctx, store, tx, user, authority)
+		if err != nil {
+			return err
+		}
+		state.TOTP = true
+		if err := state.Check(); err != nil {
+			return err
+		}
 		affected, err := store.CompleteMfaTotpEnrollment(ctx, db.CompleteMfaTotpEnrollmentParams{
 			ID:                     userID,
 			MfaTotpSecretEncrypted: enrollment.SecretEncrypted,
@@ -283,7 +299,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 		if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
 			return fmt.Errorf("mfa: delete completed enrollment: %w", err)
 		}
-		return nil
+		return store.RevokeUserCredentials(ctx, userID)
 	})
 	if err != nil {
 		return err
@@ -297,7 +313,8 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 	if userID == uuid.Nil || authVersion < 0 {
 		return ErrAccountNotActive
 	}
-	return s.runInTx(ctx, userID, func(store UserStore) error {
+	var changed bool
+	err := s.runInTx(ctx, userID, func(store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -308,13 +325,19 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
 			return ErrAccountNotActive
 		}
-		if user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0 {
-			count, err := store.CountWebauthnCredentialsByUser(ctx, userID)
+		changed = user.IsMfaEnabled || len(user.MfaTotpSecretEncrypted) > 0
+		if changed {
+			state, err := s.protection(ctx, store, tx, user, authority)
 			if err != nil {
-				return fmt.Errorf("mfa: count passkeys: %w", err)
+				return err
 			}
-			if count == 0 {
+			// This route retains its passkey requirement; password alternatives belong to T26.
+			if state.Passkeys == 0 {
 				return ErrLastFactor
+			}
+			state.TOTP = false
+			if err := state.Check(); err != nil {
+				return err
 			}
 		}
 		affected, err := store.DisableMfa(ctx, userID)
@@ -327,8 +350,15 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 		if _, err := store.DeleteMfaTotpEnrollmentsForUser(ctx, userID); err != nil {
 			return fmt.Errorf("mfa: clear pending enrollments: %w", err)
 		}
+		if changed {
+			return store.RevokeUserCredentials(ctx, userID)
+		}
 		return nil
 	})
+	if err == nil && changed {
+		session.SecurityChangeCommitted(ctx)
+	}
+	return err
 }
 
 // VerifyEnabledCode verifies a submitted 6-digit TOTP code only against an
@@ -406,9 +436,20 @@ func (s *Service) VerifyTOTPForReclaim(ctx context.Context, userID uuid.UUID, co
 // accepts.
 const statusPendingDeletion = "pending_deletion"
 
-func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserStore) error) error {
+func (s *Service) protection(ctx context.Context, store UserStore, tx pgx.Tx, user db.User, authority username.GuardAuthority) (accountpolicy.State, error) {
+	if tx != nil {
+		return s.policy.Read(ctx, tx, user, authority)
+	}
+	count, err := store.CountWebauthnCredentialsByUser(ctx, user.ID)
+	return accountpolicy.State{Passkeys: count, TOTP: user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0}, err
+}
+
+func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserStore, pgx.Tx, username.GuardAuthority) error) error {
 	if s.tx == nil {
-		return fn(s.users)
+		if _, databaseStore := s.users.(*db.Queries); databaseStore {
+			return errors.New("mfa: database mutations require a transaction")
+		}
+		return fn(s.users, nil, username.GuardAuthority{})
 	}
 	tx, err := s.tx.Begin(ctx)
 	if err != nil {
@@ -422,10 +463,17 @@ func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserSto
 			_ = tx.Rollback(cleanup)
 		}
 	}()
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return err
+	}
+	authority, err := s.policy.Guard(ctx, tx)
+	if err != nil {
+		return err
+	}
 	if err := pglock.LockAccount(ctx, tx, userID); err != nil {
 		return fmt.Errorf("mfa: lock subject: %w", err)
 	}
-	if err := fn(db.New(tx)); err != nil {
+	if err := fn(db.New(tx), tx, authority); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
