@@ -21,6 +21,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/adminaction"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
@@ -175,6 +176,19 @@ func TestAdminEvidenceEligibilityAndDisabledAdminAuthorityIntegration(t *testing
 	if _, err := f.pool.Exec(t.Context(), "UPDATE users SET is_mfa_enabled=false WHERE id=$1", actor); err != nil {
 		t.Fatal(err)
 	}
+	q := db.New(f.pool)
+	user, err := q.GetUserByID(t.Context(), actor)
+	if err != nil || user.Email == nil {
+		t.Fatalf("load owned evidence contact: %v", err)
+	}
+	email := *user.Email
+	proof, err := contactproof.Seal(t.Context(), f.enc, actor, contactproof.Email, email, contactproof.EmailLink, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(t.Context(), `INSERT INTO contact_verification_evidence(user_id,channel,evidence_encrypted) VALUES($1,$2,$3)`, actor, contactproof.Email, proof); err != nil {
+		t.Fatal(err)
+	}
 	for _, evidence := range []session.Evidence{
 		{},
 		{PrimaryMethod: session.MethodPasskey, UV: session.UVNotVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
@@ -184,9 +198,22 @@ func TestAdminEvidenceEligibilityAndDisabledAdminAuthorityIntegration(t *testing
 		{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
 	} {
 		w := httptest.NewRecorder()
-		current, err := f.sessions.IssueContext(t.Context(), w, session.IssueParams{
+		params := session.IssueParams{
 			UserID: actor.String(), AuthVersion: f.actors["support"].AuthVersion, AuthVersionSet: true, DPoPJKT: f.browser.jkt, Evidence: evidence,
-		})
+		}
+		if evidence.PrimaryMethod == session.MethodContactCode {
+			params.CheckPrimaryFactor = func(ctx context.Context) error {
+				proof, err := contactproof.Read(ctx, q, f.enc, actor, contactproof.Email)
+				if err != nil {
+					return err
+				}
+				if proof == nil || proof.Destination != email {
+					return session.ErrAccountIneligible
+				}
+				return nil
+			}
+		}
+		current, err := f.sessions.IssueContext(t.Context(), w, params)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -569,7 +596,8 @@ func TestAdminPrivilegedTargetGrantWinsModerationRaceIntegration(t *testing.T) {
 		t.Fatalf("racing grant was not persisted: %v", err)
 	}
 	u, err := q.GetUserByIDForAdmin(ctx, f.target.ID)
-	if err != nil || u.Status != f.target.Status || u.AuthVersion != f.target.AuthVersion || u.AuthEpoch != f.target.AuthEpoch || u.LifecycleRevision != f.target.LifecycleRevision {
+	// The role grant advances authentication authority; denied moderation must not.
+	if err != nil || u.Status != f.target.Status || u.AuthVersion != f.target.AuthVersion+1 || u.AuthEpoch <= f.target.AuthEpoch || u.LifecycleRevision != f.target.LifecycleRevision {
 		t.Fatalf("protected target was mutated after waiting for its grant: %v", err)
 	}
 	var lifecycleEvents, contexts, successes, failures int64

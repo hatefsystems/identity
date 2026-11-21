@@ -2046,6 +2046,26 @@ test('portal integration cannot silently omit real dependencies or run in parall
   assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login'\]/);
 });
 
+test('TOTP browser response deadlines begin after factor rollover and before submission', () => {
+  const portal = readFileSync(new URL('./web-portal.browser.mjs', import.meta.url), 'utf8');
+  const stepup = portal.slice(portal.indexOf('async function totpStepUp('), portal.indexOf('function operationResponse('));
+  const ready = stepup.indexOf('await freshTOTP(harness, fixture)');
+  const armed = stepup.indexOf('const completed = beforeVerify()');
+  const submit = stepup.indexOf("await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click()", armed);
+  assert(ready >= 0 && armed > ready && submit > armed);
+  assert.match(stepup, /return completed;/);
+  const management = portal.slice(portal.indexOf('async function passkeyManagement('), portal.indexOf('export async function recoveryAction('));
+  assert.match(management, /const renamed = await totpStepUp\([\s\S]*?\(\) => operationResponse\(page, `\/api\/v1\/auth\/webauthn\/keys\/\$\{key.id\}`, 'PATCH'\)/);
+  assert.match(portal, /context\.setDefaultTimeout\(15_000\)/);
+
+  const admin = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
+  const verify = admin.slice(admin.indexOf('const verify = async (actor, button,'), admin.indexOf('const fillCreate = async'));
+  const factor = verify.indexOf('await freshTOTP(harness, actor.fixture)');
+  const captured = verify.indexOf("harness.captureJSON('/api/v1/auth/stepup/verify', 'POST', 200)");
+  const verifyClick = verify.indexOf("localizedText('Verify code')", captured);
+  assert(factor >= 0 && captured > factor && verifyClick > captured);
+});
+
 test('role-revocation reauthentication removes only a proven-invalid cookie before fresh MFA', () => {
   const source = readFileSync(new URL('./web-admin.browser.mjs', import.meta.url), 'utf8');
   for (const stage of ['legal-revocation', 'admin-revocation']) {

@@ -134,23 +134,24 @@ func (s *loginCodeCaptureStore) Reserve(ctx context.Context, rec contactcode.Rec
 }
 
 type realLoginFixture struct {
-	ctx       context.Context
-	pool      *pgxpool.Pool
-	client    *redis.Client
-	hook      *loginRedisNamespace
-	cipher    contactproof.Cipher
-	names     *username.Store
-	pending   *login.RedisPending
-	replay    *stepup.RedisReplayGuard
-	accounts  *session.DBAccountState
-	factor    *mfa.Service
-	manager   *session.Manager
-	service   *login.Service
-	codeStore *loginCodeCaptureStore
-	delivery  *loginDeliveryCapture
-	browser   *portalTestClient
-	server    *Server
-	index     int
+	ctx           context.Context
+	pool          *pgxpool.Pool
+	client        *redis.Client
+	sessionClient *redis.Client
+	hook          *loginRedisNamespace
+	cipher        contactproof.Cipher
+	names         *username.Store
+	pending       *login.RedisPending
+	replay        *stepup.RedisReplayGuard
+	accounts      *session.DBAccountState
+	factor        *mfa.Service
+	manager       *session.Manager
+	service       *login.Service
+	codeStore     *loginCodeCaptureStore
+	delivery      *loginDeliveryCapture
+	browser       *portalTestClient
+	server        *Server
+	index         int
 }
 
 func newRealLoginFixture(t *testing.T, emailEnabled, smsEnabled bool) *realLoginFixture {
@@ -198,7 +199,7 @@ func newRealLoginFixture(t *testing.T, emailEnabled, smsEnabled bool) *realLogin
 	}
 	hook := &loginRedisNamespace{prefix: "login_fixture:" + uuid.NewString() + ":"}
 	client.AddHook(hook)
-	// Use an unwrapped cleanup client so SCAN sees exactly the run-owned prefix.
+	// Session Lua reconstructs fixed keys, so sessions and cleanup bypass the hook.
 	cleanupClient := redis.NewClient(opts)
 	t.Cleanup(func() {
 		defer func() { _ = cleanupClient.Close() }()
@@ -244,7 +245,7 @@ func newRealLoginFixture(t *testing.T, emailEnabled, smsEnabled bool) *realLogin
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := session.NewRedisStore(client)
+	store, err := session.NewRedisStore(cleanupClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +292,7 @@ func newRealLoginFixture(t *testing.T, emailEnabled, smsEnabled bool) *realLogin
 	}
 	browser := newPortalTestClient(t, testPortalOrigin)
 	srv := New(config.Config{Environment: "production", PortalOrigin: browser.origin}, slog.New(slog.NewTextHandler(io.Discard, nil)), Deps{Login: service, PasswordLoginEnabled: true, SessionManager: manager, DPoPValidator: browser.validator, WebAuthnLimiter: limiter})
-	return &realLoginFixture{ctx: ctx, pool: pool, client: client, hook: hook, cipher: cipher, names: names, pending: pending, replay: replay, accounts: accounts, factor: factor, manager: manager, service: service, codeStore: codeStore, delivery: delivery, browser: browser, server: srv}
+	return &realLoginFixture{ctx: ctx, pool: pool, client: client, sessionClient: cleanupClient, hook: hook, cipher: cipher, names: names, pending: pending, replay: replay, accounts: accounts, factor: factor, manager: manager, service: service, codeStore: codeStore, delivery: delivery, browser: browser, server: srv}
 }
 
 type realLoginAccount struct {
@@ -317,6 +318,41 @@ func (f *realLoginFixture) account(t *testing.T, credential string, mfaEnabled b
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		id := user.ID.String()
+		if err := f.manager.RevokeAllForUser(cleanup, id); err != nil {
+			t.Error("owned login session revocation failed")
+			return
+		}
+		// Revocation retains negative ID markers; remove only this UUID subject's.
+		prefix := "identity:session:v1:id:" + strconv.Itoa(len(id)) + ":" + id + ":"
+		var cursor uint64
+		for {
+			keys, next, err := f.sessionClient.Scan(cleanup, cursor, prefix+"*", 100).Result()
+			if err != nil {
+				t.Error("owned login session cleanup scan failed")
+				return
+			}
+			if len(keys) > 0 {
+				if err := f.sessionClient.Del(cleanup, keys...).Err(); err != nil {
+					t.Error("owned login session marker cleanup failed")
+					return
+				}
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+		keys, _, err := f.sessionClient.Scan(cleanup, 0, prefix+"*", 100).Result()
+		owner := "identity:session:v1:user:" + strconv.Itoa(len(id)) + ":" + id
+		remaining, ownerErr := f.sessionClient.Exists(cleanup, owner).Result()
+		if err != nil || len(keys) != 0 || ownerErr != nil || remaining != 0 {
+			t.Error("owned login session teardown incomplete")
+		}
+	})
 	value, err := f.names.Normalizer().Normalize(name)
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +405,6 @@ func (f *realLoginFixture) contact(t *testing.T, id uuid.UUID, channel, destinat
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Phone lookup is not account identity; shared phone indexes are permitted.
 		if _, err := f.pool.Exec(f.ctx, `UPDATE users SET phone_encrypted=$2,phone_blind_index=$3 WHERE id=$1`, id, blob, phoneFakeIndexer{}.Compute(destination)); err != nil {
 			t.Fatal(err)
 		}
@@ -491,17 +526,19 @@ func TestLoginRealServicesCredentialAndContactMatrixIntegration(t *testing.T) {
 	}
 }
 
-func TestLoginRealServicesSharedPhoneAndIndependentChannelsIntegration(t *testing.T) {
+func TestLoginRealServicesAccountBindingAndIndependentChannelsIntegration(t *testing.T) {
 	for _, channel := range []string{contactcode.ChannelEmail, contactcode.ChannelSMS} {
 		t.Run(channel, func(t *testing.T) {
 			f := newRealLoginFixture(t, channel == contactcode.ChannelEmail, channel == contactcode.ChannelSMS)
 			a, b := f.account(t, "passkey_only", false), f.account(t, "password_only", false)
-			f.contact(t, b.user.ID, contactproof.Phone, a.phone)
+			if a.phone == b.phone {
+				t.Fatal("owned accounts must have distinct phones")
+			}
 			requested := f.request(t, f.browser, "/api/v1/auth/login/code/request", map[string]string{"username": a.name, "channel": channel}, 202)
 			requireLoginNoCookie(t, requested)
 			rec := f.codeStore.record
 			if rec.AccountID != a.user.ID {
-				t.Fatal("shared contact selected another account")
+				t.Fatal("contact challenge selected another account")
 			}
 			other := newPortalTestClient(t, testPortalOrigin)
 			other.validator = f.browser.validator
@@ -529,7 +566,7 @@ func TestLoginRealServicesSharedPhoneAndIndependentChannelsIntegration(t *testin
 			}
 			current := f.session(t, f.request(t, f.browser, "/api/v1/auth/login/code/verify", map[string]string{"challenge": rec.Operation, "code": f.delivery.last()}, 204))
 			if current.UserID != a.user.ID.String() {
-				t.Fatal("challenge authenticated account sharing destination")
+				t.Fatal("challenge authenticated another account")
 			}
 			disabled := contactcode.ChannelSMS
 			if channel == contactcode.ChannelSMS {
@@ -878,7 +915,7 @@ func (f *realLoginFixture) invalidateContact(t *testing.T, a realLoginAccount, c
 		}
 		f.contact(t, a.user.ID, channel, destination)
 	} else {
-		f.contact(t, a.user.ID, channel, "+989130000000")
+		f.contact(t, a.user.ID, channel, strings.Replace(a.phone, "+98912", "+98913", 1))
 	}
 	current, err := db.New(f.pool).GetUserByID(f.ctx, a.user.ID)
 	if err != nil || current.AuthVersion != a.user.AuthVersion || current.Status != "active" {
@@ -951,7 +988,7 @@ func TestLoginRealServicesContactInvalidationBeforeFinalIssuanceIntegration(t *t
 										close(barrier.release)
 									}
 								}()
-								store, err := session.NewRedisStore(f.client)
+								store, err := session.NewRedisStore(f.sessionClient)
 								if err != nil {
 									t.Fatal(err)
 								}

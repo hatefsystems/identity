@@ -183,6 +183,18 @@ func TestIntegrationCredentialMutationSessionFences(t *testing.T) {
 					if err := initialMFA.VerifyAndEnable(ctx, user.ID, user.AuthVersion, current.ID, pending.EnrollmentID, code); err != nil {
 						t.Fatal(err)
 					}
+					loginCode, err := totp.GenerateCode(pending.Secret, time.Now())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := stepup.VerifyLoginTOTP(ctx, initialMFA, stepup.NewMemoryReplayGuard(), user.ID, loginCode, time.Now()); err != nil {
+						t.Fatal(err)
+					}
+					// Enrollment does not restamp the old session: model a fresh MFA sign-in.
+					current, cookies = browser.issueSession(t, manager, session.IssueParams{
+						UserID: user.ID.String(), AuthVersion: user.AuthVersion, AuthVersionSet: true,
+						Evidence: session.Evidence{PrimaryMethod: session.MethodPassword, UV: session.UVNotApplicable, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()},
+					})
 					if _, err := pool.Exec(ctx, `INSERT INTO webauthn_credentials(id,user_id,public_key,attestation_type,aaguid) VALUES($1,$2,$3,'none',$4)`, []byte(uuid.NewString()), user.ID, []byte("fixture-public-key"), uuid.Nil); err != nil {
 						t.Fatal(err)
 					}

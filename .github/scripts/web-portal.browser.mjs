@@ -526,7 +526,7 @@ async function hidePortal(page, context, evidence, readyID = 'portal-ready') {
   };
 }
 
-async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
+async function totpStepUp(page, context, harness, fixture, evidence, trigger, beforeVerify) {
   await trigger();
   const dialog = page.getByTestId('stepup-dialog');
   await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
@@ -567,6 +567,10 @@ async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
   let current = await freshTOTP(harness, fixture);
   assert.match(current.code, /^\d{6}$/);
   await input.fill(current.code);
+  // TOTP rollover can outlast a response timeout. Arm the pending action only
+  // once its factor is ready, before verification can dispatch that action.
+  const completed = beforeVerify();
+  completed.catch(() => {});
   const verified = operationResponse(page, '/api/v1/auth/stepup/verify', 'POST');
   await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
   current = undefined;
@@ -574,6 +578,7 @@ async function totpStepUp(page, context, harness, fixture, evidence, trigger) {
   evidence.checks.push(
     'real encrypted TOTP: rejected factor retains session, background clears entered code, same-session resume requires fresh challenge and explicit successful verification'
   );
+  return completed;
 }
 
 function operationResponse(page, path, method) {
@@ -1246,11 +1251,11 @@ async function passkeyManagement(browser, harness, evidence, contexts) {
   await row.waitFor({ state: 'visible' });
   await row.getByRole('button', { name: localizedText(/^Rename /) }).click();
   await row.getByLabel(localizedText('Passkey name'), { exact: true }).fill('Renamed browser key');
-  const renamed = operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'PATCH');
-  await totpStepUp(page, context, harness, fixture, evidence, () =>
-    row.getByRole('button', { name: localizedText('Save passkey name'), exact: true }).click()
+  const renamed = await totpStepUp(page, context, harness, fixture, evidence, () =>
+    row.getByRole('button', { name: localizedText('Save passkey name'), exact: true }).click(),
+    () => operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'PATCH')
   );
-  assert.equal((await renamed).status(), 200);
+  assert.equal(renamed.status(), 200);
   const removed = operationResponse(page, `/api/v1/auth/webauthn/keys/${key.id}`, 'DELETE');
   await stepUp(page, () => row.getByRole('button', { name: localizedText(/remove/i) }).click());
   assert.equal((await removed).status(), 204);

@@ -818,13 +818,16 @@ async function validateLegal(harness, actors, evidence, artifactDirectory, marke
     assert.equal(await dialog.getByLabel(localizedText('Reason'), { exact: true }).count(), 0);
     assert.equal(await dialog.getByLabel(localizedText('Email for attribution'), { exact: true }).count(), 0);
     await dialog.getByRole('button', { name: localizedText('Continue to verification'), exact: true }).click();
+    if (method === 'totp') {
+      await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
+      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill((await freshTOTP(harness, actor.fixture)).code);
+    }
+    // Do not spend the capture deadline waiting for the shared TOTP replay step.
     const captured = harness.captureJSON('/api/v1/auth/stepup/verify', 'POST', 200);
     times.push(Date.now());
     verificationTimes.set(actor, times);
     verificationCount++;
     if (method === 'totp') {
-      await dialog.getByRole('button', { name: localizedText('Use authenticator code'), exact: true }).click();
-      await dialog.getByLabel(localizedText('Authenticator code'), { exact: true }).fill((await freshTOTP(harness, actor.fixture)).code);
       await dialog.getByRole('button', { name: localizedText('Verify code'), exact: true }).click();
     } else await dialog.getByRole('button', { name: localizedText('Verify with a passkey'), exact: true }).click();
     const grant = await captured;
