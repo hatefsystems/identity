@@ -26,7 +26,8 @@ func TestAbsentEmailAuthenticatorLabelUsesOpaqueHandle(t *testing.T) {
 
 func TestRegistrationNameFrozenAcrossRedisInstances(t *testing.T) {
 	f := newFixture(t)
-	_, stores := redisChallengeStores(t)
+	mini, stores := redisChallengeStores(t)
+	mini.SetTime(*f.clock)
 	for _, store := range stores {
 		store.now = f.svc.now
 	}
@@ -36,7 +37,8 @@ func TestRegistrationNameFrozenAcrossRedisInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	other.now = f.svc.now
-	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session", "  Personal \u06a9\u0644\u06cc\u062f  ")
+	other.SetFirstPasskeyDependencies(nil, fixtureSessions{other}, nil)
+	options, err := f.beginRegistration(f.ctx(), f.user.ID, "test-session", "  Personal \u06a9\u0644\u06cc\u062f  ")
 	if err != nil {
 		t.Fatal(err)
 	}

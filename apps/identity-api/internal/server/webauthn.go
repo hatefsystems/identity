@@ -15,12 +15,14 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/uuid"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/actionproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/profile"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -122,14 +124,16 @@ func (s *Server) registerWebAuthnRoutes() {
 			pr.Use(guard.Handler)
 			pr.Get("/keys", s.handleWebAuthnListKeys())
 
-			if !hasStepUp {
-				return
-			}
 			// The single-use grant is consumed at ceremony start. Finish relies on
 			// the pending challenge's exact session binding, so a second grant is
 			// neither needed nor accepted.
-			pr.With(stepGuard.Handler).Post("/register/generate-options", s.handleWebAuthnRegisterOptions())
-			pr.Post("/register/verify", s.handleWebAuthnRegisterVerify())
+			if hasStepUp || s.deps.FirstPasskeyProofs != nil {
+				pr.Post("/register/generate-options", s.handleWebAuthnRegisterOptions())
+				pr.Post("/register/verify", s.handleWebAuthnRegisterVerify())
+			}
+			if !hasStepUp {
+				return
+			}
 			// Nested inside the session group so deletion requires both a live
 			// session and a fresh step-up grant.
 			pr.Group(func(sr chi.Router) {
@@ -172,13 +176,66 @@ func (s *Server) handleWebAuthnRegisterOptions() http.HandlerFunc {
 			return
 		}
 		current, _ := session.FromContext(r.Context())
-		options, err := s.deps.WebAuthn.BeginRegistration(r.Context(), userID, current.ID, name)
+		authorization, ok := s.webAuthnRegistrationAuthorization(w, r, current, userID)
+		if !ok {
+			return
+		}
+		options, expiresAt, err := s.deps.WebAuthn.BeginAuthorizedRegistration(r.Context(), userID, current.ID, name, authorization)
 		if err != nil {
 			s.writeWebAuthnRegistrationError(w, "begin registration", err)
 			return
 		}
-		writeJSON(w, http.StatusOK, options)
+		session.OutcomeCommitted(r.Context())
+		if expiresAt.IsZero() {
+			writeJSON(w, http.StatusOK, options)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			*protocol.CredentialCreation
+			ExpiresAt time.Time `json:"expires_at"`
+		}{options, expiresAt})
 	}
+}
+
+// Only this start endpoint selects authority. Body preflight precedes spending,
+// and a failed mechanism never falls through to the other one.
+func (s *Server) webAuthnRegistrationAuthorization(w http.ResponseWriter, r *http.Request, current session.Session, userID uuid.UUID) (webauthn.RegistrationAuthorization, bool) {
+	grants, proofs := r.Header.Values(stepup.HeaderStepUpAuth), r.Header.Values("X-Action-Proof")
+	if r.URL.RawQuery != "" || r.URL.ForceQuery || len(grants)+len(proofs) != 1 {
+		writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+		return webauthn.RegistrationAuthorization{}, false
+	}
+	authorization := webauthn.RegistrationAuthorization{
+		UserID: userID, SessionID: current.ID, DPoPJKT: current.DPoPJKT, AuthVersion: current.AuthVersion,
+	}
+	if len(proofs) == 1 {
+		if len(proofs[0]) != 43 {
+			writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+			return webauthn.RegistrationAuthorization{}, false
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(proofs[0])
+		if s.deps.FirstPasskeyProofs == nil || err != nil || len(raw) != 32 || base64.RawURLEncoding.EncodeToString(raw) != proofs[0] {
+			writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+			return webauthn.RegistrationAuthorization{}, false
+		}
+		authorization.Proof = proofs[0]
+		return authorization, true
+	}
+	if s.deps.StepUp == nil || grants[0] == "" || strings.Contains(grants[0], ",") || len(grants[0]) > 16*1024 {
+		writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+		return webauthn.RegistrationAuthorization{}, false
+	}
+	grant, err := s.deps.StepUp.Validate(r.Context(), grants[0], current)
+	if err != nil {
+		s.writeWebAuthnRegistrationError(w, "registration authorization", err)
+		return webauthn.RegistrationAuthorization{}, false
+	}
+	if grant.UserID != userID.String() || grant.SessionID != current.ID || grant.DPoPJKT != current.DPoPJKT || grant.AuthVersion != current.AuthVersion {
+		writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+		return webauthn.RegistrationAuthorization{}, false
+	}
+	authorization.ExpiresAt = grant.ExpiresAt
+	return authorization, true
 }
 
 // handleWebAuthnRegisterVerify serves POST /api/v1/auth/webauthn/register/verify.
@@ -187,6 +244,10 @@ func (s *Server) handleWebAuthnRegisterOptions() http.HandlerFunc {
 // credential for the authenticated account.
 func (s *Server) handleWebAuthnRegisterVerify() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" || r.URL.ForceQuery || len(r.Header.Values(stepup.HeaderStepUpAuth))+len(r.Header.Values("X-Action-Proof")) != 0 {
+			writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
+			return
+		}
 		userID, ok := s.webauthnSessionUser(w, r)
 		if !ok {
 			return
@@ -194,6 +255,10 @@ func (s *Server) handleWebAuthnRegisterVerify() http.HandlerFunc {
 
 		body, ok := s.readWebAuthnBody(w, r)
 		if !ok {
+			return
+		}
+		if !utf8.Valid(body) || !json.Valid(body) || !uniqueJSONFields(body) {
+			writeJSON(w, http.StatusBadRequest, webauthnErrorResponse{Error: "invalid_request"})
 			return
 		}
 
@@ -585,6 +650,16 @@ func (s *Server) readWebAuthnName(w http.ResponseWriter, r *http.Request, requir
 // retry the ceremony) without leaking anything useful to an attacker.
 func (s *Server) writeWebAuthnRegistrationError(w http.ResponseWriter, op string, err error) {
 	switch {
+	case errors.Is(err, actionproof.ErrInvalid), errors.Is(err, actionproof.ErrUnauthorized),
+		errors.Is(err, webauthn.ErrRegistrationUnauthorized),
+		errors.Is(err, stepup.ErrNoGrant), errors.Is(err, stepup.ErrInvalidGrant), errors.Is(err, stepup.ErrGrantConsumed), errors.Is(err, stepup.ErrGrantNotForSession):
+		writeJSON(w, http.StatusForbidden, webauthnErrorResponse{Error: "insufficient_user_authentication"})
+	case errors.Is(err, webauthn.ErrEnrollmentInProgress):
+		writeJSON(w, http.StatusConflict, webauthnErrorResponse{Error: "enrollment_in_progress"})
+	case errors.Is(err, actionproof.ErrOutcomeUnknown), errors.Is(err, webauthn.ErrRegistrationOutcomeUnknown):
+		writeJSON(w, http.StatusServiceUnavailable, webauthnErrorResponse{Error: "outcome_unknown"})
+	case errors.Is(err, actionproof.ErrRateLimited):
+		writeJSON(w, http.StatusTooManyRequests, webauthnErrorResponse{Error: "rate_limited"})
 	case errors.Is(err, webauthn.ErrUserNotFound), errors.Is(err, webauthn.ErrAccountNotActive):
 		// The session outlived its account (deleted mid-session).
 		s.writeBrowserSessionError(w, session.ErrAccountIneligible)

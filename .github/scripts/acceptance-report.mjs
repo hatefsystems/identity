@@ -26,7 +26,7 @@ export const integrationPackages = Object.freeze({
 });
 for (const packages of Object.values(integrationPackages)) Object.freeze(packages);
 export const integrationTargets = Object.freeze(Object.keys(integrationPackages));
-export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer', './internal/geography', './internal/contactcode', './internal/actionproof', './internal/passwordmanager']);
+export const racePackages = Object.freeze(['./internal/recovery', './internal/mfa', './internal/oidc/clientauth', './internal/adminaction', './internal/smsotp', './internal/registration', './internal/audit/signer', './internal/geography', './internal/contactcode', './internal/actionproof', './internal/passwordmanager', './internal/webauthn']);
 export const raceToolchainProfile = 'linux-amd64-cgo-go1.26.5-gcc';
 const digest = /^[0-9a-f]{64}$/;
 const imageDigest = /^sha256:[0-9a-f]{64}$/;

@@ -72,6 +72,8 @@ func enabledActionProofCompositionEnvironment(t *testing.T) {
 		"LOGIN_CODE_HMAC_KEY":                 base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x46}, 32)),
 		"PASSWORD_CHANGE_PROOFS_BINDING_KEY":  base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x47}, 32)),
 		"ACCOUNT_DELETION_PROOFS_BINDING_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x48}, 32)),
+		"FIRST_PASSKEY_PROOFS_BINDING_KEY":    base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x49}, 32)),
+		"FIRST_PASSKEY_SMS_IR_TEMPLATE_ID":    "126",
 		"PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID":  "125",
 		"ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID": "124",
 		"LOGIN_SMTP_HOST":                     "smtp.composition.invalid",
@@ -91,6 +93,7 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 		name                       string
 		passwordSMS, passwordEmail bool
 		deletionSMS, deletionEmail bool
+		firstSMS, firstEmail       bool
 	}{
 		{name: "no-purpose"},
 		{name: "password-sms-only", passwordSMS: true},
@@ -100,6 +103,10 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 		{name: "password-email-deletion-sms", passwordEmail: true, deletionSMS: true},
 		{name: "both-email", passwordEmail: true, deletionEmail: true},
 		{name: "both-mixed", passwordSMS: true, passwordEmail: true, deletionSMS: true, deletionEmail: true},
+		{name: "first-sms-only", firstSMS: true},
+		{name: "first-email-only", firstEmail: true},
+		{name: "all-sms", firstSMS: true, passwordSMS: true, deletionSMS: true},
+		{name: "first-sms-other-email", firstSMS: true, passwordEmail: true, deletionEmail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			enabledActionProofCompositionEnvironment(t)
@@ -110,6 +117,9 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 				"ACCOUNT_DELETION_PROOFS_ENABLED":       tc.deletionSMS || tc.deletionEmail,
 				"ACCOUNT_DELETION_PROOFS_SMS_ENABLED":   tc.deletionSMS,
 				"ACCOUNT_DELETION_PROOFS_EMAIL_ENABLED": tc.deletionEmail,
+				"FIRST_PASSKEY_PROOFS_ENABLED":          tc.firstSMS || tc.firstEmail,
+				"FIRST_PASSKEY_PROOFS_SMS_ENABLED":      tc.firstSMS,
+				"FIRST_PASSKEY_PROOFS_EMAIL_ENABLED":    tc.firstEmail,
 			} {
 				t.Setenv(name, strconv.FormatBool(enabled))
 			}
@@ -138,6 +148,9 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 			if tc.deletionSMS && !tc.deletionEmail {
 				expectedPreloads++
 			}
+			if tc.firstSMS && !tc.firstEmail {
+				expectedPreloads++
+			}
 			client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1,
 				Dialer: func(context.Context, string, string) (net.Conn, error) {
 					dials.Add(1)
@@ -160,8 +173,15 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 			if err != nil || sms == nil || !sms.DeliveryEnabled() {
 				t.Fatal("actual enabled SMS construction failed", err)
 			}
-			if sms.PasswordChangeDeliveryEnabled() != tc.passwordSMS || sms.DeletionDeliveryEnabled() != tc.deletionSMS {
+			if sms.PasswordChangeDeliveryEnabled() != tc.passwordSMS || sms.DeletionDeliveryEnabled() != tc.deletionSMS || sms.FirstPasskeyDeliveryEnabled() != tc.firstSMS {
 				t.Fatal("composition coupled password-change and deletion SMS channels")
+			}
+			if tc.firstSMS {
+				first, err := sms.ContactFirstPasskeyPolicy("+989123456789", "203.0.113.8")
+				login, loginErr := sms.ContactLoginPolicy("+989123456789", "203.0.113.8")
+				if err != nil || loginErr != nil || !reflect.DeepEqual(first, login) {
+					t.Fatal("first-passkey composition lost shared SMS spend policy")
+				}
 			}
 			if tc.passwordSMS {
 				policy, err := sms.ContactPasswordChangePolicy("+989123456789", "203.0.113.8")
@@ -200,6 +220,12 @@ func TestEnabledActionProofSMSCompositionKeepsPurposeChannelsIndependent(t *test
 				proofs, err := buildAccountDeletionProofs("production", pool, client, sessions, sms)
 				if err != nil || (proofs != nil) != tc.deletionSMS {
 					t.Fatal("deletion proof builder depends on password-change enablement", err)
+				}
+			}
+			if !tc.firstEmail {
+				proofs, err := buildFirstPasskeyProofs("production", pool, client, sessions, sms)
+				if err != nil || (proofs != nil) != tc.firstSMS {
+					t.Fatal("first-passkey builder depends on deletion/password/login", err)
 				}
 			}
 		})

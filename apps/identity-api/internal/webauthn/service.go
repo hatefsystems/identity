@@ -15,6 +15,7 @@ import (
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/actionproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/emailaddress"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
@@ -24,12 +25,10 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
-// BeginRegistration starts an attestation ceremony for an already-authenticated
-// account and returns the PublicKeyCredentialCreationOptions the browser feeds
-// to navigator.credentials.create().
+// BeginRegistration starts an additional-key attestation ceremony. Zero-key
+// ordinary accounts must use BeginAuthorizedRegistration with explicit authority.
 //
-// The options carry the account's anonymised 64-bit user handle (generated here
-// on the first passkey and only persisted once the ceremony succeeds) plus an
+// The options carry the account's anonymised 64-bit user handle plus an
 // exclusion list of the credentials already registered, so an authenticator the
 // user already enrolled refuses to create a duplicate. The generated challenge
 // and its SessionData are held server-side under a short TTL; the response is
@@ -80,6 +79,12 @@ func (s *Service) beginRegistration(ctx context.Context, userID uuid.UUID, sessi
 		return nil, fmt.Errorf("webauthn: list credentials: %w", err)
 	}
 	existing := dbToCredentials(rows)
+	if flow == FlowRegistration && len(rows) == 0 {
+		return nil, ErrRegistrationUnauthorized
+	}
+	if len(handle) != userHandleByteLen {
+		return nil, ErrVerification
+	}
 
 	registrationOptions := []gowebauthn.RegistrationOption{
 		gowebauthn.WithExclusions(gowebauthn.Credentials(existing).CredentialDescriptors()),
@@ -146,7 +151,20 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 		Flows: []Flow{flow}, UserRef: userID, SessionID: sessionID, DPoPJKT: challengeDPoPJKT(ctx),
 	})
 	if err != nil {
+		if flow == FlowRegistration && errors.Is(err, ErrChallengeStoreUnavailable) {
+			err = errors.Join(ErrRegistrationOutcomeUnknown, err)
+		}
 		return db.WebauthnCredential{}, err
+	}
+	first := pending.FirstRegistration != nil
+	if first {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if validatePendingChallenge(parsed.Response.CollectedClientData.Challenge, pending) != nil {
+			return db.WebauthnCredential{}, ErrInvalidChallenge
+		}
+		requireUV = true
 	}
 
 	user, err := s.users.GetUserByID(ctx, userID)
@@ -174,16 +192,51 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 	if err != nil {
 		return db.WebauthnCredential{}, fmt.Errorf("%w: %v", ErrVerification, err)
 	}
-	if requireUV && !cred.Flags.UserVerified {
+	if requireUV && (!cred.Flags.UserVerified || !cred.Flags.UserPresent) {
 		return db.WebauthnCredential{}, ErrUserVerificationRequired
 	}
 
 	var row db.WebauthnCredential
-	err = s.runAccountPolicyTx(ctx, user.ID, true, func(users UserStore, creds CredentialStore, locked db.User, _ accountpolicy.State) error {
+	err = s.runRegistrationPolicyTx(ctx, user.ID, true, first, func(users UserStore, creds CredentialStore, tx pgx.Tx, locked db.User, state accountpolicy.State, _ string) error {
 		if !isLoginEligible(locked.Status) || locked.AuthVersion != pending.AuthVersion {
 			return ErrAccountNotActive
 		}
 		user = locked
+		if flow == FlowRegistration {
+			if !first && state.Passkeys == 0 {
+				return ErrRegistrationUnauthorized
+			}
+			if first {
+				if state.Passkeys != 0 || !s.now().Before(pending.Expires) {
+					return ErrRegistrationUnauthorized
+				}
+				live, err := s.registrationSession(ctx, locked, sessionID)
+				if err != nil {
+					return err
+				}
+				store, ok := s.challenges.(FirstRegistrationStore)
+				if !ok {
+					return ErrRegistrationUnauthorized
+				}
+				if err := store.CheckFirstRegistration(ctx, pending.Session.Challenge, pending); err != nil {
+					return err
+				}
+				if pending.FirstRegistration.Authorization == FirstPasskeyEnrollment {
+					if s.firstProofs == nil || tx == nil {
+						return ErrRegistrationUnauthorized
+					}
+					if err := s.firstProofs.ValidateFirstPasskeyTx(ctx, tx, live, actionproof.FirstPasskeyAuthorization{
+						ExpiresAt: pending.Expires, Channel: pending.FirstRegistration.Channel, ContactBinding: pending.FirstRegistration.ContactBinding,
+					}); err != nil {
+						return err
+					}
+				}
+				// Re-read the clock after every dependency/lock wait, before writes.
+				if !s.now().Before(pending.Expires) {
+					return ErrChallengeExpired
+				}
+			}
+		}
 		// Persist the handle only after a successful ceremony, so a failed or
 		// abandoned registration never pins a handle to the account.
 		if len(user.WebauthnUserHandle) == 0 {
@@ -216,6 +269,10 @@ func (s *Service) finishRegistration(ctx context.Context, userID uuid.UUID, sess
 		return nil
 	})
 	if err != nil {
+		var commit *transactionCommitError
+		if first && errors.As(err, &commit) {
+			err = errors.Join(ErrRegistrationOutcomeUnknown, err)
+		}
 		return db.WebauthnCredential{}, err
 	}
 	return row, nil
@@ -717,25 +774,56 @@ func (s *Service) runInTxContext(ctx context.Context, fn func(UserStore, Credent
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("webauthn: commit tx: %w", err)
+		return &transactionCommitError{err}
 	}
 	committed = true
 	return nil
 }
 
+type transactionCommitError struct{ err error }
+
+func (e *transactionCommitError) Error() string { return "webauthn: commit tx: " + e.err.Error() }
+func (e *transactionCommitError) Unwrap() error { return e.err }
+
 // runAccountPolicyTx serializes protection reads and mutations with every other
 // credential writer. The policy authority precedes the account advisory and row
 // locks; separate READ COMMITTED statements observe a preceding writer's commit.
 func (s *Service) runAccountPolicyTx(ctx context.Context, userID uuid.UUID, revoke bool, fn func(UserStore, CredentialStore, db.User, accountpolicy.State) error) error {
+	return s.runRegistrationPolicyTx(ctx, userID, revoke, false, func(users UserStore, creds CredentialStore, _ pgx.Tx, user db.User, state accountpolicy.State, _ string) error {
+		return fn(users, creds, user, state)
+	})
+}
+
+func (s *Service) runRegistrationPolicyTx(ctx context.Context, userID uuid.UUID, revoke, registration bool, fn func(UserStore, CredentialStore, pgx.Tx, db.User, accountpolicy.State, string) error) error {
 	return s.runInTxContext(ctx, func(users UserStore, creds CredentialStore, tx pgx.Tx) error {
 		var state accountpolicy.State
 		var authority username.GuardAuthority
+		var names *username.Store
+		var display string
 		if tx != nil {
 			if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
 				return err
 			}
 			var err error
-			authority, err = s.policy.Guard(ctx, tx)
+			if registration {
+				// Select actual username authority before account locks. GetInTx
+				// under those locks refuses an out-of-order authority upgrade.
+				before, readErr := users.GetUserByID(ctx, userID)
+				if readErr != nil {
+					return readErr
+				}
+				if nullRegistrationUsername(before) {
+					err = username.AcquireOwnershipGuard(ctx, tx)
+				} else {
+					names = s.firstUsernames
+					if names == nil {
+						return username.ErrUnavailable
+					}
+					authority, err = names.GuardAuthority(ctx, tx)
+				}
+			} else {
+				authority, err = s.policy.Guard(ctx, tx)
+			}
 			if err != nil {
 				return err
 			}
@@ -750,26 +838,46 @@ func (s *Service) runAccountPolicyTx(ctx context.Context, userID uuid.UUID, revo
 		if err != nil {
 			return fmt.Errorf("webauthn: lock credential owner: %w", err)
 		}
-		if !isLoginEligible(user.Status) {
+		if !isLoginEligible(user.Status) || user.DeletedAt.Valid {
 			return ErrAccountNotActive
 		}
 		if err := s.checkSessionVersion(ctx, user); err != nil {
 			return err
 		}
 		if tx != nil {
-			state, err = s.policy.Read(ctx, tx, user, authority)
+			if registration {
+				name, readErr := names.GetInTx(ctx, tx, userID, user.AuthVersion, authority)
+				if readErr != nil {
+					return readErr
+				}
+				if name != nil {
+					display = name.Display
+				}
+				q := db.New(tx)
+				state.Passkeys, err = q.CountWebauthnCredentialsByUser(ctx, userID)
+				if err != nil {
+					return err
+				}
+				state.Privileged, err = q.UserHasPrivilegedRole(ctx, userID)
+				state.TOTP = user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0
+			} else {
+				state, err = s.policy.Read(ctx, tx, user, authority)
+			}
 			if err != nil {
 				return err
 			}
 		} else {
 			// Pure-memory stores cannot assert admitted password authority.
+			if registration && !nullRegistrationUsername(user) {
+				return username.ErrUnavailable
+			}
 			rows, err := creds.ListWebauthnCredentialsByUser(ctx, userID)
 			if err != nil {
 				return err
 			}
 			state = accountpolicy.State{Passkeys: int64(len(rows)), TOTP: user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0}
 		}
-		if err := fn(users, creds, user, state); err != nil {
+		if err := fn(users, creds, tx, user, state, display); err != nil {
 			return err
 		}
 		if revoke && tx != nil {

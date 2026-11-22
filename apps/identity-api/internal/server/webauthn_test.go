@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -243,6 +244,7 @@ func newWebAuthnTestServerWithStepUp(t *testing.T, withStepUp bool) *webAuthnTes
 	if err != nil {
 		t.Fatalf("webauthn.New: %v", err)
 	}
+	svc.SetFirstPasskeyDependencies(nil, mgr, nil)
 
 	var stepUpSvc *stepup.Service
 	if withStepUp {
@@ -623,7 +625,8 @@ func TestWebAuthnLoginRoutesAreUnauthenticated(t *testing.T) {
 // well-formed CredentialCreation payload.
 func TestRegisterOptionsReturns200(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	fx.seedCredential([]byte("existing-key"))
+	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String(), AuthVersionSet: true})
 
 	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
 
@@ -670,7 +673,7 @@ func TestRegisterOptionsReturns200(t *testing.T) {
 // its account cannot start an enrolment.
 func TestRegisterOptionsForDeletedAccountReturns401(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
-	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String(), AuthVersionSet: true})
 	delete(fx.users.byID, fx.user.ID)
 
 	rec := fx.doWithGrant(t, http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", cookies, sess)
@@ -718,6 +721,60 @@ func TestRegisterOptionsRejectsSessionWithoutStepUp(t *testing.T) {
 	}
 }
 
+func TestRegistrationPreflightDoesNotSpendStepUp(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		headers    map[string][]string
+		status     int
+	}{
+		{"unknown body", `{"username":"chosen"}`, nil, http.StatusBadRequest},
+		{"duplicate body", `{"name":"first","name":"second"}`, nil, http.StatusBadRequest},
+		{"null name", `{"name":null}`, nil, http.StatusBadRequest},
+		{"mixed", `{}`, map[string][]string{"X-Action-Proof": {base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))}}, http.StatusForbidden},
+		{"empty mixed", `{}`, map[string][]string{"X-Action-Proof": {""}}, http.StatusForbidden},
+		{"duplicate grant", `{}`, map[string][]string{stepup.HeaderStepUpAuth: {"duplicate"}}, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newWebAuthnTestServerWithStepUp(t, true)
+			sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+			grant := mintTestGrant(t, fx.stepUp, sess)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/webauthn/register/generate-options", strings.NewReader(tc.body))
+			fx.browser.authorize(t, req, sess, cookies...)
+			req.Header.Set(stepup.HeaderStepUpAuth, grant)
+			for key, values := range tc.headers {
+				for _, value := range values {
+					req.Header.Add(key, value)
+				}
+			}
+			rec := httptest.NewRecorder()
+			fx.srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("preflight status=%d want=%d", rec.Code, tc.status)
+			}
+			if _, err := fx.stepUp.Validate(context.Background(), grant, sess); err != nil {
+				t.Fatalf("preflight spent grant: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationFinishRefusesStartAuthority(t *testing.T) {
+	for _, key := range []string{stepup.HeaderStepUpAuth, "X-Action-Proof"} {
+		t.Run(key, func(t *testing.T) {
+			fx := newWebAuthnTestServerWithStepUp(t, true)
+			sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/webauthn/register/verify", strings.NewReader(`{}`))
+			fx.browser.authorize(t, req, sess, cookies...)
+			req.Header[key] = []string{""}
+			rec := httptest.NewRecorder()
+			fx.srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("finish authority status=%d", rec.Code)
+			}
+		})
+	}
+}
+
 // TestWebAuthnErrorMapping locks in the status/code matrix the two error
 // writers implement. It exercises them directly because several branches
 // (a cloned authenticator, an expired challenge) cannot be reached over HTTP
@@ -737,6 +794,9 @@ func TestWebAuthnErrorMapping(t *testing.T) {
 			{webauthn.ErrChallengeNotFound, http.StatusBadRequest, "challenge_invalid"},
 			{webauthn.ErrChallengeExpired, http.StatusBadRequest, "challenge_invalid"},
 			{webauthn.ErrVerification, http.StatusBadRequest, "verification_failed"},
+			{webauthn.ErrRegistrationUnauthorized, http.StatusForbidden, "insufficient_user_authentication"},
+			{webauthn.ErrEnrollmentInProgress, http.StatusConflict, "enrollment_in_progress"},
+			{webauthn.ErrRegistrationOutcomeUnknown, http.StatusServiceUnavailable, "outcome_unknown"},
 			{errors.New("database on fire"), http.StatusServiceUnavailable, "temporarily_unavailable"},
 			{webauthn.ErrChallengeStoreUnavailable, http.StatusServiceUnavailable, "temporarily_unavailable"},
 		}

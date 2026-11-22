@@ -11,6 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/hatefsystems/identity/apps/identity-api/internal/actionproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/clientip"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/contactcode"
@@ -19,12 +21,32 @@ import (
 
 const accountDeletionProofPath = "/api/v1/auth/action-proofs/account-deletion"
 const passwordChangeProofPath = "/api/v1/auth/action-proofs/password-change" //nolint:gosec // G101: fixed public API route, not a credential.
+const firstPasskeyProofPath = "/api/v1/auth/action-proofs/first-passkey"     //nolint:gosec // G101: fixed public API route, not a credential.
 
 // AccountDeletionProofs earns deletion-only authority for the request's live
 // browser session. Consumption belongs to the eventual deletion transaction.
 type AccountDeletionProofs interface {
 	Challenge(ctx context.Context, sess session.Session, password, channel, sourceIP string) (string, time.Time, error)
 	Verify(ctx context.Context, sess session.Session, challenge, code string) (string, time.Time, error)
+}
+
+// FirstPasskeyProofs issues only first-start authority; the WebAuthn service owns
+// the caller transactions and commits. Final validation is read-only.
+type FirstPasskeyProofs interface {
+	ChallengeFirstPasskey(context.Context, session.Session, string, string, string) (string, time.Time, error)
+	VerifyFirstPasskey(context.Context, session.Session, string, string) (string, time.Time, error)
+	CheckFirstPasskey(context.Context, session.Session, string) error
+	ConsumeFirstPasskeyStartTx(context.Context, pgx.Tx, session.Session, string) (actionproof.FirstPasskeyAuthorization, error)
+	ValidateFirstPasskeyTx(context.Context, pgx.Tx, session.Session, actionproof.FirstPasskeyAuthorization) error
+}
+
+func (s *Server) registerFirstPasskeyProofRoutes() {
+	guard, ok := s.sessionGuard("first passkey proofs")
+	if !ok {
+		return
+	}
+	s.router.With(guard.Handler).Post(firstPasskeyProofPath+"/challenge", s.handleFixedProofCeremony(false, contactcode.PurposeFirstPasskey))
+	s.router.With(guard.Handler).Post(firstPasskeyProofPath+"/verify", s.handleFixedProofCeremony(true, contactcode.PurposeFirstPasskey))
 }
 
 func (s *Server) registerActionProofRoutes() {
@@ -93,6 +115,14 @@ func (s *Server) handleActionProof(verify bool) http.HandlerFunc {
 }
 
 func (s *Server) handleProofCeremony(verify, passwordChange bool) http.HandlerFunc {
+	purpose := contactcode.PurposeAccountDeletion
+	if passwordChange {
+		purpose = contactcode.PurposePasswordChange
+	}
+	return s.handleFixedProofCeremony(verify, purpose)
+}
+
+func (s *Server) handleFixedProofCeremony(verify bool, purpose string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, _, ok := profileSession(w, r)
 		if !ok {
@@ -104,17 +134,23 @@ func (s *Server) handleProofCeremony(verify, passwordChange bool) http.HandlerFu
 			return
 		}
 		service := s.deps.AccountDeletionProofs
-		if passwordChange {
+		if purpose == contactcode.PurposePasswordChange {
 			service = s.deps.PasswordChangeProofs
 		}
-		if service == nil {
+		if purpose != contactcode.PurposeFirstPasskey && service == nil || purpose == contactcode.PurposeFirstPasskey && s.deps.FirstPasskeyProofs == nil {
 			writeActionProofError(w, actionproof.ErrUnavailable)
 			return
 		}
 		var handle string
 		var deadline time.Time
 		var err error
-		if verify {
+		if purpose == contactcode.PurposeFirstPasskey {
+			if verify {
+				handle, deadline, err = s.deps.FirstPasskeyProofs.VerifyFirstPasskey(r.Context(), sess, values["challenge"], values["code"])
+			} else {
+				handle, deadline, err = s.deps.FirstPasskeyProofs.ChallengeFirstPasskey(r.Context(), sess, values["password"], values["channel"], clientip.FromRequest(r))
+			}
+		} else if verify {
 			handle, deadline, err = service.Verify(r.Context(), sess, values["challenge"], values["code"])
 		} else {
 			handle, deadline, err = service.Challenge(r.Context(), sess, values["password"], values["channel"], clientip.FromRequest(r))

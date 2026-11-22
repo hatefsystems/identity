@@ -31,10 +31,13 @@ var (
 	// TTL had elapsed before the ceremony was completed.
 	ErrChallengeExpired = errors.New("webauthn: challenge expired")
 
-	ErrChallengeConflict         = errors.New("webauthn: challenge already exists")
-	ErrInvalidChallenge          = errors.New("webauthn: invalid or oversized challenge state")
-	ErrChallengeStoreUnavailable = errors.New("webauthn: challenge store unavailable")
-	ErrDPoPBindingRequired       = errors.New("webauthn: verified browser DPoP binding required")
+	ErrChallengeConflict          = errors.New("webauthn: challenge already exists")
+	ErrEnrollmentInProgress       = errors.New("webauthn: first enrollment in progress")
+	ErrRegistrationUnauthorized   = errors.New("webauthn: registration authority unavailable")
+	ErrRegistrationOutcomeUnknown = errors.New("webauthn: registration outcome unknown")
+	ErrInvalidChallenge           = errors.New("webauthn: invalid or oversized challenge state")
+	ErrChallengeStoreUnavailable  = errors.New("webauthn: challenge store unavailable")
+	ErrDPoPBindingRequired        = errors.New("webauthn: verified browser DPoP binding required")
 
 	// ErrInvalidResponse indicates the authenticator response body was missing
 	// or could not be parsed into a WebAuthn credential response.

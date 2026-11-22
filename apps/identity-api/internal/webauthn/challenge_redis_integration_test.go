@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -50,6 +51,56 @@ func realRedisChallengeStores(t *testing.T) [2]*RedisChallengeStore {
 // clear a database/script cache or stop a shared service.
 func TestRedisChallengeIntegrationFlows(t *testing.T) {
 	exerciseRedisChallengeServiceFlows(t, realRedisChallengeStores)
+}
+
+func TestRedisFirstRegistrationIntegrationSlots(t *testing.T) {
+	exerciseFirstRegistrationRedis(t, realRedisChallengeStores(t))
+}
+
+func TestRedisFirstRegistrationIntegrationRuntimeFailure(t *testing.T) {
+	exerciseFirstRegistrationRuntimeFailure(t, realRedisChallengeStores(t))
+}
+
+func TestRedisFirstRegistrationIntegrationRedisClockAndLostSlot(t *testing.T) {
+	stores := realRedisChallengeStores(t)
+	pc := firstPending(uuid.New(), time.Now().Add(-time.Millisecond))
+	stores[0].now = func() time.Time { return time.Now().Add(-time.Minute) }
+	key, slot := challengeRedisKey(pc.Session.Challenge), firstRegistrationRedisKey(pc.UserRef)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := stores[0].client.Del(ctx, key, slot).Err(); err != nil {
+			t.Error("owned first slot cleanup failed", err)
+		}
+	})
+	if err := stores[0].SaveFirstRegistration(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrChallengeExpired) {
+		t.Fatal("local stale clock overrode Redis deadline", err)
+	}
+	if count := stores[0].client.Exists(t.Context(), key, slot).Val(); count != 0 {
+		t.Fatal("expired Redis-time admission wrote authority")
+	}
+	stores[0].now = time.Now
+	pc.Expires = time.Now().Add(time.Minute).UTC().Truncate(time.Millisecond)
+	pc.Session.Expires = pc.Expires
+	if err := stores[0].SaveFirstRegistration(t.Context(), pc.Session.Challenge, pc); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].client.PExpire(t.Context(), slot, time.Millisecond).Err(); err != nil {
+		t.Fatal(err)
+	}
+	timer := time.NewTimer(25 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	if _, err := stores[1].Take(t.Context(), pc.Session.Challenge, bindingFor(pc)); err != nil {
+		t.Fatal("pending should remain bound independently of lost slot", err)
+	}
+	if err := stores[1].CheckFirstRegistration(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrChallengeNotFound) {
+		t.Fatal("lost slot reconstructed final authority", err)
+	}
 }
 
 func TestRedisChallengeIntegrationAtomicConsumption(t *testing.T) {

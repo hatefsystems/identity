@@ -26,6 +26,7 @@ import {
   integrationInvocation,
   acceptanceLifecycle,
   failureCategories,
+  firstPasskeyActionProof,
   legalCoordinateRequest,
   legalIdempotencyKey,
   legalReferenceRequest,
@@ -43,9 +44,9 @@ import {
   startPortalServices,
 } from './portal-harness.mjs';
 import { identityGoModule, integrationPackages, racePackages, raceToolchainProfile } from './acceptance-report.mjs';
-import { decodeQuotedPrintableUTF8, deletionMail, startMailSink } from './portal-mail-sink.mjs';
+import { decodeQuotedPrintableUTF8, deletionMail, firstPasskeyMail, loginMail, startMailSink } from './portal-mail-sink.mjs';
 import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, reviewAppearance, runAdminBrowser, visibleKeyboardStops } from './web-admin.browser.mjs';
-import { clean, destructiveAppearance, keyStorage, newContext, recoveryAction, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
+import { api, clean, destructiveAppearance, keyStorage, nativeFirstPasskey, newContext, recoveryAction, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
 
 function testDirectory(prefix) {
   const parent = join(tmpdir(), 'kilo');
@@ -109,6 +110,151 @@ test('no-DPoP success exception covers only exact anonymous POST reclaim routes'
   for (const path of ['/api/v1/users/me', '/api/v1/auth/deletion/reclaim/options/', '/api/v1/auth/deletion/reclaim/unknown', '/api/v1/auth/stepup/verify']) {
     assert(!anonymousReclaim(path, 'POST'));
   }
+});
+
+test('first-passkey probe authority is canonical and confined to the exact options POST', async () => {
+  const proof = Buffer.alloc(32, 27).toString('base64url');
+  const path = '/api/v1/auth/webauthn/register/generate-options';
+  assert.equal(firstPasskeyActionProof(path, 'POST', proof), proof);
+  assert.equal(firstPasskeyActionProof('/api/v1/users/me', 'GET', undefined), undefined);
+  for (const token of ['', null, 1, proof + '=', proof + '\r\nX-Private: secret', 'A'.repeat(42) + 'B'])
+    assert.throws(() => firstPasskeyActionProof(path, 'POST', token));
+  for (const route of [path + '/', path + '?', path + '#secret', '/api/v1/auth/webauthn/register/verify',
+    '/api/v1/auth/action-proofs/first-passkey/verify', '/api/v1/users/me/deletion', '/api/v1/auth/logout'])
+    for (const method of ['POST', 'GET', 'PATCH', 'DELETE'])
+      assert.throws(() => firstPasskeyActionProof(route, method, proof));
+  for (const method of ['GET', 'DELETE', 'post']) assert.throws(() => firstPasskeyActionProof(path, method, proof));
+  let evaluations = 0;
+  const page = { evaluate: async () => { evaluations++; } };
+  await assert.rejects(api(page, path, { method: 'POST', actionProof: proof, stepUpToken: 'strong' }), /Mixed probe enrollment authority/);
+  await assert.rejects(api(page, '/api/v1/auth/webauthn/register/verify', { method: 'POST', actionProof: proof }));
+  assert.equal(evaluations, 0, 'Rejected authority reached the browser key or transport');
+});
+
+test('first-passkey DPoP probe sends authority only at options and never carries it into finish', async () => {
+  const pair = await webcrypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+  const { crv, kty, x, y } = await webcrypto.subtle.exportKey('jwk', pair.publicKey);
+  const key = { privateKey: pair.privateKey, publicJwk: { crv, kty, x, y } };
+  const proof = Buffer.alloc(32, 27).toString('base64url'), calls = [];
+  const request = (result) => {
+    const pending = { result };
+    queueMicrotask(() => pending.onsuccess());
+    return pending;
+  };
+  const page = { evaluate: async (callback, input) => structuredClone(await runInNewContext(`(${callback})(input)`, {
+    input, indexedDB: { open: () => request({ transaction: () => ({ objectStore: () => ({ get: () => request(key) }) }), close() {} }) },
+    crypto: webcrypto, TextEncoder, URL, location: { origin: 'https://localhost:43210' },
+    btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
+    fetch: async (path, options) => { calls.push({ path, ...options }); return { status: 200, json: async () => ({}), headers: new Headers() }; },
+  })) };
+  const options = '/api/v1/auth/webauthn/register/generate-options';
+  const password = ' exact fixture password ', username = 'owned-fixture-username';
+  await api(page, '/api/v1/auth/login', { method: 'POST', body: { username, password } });
+  await api(page, options, { method: 'POST', sessionID: 'same-session', actionProof: proof, body: {} });
+  await api(page, '/api/v1/auth/webauthn/register/verify', { method: 'POST', sessionID: 'same-session', body: { response: {} } });
+  assert.equal(calls.length, 3);
+  assert.deepEqual(JSON.parse(calls[0].body), { username, password }, 'Password fixture bytes changed before API login');
+  assert.equal(calls[0].headers['X-Action-Proof'], undefined);
+  assert.equal(calls[0].headers['X-Portal-Session'], undefined);
+  assert.equal(calls[1].headers['X-Action-Proof'], proof);
+  assert.equal(calls[2].headers['X-Action-Proof'], undefined);
+  for (const call of calls) {
+    assert.equal(call.headers['X-Step-Up-Auth'], undefined);
+    if (call.path !== '/api/v1/auth/login') assert.equal(call.headers['X-Portal-Session'], 'same-session');
+    assert.equal(call.referrerPolicy, 'no-referrer');
+    assert.equal(call.credentials, 'same-origin');
+    assert.equal(call.redirect, 'error');
+    assert.equal(call.cache, 'no-store');
+    assert(!call.path.includes(proof) && !call.body.includes(proof));
+    const claims = JSON.parse(Buffer.from(call.headers.DPoP.split('.')[1], 'base64url'));
+    assert.equal(claims.htu, 'https://localhost:43210' + call.path);
+  }
+  assert.notEqual(calls[0].headers.DPoP, calls[1].headers.DPoP);
+});
+
+test('first-passkey native probe converts canonical creation bytes and serializes one explicit native response', async () => {
+  const encode = (value) => Buffer.from(value).toString('base64url');
+  const handle = new Uint8Array(8).fill(7), challenge = new Uint8Array(32).fill(9);
+  const rawID = new Uint8Array([0, 1, 254, 255]), clientDataJSON = new Uint8Array([1, 2]), attestationObject = new Uint8Array([3, 4]);
+  const options = { expires_at: new Date(Date.now() + 60000).toISOString(), publicKey: {
+    rp: { id: 'localhost', name: 'Owned RP' }, user: { id: encode(handle), name: 'owned', displayName: 'owned' },
+    challenge: encode(challenge), timeout: 60000, authenticatorSelection: { userVerification: 'required' },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }], excludeCredentials: [{ type: 'public-key', id: encode(rawID) }],
+  } };
+  let creations = 0;
+  const page = { evaluate: async (callback, value) => structuredClone(await runInNewContext(`(${callback})(value)`, {
+    value, isSecureContext: true, location: { hostname: 'localhost' },
+    btoa: (value) => Buffer.from(value, 'binary').toString('base64'), atob: (value) => Buffer.from(value, 'base64').toString('binary'),
+    navigator: { credentials: { create: async ({ publicKey }) => {
+      creations++;
+      assert.deepEqual([...publicKey.challenge], [...challenge]);
+      assert.deepEqual([...publicKey.user.id], [...handle]);
+      assert.deepEqual([...publicKey.excludeCredentials[0].id], [...rawID]);
+      assert(publicKey.timeout > 0 && publicKey.timeout <= 60000);
+      return { type: 'public-key', rawId: rawID, authenticatorAttachment: 'platform',
+        getClientExtensionResults: () => ({ credProps: { rk: true }, ignoredPrivateValue: 'do-not-serialize' }),
+        response: { clientDataJSON, attestationObject, getTransports: () => ['internal'] } };
+    } } },
+  })) };
+  assert.equal(creations, 0, 'Options automatically started native work');
+  const result = await nativeFirstPasskey(page, options);
+  assert.equal(creations, 1);
+  assert.equal(result.id, encode(rawID));
+  assert.equal(result.rawId, encode(rawID));
+  assert.equal(result.response.clientDataJSON, encode(clientDataJSON));
+  assert.equal(result.response.attestationObject, encode(attestationObject));
+  assert.deepEqual(result.clientExtensionResults, { credProps: { rk: true } });
+  assert(!JSON.stringify(result).includes('do-not-serialize'));
+  const secrets = fixtureSecretValues(result);
+  for (const value of [result.rawId, result.response.clientDataJSON, result.response.attestationObject]) assert(secrets.includes(value));
+  for (const change of [
+    { ...options, expires_at: new Date(Date.now() - 1000).toISOString() },
+    { ...options, publicKey: { ...options.publicKey, user: { ...options.publicKey.user, id: encode([1]) } } },
+    { ...options, publicKey: { ...options.publicKey, rp: { id: 'foreign.example' } } },
+    { ...options, publicKey: { ...options.publicKey, authenticatorSelection: { userVerification: 'preferred' } } },
+  ]) await assert.rejects(nativeFirstPasskey(page, change));
+  assert.equal(creations, 1, 'Rejected native options executed creation');
+});
+
+test('first-passkey owned harness is explicit default-off and reuses password-only login fixture without UI or public fixtures', () => {
+  const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
+  const browser = readFileSync(new URL('./web-portal.browser.mjs', import.meta.url), 'utf8');
+  assert.match(harness, /firstPasskey = false/);
+  assert.match(harness, /!firstPasskey \|\| login && !admin/);
+  assert.match(harness, /FIRST_PASSKEY_PROOFS_ENABLED: firstPasskey \? 'true' : 'false'/);
+  assert.match(harness, /FIRST_PASSKEY_PROOFS_SMS_ENABLED: 'false'/);
+  assert.match(harness, /acceptFirstPasskey: firstPasskey/);
+  assert.match(browser, /startPortalHarness\(\{ login: true, firstPasskey: true \}\)/);
+  assert.match(browser, /fixture\('login-seed', \{ scenario: 'password-only', totp: false, role: 'ordinary' \}\)/);
+  assert.match(browser, /await nativeFirstPasskey\(page, options\.body\)/);
+  assert.match(browser, /firstHarness\.close/);
+  const passwordProbe = browser.slice(browser.indexOf('export async function firstPasskeyPasswordSession'),
+    browser.indexOf('export async function firstPasskeyEnrollment'));
+  assert.match(passwordProbe, /assertOnlyPreferenceCookies/);
+  assert.match(passwordProbe, /await visit\(page, harness\.origin, '\/login\/webauthn'\)/);
+  assert.match(passwordProbe, /endpoint = harness\.origin \+ '\/api\/v1\/auth\/webauthn\/login\/generate-options'/);
+  assert.match(passwordProbe, /await page\.route\(endpoint, stop\)/);
+  assert.match(passwordProbe, /await route\.abort\('aborted'\)/);
+  assert.match(passwordProbe, /await api\(page, '\/api\/v1\/auth\/login', \{ method: 'POST'/);
+  assert.match(passwordProbe, /body: \{ username: fixture\.username, password: fixture\.password \}/);
+  assert.match(passwordProbe, /profile\.body\.id, fixture\.user_id/);
+  assert.match(passwordProbe, /state\.auth_version, fixture\.auth_version/);
+  assert.match(passwordProbe, /state\.primary_method, 'password'/);
+  assert.doesNotMatch(passwordProbe, /getByLabel|\.fill\(|Sign in with password|NEXT_PUBLIC_LOGIN_ENABLED|credentials\.(?:get|create)|route\.fulfill/);
+  const enrollment = browser.slice(browser.indexOf('export async function firstPasskeyEnrollment'), browser.indexOf('async function keyStorage'));
+  assert.match(enrollment, /fixture\.credentials\.length, 0/);
+  assert.match(enrollment, /await firstPasskeyPasswordSession\(page, harness, fixture\)/);
+  assert.doesNotMatch(enrollment, /getByLabel|\.fill\(|NEXT_PUBLIC_LOGIN_ENABLED/);
+  assert.match(enrollment, /publicKey: \{ \.\.\.options\.body\.publicKey, rp: undefined \}/);
+  const privateOptions = { challenge: 'private-challenge', user: { id: 'private-user-handle', name: 'owned-username' },
+    excludeCredentials: [{ id: 'private-excluded-credential' }] };
+  const publicKey = { ...privateOptions, rp: { id: 'localhost', name: 'Owned public RP' } };
+  const secrets = fixtureSecretValues({ publicKey: { ...publicKey, rp: undefined } });
+  for (const value of ['private-challenge', 'private-user-handle', 'private-excluded-credential']) assert(secrets.includes(value));
+  assert(!secrets.includes(publicKey.rp.id) && !secrets.includes(publicKey.rp.name), 'Public RP metadata became private URL data');
+  for (const operation of ['challenge', 'verify'])
+    assert.equal(portalRoute(`/api/v1/auth/action-proofs/first-passkey/${operation}`), `/api/v1/auth/action-proofs/first-passkey/${operation}`);
+  assert.equal(portalRoute('/api/v1/auth/action-proofs/first-passkey/private'), '[redacted-route]');
 });
 
 test('portal diagnostics use route templates rather than credential/session IDs', () => {
@@ -1810,6 +1956,25 @@ function sampleMail(link = `${mailPolicy.origin}/recover-account#token=${mailTok
     body('text/html', `<html lang=3D"en" dir=3D"ltr"><body><a href=3D"${encoded}">Recover account</a></body></html>`) + '--deletion-fixture--\r\n';
 }
 
+function sampleFirstPasskeyMail() {
+  return `From: <${mailPolicy.from}>\r\nTo: <${mailPolicy.recipient}>\r\nSubject: Your first-passkey enrollment code\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nEnter this code only in the browser where you requested your first passkey:\r\n004219\r\n\r\nThis code authorizes one first-passkey enrollment start and expires at 2026-11-25T12:00:00.123456789Z. It cannot sign you in, change your password, delete your account, verify a signup or change your contacts. If you did not request a first passkey, do not share or enter this code.\r\n`;
+}
+
+test('first-passkey mail decoder requires exact purpose copy, sender, recipient and original deadline', () => {
+  const mail = sampleFirstPasskeyMail();
+  const notice = firstPasskeyMail(mail, mailPolicy);
+  assert.deepEqual(notice, { kind: 'first-passkey', recipient: mailPolicy.recipient, code: '004219', expires_at: '2026-11-25T12:00:00.123456789Z' });
+  for (const changed of [mail.replace('Your first-passkey enrollment code', 'Your account sign-in code'),
+    mail.replace('first-passkey enrollment start', 'password change'), mail.replace('004219', '00421'),
+    mail.replace(mailPolicy.from, 'foreign@example.test'), mail.replace(mailPolicy.recipient, 'foreign@example.test'),
+    mail.replace('MIME-Version:', 'Cc: foreign@example.test\r\nMIME-Version:'),
+    mail.replace('2026-11-25T12:00:00.123456789Z', '2026-11-25T12:00:00+03:30'),
+    mail + 'extra private text', mail + 'x'.repeat(32 * 1024)])
+    assert.throws(() => firstPasskeyMail(changed, mailPolicy));
+  assert.throws(() => loginMail(mail, mailPolicy), 'First enrollment code must not decode as login authority');
+  assert.throws(() => deletionMail(mail, mailPolicy), 'First enrollment code must not decode as deletion authority');
+});
+
 test('mail parser accepts bounded canonical fragment links and rejects leaks', () => {
   const mail = deletionMail(sampleMail(), mailPolicy);
   assert.equal(mail.token, mailToken);
@@ -1844,7 +2009,7 @@ test('quoted-printable alternatives decode UTF-8 Persian without changing canoni
   assert.throws(() => deletionMail(persian.replace('2026-11-25T12:00:00Z (UTC)', '2026-11-25T12:00:00Z (UTC) 2026-11-26T12:00:00Z (UTC)'), mailPolicy));
 });
 
-test('owned mail sink requires verified TLS/auth, rejects foreign recipients, and captures retry identity in memory', { timeout: 15000 }, async () => {
+test('owned mail sink requires verified TLS/auth, rejects foreign recipients, and isolates first-passkey capture from deletion retry identity in memory', { timeout: 15000 }, async () => {
   const directory = testDirectory('portal-mail-test-');
   let sink;
   const clients = [];
@@ -1861,6 +2026,7 @@ test('owned mail sink requires verified TLS/auth, rejects foreign recipients, an
     const secrets = [];
     sink = await startMailSink({
       ...mailPolicy, runID: mailRunID, cert, key: readFileSync(keyPath),
+      acceptFirstPasskey: true,
       username: 'fixture-user', password: 'fixture-password', onSecrets: (values) => secrets.push(...values),
     });
     const untrusted = connect({ host: '127.0.0.1', port: sink.port, rejectUnauthorized: true });
@@ -1904,6 +2070,16 @@ test('owned mail sink requires verified TLS/auth, rejects foreign recipients, an
     assert.equal(sink.messages[0].expires_at, accepted.expires_at);
     assert.deepEqual(sink.evidence, { tls: 1, authenticated: 1, authRejected: 1, recipientRejected: 1, temporary: 1, accepted: 1 });
     assert(secrets.includes(mailToken) && secrets.includes(accepted.link));
+    assert.equal(await send(`MAIL FROM:<${mailPolicy.from}> SMTPUTF8`), 250);
+    assert.equal(await send(`RCPT TO:<${mailPolicy.recipient}>`), 250);
+    assert.equal(await send('DATA'), 354);
+    assert.equal(await send(sampleFirstPasskeyMail() + '.'), 250);
+    const first = await sink.waitFor(mailPolicy.recipient, 1, 'first-passkey');
+    assert.equal(first.code, '004219');
+    assert.equal(first.expires_at, '2026-11-25T12:00:00.123456789Z');
+    assert.equal(sink.messages.length, 3);
+    assert.equal((await sink.waitFor(mailPolicy.recipient)).token, mailToken, 'First enrollment mail displaced deletion capture');
+    assert(secrets.includes(first.code), 'First enrollment code omitted privacy registration');
     await send('QUIT');
   } finally {
     for (const socket of clients) socket.destroy();

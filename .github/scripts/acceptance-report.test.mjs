@@ -10,6 +10,18 @@ const identity = { revision: 'a'.repeat(40), source: 'b'.repeat(64), generated: 
 const toolchain = { schema: 1, profile: raceToolchainProfile,
   go: { GOOS: 'linux', GOHOSTOS: 'linux', GOARCH: 'amd64', CGO_ENABLED: '1', GOVERSION: 'go1.26.5' },
   compiler: { name: 'gcc', version: '12.2.0', target: 'x86_64-linux-gnu' } };
+
+test('first passkey enrollment retains a separate required WebAuthn race cell', () => {
+  assert.equal(racePackages.filter((name) => name === './internal/webauthn').length, 1);
+  const cells = reports('race');
+  const index = cells.findIndex((cell) => cell.results[0].target === 'identity-api:./internal/webauthn');
+  const wrong = structuredClone(cells);
+  wrong[index].results[0].packageEvidence[0].package = `${identityGoModule}/internal/actionproof`;
+  assert.throws(() => aggregateReports(wrong, 'race', identity));
+  cells.splice(index, 1);
+  assert.throws(() => aggregateReports(cells, 'race', identity), /exactly the allowlisted reports/);
+});
+
 function reports(kind) {
   return (kind === 'integration' ? integrationTargets : racePackages).map((name) => {
     const packages = kind === 'integration' ? integrationPackages[name] : [name.slice(2)];

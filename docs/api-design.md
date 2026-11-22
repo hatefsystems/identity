@@ -73,12 +73,69 @@ Endpoints for phishing-resistant logins, Multi-Factor Authentication, and short-
 - `DELETE /api/v1/auth/webauthn/keys/{id}`: Remove a specific WebAuthn device (Requires Step-up authentication in `X-Step-Up-Auth`). `{id}` is the unpadded base64url credential ID as returned by `GET /keys`. Scoped to the caller's account: a credential belonging to another account is reported as `404 credential_not_found`, identical to one that does not exist, so credential IDs cannot be probed. Refuses with `409 {"error":"last_credential"}` if neither a passkey nor eligible username/password sign-in would remain. The last passkey is removable only when password login is enabled, its verifier is supported and usable, and the username is retained under the current admitted policy. Accounts with any privileged role also require a surviving passkey or enabled TOTP backed by configured secret material, otherwise `409 {"error":"last_factor"}`. TOTP, verified contacts, backup codes and existing sessions are not primary-login substitutes.
 
 #### WebAuthn Registration & Login Flows
-- `POST /api/v1/auth/webauthn/register/generate-options`: Optional `{"name":"..."}` for a new credential on an already authenticated account. The normalized name is frozen in pending state. Requires Step-up authentication in `X-Step-Up-Auth`; the single-use grant is consumed when the ceremony starts. Enforces RP ID as a clean domain name and validates the exact clientDataJSON origin. The returned `user.id` is a CSPRNG-generated random 64-bit handle, not the account UUID.
-- `POST /api/v1/auth/webauthn/register/verify`: Existing serialized credential-response body; it cannot supply a replacement name. Requires the same bound session, not a second grant, and returns `201` with the created named credential. A foreign-session attempt neither completes nor consumes the pending ceremony.
+- `POST /api/v1/auth/webauthn/register/generate-options`: Optional `{"name":"..."}` for a new credential on an already authenticated account. The normalized name is frozen in pending state. Accepts exactly one `X-Step-Up-Auth` or the fixed first-passkey `X-Action-Proof` described below. Authority is consumed at start, before options are returned. Enforces RP ID as a clean domain name and validates the exact clientDataJSON origin. The returned `user.id` is a CSPRNG-generated random 64-bit handle, not the account UUID.
+- `POST /api/v1/auth/webauthn/register/verify`: Existing serialized credential-response body; it cannot supply a replacement name. Requires the same bound session and accepts neither start authorization header. Returns `201` with the created named credential and security-invalidation outcome. A foreign-session attempt neither completes nor consumes the pending ceremony.
 - `POST /api/v1/auth/webauthn/login/generate-options`: Get challenge for WebAuthn login. Supports discoverable credentials (usernameless login with an empty `allowCredentials` list) to completely neutralize account harvesting. For legacy user-named flows, if the input identity is unregistered, the endpoint returns a mock challenge with identical structure and delay, although discoverable credentials remain the recommended path due to browser-level key-lookup speed variances on local devices.
 - `POST /api/v1/auth/webauthn/login/verify`: Verify the assertion using the same verified DPoP key that started options generation, issue a bound session cookie and return `204`. The client must then bootstrap `/users/me` before rendering private content.
 
 Every pending WebAuthn challenge is tagged with its ceremony flow and applicable account/session/key bindings. Shared Redis atomically checks bindings before single-use consumption, allowing start on one API replica and completion on another. Wrong bindings do not burn legitimate state; concurrent valid finishes have one winner. The versioned store has native TTLs (configured default five minutes, maximum fifteen), bounded 64-KiB serialized state and two-second operation deadlines. Redis faults fail closed without process-local fallback. Anonymous login options/verification and reclaim-options admission share a 30-request/IP-subnet/minute budget before allocating challenge/nonce state; the explicit nonce retry also counts. Memory storage is for isolated tests/development only.
+
+#### First Passkey On A Password Account (T25)
+
+This backend and typed-client contract adds no password/OTP dialog, dashboard
+wiring or bootstrap capability hint. Normal live session, exact Origin,
+DPoP/JKT, `X-Portal-Session`, strict bounded UTF-8 JSON and no-store protections
+remain required. Recovery-enrollment sessions cannot use it.
+
+| POST operation | Exact request | Successful result |
+|---|---|---|
+| `/api/v1/auth/action-proofs/first-passkey/challenge` | `{password, channel}`; `email` or `sms` selects the currently evidenced server-owned contact | `202 {challenge, expires_at}` after one delivery attempt; provider acceptance is not receipt |
+| `/api/v1/auth/action-proofs/first-passkey/verify` | `{challenge, code}` | `200 {action_proof, expires_at}` with the original contact-code deadline |
+| `/api/v1/auth/webauthn/register/generate-options` | Existing optional `{name}` and exactly one start header | Existing `publicKey` plus authoritative `expires_at` for first enrollment |
+| `/api/v1/auth/webauthn/register/verify` | Existing creation response, neither start header | Existing safe `201` credential with truthful `user_verified: true`; ordinary login follows |
+
+The fixed proof authorizes only one first-enrollment start. It requires a fresh
+exact-byte existing-password verification, active nondeleted account, supported
+password verifier, zero current credential rows, MFA disabled, no privileged
+role, and the selected complete current contact evidence. Any privileged role
+excludes fallback even when administrative HTTP is disabled. Contact-only login
+is insufficient, but the earning session need not have used password as its
+primary method. This ceremony does not depend on `LOGIN_ENABLED`.
+
+MFA-enabled or privileged accounts retain the stronger existing TOTP/UV Step-up
+path. Every zero-key ordinary start, including TOTP-authorized starts, requires
+actual verified user presence and user verification. Password/contact control
+never replaces independent MFA. Deletion/password-change/login proofs cannot
+authorize enrollment, and the first proof cannot add a second key.
+
+Malformed bodies and mixed, duplicate or empty-present start headers are refused
+before consumption, with no fallback from one failed mechanism to another.
+One short locked SQL transaction spends the proof once. A known successful
+commit is required before publishing pending authority in Redis. No handle,
+credential or account-version write occurs at options. Native identity uses
+protected immutable username display for both names when present, independently
+of email and the cosmetic credential label. Genuinely all-null username storage
+may retain the opaque-handle label; unreadable/partial identity fails closed.
+
+First ceremonies retain the original proof or consumed-grant deadline, capped by
+session limits and the ceremony ceiling and rounded down to milliseconds.
+Redis atomically reserves an account-wide expiring exclusion slot and pending
+challenge. Competing starts return `409 enrollment_in_progress`. The slot is
+never replaced, released or refreshed, including after Take, cancellation,
+verification failure or success; it expires naturally at the original deadline.
+Different proofs can both be spent in a race but only one can issue options.
+There is no refund, claim/resume receipt or automatic retry after SQL/Redis
+uncertainty or response loss. Start uncertainty cannot mean a credential was
+saved; finish uncertainty can. Retry timing is feedback, not replay authority.
+
+Finish verifies the frozen exact ceremony and actual UP/UV, then rechecks live
+session/version, zero keys, contact/policy where applicable, current deadline
+after lock waiting and read-only live slot ownership. Handle assignment,
+globally unique credential insertion and one auth-version cutoff commit
+atomically. Lifecycle revision, username, password, MFA, roles and contacts are
+unchanged. Enrollment does not restamp the old session's authentication evidence.
+Confirmed success is decoded before private authority is discarded; malformed
+or non-UV success remains uncertain and never authorizes a retry.
 
 #### Multi-Factor Authentication (TOTP) & SMS OTP
 - `POST /api/v1/auth/mfa/generate`: Generate a pending TOTP secret and QR code. Requires Step-up authentication in `X-Step-Up-Auth` because adding an authenticator changes who can satisfy future Step-up checks. The response contains `enrollment_id`, `secret`, `otpauth_url`, `issuer`, and `account_name`; keep the secret client-side only until confirmation.

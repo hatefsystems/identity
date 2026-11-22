@@ -2,6 +2,7 @@ package webauthn
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	gowebauthn "github.com/go-webauthn/webauthn/webauthn"
 )
 
@@ -94,6 +96,7 @@ func (f Flow) String() string {
 // Finish step can load the account and issue a session without re-deriving it
 // from the anonymised handle.
 type PendingChallenge struct {
+	FirstRegistration *FirstRegistrationMetadata `json:"first_registration,omitempty"`
 	// Named ceremonies pin a version; usernameless ceremonies pin a global
 	// epoch so a ban/reactivation during the challenge cannot be overlooked.
 	AuthVersion int64 `json:"auth_version,string"`
@@ -118,6 +121,27 @@ type PendingChallenge struct {
 	Flow Flow
 	// Expires is the absolute instant after which the challenge is rejected.
 	Expires time.Time
+}
+
+// FirstRegistrationMetadata freezes only the spent authorization's scope and
+// contact MAC, never a reusable proof or contact destination.
+type FirstRegistrationMetadata struct {
+	Authorization  string `json:"authorization"`
+	Channel        string `json:"channel,omitempty"`
+	ContactBinding []byte `json:"contact_binding,omitempty"`
+}
+
+// First-registration authority has exactly two non-interchangeable tags.
+const (
+	FirstPasskeyEnrollment = "first_passkey_enrollment"
+	FirstPasskeyStepUp     = "step_up"
+)
+
+// FirstRegistrationStore retains account exclusion after Take until the original
+// absolute deadline. The final check is read-only and cannot refresh authority.
+type FirstRegistrationStore interface {
+	SaveFirstRegistration(context.Context, string, PendingChallenge) error
+	CheckFirstRegistration(context.Context, string, PendingChallenge) error
 }
 
 // ChallengeStore persists pending WebAuthn ceremonies keyed by the base64url
@@ -215,6 +239,25 @@ func validatePendingChallenge(challenge string, pc PendingChallenge) error {
 	if pc.Flow != FlowRegistration && pc.Name != "" {
 		return ErrInvalidChallenge
 	}
+	if first := pc.FirstRegistration; first != nil {
+		if pc.Flow != FlowRegistration || len(pc.Session.UserID) != userHandleByteLen || strings.TrimSpace(pc.DPoPJKT) == "" ||
+			pc.Session.UserVerification != protocol.VerificationRequired || !pc.Session.Expires.Equal(pc.Expires) ||
+			pc.Expires.Nanosecond()%int(time.Millisecond) != 0 {
+			return ErrInvalidChallenge
+		}
+		switch first.Authorization {
+		case FirstPasskeyEnrollment:
+			if (first.Channel != "email" && first.Channel != "sms") || len(first.ContactBinding) != sha256.Size {
+				return ErrInvalidChallenge
+			}
+		case FirstPasskeyStepUp:
+			if first.Channel != "" || len(first.ContactBinding) != 0 {
+				return ErrInvalidChallenge
+			}
+		default:
+			return ErrInvalidChallenge
+		}
+	}
 	return nil
 }
 
@@ -266,10 +309,16 @@ type MemoryChallengeStore struct {
 	mu sync.Mutex
 	// byChallenge maps the base64url challenge string to its pending ceremony.
 	byChallenge map[string]PendingChallenge
+	firstSlots  map[uuid.UUID]firstRegistrationSlot
 	// maxEntries caps the map size; zero disables the cap.
 	maxEntries int
 	// now is injectable so expiry behavior is deterministic in tests.
 	now func() time.Time
+}
+
+type firstRegistrationSlot struct {
+	digest  [sha256.Size]byte
+	expires time.Time
 }
 
 // NewMemoryChallengeStore constructs an empty MemoryChallengeStore with the
@@ -277,6 +326,7 @@ type MemoryChallengeStore struct {
 func NewMemoryChallengeStore() *MemoryChallengeStore {
 	return &MemoryChallengeStore{
 		byChallenge: make(map[string]PendingChallenge),
+		firstSlots:  make(map[uuid.UUID]firstRegistrationSlot),
 		maxEntries:  defaultMaxPendingChallenges,
 		now:         time.Now,
 	}
@@ -287,6 +337,9 @@ func NewMemoryChallengeStore() *MemoryChallengeStore {
 // short-lived — and only if that frees nothing does it evict the entry closest
 // to expiring.
 func (m *MemoryChallengeStore) Save(ctx context.Context, challenge string, pc PendingChallenge) error {
+	if pc.FirstRegistration != nil {
+		return m.SaveFirstRegistration(ctx, challenge, pc)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -314,9 +367,85 @@ func (m *MemoryChallengeStore) Save(ctx context.Context, challenge string, pc Pe
 
 	if m.maxEntries > 0 && len(m.byChallenge) >= m.maxEntries {
 		m.evictLocked()
+		if len(m.byChallenge) >= m.maxEntries {
+			return ErrChallengeStoreUnavailable
+		}
 	}
 
 	m.byChallenge[challenge] = pc
+	return nil
+}
+
+// SaveFirstRegistration refuses live account slots and capacity exhaustion.
+func (m *MemoryChallengeStore) SaveFirstRegistration(ctx context.Context, challenge string, pc PendingChallenge) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if pc.FirstRegistration == nil {
+		return ErrInvalidChallenge
+	}
+	data, _, err := encodePendingChallenge(challenge, pc, m.now())
+	if err != nil {
+		return err
+	}
+	pc, err = decodePendingChallenge(challenge, data)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := m.now()
+	if !now.Before(pc.Expires) {
+		return ErrChallengeExpired
+	}
+	for id, slot := range m.firstSlots {
+		if !now.Before(slot.expires) {
+			delete(m.firstSlots, id)
+		}
+	}
+	for key, pending := range m.byChallenge {
+		if !now.Before(pending.Expires) {
+			delete(m.byChallenge, key)
+		}
+	}
+	if _, exists := m.byChallenge[challenge]; exists {
+		return ErrChallengeConflict
+	}
+	if _, exists := m.firstSlots[pc.UserRef]; exists {
+		return ErrEnrollmentInProgress
+	}
+	capacity := m.maxEntries
+	if capacity <= 0 {
+		capacity = defaultMaxPendingChallenges
+	}
+	if len(m.firstSlots) >= capacity || len(m.byChallenge) >= capacity {
+		return ErrChallengeStoreUnavailable
+	}
+	if m.firstSlots == nil {
+		m.firstSlots = make(map[uuid.UUID]firstRegistrationSlot)
+	}
+	m.firstSlots[pc.UserRef] = firstRegistrationSlot{sha256.Sum256([]byte(challenge)), pc.Expires}
+	m.byChallenge[challenge] = pc
+	return nil
+}
+
+// CheckFirstRegistration reads slot ownership without renewing or releasing it.
+func (m *MemoryChallengeStore) CheckFirstRegistration(ctx context.Context, challenge string, pc PendingChallenge) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if pc.FirstRegistration == nil || validatePendingChallenge(challenge, pc) != nil {
+		return ErrInvalidChallenge
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slot, ok := m.firstSlots[pc.UserRef]
+	if !ok || !m.now().Before(pc.Expires) || !m.now().Before(slot.expires) || !slot.expires.Equal(pc.Expires) || slot.digest != sha256.Sum256([]byte(challenge)) {
+		return ErrChallengeNotFound
+	}
 	return nil
 }
 
@@ -344,6 +473,9 @@ func (m *MemoryChallengeStore) evictLocked() {
 		found     bool
 	)
 	for key, entry := range m.byChallenge {
+		if entry.FirstRegistration != nil {
+			continue
+		}
 		if !found || entry.Expires.Before(oldest) {
 			oldestKey, oldest, found = key, entry.Expires, true
 		}

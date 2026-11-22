@@ -5,7 +5,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
-import { anonymousReclaim, browserFailure, fixtureSecretValues, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
+import { anonymousReclaim, browserFailure, firstPasskeyActionProof, fixtureSecretValues, guardBrowserFailures, legalCoordinateRequest, legalIdempotencyKey, legalReferenceRequest, portalCleanup, portalRoute, startPortalHarness } from './portal-harness.mjs';
 
 let checkpoint = 'startup';
 import { webDocumentNonce } from './smoke-image.mjs';
@@ -76,6 +76,13 @@ function observe(context, harness) {
         state.failures.push('Fixture secret appeared in a request URL');
       }
       if (!url.pathname.startsWith('/api/')) return;
+      const actionProof = request.headers()['x-action-proof'];
+      if (actionProof !== undefined) {
+        try {
+          firstPasskeyActionProof(url.pathname + url.search + url.hash, request.method(), actionProof);
+          assert(!request.headers()['x-step-up-auth']);
+        } catch { state.failures.push('First-passkey proof escaped its exact options boundary'); }
+      }
       const proof = request.headers().dpop;
       if (!proof) return; // Deliberate cookie-only denial probes are included below.
       try {
@@ -131,7 +138,7 @@ function observe(context, harness) {
             assert(!headers['set-cookie'], 'Failed or preauthentication login response set a normal session cookie');
           if (anonymousReclaim(url.pathname, response.request().method())) {
             const requestHeaders = await response.request().allHeaders();
-            for (const header of ['cookie', 'authorization', 'dpop', 'x-portal-session', 'x-step-up-auth', 'referer'])
+            for (const header of ['cookie', 'authorization', 'dpop', 'x-portal-session', 'x-step-up-auth', 'x-action-proof', 'referer'])
               assert(!requestHeaders[header], 'Anonymous recovery transmitted browser authority');
             assert.equal(requestHeaders.origin, harness.origin);
             assert(!headers['set-cookie'], 'Recovery issued a session cookie');
@@ -199,7 +206,7 @@ async function addAuthenticator(page, credential) {
       automaticPresenceSimulation: true,
     },
   });
-  await cdp.send('WebAuthn.addCredential', { authenticatorId, credential });
+  if (credential) await cdp.send('WebAuthn.addCredential', { authenticatorId, credential });
   return { cdp, authenticatorId };
 }
 
@@ -260,12 +267,14 @@ async function signIn(page, origin, path = '/login/webauthn', { harness, fixture
 
 // This independent boundary probe signs with the actual persisted CryptoKey.
 // User flows above/below still use the production adapter and real authenticators.
-async function api(page, path, { method = 'GET', body, sessionID, stepUpToken, idempotencyKey } = {}) {
+async function api(page, path, { method = 'GET', body, sessionID, stepUpToken, actionProof, idempotencyKey } = {}) {
   legalIdempotencyKey(path, method, idempotencyKey);
+  firstPasskeyActionProof(path, method, actionProof);
+  assert(actionProof === undefined || stepUpToken === undefined, 'Mixed probe enrollment authority');
   assert(stepUpToken === undefined || (typeof stepUpToken === 'string' && stepUpToken.length > 0 &&
     stepUpToken.length <= 8192 && !/[\r\n]/.test(stepUpToken)), 'Invalid bounded step-up probe');
   return page.evaluate(
-    async ({ path, method, body, sessionID, stepUpToken, idempotencyKey }) => {
+    async ({ path, method, body, sessionID, stepUpToken, actionProof, idempotencyKey }) => {
       const database = await new Promise((resolve, reject) => {
         const open = indexedDB.open('hatef-portal-dpop');
         open.onsuccess = () => resolve(open.result);
@@ -311,6 +320,7 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken, i
             DPoP: `${unsigned}.${encode(signature)}`,
             ...(sessionID ? { 'X-Portal-Session': sessionID } : {}),
             ...(stepUpToken ? { 'X-Step-Up-Auth': stepUpToken } : {}),
+            ...(actionProof ? { 'X-Action-Proof': actionProof } : {}),
             ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
             ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
@@ -330,8 +340,154 @@ async function api(page, path, { method = 'GET', body, sessionID, stepUpToken, i
       }
       throw new Error('Test boundary probe exhausted its single nonce retry');
     },
-    { path, method, body, sessionID, stepUpToken, idempotencyKey }
+    { path, method, body, sessionID, stepUpToken, actionProof, idempotencyKey }
   );
+}
+
+export async function nativeFirstPasskey(page, value) {
+  return page.evaluate(async (value) => {
+    if (!isSecureContext || value.publicKey.rp.id !== location.hostname ||
+      value.publicKey.authenticatorSelection.userVerification !== 'required')
+      throw new Error('Invalid first-passkey native policy');
+    const encode = (value) => btoa(String.fromCharCode(...new Uint8Array(value)))
+      .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    const decode = (value) => {
+      const bytes = Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), (character) => character.charCodeAt(0));
+      if (encode(bytes) !== value) throw new Error('Noncanonical native bytes');
+      return bytes;
+    };
+    const options = value.publicKey;
+    const remaining = Date.parse(value.expires_at) - Date.now();
+    const userID = decode(options.user.id);
+    if (userID.byteLength !== 8 || remaining <= 0) throw new Error('Expired or invalid first native identity');
+    const credential = await navigator.credentials.create({ publicKey: {
+      ...options, challenge: decode(options.challenge), user: { ...options.user, id: userID },
+      excludeCredentials: (options.excludeCredentials || []).map((item) => ({ ...item, id: decode(item.id) })),
+      timeout: Math.min(options.timeout, Math.floor(remaining)), extensions: { credProps: true },
+    } });
+    if (!credential || credential.type !== 'public-key' || !('attestationObject' in credential.response))
+      throw new Error('Native first-passkey creation did not complete');
+    const response = credential.response;
+    const extensions = credential.getClientExtensionResults();
+    return { id: encode(credential.rawId), rawId: encode(credential.rawId), type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment,
+      clientExtensionResults: extensions.credProps ? { credProps: extensions.credProps } : {},
+      response: { clientDataJSON: encode(response.clientDataJSON), attestationObject: encode(response.attestationObject),
+        transports: response.getTransports?.() ?? [] } };
+  }, value);
+}
+
+export async function firstPasskeyPasswordSession(page, harness, fixture) {
+  assert.equal(fixture.credentials.length, 0, 'First-passkey fixture already has a key');
+  assertOnlyPreferenceCookies(await page.context().cookies(harness.origin));
+  await visit(page, harness.origin, '/login/webauthn');
+  const endpoint = harness.origin + '/api/v1/auth/webauthn/login/generate-options';
+  let requests = 0;
+  // Initialize the production nonexportable key, but stop this unrelated login
+  // before options/native work. No response or authentication is fabricated.
+  const stop = async (route) => {
+    assert.equal(route.request().url(), endpoint, 'Unexpected first-passkey key bootstrap route');
+    assert.equal(route.request().method(), 'POST', 'Unexpected first-passkey key bootstrap method');
+    requests++;
+    await route.abort('aborted');
+  };
+  await page.route(endpoint, stop);
+  try {
+    const stopped = page.waitForEvent('requestfailed', {
+      predicate: (request) => request.url() === endpoint && request.method() === 'POST',
+    });
+    await page.getByTestId('passkey-login').click();
+    await stopped;
+    await page.waitForFunction(() => document.querySelector('[data-testid="passkey-login"]')?.disabled === false);
+    assert.equal(requests, 1, 'First-passkey key bootstrap replayed login options');
+  } finally {
+    await page.unroute(endpoint, stop);
+  }
+  await keyStorage(page);
+  assertOnlyPreferenceCookies(await page.context().cookies(harness.origin));
+  const login = await api(page, '/api/v1/auth/login', { method: 'POST',
+    body: { username: fixture.username, password: fixture.password } });
+  assert.equal(login.status, 204, 'Owned first-passkey password API login failed');
+  const cookie = (await page.context().cookies(harness.origin)).find((cookie) => cookie.name === '__Host-session');
+  assert(cookie && cookie.secure && cookie.httpOnly && cookie.sameSite === 'Strict' && cookie.path === '/' && cookie.domain === 'localhost',
+    'Owned first-passkey login did not issue a strict authentication cookie');
+  await visit(page, harness.origin, '/dashboard');
+  await page.getByTestId('portal-ready').waitFor();
+  const profile = await api(page, '/api/v1/users/me');
+  assert.equal(profile.status, 200, 'Owned first-passkey password session could not bootstrap');
+  assert.equal(profile.body.id, fixture.user_id, 'First-passkey login authenticated another fixture');
+  const state = harness.fixture('login-session-state', { user_id: fixture.user_id, session_id: profile.body.session.id });
+  assert.equal(state.auth_version, fixture.auth_version, 'First-passkey login captured a different authority version');
+  assert.equal(state.primary_method, 'password', 'First-passkey probe did not earn a password-only session');
+  assert.equal(state.uv, 'not_applicable', 'First-passkey password login invented UV evidence');
+  assert.equal(state.totp, false, 'First-passkey password fixture unexpectedly earned MFA');
+  assert.equal(state.totp_set, true, 'First-passkey password session omitted factor evidence');
+  return profile.body;
+}
+
+export async function firstPasskeyEnrollment(browser, harness, evidence, contexts, actualUV) {
+  const fixture = harness.fixture('login-seed', { scenario: 'password-only', totp: false, role: 'ordinary' });
+  assert.equal(fixture.credentials.length, 0, 'First-passkey fixture already has a key');
+  const { context, observed } = await newContext(browser, harness);
+  contexts.push(context);
+  const page = await context.newPage();
+  const authenticator = await addAuthenticator(page);
+  if (!actualUV) await authenticator.cdp.send('WebAuthn.setResponseOverrideBits', {
+    authenticatorId: authenticator.authenticatorId, isBadUV: true,
+  });
+  const profile = await firstPasskeyPasswordSession(page, harness, fixture);
+  const sessionID = profile.session.id;
+  const key = (await keyStorage(page)).publicKey;
+  const root = '/api/v1/auth/action-proofs/first-passkey';
+  const challenge = await api(page, root + '/challenge', { method: 'POST', sessionID,
+    body: { password: fixture.password, channel: 'email' } });
+  assert.equal(challenge.status, 202, 'Password/contact first proof did not start with SMS disabled');
+  harness.secrets.push(...fixtureSecretValues(challenge.body));
+  const notice = await harness.mail.waitFor(fixture.email, 1, 'first-passkey');
+  assert.equal(notice.expires_at, challenge.body.expires_at, 'First proof mail changed the original deadline');
+  const verified = await api(page, root + '/verify', { method: 'POST', sessionID,
+    body: { challenge: challenge.body.challenge, code: notice.code } });
+  assert.equal(verified.status, 200);
+  harness.secrets.push(...fixtureSecretValues(verified.body));
+  assert.equal(verified.body.expires_at, challenge.body.expires_at, 'Verification renewed first-passkey authority');
+  const options = await api(page, '/api/v1/auth/webauthn/register/generate-options', { method: 'POST', sessionID,
+    actionProof: verified.body.action_proof, body: { name: 'Owned first key' } });
+  assert.equal(options.status, 200);
+  // The public RP hostname is already the owned origin, not a private user ID.
+  harness.secrets.push('Owned first key', ...fixtureSecretValues({ ...options.body,
+    publicKey: { ...options.body.publicKey, rp: undefined } }));
+  assert(Date.parse(options.body.expires_at) <= Date.parse(verified.body.expires_at), 'Options extended first-passkey authority');
+  assert.equal(options.body.publicKey.user.name, fixture.username);
+  assert.equal(options.body.publicKey.user.displayName, fixture.username);
+  assert.equal(options.body.publicKey.authenticatorSelection.userVerification, 'required');
+  assert.equal((await api(page, '/api/v1/auth/webauthn/keys')).body.length, 0, 'Options saved a credential');
+  assert.equal((await api(page, '/api/v1/auth/webauthn/register/generate-options', { method: 'POST', sessionID,
+    actionProof: verified.body.action_proof, body: {} })).status, 403, 'Spent proof authorized another start');
+  let attestation = await nativeFirstPasskey(page, options.body);
+  harness.secrets.push(...fixtureSecretValues(attestation));
+  const finish = await api(page, '/api/v1/auth/webauthn/register/verify', { method: 'POST', sessionID, body: attestation });
+  attestation = undefined;
+  assert.equal(finish.status, actualUV ? 201 : 400);
+  if (actualUV) assert.equal(finish.body.user_verified, true, 'First success did not evidence actual UV');
+  else {
+    assert.equal((await api(page, '/api/v1/auth/webauthn/keys')).body.length, 0, 'Non-UV first creation saved a credential');
+    assert.equal((await api(page, '/api/v1/auth/webauthn/register/generate-options', { method: 'POST', sessionID,
+      actionProof: verified.body.action_proof, body: {} })).status, 403, 'Failed UV refunded first-start authority');
+  }
+  harness.secrets.push(...fixtureSecretValues(finish.body));
+  assert.equal((await api(page, '/api/v1/users/me')).status, actualUV ? 401 : 200,
+    'First enrollment invalidated or preserved the wrong session authority');
+  assert.equal((await keyStorage(page)).publicKey, key, 'First enrollment replaced the browser signing key');
+  await clean(page, observed);
+  harness.assertHealthy();
+  harness.assertPrivateLogs();
+  for (const [path, replica] of [[root + '/verify', 1], ['/api/v1/auth/webauthn/register/generate-options', 0],
+    ['/api/v1/auth/webauthn/register/verify', 1]])
+    assert(harness.routeEvidence.get(`POST ${path}`)?.[replica] > 0, 'First proof/enrollment missed its owned replica');
+  assert.equal(harness.originEvidence.mismatched, 0);
+  assert.equal(harness.originEvidence.referrers, 0);
+  if (actualUV) evidence.checks.push('owned password-only login fixture, distinct TLS first-passkey email with SMS disabled, original proof/options deadline, protected username native identity, one explicit virtual native UV creation across replicas, spent proof rejection and old-session invalidation without browser-key replacement');
+  else evidence.checks.push('owned virtual first native creation with non-UV response rejected by the real provider; no saved credential, proof refund or loss of the unchanged password session');
 }
 
 async function keyStorage(page) {
@@ -2058,6 +2214,25 @@ export async function validatePortal(harness) {
     await boundedStage('recovery-lifecycle', () => recoveryLifecycle(browser, harness, evidence, contexts), 120_000);
     progress('uncertain-recovery');
     await uncertainRecovery(browser, harness, evidence, contexts);
+    progress('first-passkey-enrollment');
+    const firstHarness = await startPortalHarness({ login: true, firstPasskey: true });
+    const firstContexts = [];
+    let firstBrowser;
+    try {
+      firstBrowser = await chromium.launch({ channel: 'chromium',
+        args: [`--ignore-certificate-errors-spki-list=${firstHarness.tlsSPKI}`] });
+      await boundedStage('first-passkey-enrollment', async () => {
+        for (const actualUV of [true, false])
+          await firstPasskeyEnrollment(firstBrowser, firstHarness, evidence, firstContexts, actualUV);
+      }, 120_000);
+      harness.secrets.push(...firstHarness.secrets);
+    } catch (error) {
+      firstHarness.diagnostics();
+      throw error;
+    } finally {
+      await portalCleanup([firstHarness.close, () => firstBrowser?.close(),
+        ...firstContexts.map((context) => () => context.close())])();
+    }
     progress('deletion-reclaim');
     // The legacy scenarios legitimately consume the production per-subnet login
     // budget. Isolate this account lifecycle instead of disabling rate limits.

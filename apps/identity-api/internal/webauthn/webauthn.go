@@ -36,6 +36,7 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // userHandleByteLen is the size of the WebAuthn user handle: a random 64-bit
@@ -111,13 +112,16 @@ func WithTransacter(tx Transacter) Option {
 // Service orchestrates the WebAuthn registration and login ceremonies over the
 // persistence layer. Construct it with New; the zero value is not usable.
 type Service struct {
-	wa         *gowebauthn.WebAuthn
-	users      UserStore
-	creds      CredentialStore
-	challenges ChallengeStore
-	tx         Transacter
-	accounts   session.AccountState
-	policy     accountpolicy.Policy
+	wa             *gowebauthn.WebAuthn
+	users          UserStore
+	creds          CredentialStore
+	challenges     ChallengeStore
+	tx             Transacter
+	accounts       session.AccountState
+	policy         accountpolicy.Policy
+	firstProofs    FirstPasskeyProofs
+	firstSessions  SessionReader
+	firstUsernames *username.Store
 	// challengeTTL is the validity window stamped onto each pending ceremony.
 	challengeTTL time.Duration
 	// residentKey is the residentKey requirement applied to registration.

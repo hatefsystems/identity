@@ -66,3 +66,27 @@ func TestPasswordChangeProofBuilderDefaultOff(t *testing.T) {
 		t.Fatal("disabled builder required provider or enabled SMS")
 	}
 }
+
+func (c *cancelProofCleanup) CleanupExpiredFirstPasskey(ctx context.Context, batch int32) (int64, error) {
+	return c.CleanupExpired(ctx, batch)
+}
+
+func TestFirstPasskeyProofMaintenanceAndDefaultOffBuilder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleanup := &cancelProofCleanup{t: t, stop: cancel}
+	maintainFirstPasskeyProofs(ctx, cleanup, slog.New(slog.DiscardHandler))
+	maintainFirstPasskeyProofs(ctx, cleanup, slog.New(slog.DiscardHandler))
+	if cleanup.calls != 1 {
+		t.Fatal("first-passkey cleanup retried after cancellation")
+	}
+	for _, key := range []string{"FIRST_PASSKEY_PROOFS_ENABLED", "FIRST_PASSKEY_PROOFS_EMAIL_ENABLED", "FIRST_PASSKEY_PROOFS_SMS_ENABLED"} {
+		t.Setenv(key, "")
+	}
+	if proofs, err := buildFirstPasskeyProofs("production", nil, nil, nil, nil); err != nil || proofs != nil {
+		t.Fatal("disabled first-passkey builder acquired authority/dependencies")
+	}
+	if sender, err := buildFirstPasskeySMSSender("production"); err != nil || sender != nil {
+		t.Fatal("disabled first-passkey builder activated provider")
+	}
+}

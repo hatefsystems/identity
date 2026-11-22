@@ -27,7 +27,7 @@ func buildAccountDeletionProofs(environment string, pool *pgxpool.Pool, client *
 	if err != nil || !cfg.Enabled {
 		return nil, err
 	}
-	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, false)
+	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, contactcode.PurposeAccountDeletion)
 }
 
 func buildPasswordChangeProofs(environment string, pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service) (*actionproof.Service, error) {
@@ -35,7 +35,27 @@ func buildPasswordChangeProofs(environment string, pool *pgxpool.Pool, client *r
 	if err != nil || !cfg.Enabled {
 		return nil, err
 	}
-	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, true)
+	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, contactcode.PurposePasswordChange)
+}
+
+func buildFirstPasskeyProofs(environment string, pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service) (*actionproof.Service, error) {
+	cfg, err := config.LoadFirstPasskeyProofs(environment)
+	if err != nil || !cfg.Enabled {
+		return nil, err
+	}
+	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, contactcode.PurposeFirstPasskey)
+}
+
+func buildFirstPasskeySMSSender(environment string) (smsotp.Sender, error) {
+	cfg, err := config.LoadFirstPasskeyProofs(environment)
+	if err != nil || !cfg.SMSEnabled {
+		return nil, err
+	}
+	sms, err := config.LoadSMS(environment)
+	if err != nil {
+		return nil, err
+	}
+	return smsir.New(smsir.Config{APIKey: sms.GatewayAPIKey, TemplateID: cfg.FirstTemplateID, CodeParameter: sms.CodeParameter})
 }
 
 // The existing SMS service owns shared policy; main installs this purpose sender
@@ -52,11 +72,12 @@ func buildPasswordChangeSMSSender(environment string) (smsotp.Sender, error) {
 	return smsir.New(smsir.Config{APIKey: sms.GatewayAPIKey, TemplateID: cfg.ChangeTemplateID, CodeParameter: sms.CodeParameter})
 }
 
-func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service, emailEnabled, smsEnabled bool, codeKey, bindingKey []byte, smtp smtptransport.Config, passwordChange bool) (*actionproof.Service, error) {
+func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service, emailEnabled, smsEnabled bool, codeKey, bindingKey []byte, smtp smtptransport.Config, purpose string) (*actionproof.Service, error) {
 	if pool == nil || client == nil || sessions == nil {
 		return nil, errors.New("main: action proofs require database, Redis and live sessions")
 	}
-	if smsEnabled && (passwordChange && !sms.PasswordChangeDeliveryEnabled() || !passwordChange && !sms.DeletionDeliveryEnabled()) {
+	smsReady := purpose == contactcode.PurposeAccountDeletion && sms.DeletionDeliveryEnabled() || purpose == contactcode.PurposePasswordChange && sms.PasswordChangeDeliveryEnabled() || purpose == contactcode.PurposeFirstPasskey && sms.FirstPasskeyDeliveryEnabled()
+	if smsEnabled && !smsReady {
 		return nil, errors.New("main: action proofs require configured purpose-specific SMS delivery")
 	}
 	crypto, err := config.LoadEnvelopeCrypto()
@@ -87,9 +108,12 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 		if err != nil {
 			return nil, errors.New("main: action proof SMTPUTF8 relay unavailable")
 		}
-		if passwordChange {
+		switch purpose {
+		case contactcode.PurposeFirstPasskey:
+			email, err = contactcode.NewFirstPasskeyEmail(smtp.From, transport)
+		case contactcode.PurposePasswordChange:
 			email, err = contactcode.NewPasswordChangeEmail(smtp.From, transport)
-		} else {
+		default:
 			email, err = contactcode.NewDeletionEmail(smtp.From, transport)
 		}
 		if err != nil {
@@ -100,9 +124,12 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 		sms = nil
 	}
 	codeConfig := contactcode.Config{HashKey: codeKey}
-	if passwordChange {
+	switch purpose {
+	case contactcode.PurposeFirstPasskey:
+		codeConfig.FirstPasskeyEmail = email
+	case contactcode.PurposePasswordChange:
 		codeConfig.PasswordChangeEmail = email
-	} else {
+	default:
 		codeConfig.DeletionEmail = email
 	}
 	codes, err := contactcode.New(codeConfig, store, sms, nil)
@@ -116,7 +143,10 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 	deps := actionproof.Deps{
 		DB: pool, Queries: db.New(pool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions,
 	}
-	if passwordChange {
+	if purpose == contactcode.PurposeFirstPasskey {
+		return actionproof.NewFirstPasskey(actionproof.Config{BindingKey: bindingKey}, deps)
+	}
+	if purpose == contactcode.PurposePasswordChange {
 		return actionproof.NewPasswordChange(actionproof.Config{BindingKey: bindingKey}, deps)
 	}
 	return actionproof.New(actionproof.Config{BindingKey: bindingKey}, deps)
@@ -138,6 +168,14 @@ type passwordChangeProofCleanup interface {
 
 func maintainPasswordChangeProofs(ctx context.Context, proofs passwordChangeProofCleanup, logger *slog.Logger) {
 	maintainActionProofs(ctx, proofs.CleanupExpiredPasswordChange, logger, "password change proof cleanup unavailable")
+}
+
+type firstPasskeyProofCleanup interface {
+	CleanupExpiredFirstPasskey(context.Context, int32) (int64, error)
+}
+
+func maintainFirstPasskeyProofs(ctx context.Context, proofs firstPasskeyProofCleanup, logger *slog.Logger) {
+	maintainActionProofs(ctx, proofs.CleanupExpiredFirstPasskey, logger, "first passkey proof cleanup unavailable")
 }
 
 func maintainActionProofs(ctx context.Context, cleanup func(context.Context, int32) (int64, error), logger *slog.Logger, diagnostic string) {

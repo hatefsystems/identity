@@ -165,6 +165,65 @@ invalidated the previous batch; only a new explicit generation can replace it.
 
 For full HTTP shapes and failure handling, see the [browser boundary](api-design.md#first-party-browser-boundary-task-73).
 
+#### First Passkey on a Password Account (T25)
+
+The existing `PortalClient` also exposes a fixed-purpose password/contact path.
+It does not infer eligibility from profile email, username or an empty key list.
+The server decides whether the account is active, has an existing supported
+password, zero current passkeys, no MFA or privileged role and a currently
+evidenced selected contact. Recovery sessions cannot use this fallback. Existing
+stronger TOTP/UV Step-up remains available under its own server policy.
+
+Call each phase explicitly, using the same live portal client and browser key:
+
+1. `firstPasskeyChallenge(password, channel, signal)` sends exactly
+   `{password,channel}` to `POST /api/v1/auth/action-proofs/first-passkey/challenge`.
+   `channel` is `email` or `sms`; the server selects the evidenced destination.
+   Password bytes are not trimmed, normalized or subjected to new-password
+   strength rules. A `202` acknowledges issuance/transport, not inbox receipt.
+2. `firstPasskeyVerify(code, signal)` sends the private challenge and exactly six
+   ASCII digits to the fixed `/first-passkey/verify` route. It accepts only the
+   original `expires_at`, not a refreshed proof lifetime. This client does not
+   normalize OTPs or automatically retry verification or delivery.
+3. `startFirstPasskey(name, signal)` discards the private proof before validating,
+   signing or sending the existing registration-options request. Only this request
+   can carry `X-Action-Proof`; it never also carries `X-Step-Up-Auth`. The optional
+   cosmetic credential name does not choose the native identity, RP or handle.
+   Options must contain authoritative `expires_at`, an origin-compatible server
+   RP, a canonical eight-byte handle, bounded server identity and required UV.
+   The returned options can only shorten the original authority deadline.
+4. `createFirstPasskey(signal)` invokes native creation once. Receiving options
+   never opens a native prompt automatically. The credential response stays
+   private, and successful native creation never submits a finish automatically.
+5. `finishFirstPasskey(signal, onSend?)` discards that response locally before one
+   submission to the existing registration-verify route, without a second proof
+   or grant. Only a strictly decoded `201` safe credential with
+   `user_verified: true` reports `passkeyAdded`. The existing security-outcome
+   handling withdraws the old session; normal login follows separately, without
+   automatic bootstrap or a replacement session.
+
+The first three methods return only `{purpose: "first_passkey_enrollment",
+expires_at}` metadata. It is not a `StepUpGrant`, proof token or resumable receipt.
+Challenge, proof, bound options and native response are transient private client
+fields. They retain the original account/session/key binding and both wall and
+monotonic deadlines, so wall-clock rollback, locale or display-preference changes
+cannot extend authority. `clearFirstPasskey()`, cancellation, expiry, disposal,
+session/key change or a late response discard the corresponding authority. Never
+persist or broadcast passwords, codes, proofs, options or attestations, or include
+them in logs, diagnostics or browser artifacts.
+
+`FirstPasskeyError.phase` distinguishes `challenge`, `proof`, `start`, `native`
+and `finish`. `uncertain` never grants retry permission.
+`credentialMayHaveBeenSaved` is true only for an uncertain finish, not an options
+failure. A malformed or non-UV finish success is uncertain and never replayed.
+Only the existing strictly identified pre-handler DPoP nonce rejection allows one
+fresh-proof/JTI retry of the same logical request; native work is never repeated.
+`409 enrollment_in_progress` and `Retry-After` are feedback, not retry scheduling.
+The server spends a proof once before publishing options and retains account-wide
+exclusion until the original deadline. Cancellation, refusal, response loss or
+uncertainty do not refund it or release the slot early. No new portal UI, password/
+OTP dialog, provider, preference, dashboard or login journey is implemented here.
+
 ### 1.4 Conditional New-Account Registration
 
 See the authoritative [registration contract](registration-contract.md) for live

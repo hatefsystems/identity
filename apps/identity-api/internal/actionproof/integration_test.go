@@ -87,14 +87,14 @@ type realProofFixture struct {
 }
 
 func newRealProofFixture(t *testing.T) realProofFixture {
-	return newRealProofFixtureFor(t, false)
+	return newRealProofFixtureFor(t, contactcode.PurposeAccountDeletion)
 }
 
 func newRealPasswordChangeFixture(t *testing.T) realProofFixture {
-	return newRealProofFixtureFor(t, true)
+	return newRealProofFixtureFor(t, contactcode.PurposePasswordChange)
 }
 
-func newRealProofFixtureFor(t *testing.T, passwordChange bool) realProofFixture {
+func newRealProofFixtureFor(t *testing.T, purpose string) realProofFixture {
 	t.Helper()
 	dsn, redisURL := strings.TrimSpace(os.Getenv("DATABASE_URL")), strings.TrimSpace(os.Getenv("REDIS_URL"))
 	if dsn == "" || redisURL == "" {
@@ -186,10 +186,7 @@ func newRealProofFixtureFor(t *testing.T, passwordChange bool) realProofFixture 
 		}
 	})
 	delivery := &captureDelivery{}
-	codes := deletionCodes(t, client, delivery, true, true)
-	if passwordChange {
-		codes = passwordChangeCodes(t, client, delivery, true, true)
-	}
+	codes := purposeCodes(t, client, delivery, true, true, purpose)
 	limiter, err := ratelimit.NewRedisLimiter(client)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +260,7 @@ func newRealProofFixtureFor(t *testing.T, passwordChange bool) realProofFixture 
 		"GRANT USAGE ON SCHEMA public TO ",
 		"GRANT SELECT ON public.users,public.webauthn_credentials,public.user_roles,public.contact_verification_evidence TO ",
 		"GRANT UPDATE(id) ON public.users TO ", // Required by SELECT ... FOR UPDATE, not proof mutation.
-		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs,public.password_change_action_proofs TO ",
+		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs,public.password_change_action_proofs,public.first_passkey_enrollment_action_proofs TO ",
 		"GRANT INSERT ON public.proof_test_actions TO ",
 		"GRANT USAGE ON SEQUENCE public.proof_test_actions_id_seq TO ",
 	} {
@@ -281,9 +278,15 @@ func newRealProofFixtureFor(t *testing.T, passwordChange bool) realProofFixture 
 		t.Fatal("connect restricted fixture runtime failed")
 	}
 	t.Cleanup(runtimePool.Close)
-	svc, err := New(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions})
-	if passwordChange {
-		svc, err = NewPasswordChange(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions})
+	deps := Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions}
+	var svc *Service
+	switch purpose {
+	case contactcode.PurposeFirstPasskey:
+		svc, err = NewFirstPasskey(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, deps)
+	case contactcode.PurposePasswordChange:
+		svc, err = NewPasswordChange(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, deps)
+	default:
+		svc, err = New(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, deps)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -773,7 +776,7 @@ func TestAccountDeletionProofSchemaCleanupAndForwardOnlyIntegration(t *testing.T
 	if _, err := provider.ApplyVersion(f.ctx, 7, false); err == nil {
 		t.Fatal("forward-only proof migration allowed rollback")
 	}
-	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 8 {
+	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 9 {
 		t.Fatal("forward-only refusal changed final lineage")
 	}
 }

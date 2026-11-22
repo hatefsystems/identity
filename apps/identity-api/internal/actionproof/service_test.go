@@ -133,14 +133,18 @@ func (s deletionSMSSender) SendCode(ctx context.Context, destination, code strin
 }
 
 func deletionCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool) *contactcode.Service {
-	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, false)
+	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, contactcode.PurposeAccountDeletion)
 }
 
 func passwordChangeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool) *contactcode.Service {
-	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, true)
+	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, contactcode.PurposePasswordChange)
 }
 
-func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled, change bool) *contactcode.Service {
+func firstPasskeyCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool) *contactcode.Service {
+	return purposeCodes(t, client, delivery, emailEnabled, smsEnabled, contactcode.PurposeFirstPasskey)
+}
+
+func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery, emailEnabled, smsEnabled bool, purpose string) *contactcode.Service {
 	t.Helper()
 	store, err := contactcode.NewRedisStore(client)
 	if err != nil {
@@ -158,9 +162,12 @@ func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery,
 		}
 		sender := deletionSMSSender{delivery}
 		cfg := smsotp.Config{HashPepper: bytes.Repeat([]byte{5}, 32)}
-		if change {
+		switch purpose {
+		case contactcode.PurposeFirstPasskey:
+			cfg.FirstPasskeySender = sender
+		case contactcode.PurposePasswordChange:
 			cfg.PasswordChangeSender = sender
-		} else {
+		default:
 			cfg.DeletionSender = sender
 		}
 		phones, err = smsotp.New(cfg, unusedSMSUsers{}, unusedSMSEncryptor{}, unusedSMSIndexer{}, limiter, otpStore, sender)
@@ -170,9 +177,12 @@ func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery,
 	}
 	cfg := contactcode.Config{HashKey: bytes.Repeat([]byte{3}, 32)}
 	if emailEnabled {
-		if change {
+		switch purpose {
+		case contactcode.PurposeFirstPasskey:
+			cfg.FirstPasskeyEmail = delivery
+		case contactcode.PurposePasswordChange:
 			cfg.PasswordChangeEmail = delivery
-		} else {
+		default:
 			cfg.DeletionEmail = delivery
 		}
 	}
@@ -222,6 +232,9 @@ type proofDB struct {
 	changeSaved   *db.CreatePasswordChangeActionProofParams
 	changePending *db.CreatePasswordChangeActionProofParams
 	changeDeleted bool
+	firstSaved    *db.CreateFirstPasskeyActionProofParams
+	firstPending  *db.CreateFirstPasskeyActionProofParams
+	firstDeleted  bool
 	deleted       bool
 	commits       int
 	rollbacks     int
@@ -264,6 +277,12 @@ func (f *proofDB) Commit(context.Context) error {
 	if f.changeDeleted {
 		f.changeSaved = nil
 	}
+	if f.firstPending != nil {
+		f.firstSaved, f.firstPending = f.firstPending, nil
+	}
+	if f.firstDeleted {
+		f.firstSaved = nil
+	}
 	return nil
 }
 
@@ -274,6 +293,8 @@ func (f *proofDB) Rollback(context.Context) error {
 	f.deleted = false
 	f.changePending = nil
 	f.changeDeleted = false
+	f.firstPending = nil
+	f.firstDeleted = false
 	return nil
 }
 
@@ -312,6 +333,19 @@ func (f *proofDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 			return proofRow{err: pgx.ErrNoRows}
 		}
 		return proofRow{values: []any{f.changeSaved.Channel, f.changeSaved.ContactBinding}}
+	case strings.Contains(sql, "-- name: GetFirstPasskeyActionProofBinding"), strings.Contains(sql, "-- name: ConsumeFirstPasskeyActionProofStart"):
+		row := f.firstSaved
+		if row == nil || f.firstDeleted || !bytes.Equal(args[0].([]byte), row.ProofDigest) || args[1] != row.UserID || args[2] != row.SessionID || args[3] != row.Jkt || args[4] != row.AuthVersion || !time.Now().Before(row.ExpiresAt.Time) {
+			return proofRow{err: pgx.ErrNoRows}
+		}
+		if strings.Contains(sql, "ConsumeFirstPasskeyActionProofStart") {
+			if args[5] != row.Channel || !bytes.Equal(args[6].([]byte), row.ContactBinding) || f.deleteZero {
+				return proofRow{err: pgx.ErrNoRows}
+			}
+			f.deleteCalls++
+			f.firstDeleted = true
+		}
+		return proofRow{values: []any{row.ExpiresAt, row.Channel, row.ContactBinding}}
 	default:
 		return proofRow{err: errors.New("unexpected fixture query")}
 	}
@@ -325,7 +359,7 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 			f.onLock()
 		}
 		return pgconn.NewCommandTag("SELECT 1"), nil
-	case strings.Contains(sql, "-- name: CreateAccountDeletionActionProof"), strings.Contains(sql, "-- name: CreatePasswordChangeActionProof"):
+	case strings.Contains(sql, "-- name: CreateAccountDeletionActionProof"), strings.Contains(sql, "-- name: CreatePasswordChangeActionProof"), strings.Contains(sql, "-- name: CreateFirstPasskeyActionProof"):
 		f.createCalls++
 		if f.createErr != nil {
 			return pgconn.CommandTag{}, f.createErr
@@ -334,7 +368,9 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 			return pgconn.NewCommandTag("INSERT 0 0"), nil
 		}
 		params := db.CreateAccountDeletionActionProofParams{ProofDigest: args[0].([]byte), UserID: args[1].(uuid.UUID), SessionID: args[2].(string), Jkt: args[3].(string), AuthVersion: args[4].(int64), Channel: args[5].(string), ContactBinding: args[6].([]byte), ExpiresAt: args[7].(pgtype.Timestamptz)}
-		if strings.Contains(sql, "CreatePasswordChangeActionProof") {
+		if strings.Contains(sql, "CreateFirstPasskeyActionProof") {
+			f.firstPending = new(db.CreateFirstPasskeyActionProofParams(params))
+		} else if strings.Contains(sql, "CreatePasswordChangeActionProof") {
 			f.changePending = new(db.CreatePasswordChangeActionProofParams(params))
 		} else {
 			f.pending = &params
@@ -354,7 +390,7 @@ func (f *proofDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 		}
 		f.changeDeleted = true
 		return pgconn.NewCommandTag("DELETE 1"), nil
-	case strings.Contains(sql, "-- name: CleanupExpiredAccountDeletionActionProofs"), strings.Contains(sql, "-- name: CleanupExpiredPasswordChangeActionProofs"):
+	case strings.Contains(sql, "-- name: CleanupExpiredAccountDeletionActionProofs"), strings.Contains(sql, "-- name: CleanupExpiredPasswordChangeActionProofs"), strings.Contains(sql, "-- name: CleanupExpiredFirstPasskeyActionProofs"):
 		return pgconn.NewCommandTag("DELETE 2"), nil
 	default:
 		return pgconn.CommandTag{}, errors.New("unexpected fixture execution")

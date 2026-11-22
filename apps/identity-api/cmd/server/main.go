@@ -215,6 +215,19 @@ func run(logger *slog.Logger) (runErr error) {
 	if passwordProofService != nil {
 		passwordProofs = passwordChangeCeremony{service: passwordProofService}
 	}
+	firstProofService, err := buildFirstPasskeyProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
+	if err != nil {
+		return err
+	}
+	var firstProofs server.FirstPasskeyProofs
+	if firstProofService != nil {
+		firstProofs = firstProofService
+	}
+	if webauthnService != nil {
+		// Raw sessions and protected identity are required even for Step-up first
+		// enrollment, independently of password-login or proof-issuance switches.
+		webauthnService.SetFirstPasskeyDependencies(firstProofs, sessionManager, usernameService)
+	}
 	passwordService, err := buildPasswordManager(pool, sessionManager, webAuthnLimiter, protection, passwordProofService)
 	if err != nil {
 		return err
@@ -333,6 +346,7 @@ func run(logger *slog.Logger) (runErr error) {
 		PasswordLoginEnabled:   passwordLoginEnabled,
 		AccountDeletionProofs:  deletionProofs,
 		PasswordChangeProofs:   passwordProofs,
+		FirstPasskeyProofs:     firstProofs,
 		Passwords:              passwordService,
 		Profile:                profileService,
 		PrivateProfile:         privateProfileReader,
@@ -367,6 +381,14 @@ func run(logger *slog.Logger) (runErr error) {
 			maintainPasswordChangeProofs(ctx, passwordProofService, logger)
 		}()
 	}
+	var firstProofCleanupDone chan struct{}
+	if firstProofService != nil {
+		firstProofCleanupDone = make(chan struct{})
+		go func() {
+			defer close(firstProofCleanupDone)
+			maintainFirstPasskeyProofs(ctx, firstProofService, logger)
+		}()
+	}
 
 	// Run the server in a goroutine so we can wait on the signal context.
 	serverErr := make(chan error, 2)
@@ -390,6 +412,9 @@ func run(logger *slog.Logger) (runErr error) {
 	if passwordProofCleanupDone != nil {
 		<-passwordProofCleanupDone
 	}
+	if firstProofCleanupDone != nil {
+		<-firstProofCleanupDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
@@ -407,6 +432,10 @@ func validateStartupInputs(cfg config.Config) error {
 		return err
 	}
 	passwordProofCfg, err := config.LoadPasswordChangeProofs(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	firstProofCfg, err := config.LoadFirstPasskeyProofs(cfg.Environment)
 	if err != nil {
 		return err
 	}
@@ -440,7 +469,7 @@ func validateStartupInputs(cfg config.Config) error {
 	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled || firstProofCfg.Enabled {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}
@@ -916,6 +945,10 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 	if err != nil {
 		return nil, err
 	}
+	firstPasskeySender, err := buildFirstPasskeySMSSender(environment)
+	if err != nil {
+		return nil, err
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
 		CodeTTL:              smsCfg.CodeTTL,
@@ -930,6 +963,7 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		MaxPendingSignup:     smsCfg.MaxPendingSignup,
 		DeletionSender:       deletionSender,
 		PasswordChangeSender: passwordChangeSender,
+		FirstPasskeySender:   firstPasskeySender,
 	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)

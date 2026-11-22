@@ -120,6 +120,36 @@ export function creationOptions(value: unknown): PublicKeyCredentialCreationOpti
   };
 }
 
+export function firstPasskeyCreationOptions(
+  value: unknown,
+  origin: string,
+  remaining: number
+): PublicKeyCredentialCreationOptions {
+  const envelope = record(value);
+  if (Object.keys(envelope).length !== 2 || !Object.hasOwn(envelope, 'publicKey') ||
+    !Object.hasOwn(envelope, 'expires_at')) throw new PortalError('invalid_response');
+  const options = creationOptions(value);
+  const rpID = options.rp.id;
+  const hostname = new URL(origin).hostname;
+  const identity = [options.rp.name, options.user.name, options.user.displayName];
+  if (!rpID || !/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/.test(rpID) || rpID.length > 253 ||
+    (hostname !== rpID && !hostname.endsWith(`.${rpID}`)) ||
+    options.user.id.byteLength !== 8 ||
+    identity.some((name) => !name || new TextEncoder().encode(name).length > 1024 ||
+      /[\p{Cc}\p{Cs}]/u.test(name)) ||
+    options.user.name !== options.user.displayName ||
+    options.authenticatorSelection?.userVerification !== 'required' ||
+    options.pubKeyCredParams.length === 0 ||
+    !Number.isFinite(remaining) || remaining <= 0)
+    throw new PortalError('invalid_response');
+  const serverTimeout = record(envelope.publicKey).timeout;
+  if (typeof serverTimeout !== 'number' || !Number.isSafeInteger(serverTimeout) ||
+    serverTimeout <= 0 || serverTimeout > 180000) throw new PortalError('invalid_response');
+  options.timeout = Math.min(options.timeout ?? serverTimeout, Math.floor(remaining));
+  if (options.timeout <= 0) throw new PortalError('invalid_response');
+  return options;
+}
+
 export function serializeCredential(credential: PublicKeyCredential) {
   if (credential.type !== 'public-key') throw new PortalError('invalid_response');
   const response = credential.response;
@@ -175,18 +205,36 @@ export async function usePasskey(
 ) {
   requireWebAuthn();
   throwIfAborted(signal);
+  return nativePasskey(
+    create ? creationOptions(value) : assertionOptions(value, requireUV), signal, create
+  );
+}
+
+export function createPasskey(options: PublicKeyCredentialCreationOptions, signal: AbortSignal) {
+  return nativePasskey(options, signal, true);
+}
+
+async function nativePasskey(
+  options: PublicKeyCredentialCreationOptions | PublicKeyCredentialRequestOptions,
+  signal: AbortSignal,
+  create: boolean
+) {
+  requireWebAuthn();
+  throwIfAborted(signal);
   try {
     const credential = create
-      ? await navigator.credentials.create({ publicKey: creationOptions(value), signal })
-      : await navigator.credentials.get({ publicKey: assertionOptions(value, requireUV), signal });
+      ? await navigator.credentials.create({ publicKey: options as PublicKeyCredentialCreationOptions, signal })
+      : await navigator.credentials.get({ publicKey: options as PublicKeyCredentialRequestOptions, signal });
     throwIfAborted(signal);
     if (!credential) throw new PortalError('cancelled');
+    if (create && !('attestationObject' in (credential as PublicKeyCredential).response))
+      throw new PortalError('invalid_response');
     return serializeCredential(credential as PublicKeyCredential);
   } catch (error) {
     throwIfAborted(signal);
-    if (error instanceof Error && ['NotAllowedError', 'AbortError'].includes(error.name))
+    if ((error instanceof Error || error instanceof DOMException) && ['NotAllowedError', 'AbortError'].includes(error.name))
       throw new PortalError('cancelled');
-    if (error instanceof Error && error.name === 'SecurityError')
+    if ((error instanceof Error || error instanceof DOMException) && error.name === 'SecurityError')
       throw new PortalError('authenticator_security');
     throw error instanceof PortalError ? error : new PortalError('authenticator_failed');
   }

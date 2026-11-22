@@ -13,6 +13,18 @@ export class PortalError extends Error {
   }
 }
 
+export type FirstPasskeyPhase = 'challenge' | 'proof' | 'start' | 'native' | 'finish';
+
+export class FirstPasskeyError extends PortalError {
+  constructor(readonly phase: FirstPasskeyPhase, error: PortalError) {
+    super(error.code, error.status, error.uncertain, error.retryAfterSeconds);
+  }
+
+  get credentialMayHaveBeenSaved(): boolean {
+    return this.phase === 'finish' && this.uncertain;
+  }
+}
+
 // Feedback only: never schedule a retry, keepalive, or replay from this header.
 export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
   if (value === null || value.length > 80 || value.trim() !== value) return undefined;

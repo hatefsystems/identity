@@ -28,6 +28,14 @@ export function legalIdempotencyKey(path, method, value) {
   return value;
 }
 
+export function firstPasskeyActionProof(path, method, value) {
+  if (value === undefined) return;
+  assert(method === 'POST' && path === '/api/v1/auth/webauthn/register/generate-options' &&
+    typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value) &&
+    Buffer.from(value, 'base64url').toString('base64url') === value, 'Invalid scoped first-passkey proof');
+  return value;
+}
+
 export function legalReferenceRequest(request, secret, harness) {
   try {
     const url = new URL(request.url());
@@ -136,7 +144,7 @@ export function portalRoute(path) {
   ]) {
     if (pattern.test(pathname)) return template;
   }
-  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify|legal-holds|preservation-requests|legal-inquiry\/lookup)|users\/me(?:\/(?:sessions|profile|private-data|username|deletion))?|auth\/(?:login(?:\/(?:code\/(?:request|verify)|mfa))?|logout|session|stepup\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
+  if (/^\/api\/v1\/(?:admin\/(?:capabilities|users(?:\/lookup)?|audit-logs(?:\/verify)?|ledger\/verify|legal-holds|preservation-requests|legal-inquiry\/lookup)|users\/me(?:\/(?:sessions|profile|private-data|username|deletion))?|auth\/(?:login(?:\/(?:code\/(?:request|verify)|mfa))?|logout|session|stepup\/(?:challenge|verify)|action-proofs\/first-passkey\/(?:challenge|verify)|webauthn\/(?:keys|(?:login|register)\/(?:generate-options|verify))|mfa\/totp\/(?:setup|enable|disable)|recovery-codes\/(?:generate|status|verify)|deletion\/reclaim(?:\/options)?))\/?$/.test(pathname) ||
       /^\/(?:admin(?:\/(?:users|audit-logs|integrity|legal))?|dashboard(?:\/(?:profile|security|sessions|privacy))?|login(?:\/webauthn)?|recover-account)$/.test(pathname)) return pathname;
   return '[redacted-route]';
 }
@@ -192,7 +200,7 @@ export function secretEnvironmentValues(environment) {
 export function fixtureSecretValues(value) {
   if (!value || typeof value !== 'object') return [];
   return Object.entries(value).flatMap(([key, item]) => {
-    if (/^(?:username|phone|preauthentication|challenge|USERNAME_LOOKUP_KEY)$/.test(key))
+    if (/^(?:username|phone|preauthentication|challenge|action_proof|clientDataJSON|attestationObject|rawId|USERNAME_LOOKUP_KEY)$/.test(key))
       return typeof item === 'string' && item ? [item] : [];
     if (key === 'database_url' && typeof item === 'string') {
       try {
@@ -758,9 +766,11 @@ export async function runPortalIntegrationSuites({ invocation = integrationInvoc
   return report;
 }
 
-export async function startPortalHarness({ admin = false, login = false } = {}) {
+export async function startPortalHarness({ admin = false, login = false, firstPasskey = false } = {}) {
   assert.equal(typeof admin, 'boolean', 'Admin harness mode must be explicit');
   assert.equal(typeof login, 'boolean', 'Login harness mode must be explicit');
+  assert.equal(typeof firstPasskey, 'boolean', 'First-passkey harness mode must be explicit');
+  assert(!firstPasskey || login && !admin, 'First-passkey probe requires an isolated password-login harness');
   let apiBinary = resolve(backend, 'bin/identity-api');
   let fixtureBinary = resolve(backend, 'bin/portal-fixture');
   let notifierBinary = resolve(backend, 'bin/deletion-notifier');
@@ -1106,7 +1116,7 @@ export async function startPortalHarness({ admin = false, login = false } = {}) 
     secrets.push(smtpUsername, smtpPassword);
     const mail = await startMailSink({
       ...tls, username: smtpUsername, password: smtpPassword, from: smtpFrom,
-      runID, origin, acceptLogin: login, onSecrets: (values) => secrets.push(...values),
+      runID, origin, acceptLogin: login, acceptFirstPasskey: firstPasskey, onSecrets: (values) => secrets.push(...values),
     });
     cleanup.push(() => mail.close());
     const workerDatabase = fixture('notifier-role');
@@ -1174,6 +1184,10 @@ export async function startPortalHarness({ admin = false, login = false } = {}) 
       REGISTRATION_ENABLED: 'false',
       LOGIN_ENABLED: login ? 'true' : 'false',
       LOGIN_EMAIL_ENABLED: login ? 'true' : 'false',
+      FIRST_PASSKEY_PROOFS_ENABLED: firstPasskey ? 'true' : 'false',
+      FIRST_PASSKEY_PROOFS_EMAIL_ENABLED: firstPasskey ? 'true' : 'false',
+      FIRST_PASSKEY_PROOFS_SMS_ENABLED: 'false',
+      ...(firstPasskey ? { FIRST_PASSKEY_PROOFS_BINDING_KEY: randomBytes(32).toString('base64') } : {}),
       ...(login ? {
         LOGIN_CODE_HMAC_KEY: randomBytes(32).toString('base64'),
         LOGIN_SMTP_HOST: '127.0.0.1', LOGIN_SMTP_PORT: String(mail.port),

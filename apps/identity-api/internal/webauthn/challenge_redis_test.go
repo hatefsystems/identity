@@ -2,6 +2,8 @@ package webauthn
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"math"
 	"net"
@@ -274,6 +276,167 @@ func TestRedisChallengeServiceCrossInstanceFlows(t *testing.T) {
 		_, stores := redisChallengeStores(t)
 		return stores
 	})
+}
+
+func TestRedisFirstRegistrationSlots(t *testing.T) {
+	mini, stores := redisChallengeStores(t)
+	mini.SetTime(time.Now().UTC().Truncate(time.Millisecond))
+	exerciseFirstRegistrationRedis(t, stores)
+}
+
+func exerciseFirstRegistrationRedis(t *testing.T, stores [2]*RedisChallengeStore) {
+	t.Helper()
+	pc := firstPending(uuid.New(), time.Now().Add(time.Minute))
+	challengeKey, slotKey := challengeRedisKey(pc.Session.Challenge), firstRegistrationRedisKey(pc.UserRef)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := stores[0].client.Del(ctx, challengeKey, slotKey).Err(); err != nil {
+			t.Error("owned slot cleanup failed", err)
+		}
+	})
+	const workers = 16
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := range workers {
+		wg.Go(func() {
+			candidate := pc
+			candidate.Session.Challenge = uuid.NewString()
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if err := stores[0].client.Del(ctx, challengeRedisKey(candidate.Session.Challenge)).Err(); err != nil {
+					t.Error("owned racing challenge cleanup failed", err)
+				}
+			})
+			err := stores[i%2].SaveFirstRegistration(t.Context(), candidate.Session.Challenge, candidate)
+			if err == nil {
+				pcKey := challengeRedisKey(candidate.Session.Challenge)
+				if _, err := stores[i%2].Take(t.Context(), candidate.Session.Challenge, bindingFor(candidate)); err != nil {
+					results <- err
+					return
+				}
+				if err := stores[i%2].CheckFirstRegistration(t.Context(), candidate.Session.Challenge, candidate); err != nil {
+					results <- err
+					return
+				}
+				if exists, err1 := stores[i%2].client.Exists(t.Context(), pcKey).Result(); err1 != nil || exists != 0 {
+					results <- errors.New("Take retained pending state")
+					return
+				}
+			}
+			results <- err
+		})
+	}
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if !errors.Is(err, ErrEnrollmentInProgress) {
+			t.Fatal(err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("first Redis slot winners: %d", winners)
+	}
+	if err := stores[1].SaveFirstRegistration(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrEnrollmentInProgress) {
+		t.Fatal("slot released after Take", err)
+	}
+	if err := stores[0].client.Del(t.Context(), slotKey).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].SaveFirstRegistration(t.Context(), pc.Session.Challenge, pc); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{challengeKey, slotKey} {
+		deadline, err := stores[1].client.PExpireTime(t.Context(), key).Result()
+		if err != nil || deadline.Milliseconds() != pc.Expires.UnixMilli() {
+			t.Fatal("pending and slot do not share original absolute expiry", err)
+		}
+	}
+	wrong := bindingFor(pc)
+	wrong.SessionID = "foreign-session"
+	if _, err := stores[1].Take(t.Context(), pc.Session.Challenge, wrong); !errors.Is(err, ErrChallengeNotFound) {
+		t.Fatal(err)
+	}
+	if _, err := stores[1].Take(t.Context(), pc.Session.Challenge, bindingFor(pc)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[1].CheckFirstRegistration(t.Context(), pc.Session.Challenge, pc); err != nil {
+		t.Fatal(err)
+	}
+	for _, corruption := range []string{"replacement", "missing TTL", "wrong type", "missing"} {
+		switch corruption {
+		case "replacement":
+			if err := stores[0].client.SetArgs(t.Context(), slotKey, strings.Repeat("a", 64), redis.SetArgs{ExpireAt: pc.Expires}).Err(); err != nil {
+				t.Fatal(err)
+			}
+		case "missing TTL":
+			if err := stores[0].client.Persist(t.Context(), slotKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+		case "wrong type":
+			if err := stores[0].client.Del(t.Context(), slotKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := stores[0].client.HSet(t.Context(), slotKey, "bad", "bad").Err(); err != nil {
+				t.Fatal(err)
+			}
+		case "missing":
+			if err := stores[0].client.Del(t.Context(), slotKey).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := stores[1].CheckFirstRegistration(t.Context(), pc.Session.Challenge, pc); err == nil {
+			t.Fatalf("accepted %s slot", corruption)
+		}
+	}
+	if err := stores[1].client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[1].CheckFirstRegistration(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrChallengeStoreUnavailable) {
+		t.Fatal("slot outage used local authority", err)
+	}
+}
+
+func TestRedisFirstRegistrationConservativeRuntimeFailure(t *testing.T) {
+	mini, stores := redisChallengeStores(t)
+	mini.SetTime(time.Now().UTC().Truncate(time.Millisecond))
+	exerciseFirstRegistrationRuntimeFailure(t, stores)
+}
+
+func exerciseFirstRegistrationRuntimeFailure(t *testing.T, stores [2]*RedisChallengeStore) {
+	t.Helper()
+	pc := firstPending(uuid.New(), time.Now().Add(time.Minute))
+	key, slot := challengeRedisKey(pc.Session.Challenge), firstRegistrationRedisKey(pc.UserRef)
+	t.Cleanup(func() {
+		if err := stores[0].client.Del(context.Background(), key, slot).Err(); err != nil {
+			t.Error(err)
+		}
+	})
+	data, _, err := encodePendingChallenge(pc.Session.Challenge, pc, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(pc.Session.Challenge))
+	// Force the first post-slot HSET to hit the slot's string key: the exact
+	// script prefix remains unchanged and Redis's earlier SET must survive.
+	fault := redis.NewScript(strings.Replace(saveFirstRegistrationLua, "redis.call('HSET', KEYS[1]", "redis.call('HSET', KEYS[2]", 1))
+	if _, err := fault.Run(t.Context(), stores[0].client, []string{key, slot}, pc.Flow.String(), pc.UserRef.String(), pc.SessionID,
+		pc.DPoPJKT, data, pc.Expires.UnixMilli(), hex.EncodeToString(digest[:]), MaxChallengeTTL.Milliseconds()).Result(); err == nil {
+		t.Fatal("Lua runtime fault did not occur")
+	}
+	if exists := stores[0].client.Exists(t.Context(), key).Val(); exists != 0 {
+		t.Fatal("partial pending authority published")
+	}
+	if err := stores[1].CheckFirstRegistration(t.Context(), pc.Session.Challenge, pc); err != nil {
+		t.Fatal("conservative slot missing", err)
+	}
+	if err := stores[1].SaveFirstRegistration(t.Context(), pc.Session.Challenge, pc); !errors.Is(err, ErrEnrollmentInProgress) {
+		t.Fatal("runtime fault refunded exclusion", err)
+	}
 }
 
 func exerciseRedisChallengeServiceFlows(t *testing.T, newStores func(*testing.T) [2]*RedisChallengeStore) {

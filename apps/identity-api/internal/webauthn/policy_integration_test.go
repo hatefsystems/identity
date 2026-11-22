@@ -297,6 +297,9 @@ func TestIntegrationPasskeyEnrollmentRevokesOnceAndCosmeticsDoNot(t *testing.T) 
 			pool := openFactorIntegrationPool(ctx, t)
 			q := db.New(pool)
 			id := createFactorIntegrationUser(ctx, t, pool, "enrollment")
+			if !recovery {
+				createFactorIntegrationCredential(ctx, t, q, id)
+			}
 			user, err := q.GetUserByID(ctx, id)
 			if err != nil {
 				t.Fatal(err)
@@ -358,7 +361,11 @@ func TestIntegrationPasskeyEnrollmentRevokesOnceAndCosmeticsDoNot(t *testing.T) 
 			}
 			final, err := q.GetUserByID(ctx, id)
 			count, countErr := q.CountWebauthnCredentialsByUser(ctx, id)
-			if err != nil || countErr != nil || final.AuthVersion != after.AuthVersion || count != 1 {
+			wantCount := int64(1)
+			if !recovery {
+				wantCount = 2
+			}
+			if err != nil || countErr != nil || final.AuthVersion != after.AuthVersion || count != wantCount {
 				t.Fatal("rename/use/list/stale enrollment changed authority")
 			}
 		})

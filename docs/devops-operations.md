@@ -58,6 +58,42 @@ they are not evidence that this baseline passed.
     [required acceptance](admin-operations.md#automated-validation), without reusing
     historical evidence or certifying production readiness.
 
+## First-Passkey Proofs (T25)
+
+The fixed-purpose fallback is default-off. Enable `FIRST_PASSKEY_PROOFS_ENABLED`
+only with an explicitly selected `FIRST_PASSKEY_PROOFS_EMAIL_ENABLED` or
+`FIRST_PASSKEY_PROOFS_SMS_ENABLED` channel. It is independent of `LOGIN_ENABLED`;
+an unselected disabled channel does not prevent the selected channel from working.
+Use the shared `LOGIN_CODE_HMAC_KEY` for contact quotas/lockouts and a distinct
+32..64-byte base64 `FIRST_PASSKEY_PROOFS_BINDING_KEY` for complete-contact evidence.
+Never reuse deletion/password-change binding keys. Email uses the admitted TLS
+`LOGIN_SMTP_*` transport with first-passkey-specific copy. SMS additionally requires
+`SMS_ENABLED` and an explicit `FIRST_PASSKEY_SMS_IR_TEMPLATE_ID` distinct from
+login, deletion and password-change templates. Provider acceptance is not receipt.
+
+Apply additive forward-only migration
+`00009_first_passkey_enrollment_action_proofs.sql` after the unchanged 00001..00008
+lineage. Explicitly grant the API role only `SELECT, INSERT, DELETE` on
+`public.first_passkey_enrollment_action_proofs`, never `UPDATE` or `TRUNCATE`.
+The table stores only a capability digest, bound subject/session/JKT/version,
+fixed action/channel, keyed contact MAC and original expiry; cleanup processes at
+most 1000 expired rows per minute. No purpose key or recipient belongs in artifacts.
+
+Enrollment spends the proof once in its caller-owned SQL start transaction before
+publishing options. The pending ceremony retains the original deadline, not a fresh
+lifetime. Cancellation, expiry, failed verification, response loss and uncertain
+SQL/Redis outcomes never refund or restore authority and never authorize retries.
+Keep standalone Redis available with a non-evicting live account-slot policy before
+activation; this is an operational prerequisite, not a shared Redis reconfiguration.
+To disable rollout, first close proof-issuance and enrollment-options ingress while
+retaining the enabled service, purpose keys and Redis verification dependencies
+until original deadlines drain. Only then disable `FIRST_PASSKEY_PROOFS_ENABLED`
+or remove support; toggling the switch alone before draining is not finish-safe.
+Do not release slots,
+rewrite deadlines/identity, remove committed credentials or run a destructive Down.
+Inbox/provider receipt, platform authenticators and deployed-ingress acceptance
+remain independent unverified release gates.
+
 ## Geography Catalog (T08/T09)
 
 The catalog is an independent operator import and anonymous read boundary, not

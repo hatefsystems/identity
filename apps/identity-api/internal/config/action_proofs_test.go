@@ -155,3 +155,83 @@ func TestPasswordChangeProofDistinctTemplatesAndProtection(t *testing.T) {
 		t.Fatal("password change admitted noncanonical switch")
 	}
 }
+
+func firstPasskeyProofEnvironment(t *testing.T) {
+	t.Helper()
+	passwordChangeProofEnvironment(t)
+	for _, key := range []string{"FIRST_PASSKEY_PROOFS_ENABLED", "FIRST_PASSKEY_PROOFS_EMAIL_ENABLED", "FIRST_PASSKEY_PROOFS_SMS_ENABLED", "FIRST_PASSKEY_PROOFS_BINDING_KEY", "FIRST_PASSKEY_SMS_IR_TEMPLATE_ID"} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestFirstPasskeyProofDefaultOffAndSelectedChannels(t *testing.T) {
+	firstPasskeyProofEnvironment(t)
+	cfg, err := LoadFirstPasskeyProofs("production")
+	if err != nil || cfg.Enabled || cfg.EmailEnabled || cfg.SMSEnabled || len(cfg.BindingKey) != 0 {
+		t.Fatal("default configuration acquired first-passkey authority")
+	}
+	t.Setenv("FIRST_PASSKEY_PROOFS_EMAIL_ENABLED", "true")
+	if _, err := LoadFirstPasskeyProofs("production"); err == nil {
+		t.Fatal("delivery enabled without ceremony")
+	}
+	t.Setenv("FIRST_PASSKEY_PROOFS_EMAIL_ENABLED", "false")
+	t.Setenv("FIRST_PASSKEY_PROOFS_ENABLED", "true")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("FIRST_PASSKEY_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+	if _, err := LoadFirstPasskeyProofs("production"); err == nil {
+		t.Fatal("proof enabled without channel")
+	}
+	t.Setenv("FIRST_PASSKEY_PROOFS_SMS_ENABLED", "true")
+	t.Setenv("SMS_ENABLED", "true")
+	t.Setenv("SMS_IR_TEMPLATE_ID", "123")
+	t.Setenv("FIRST_PASSKEY_SMS_IR_TEMPLATE_ID", "126")
+	cfg, err = LoadFirstPasskeyProofs("production")
+	if err != nil || !cfg.SMSEnabled || cfg.EmailEnabled || cfg.FirstTemplateID != 126 {
+		t.Fatal("SMS-only first proofs depend on login/SMTP", err)
+	}
+	t.Setenv("FIRST_PASSKEY_PROOFS_SMS_ENABLED", "false")
+	t.Setenv("SMS_ENABLED", "false")
+	t.Setenv("FIRST_PASSKEY_SMS_IR_TEMPLATE_ID", "unused-invalid")
+	t.Setenv("FIRST_PASSKEY_PROOFS_EMAIL_ENABLED", "true")
+	t.Setenv("LOGIN_SMTP_HOST", "smtp.example.test")
+	t.Setenv("LOGIN_SMTP_PORT", "465")
+	t.Setenv("LOGIN_SMTP_TLS_MODE", "implicit")
+	t.Setenv("LOGIN_SMTP_FROM", "identity@example.test")
+	t.Setenv("LOGIN_SMTP_USERNAME", "isolated-user")
+	t.Setenv("LOGIN_SMTP_PASSWORD", "isolated-password")
+	cfg, err = LoadFirstPasskeyProofs("production")
+	if err != nil || !cfg.EmailEnabled || cfg.SMSEnabled {
+		t.Fatal("email-only first proofs depend on disabled SMS", err)
+	}
+}
+
+func TestFirstPasskeyDistinctProtectionAndTemplates(t *testing.T) {
+	firstPasskeyProofEnvironment(t)
+	t.Setenv("FIRST_PASSKEY_PROOFS_ENABLED", "true")
+	t.Setenv("FIRST_PASSKEY_PROOFS_SMS_ENABLED", "true")
+	t.Setenv("SMS_ENABLED", "true")
+	t.Setenv("SMS_IR_TEMPLATE_ID", "123")
+	t.Setenv("ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID", "124")
+	t.Setenv("PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID", "125")
+	t.Setenv("LOGIN_CODE_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("ACCOUNT_DELETION_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	t.Setenv("PASSWORD_CHANGE_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{10}, 32)))
+	t.Setenv("FIRST_PASSKEY_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+	for _, template := range []string{"", "0", "-1", "invalid", "123", "124", "125"} {
+		t.Setenv("FIRST_PASSKEY_SMS_IR_TEMPLATE_ID", template)
+		if _, err := LoadFirstPasskeyProofs("production"); err == nil {
+			t.Fatal("first proofs admitted missing/reused template")
+		}
+	}
+	t.Setenv("FIRST_PASSKEY_SMS_IR_TEMPLATE_ID", "126")
+	for _, key := range []string{"", "invalid", base64.StdEncoding.EncodeToString(make([]byte, 32)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 31)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 65)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)), base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{10}, 32))} {
+		t.Setenv("FIRST_PASSKEY_PROOFS_BINDING_KEY", key)
+		if _, err := LoadFirstPasskeyProofs("production"); err == nil {
+			t.Fatal("first proofs admitted invalid/reused binding key")
+		}
+	}
+	t.Setenv("FIRST_PASSKEY_PROOFS_ENABLED", "TRUE")
+	if _, err := LoadFirstPasskeyProofs("development"); err == nil {
+		t.Fatal("first proofs admitted noncanonical switch")
+	}
+}

@@ -76,6 +76,11 @@ func NewPasswordChange(cfg Config, deps Deps) (*Service, error) {
 	return newService(cfg, deps, contactcode.PurposePasswordChange)
 }
 
+// NewFirstPasskey requires independent first-passkey delivery and protection.
+func NewFirstPasskey(cfg Config, deps Deps) (*Service, error) {
+	return newService(cfg, deps, contactcode.PurposeFirstPasskey)
+}
+
 func newService(cfg Config, deps Deps, purpose string) (*Service, error) {
 	if len(cfg.BindingKey) < 32 || len(cfg.BindingKey) > 64 {
 		return nil, ErrInvalid
@@ -91,6 +96,9 @@ func newService(cfg Config, deps Deps, purpose string) (*Service, error) {
 }
 
 func (s *Service) channelEnabled(purpose, channel string) bool {
+	if purpose == contactcode.PurposeFirstPasskey {
+		return s.deps.Codes.FirstPasskeyChannelEnabled(channel)
+	}
 	if purpose == contactcode.PurposePasswordChange {
 		return s.deps.Codes.PasswordChangeChannelEnabled(channel)
 	}
@@ -243,6 +251,11 @@ func (s *Service) ChallengePasswordChange(ctx context.Context, sess session.Sess
 	return s.challenge(ctx, sess, secret, channel, sourceIP, contactcode.PurposePasswordChange)
 }
 
+// ChallengeFirstPasskey freshly verifies the exact existing password, outside locks.
+func (s *Service) ChallengeFirstPasskey(ctx context.Context, sess session.Session, secret, channel, sourceIP string) (string, time.Time, error) {
+	return s.challenge(ctx, sess, secret, channel, sourceIP, contactcode.PurposeFirstPasskey)
+}
+
 func (s *Service) challenge(ctx context.Context, sess session.Session, secret, channel, sourceIP, purpose string) (string, time.Time, error) {
 	if s == nil {
 		return "", time.Time{}, ErrUnavailable
@@ -265,6 +278,9 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 		return "", time.Time{}, ErrUnavailable
 	}
 	if u.AuthVersion != binding.AuthVersion || u.PasswordHash == nil || u.Status != "active" || u.DeletedAt.Valid {
+		return "", time.Time{}, ErrUnauthorized
+	}
+	if purpose == contactcode.PurposeFirstPasskey && !password.SupportedHash(*u.PasswordHash) {
 		return "", time.Time{}, ErrUnauthorized
 	}
 	matched, err := password.VerifyContext(ctx, secret, *u.PasswordHash)
@@ -291,6 +307,9 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 	if err != nil || current.PasswordHash == nil || *current.PasswordHash != *u.PasswordHash {
 		return "", time.Time{}, ErrUnauthorized
 	}
+	if purpose == contactcode.PurposeFirstPasskey && !password.SupportedHash(*current.PasswordHash) {
+		return "", time.Time{}, ErrUnauthorized
+	}
 	e, err := s.contact(ctx, q, binding, channel)
 	if err != nil {
 		return "", time.Time{}, err
@@ -298,6 +317,9 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 	contactBinding := hex.EncodeToString(s.contactBindingFor(binding, purpose, channel, *e))
 	if err := tx.Commit(ctx); err != nil {
 		return "", time.Time{}, ErrOutcomeUnknown
+	}
+	if purpose == contactcode.PurposeFirstPasskey {
+		return s.deps.Codes.RequestFirstPasskey(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
 	}
 	if purpose == contactcode.PurposePasswordChange {
 		return s.deps.Codes.RequestPasswordChange(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
@@ -316,6 +338,11 @@ func (s *Service) VerifyPasswordChange(ctx context.Context, sess session.Session
 	return s.verify(ctx, sess, challenge, code, contactcode.PurposePasswordChange)
 }
 
+// VerifyFirstPasskey issues one start proof with the OTP's original expiry.
+func (s *Service) VerifyFirstPasskey(ctx context.Context, sess session.Session, challenge, code string) (string, time.Time, error) {
+	return s.verify(ctx, sess, challenge, code, contactcode.PurposeFirstPasskey)
+}
+
 func (s *Service) verify(ctx context.Context, sess session.Session, challenge, code, purpose string) (string, time.Time, error) {
 	if s == nil {
 		return "", time.Time{}, ErrUnavailable
@@ -325,9 +352,12 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 		return "", time.Time{}, err
 	}
 	var rec contactcode.Record
-	if purpose == contactcode.PurposePasswordChange {
+	switch purpose {
+	case contactcode.PurposeFirstPasskey:
+		rec, err = s.deps.Codes.VerifyFirstPasskey(ctx, binding, challenge, code)
+	case contactcode.PurposePasswordChange:
 		rec, err = s.deps.Codes.VerifyPasswordChange(ctx, binding, challenge, code)
-	} else {
+	default:
 		rec, err = s.deps.Codes.VerifyDeletion(ctx, binding, challenge, code)
 	}
 	if err != nil {
@@ -345,6 +375,15 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 		return "", time.Time{}, err
 	}
 	q := s.deps.Queries.WithTx(tx)
+	if purpose == contactcode.PurposeFirstPasskey {
+		u, err := q.GetUserByID(ctx, binding.AccountID)
+		if err != nil {
+			return "", time.Time{}, ErrUnavailable
+		}
+		if u.PasswordHash == nil || !password.SupportedHash(*u.PasswordHash) {
+			return "", time.Time{}, ErrUnauthorized
+		}
+	}
 	e, err := s.contact(ctx, q, binding, rec.Channel)
 	if err != nil {
 		return "", time.Time{}, err
@@ -364,9 +403,12 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 		Channel: rec.Channel, ContactBinding: contactBinding, ExpiresAt: pgtype.Timestamptz{Time: rec.ExpiresAt, Valid: true},
 	}
 	var rows int64
-	if purpose == contactcode.PurposePasswordChange {
+	switch purpose {
+	case contactcode.PurposeFirstPasskey:
+		rows, err = q.CreateFirstPasskeyActionProof(ctx, db.CreateFirstPasskeyActionProofParams(params))
+	case contactcode.PurposePasswordChange:
 		rows, err = q.CreatePasswordChangeActionProof(ctx, db.CreatePasswordChangeActionProofParams(params))
-	} else {
+	default:
 		rows, err = q.CreateAccountDeletionActionProof(ctx, params)
 	}
 	if err != nil || rows != 1 {
@@ -511,6 +553,11 @@ func (s *Service) CleanupExpiredPasswordChange(ctx context.Context, batchSize in
 	return s.cleanupExpired(ctx, batchSize, contactcode.PurposePasswordChange)
 }
 
+// CleanupExpiredFirstPasskey reclaims at most 1000 expired start proofs.
+func (s *Service) CleanupExpiredFirstPasskey(ctx context.Context, batchSize int32) (int64, error) {
+	return s.cleanupExpired(ctx, batchSize, contactcode.PurposeFirstPasskey)
+}
+
 func (s *Service) cleanupExpired(ctx context.Context, batchSize int32, purpose string) (int64, error) {
 	if s == nil {
 		return 0, ErrUnavailable
@@ -520,9 +567,12 @@ func (s *Service) cleanupExpired(ctx context.Context, batchSize int32, purpose s
 	}
 	var rows int64
 	var err error
-	if purpose == contactcode.PurposePasswordChange {
+	switch purpose {
+	case contactcode.PurposeFirstPasskey:
+		rows, err = s.deps.Queries.CleanupExpiredFirstPasskeyActionProofs(ctx, batchSize)
+	case contactcode.PurposePasswordChange:
 		rows, err = s.deps.Queries.CleanupExpiredPasswordChangeActionProofs(ctx, batchSize)
-	} else {
+	default:
 		rows, err = s.deps.Queries.CleanupExpiredAccountDeletionActionProofs(ctx, batchSize)
 	}
 	if err != nil {

@@ -69,6 +69,30 @@ export function passkeyResponse(value: unknown): PasskeyCredential {
   };
 }
 
+export type FirstPasskeyAuthority = {
+  purpose: 'first_passkey_enrollment';
+  expires_at: string;
+};
+export type FirstPasskeyChannel = 'email' | 'sms';
+
+export function firstPasskeyAuthorityResponse(value: unknown, field: 'challenge' | 'action_proof') {
+  const item = record(value);
+  if (Object.keys(item).length !== 2 || !Object.hasOwn(item, field) || !Object.hasOwn(item, 'expires_at'))
+    throw new PortalError('invalid_response');
+  const expires_at = timestamp(item.expires_at);
+  // These deadlines are server UTC evidence, not presentation dates.
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(expires_at) ||
+    new Date(Date.parse(expires_at)).toISOString().slice(0, 19) !== expires_at.slice(0, 19))
+    throw new PortalError('invalid_response');
+  return { token: identifier(item[field], 1024), expires_at };
+}
+
+export function firstPasskeyResponse(value: unknown, status: number): PasskeyCredential {
+  const result = passkeyResponse(value);
+  if (status !== 201 || result.user_verified !== true) throw new PortalError('invalid_response');
+  return result;
+}
+
 export function passkeyListEntryResponse(value: unknown): Passkey {
   return { ...passkeyResponse(value), can_remove: boolean(record(value).can_remove) };
 }

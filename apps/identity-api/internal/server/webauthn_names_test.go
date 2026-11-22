@@ -81,7 +81,7 @@ func TestWebAuthnRenameKeyRequiresStepUpAndReturnsSafeProjection(t *testing.T) {
 func TestWebAuthnNameBodiesAreStrict(t *testing.T) {
 	fx := newWebAuthnTestServerWithStepUp(t, true)
 	row := fx.seedCredential([]byte("owned"))
-	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String()})
+	sess, cookies := fx.browser.issueSession(t, fx.mgr, session.IssueParams{UserID: fx.user.ID.String(), AuthVersionSet: true})
 	for _, path := range []string{"/api/v1/auth/webauthn/register/generate-options", "/api/v1/auth/webauthn/keys/" + base64.RawURLEncoding.EncodeToString(row.ID)} {
 		method := http.MethodPost
 		if strings.Contains(path, "/keys/") {

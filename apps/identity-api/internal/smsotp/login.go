@@ -87,6 +87,27 @@ func (s *Service) ContactPasswordChangePolicy(phone, sourceIP string) (LoginPoli
 	return s.contactPolicy(phone, sourceIP)
 }
 
+// FirstPasskeyDeliveryEnabled requires the separate first-passkey template sender.
+func (s *Service) FirstPasskeyDeliveryEnabled() bool {
+	return s != nil && s.cfg.FirstPasskeySender != nil
+}
+
+// ContactFirstPasskeyTTL exposes shared bounds, without issuing authority.
+func (s *Service) ContactFirstPasskeyTTL() time.Duration {
+	if !s.FirstPasskeyDeliveryEnabled() {
+		return 0
+	}
+	return s.cfg.CodeTTL
+}
+
+// ContactFirstPasskeyPolicy retains the existing cross-purpose spend and lockout.
+func (s *Service) ContactFirstPasskeyPolicy(phone, sourceIP string) (LoginPolicy, error) {
+	if !s.FirstPasskeyDeliveryEnabled() {
+		return LoginPolicy{}, ErrDisabled
+	}
+	return s.contactPolicy(phone, sourceIP)
+}
+
 func (s *Service) contactPolicy(phone, sourceIP string) (LoginPolicy, error) {
 	canonical, err := NormalizePhone(phone)
 	if err != nil || canonical != phone {
@@ -128,6 +149,14 @@ func (s *Service) DeliverContactPasswordChangeCode(ctx context.Context, phone, c
 		return ErrDisabled
 	}
 	return deliverContactCode(ctx, s.cfg.PasswordChangeSender, phone, code, expiresAt)
+}
+
+// DeliverContactFirstPasskeyCode submits once, without retries or quota refunds.
+func (s *Service) DeliverContactFirstPasskeyCode(ctx context.Context, phone, code string, expiresAt time.Time) error {
+	if !s.FirstPasskeyDeliveryEnabled() {
+		return ErrDisabled
+	}
+	return deliverContactCode(ctx, s.cfg.FirstPasskeySender, phone, code, expiresAt)
 }
 
 func deliverContactCode(ctx context.Context, sender Sender, phone, code string, expiresAt time.Time) error {

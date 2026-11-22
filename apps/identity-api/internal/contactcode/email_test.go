@@ -119,3 +119,28 @@ func TestPasswordChangeEmailCopyAndOriginalDeadline(t *testing.T) {
 		t.Fatal("password change reused deletion copy or changed delivery lifetime")
 	}
 }
+
+func TestFirstPasskeyEmailDistinctCopyAndExactDeadline(t *testing.T) {
+	transport := &captureMail{}
+	email, err := NewFirstPasskeyEmail("security@example.test", transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute).Truncate(time.Millisecond)
+	if err := email.SendCode(t.Context(), "owner@example.test", "000042", expires); err != nil {
+		t.Fatal(err)
+	}
+	message := string(transport.message)
+	for _, text := range []string{"Subject: Your first-passkey enrollment code\r\n", "authorizes one first-passkey enrollment start", "cannot sign you in, change your password, delete your account", "000042\r\n", expires.Format(time.RFC3339Nano)} {
+		if !strings.Contains(message, text) {
+			t.Fatal("first-passkey copy lost security meaning/deadline")
+		}
+	}
+	if !transport.deadline.Equal(expires) || transport.calls != 1 || strings.Contains(message, "Subject: Your password-change") || strings.Contains(message, "Subject: Your account-deletion") || strings.Contains(message, "#token=") {
+		t.Fatal("first passkey reused another purpose or changed lifetime")
+	}
+	transport.err = errPrivate
+	if err := email.SendCode(t.Context(), "owner@example.test", "000042", expires); err != ErrOutcomeUnknown || transport.calls != 2 {
+		t.Fatal("first-passkey SMTP uncertainty retried or hid outcome")
+	}
+}

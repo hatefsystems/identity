@@ -26,11 +26,12 @@ import (
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/oidc/dpop"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 )
 
 // testNow is the fixed instant the ceremony fixtures start from, so challenge
 // expiry is asserted against arithmetic rather than the wall clock.
-var testNow = time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC)
+var testNow = time.Now().UTC().Truncate(time.Millisecond)
 
 // errBoom stands in for an arbitrary infrastructure failure (connection reset,
 // timeout) that is neither pgx.ErrNoRows nor a domain error, proving those are
@@ -485,6 +486,10 @@ func (a *softAuthenticator) publicKeyCredential() protocol.PublicKeyCredential {
 // given challenge, using "none" attestation (the conveyance the platform asks
 // for, since it does not verify attestation certificates).
 func (a *softAuthenticator) attestation(challenge string) []byte {
+	return a.attestationWithFlags(challenge, flagUserPresent|flagUserVerified, false)
+}
+
+func (a *softAuthenticator) attestationWithFlags(challenge string, flags byte, signed bool) []byte {
 	a.t.Helper()
 
 	// Declared locally with explicit CBOR tags: protocol.AttestationObject's
@@ -496,7 +501,17 @@ func (a *softAuthenticator) attestation(challenge string) []byte {
 	}{
 		Format:       "none",
 		AttStatement: map[string]any{},
-		AuthData:     a.authData(flagUserPresent|flagUserVerified|flagAttestedData, true),
+		AuthData:     a.authData(flags|flagAttestedData, true),
+	}
+	if signed {
+		clientHash := sha256.Sum256(a.clientData(protocol.CreateCeremony, challenge))
+		digest := sha256.Sum256(append(append([]byte(nil), attestationObject.AuthData...), clientHash[:]...))
+		signature, err := ecdsa.SignASN1(rand.Reader, a.key, digest[:])
+		if err != nil {
+			a.t.Fatal(err)
+		}
+		attestationObject.Format = "packed"
+		attestationObject.AttStatement = map[string]any{"alg": int64(-7), "sig": signature}
 	}
 	raw, err := webauthncbor.Marshal(attestationObject)
 	if err != nil {
@@ -631,6 +646,7 @@ func newFixture(t *testing.T) *ceremonyFixture {
 		t.Fatalf("New: %v", err)
 	}
 	svc.now = func() time.Time { return clock }
+	svc.SetFirstPasskeyDependencies(nil, fixtureSessions{svc}, nil)
 
 	var slept []time.Duration
 	svc.sleep = func(d time.Duration) { slept = append(slept, d) }
@@ -676,7 +692,36 @@ func (f *ceremonyFixture) advance(d time.Duration) { *f.clock = f.clock.Add(d) }
 
 // ctx is a convenience for the many single-use contexts below.
 func (f *ceremonyFixture) ctx() context.Context {
-	return dpop.WithProof(context.Background(), &dpop.Proof{JKT: testBrowserJKT})
+	user := f.users.byID[f.user.ID]
+	return session.WithSession(dpop.WithProof(context.Background(), &dpop.Proof{JKT: testBrowserJKT}), fixtureSession(user, "test-session", *f.clock))
+}
+
+type fixtureSessions struct{ svc *Service }
+
+func fixtureSession(user db.User, id string, now time.Time) session.Session {
+	return session.Session{ID: id, UserID: user.ID.String(), Kind: session.KindAuthenticated,
+		AuthVersionSet: true, AuthVersion: user.AuthVersion, DPoPJKT: testBrowserJKT,
+		AbsoluteExpiry: now.Add(time.Hour), IdleExpiry: now.Add(time.Hour)}
+}
+
+func (f fixtureSessions) LookupByID(ctx context.Context, userID, id string) (session.Session, error) {
+	user, err := f.svc.users.GetUserByID(ctx, uuid.MustParse(userID))
+	if err != nil {
+		return session.Session{}, err
+	}
+	return fixtureSession(user, id, f.svc.now()), nil
+}
+
+func (f *ceremonyFixture) beginRegistration(ctx context.Context, id uuid.UUID, sessionID, name string) (*protocol.CredentialCreation, error) {
+	user, err := f.users.GetUserByID(ctx, id)
+	if err != nil {
+		return f.svc.BeginRegistration(ctx, id, sessionID, name)
+	}
+	ctx = session.WithSession(ctx, fixtureSession(user, sessionID, *f.clock))
+	creation, _, err := f.svc.BeginAuthorizedRegistration(ctx, id, sessionID, name, RegistrationAuthorization{
+		UserID: id, SessionID: sessionID, DPoPJKT: testBrowserJKT, AuthVersion: user.AuthVersion, ExpiresAt: f.clock.Add(f.svc.challengeTTL),
+	})
+	return creation, err
 }
 
 const testBrowserJKT = "test-browser-dpop-thumbprint"
@@ -691,7 +736,7 @@ func (f *ceremonyFixture) handle(t *testing.T) []byte {
 func (f *ceremonyFixture) register(t *testing.T, auth *softAuthenticator) db.WebauthnCredential {
 	t.Helper()
 
-	options, err := f.svc.BeginRegistration(f.ctx(), f.user.ID, "test-session", "")
+	options, err := f.beginRegistration(f.ctx(), f.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -803,7 +848,7 @@ func TestLoginResultRecordsActualAssertionUVNotEnrollment(t *testing.T) {
 func TestBeginRegistrationOptions(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -844,11 +889,11 @@ func TestBeginRegistrationOptions(t *testing.T) {
 	if bytes.Equal(handle, fx.user.ID[:]) || strings.Contains(wire.PublicKey.User.ID, fx.user.ID.String()) {
 		t.Error("user.id leaks the account UUID; it must be an unlinkable random handle")
 	}
-	if wire.PublicKey.User.Name != *fx.user.Email {
-		t.Errorf("user.name = %q, want %q", wire.PublicKey.User.Name, *fx.user.Email)
+	if wire.PublicKey.User.Name != wire.PublicKey.User.ID {
+		t.Errorf("user.name = %q, want opaque handle %q", wire.PublicKey.User.Name, wire.PublicKey.User.ID)
 	}
-	if wire.PublicKey.User.DisplayName != *fx.user.Email {
-		t.Errorf("user.displayName = %q, want %q", wire.PublicKey.User.DisplayName, *fx.user.Email)
+	if wire.PublicKey.User.DisplayName != wire.PublicKey.User.ID {
+		t.Errorf("user.displayName = %q, want opaque handle %q", wire.PublicKey.User.DisplayName, wire.PublicKey.User.ID)
 	}
 }
 
@@ -857,7 +902,7 @@ func TestBeginRegistrationOptions(t *testing.T) {
 func TestBeginRegistrationStoresChallenge(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -881,7 +926,7 @@ func TestBeginRegistrationStoresChallenge(t *testing.T) {
 
 func TestFinishRegistrationForeignSessionCannotBurnChallenge(t *testing.T) {
 	fx := newFixture(t)
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "session-a", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "session-a", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -890,7 +935,7 @@ func TestFinishRegistrationForeignSessionCannotBurnChallenge(t *testing.T) {
 	if _, err := fx.svc.FinishRegistration(fx.ctx(), fx.user.ID, "session-b", body); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("foreign-session FinishRegistration = %v, want ErrChallengeNotFound", err)
 	}
-	if _, err := fx.svc.FinishRegistration(fx.ctx(), fx.user.ID, "session-a", body); err != nil {
+	if _, err := fx.svc.FinishRegistration(session.WithSession(fx.ctx(), fixtureSession(fx.user, "session-a", *fx.clock)), fx.user.ID, "session-a", body); err != nil {
 		t.Fatalf("legitimate FinishRegistration after foreign probe: %v", err)
 	}
 	if got := fx.creds.count(fx.user.ID); got != 1 {
@@ -950,7 +995,7 @@ func TestRecoveryRegistrationCreatesReplacementUsableForFreshLogin(t *testing.T)
 func TestBeginRegistrationDoesNotPersistHandle(t *testing.T) {
 	fx := newFixture(t)
 
-	if _, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", ""); err != nil {
+	if _, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", ""); err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
 	if got := fx.handle(t); len(got) != 0 {
@@ -1072,7 +1117,7 @@ func TestFinishRegistrationForeignChallenge(t *testing.T) {
 	fx.users.byID[victim.ID] = victim
 	fx.users.byEmail[*victim.Email] = victim.ID
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), victim.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), victim.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1091,7 +1136,7 @@ func TestFinishRegistrationForeignChallenge(t *testing.T) {
 func TestFinishRegistrationChallengeIsSingleUse(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1111,7 +1156,7 @@ func TestFinishRegistrationChallengeIsSingleUse(t *testing.T) {
 func TestFinishRegistrationExpiredChallenge(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1145,7 +1190,7 @@ func TestFinishRegistrationRejectsForgedCeremony(t *testing.T) {
 			fx := newFixture(t)
 			tc.mutate(fx.auth)
 
-			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+			options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 			if err != nil {
 				t.Fatalf("BeginRegistration: %v", err)
 			}
@@ -1197,7 +1242,7 @@ func TestFinishRegistrationConcurrentHandleWrite(t *testing.T) {
 	var none int64
 	fx.users.setHandleAffected = &none
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -1238,7 +1283,7 @@ func TestFinishRegistrationWrapsStoreFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFixture(t)
 
-			options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+			options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 			if err != nil {
 				t.Fatalf("BeginRegistration: %v", err)
 			}
@@ -2199,7 +2244,7 @@ func TestFinishRegistrationRejectsLoginChallenge(t *testing.T) {
 func TestBeginRegistrationRequestsDiscoverableCredential(t *testing.T) {
 	fx := newFixture(t)
 
-	options, err := fx.svc.BeginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
+	options, err := fx.beginRegistration(fx.ctx(), fx.user.ID, "test-session", "")
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}
@@ -2231,7 +2276,11 @@ func TestBeginRegistrationHonoursResidentKeyConfig(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	options, err := svc.BeginRegistration(context.Background(), userID, "test-session", "")
+	svc.SetFirstPasskeyDependencies(nil, fixtureSessions{svc}, nil)
+	ctx := session.WithSession(dpop.WithProof(context.Background(), &dpop.Proof{JKT: testBrowserJKT}), fixtureSession(users.byID[userID], "test-session", svc.now()))
+	options, _, err := svc.BeginAuthorizedRegistration(ctx, userID, "test-session", "", RegistrationAuthorization{
+		UserID: userID, SessionID: "test-session", DPoPJKT: testBrowserJKT, ExpiresAt: svc.now().Add(cfg.ChallengeTTL),
+	})
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}

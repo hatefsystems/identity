@@ -44,6 +44,7 @@ type Config struct {
 	// A missing sender disables deletion, never falling back to enrollment/login.
 	DeletionSender       Sender
 	PasswordChangeSender Sender
+	FirstPasskeySender   Sender
 	CodeTTL              time.Duration
 	MaxAttempts          int
 	LockoutTTL           time.Duration
@@ -110,6 +111,9 @@ func New(cfg Config, users UserStore, enc Encryptor, idx BlindIndexer, limiter r
 	}
 	if missingDependency(cfg.PasswordChangeSender) {
 		cfg.PasswordChangeSender = nil
+	}
+	if missingDependency(cfg.FirstPasskeySender) {
+		cfg.FirstPasskeySender = nil
 	}
 	return &Service{users: users, encryptor: enc, indexer: idx, limiter: limiter, otps: otps, sender: sender, cfg: cfg}, nil
 }

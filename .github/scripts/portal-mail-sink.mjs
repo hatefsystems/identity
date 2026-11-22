@@ -83,15 +83,29 @@ export function loginMail(message, { recipient, from }) {
   return { kind: 'login', recipient, code: matched[1], expires_at: matched[2] };
 }
 
+export function firstPasskeyMail(message, { recipient, from }) {
+  assert(Buffer.byteLength(message) <= limit, 'Unbounded fixture first-passkey mail');
+  const split = message.indexOf('\r\n\r\n');
+  assert(split > 0, 'Invalid fixture first-passkey message');
+  const headers = message.slice(0, split), body = message.slice(split + 4);
+  assert(headers === `From: <${from}>\r\nTo: <${recipient}>\r\nSubject: Your first-passkey enrollment code\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit`,
+    'Unexpected fixture first-passkey headers');
+  const matched = body.match(/^Enter this code only in the browser where you requested your first passkey:\r\n([0-9]{6})\r\n\r\nThis code authorizes one first-passkey enrollment start and expires at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)\. It cannot sign you in, change your password, delete your account, verify a signup or change your contacts\. If you did not request a first passkey, do not share or enter this code\.\r\n$/);
+  assert(matched && Number.isFinite(Date.parse(matched[2])), 'Invalid bounded first-passkey code or deadline');
+  return { kind: 'first-passkey', recipient, code: matched[1], expires_at: matched[2] };
+}
+
 // Implicit TLS only: no plaintext listener, external relay, transcript, or spool.
 // Fault injection is recipient-scoped, and cannot deliver outside this run.
-export async function startMailSink({ key, cert, username, password, from, runID, origin, acceptLogin = false, onSecrets = () => {} }) {
+export async function startMailSink({ key, cert, username, password, from, runID, origin, acceptLogin = false, acceptFirstPasskey = false, onSecrets = () => {} }) {
   assert(/^[a-f0-9]{32}$/.test(runID), 'Mail sink requires a fixture run');
   const publicOrigin = new URL(origin);
   assert(publicOrigin.hostname === 'localhost' && publicOrigin.protocol === 'https:' &&
     publicOrigin.port && publicOrigin.origin === origin,
     'Mail sink requires a local HTTPS portal');
   assert(username && password && from.endsWith(`@${runID}.example.test`), 'Mail sink requires owned credentials');
+  assert(typeof acceptLogin === 'boolean' && typeof acceptFirstPasskey === 'boolean', 'Mail purposes must be explicit');
+  const acceptCode = acceptLogin || acceptFirstPasskey;
   const connections = new Set();
   const messages = [];
   const faults = new Map();
@@ -132,8 +146,10 @@ export async function startMailSink({ key, cert, username, password, from, runID
           try {
             assert(messages.length < 64, 'Fixture mail capture limit');
             const message = data.join('\r\n') + '\r\n';
-            const notice = acceptLogin && /^Subject: Your account sign-in code\r?$/m.test(message)
-              ? loginMail(message, { recipient, from }) : deletionMail(message, { origin, recipient, from });
+            const notice = acceptFirstPasskey && /^Subject: Your first-passkey enrollment code\r?$/m.test(message)
+              ? firstPasskeyMail(message, { recipient, from })
+              : acceptLogin && /^Subject: Your account sign-in code\r?$/m.test(message)
+                ? loginMail(message, { recipient, from }) : deletionMail(message, { origin, recipient, from });
             onSecrets([notice.recipient, notice.code, notice.token, notice.link].filter(Boolean));
             const remaining = faults.get(recipient) || 0;
             const accepted = remaining === 0;
@@ -155,7 +171,7 @@ export async function startMailSink({ key, cert, username, password, from, runID
           sender = false;
           recipient = '';
         } else if (/^EHLO [^\r\n]+$/.test(line)) {
-          reply(`250-localhost\r\n${acceptLogin ? '250-SMTPUTF8\r\n' : ''}250 AUTH PLAIN`);
+          reply(`250-localhost\r\n${acceptCode ? '250-SMTPUTF8\r\n' : ''}250 AUTH PLAIN`);
         } else if (line.startsWith('AUTH PLAIN ')) {
           const presented = Buffer.from(line.slice(11), 'base64');
           authenticated = presented.length === expected.length && timingSafeEqual(presented, expected);
@@ -167,7 +183,7 @@ export async function startMailSink({ key, cert, username, password, from, runID
           socket.end('221 closing\r\n');
         } else if (!authenticated) {
           reply('530 authentication required');
-        } else if (line === `MAIL FROM:<${from}>` || acceptLogin && line === `MAIL FROM:<${from}> SMTPUTF8`) {
+        } else if (line === `MAIL FROM:<${from}>` || acceptCode && line === `MAIL FROM:<${from}> SMTPUTF8`) {
           sender = true;
           recipient = '';
           reply('250 sender accepted');
@@ -208,11 +224,11 @@ export async function startMailSink({ key, cert, username, password, from, runID
       faults.set(recipient, (faults.get(recipient) || 0) + 1);
     },
     async waitFor(recipient, count = 1, kind = 'deletion') {
-      assert(owned(recipient) && count >= 1 && count <= 16 && ['deletion', 'login'].includes(kind), 'Invalid fixture mail wait');
+      assert(owned(recipient) && count >= 1 && count <= 16 && ['deletion', 'login', 'first-passkey'].includes(kind), 'Invalid fixture mail wait');
       const end = Date.now() + 15_000;
       while (Date.now() < end) {
         const accepted = messages.filter((message) => message.recipient === recipient && message.accepted &&
-          (kind === 'login' ? message.kind === 'login' : message.kind === undefined));
+          (kind === 'deletion' ? message.kind === undefined : message.kind === kind));
         if (accepted.length >= count) return accepted[count - 1];
         await delay(50);
       }

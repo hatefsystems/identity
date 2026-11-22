@@ -128,6 +128,7 @@ type Deps struct {
 	// only deletion-specific authority, never Step-up or a new session.
 	AccountDeletionProofs AccountDeletionProofs
 	PasswordChangeProofs  AccountDeletionProofs
+	FirstPasskeyProofs    FirstPasskeyProofs
 	Passwords             *passwordmanager.Service
 	// Privacy serves anonymous recovery even when new deletion requests are off.
 	Privacy *privacy.Service
@@ -316,6 +317,9 @@ func (s *Server) registerRoutes() {
 	}
 	if s.deps.PasswordChangeProofs != nil {
 		s.registerPasswordChangeProofRoutes()
+	}
+	if s.deps.FirstPasskeyProofs != nil {
+		s.registerFirstPasskeyProofRoutes()
 	}
 	if s.deps.Passwords != nil {
 		s.registerPasswordRoutes()
