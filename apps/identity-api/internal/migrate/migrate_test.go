@@ -120,7 +120,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var count int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 46 {
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 47 {
 			t.Fatalf("final application table count: %d, %v", count, err)
 		}
 	})

@@ -32,6 +32,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
 
@@ -74,7 +75,7 @@ func newRealPasswordFixture(t *testing.T, enabled bool) *realPasswordFixture {
 	}
 	policy := accountpolicy.Policy{PasswordLoginEnabled: enabled, Usernames: f.names}
 	wa.SetAccountPolicy(policy)
-	_, keys := newTestStepUpService(t, q, nil, nil)
+	_, keys := newTestStepUpService(t, q, wa, f.factor)
 	grants, err := stepup.New(stepup.Config{Issuer: testStepUpIssuer, AccountState: f.accounts}, keys, q, wa, f.factor, f.replay)
 	if err != nil {
 		t.Fatal(err)
@@ -589,7 +590,7 @@ func TestPasswordHTTPProofEligibilityBindingsAndDeletionIsolationIntegration(t *
 			}
 			a := f.account(t, credential, totp)
 			if mode == "privileged" {
-				role := "password-fixture-" + uuid.NewString()
+				role := "password-" + uuid.NewString()
 				if _, err := db.New(f.pool).CreateRole(f.ctx, db.CreateRoleParams{ID: role, Description: "Fixture role"}); err != nil {
 					t.Fatal(err)
 				}
@@ -711,7 +712,7 @@ func TestPasswordHTTPPrivilegedRetainedPasskeyAndExactCreationBoundsIntegration(
 	f := newRealPasswordFixture(t, true)
 	a := f.account(t, "passkey_only", false)
 	auth := f.authenticator(t, a)
-	role := "password-boundary-fixture-" + uuid.NewString()
+	role := "password-" + uuid.NewString()
 	q := db.New(f.pool)
 	if _, err := q.CreateRole(f.ctx, db.CreateRoleParams{ID: role, Description: "Fixture role"}); err != nil {
 		t.Fatal(err)
@@ -753,9 +754,17 @@ func TestPasswordHTTPInadmissibleRetainedUsernameUnderUnchangedAuthorityIntegrat
 	if err := f.pool.QueryRow(f.ctx, `SELECT epoch FROM username_active_policy WHERE singleton`).Scan(&epoch); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(f.ctx, `UPDATE users SET username_details_encrypted=set_byte(username_details_encrypted,0,get_byte(username_details_encrypted,0)#255) WHERE id=$1`, a.user.ID); err != nil {
+	// A wrong decryptor makes retained evidence unreadable without bypassing
+	// the immutable username assignment or changing its policy authority.
+	names, err := username.NewStore(f.pool, phoneIntegrationCipher(t), f.names.Normalizer())
+	if err != nil {
 		t.Fatal(err)
 	}
+	mutations, err := passwordmanager.New(passwordmanager.Deps{DB: f.pool, Queries: db.New(f.pool), Sessions: f.manager, Limiter: f.limiter, Policy: accountpolicy.Policy{PasswordLoginEnabled: true, Usernames: names}, Proofs: f.proofs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.server.deps.Passwords = mutations
 	f.mutate(t, current, cookies, "change", "private inadmissible replacement", grant, "", 503)
 	f.assertState(t, a, a.user.AuthVersion, &a.secret)
 	var afterEpoch int64

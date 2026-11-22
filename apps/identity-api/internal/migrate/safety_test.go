@@ -232,7 +232,7 @@ func TestReadOnlyFreshStatusAndZeroRetry(t *testing.T) {
 	for _, run := range []func() error{
 		func() error { _, err := p.Up(ctx); return err },
 		func() error { _, err := p.UpTo(ctx, 1); return err },
-		func() error { _, err := p.DownTo(ctx, 7); return err },
+		func() error { _, err := p.DownTo(ctx, 8); return err },
 		func() error { _, err := p.Status(ctx); return err },
 	} {
 		if err := run(); err != nil {
@@ -666,7 +666,7 @@ func TestCompetingFreshMigratorsSerialize(t *testing.T) {
 		t.Fatal("no competing migrator completed successfully")
 	}
 	var count int
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 8 {
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 9 {
 		t.Fatalf("approved migrations not installed exactly once: %d, %v", count, err)
 	}
 	database.SetMaxOpenConns(1)
