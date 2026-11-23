@@ -72,6 +72,30 @@ func NewMFAEnrollmentEmail(from string, transport MessageSender) (*Email, error)
 	return email, nil
 }
 
+// NewContactChangeEmail selects action authorization, not new ownership copy.
+func NewContactChangeEmail(from string, transport MessageSender) (*Email, error) {
+	return newContactEmail(from, transport, PurposeContactChange)
+}
+
+// NewContactRemovalEmail selects removal-only authorization copy.
+func NewContactRemovalEmail(from string, transport MessageSender) (*Email, error) {
+	return newContactEmail(from, transport, PurposeContactRemove)
+}
+
+// NewContactOwnershipEmail never describes new-destination ownership as authority.
+func NewContactOwnershipEmail(from string, transport MessageSender) (*Email, error) {
+	return newContactEmail(from, transport, PurposeContactOwnership)
+}
+
+func newContactEmail(from string, transport MessageSender, purpose string) (*Email, error) {
+	email, err := NewEmail(from, transport)
+	if err != nil {
+		return nil, err
+	}
+	email.purpose = purpose
+	return email, nil
+}
+
 // SendCode submits one fixed-purpose message with exact code, recipient and deadline.
 // Ambiguous SMTP acceptance is returned as ErrOutcomeUnknown without retry.
 func (e *Email) SendCode(ctx context.Context, destination, code string, expiresAt time.Time) error {
@@ -93,6 +117,15 @@ func (e *Email) SendCode(ctx context.Context, destination, code string, expiresA
 	case PurposeMFAEnrollment:
 		subject = "Your authenticator enrollment code"
 		body = "Enter this code only in the browser where you requested an authenticator:\r\n%s\r\n\r\nThis code authorizes one authenticator enrollment start and expires at %s. It cannot disable an authenticator, sign you in, change your password, add a passkey, delete your account, verify a signup or change your contacts. If you did not request an authenticator, do not share or enter this code.\r\n"
+	case PurposeContactChange:
+		subject = "Your contact-change authorization code"
+		body = "Enter this code only in the browser where you requested a contact change:\r\n%s\r\n\r\nThis code authorizes one contact-change start and expires at %s. It cannot remove a contact, prove ownership of a new address, sign you in or verify a signup. If you did not request this change, do not share or enter this code.\r\n"
+	case PurposeContactRemove:
+		subject = "Your contact-removal authorization code"
+		body = "Enter this code only in the browser where you requested contact removal:\r\n%s\r\n\r\nThis code authorizes one contact removal and expires at %s. It cannot replace a contact, prove ownership of a new address, sign you in or verify a signup. If you did not request this removal, do not share or enter this code.\r\n"
+	case PurposeContactOwnership:
+		subject = "Verify your new contact email"
+		body = "Enter this code only in the browser where you requested this new contact email:\r\n%s\r\n\r\nThis code proves ownership of this exact new email address and expires at %s. It is not authorization to modify an account, remove a contact, sign in or verify a signup. If you did not request this address, do not share or enter this code.\r\n"
 	}
 	message := []byte(fmt.Sprintf("From: <%s>\r\nTo: <%s>\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n", e.from, destination, subject) + fmt.Sprintf(body, code, expiresAt.UTC().Format(time.RFC3339Nano)))
 	defer clear(message)

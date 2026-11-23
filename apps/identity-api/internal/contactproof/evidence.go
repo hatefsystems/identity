@@ -21,6 +21,7 @@ const (
 	Email     = "email"
 	Phone     = "phone"
 	EmailLink = "email_link"
+	EmailOTP  = "email_otp"
 	SMSOTP    = "sms_otp"
 	purpose   = "contact_verification_evidence:v1"
 )
@@ -55,7 +56,7 @@ func valid(e Evidence) bool {
 	if e.Purpose != purpose || e.AccountID == uuid.Nil || e.VerifiedAt.IsZero() || e.VerifiedAt.Year() < 1 || e.VerifiedAt.Year() > 9999 || !e.VerifiedAt.Equal(e.VerifiedAt.UTC().Truncate(time.Microsecond)) {
 		return false
 	}
-	return e.Channel == Email && e.Method == EmailLink && emailaddress.ValidCanonicalMailbox(e.Destination) ||
+	return e.Channel == Email && (e.Method == EmailLink || e.Method == EmailOTP) && emailaddress.ValidCanonicalMailbox(e.Destination) ||
 		e.Channel == Phone && e.Method == SMSOTP && phonePattern.MatchString(e.Destination)
 }
 

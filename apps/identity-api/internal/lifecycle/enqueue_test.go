@@ -217,3 +217,23 @@ func TestDisplayNameIntentAllocatesOnlyMetadataV2(t *testing.T) {
 		}
 	}
 }
+
+func TestEmailChangeIntentRetainsMetadataOnlyV1(t *testing.T) {
+	id, store := uuid.New(), &intentStore{revision: 6}
+	revision, err := lifecycle.EnqueueEmailChange(t.Context(), store, id, "active")
+	if err != nil || revision != 7 || store.advances != 1 || len(store.rows) != 1 {
+		t.Fatal("email change did not allocate exactly one revision and intent")
+	}
+	event, err := lifecycle.UnmarshalEvent([]byte(store.rows[0].Payload))
+	if err != nil || event.SchemaVersion != lifecycle.SchemaVersion || event.UserId != id.String() || event.GetRevision() != 7 || event.EventType != lifecycle.SubjectUpdated || len(event.ChangedFields) != 1 || event.ChangedFields[0] != "email" {
+		t.Fatal("email change rewrote existing metadata event contract")
+	}
+	for _, bad := range []*intentStore{{advance: errors.New("private recipient")}, {insert: errors.New("private recipient")}} {
+		if _, err := lifecycle.EnqueueEmailChange(t.Context(), bad, id, "active"); !errors.Is(err, lifecycle.ErrEnqueue) || strings.Contains(err.Error(), "recipient") {
+			t.Fatal("email event failure was hidden or leaked")
+		}
+	}
+	if _, err := lifecycle.EnqueueEmailChange(t.Context(), store, id, "suspended"); !errors.Is(err, lifecycle.ErrInvalidEvent) {
+		t.Fatal("ineligible email lifecycle producer accepted")
+	}
+}

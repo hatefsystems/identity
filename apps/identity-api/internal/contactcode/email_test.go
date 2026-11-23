@@ -170,3 +170,30 @@ func TestMFAEnrollmentEmailDistinctCopyAndExactDeadline(t *testing.T) {
 		t.Fatal("MFA enrollment SMTP uncertainty retried or hid outcome")
 	}
 }
+
+func TestContactEmailActionAndOwnershipCopyAreDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		newEmail         func(string, MessageSender) (*Email, error)
+		subject, meaning string
+	}{
+		{NewContactChangeEmail, "Your contact-change authorization code", "authorizes one contact-change start"},
+		{NewContactRemovalEmail, "Your contact-removal authorization code", "authorizes one contact removal"},
+		{NewContactOwnershipEmail, "Verify your new contact email", "is not authorization to modify an account"},
+	} {
+		t.Run(tc.subject, func(t *testing.T) {
+			transport := &captureMail{}
+			email, err := tc.newEmail("security@example.test", transport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expires := time.Now().UTC().Add(time.Minute).Truncate(time.Millisecond)
+			if err := email.SendCode(t.Context(), "owner@example.test", "000042", expires); err != nil {
+				t.Fatal(err)
+			}
+			message := string(transport.message)
+			if transport.calls != 1 || transport.recipient != "owner@example.test" || !transport.deadline.Equal(expires) || !strings.Contains(message, "Subject: "+tc.subject+"\r\n") || !strings.Contains(message, tc.meaning) || !strings.Contains(message, "000042\r\n") || !strings.Contains(message, expires.Format(time.RFC3339Nano)) || strings.Contains(message, "Subject: Your account sign-in code") || strings.Contains(message, "#token=") {
+				t.Fatal("contact email conflated purpose or changed exact code/deadline")
+			}
+		})
+	}
+}

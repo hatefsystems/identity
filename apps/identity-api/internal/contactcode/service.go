@@ -39,6 +39,12 @@ const (
 	PurposeFirstPasskey = "first_passkey_enrollment"
 	// PurposeMFAEnrollment authorizes only a pending TOTP enrollment start.
 	PurposeMFAEnrollment = "mfa_enrollment"
+	// PurposeContactChange authorizes a target-bound contact-change start only.
+	PurposeContactChange = "contact_change"
+	// PurposeContactRemove authorizes one target-bound contact removal only.
+	PurposeContactRemove = "contact_remove"
+	// PurposeContactOwnership proves a frozen new destination, never authority.
+	PurposeContactOwnership = "contact_ownership"
 )
 
 var (
@@ -75,6 +81,9 @@ type Config struct {
 	PasswordChangeEmail     Sender
 	FirstPasskeyEmail       Sender
 	MFAEnrollmentEmail      Sender
+	ContactChangeEmail      Sender
+	ContactRemovalEmail     Sender
+	ContactOwnershipEmail   Sender
 	HashKey                 []byte
 	CodeTTL                 time.Duration
 	MaxAttempts             int
@@ -114,6 +123,9 @@ type Record struct {
 	MaxAttempts    int
 	LockoutTTL     time.Duration
 	CodeHash       string
+	Action         string `json:",omitempty"`
+	Target         string `json:",omitempty"`
+	DestinationMAC string `json:",omitempty"`
 }
 
 // Budget preserves the existing SMS sliding-window spend representation.
@@ -176,6 +188,15 @@ func New(cfg Config, store Store, sms *smsotp.Service, email Sender) (*Service, 
 	}
 	if missing(cfg.MFAEnrollmentEmail) {
 		cfg.MFAEnrollmentEmail = nil
+	}
+	if missing(cfg.ContactChangeEmail) {
+		cfg.ContactChangeEmail = nil
+	}
+	if missing(cfg.ContactRemovalEmail) {
+		cfg.ContactRemovalEmail = nil
+	}
+	if missing(cfg.ContactOwnershipEmail) {
+		cfg.ContactOwnershipEmail = nil
 	}
 	cfg.HashKey = append([]byte(nil), cfg.HashKey...)
 	return &Service{cfg, store, sms, email}, nil
@@ -570,7 +591,13 @@ func validRecord(rec Record) bool {
 		contact, contactErr := hex.DecodeString(rec.ContactBinding)
 		purposeValid = validDeletionBinding(DeletionBinding{rec.AccountID, rec.AuthVersion, rec.SessionID, rec.JKT}) && contactErr == nil && len(contact) == 32 && hex.EncodeToString(contact) == rec.ContactBinding
 	}
-	return rec.AccountID != uuid.Nil && rec.AuthVersion >= 0 && purposeValid && validCapability(rec.JKT) && validCapability(rec.Operation) && validDestination(rec.Channel, rec.Destination) && !rec.ExpiresAt.IsZero() && rec.ExpiresAt.Equal(rec.ExpiresAt.Truncate(time.Millisecond)) && rec.MaxAttempts >= 1 && rec.MaxAttempts <= 3 && rec.LockoutTTL >= 15*time.Minute && rec.LockoutTTL <= 24*time.Hour && err == nil && len(raw) == 32 && hex.EncodeToString(raw) == rec.CodeHash
+	if rec.Purpose == PurposeContactChange || rec.Purpose == PurposeContactRemove || rec.Purpose == PurposeContactOwnership {
+		purposeValid = validContactRecord(rec)
+	} else if rec.Action != "" || rec.Target != "" || rec.DestinationMAC != "" {
+		purposeValid = false
+	}
+	destinationValid := validDestination(rec.Channel, rec.Destination) || rec.Purpose == PurposeContactOwnership && rec.Destination == ""
+	return rec.AccountID != uuid.Nil && rec.AuthVersion >= 0 && purposeValid && validCapability(rec.JKT) && validCapability(rec.Operation) && destinationValid && !rec.ExpiresAt.IsZero() && rec.ExpiresAt.Equal(rec.ExpiresAt.Truncate(time.Millisecond)) && rec.MaxAttempts >= 1 && rec.MaxAttempts <= 3 && rec.LockoutTTL >= 15*time.Minute && rec.LockoutTTL <= 24*time.Hour && err == nil && len(raw) == 32 && hex.EncodeToString(raw) == rec.CodeHash
 }
 
 func validDeletionBinding(binding DeletionBinding) bool {

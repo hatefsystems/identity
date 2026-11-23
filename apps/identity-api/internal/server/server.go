@@ -34,7 +34,6 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/recovery"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/registration"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
-	"github.com/hatefsystems/identity/apps/identity-api/internal/smsotp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/webauthn"
 )
@@ -101,11 +100,10 @@ type Deps struct {
 	// MFA drives the TOTP MFA setup, verification, and teardown routes
 	// at /api/v1/auth/mfa.
 	MFA *mfa.Service
-	// SMSOTP drives the SMS OTP phone-verification routes at
-	// /api/v1/users/me/phone. It requires both Redis (rate limiting + code
-	// store) and a database (persisting the verified phone), so when nil
-	// (no REDIS_URL/DATABASE_URL configured) those routes are not mounted.
-	SMSOTP *smsotp.Service
+	// Contacts owns the frozen-authority primary contact transaction boundary.
+	Contacts ContactManager
+	// ContactManagementProofs issues action/target-bound password-contact authority.
+	ContactManagementProofs ContactManagementProofs
 	// Recovery drives the recovery (backup) code routes at
 	// /api/v1/auth/recovery-codes and /api/v1/auth/mfa/verify-recovery-code. It
 	// requires a database, so when nil (no DATABASE_URL configured) those
@@ -296,10 +294,11 @@ func (s *Server) registerRoutes() {
 		s.registerMFARoutes()
 	}
 
-	// SMS OTP phone-verification routes are mounted when the service is
-	// provisioned (it requires Redis and a database).
-	if s.deps.SMSOTP != nil {
-		s.registerPhoneRoutes()
+	if s.deps.Contacts != nil {
+		s.registerContactRoutes()
+	}
+	if s.deps.ContactManagementProofs != nil {
+		s.registerContactProofRoutes()
 	}
 
 	// Recovery (backup) code routes are mounted when the service is

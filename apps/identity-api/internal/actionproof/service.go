@@ -50,7 +50,11 @@ type SessionReader interface {
 }
 
 // Config uses a separate keyed binding for complete verified-contact evidence.
-type Config struct{ BindingKey []byte }
+type Config struct {
+	BindingKey []byte
+	// ContactIssuanceEnabled defaults off; frozen authority readers do not.
+	ContactIssuanceEnabled bool
+}
 
 // Deps is the existing DB/contact delivery/crypto/rate/session infrastructure.
 type Deps struct {
@@ -64,9 +68,10 @@ type Deps struct {
 
 // Service neither issues sessions nor changes authentication/step-up evidence.
 type Service struct {
-	key    []byte
-	deps   Deps
-	policy accountpolicy.Policy
+	key             []byte
+	deps            Deps
+	policy          accountpolicy.Policy
+	contactIssuance bool
 }
 
 // New rejects missing protection; deletion channels remain independently enabled.

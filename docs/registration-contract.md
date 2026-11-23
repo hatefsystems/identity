@@ -14,6 +14,7 @@ It is not deployed acceptance, policy approval or authorization to execute the
 | Username increment        | Add one required username to that same flow, explicit advisory username validation, atomic reservation, and an authenticated read of the saved username or truthful absence. No contact choice, password, private-data editor or six-stage shell is activated by this increment.                                      |
 | Geography increment (T08/T09) | An independently imported immutable geography catalog, anonymous bounded reads, server snapshot validator and reusable bilingual selector. Registration requests, stages and completion remain unchanged. T10 encrypted storage and T34/T37 integration remain deferred. |
 | Existing-account MFA maintenance (T26) | Extend existing TOTP routes with a default-off, password/contact `mfa_enrollment` start proof and fresh strong-factor disable. No registration fields/stages, login policy, optional-MFA flag, management UI or other task status changes. |
+| Existing-account primary contacts (T27) | Unified normal-session email/phone maintenance, frozen strong or action/target-specific password-contact authorization and separate new-destination ownership. Present-email removal is temporarily refused pending independently verified T28/T41. No signup, backup-contact, notification or T38 UI changes. |
 | Deferred final target     | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
 
 Do not add a second registration implementation or versioned registration route.
@@ -97,6 +98,19 @@ protection. Enabled MFA still requires independently earned TOTP at normal-sessi
 boundaries, including UV-passkey sign-in. Signup proofs, receipt replay and `/result`
 cannot authorize or reconcile these maintenance mutations, and enrollment does not
 restamp an existing session as MFA-authenticated.
+
+T27's [primary-contact maintenance contract](api-design.md#primary-contact-maintenance-t27)
+is also separate from registration authority. A valid registration commit supplies
+durable destination provenance, not fresh action authority. Email/phone change and
+removal proofs are action/target-bound; new-destination ownership cannot authorize
+changing the account. Starts freeze original authorization and session deadlines,
+and final mutations consume only the matching ownership code before read-only
+locked revalidation. Fresh `email_otp` evidence is truthful and existing
+`email_link`/`sms_otp` readers remain valid. Signup codes/tokens/receipts and `/result`
+cannot authorize or reconcile maintenance, and no registration request or stage
+changes. Present-email removal remains operation-gated on T28/T41; already-NULL
+accounts are supported without fabricated email or verification. Implementation
+and verification evidence are separate from real delivery or release activation.
 
 ## Username Namespace
 

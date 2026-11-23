@@ -245,6 +245,18 @@ func run(logger *slog.Logger) (runErr error) {
 	if err != nil {
 		return err
 	}
+	contactService, contactProofService, err := buildContactMaintenance(cfg.Environment, pool, redisClient, sessionManager, smsotpService, protection)
+	if err != nil {
+		return err
+	}
+	var contactProofs server.ContactManagementProofs
+	if contactProofService != nil {
+		contactProofs = contactProofService
+	}
+	var contacts server.ContactManager
+	if contactService != nil {
+		contacts = contactService
+	}
 
 	// The recovery-code service reuses the WebAuthn database pool and, when
 	// present, the Redis client for its optional rate limits. When no database
@@ -341,39 +353,40 @@ func run(logger *slog.Logger) (runErr error) {
 		AdminRevoke: func(ctx context.Context, userID string) error {
 			return errors.Join(sessionManager.RevokeAllForUser(ctx, userID), refreshTokenStore.RevokeAllForUser(ctx, userID))
 		},
-		GRPCReady:              grpcReady,
-		AdminStore:             adminDeps.AdminStore,
-		LedgerProofDB:          pool,
-		RBAC:                   adminDeps.RBAC,
-		LegalHold:              adminDeps.LegalHold,
-		LegalWorkflow:          adminDeps.LegalWorkflow,
-		LegalReports:           adminDeps.LegalReports,
-		AdminLimiter:           adminDeps.AdminLimiter,
-		OIDC:                   oidcCfg,
-		Keys:                   keyManager,
-		Clients:                clientRegistry,
-		TokenService:           tokenService,
-		DPoPValidator:          dpopValidator,
-		SessionManager:         sessionManager,
-		Login:                  loginService,
-		PasswordLoginEnabled:   passwordLoginEnabled,
-		AccountDeletionProofs:  deletionProofs,
-		PasswordChangeProofs:   passwordProofs,
-		FirstPasskeyProofs:     firstProofs,
-		MFAEnrollmentProofs:    mfaEnrollmentProofs,
-		Passwords:              passwordService,
-		Profile:                profileService,
-		PrivateProfile:         privateProfileReader,
-		WebAuthn:               webauthnService,
-		WebAuthnLimiter:        webAuthnLimiter,
-		MFA:                    mfaService,
-		SMSOTP:                 smsotpService,
-		Recovery:               recoveryService,
-		RecoveryFlow:           recoveryFlow,
-		StepUp:                 stepupService,
-		Privacy:                privacyService,
-		PrivacyDeletionEnabled: privacyDeletionEnabled,
-		AuditRecorder:          auditRecorder,
+		GRPCReady:               grpcReady,
+		AdminStore:              adminDeps.AdminStore,
+		LedgerProofDB:           pool,
+		RBAC:                    adminDeps.RBAC,
+		LegalHold:               adminDeps.LegalHold,
+		LegalWorkflow:           adminDeps.LegalWorkflow,
+		LegalReports:            adminDeps.LegalReports,
+		AdminLimiter:            adminDeps.AdminLimiter,
+		OIDC:                    oidcCfg,
+		Keys:                    keyManager,
+		Clients:                 clientRegistry,
+		TokenService:            tokenService,
+		DPoPValidator:           dpopValidator,
+		SessionManager:          sessionManager,
+		Login:                   loginService,
+		PasswordLoginEnabled:    passwordLoginEnabled,
+		AccountDeletionProofs:   deletionProofs,
+		PasswordChangeProofs:    passwordProofs,
+		FirstPasskeyProofs:      firstProofs,
+		MFAEnrollmentProofs:     mfaEnrollmentProofs,
+		Passwords:               passwordService,
+		Contacts:                contacts,
+		ContactManagementProofs: contactProofs,
+		Profile:                 profileService,
+		PrivateProfile:          privateProfileReader,
+		WebAuthn:                webauthnService,
+		WebAuthnLimiter:         webAuthnLimiter,
+		MFA:                     mfaService,
+		Recovery:                recoveryService,
+		RecoveryFlow:            recoveryFlow,
+		StepUp:                  stepupService,
+		Privacy:                 privacyService,
+		PrivacyDeletionEnabled:  privacyDeletionEnabled,
+		AuditRecorder:           auditRecorder,
 	})
 
 	// Listen for OS termination signals to trigger graceful shutdown.
@@ -411,6 +424,21 @@ func run(logger *slog.Logger) (runErr error) {
 			maintainActionProofs(ctx, mfaEnrollmentProofService.CleanupExpiredMFAEnrollment, logger, "MFA enrollment proof cleanup unavailable")
 		}()
 	}
+	var contactCleanupDone chan struct{}
+	if contactService != nil {
+		contactCleanupDone = make(chan struct{})
+		go func() {
+			defer close(contactCleanupDone)
+			maintainActionProofs(ctx, func(ctx context.Context, batchSize int32) (int64, error) {
+				count, err := contactService.CleanupExpired(ctx, batchSize)
+				if err != nil || contactProofService == nil {
+					return count, err
+				}
+				proofCount, err := contactProofService.CleanupExpiredContacts(ctx, batchSize)
+				return count + proofCount, err
+			}, logger, "contact maintenance cleanup unavailable")
+		}()
+	}
 
 	// Run the server in a goroutine so we can wait on the signal context.
 	serverErr := make(chan error, 2)
@@ -440,6 +468,9 @@ func run(logger *slog.Logger) (runErr error) {
 	if mfaProofCleanupDone != nil {
 		<-mfaProofCleanupDone
 	}
+	if contactCleanupDone != nil {
+		<-contactCleanupDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
@@ -465,6 +496,10 @@ func validateStartupInputs(cfg config.Config) error {
 		return err
 	}
 	mfaProofCfg, err := config.LoadMFAEnrollmentProofs(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	contactCfg, err := config.LoadContactManagement(cfg.Environment)
 	if err != nil {
 		return err
 	}
@@ -499,9 +534,12 @@ func validateStartupInputs(cfg config.Config) error {
 	if mfaProofCfg.Enabled && (!loginCfg.Enabled || !usernameCfg.Enabled) {
 		return errors.New("main: MFA enrollment proofs require usable admitted username password login")
 	}
+	if contactCfg.ProofsEnabled && (!loginCfg.Enabled || !usernameCfg.Enabled) {
+		return errors.New("main: contact management proofs require usable admitted username password login")
+	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled || firstProofCfg.Enabled || len(mfaProofCfg.BindingKey) > 0 {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled || firstProofCfg.Enabled || len(mfaProofCfg.BindingKey) > 0 || len(contactCfg.BindingKey) > 0 || len(contactCfg.CodeKey) > 0 {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}
@@ -985,6 +1023,10 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 	if err != nil {
 		return nil, err
 	}
+	contactChangeSender, contactRemovalSender, err := buildContactSMSSenders(environment)
+	if err != nil {
+		return nil, err
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
 		CodeTTL:              smsCfg.CodeTTL,
@@ -1001,6 +1043,8 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		PasswordChangeSender: passwordChangeSender,
 		FirstPasskeySender:   firstPasskeySender,
 		MFAEnrollmentSender:  mfaEnrollmentSender,
+		ContactChangeSender:  contactChangeSender,
+		ContactRemovalSender: contactRemovalSender,
 	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)

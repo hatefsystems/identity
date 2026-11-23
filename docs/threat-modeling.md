@@ -140,6 +140,41 @@ ordinary login/current-state inspection, not automatic replay or reconciliation.
   * *Description:* A security change removes the only proven contact, or treats a populated legacy email/phone/backup field as verified recovery authority.
   * *Mitigation:* Phone replacement/removal validates encrypted evidence against the exact account, contact kind and current canonical contact under the shared account lock. An evidenced phone may be removed only when matching verified primary-email evidence survives; otherwise `last_verified_contact`. A populated backup address, verification-looking timestamp or legacy payload without matching evidence is not proof. Corrupt/misbound evidence fails closed rather than becoming absence. Phone ciphertext, blind index and evidence change together, with one auth-version increment for actual changes and none for absent-phone no-ops. This contact-preservation rule is separate from primary-login/factor policy and does not enable SMS/email sign-in.
 
+T27 separates old-contact authorization from new-destination ownership. Eligible
+password-only fallback needs usable admitted username/password login, no enabled
+or configured independent MFA and no role membership. Its fresh password plus OTP
+to an exactly evidenced server-selected contact yields only change/removal and
+email/phone-target authority. New ownership, signup/login/recovery and other action
+proofs cannot cross this boundary. Strong grants retain their existing shared
+single-use contract; only genuinely earned UV or enrolled TOTP is admitted.
+
+One contact manager freezes account/SID/JKT/version, original target evidence and
+the earliest original authorization/channel/session deadline in encrypted pending
+state. Prepared code and SQL pending state share one digest handle. Shared quota
+reservation precedes the final pending/live-authority check immediately before
+provider submission; no SQL lock spans transport I/O. Replacement/revocation
+detected at that check sends nothing. Already-admitted external sends can race a
+later change, but final locked validation rejects stale ownership. Redis holds a
+keyed destination binding, not the plaintext new pending destination. Foreign
+bindings are rejected before legitimate attempt consumption.
+
+Finish spends ownership once and revalidates frozen authority read-only. Contact
+write, exact `email_otp`/`sms_otp` evidence, pending consumption and one auth-version
+cutoff commit atomically; an actual email value change adds one metadata-only
+email lifecycle update. Same-value fresh provenance is a security change. Missing
+evidence stays unknown, corrupt evidence cannot authorize or survive, and deliberate
+repair needs independent valid authority plus new exact ownership. Known committed
+outcomes survive renewal failure; unknown SQL/Redis/provider acknowledgement
+exposes no tentative handle/success and never refunds or automatically retries.
+
+Present-email removal is temporarily refused at the operation boundary until T28
+alternative recovery identification and T41 email-absent notification/deletion/reclaim
+are independently implemented and verified. Backup recipients or raw username bytes
+do not bypass it. Already-absent email remains valid; no schema mandatory-email
+rule or operator bypass is added. Disabled issuance retains finite code/proof readers,
+keys and frozen budgets through original deadlines, and durable `email_otp` evidence
+readers/envelope keys remain necessary for as long as stored evidence needs them.
+
 ### 2.3 Repudiation (Denying Actions)
 
 * **Threat R1: Admin Denies Performing Unauthorized Account Ban or Deletion**
@@ -182,7 +217,7 @@ ordinary login/current-state inspection, not automatic replay or reconciliation.
   * *Description:* A valid short-lived grant or still-valid TOTP code is replayed against multiple high-risk operations or replicas.
   * *Mitigation:* Grants are signed, session/version/JKT-bound, short-lived, and single-use, not action-scoped; each consumer checks its required actually earned factor. Production replicas share a Redis replay guard that performs atomic `SET NX` for the remaining lifetime under an HMAC-SHA-256-derived opaque key. TOTP-to-grant exchanges use the same guard for their validity window. Redis errors fail closed, and all replicas use the same `STEPUP_REPLAY_HMAC_KEY`; mixed-key rolling rotation is prohibited because it would create disjoint replay domains.
 
-Only the new T26 password/contact proof is purpose-specific `mfa_enrollment`. Fresh
+The T26 password/contact proof is purpose-specific `mfa_enrollment`. Fresh
 password verification and exact protected canonical-contact evidence are required
 before delivery and rechecked at issuance/start/confirmation; populated contacts,
 available factors or an old login do not confer fresh authority. Eligibility is

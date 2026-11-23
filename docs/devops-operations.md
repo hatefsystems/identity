@@ -183,6 +183,79 @@ toolchains. Historical acceptance remains unchanged and is not T26 evidence.
 Real email/SMS receipt, physical-authenticator use, independent Persian security
 wording review and deployed-ingress acceptance remain separately unverified.
 
+## Primary Contact Maintenance (T27)
+
+This is an existing-account API extension only. Backup contacts, registration,
+login/recovery redesign, notifications and the T38 UI remain separate. Present
+primary-email removal is refused with `email_removal_unavailable` until actual
+T28 alternative recovery identification and T41 email-absent notification/deletion/
+reclaim capabilities are independently implemented and verified. There is no
+mandatory-email schema invariant, operator bypass or T27 dependency activation.
+
+Password-contact issuance defaults off through `CONTACT_MANAGEMENT_PROOFS_ENABLED`
+and independently selected `CONTACT_MANAGEMENT_PROOFS_EMAIL_ENABLED` /
+`CONTACT_MANAGEMENT_PROOFS_SMS_ENABLED`. It requires usable enabled supported
+password login and already-admitted immutable username authority, an active
+nondeleted password-only account, no enabled/configured independent MFA and no role
+membership. New-email ownership is independently opt-in through
+`CONTACT_MANAGEMENT_EMAIL_OWNERSHIP_ENABLED`. Strong phone ownership remains under
+existing `SMS_ENABLED`; removal/read need no delivery provider.
+
+Use a dedicated base64 32..64-byte `CONTACT_MANAGEMENT_BINDING_KEY`, distinct from
+all code/other proof keys. Proof/email issuance uses shared `LOGIN_CODE_HMAC_KEY`.
+Strong SMS ownership without that key derives its code key from the existing
+`SMS_OTP_HASH_PEPPER` with fixed domain separation, not a new operator secret.
+Do not switch key sources or rotate either key while live records require their
+original reader. Retain configured binding/code/SMS keys with issuance off; pending
+records preserve original expiry, attempt and lockout policy independently of
+provider switches. Selected email delivery uses verified-TLS `LOGIN_SMTP_*` and
+distinct change/removal/ownership copy. SMS action delivery requires explicit
+positive `CONTACT_CHANGE_SMS_IR_TEMPLATE_ID` and
+`CONTACT_REMOVAL_SMS_IR_TEMPLATE_ID`, distinct from each other and all existing
+purpose templates. New phone ownership keeps the existing ownership template.
+UI locale does not choose provider templates or create notification negotiation.
+
+Additive forward-only `00011_contact_management.sql` follows the unchanged
+00001..00010 lineage. Runtime proof and pending tables
+`contact_management_action_proofs` / `contact_change_attempts` require only
+`SELECT, INSERT, DELETE`, never generic `UPDATE` or `TRUNCATE`. Public authority is
+digest-only and the exact pending destination is account/attempt/target/authorization
+bound encrypted data. Bounded SQL cleanup is required independently of native
+Redis expiry. No password, OTP, token, handle, recipient or evidence ciphertext
+belongs in diagnostics or browser artifacts.
+The reviewed `tools/docker/contact-management.sql` fragment takes the existing
+restricted `runtime_role` through psql identifier quoting; it creates no role,
+activates no provider and changes no unrelated table privilege. Its application
+requires separate authorization and verification of effective inherited grants.
+
+Rollout and rollback guidance is documentation, not authorization to deploy,
+migrate/write shared databases, activate policies, reset data or install templates:
+
+1. Inventory actual pending work and quiesce old phone-maintenance writers before
+   switching to frozen-binding writers. Preserve original clocks; do not assume a
+   legacy population, infer provenance, backfill records or run destructive Down.
+2. Separately admit additive schema/restricted grants and deploy `email_otp`-capable
+   durable evidence readers before enabling any new email ownership writer. Keep
+   password-proof issuance and email ownership default-off until their actual
+   policy/key/provider/template/budget prerequisites are approved and verified.
+3. Starts consume authority once before pending commit, reserve shared quotas and
+   revalidate exact pending/live state immediately before one send. Submission is
+   not receipt. Unknown commit/dispatch/activation returns `outcome_unknown` without
+   a tentative handle, refund, automatic retry or reconciliation system.
+4. To stop issuance or sending, retain bounded proof/code/pending readers, keys,
+   Redis policy, sessions and current account-policy validation through all
+   inventoried original deadlines. Final validation must not require an enabled
+   sending provider or extend pending expiry during renewal/cleanup.
+5. Rollback binaries must retain durable `email_otp` readers and compatible envelope
+   keys as long as any stored evidence requires them. Expired/cleaned pending work
+   does not make an old method-rejecting binary safe. Never relabel or rewrite
+   provenance, restore spent authority or run old unbound writers against new work.
+
+Local automated gate results belong in the delivery record; configuration/test
+source does not establish a pass. Real email/SMS receipt, physical authenticators,
+independent Persian security wording review and deployed-ingress/log-redaction
+acceptance remain separately unverified. T28/T41 activation remains blocked.
+
 ## Geography Catalog (T08/T09)
 
 The catalog is an independent operator import and anonymous read boundary, not

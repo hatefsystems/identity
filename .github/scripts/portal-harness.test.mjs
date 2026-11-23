@@ -1141,9 +1141,9 @@ test('integration runner executes the exact uncached mandatory inventory seriall
   assert.equal(state.children.length, integrationTargets.length);
   assert.deepEqual(state.children.map((child) => child.target), integrationTargets.map((target) => `identity-api:${target}`));
   const portal = report.results.at(-1);
-  assert.equal(portal.packages, 20);
+  assert.equal(portal.packages, 21);
   assert.equal(portal.skipped, 0);
-  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/passwordmanager`, tests: ['TestOwnedFixture'] });
+  assert.deepEqual(portal.packageEvidence.at(-1), { package: `${identityGoModule}/internal/contactmanager`, tests: ['TestOwnedFixture'] });
   assert.equal(state.maximumActive, 1);
   assert.equal(state.active, 0);
   assert.equal(state.terminated.length, 0);
@@ -1154,7 +1154,7 @@ test('integration runner executes the exact uncached mandatory inventory seriall
 });
 
 test('portal integration rejects missing, duplicate, empty or skipped username and login evidence', async (t) => {
-  for (const expected of ['internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof', 'internal/passwordmanager'])
+  for (const expected of ['internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof', 'internal/passwordmanager', 'internal/contactmanager'])
   for (const kind of ['missing', 'duplicate', 'empty', 'skipped']) await t.test(expected + '-' + kind, async (t) => {
     const state = mockIntegrationRunner(t, { output(child) {
       for (const name of integrationPackages['test-portal-integration']) {
@@ -2125,6 +2125,31 @@ test('supervised log diagnostics report only fixed categories and field names', 
   assert.deepEqual(privateLogSummary('ordinary service message', values), { matches: 0, kinds: {}, fields: [] });
 });
 
+test('numeric secrets cannot exempt anything except the generated slog clock prefix', () => {
+  const clock = '2026-11-23T17:24:56.123456+03:30';
+  const generated = JSON.stringify({ time: clock, level: 'INFO', msg: 'worker stopped' });
+  assert.deepEqual(privateLogSummary(generated, ['123456']), { matches: 0, kinds: {}, fields: [] });
+  assert.equal(privateLogSummary(generated, [clock]).matches, 1);
+  for (const text of [
+    JSON.stringify({ time: clock, level: 'INFO', msg: 'code 123456' }),
+    JSON.stringify({ time: clock, level: 'INFO', msg: 'stopped', error: 'code 123456' }),
+    JSON.stringify({ time: clock, level: 'INFO', msg: 'stopped', payload: { time: clock } }),
+    JSON.stringify({ time: '123456', level: 'INFO', msg: 'stopped' }),
+    JSON.stringify({ time: '2026-11-23T17:24:56.123456', level: 'INFO', msg: 'stopped' }),
+    JSON.stringify({ time: clock, level: 'unexpected', msg: 'stopped' }),
+    JSON.stringify({ timestamp: clock, level: 'INFO', msg: 'stopped' }),
+    JSON.stringify({ time: clock, level: 'INFO', msg: null }),
+    `{"time":"${clock}","level":"INFO","msg":`,
+    `{"time":"${clock}","level":"INFO","msg":"`,
+    JSON.stringify({ time: '2026-02-31T17:24:56.123456Z', level: 'INFO', msg: 'stopped' }),
+    JSON.stringify({ time: '2026-02-29T17:24:56.123456Z', level: 'INFO', msg: 'stopped' }),
+    `time=${clock}`,
+    `{"time":"${clock}","level":"INFO","msg":"123456","msg":"stopped"}`,
+    `{"time":"${clock}","level":"INFO","msg":"stopped","time":"123456"}`,
+  ]) assert.equal(privateLogSummary(text, ['123456']).matches, 1);
+  assert.equal(privateLogSummary(`${generated}\n${JSON.stringify({ time: clock, level: 'ERROR', msg: '123456' })}\n`, ['123456']).matches, 1);
+});
+
 test('destructive ledger fixtures retire only a healthy, drained, cleanly exited signer', () => {
   const harness = readFileSync(new URL('./portal-harness.mjs', import.meta.url), 'utf8');
   const stop = harness.slice(harness.indexOf('const stopSignerForDestructiveFixtures'), harness.indexOf('const setLegalLookup'));
@@ -2209,6 +2234,7 @@ test('portal integration cannot silently omit real dependencies or run in parall
     './internal/login',
     './internal/actionproof',
     './internal/passwordmanager',
+    './internal/contactmanager',
   ]) {
     assert(
       target.options.command.includes(contract),
@@ -2219,9 +2245,9 @@ test('portal integration cannot silently omit real dependencies or run in parall
     'internal/profile', 'internal/privacy', 'internal/session', 'internal/server', 'internal/webauthn',
     'internal/recovery', 'internal/stepup', 'internal/oidc/dpop', 'internal/oidc/token', 'internal/lifecycle',
     'internal/identitygrpc', 'internal/oidc/clientauth', 'internal/mfa', 'internal/smsotp',
-    'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof', 'internal/passwordmanager',
+    'internal/registration', 'internal/username', 'internal/contactcode', 'internal/login', 'internal/actionproof', 'internal/passwordmanager', 'internal/contactmanager',
   ]);
-  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login','\.\/internal\/actionproof','\.\/internal\/passwordmanager'\]/);
+  assert.match(target.options.command, /'\.\/internal\/registration','\.\/internal\/username','\.\/internal\/contactcode','\.\/internal\/login','\.\/internal\/actionproof','\.\/internal\/passwordmanager','\.\/internal\/contactmanager'\]/);
 });
 
 test('TOTP browser response deadlines begin after factor rollover and before submission', () => {

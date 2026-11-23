@@ -170,7 +170,23 @@ export function anonymousReclaim(path, method) {
 export function privateLogSummary(text, secrets) {
   const contains = (source, value) => source.includes(value) || source.includes(encodeURIComponent(value)) ||
     source.includes(JSON.stringify(value).slice(1, -1));
-  const matches = [...new Set(secrets)].filter((value) => typeof value === 'string' && value && contains(text, value));
+  // Only the generated slog clock prefix is technical data. Preserve all other
+  // bytes, including duplicate fields, and never exempt nonnumeric markers.
+  const clockPrefix = /^(\{"time":)"(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))"(,"level":"(?:DEBUG|INFO|WARN|ERROR)","msg":")/;
+  const withoutClock = text.split('\n').map((line) => {
+    try {
+      const record = JSON.parse(line);
+      if (!record || typeof record !== 'object' || Array.isArray(record)) return line;
+      const match = clockPrefix.exec(line);
+      if (!match) return line;
+      const day = match[2].slice(0, 10);
+      const date = new Date(`${day}T00:00:00Z`);
+      if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== day) return line;
+      return line.replace(clockPrefix, '$1"[service-clock]"$3');
+    } catch { return line; }
+  }).join('\n');
+  const matches = [...new Set(secrets)].filter((value) => typeof value === 'string' && value &&
+    contains(/^[0-9]+$/.test(value) ? withoutClock : text, value));
   const kinds = {};
   for (const value of matches) {
     const kind = /^[0-9]+$/.test(value) ? 'numeric' : canonicalUUID(value) ? 'reference'

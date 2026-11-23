@@ -32,6 +32,18 @@ function reports(kind) {
   });
 }
 
+test('contact maintenance requires its own integration inventory and race evidence', () => {
+  assert.equal(integrationPackages['test-portal-integration'].filter((name) => name === 'internal/contactmanager').length, 1);
+  assert.equal(racePackages.filter((name) => name === './internal/contactmanager').length, 1);
+  const cells = reports('race');
+  const index = cells.findIndex((cell) => cell.results[0].target === 'identity-api:./internal/contactmanager');
+  const substituted = structuredClone(cells);
+  substituted[index].results[0].packageEvidence[0].package = `${identityGoModule}/internal/smsotp`;
+  assert.throws(() => aggregateReports(substituted, 'race', identity));
+  cells.splice(index, 1);
+  assert.throws(() => aggregateReports(cells, 'race', identity), /exactly the allowlisted reports/);
+});
+
 test('geography remains a distinct required integration and race cell with no substituted portal evidence', () => {
   assert.deepEqual(integrationPackages['test-geography-integration'], ['internal/geography']);
   assert(racePackages.includes('./internal/geography'));

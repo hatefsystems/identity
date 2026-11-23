@@ -79,7 +79,7 @@ return 1
 
 // Reserve atomically admits all spend/capacity dimensions and stores an inactive proof.
 func (s *RedisStore) Reserve(ctx context.Context, rec Record, budgets []Budget, lockKey string, capacity int) error {
-	if !validRecord(rec) || len(budgets) < 1 || len(budgets) > 8 || capacity < 1 || capacity > 10000 || !validKey(lockKey) {
+	if !validRecord(rec) || len(budgets) < 1 || len(budgets) > 9 || capacity < 1 || capacity > 10000 || !validKey(lockKey) {
 		return ErrInvalid
 	}
 	keys := []string{challengePrefix + rec.Operation, capacityKey, lockKey}

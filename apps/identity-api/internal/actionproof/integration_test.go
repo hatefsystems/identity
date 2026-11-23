@@ -84,6 +84,7 @@ type realProofFixture struct {
 	delivery *captureDelivery
 	sess     session.Session
 	user     db.User
+	client   *redis.Client
 }
 
 func newRealProofFixture(t *testing.T) realProofFixture {
@@ -293,7 +294,7 @@ func newRealProofFixtureFor(t *testing.T, purpose string) realProofFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return realProofFixture{ctx: ctx, pool: pool, runtime: runtimePool, service: svc, sessions: sessions, delivery: delivery, sess: sess, user: u}
+	return realProofFixture{ctx: ctx, pool: pool, runtime: runtimePool, service: svc, sessions: sessions, delivery: delivery, sess: sess, user: u, client: client}
 }
 
 func (f realProofFixture) challenge(t *testing.T) (string, time.Time) {
@@ -778,7 +779,7 @@ func TestAccountDeletionProofSchemaCleanupAndForwardOnlyIntegration(t *testing.T
 	if _, err := provider.ApplyVersion(f.ctx, 7, false); err == nil {
 		t.Fatal("forward-only proof migration allowed rollback")
 	}
-	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 10 {
+	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 11 {
 		t.Fatal("forward-only refusal changed final lineage")
 	}
 }

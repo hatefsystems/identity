@@ -30,7 +30,7 @@ func TestEvidenceExactBindingAndOriginalTime(t *testing.T) {
 	cipher, id := proofCipher(t), uuid.New()
 	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
 	for _, tc := range []struct{ channel, destination, method string }{
-		{Email, "person@example.test", EmailLink}, {Phone, "+989123456789", SMSOTP},
+		{Email, "person@example.test", EmailLink}, {Email, "person@example.test", EmailOTP}, {Phone, "+989123456789", SMSOTP},
 	} {
 		blob, err := Seal(t.Context(), cipher, id, tc.channel, tc.destination, tc.method, at)
 		if err != nil {
@@ -79,5 +79,27 @@ func TestEvidenceAbsentUnreadableAndCrossPurpose(t *testing.T) {
 	}
 	if e, err := Open(t.Context(), cipher, blob, id, Email, "person@example.test"); e != nil || !errors.Is(err, ErrInvalid) {
 		t.Fatal("cross-purpose evidence accepted")
+	}
+}
+
+func TestEmailOTPMethodCannotBeRelabeledOrUsedForPhone(t *testing.T) {
+	cipher, id := proofCipher(t), uuid.New()
+	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	for _, tc := range []struct{ channel, destination, method string }{
+		{Phone, "+989123456789", EmailOTP}, {Email, "owner@example.test", SMSOTP}, {Email, "owner@example.test", "otp"},
+	} {
+		if _, err := Seal(t.Context(), cipher, id, tc.channel, tc.destination, tc.method, at); err != ErrInvalid {
+			t.Fatal("untruthful channel/method evidence admitted", err)
+		}
+	}
+	blob, err := Seal(t.Context(), cipher, id, Email, "owner@example.test", EmailOTP, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		e, err := Open(t.Context(), cipher, blob, id, Email, "owner@example.test")
+		if err != nil || e == nil || e.Method != EmailOTP || !e.VerifiedAt.Equal(at) {
+			t.Fatal("durable evidence read renewed time or fabricated link method", err)
+		}
 	}
 }

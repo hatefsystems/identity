@@ -102,7 +102,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"deletion_notifications", "registration_attempts",
 			"username_policy_artifacts", "username_lookup_keys", "username_active_policy",
 			"geography_catalogs", "geography_types", "geography_places", "geography_place_versions", "geography_catalog_state",
-			"private_profile", "contact_verification_evidence", "account_deletion_action_proofs", "password_change_action_proofs", "first_passkey_enrollment_action_proofs", "mfa_enrollment_action_proofs",
+			"private_profile", "contact_verification_evidence", "account_deletion_action_proofs", "password_change_action_proofs", "first_passkey_enrollment_action_proofs", "mfa_enrollment_action_proofs", "contact_management_action_proofs", "contact_change_attempts",
 		}
 		for _, table := range tables {
 			var exists bool
@@ -120,7 +120,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 		}
 		var count int
 		if err := sqldb.QueryRowContext(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 49 {
+			WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&count); err != nil || count != 51 {
 			t.Fatalf("final application table count: %d, %v", count, err)
 		}
 	})
@@ -142,6 +142,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"password_change_action_proofs_expiry",
 			"first_passkey_enrollment_action_proofs_expiry",
 			"mfa_enrollment_action_proofs_expiry",
+			"contact_management_action_proofs_expiry", "contact_change_attempts_expiry", "contact_change_attempts_current",
 		}
 		for _, index := range indexes {
 			var exists bool
@@ -166,7 +167,7 @@ func TestInitialSchemaMigration(t *testing.T) {
 			"legal_governance_baseline": 0, "legal_governance_policies": 0, "event_outbox": 0, "registration_attempts": 0,
 			"username_policy_artifacts": 0, "username_lookup_keys": 0, "username_active_policy": 1,
 			"geography_catalogs": 0, "geography_types": 0, "geography_places": 0, "geography_place_versions": 0, "geography_catalog_state": 1,
-			"private_profile": 0, "contact_verification_evidence": 0, "account_deletion_action_proofs": 0, "password_change_action_proofs": 0, "first_passkey_enrollment_action_proofs": 0, "mfa_enrollment_action_proofs": 0} {
+			"private_profile": 0, "contact_verification_evidence": 0, "account_deletion_action_proofs": 0, "password_change_action_proofs": 0, "first_passkey_enrollment_action_proofs": 0, "mfa_enrollment_action_proofs": 0, "contact_management_action_proofs": 0, "contact_change_attempts": 0} {
 			var count int
 			if err := sqldb.QueryRowContext(ctx, "SELECT count(*) FROM public."+table).Scan(&count); err != nil || count != want {
 				t.Fatalf("%s reference seed boundary: %d, want %d, %v", table, count, want, err)

@@ -280,6 +280,7 @@ jobs:
           - { package: './internal/actionproof', artifact: actionproof }
           - { package: './internal/passwordmanager', artifact: passwordmanager }
           - { package: './internal/webauthn', artifact: webauthn }
+          - { package: './internal/contactmanager', artifact: contactmanager }
     steps:
       - uses: actions/checkout@v7
         with:

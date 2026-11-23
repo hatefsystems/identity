@@ -239,6 +239,89 @@ retrieval endpoint. The sole pre-handler DPoP nonce retry above remains distinct
 - `POST /api/v1/auth/recovery-codes/generate`: Generates a new batch of one-time backup codes (stored securely in PostgreSQL hashed via **SHA-256** to prevent CPU Denial of Service during validation). Requires Step-up authentication in `X-Step-Up-Auth`: a fresh batch is a set of long-lived bypasses for every other factor, so minting one must cost a re-asserted strong factor. This is not circular, because a recovery code cannot itself satisfy Step-up.
 - `GET /api/v1/auth/recovery-codes/status`: Returns only `{"remaining":10,"low":false}`. Generation returns `{"codes":["..."],"count":10}` once and atomically invalidates every previous code. There is no GET endpoint for previous plaintext batches. A lost generation response may mean replacement committed; require explicit new generation and fresh step-up rather than replaying/caching the old response.
 
+#### Primary Contact Maintenance (T27)
+
+T27 manages primary email and phone through the normal authenticated cookie,
+exact Origin, DPoP/JKT and session-intent boundary. It does not change registration,
+backup contacts, login/recovery, notifications or the T38 management UI.
+
+| Operation | Exact request / authority | Successful response |
+|---|---|---|
+| `GET /api/v1/users/me/contacts` | Empty body/query; neither authority header | `{email,phone}`; each is `null` or `{value,verified,verified_at}` from one snapshot |
+| `POST /api/v1/auth/action-proofs/contact-change/challenge` | `{password,channel,target}`; `channel` is `email`/`sms`, `target` is `email`/`phone`; neither authority header | `202 {challenge,expires_at}` after one old-contact delivery attempt |
+| `POST /api/v1/auth/action-proofs/contact-removal/challenge` | Same fields, removal-only purpose; neither authority header | Same `202` shape; present-email removal is refused before avoidable password work/delivery |
+| Corresponding action-proof `/verify` routes | `{challenge,code}`; neither authority header | `200 {action_proof,expires_at}` with the original deadline and frozen action/target |
+| `POST /api/v1/users/me/phone/send-code` or `/email/send-code` | `{phone}` or `{email}`; exactly one fresh `X-Step-Up-Auth` OR matching change `X-Action-Proof` | `200 {status:"sent",verification_id,expires_at}` only after known pending commit and code submission/activation |
+| Corresponding contact `/verify` routes | `{verification_id,code}`; neither authority header or replacement destination | `200 {status:"verified"}` and committed security-invalidation metadata |
+| `DELETE /api/v1/users/me/phone` or `/email` | Empty body/query; exactly one fresh strong grant OR matching removal proof | Empty `204`; real changes invalidate authority, authorized absent-contact no-ops do not |
+
+JSON is bounded to 8192 bytes of valid UTF-8, with required string fields and no
+duplicates, unknown/null fields, trailing document or query. All public handles
+are canonical unpadded base64url encodings of 32 random bytes; codes are exactly
+six ASCII digits, including leading zeros. Mixed, duplicate, empty, comma-joined,
+oversized and misplaced authority headers fail before consumption. Destination
+canonicalization and the current Iranian SMS.ir destination policy are checked
+before spending strong authority. Maintenance does not add signup-only aliases.
+No failed authorization mechanism falls back to another one.
+
+Strong authority must be genuinely earned WebAuthn UV (`hwk` AND `user`) or enrolled
+TOTP (`otp`). Shared grants remain single-use and session/version/JKT-bound, not
+action-scoped. The default-off password/contact alternative requires fresh exact
+password verification, an active nondeleted nonprivileged password-only account,
+no enabled/configured independent MFA, usable enabled supported password login
+and an admitted immutable username. Any role membership excludes this fallback,
+even with administrative HTTP disabled. The server selects only a current contact
+with complete matching protected evidence. Signup authority, unverified populated
+contacts and separately verified new destinations cannot authorize modification.
+
+The contact manager owns the deciding READ COMMITTED transaction under the current
+username guard, account mutex and user-row lock. Start spends the matching SQL
+proof once or freezes the already-spent strong grant; it changes no contact,
+auth version or lifecycle revision. Pending state encrypts the exact destination
+with account/attempt/target/authorization binding and stores only digest handles.
+Post-commit sending reserves shared quotas, then immediately rechecks the exact
+pending attempt and nonrenewing live session/version/evidence before submission,
+without holding SQL locks during provider I/O. Detected revocation or replacement
+forbids submission and handle release. A change after this final check may race an
+already-admitted external send, but its code cannot authorize a stale mutation.
+
+Ownership has distinct `contact_ownership` purpose and is not a bearer action
+proof. Finish consumes only the frozen new-destination code once, then read-only
+revalidates frozen authorization; it neither redeems the spent start proof nor
+requires a second grant. Its deadline is the earliest original authorization,
+at-most-three-minute channel ceiling and captured/live session idle/absolute
+limit, rounded down without renewal, lock-wait or retry extension. Foreign
+account/session/JKT/target attempts do not burn legitimate code budgets.
+
+Contact values are saved before fresh exact evidence so the invalidation trigger
+cannot erase the new provenance. Evidence records the successful server ownership
+verification instant, at UTC microsecond precision, with truthful `email_otp` or
+`sms_otp` method; existing `email_link` evidence remains readable. A real value or
+provenance change advances auth version once, including deliberate same-value
+reverification. A real primary-email value change also advances lifecycle revision
+once and enqueues one metadata-only `email` update; phone/evidence-only changes do
+not. Existing credentials, immutable identity, last evidenced primary contact and
+privileged/MFA protection remain preserved. Backup fields and timestamps alone
+are not survivors. Missing provenance is unknown, not fabricated; independent
+strong authority plus fresh exact ownership can repair target provenance.
+
+**Temporary email-removal gate:** removing a present primary email returns
+`409 {error:"email_removal_unavailable"}`, including when verified phone, username
+or a backup address exists. T28 alternative recovery identification and T41
+email-absent notification/deletion/reclaim compatibility are not implemented by
+T27. This is an operation refusal, not a mandatory-email schema/shared invariant
+or bypass switch: existing email-absent accounts and authorized absent-email
+removal remain supported.
+
+Known start/no-op commits use `session.OutcomeCommitted`; security changes use
+`session.SecurityChangeCommitted`. Unknown dispatch/activation/commit returns
+bounded `503 {error:"outcome_unknown"}` without tentative handle, evidence,
+success audit or replacement session. SQL rollback restores SQL changes, not
+spent Redis authority. No automatic retry, refund, resume receipt or reconciliation
+endpoint exists; recovery is explicit fresh login/current-state inspection or a
+freshly authorized new start. Provider submission is not mailbox/handset receipt.
+The sole explicit pre-handler DPoP nonce retry remains unchanged.
+
 #### Restricted Recovery Flow
 - `POST /api/v1/auth/recovery/start`: Anonymous start endpoint. Accepts `{"email":"user@example.com"}` and always returns the same no-store `202` shape for active, inactive, deleted, and unknown accounts: `transaction_id` (256-bit opaque base64url value), `expires_at`, and `expires_in` (600 seconds). The transaction is stored by SHA-256 hash, expires after 10 minutes, and is atomically single-use. A lookup timing floor and deterministic decoy subject prevent account enumeration.
 - `POST /api/v1/auth/mfa/verify-recovery-code`: Accepts `{"transaction_id":"...","code":"..."}`. The transaction is consumed before the code check, so a failed guess cannot be retried under it. A valid high-entropy code is located and physically deleted in the same ACID transaction, then the server issues a 10-minute `recovery_enrollment` session and returns `{"next":"enroll_factor","expires_in":600}`. Invalid, spent, foreign, and decoy transactions collapse into `401 {"error":"invalid_credentials"}`; a saturated recovery limit returns `429 {"error":"rate_limited"}`.

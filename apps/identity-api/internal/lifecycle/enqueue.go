@@ -102,6 +102,22 @@ func EnqueueDisplayNameChange(ctx context.Context, store Store, id uuid.UUID, st
 	return revision, nil
 }
 
+// EnqueueEmailChange follows a real primary-email value change under the row lock.
+// No destination enters the existing metadata-only email event contract.
+func EnqueueEmailChange(ctx context.Context, store Store, id uuid.UUID, status string) (int64, error) {
+	if store == nil || id == uuid.Nil || status != "active" {
+		return 0, ErrInvalidEvent
+	}
+	revision, err := store.AdvanceUserLifecycleRevision(ctx, id)
+	if err != nil {
+		return 0, ErrEnqueue
+	}
+	if err := enqueue(ctx, store, id, revision, SubjectUpdated, status, []string{"email"}, SchemaVersion); err != nil {
+		return 0, err
+	}
+	return revision, nil
+}
+
 // EnqueuePrivateProfileChange emits only a coarse marker, never field names or
 // values. The protected child, one revision and this intent share the caller tx.
 func EnqueuePrivateProfileChange(ctx context.Context, store Store, id uuid.UUID, status string) (int64, error) {

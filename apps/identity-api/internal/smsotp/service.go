@@ -46,6 +46,8 @@ type Config struct {
 	PasswordChangeSender Sender
 	FirstPasskeySender   Sender
 	MFAEnrollmentSender  Sender
+	ContactChangeSender  Sender
+	ContactRemovalSender Sender
 	CodeTTL              time.Duration
 	MaxAttempts          int
 	LockoutTTL           time.Duration
@@ -118,6 +120,12 @@ func New(cfg Config, users UserStore, enc Encryptor, idx BlindIndexer, limiter r
 	}
 	if missingDependency(cfg.MFAEnrollmentSender) {
 		cfg.MFAEnrollmentSender = nil
+	}
+	if missingDependency(cfg.ContactChangeSender) {
+		cfg.ContactChangeSender = nil
+	}
+	if missingDependency(cfg.ContactRemovalSender) {
+		cfg.ContactRemovalSender = nil
 	}
 	return &Service{users: users, encryptor: enc, indexer: idx, limiter: limiter, otps: otps, sender: sender, cfg: cfg}, nil
 }
