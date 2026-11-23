@@ -46,6 +46,26 @@ func buildFirstPasskeyProofs(environment string, pool *pgxpool.Pool, client *red
 	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, contactcode.PurposeFirstPasskey)
 }
 
+func buildMFAEnrollmentProofs(environment string, pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service) (*actionproof.Service, error) {
+	cfg, err := config.LoadMFAEnrollmentProofs(environment)
+	if err != nil || len(cfg.BindingKey) == 0 {
+		return nil, err
+	}
+	return buildActionProofs(pool, client, sessions, sms, cfg.EmailEnabled, cfg.SMSEnabled, cfg.CodeKey, cfg.BindingKey, cfg.SMTP, contactcode.PurposeMFAEnrollment)
+}
+
+func buildMFAEnrollmentSMSSender(environment string) (smsotp.Sender, error) {
+	cfg, err := config.LoadMFAEnrollmentProofs(environment)
+	if err != nil || !cfg.SMSEnabled {
+		return nil, err
+	}
+	sms, err := config.LoadSMS(environment)
+	if err != nil {
+		return nil, err
+	}
+	return smsir.New(smsir.Config{APIKey: sms.GatewayAPIKey, TemplateID: cfg.EnrollmentTemplateID, CodeParameter: sms.CodeParameter})
+}
+
 func buildFirstPasskeySMSSender(environment string) (smsotp.Sender, error) {
 	cfg, err := config.LoadFirstPasskeyProofs(environment)
 	if err != nil || !cfg.SMSEnabled {
@@ -73,10 +93,11 @@ func buildPasswordChangeSMSSender(environment string) (smsotp.Sender, error) {
 }
 
 func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *session.Manager, sms *smsotp.Service, emailEnabled, smsEnabled bool, codeKey, bindingKey []byte, smtp smtptransport.Config, purpose string) (*actionproof.Service, error) {
-	if pool == nil || client == nil || sessions == nil {
+	readerOnly := purpose == contactcode.PurposeMFAEnrollment && !emailEnabled && !smsEnabled
+	if pool == nil || sessions == nil || !readerOnly && client == nil {
 		return nil, errors.New("main: action proofs require database, Redis and live sessions")
 	}
-	smsReady := purpose == contactcode.PurposeAccountDeletion && sms.DeletionDeliveryEnabled() || purpose == contactcode.PurposePasswordChange && sms.PasswordChangeDeliveryEnabled() || purpose == contactcode.PurposeFirstPasskey && sms.FirstPasskeyDeliveryEnabled()
+	smsReady := purpose == contactcode.PurposeAccountDeletion && sms.DeletionDeliveryEnabled() || purpose == contactcode.PurposePasswordChange && sms.PasswordChangeDeliveryEnabled() || purpose == contactcode.PurposeFirstPasskey && sms.FirstPasskeyDeliveryEnabled() || purpose == contactcode.PurposeMFAEnrollment && sms.MFAEnrollmentDeliveryEnabled()
 	if smsEnabled && !smsReady {
 		return nil, errors.New("main: action proofs require configured purpose-specific SMS delivery")
 	}
@@ -91,6 +112,9 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 	cipher, err := envelope.New(provider)
 	if err != nil {
 		return nil, err
+	}
+	if readerOnly {
+		return actionproof.NewMFAEnrollment(actionproof.Config{BindingKey: bindingKey}, actionproof.Deps{DB: pool, Queries: db.New(pool), Cipher: cipher, Sessions: sessions})
 	}
 	store, err := contactcode.NewRedisStore(client)
 	if err != nil {
@@ -109,6 +133,8 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 			return nil, errors.New("main: action proof SMTPUTF8 relay unavailable")
 		}
 		switch purpose {
+		case contactcode.PurposeMFAEnrollment:
+			email, err = contactcode.NewMFAEnrollmentEmail(smtp.From, transport)
 		case contactcode.PurposeFirstPasskey:
 			email, err = contactcode.NewFirstPasskeyEmail(smtp.From, transport)
 		case contactcode.PurposePasswordChange:
@@ -125,6 +151,8 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 	}
 	codeConfig := contactcode.Config{HashKey: codeKey}
 	switch purpose {
+	case contactcode.PurposeMFAEnrollment:
+		codeConfig.MFAEnrollmentEmail = email
 	case contactcode.PurposeFirstPasskey:
 		codeConfig.FirstPasskeyEmail = email
 	case contactcode.PurposePasswordChange:
@@ -142,6 +170,9 @@ func buildActionProofs(pool *pgxpool.Pool, client *redis.Client, sessions *sessi
 	}
 	deps := actionproof.Deps{
 		DB: pool, Queries: db.New(pool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions,
+	}
+	if purpose == contactcode.PurposeMFAEnrollment {
+		return actionproof.NewMFAEnrollment(actionproof.Config{BindingKey: bindingKey}, deps)
 	}
 	if purpose == contactcode.PurposeFirstPasskey {
 		return actionproof.NewFirstPasskey(actionproof.Config{BindingKey: bindingKey}, deps)

@@ -168,17 +168,18 @@ func signImpostorToken(t *testing.T, km *keys.Manager, typ, sub, sid, acr, jkt s
 
 	now := time.Now()
 	compact, err := token.Sign(km.ActiveSigner(), typ, token.Claims{
-		"iss":       testStepUpIssuer,
-		"sub":       sub,
-		"aud":       testStepUpIssuer,
-		"acr":       acr,
-		"amr":       []string{"otp"},
-		"auth_time": now.Unix(),
-		"sid":       sid,
-		"jti":       uuid.NewString(),
-		"iat":       now.Unix(),
-		"exp":       now.Add(5 * time.Minute).Unix(),
-		"cnf":       map[string]string{"jkt": jkt},
+		"iss":          testStepUpIssuer,
+		"sub":          sub,
+		"aud":          testStepUpIssuer,
+		"acr":          acr,
+		"amr":          []string{"otp"},
+		"auth_time":    now.Unix(),
+		"auth_version": "0",
+		"sid":          sid,
+		"jti":          uuid.NewString(),
+		"iat":          now.Unix(),
+		"exp":          now.Add(5 * time.Minute).Unix(),
+		"cnf":          map[string]string{"jkt": jkt},
 	})
 	if err != nil {
 		t.Fatalf("token.Sign: %v", err)
@@ -614,10 +615,12 @@ func newStepUpFixture(t *testing.T, userID uuid.UUID, stepUpSvc *stepup.Service)
 
 	w := httptest.NewRecorder()
 	sess, err := sessMgr.Issue(w, session.IssueParams{
-		UserID:    userID.String(),
-		DPoPJKT:   browser.jkt,
-		IP:        "127.0.0.1",
-		UserAgent: "test-agent",
+		AuthVersion:    0,
+		AuthVersionSet: true,
+		UserID:         userID.String(),
+		DPoPJKT:        browser.jkt,
+		IP:             "127.0.0.1",
+		UserAgent:      "test-agent",
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"testing"
@@ -88,5 +90,32 @@ func TestFirstPasskeyProofMaintenanceAndDefaultOffBuilder(t *testing.T) {
 	}
 	if sender, err := buildFirstPasskeySMSSender("production"); err != nil || sender != nil {
 		t.Fatal("disabled first-passkey builder activated provider")
+	}
+}
+
+func TestMFAEnrollmentProofMaintenanceAndDisabledBuilder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleanup := &cancelProofCleanup{t: t, stop: cancel}
+	maintainActionProofs(ctx, cleanup.CleanupExpired, slog.New(slog.DiscardHandler), "MFA enrollment proof cleanup unavailable")
+	maintainActionProofs(ctx, cleanup.CleanupExpired, slog.New(slog.DiscardHandler), "MFA enrollment proof cleanup unavailable")
+	if cleanup.calls != 1 {
+		t.Fatal("MFA enrollment cleanup retried after cancellation")
+	}
+	for _, name := range []string{"MFA_ENROLLMENT_PROOFS_ENABLED", "MFA_ENROLLMENT_PROOFS_EMAIL_ENABLED", "MFA_ENROLLMENT_PROOFS_SMS_ENABLED", "MFA_ENROLLMENT_PROOFS_BINDING_KEY", "LOGIN_CODE_HMAC_KEY", "ACCOUNT_DELETION_PROOFS_BINDING_KEY", "PASSWORD_CHANGE_PROOFS_BINDING_KEY", "FIRST_PASSKEY_PROOFS_BINDING_KEY"} {
+		t.Setenv(name, "")
+	}
+	if proofs, err := buildMFAEnrollmentProofs("production", nil, nil, nil, nil); err != nil || proofs != nil {
+		t.Fatal("default-off MFA enrollment builder acquired authority/dependencies")
+	}
+	if sender, err := buildMFAEnrollmentSMSSender("production"); err != nil || sender != nil {
+		t.Fatal("default-off MFA enrollment builder activated provider")
+	}
+	t.Setenv("MFA_ENROLLMENT_PROOFS_BINDING_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{11}, 32)))
+	if proofs, err := buildMFAEnrollmentProofs("production", nil, nil, nil, nil); err == nil || proofs != nil {
+		t.Fatal("configured reader silently discarded its required dependencies")
+	}
+	if sender, err := buildMFAEnrollmentSMSSender("production"); err != nil || sender != nil {
+		t.Fatal("disabled issuance reader activated SMS")
 	}
 }

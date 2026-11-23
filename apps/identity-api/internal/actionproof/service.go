@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/contactcode"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/contactproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/password"
@@ -25,6 +26,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/ratelimit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
 // Failures contain no secrets, contacts, session IDs or dependency diagnostics.
@@ -62,8 +64,9 @@ type Deps struct {
 
 // Service neither issues sessions nor changes authentication/step-up evidence.
 type Service struct {
-	key  []byte
-	deps Deps
+	key    []byte
+	deps   Deps
+	policy accountpolicy.Policy
 }
 
 // New rejects missing protection; deletion channels remain independently enabled.
@@ -96,6 +99,12 @@ func newService(cfg Config, deps Deps, purpose string) (*Service, error) {
 }
 
 func (s *Service) channelEnabled(purpose, channel string) bool {
+	if s.deps.Codes == nil {
+		return false
+	}
+	if purpose == contactcode.PurposeMFAEnrollment {
+		return s.deps.Codes.MFAEnrollmentChannelEnabled(channel)
+	}
 	if purpose == contactcode.PurposeFirstPasskey {
 		return s.deps.Codes.FirstPasskeyChannelEnabled(channel)
 	}
@@ -280,7 +289,7 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 	if u.AuthVersion != binding.AuthVersion || u.PasswordHash == nil || u.Status != "active" || u.DeletedAt.Valid {
 		return "", time.Time{}, ErrUnauthorized
 	}
-	if purpose == contactcode.PurposeFirstPasskey && !password.SupportedHash(*u.PasswordHash) {
+	if (purpose == contactcode.PurposeFirstPasskey || purpose == contactcode.PurposeMFAEnrollment) && !password.SupportedHash(*u.PasswordHash) {
 		return "", time.Time{}, ErrUnauthorized
 	}
 	matched, err := password.VerifyContext(ctx, secret, *u.PasswordHash)
@@ -297,6 +306,13 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 		return "", time.Time{}, ErrUnavailable
 	}
 	defer rollback(ctx, tx)
+	var authority username.GuardAuthority
+	if purpose == contactcode.PurposeMFAEnrollment {
+		authority, err = s.policy.Guard(ctx, tx)
+		if err != nil {
+			return "", time.Time{}, ErrUnavailable
+		}
+	}
 	binding, err = s.locked(ctx, tx, sess)
 	if err != nil {
 		return "", time.Time{}, err
@@ -307,8 +323,13 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 	if err != nil || current.PasswordHash == nil || *current.PasswordHash != *u.PasswordHash {
 		return "", time.Time{}, ErrUnauthorized
 	}
-	if purpose == contactcode.PurposeFirstPasskey && !password.SupportedHash(*current.PasswordHash) {
+	if (purpose == contactcode.PurposeFirstPasskey || purpose == contactcode.PurposeMFAEnrollment) && !password.SupportedHash(*current.PasswordHash) {
 		return "", time.Time{}, ErrUnauthorized
+	}
+	if purpose == contactcode.PurposeMFAEnrollment {
+		if _, err := s.mfaEnrollmentCurrent(ctx, tx, sess, authority); err != nil {
+			return "", time.Time{}, err
+		}
 	}
 	e, err := s.contact(ctx, q, binding, channel)
 	if err != nil {
@@ -317,6 +338,9 @@ func (s *Service) challenge(ctx context.Context, sess session.Session, secret, c
 	contactBinding := hex.EncodeToString(s.contactBindingFor(binding, purpose, channel, *e))
 	if err := tx.Commit(ctx); err != nil {
 		return "", time.Time{}, ErrOutcomeUnknown
+	}
+	if purpose == contactcode.PurposeMFAEnrollment {
+		return s.deps.Codes.RequestMFAEnrollment(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
 	}
 	if purpose == contactcode.PurposeFirstPasskey {
 		return s.deps.Codes.RequestFirstPasskey(ctx, binding, channel, e.Destination, contactBinding, sourceIP)
@@ -353,6 +377,11 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 	}
 	var rec contactcode.Record
 	switch purpose {
+	case contactcode.PurposeMFAEnrollment:
+		if !s.channelEnabled(purpose, contactcode.ChannelEmail) && !s.channelEnabled(purpose, contactcode.ChannelSMS) {
+			return "", time.Time{}, contactcode.ErrDisabled
+		}
+		rec, err = s.deps.Codes.VerifyMFAEnrollment(ctx, binding, challenge, code)
 	case contactcode.PurposeFirstPasskey:
 		rec, err = s.deps.Codes.VerifyFirstPasskey(ctx, binding, challenge, code)
 	case contactcode.PurposePasswordChange:
@@ -370,11 +399,23 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 		return "", time.Time{}, ErrOutcomeUnknown
 	}
 	defer rollback(ctx, tx)
+	var authority username.GuardAuthority
+	if purpose == contactcode.PurposeMFAEnrollment {
+		authority, err = s.policy.Guard(ctx, tx)
+		if err != nil {
+			return "", time.Time{}, ErrUnavailable
+		}
+	}
 	binding, err = s.locked(ctx, tx, sess)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	q := s.deps.Queries.WithTx(tx)
+	if purpose == contactcode.PurposeMFAEnrollment {
+		if _, err := s.mfaEnrollmentCurrent(ctx, tx, sess, authority); err != nil {
+			return "", time.Time{}, err
+		}
+	}
 	if purpose == contactcode.PurposeFirstPasskey {
 		u, err := q.GetUserByID(ctx, binding.AccountID)
 		if err != nil {
@@ -404,6 +445,8 @@ func (s *Service) verify(ctx context.Context, sess session.Session, challenge, c
 	}
 	var rows int64
 	switch purpose {
+	case contactcode.PurposeMFAEnrollment:
+		rows, err = q.CreateMFAEnrollmentActionProof(ctx, db.CreateMFAEnrollmentActionProofParams(params))
 	case contactcode.PurposeFirstPasskey:
 		rows, err = q.CreateFirstPasskeyActionProof(ctx, db.CreateFirstPasskeyActionProofParams(params))
 	case contactcode.PurposePasswordChange:
@@ -568,6 +611,8 @@ func (s *Service) cleanupExpired(ctx context.Context, batchSize int32, purpose s
 	var rows int64
 	var err error
 	switch purpose {
+	case contactcode.PurposeMFAEnrollment:
+		rows, err = s.deps.Queries.CleanupExpiredMFAEnrollmentActionProofs(ctx, batchSize)
 	case contactcode.PurposeFirstPasskey:
 		rows, err = s.deps.Queries.CleanupExpiredFirstPasskeyActionProofs(ctx, batchSize)
 	case contactcode.PurposePasswordChange:

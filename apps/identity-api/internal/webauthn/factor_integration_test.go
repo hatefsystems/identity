@@ -7,8 +7,10 @@ package webauthn
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -303,13 +305,28 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	if err != nil {
 		t.Fatal("read admitted MFA version failed")
 	}
-	ctx = factorSessionContext(ctx, admitted)
+	codec, err := session.NewCookieCodec(session.CookieConfig{Name: "session", TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := session.NewManager(session.NewMemoryStore(), codec, session.ManagerConfig{AbsoluteTTL: time.Hour, IdleTTL: time.Hour, AccountState: session.NewDBAccountState(pool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := manager.Issue(httptest.NewRecorder(), session.IssueParams{UserID: admitted.ID.String(), AuthVersion: admitted.AuthVersion, AuthVersionSet: true,
+		DPoPJKT:  base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		Evidence: session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, TOTP: true, AuthenticatedAt: time.Now().UTC()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = session.WithSession(ctx, current)
 	barrier := newFactorBeginBarrier(pool, 2)
 	webAuthnService := newFactorIntegrationWebAuthn(t, q, barrier)
 	mfaService, err := mfa.New(mfa.Config{}, q, factorTestEncryptor{}, mfa.WithTransacter(barrier))
 	if err != nil {
 		t.Fatalf("construct MFA service: %v", err)
 	}
+	mfaService.SetSessions(manager)
 
 	start := make(chan struct{})
 	deleteResult := make(chan error, 1)
@@ -320,7 +337,9 @@ func TestIntegrationPasskeyDeletionRacingMFADisablePreservesLoginPasskey(t *test
 	}()
 	go func() {
 		<-start
-		disableResult <- mfaService.Disable(ctx, userID, admitted.AuthVersion)
+		_, err := mfaService.Disable(ctx, current, mfa.Authorization{UserID: current.UserID, SessionID: current.ID, JKT: current.DPoPJKT,
+			AuthVersion: current.AuthVersion, Method: mfa.AuthorizationTOTP, ExpiresAt: time.Now().Add(5 * time.Minute)})
+		disableResult <- err
 	}()
 	close(start)
 

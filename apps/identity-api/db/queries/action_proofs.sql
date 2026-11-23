@@ -136,3 +136,49 @@ WITH expired AS (
 )
 DELETE FROM public.first_passkey_enrollment_action_proofs p
 USING expired e WHERE p.proof_digest = e.proof_digest;
+
+-- name: CreateMFAEnrollmentActionProof :execrows
+INSERT INTO public.mfa_enrollment_action_proofs
+    (proof_digest, user_id, session_id, jkt, auth_version, action, channel, contact_binding, expires_at)
+SELECT sqlc.arg('proof_digest')::bytea, sqlc.arg('user_id')::uuid,
+       sqlc.arg('session_id')::text, sqlc.arg('jkt')::text,
+       sqlc.arg('auth_version')::bigint, 'mfa_enrollment',
+       sqlc.arg('channel')::text, sqlc.arg('contact_binding')::bytea,
+       sqlc.arg('expires_at')::timestamptz
+WHERE sqlc.arg('expires_at')::timestamptz > clock_timestamp()
+  AND sqlc.arg('expires_at')::timestamptz <= clock_timestamp() + INTERVAL '5 minutes';
+
+-- name: GetMFAEnrollmentActionProofBinding :one
+-- Caller holds the username guard, account advisory and user row locks.
+SELECT expires_at, channel, contact_binding FROM public.mfa_enrollment_action_proofs
+WHERE proof_digest = sqlc.arg('proof_digest')::bytea
+  AND user_id = sqlc.arg('user_id')::uuid
+  AND session_id = sqlc.arg('session_id')::text
+  AND jkt = sqlc.arg('jkt')::text
+  AND auth_version = sqlc.arg('auth_version')::bigint
+  AND action = 'mfa_enrollment'
+  AND expires_at > clock_timestamp();
+
+-- name: ConsumeMFAEnrollmentActionProofStart :one
+-- Exactly one start in the caller's deciding transaction. Preserve original expiry.
+DELETE FROM public.mfa_enrollment_action_proofs
+WHERE proof_digest = sqlc.arg('proof_digest')::bytea
+  AND user_id = sqlc.arg('user_id')::uuid
+  AND session_id = sqlc.arg('session_id')::text
+  AND jkt = sqlc.arg('jkt')::text
+  AND auth_version = sqlc.arg('auth_version')::bigint
+  AND action = 'mfa_enrollment'
+  AND channel = sqlc.arg('channel')::text
+  AND contact_binding = sqlc.arg('contact_binding')::bytea
+  AND expires_at > clock_timestamp()
+RETURNING expires_at, channel, contact_binding;
+
+-- name: CleanupExpiredMFAEnrollmentActionProofs :execrows
+WITH expired AS (
+    SELECT proof_digest FROM public.mfa_enrollment_action_proofs
+    WHERE expires_at <= clock_timestamp()
+    ORDER BY expires_at, proof_digest
+    LIMIT sqlc.arg('batch_size')::integer
+)
+DELETE FROM public.mfa_enrollment_action_proofs p
+USING expired e WHERE p.proof_digest = e.proof_digest;

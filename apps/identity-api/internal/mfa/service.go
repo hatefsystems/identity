@@ -2,6 +2,8 @@ package mfa
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/actionproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
@@ -51,6 +54,34 @@ type Encryptor interface {
 	Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 }
 
+// SessionReader reads raw live authority without renewing or acquiring account locks.
+type SessionReader interface {
+	LookupByID(context.Context, string, string) (session.Session, error)
+}
+
+// EnrollmentProofs joins proof consumption and frozen final validation to MFA's transaction.
+type EnrollmentProofs interface {
+	ConsumeMFAEnrollmentStartTx(context.Context, pgx.Tx, session.Session, string, username.GuardAuthority) (actionproof.MFAEnrollmentAuthorization, error)
+	ValidateMFAEnrollmentTx(context.Context, pgx.Tx, session.Session, actionproof.MFAEnrollmentAuthorization, username.GuardAuthority) error
+}
+
+// Maintenance authorization methods name genuinely earned evidence, not available factors.
+const (
+	AuthorizationWebAuthnUV      = "webauthn_uv"
+	AuthorizationTOTP            = "otp"
+	AuthorizationPasswordContact = "password_contact"
+)
+
+// Authorization copies already-spent strong-factor evidence, or a start-only SQL proof.
+// It is not a general Step-up grant; stepup imports this package.
+type Authorization struct {
+	UserID, SessionID, JKT string
+	AuthVersion            int64
+	Method                 string
+	ExpiresAt              time.Time
+	Proof                  string
+}
+
 // Config carries MFA service configuration.
 type Config struct {
 	Issuer                string
@@ -62,11 +93,12 @@ type Config struct {
 // SetupResponse contains the unencrypted TOTP secret and QR code URI returned
 // during initial MFA setup (Task 4.4).
 type SetupResponse struct {
-	EnrollmentID string `json:"enrollment_id"`
-	Secret       string `json:"secret"`
-	OtpauthURL   string `json:"otpauth_url"`
-	Issuer       string `json:"issuer"`
-	AccountName  string `json:"account_name"`
+	EnrollmentID string    `json:"enrollment_id"`
+	Secret       string    `json:"secret"`
+	OtpauthURL   string    `json:"otpauth_url"`
+	Issuer       string    `json:"issuer"`
+	AccountName  string    `json:"account_name"`
+	ExpiresAt    time.Time `json:"expires_at"`
 }
 
 // Service orchestrates TOTP MFA enrollment, verification, and teardown.
@@ -80,6 +112,8 @@ type Service struct {
 	enrollmentTTL         time.Duration
 	maxEnrollmentAttempts int
 	policy                accountpolicy.Policy
+	sessions              SessionReader
+	proofs                EnrollmentProofs
 }
 
 // Option configures optional service behavior.
@@ -87,6 +121,12 @@ type Option func(*Service)
 
 // SetAccountPolicy binds maintenance to the login route's admitted authority at startup.
 func (s *Service) SetAccountPolicy(policy accountpolicy.Policy) { s.policy = policy }
+
+// SetSessions binds the raw session reader used inside deciding transactions.
+func (s *Service) SetSessions(reader SessionReader) { s.sessions = reader }
+
+// SetEnrollmentProofs retains bounded password/contact readers independently of issuance.
+func (s *Service) SetEnrollmentProofs(proofs EnrollmentProofs) { s.proofs = proofs }
 
 // WithTransacter enables the production ACID paths.
 func WithTransacter(tx Transacter) Option {
@@ -141,13 +181,31 @@ func New(cfg Config, users UserStore, encryptor Encryptor, opts ...Option) (*Ser
 // GenerateSetup initiates TOTP MFA setup for an account. It generates a fresh
 // TOTP secret, envelope-encrypts it, persists it in the database, and returns
 // the setup details including the otpauth:// URI for QR code mapping.
-func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersion int64, sessionID string) (*SetupResponse, error) {
-	if userID == uuid.Nil || authVersion < 0 {
-		return nil, ErrAccountNotActive
-	}
-	sessionUUID, err := uuid.Parse(sessionID)
+func (s *Service) GenerateSetup(ctx context.Context, sess session.Session, auth Authorization) (*SetupResponse, error) {
+	live, err := s.live(ctx, sess)
 	if err != nil {
-		return nil, ErrMfaNotSetup
+		return nil, err
+	}
+	if auth.Method != AuthorizationWebAuthnUV && auth.Method != AuthorizationPasswordContact {
+		return nil, ErrUnauthorized
+	}
+	if auth.Method == AuthorizationWebAuthnUV {
+		if err := s.checkAuthorization(sess, auth); err != nil {
+			return nil, err
+		}
+	} else if auth.Proof == "" || s.proofs == nil {
+		return nil, ErrUnauthorized
+	}
+	userID := uuid.MustParse(sess.UserID)
+	sessionUUID := uuid.MustParse(sess.ID)
+	deadline := s.now().Add(s.enrollmentTTL)
+	for _, expiry := range []time.Time{sess.IdleExpiry, sess.AbsoluteExpiry, live.IdleExpiry, live.AbsoluteExpiry} {
+		if expiry.Before(deadline) {
+			deadline = expiry
+		}
+	}
+	if auth.Method == AuthorizationWebAuthnUV && auth.ExpiresAt.Before(deadline) {
+		deadline = auth.ExpiresAt
 	}
 	secret, err := totp.GenerateSecret()
 	if err != nil {
@@ -161,7 +219,7 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersi
 
 	var user db.User
 	var enrollment db.MfaTotpEnrollment
-	err = s.runInTx(ctx, userID, func(store UserStore, _ pgx.Tx, _ username.GuardAuthority) error {
+	err = s.runInTx(ctx, userID, func(ctx context.Context, store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
 		user, err = store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -169,30 +227,94 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersi
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != sess.AuthVersion {
 			return ErrAccountNotActive
 		}
 		if user.IsMfaEnabled {
 			return ErrMfaAlreadyEnabled
 		}
+		if len(user.MfaTotpSecretEncrypted) != 0 {
+			return ErrUnauthorized
+		}
+		if _, err := s.live(ctx, sess); err != nil {
+			return err
+		}
+		state, err := s.protection(ctx, store, tx, user, authority)
+		if err != nil {
+			return err
+		}
+		if err := state.Check(); err != nil {
+			return err
+		}
+		var binding actionproof.MFAEnrollmentAuthorization
+		if !s.now().Before(deadline) {
+			return ErrUnauthorized
+		}
+		if auth.Method == AuthorizationWebAuthnUV {
+			if state.Passkeys == 0 {
+				return ErrUnauthorized
+			}
+			if err := s.checkAuthorization(sess, auth); err != nil {
+				return err
+			}
+		} else {
+			if !state.Password || state.Passkeys != 0 || state.Privileged {
+				return ErrUnauthorized
+			}
+			binding, err = s.proofs.ConsumeMFAEnrollmentStartTx(ctx, tx, sess, auth.Proof, authority)
+			if err != nil {
+				return err
+			}
+			if len(binding.ContactBinding) != sha256.Size || binding.Channel != "email" && binding.Channel != "sms" {
+				return ErrUnauthorized
+			}
+			if binding.ExpiresAt.Before(deadline) {
+				deadline = binding.ExpiresAt
+			}
+		}
+		if !s.now().Before(deadline) {
+			return ErrUnauthorized
+		}
+		if _, err := s.live(ctx, sess); err != nil {
+			return err
+		}
+		if !s.now().Before(deadline) {
+			return ErrUnauthorized
+		}
 		if _, err := store.DeleteMfaTotpEnrollmentsForUser(ctx, userID); err != nil {
 			return fmt.Errorf("mfa: replace pending enrollment: %w", err)
 		}
-		enrollment, err = store.CreateMfaTotpEnrollment(ctx, db.CreateMfaTotpEnrollmentParams{
-			UserID:          userID,
-			SessionID:       sessionUUID,
-			Purpose:         "maintenance",
-			SecretEncrypted: encSecret,
-			ExpiresAt:       pgtype.Timestamptz{Time: s.now().Add(s.enrollmentTTL), Valid: true},
-		})
+		params := db.CreateMfaTotpEnrollmentParams{
+			UserID:              userID,
+			SessionID:           sessionUUID,
+			Purpose:             "maintenance",
+			SecretEncrypted:     encSecret,
+			ExpiresAt:           pgtype.Timestamptz{Time: deadline, Valid: true},
+			AuthVersion:         &sess.AuthVersion,
+			Jkt:                 &sess.DPoPJKT,
+			AuthorizationMethod: &auth.Method,
+			Channel:             nil,
+			ContactBinding:      binding.ContactBinding,
+		}
+		if auth.Method == AuthorizationPasswordContact {
+			params.Channel = &binding.Channel
+		}
+		enrollment, err = store.CreateMfaTotpEnrollment(ctx, params)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrUnauthorized
+			}
 			return fmt.Errorf("mfa: store pending enrollment: %w", err)
+		}
+		if !s.now().Before(deadline) {
+			return ErrUnauthorized
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	session.OutcomeCommitted(ctx)
 
 	accountName := user.ID.String()
 	if user.Email != nil {
@@ -206,25 +328,27 @@ func (s *Service) GenerateSetup(ctx context.Context, userID uuid.UUID, authVersi
 		OtpauthURL:   uri,
 		Issuer:       s.issuer,
 		AccountName:  accountName,
+		ExpiresAt:    enrollment.ExpiresAt.Time,
 	}, nil
 }
 
 // VerifyAndEnable verifies the submitted 6-digit passcode against the pending
 // stored TOTP secret and flips is_mfa_enabled to true.
-func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVersion int64, sessionID, enrollmentID, code string) error {
-	if userID == uuid.Nil || authVersion < 0 {
-		return ErrAccountNotActive
+func (s *Service) VerifyAndEnable(ctx context.Context, sess session.Session, enrollmentID, code string) error {
+	if _, err := totp.CanonicalizeCode(code); err != nil {
+		return ErrInvalidCode
 	}
-	sessionUUID, err := uuid.Parse(sessionID)
-	if err != nil {
-		return ErrMfaNotSetup
+	if _, err := s.live(ctx, sess); err != nil {
+		return err
 	}
+	userID := uuid.MustParse(sess.UserID)
+	sessionUUID := uuid.MustParse(sess.ID)
 	enrollmentUUID, err := uuid.Parse(enrollmentID)
 	if err != nil {
 		return ErrMfaNotSetup
 	}
 	var outcome error
-	err = s.runInTx(ctx, userID, func(store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
+	err = s.runInTx(ctx, userID, func(ctx context.Context, store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -232,7 +356,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != sess.AuthVersion {
 			return ErrAccountNotActive
 		}
 		// An enabled account is rejected before loading or decrypting any
@@ -253,19 +377,47 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 			}
 			return fmt.Errorf("mfa: lock pending enrollment: %w", err)
 		}
-		if !enrollment.ExpiresAt.Valid || !s.now().Before(enrollment.ExpiresAt.Time) {
+		if err := s.validatePending(ctx, tx, sess, enrollment, authority); err != nil {
+			return err
+		}
+		if !s.now().Before(enrollment.ExpiresAt.Time) || int(enrollment.FailedAttempts) >= s.maxEnrollmentAttempts {
 			if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
 				return fmt.Errorf("mfa: delete expired enrollment: %w", err)
 			}
 			outcome = ErrEnrollmentExpired
 			return nil
 		}
+		state, err := s.protection(ctx, store, tx, user, authority)
+		if err != nil {
+			return err
+		}
+		if err := state.Check(); err != nil {
+			return err
+		}
+		if *enrollment.AuthorizationMethod == AuthorizationWebAuthnUV && state.Passkeys == 0 {
+			return ErrUnauthorized
+		}
+		if *enrollment.AuthorizationMethod == AuthorizationPasswordContact && (!state.Password || state.Passkeys != 0 || state.Privileged || len(user.MfaTotpSecretEncrypted) != 0) {
+			return ErrUnauthorized
+		}
 
 		rawSecret, err := s.encryptor.Decrypt(ctx, enrollment.SecretEncrypted)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrDecryptFailed, err)
 		}
-		if !totp.ValidateCode(string(rawSecret), code, s.now(), s.windowSteps) {
+		defer clear(rawSecret)
+		valid := totp.ValidateCode(string(rawSecret), code, s.now(), s.windowSteps)
+		if err := s.validatePending(ctx, tx, sess, enrollment, authority); err != nil {
+			return err
+		}
+		if !s.now().Before(enrollment.ExpiresAt.Time) {
+			if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
+				return err
+			}
+			outcome = ErrEnrollmentExpired
+			return nil
+		}
+		if !valid {
 			if int(enrollment.FailedAttempts)+1 >= s.maxEnrollmentAttempts {
 				_, err = store.DeleteMfaTotpEnrollment(ctx, enrollment.ID)
 			} else {
@@ -278,7 +430,7 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 			return nil
 		}
 
-		state, err := s.protection(ctx, store, tx, user, authority)
+		state, err = s.protection(ctx, store, tx, user, authority)
 		if err != nil {
 			return err
 		}
@@ -286,14 +438,35 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 		if err := state.Check(); err != nil {
 			return err
 		}
+		if enrollment.AuthorizationMethod != nil && *enrollment.AuthorizationMethod == AuthorizationWebAuthnUV && state.Passkeys == 0 {
+			return ErrUnauthorized
+		}
+		if err := s.validatePending(ctx, tx, sess, enrollment, authority); err != nil {
+			return err
+		}
+		if !s.now().Before(enrollment.ExpiresAt.Time) {
+			if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
+				return err
+			}
+			outcome = ErrEnrollmentExpired
+			return nil
+		}
 		affected, err := store.CompleteMfaTotpEnrollment(ctx, db.CompleteMfaTotpEnrollmentParams{
 			ID:                     userID,
 			MfaTotpSecretEncrypted: enrollment.SecretEncrypted,
+			ExpiresAt:              enrollment.ExpiresAt,
 		})
 		if err != nil {
 			return fmt.Errorf("mfa: enable mfa: %w", err)
 		}
 		if affected == 0 {
+			if !s.now().Before(enrollment.ExpiresAt.Time) {
+				if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
+					return err
+				}
+				outcome = ErrEnrollmentExpired
+				return nil
+			}
 			return ErrMfaAlreadyEnabled
 		}
 		if _, err := store.DeleteMfaTotpEnrollment(ctx, enrollment.ID); err != nil {
@@ -304,17 +477,29 @@ func (s *Service) VerifyAndEnable(ctx context.Context, userID uuid.UUID, authVer
 	if err != nil {
 		return err
 	}
+	if outcome == nil {
+		session.SecurityChangeCommitted(ctx)
+	} else {
+		session.OutcomeCommitted(ctx)
+	}
 	return outcome
 }
 
 // Disable disables TOTP MFA for the user, wiping the encrypted secret and
 // setting is_mfa_enabled to false.
-func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int64) error {
-	if userID == uuid.Nil || authVersion < 0 {
-		return ErrAccountNotActive
+func (s *Service) Disable(ctx context.Context, sess session.Session, auth Authorization) (bool, error) {
+	if _, err := s.live(ctx, sess); err != nil {
+		return false, err
 	}
+	if auth.Method != AuthorizationWebAuthnUV && auth.Method != AuthorizationTOTP {
+		return false, ErrUnauthorized
+	}
+	if err := s.checkAuthorization(sess, auth); err != nil {
+		return false, err
+	}
+	userID := uuid.MustParse(sess.UserID)
 	var changed bool
-	err := s.runInTx(ctx, userID, func(store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
+	err := s.runInTx(ctx, userID, func(ctx context.Context, store UserStore, tx pgx.Tx, authority username.GuardAuthority) error {
 		user, err := store.GetUserByIDForUpdate(ctx, userID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -322,8 +507,14 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 			}
 			return fmt.Errorf("mfa: lock user: %w", err)
 		}
-		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != authVersion {
+		if user.ID != userID || user.Status != "active" || user.DeletedAt.Valid || user.AuthVersion != sess.AuthVersion {
 			return ErrAccountNotActive
+		}
+		if _, err := s.live(ctx, sess); err != nil {
+			return err
+		}
+		if err := s.checkAuthorization(sess, auth); err != nil {
+			return err
 		}
 		changed = user.IsMfaEnabled || len(user.MfaTotpSecretEncrypted) > 0
 		if changed {
@@ -331,14 +522,22 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 			if err != nil {
 				return err
 			}
-			// This route retains its passkey requirement; password alternatives belong to T26.
-			if state.Passkeys == 0 {
-				return ErrLastFactor
+			if auth.Method == AuthorizationWebAuthnUV && state.Passkeys == 0 || auth.Method == AuthorizationTOTP && !state.TOTP {
+				return ErrUnauthorized
 			}
 			state.TOTP = false
 			if err := state.Check(); err != nil {
 				return err
 			}
+		}
+		if err := s.checkAuthorization(sess, auth); err != nil {
+			return err
+		}
+		if _, err := s.live(ctx, sess); err != nil {
+			return err
+		}
+		if err := s.checkAuthorization(sess, auth); err != nil {
+			return err
 		}
 		affected, err := store.DisableMfa(ctx, userID)
 		if err != nil {
@@ -357,8 +556,10 @@ func (s *Service) Disable(ctx context.Context, userID uuid.UUID, authVersion int
 	})
 	if err == nil && changed {
 		session.SecurityChangeCommitted(ctx)
+	} else if err == nil {
+		session.OutcomeCommitted(ctx)
 	}
-	return err
+	return changed && err == nil, err
 }
 
 // VerifyEnabledCode verifies a submitted 6-digit TOTP code only against an
@@ -444,13 +645,79 @@ func (s *Service) protection(ctx context.Context, store UserStore, tx pgx.Tx, us
 	return accountpolicy.State{Passkeys: count, TOTP: user.IsMfaEnabled && len(user.MfaTotpSecretEncrypted) > 0}, err
 }
 
-func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserStore, pgx.Tx, username.GuardAuthority) error) error {
+func (s *Service) live(ctx context.Context, sess session.Session) (session.Session, error) {
+	id, err := uuid.Parse(sess.UserID)
+	sid, sidErr := uuid.Parse(sess.ID)
+	jkt, jktErr := base64.RawURLEncoding.DecodeString(sess.DPoPJKT)
+	if err != nil || id == uuid.Nil || id.String() != sess.UserID || sidErr != nil || sid == uuid.Nil || sid.String() != sess.ID ||
+		sess.Kind != session.KindAuthenticated || !sess.AuthVersionSet || sess.AuthVersion < 0 || jktErr != nil || len(jkt) != sha256.Size || base64.RawURLEncoding.EncodeToString(jkt) != sess.DPoPJKT {
+		return session.Session{}, ErrAccountNotActive
+	}
+	if s.sessions == nil {
+		return session.Session{}, ErrUnauthorized
+	}
+	live, err := s.sessions.LookupByID(ctx, sess.UserID, sess.ID)
+	if err != nil {
+		return session.Session{}, err
+	}
+	now := s.now()
+	if live.UserID != sess.UserID || live.ID != sess.ID || live.Kind != session.KindAuthenticated || !live.AuthVersionSet || live.AuthVersion != sess.AuthVersion || live.DPoPJKT != sess.DPoPJKT ||
+		!now.Before(sess.IdleExpiry) || !now.Before(sess.AbsoluteExpiry) || !now.Before(live.IdleExpiry) || !now.Before(live.AbsoluteExpiry) {
+		return session.Session{}, ErrUnauthorized
+	}
+	return live, nil
+}
+
+func (s *Service) checkAuthorization(sess session.Session, auth Authorization) error {
+	if auth.Proof != "" || auth.UserID != sess.UserID || auth.SessionID != sess.ID || auth.JKT != sess.DPoPJKT || auth.AuthVersion != sess.AuthVersion || !s.now().Before(auth.ExpiresAt) {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *Service) validatePending(ctx context.Context, tx pgx.Tx, sess session.Session, row db.MfaTotpEnrollment, authority username.GuardAuthority) error {
+	if row.AuthVersion == nil || *row.AuthVersion != sess.AuthVersion || row.Jkt == nil || *row.Jkt != sess.DPoPJKT || row.AuthorizationMethod == nil ||
+		!row.ExpiresAt.Valid || row.ExpiresAt.InfinityModifier != 0 || row.FailedAttempts < 0 {
+		return ErrUnauthorized
+	}
+	switch *row.AuthorizationMethod {
+	case AuthorizationWebAuthnUV:
+		if row.Channel != nil || len(row.ContactBinding) != 0 {
+			return ErrUnauthorized
+		}
+	case AuthorizationPasswordContact:
+		if row.Channel == nil || (*row.Channel != "email" && *row.Channel != "sms") || len(row.ContactBinding) != sha256.Size || s.proofs == nil {
+			return ErrUnauthorized
+		}
+	default:
+		return ErrUnauthorized
+	}
+	// The authenticated initiating request may cross its frozen deadline while
+	// waiting for locks. Only deletion of that exact expired binding can then commit.
+	if !s.now().Before(row.ExpiresAt.Time) {
+		return nil
+	}
+	if _, err := s.live(ctx, sess); err != nil {
+		return err
+	}
+	if *row.AuthorizationMethod == AuthorizationPasswordContact {
+		err := s.proofs.ValidateMFAEnrollmentTx(ctx, tx, sess, actionproof.MFAEnrollmentAuthorization{ExpiresAt: row.ExpiresAt.Time, Channel: *row.Channel, ContactBinding: row.ContactBinding}, authority)
+		if err != nil && !(errors.Is(err, actionproof.ErrMFAEnrollmentExpired) && !s.now().Before(row.ExpiresAt.Time)) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(context.Context, UserStore, pgx.Tx, username.GuardAuthority) error) error {
 	if s.tx == nil {
 		if _, databaseStore := s.users.(*db.Queries); databaseStore {
 			return errors.New("mfa: database mutations require a transaction")
 		}
-		return fn(s.users, nil, username.GuardAuthority{})
+		return fn(ctx, s.users, nil, username.GuardAuthority{})
 	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	tx, err := s.tx.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("mfa: begin transaction: %w", err)
@@ -473,11 +740,11 @@ func (s *Service) runInTx(ctx context.Context, userID uuid.UUID, fn func(UserSto
 	if err := pglock.LockAccount(ctx, tx, userID); err != nil {
 		return fmt.Errorf("mfa: lock subject: %w", err)
 	}
-	if err := fn(db.New(tx), tx, authority); err != nil {
+	if err := fn(ctx, db.New(tx), tx, authority); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("mfa: commit transaction: %w", err)
+		return fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
 	}
 	committed = true
 	return nil

@@ -129,6 +129,7 @@ type Deps struct {
 	AccountDeletionProofs AccountDeletionProofs
 	PasswordChangeProofs  AccountDeletionProofs
 	FirstPasskeyProofs    FirstPasskeyProofs
+	MFAEnrollmentProofs   MFAEnrollmentProofs
 	Passwords             *passwordmanager.Service
 	// Privacy serves anonymous recovery even when new deletion requests are off.
 	Privacy *privacy.Service
@@ -320,6 +321,9 @@ func (s *Server) registerRoutes() {
 	}
 	if s.deps.FirstPasskeyProofs != nil {
 		s.registerFirstPasskeyProofRoutes()
+	}
+	if s.deps.MFAEnrollmentProofs != nil {
+		s.registerMFAEnrollmentProofRoutes()
 	}
 	if s.deps.Passwords != nil {
 		s.registerPasswordRoutes()

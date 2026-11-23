@@ -1,17 +1,23 @@
 package server
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/base64"
 	"errors"
+	"io"
 	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/accountpolicy"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/actionproof"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/audit"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/mfa/totp"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/session"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/stepup"
 )
 
 // mfaFactorTOTP labels the factor in audit payloads. The MFA package currently
@@ -21,7 +27,8 @@ import (
 const mfaFactorTOTP = "totp"
 
 type mfaErrorResponse struct {
-	Error string `json:"error"`
+	Error     string `json:"error"`
+	ACRValues string `json:"acr_values,omitempty"`
 }
 
 type mfaVerifyRequest struct {
@@ -36,7 +43,8 @@ type mfaStatusResponse struct {
 // registerMFARoutes mounts the TOTP MFA management endpoints from
 // docs/api-design.md §1.3.
 //
-// Starting enrollment and disabling TOTP both require Step-up authentication.
+// Starting enrollment accepts UV Step-up or a purpose-specific password/contact proof.
+// Disabling TOTP accepts only fresh enrolled-TOTP or UV Step-up.
 // Enrollment completion does not consume a second grant: it can only redeem the
 // short-lived pending record bound to the same user and initiating session.
 func (s *Server) registerMFARoutes() {
@@ -44,23 +52,19 @@ func (s *Server) registerMFARoutes() {
 	if !ok {
 		return
 	}
-	stepGuard, hasStepUp := s.stepUpGuard("mfa")
+	s.deps.MFA.SetSessions(s.deps.SessionManager)
 
 	s.router.Route("/api/v1/auth/mfa", func(r chi.Router) {
 		r.Use(guard.Handler)
 
 		r.Post("/verify", s.handleMFAVerify())
 
-		if !hasStepUp {
-			return
+		if s.deps.StepUp != nil || s.deps.MFAEnrollmentProofs != nil {
+			r.Post("/generate", s.handleMFAGenerate())
 		}
-		// The grant is consumed at enrollment start. Verification relies on the
-		// pending enrollment's exact session binding.
-		r.Group(func(pr chi.Router) {
-			pr.Use(stepGuard.Handler)
-			pr.Post("/generate", s.handleMFAGenerate())
-			pr.Delete("/", s.handleMFADisable())
-		})
+		if s.deps.StepUp != nil {
+			r.Delete("/", s.handleMFADisable())
+		}
 	})
 }
 
@@ -69,7 +73,7 @@ func (s *Server) registerMFARoutes() {
 // and returns the setup secret and otpauth:// URI.
 func (s *Server) handleMFAGenerate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := s.webauthnSessionUser(w, r)
+		_, ok := s.webauthnSessionUser(w, r)
 		if !ok {
 			return
 		}
@@ -79,7 +83,16 @@ func (s *Server) handleMFAGenerate() http.HandlerFunc {
 			s.writeMFAError(w, "generate mfa setup", mfa.ErrAccountNotActive)
 			return
 		}
-		resp, err := s.deps.MFA.GenerateSetup(r.Context(), userID, current.AuthVersion, current.ID)
+		if !emptyMFARequest(r) {
+			writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
+			return
+		}
+		auth, err := s.mfaAuthorization(r, current, true)
+		if err != nil {
+			s.writeMFAError(w, "authorize mfa setup", err)
+			return
+		}
+		resp, err := s.deps.MFA.GenerateSetup(r.Context(), current, auth)
 		if err != nil {
 			s.writeMFAError(w, "generate mfa setup", err)
 			return
@@ -91,6 +104,51 @@ func (s *Server) handleMFAGenerate() http.HandlerFunc {
 	}
 }
 
+func emptyMFARequest(r *http.Request) bool {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		return false
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1))
+	return err == nil && len(body) == 0
+}
+
+func (s *Server) mfaAuthorization(r *http.Request, sess session.Session, start bool) (mfa.Authorization, error) {
+	grants, proofs := r.Header.Values(stepup.HeaderStepUpAuth), r.Header.Values("X-Action-Proof")
+	if len(grants)+len(proofs) != 1 || !start && len(proofs) != 0 {
+		return mfa.Authorization{}, mfa.ErrUnauthorized
+	}
+	if len(proofs) == 1 {
+		if len(proofs[0]) != 43 || s.deps.MFAEnrollmentProofs == nil {
+			return mfa.Authorization{}, mfa.ErrUnauthorized
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(proofs[0])
+		if err != nil || len(raw) != 32 || base64.RawURLEncoding.EncodeToString(raw) != proofs[0] {
+			return mfa.Authorization{}, mfa.ErrUnauthorized
+		}
+		return mfa.Authorization{Method: mfa.AuthorizationPasswordContact, Proof: proofs[0]}, nil
+	}
+	if grants[0] == "" || len(grants[0]) > 16*1024 || strings.Contains(grants[0], ",") || s.deps.StepUp == nil {
+		return mfa.Authorization{}, mfa.ErrUnauthorized
+	}
+	grant, err := s.deps.StepUp.Validate(r.Context(), grants[0], sess)
+	if err != nil {
+		return mfa.Authorization{}, err
+	}
+	method := ""
+	if slices.Contains(grant.AMR, "hwk") && slices.Contains(grant.AMR, "user") {
+		method = mfa.AuthorizationWebAuthnUV
+	} else if !start && slices.Contains(grant.AMR, "otp") {
+		method = mfa.AuthorizationTOTP
+	}
+	if method == "" || !grant.AuthVersionSet {
+		return mfa.Authorization{}, mfa.ErrUnauthorized
+	}
+	return mfa.Authorization{UserID: grant.UserID, SessionID: grant.SessionID, JKT: grant.DPoPJKT, AuthVersion: grant.AuthVersion, Method: method, ExpiresAt: grant.ExpiresAt}, nil
+}
+
 // handleMFAVerify serves POST /api/v1/auth/mfa/verify.
 // Verifies the submitted 6-digit passcode against the pending secret and enables MFA.
 func (s *Server) handleMFAVerify() http.HandlerFunc {
@@ -100,17 +158,20 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 			return
 		}
 
-		body, ok := s.readWebAuthnBody(w, r)
-		if !ok {
+		if len(r.Header.Values(stepup.HeaderStepUpAuth))+len(r.Header.Values("X-Action-Proof")) != 0 {
+			s.writeMFAError(w, "misplaced mfa authority", mfa.ErrUnauthorized)
 			return
 		}
-
-		var req mfaVerifyRequest
-		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
-				writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
-				return
-			}
+		values, ok := readProofStringObject(r, []string{"enrollment_id", "code"})
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
+			return
+		}
+		id, parseErr := uuid.Parse(values["enrollment_id"])
+		_, codeErr := totp.CanonicalizeCode(values["code"])
+		if parseErr != nil || id == uuid.Nil || id.String() != values["enrollment_id"] || codeErr != nil {
+			writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
+			return
 		}
 
 		current, _ := session.FromContext(r.Context())
@@ -118,7 +179,11 @@ func (s *Server) handleMFAVerify() http.HandlerFunc {
 			s.writeMFAError(w, "verify and enable mfa", mfa.ErrAccountNotActive)
 			return
 		}
-		if err := s.deps.MFA.VerifyAndEnable(r.Context(), userID, current.AuthVersion, current.ID, req.EnrollmentID, req.Code); err != nil {
+		if err := s.deps.MFA.VerifyAndEnable(r.Context(), current, values["enrollment_id"], values["code"]); err != nil {
+			if errors.Is(err, mfa.ErrOutcomeUnknown) {
+				s.writeMFAError(w, "verify and enable mfa", err)
+				return
+			}
 			s.record(r, audit.Event{
 				EventType:    audit.EventMFAVerifyFailed,
 				ActionStatus: audit.StatusFailure,
@@ -164,7 +229,17 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 			s.writeMFAError(w, "disable mfa", mfa.ErrAccountNotActive)
 			return
 		}
-		if err := s.deps.MFA.Disable(r.Context(), userID, current.AuthVersion); err != nil {
+		if !emptyMFARequest(r) {
+			writeJSON(w, http.StatusBadRequest, mfaErrorResponse{Error: "invalid_request"})
+			return
+		}
+		auth, err := s.mfaAuthorization(r, current, false)
+		if err != nil {
+			s.writeMFAError(w, "authorize mfa disable", err)
+			return
+		}
+		changed, err := s.deps.MFA.Disable(r.Context(), current, auth)
+		if err != nil {
 			s.writeMFAError(w, "disable mfa", err)
 			return
 		}
@@ -173,14 +248,16 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 		// same way enabling one is. ErrLastFactor keeps this from being an
 		// account-takeover lockout path, but a successful disable is exactly what an
 		// attacker who already holds a session would do next.
-		s.record(r, audit.Event{
-			EventType:    audit.EventMFATOTPDisabled,
-			ActionStatus: audit.StatusSuccess,
-			ActorID:      userID,
-			SubjectID:    &userID,
-			Payload:      map[string]any{"factor": mfaFactorTOTP},
-			Security:     &audit.SecurityContext{AccountRef: userID},
-		})
+		if changed {
+			s.record(r, audit.Event{
+				EventType:    audit.EventMFATOTPDisabled,
+				ActionStatus: audit.StatusSuccess,
+				ActorID:      userID,
+				SubjectID:    &userID,
+				Payload:      map[string]any{"factor": mfaFactorTOTP},
+				Security:     &audit.SecurityContext{AccountRef: userID},
+			})
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -188,6 +265,10 @@ func (s *Server) handleMFADisable() http.HandlerFunc {
 // writeMFAError maps domain MFA errors into standard HTTP responses.
 func (s *Server) writeMFAError(w http.ResponseWriter, op string, err error) {
 	switch {
+	case errors.Is(err, mfa.ErrOutcomeUnknown), errors.Is(err, actionproof.ErrOutcomeUnknown):
+		writeJSON(w, http.StatusServiceUnavailable, mfaErrorResponse{Error: "outcome_unknown"})
+	case errors.Is(err, mfa.ErrUnauthorized), errors.Is(err, actionproof.ErrInvalid), errors.Is(err, actionproof.ErrUnauthorized), errors.Is(err, actionproof.ErrMFAEnrollmentExpired), errors.Is(err, session.ErrSessionNotFound), errors.Is(err, stepup.ErrNoGrant), errors.Is(err, stepup.ErrInvalidGrant), errors.Is(err, stepup.ErrGrantConsumed), errors.Is(err, stepup.ErrGrantNotForSession):
+		writeJSON(w, http.StatusForbidden, mfaErrorResponse{Error: "insufficient_user_authentication", ACRValues: stepup.ACRStepUp})
 	case errors.Is(err, mfa.ErrUserNotFound):
 		writeJSON(w, http.StatusUnauthorized, mfaErrorResponse{Error: "unauthorized"})
 	case errors.Is(err, mfa.ErrAccountNotActive):

@@ -163,6 +163,8 @@ func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery,
 		sender := deletionSMSSender{delivery}
 		cfg := smsotp.Config{HashPepper: bytes.Repeat([]byte{5}, 32)}
 		switch purpose {
+		case contactcode.PurposeMFAEnrollment:
+			cfg.MFAEnrollmentSender = sender
 		case contactcode.PurposeFirstPasskey:
 			cfg.FirstPasskeySender = sender
 		case contactcode.PurposePasswordChange:
@@ -178,6 +180,8 @@ func purposeCodes(t *testing.T, client *redis.Client, delivery *captureDelivery,
 	cfg := contactcode.Config{HashKey: bytes.Repeat([]byte{3}, 32)}
 	if emailEnabled {
 		switch purpose {
+		case contactcode.PurposeMFAEnrollment:
+			cfg.MFAEnrollmentEmail = delivery
 		case contactcode.PurposeFirstPasskey:
 			cfg.FirstPasskeyEmail = delivery
 		case contactcode.PurposePasswordChange:

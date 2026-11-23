@@ -13,6 +13,7 @@ It is not deployed acceptance, policy approval or authorization to execute the
 | Existing conditional flow | Email-link ownership, then Iranian mobile SMS ownership, then a resident UV-required passkey. Completion returns `next: "login"`; discoverable login is separate. Registration and SMS default disabled.                                                                                                              |
 | Username increment        | Add one required username to that same flow, explicit advisory username validation, atomic reservation, and an authenticated read of the saved username or truthful absence. No contact choice, password, private-data editor or six-stage shell is activated by this increment.                                      |
 | Geography increment (T08/T09) | An independently imported immutable geography catalog, anonymous bounded reads, server snapshot validator and reusable bilingual selector. Registration requests, stages and completion remain unchanged. T10 encrypted storage and T34/T37 integration remain deferred. |
+| Existing-account MFA maintenance (T26) | Extend existing TOTP routes with a default-off, password/contact `mfa_enrollment` start proof and fresh strong-factor disable. No registration fields/stages, login policy, optional-MFA flag, management UI or other task status changes. |
 | Deferred final target     | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
 
 Do not add a second registration implementation or versioned registration route.
@@ -78,6 +79,24 @@ redacted failures. Do not put contacts, usernames, proofs, keys or private colli
 reports into logs, URLs, analytics, cross-tab messages or browser artifacts.
 Provider/relay acceptance is not delivery. Native cancellation and locale changes
 are not permission to replay enrollment, resend, rebootstrap or extend authority.
+
+Existing-account T26 maintenance is a separate normal-session ceremony, not signup
+authority. Its [exact challenge/verify and TOTP contracts](api-design.md#multi-factor-authentication-totp--sms-otp)
+use fresh exact-byte password verification plus a code to an exactly evidenced
+server-owned contact only for nonprivileged password-only accounts with usable
+enabled admitted username/password sign-in, zero passkeys and no enabled/configured
+active TOTP. Any role membership excludes that fallback. The fixed-purpose proof
+is spent once at pending start; confirmation rechecks its frozen session/version/JKT,
+contact and policy binding, using only the new-secret TOTP and no second authority
+header. The deadline is the earliest enrollment/original-authorization/session
+idle/absolute limit and never extends through renewal, retry or replacement.
+Existing UV Step-up remains a stronger start path; shared grants are single-use,
+not action-scoped. Disable requires fresh enrolled-TOTP or UV Step-up, never the
+password/contact proof, and preserves resulting-state primary-login and every-role
+protection. Enabled MFA still requires independently earned TOTP at normal-session
+boundaries, including UV-passkey sign-in. Signup proofs, receipt replay and `/result`
+cannot authorize or reconcile these maintenance mutations, and enrollment does not
+restamp an existing session as MFA-authenticated.
 
 ## Username Namespace
 

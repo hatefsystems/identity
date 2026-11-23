@@ -28,4 +28,8 @@ var (
 	ErrLastFactor = errors.New("mfa: cannot disable the last login factor")
 	// ErrEnrollmentExpired indicates a pending TOTP enrollment exceeded its TTL.
 	ErrEnrollmentExpired = errors.New("mfa: enrollment expired")
+	// ErrUnauthorized rejects missing, stale or insufficiently earned maintenance authority.
+	ErrUnauthorized = errors.New("mfa: fresh maintenance authority unavailable")
+	// ErrOutcomeUnknown forbids publishing tentative setup or success after commit uncertainty.
+	ErrOutcomeUnknown = errors.New("mfa: transaction outcome unknown")
 )

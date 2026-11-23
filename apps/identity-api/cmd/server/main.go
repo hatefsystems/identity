@@ -198,6 +198,7 @@ func run(logger *slog.Logger) (runErr error) {
 	}
 	if mfaService != nil {
 		mfaService.SetAccountPolicy(protection)
+		mfaService.SetSessions(sessionManager)
 	}
 	deletionProofService, err := buildAccountDeletionProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
 	if err != nil {
@@ -222,6 +223,18 @@ func run(logger *slog.Logger) (runErr error) {
 	var firstProofs server.FirstPasskeyProofs
 	if firstProofService != nil {
 		firstProofs = firstProofService
+	}
+	mfaEnrollmentProofService, err := buildMFAEnrollmentProofs(cfg.Environment, pool, redisClient, sessionManager, smsotpService)
+	if err != nil {
+		return err
+	}
+	var mfaEnrollmentProofs server.MFAEnrollmentProofs
+	if mfaEnrollmentProofService != nil {
+		mfaEnrollmentProofService.SetAccountPolicy(protection)
+		mfaEnrollmentProofs = mfaEnrollmentProofService
+	}
+	if mfaService != nil && mfaEnrollmentProofService != nil {
+		mfaService.SetEnrollmentProofs(mfaEnrollmentProofService)
 	}
 	if webauthnService != nil {
 		// Raw sessions and protected identity are required even for Step-up first
@@ -347,6 +360,7 @@ func run(logger *slog.Logger) (runErr error) {
 		AccountDeletionProofs:  deletionProofs,
 		PasswordChangeProofs:   passwordProofs,
 		FirstPasskeyProofs:     firstProofs,
+		MFAEnrollmentProofs:    mfaEnrollmentProofs,
 		Passwords:              passwordService,
 		Profile:                profileService,
 		PrivateProfile:         privateProfileReader,
@@ -389,6 +403,14 @@ func run(logger *slog.Logger) (runErr error) {
 			maintainFirstPasskeyProofs(ctx, firstProofService, logger)
 		}()
 	}
+	var mfaProofCleanupDone chan struct{}
+	if mfaEnrollmentProofService != nil {
+		mfaProofCleanupDone = make(chan struct{})
+		go func() {
+			defer close(mfaProofCleanupDone)
+			maintainActionProofs(ctx, mfaEnrollmentProofService.CleanupExpiredMFAEnrollment, logger, "MFA enrollment proof cleanup unavailable")
+		}()
+	}
 
 	// Run the server in a goroutine so we can wait on the signal context.
 	serverErr := make(chan error, 2)
@@ -415,6 +437,9 @@ func run(logger *slog.Logger) (runErr error) {
 	if firstProofCleanupDone != nil {
 		<-firstProofCleanupDone
 	}
+	if mfaProofCleanupDone != nil {
+		<-mfaProofCleanupDone
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return errors.Join(serveErr, shutdownServers(shutdownCtx, srv, grpcServer))
@@ -436,6 +461,10 @@ func validateStartupInputs(cfg config.Config) error {
 		return err
 	}
 	firstProofCfg, err := config.LoadFirstPasskeyProofs(cfg.Environment)
+	if err != nil {
+		return err
+	}
+	mfaProofCfg, err := config.LoadMFAEnrollmentProofs(cfg.Environment)
 	if err != nil {
 		return err
 	}
@@ -467,9 +496,12 @@ func validateStartupInputs(cfg config.Config) error {
 	if loginCfg.Enabled && !usernameCfg.Enabled {
 		return errors.New("main: enabled username login requires USERNAME_ENABLED")
 	}
+	if mfaProofCfg.Enabled && (!loginCfg.Enabled || !usernameCfg.Enabled) {
+		return errors.New("main: MFA enrollment proofs require usable admitted username password login")
+	}
 	hasDB := strings.TrimSpace(os.Getenv("DATABASE_URL")) != ""
 	hasRedis := strings.TrimSpace(os.Getenv("REDIS_URL")) != ""
-	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled || firstProofCfg.Enabled {
+	if cfg.Environment != "development" || cfg.GRPC.Enabled || cfg.Admin.Enabled || privacyCfg.DeletionEnabled || smsCfg.Enabled || registrationCfg.Enabled || usernameCfg.Enabled || loginCfg.Enabled || deletionProofCfg.Enabled || passwordProofCfg.Enabled || firstProofCfg.Enabled || len(mfaProofCfg.BindingKey) > 0 {
 		if !hasDB {
 			return errors.New("main: DATABASE_URL is required")
 		}
@@ -949,6 +981,10 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 	if err != nil {
 		return nil, err
 	}
+	mfaEnrollmentSender, err := buildMFAEnrollmentSMSSender(environment)
+	if err != nil {
+		return nil, err
+	}
 
 	svc, err := smsotp.New(smsotp.Config{
 		CodeTTL:              smsCfg.CodeTTL,
@@ -964,6 +1000,7 @@ func buildSMSOTPService(environment string, pool *pgxpool.Pool, redisClient *red
 		DeletionSender:       deletionSender,
 		PasswordChangeSender: passwordChangeSender,
 		FirstPasskeySender:   firstPasskeySender,
+		MFAEnrollmentSender:  mfaEnrollmentSender,
 	}, users, encryptor, indexer, limiter, otpStore, sender)
 	if err != nil {
 		return nil, fmt.Errorf("main: build SMS OTP service: %w", err)

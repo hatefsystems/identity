@@ -94,6 +94,95 @@ rewrite deadlines/identity, remove committed credentials or run a destructive Do
 Inbox/provider receipt, platform authenticators and deployed-ingress acceptance
 remain independent unverified release gates.
 
+For the separate MFA-enrollment fallback (T26), all three switches default off:
+`MFA_ENROLLMENT_PROOFS_ENABLED`, `MFA_ENROLLMENT_PROOFS_EMAIL_ENABLED` and
+`MFA_ENROLLMENT_PROOFS_SMS_ENABLED`. Enable the ceremony only with at least one
+explicitly selected channel; an unselected channel needs no provider. Channel
+switches cannot remain true with the global switch false. Unlike T25, eligibility
+requires `LOGIN_ENABLED` and already-approved admitted username authority, a usable
+supported password, zero passkeys, no enabled/configured active TOTP, no role
+membership and an exactly evidenced verified selected contact. Do not activate
+username policy, add contacts, install provider templates or infer approvals here.
+
+Use shared `LOGIN_CODE_HMAC_KEY` for bounded contact-code quotas/lockouts and a
+dedicated 32..64-byte base64 `MFA_ENROLLMENT_PROOFS_BINDING_KEY`; it must differ from
+the code, deletion, password-change and first-passkey binding keys. Email uses
+the existing verified-TLS `LOGIN_SMTP_*` transport with MFA-enrollment-specific
+copy. SMS additionally needs `SMS_ENABLED` and positive explicit
+`MFA_ENROLLMENT_SMS_IR_TEMPLATE_ID`, distinct from `SMS_IR_TEMPLATE_ID`,
+`ACCOUNT_DELETION_SMS_IR_TEMPLATE_ID`, `PASSWORD_CHANGE_SMS_IR_TEMPLATE_ID` and
+`FIRST_PASSKEY_SMS_IR_TEMPLATE_ID`. Keep existing country/key-mode/spend/provider
+protections and direct-transport language behavior; UI locale does not choose a
+different SMS template, and T26 adds no notification wire version/locale negotiation.
+No purpose key, recipient, password, code, proof or setup secret belongs in logs or
+browser/CI artifacts. Provider acceptance is not mailbox/handset receipt.
+
+Additive forward-only `00010_mfa_enrollment_authorization.sql` follows unchanged
+00001..00009 in `public.identity_schema_version`. It creates
+`public.mfa_enrollment_action_proofs` and adds captured `auth_version`, `jkt`,
+`authorization_method`, `channel` and `contact_binding` to the existing
+`mfa_totp_enrollments`. Proof rows store only digest, subject/session/JKT/version,
+fixed `mfa_enrollment` action, channel, 32-byte keyed evidence and original finite
+expiry. New pending rows require complete method-specific bounded metadata:
+`webauthn_uv` has no contact fields; `password_contact` requires channel and 32-byte
+contact binding. Existing all-null metadata groups remain stored, but readers reject
+them before decryption; partial metadata fails constraints. There is no backfill,
+inferred authorization or active/pending secret-encryption format change. Provision
+only `SELECT, INSERT, DELETE` for the runtime proof table, not `UPDATE`, `TRUNCATE`
+or broad grants; bounded cleanup handles at most 1000 expired proofs per minute.
+
+T26 rollout/rollback below is documentation only, not permission to migrate, deploy,
+write shared state, reset data, activate policies or install templates:
+
+1. Quiesce and drain old MFA maintenance writers before separately authorized
+   schema application. Never run mixed old/new maintenance writers: nullable
+   columns do not prevent old code bypassing frozen authorization checks. Inventory
+   actual pending enrollments without assuming a legacy population. If live rows
+   lacking bindings exist, obtain an explicit owner-approved expiry/restart
+   transition; no automatic deletion, reset or account/factor backfill is authorized.
+2. Apply the reviewed additive schema and restricted grants under the separately
+   authorized migrator/provisioner identities, then admit only new readers/writers
+   with proof issuance default-off. Preserve existing normal-session MFA, Origin,
+   DPoP, recovery and stronger UV-maintenance paths. There is no T26 management UI.
+3. Enable selected proof delivery only after actual admitted-login policy, protected
+   key custody and provider/template/budget approvals. Enrollment start consumes
+   exactly one UV strong grant OR `mfa_enrollment` proof; final confirmation accepts
+   only the bound enrollment/new-secret code. Disable accepts fresh enrolled-TOTP
+   or UV Step-up only and rechecks resulting-state password fallback/nonprivileged
+   and every-role protection under the common locks. Shared Step-up is not action-scoped.
+4. To stop new issuance/delivery, turn the selected channel switches and global
+   switch off together while retaining binding readers/keys, DB/encryption/session
+   and current-policy dependencies for bounded pending work. Final validation does
+   not need an enabled provider. The fixed enrollment deadline is the earliest
+   configured ten-minute-default limit, original authorization expiry and initiating
+   session idle/absolute expiry; do not rewrite or extend it through renewal/retry.
+5. Rollback retains additive 00010 and the unchanged active-secret representation.
+   Stop new maintenance writers and resolve bounded pending work before restoring
+   any older writer; old code must never redeem new records without frozen binding
+   checks. Preserve account/active-factor data, keys and original authority clocks.
+   No Down, migration downgrade, authority rewrite or stale-session restore is allowed.
+
+Known-committed setup/no-op outcomes survive renewal failure. Actual enable/removal
+invalidates old sessions/tokens/grants/pending authority once and emits only the
+existing real-change security events; a pending-only/absent disable emits no
+disabled-factor event, version bump or invalidation header. `503 outcome_unknown`
+means commit acknowledgement was uncertain, not rollback: expose no tentative
+secret/success/success audit, restore no spent strong grant and never auto-retry.
+Lost setup output requires an explicit fresh ceremony; uncertain enable/disable
+requires ordinary fresh login/current-state inspection, not reconciliation or
+setup-secret retrieval. Issuance switches do not weaken enabled required MFA.
+
+T26 runtime/CI evidence is unrun for these documentation edits: required native
+Linux Node `24.18.0`, npm `11.21.0` and Go `1.26.5+` are unavailable in the current
+agent environment, and no installation is authorized. No generation, build,
+unit/race/vet/lint, disposable-service integration or browser gate was executed;
+no migration/provider/shared-service operation was performed. The integrating
+implementation owner must run the final combined-source gates from
+`.github/workflows/identity-api.yml` and resolved Nx targets with the required
+toolchains. Historical acceptance remains unchanged and is not T26 evidence.
+Real email/SMS receipt, physical-authenticator use, independent Persian security
+wording review and deployed-ingress acceptance remain separately unverified.
+
 ## Geography Catalog (T08/T09)
 
 The catalog is an independent operator import and anonymous read boundary, not

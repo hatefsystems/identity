@@ -260,7 +260,7 @@ func newRealProofFixtureFor(t *testing.T, purpose string) realProofFixture {
 		"GRANT USAGE ON SCHEMA public TO ",
 		"GRANT SELECT ON public.users,public.webauthn_credentials,public.user_roles,public.contact_verification_evidence TO ",
 		"GRANT UPDATE(id) ON public.users TO ", // Required by SELECT ... FOR UPDATE, not proof mutation.
-		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs,public.password_change_action_proofs,public.first_passkey_enrollment_action_proofs TO ",
+		"GRANT SELECT,INSERT,DELETE ON public.account_deletion_action_proofs,public.password_change_action_proofs,public.first_passkey_enrollment_action_proofs,public.mfa_enrollment_action_proofs TO ",
 		"GRANT INSERT ON public.proof_test_actions TO ",
 		"GRANT USAGE ON SEQUENCE public.proof_test_actions_id_seq TO ",
 	} {
@@ -281,6 +281,8 @@ func newRealProofFixtureFor(t *testing.T, purpose string) realProofFixture {
 	deps := Deps{DB: runtimePool, Queries: db.New(runtimePool), Codes: codes, Cipher: cipher, Limiter: limiter, Sessions: sessions}
 	var svc *Service
 	switch purpose {
+	case contactcode.PurposeMFAEnrollment:
+		svc, err = NewMFAEnrollment(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, deps)
 	case contactcode.PurposeFirstPasskey:
 		svc, err = NewFirstPasskey(Config{BindingKey: bytes.Repeat([]byte{4}, 32)}, deps)
 	case contactcode.PurposePasswordChange:

@@ -37,6 +37,8 @@ const (
 	PurposePasswordChange = "password_change"
 	// PurposeFirstPasskey authorizes one first-passkey enrollment start only.
 	PurposeFirstPasskey = "first_passkey_enrollment"
+	// PurposeMFAEnrollment authorizes only a pending TOTP enrollment start.
+	PurposeMFAEnrollment = "mfa_enrollment"
 )
 
 var (
@@ -72,6 +74,7 @@ type Config struct {
 	DeletionEmail           Sender
 	PasswordChangeEmail     Sender
 	FirstPasskeyEmail       Sender
+	MFAEnrollmentEmail      Sender
 	HashKey                 []byte
 	CodeTTL                 time.Duration
 	MaxAttempts             int
@@ -171,6 +174,9 @@ func New(cfg Config, store Store, sms *smsotp.Service, email Sender) (*Service, 
 	if missing(cfg.FirstPasskeyEmail) {
 		cfg.FirstPasskeyEmail = nil
 	}
+	if missing(cfg.MFAEnrollmentEmail) {
+		cfg.MFAEnrollmentEmail = nil
+	}
 	cfg.HashKey = append([]byte(nil), cfg.HashKey...)
 	return &Service{cfg, store, sms, email}, nil
 }
@@ -221,6 +227,11 @@ func (s *Service) FirstPasskeyChannelEnabled(channel string) bool {
 	return s.actionChannelEnabled(PurposeFirstPasskey, channel)
 }
 
+// MFAEnrollmentChannelEnabled never falls back to another purpose's transport.
+func (s *Service) MFAEnrollmentChannelEnabled(channel string) bool {
+	return s.actionChannelEnabled(PurposeMFAEnrollment, channel)
+}
+
 func (s *Service) actionChannelEnabled(purpose, channel string) bool {
 	if s == nil {
 		return false
@@ -232,6 +243,8 @@ func (s *Service) actionChannelEnabled(purpose, channel string) bool {
 		return channel == ChannelEmail && s.cfg.PasswordChangeEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.PasswordChangeDeliveryEnabled()
 	case PurposeFirstPasskey:
 		return channel == ChannelEmail && s.cfg.FirstPasskeyEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.FirstPasskeyDeliveryEnabled()
+	case PurposeMFAEnrollment:
+		return channel == ChannelEmail && s.cfg.MFAEnrollmentEmail != nil || channel == ChannelSMS && s.sms != nil && s.sms.MFAEnrollmentDeliveryEnabled()
 	default:
 		return false
 	}
@@ -252,6 +265,10 @@ func (s *Service) FirstPasskeyChallengeTTL(channel string) time.Duration {
 	return s.actionChallengeTTL(PurposeFirstPasskey, channel)
 }
 
+func (s *Service) MFAEnrollmentChallengeTTL(channel string) time.Duration {
+	return s.actionChallengeTTL(PurposeMFAEnrollment, channel)
+}
+
 func (s *Service) actionChallengeTTL(purpose, channel string) time.Duration {
 	if !s.actionChannelEnabled(purpose, channel) {
 		return 0
@@ -259,6 +276,8 @@ func (s *Service) actionChallengeTTL(purpose, channel string) time.Duration {
 	ttl := min(s.cfg.CodeTTL, 5*time.Minute)
 	if channel == ChannelSMS {
 		switch purpose {
+		case PurposeMFAEnrollment:
+			ttl = min(ttl, s.sms.ContactMFAEnrollmentTTL())
 		case PurposeFirstPasskey:
 			ttl = min(ttl, s.sms.ContactFirstPasskeyTTL())
 		case PurposePasswordChange:
@@ -295,6 +314,10 @@ func (s *Service) RequestFirstPasskey(ctx context.Context, binding DeletionBindi
 	return s.requestAction(ctx, binding, PurposeFirstPasskey, channel, destination, contactBinding, sourceIP)
 }
 
+func (s *Service) RequestMFAEnrollment(ctx context.Context, binding DeletionBinding, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
+	return s.requestAction(ctx, binding, PurposeMFAEnrollment, channel, destination, contactBinding, sourceIP)
+}
+
 func (s *Service) requestAction(ctx context.Context, binding DeletionBinding, purpose, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
 	if !s.actionChannelEnabled(purpose, channel) {
 		return "", time.Time{}, ErrDisabled
@@ -329,6 +352,8 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 		var p smsotp.LoginPolicy
 		var err error
 		switch purpose {
+		case PurposeMFAEnrollment:
+			p, err = s.sms.ContactMFAEnrollmentPolicy(destination, sourceIP)
 		case PurposeAccountDeletion:
 			p, err = s.sms.ContactDeletionPolicy(destination, sourceIP)
 		case PurposePasswordChange:
@@ -366,6 +391,8 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 	}
 	if channel == ChannelSMS {
 		switch purpose {
+		case PurposeMFAEnrollment:
+			err = s.sms.DeliverContactMFAEnrollmentCode(ctx, destination, code, rec.ExpiresAt)
 		case PurposeAccountDeletion:
 			err = s.sms.DeliverContactDeletionCode(ctx, destination, code, rec.ExpiresAt)
 		case PurposePasswordChange:
@@ -378,6 +405,8 @@ func (s *Service) request(ctx context.Context, binding DeletionBinding, purpose,
 	} else {
 		sender := s.email
 		switch purpose {
+		case PurposeMFAEnrollment:
+			sender = s.cfg.MFAEnrollmentEmail
 		case PurposeAccountDeletion:
 			sender = s.cfg.DeletionEmail
 		case PurposePasswordChange:
@@ -441,6 +470,13 @@ func (s *Service) VerifyFirstPasskey(ctx context.Context, binding DeletionBindin
 	return s.verifyAction(ctx, binding, PurposeFirstPasskey, handle, code)
 }
 
+func (s *Service) VerifyMFAEnrollment(ctx context.Context, binding DeletionBinding, handle, code string) (Record, error) {
+	if !validCode(code) {
+		return Record{}, ErrInvalid
+	}
+	return s.verifyAction(ctx, binding, PurposeMFAEnrollment, handle, code)
+}
+
 func (s *Service) verifyAction(ctx context.Context, binding DeletionBinding, purpose, handle, code string) (Record, error) {
 	if s == nil {
 		return Record{}, ErrDisabled
@@ -470,6 +506,8 @@ func (s *Service) consume(ctx context.Context, rec Record, code string) error {
 		var p smsotp.LoginPolicy
 		var err error
 		switch rec.Purpose {
+		case PurposeMFAEnrollment:
+			p, err = s.sms.ContactMFAEnrollmentPolicy(rec.Destination, "")
 		case PurposeAccountDeletion:
 			p, err = s.sms.ContactDeletionPolicy(rec.Destination, "")
 		case PurposePasswordChange:
@@ -525,7 +563,7 @@ func validDestination(channel, destination string) bool {
 func validRecord(rec Record) bool {
 	raw, err := hex.DecodeString(rec.CodeHash)
 	purposeValid := rec.Purpose == PurposeLogin && rec.SessionID == "" && rec.ContactBinding == ""
-	if rec.Purpose == PurposeAccountDeletion || rec.Purpose == PurposePasswordChange || rec.Purpose == PurposeFirstPasskey {
+	if rec.Purpose == PurposeAccountDeletion || rec.Purpose == PurposePasswordChange || rec.Purpose == PurposeFirstPasskey || rec.Purpose == PurposeMFAEnrollment {
 		contact, contactErr := hex.DecodeString(rec.ContactBinding)
 		purposeValid = validDeletionBinding(DeletionBinding{rec.AccountID, rec.AuthVersion, rec.SessionID, rec.JKT}) && contactErr == nil && len(contact) == 32 && hex.EncodeToString(contact) == rec.ContactBinding
 	}

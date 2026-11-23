@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,10 +55,11 @@ func TestMFAMutationsRejectStaleOrUncapturedSessions(t *testing.T) {
 		for _, captured := range []bool{true, false} {
 			t.Run(operation+"/"+map[bool]string{true: "stale", false: "uncaptured"}[captured], func(t *testing.T) {
 				fx := setupMFATestFixtureWithStepUp(t)
-				setup, err := fx.server.deps.MFA.GenerateSetup(t.Context(), fx.user.id, 0, fx.sess.ID)
+				setup, err := fx.server.deps.MFA.GenerateSetup(t.Context(), fx.sess, mfaAuthorizationForSession(fx.sess, mfa.AuthorizationWebAuthnUV))
 				if err != nil {
 					t.Fatal(err)
 				}
+				grant := fx.grantHeader(t)
 				fx.user.version = 1
 				if operation == "disable" {
 					fx.user.mfaOn = true
@@ -70,7 +72,13 @@ func TestMFAMutationsRejectStaleOrUncapturedSessions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa", bytes.NewReader(body))
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa", nil)
+				if operation == "enable" {
+					req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", bytes.NewReader(body))
+					req.Header.Set("Content-Type", "application/json")
+				} else {
+					req.Header.Set(stepup.HeaderStepUpAuth, grant)
+				}
 				req = req.WithContext(session.WithSession(req.Context(), fx.sess))
 				response := httptest.NewRecorder()
 				switch operation {
@@ -127,13 +135,18 @@ func (f *mfaFakeStore) DeleteMfaTotpEnrollmentsForUser(_ context.Context, userID
 
 func (f *mfaFakeStore) CreateMfaTotpEnrollment(_ context.Context, arg db.CreateMfaTotpEnrollmentParams) (db.MfaTotpEnrollment, error) {
 	row := db.MfaTotpEnrollment{
-		ID:              uuid.New(),
-		UserID:          arg.UserID,
-		SessionID:       arg.SessionID,
-		Purpose:         arg.Purpose,
-		SecretEncrypted: arg.SecretEncrypted,
-		ExpiresAt:       arg.ExpiresAt,
-		CreatedAt:       pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		ID:                  uuid.New(),
+		UserID:              arg.UserID,
+		SessionID:           arg.SessionID,
+		Purpose:             arg.Purpose,
+		SecretEncrypted:     arg.SecretEncrypted,
+		ExpiresAt:           arg.ExpiresAt,
+		AuthVersion:         arg.AuthVersion,
+		Jkt:                 arg.Jkt,
+		AuthorizationMethod: arg.AuthorizationMethod,
+		Channel:             arg.Channel,
+		ContactBinding:      append([]byte(nil), arg.ContactBinding...),
+		CreatedAt:           pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
 	f.enrollments[row.ID] = row
 	return row, nil
@@ -213,17 +226,18 @@ func (e *mfaTestEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byte
 	if len(ciphertext) < 4 || string(ciphertext[:4]) != "enc_" {
 		return nil, mfa.ErrDecryptFailed
 	}
-	return ciphertext[4:], nil
+	return append([]byte(nil), ciphertext[4:]...), nil
 }
 
 type mfaTestFixture struct {
-	server  *Server
-	browser *portalTestClient
-	store   *mfaFakeStore
-	user    *mfaTestUser
-	sess    session.Session
-	cookie  *http.Cookie
-	sessMgr *session.Manager
+	server       *Server
+	browser      *portalTestClient
+	store        *mfaFakeStore
+	user         *mfaTestUser
+	sess         session.Session
+	cookie       *http.Cookie
+	sessMgr      *session.Manager
+	sessionStore *boundaryStore
 	// stepUp is nil for the default fixture, which deliberately has no step-up
 	// service so the fail-closed behaviour of the gated DELETE route stays
 	// covered. setupMFATestFixtureWithStepUp populates it.
@@ -236,7 +250,22 @@ func (fx *mfaTestFixture) grantHeader(t *testing.T) string {
 	if fx.stepUp == nil {
 		t.Fatal("fixture has no step-up service")
 	}
-	return mintTestGrant(t, fx.stepUp, fx.sess)
+	return mintMFAGrant(t, fx.stepUp, fx.sess, []string{"hwk", "user"})
+}
+
+func mfaAuthorizationForSession(sess session.Session, method string) mfa.Authorization {
+	return mfa.Authorization{UserID: sess.UserID, SessionID: sess.ID, JKT: sess.DPoPJKT,
+		AuthVersion: sess.AuthVersion, Method: method, ExpiresAt: time.Now().Add(5 * time.Minute)}
+}
+
+func mintMFAGrant(t *testing.T, svc *stepup.Service, sess session.Session, amr []string) string {
+	t.Helper()
+	grant, _, err := svc.Mint(stepup.MintParams{UserID: sess.UserID, SessionID: sess.ID,
+		DPoPJKT: sess.DPoPJKT, AuthVersion: sess.AuthVersion, AuthVersionSet: sess.AuthVersionSet, AMR: amr})
+	if err != nil {
+		t.Fatal("mint MFA grant", err)
+	}
+	return grant
 }
 
 func setupMFATestFixture(t *testing.T) *mfaTestFixture {
@@ -279,7 +308,7 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 		t.Fatalf("NewCookieCodec: %v", err)
 	}
 
-	sessionStore := session.NewMemoryStore()
+	sessionStore := &boundaryStore{Store: session.NewMemoryStore()}
 	sessMgr, err := session.NewManager(sessionStore, codec, session.ManagerConfig{
 		AbsoluteTTL: 24 * time.Hour,
 		IdleTTL:     2 * time.Hour,
@@ -297,6 +326,7 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 		IP:             "127.0.0.1",
 		UserAgent:      "test-agent",
 		DPoPJKT:        browser.jkt,
+		Evidence:       session.Evidence{PrimaryMethod: session.MethodPasskey, UV: session.UVVerified, TOTPSet: true, AuthenticatedAt: time.Now().UTC()},
 	})
 	if err != nil {
 		t.Fatalf("sessMgr.Issue: %v", err)
@@ -328,14 +358,15 @@ func newMFATestFixture(t *testing.T, withStepUp bool) *mfaTestFixture {
 	})
 
 	return &mfaTestFixture{
-		server:  srv,
-		browser: browser,
-		store:   store,
-		user:    u,
-		sess:    sess,
-		cookie:  sessionCookie,
-		sessMgr: sessMgr,
-		stepUp:  stepUpSvc,
+		server:       srv,
+		browser:      browser,
+		store:        store,
+		user:         u,
+		sess:         sess,
+		cookie:       sessionCookie,
+		sessMgr:      sessMgr,
+		stepUp:       stepUpSvc,
+		sessionStore: sessionStore,
 	}
 }
 
@@ -364,8 +395,12 @@ func TestMFARoutesEndToEnd(t *testing.T) {
 		t.Errorf("expected 32-char secret, got %q", genResp.Secret)
 	}
 
-	// 2. Verify with invalid code
-	verifyBody, _ := json.Marshal(map[string]string{"enrollment_id": genResp.EnrollmentID, "code": "000000"})
+	if genResp.ExpiresAt.IsZero() || !genResp.ExpiresAt.Equal(fx.store.enrollments[uuid.MustParse(genResp.EnrollmentID)].ExpiresAt.Time) {
+		t.Fatal("setup response lost frozen enrollment deadline")
+	}
+	// 2. Verify with a code outside all accepted time steps.
+	wrong := wrongMFAHTTPCode(t, genResp.Secret, time.Now())
+	verifyBody, _ := json.Marshal(map[string]string{"enrollment_id": genResp.EnrollmentID, "code": wrong})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", bytes.NewReader(verifyBody))
 	fx.browser.authorize(t, req, fx.sess, fx.cookie)
 	rec = httptest.NewRecorder()
@@ -510,5 +545,202 @@ func TestMFADisableRejectedWithoutGrant(t *testing.T) {
 	if fx.user.mfaOn {
 		// Belt and braces: a rejected request must not have run the handler.
 		t.Error("MFA state changed despite the request being rejected")
+	}
+}
+
+func wrongMFAHTTPCode(t *testing.T, secret string, now time.Time) string {
+	t.Helper()
+	for _, code := range []string{"000000", "111111", "222222", "333333"} {
+		if !totp.ValidateCode(secret, code, now, 1) {
+			return code
+		}
+	}
+	t.Fatal("no code outside accepted TOTP window")
+	return ""
+}
+
+func TestMFAMalformedRequestsDoNotSpendValidGrant(t *testing.T) {
+	for _, operation := range []string{"setup", "disable"} {
+		for _, malformed := range []string{"body", "query", "duplicate", "comma_joined", "mixed", "oversized", "empty"} {
+			t.Run(operation+"/"+malformed, func(t *testing.T) {
+				fx := setupMFATestFixtureWithStepUp(t)
+				grant := fx.grantHeader(t)
+				method, path := http.MethodPost, "/api/v1/auth/mfa/generate"
+				if operation == "disable" {
+					method, path = http.MethodDelete, "/api/v1/auth/mfa"
+				}
+				body := ""
+				if malformed == "body" {
+					body = "{}"
+				}
+				if malformed == "query" {
+					path += "?unexpected=true"
+				}
+				req := httptest.NewRequest(method, path, strings.NewReader(body))
+				fx.browser.authorize(t, req, fx.sess, fx.cookie)
+				req.Header.Set(stepup.HeaderStepUpAuth, grant)
+				switch malformed {
+				case "duplicate":
+					req.Header.Add(stepup.HeaderStepUpAuth, grant)
+				case "comma_joined":
+					req.Header.Set(stepup.HeaderStepUpAuth, grant+","+grant)
+				case "mixed":
+					req.Header.Set("X-Action-Proof", strings.Repeat("A", 43))
+				case "oversized":
+					req.Header.Set(stepup.HeaderStepUpAuth, strings.Repeat("a", 16*1024+1))
+				case "empty":
+					req.Header.Set(stepup.HeaderStepUpAuth, "")
+				}
+				response := httptest.NewRecorder()
+				fx.server.Handler().ServeHTTP(response, req)
+				want := http.StatusForbidden
+				if malformed == "body" || malformed == "query" {
+					want = http.StatusBadRequest
+				}
+				if response.Code != want || len(fx.store.enrollments) != 0 || fx.user.version != 0 {
+					t.Fatalf("malformed request touched state: status %d", response.Code)
+				}
+				if _, err := fx.stepUp.Validate(t.Context(), grant, fx.sess); err != nil {
+					t.Fatal("malformed request spent otherwise valid authority", err)
+				}
+			})
+		}
+	}
+}
+
+func TestMFAVerifyStrictBodyAndMisplacedAuthorityDoNotBurnEnrollment(t *testing.T) {
+	for _, malformed := range []string{"unknown", "duplicate", "trailing", "numeric", "missing", "null", "noncanonical_id", "whitespace_code", "unicode_code", "stepup_header", "proof_header"} {
+		t.Run(malformed, func(t *testing.T) {
+			fx := setupMFATestFixtureWithStepUp(t)
+			setup, err := fx.server.deps.MFA.GenerateSetup(t.Context(), fx.sess, mfaAuthorizationForSession(fx.sess, mfa.AuthorizationWebAuthnUV))
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := fx.grantHeader(t)
+			id := setup.EnrollmentID
+			body := `{"enrollment_id":"` + id + `","code":"123456"}`
+			switch malformed {
+			case "unknown":
+				body = `{"enrollment_id":"` + id + `","code":"123456","extra":"x"}`
+			case "duplicate":
+				body = `{"enrollment_id":"` + id + `","code":"123456","code":"123456"}`
+			case "trailing":
+				body += `{}`
+			case "numeric":
+				body = `{"enrollment_id":"` + id + `","code":123456}`
+			case "missing":
+				body = `{"enrollment_id":"` + id + `"}`
+			case "null":
+				body = `{"enrollment_id":"` + id + `","code":null}`
+			case "noncanonical_id":
+				body = `{"enrollment_id":"{` + id + `}","code":"123456"}`
+			case "whitespace_code":
+				body = `{"enrollment_id":"` + id + `","code":" 123456"}`
+			case "unicode_code":
+				body = `{"enrollment_id":"` + id + `","code":"\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6"}`
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/mfa/verify", strings.NewReader(body))
+			fx.browser.authorize(t, req, fx.sess, fx.cookie)
+			if malformed == "stepup_header" {
+				req.Header.Set(stepup.HeaderStepUpAuth, grant)
+			}
+			if malformed == "proof_header" {
+				req.Header.Set("X-Action-Proof", strings.Repeat("A", 43))
+			}
+			response := httptest.NewRecorder()
+			fx.server.Handler().ServeHTTP(response, req)
+			want := http.StatusBadRequest
+			if malformed == "stepup_header" || malformed == "proof_header" {
+				want = http.StatusForbidden
+			}
+			if response.Code != want || len(fx.store.enrollments) != 1 || fx.store.enrollments[uuid.MustParse(id)].FailedAttempts != 0 || fx.user.mfaOn || fx.user.version != 0 {
+				t.Fatalf("malformed verify spent pending authority: status %d", response.Code)
+			}
+			if _, err := fx.stepUp.Validate(t.Context(), grant, fx.sess); err != nil {
+				t.Fatal("verify spent misplaced grant", err)
+			}
+		})
+	}
+}
+
+func TestMFAManagementRequiresActuallyEarnedStrongAMR(t *testing.T) {
+	for _, operation := range []string{"setup", "disable"} {
+		for _, amr := range [][]string{{"pwd"}, {"email"}, {"sms"}, {"recovery"}, {"webauthn"}, {"hwk"}, {"user"}, {"otp"}, {"hwk", "user"}} {
+			t.Run(operation+"/"+strings.Join(amr, "+"), func(t *testing.T) {
+				fx := setupMFATestFixtureWithStepUp(t)
+				method, path := http.MethodPost, "/api/v1/auth/mfa/generate"
+				if operation == "disable" {
+					method, path = http.MethodDelete, "/api/v1/auth/mfa"
+					fx.user.mfaOn, fx.user.secret = true, []byte("active-secret")
+				}
+				req := httptest.NewRequest(method, path, nil)
+				fx.browser.authorize(t, req, fx.sess, fx.cookie)
+				req.Header.Set(stepup.HeaderStepUpAuth, mintMFAGrant(t, fx.stepUp, fx.sess, amr))
+				response := httptest.NewRecorder()
+				fx.server.Handler().ServeHTTP(response, req)
+				strong := len(amr) == 2 || operation == "disable" && amr[0] == "otp"
+				want := http.StatusForbidden
+				if strong {
+					want = http.StatusOK
+					if operation == "disable" {
+						want = http.StatusNoContent
+					}
+				}
+				if response.Code != want {
+					t.Fatalf("AMR acceptance mismatch: status %d, want %d", response.Code, want)
+				}
+				if !strong && (len(fx.store.enrollments) != 0 || fx.user.version != 0 || fx.user.mfaOn != (operation == "disable")) {
+					t.Fatal("weak AMR wrote credentials")
+				}
+			})
+		}
+	}
+}
+
+func TestMFASetupAndPendingOnlyNoopSurviveRenewalFailureWithoutInvalidationOrAudit(t *testing.T) {
+	for _, operation := range []string{"setup", "absent_disable", "pending_disable"} {
+		t.Run(operation, func(t *testing.T) {
+			fx := setupMFATestFixtureWithStepUp(t)
+			if operation == "pending_disable" {
+				if _, err := fx.server.deps.MFA.GenerateSetup(t.Context(), fx.sess, mfaAuthorizationForSession(fx.sess, mfa.AuthorizationWebAuthnUV)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recorder := &profileAuditRecorder{}
+			fx.server.deps.AuditRecorder = recorder
+			before, err := fx.sessMgr.LookupByID(t.Context(), fx.sess.UserID, fx.sess.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fx.sessionStore.touchErr = session.ErrStoreUnavailable
+			method, path, want := http.MethodDelete, "/api/v1/auth/mfa", http.StatusNoContent
+			if operation == "setup" {
+				method, path, want = http.MethodPost, "/api/v1/auth/mfa/generate", http.StatusOK
+			}
+			grant := fx.grantHeader(t)
+			req := httptest.NewRequest(method, path, nil)
+			fx.browser.authorize(t, req, fx.sess, fx.cookie)
+			req.Header.Set(stepup.HeaderStepUpAuth, grant)
+			response := httptest.NewRecorder()
+			fx.server.Handler().ServeHTTP(response, req)
+			if response.Code != want || response.Header().Get(session.HeaderAuthInvalidated) != "" || len(response.Result().Cookies()) != 0 || fx.user.version != 0 || fx.sessionStore.touches.Load() != 1 {
+				t.Fatalf("renewal failure overwrote known outcome or rotated authority: status %d", response.Code)
+			}
+			after, err := fx.sessMgr.LookupByID(t.Context(), fx.sess.UserID, fx.sess.ID)
+			if err != nil || !before.IdleExpiry.Equal(after.IdleExpiry) || !before.AbsoluteExpiry.Equal(after.AbsoluteExpiry) {
+				t.Fatal("failed renewal extended or removed known committed session", err)
+			}
+			if operation != "setup" && len(fx.store.enrollments) != 0 {
+				t.Fatal("pending-only cancellation did not clear enrollment")
+			}
+			for _, event := range recorder.events {
+				if event.ActionStatus == "success" {
+					t.Fatal("setup/no-op emitted factor-change audit")
+				}
+			}
+			if _, err := fx.stepUp.Validate(t.Context(), grant, fx.sess); err == nil {
+				t.Fatal("known no-op restored single-use strong grant")
+			}
+		})
 	}
 }

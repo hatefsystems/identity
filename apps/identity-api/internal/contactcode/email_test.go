@@ -144,3 +144,29 @@ func TestFirstPasskeyEmailDistinctCopyAndExactDeadline(t *testing.T) {
 		t.Fatal("first-passkey SMTP uncertainty retried or hid outcome")
 	}
 }
+
+func TestMFAEnrollmentEmailDistinctCopyAndExactDeadline(t *testing.T) {
+	transport := &captureMail{}
+	email, err := NewMFAEnrollmentEmail("security@example.test", transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute).Truncate(time.Millisecond)
+	destination := "\u0645\u0627\u0644\u06a9@example.test"
+	if err := email.SendCode(t.Context(), destination, "000042", expires); err != nil {
+		t.Fatal(err)
+	}
+	message := string(transport.message)
+	for _, text := range []string{"Subject: Your authenticator enrollment code\r\n", "authorizes one authenticator enrollment start", "cannot disable an authenticator, sign you in", "000042\r\n", expires.Format(time.RFC3339Nano)} {
+		if !strings.Contains(message, text) {
+			t.Fatal("MFA enrollment copy lost security meaning/deadline")
+		}
+	}
+	if !transport.deadline.Equal(expires) || transport.calls != 1 || transport.recipient != destination || strings.Contains(message, "Subject: Your first-passkey") || strings.Contains(message, "Subject: Your password-change") || strings.Contains(message, "#token=") {
+		t.Fatal("MFA enrollment reused another purpose or changed exact delivery")
+	}
+	transport.err = errPrivate
+	if err := email.SendCode(t.Context(), destination, "000042", expires); err != ErrOutcomeUnknown || transport.calls != 2 {
+		t.Fatal("MFA enrollment SMTP uncertainty retried or hid outcome")
+	}
+}

@@ -108,6 +108,26 @@ func (s *Service) ContactFirstPasskeyPolicy(phone, sourceIP string) (LoginPolicy
 	return s.contactPolicy(phone, sourceIP)
 }
 
+// MFAEnrollmentDeliveryEnabled requires a separately configured enrollment template.
+func (s *Service) MFAEnrollmentDeliveryEnabled() bool {
+	return s != nil && s.cfg.MFAEnrollmentSender != nil
+}
+
+func (s *Service) ContactMFAEnrollmentTTL() time.Duration {
+	if !s.MFAEnrollmentDeliveryEnabled() {
+		return 0
+	}
+	return s.cfg.CodeTTL
+}
+
+// ContactMFAEnrollmentPolicy preserves cross-purpose quotas and destination lockout.
+func (s *Service) ContactMFAEnrollmentPolicy(phone, sourceIP string) (LoginPolicy, error) {
+	if !s.MFAEnrollmentDeliveryEnabled() {
+		return LoginPolicy{}, ErrDisabled
+	}
+	return s.contactPolicy(phone, sourceIP)
+}
+
 func (s *Service) contactPolicy(phone, sourceIP string) (LoginPolicy, error) {
 	canonical, err := NormalizePhone(phone)
 	if err != nil || canonical != phone {
@@ -157,6 +177,14 @@ func (s *Service) DeliverContactFirstPasskeyCode(ctx context.Context, phone, cod
 		return ErrDisabled
 	}
 	return deliverContactCode(ctx, s.cfg.FirstPasskeySender, phone, code, expiresAt)
+}
+
+// DeliverContactMFAEnrollmentCode submits once after shared quota reservation.
+func (s *Service) DeliverContactMFAEnrollmentCode(ctx context.Context, phone, code string, expiresAt time.Time) error {
+	if !s.MFAEnrollmentDeliveryEnabled() {
+		return ErrDisabled
+	}
+	return deliverContactCode(ctx, s.cfg.MFAEnrollmentSender, phone, code, expiresAt)
 }
 
 func deliverContactCode(ctx context.Context, sender Sender, phone, code string, expiresAt time.Time) error {

@@ -63,6 +63,7 @@ transliteration or ASCII downgrade. Sender/auth values remain ASCII.
 | `409 last_credential` / `409 last_factor` | The proposed security change would violate current primary-login or privileged-factor policy. The change was refused, even if an earlier list hint allowed it; refresh/review the current state without automatic mutation replay. |
 | `429 rate_limited` | Surface throttling; do not loop challenges or mutations. |
 | `503 temporarily_unavailable` | Dependency failure; do not authorize from cached state or report a successful mutation. |
+| `503 outcome_unknown` | The mutation may have committed. Do not automatically retry, restore spent authority or infer rollback from a later `401`; no tentative setup secret or success is returned. |
 
 ### 1.3 Advanced Security, WebAuthn & Step-up Auth
 Endpoints for phishing-resistant logins, Multi-Factor Authentication, and short-lived Step-up verification.
@@ -138,9 +139,102 @@ Confirmed success is decoded before private authority is discarded; malformed
 or non-UV success remains uncertain and never authorizes a retry.
 
 #### Multi-Factor Authentication (TOTP) & SMS OTP
-- `POST /api/v1/auth/mfa/generate`: Generate a pending TOTP secret and QR code. Requires Step-up authentication in `X-Step-Up-Auth` because adding an authenticator changes who can satisfy future Step-up checks. The response contains `enrollment_id`, `secret`, `otpauth_url`, `issuer`, and `account_name`; keep the secret client-side only until confirmation.
-- `POST /api/v1/auth/mfa/verify`: Verify `{"enrollment_id":"...","code":"123456"}` and enable TOTP. The pending enrollment is bound to the authenticated user, exact session that called `/generate`, and the `maintenance` purpose; by default it expires after 10 minutes and permits at most five failed attempts. A foreign enrollment/session is reported as `mfa_not_setup` without burning the legitimate attempt. The Step-up grant was consumed at `/generate`, so verification needs the same live session but no second grant. Success returns `{"status":"enabled"}`.
-- `DELETE /api/v1/auth/mfa`: Disable TOTP MFA (Requires Step-up authentication in `X-Step-Up-Auth`). Uses the same resulting-state policy as passkey removal: a usable primary login must remain, and an account with any privileged role must retain a passkey or enabled TOTP backed by secret material. Refusals are `409 last_credential` or `409 last_factor`; a nonprivileged account with eligible username/password login need not retain TOTP. An already-disabled empty authenticator is a no-op.
+
+T26 extends these existing backend routes, not registration, login or a dashboard
+management UI. Every operation requires the normal live cookie session, exact
+Origin, DPoP/JKT and `X-Portal-Session` boundary above; restricted recovery sessions
+cannot use it. Enabled `is_mfa_enabled` still requires independently earned TOTP
+at normal-session boundaries, including UV-passkey sign-in. There is no new
+optional/required-MFA flag or privilege exemption.
+
+| Operation | Exact request / authority | Successful response |
+|---|---|---|
+| `POST /api/v1/auth/action-proofs/mfa-enrollment/challenge` | `{"password":"...","channel":"email"}` or `{"password":"...","channel":"sms"}`; neither authority header | `202 {"challenge":"...","expires_at":"..."}` after one delivery attempt; acceptance is not receipt |
+| `POST /api/v1/auth/action-proofs/mfa-enrollment/verify` | `{"challenge":"...","code":"123456"}`; neither authority header | `200 {"action_proof":"...","expires_at":"..."}` retaining the original contact-code deadline |
+| `POST /api/v1/auth/mfa/generate` | Empty body, no query; exactly one fresh UV `X-Step-Up-Auth` OR fixed-purpose `X-Action-Proof` | `200 {"enrollment_id":"...","secret":"...","otpauth_url":"...","issuer":"...","account_name":"...","expires_at":"..."}` only after known commit |
+| `POST /api/v1/auth/mfa/verify` | `{"enrollment_id":"...","code":"123456"}`; neither authority header | `200 {"status":"enabled"}` and committed security-invalidation metadata |
+| `DELETE /api/v1/auth/mfa` | Empty body, no query; only fresh `X-Step-Up-Auth` earned through enrolled TOTP (`otp`) or UV WebAuthn (`hwk` AND `user`) | Empty `204`; security-invalidation metadata only for actual removal |
+
+All listed JSON fields are required strings. Proof and confirmation bodies are
+strict UTF-8 `application/json` objects of at most 8192 bytes, with no unknown,
+duplicate or null fields, trailing document or query. `channel` is exactly `email`
+or `sms`, not a destination supplied by the caller. Password bytes remain exact;
+codes are exactly six ASCII digits, preserving leading zeros. `challenge` and
+`action_proof` are canonical unpadded base64url encodings of 32 random bytes (43
+characters); `enrollment_id` is a canonical nonzero UUID. `expires_at` is the
+authoritative RFC 3339 instant, not a relative lifetime. Mixed, duplicate, empty,
+comma-joined, oversized or misplaced authority headers are rejected before
+consumption; there is no fallback to a second mechanism after failure.
+Keep returned setup secret/URI only in bounded client memory until confirmation;
+there is no setup-secret retrieval endpoint or persistent browser-storage contract.
+
+The password/contact path is default-off behind `MFA_ENROLLMENT_PROOFS_ENABLED`
+and independently selected email/SMS switches. It requires fresh supported
+password verification, an active nondeleted nonprivileged password-only account,
+zero passkeys, no enabled or configured active TOTP, usable enabled password login
+and a protected username retained under the admitted policy. Any role membership
+excludes this fallback, even if administrative HTTP is disabled. Delivery selects
+only the server-owned exact canonical contact with complete current protected
+verification evidence; populated fields or timestamps alone are not proof. These
+conditions are rechecked before delivery, at proof issuance, enrollment start and
+final confirmation. Unlike the separate first-passkey proof, this fallback requires
+usable admitted password sign-in. See [configuration and rollout](devops-operations.md#first-passkey-proofs-t25).
+
+The new proof has fixed purpose/action `mfa_enrollment` and authorizes one pending
+enrollment start only. It cannot authorize disable, first-passkey enrollment,
+password change, deletion, login, recovery or generic Step-up; other-purpose codes
+and proofs cannot authorize MFA enrollment. Existing strong Step-up grants remain
+single-use, session/version/JKT-bound, **not action-scoped**; MFA start specifically
+requires genuinely earned UV, not available-factor metadata or a TOTP-only grant.
+One MFA-owned locked SQL transaction consumes the purpose proof at start, replaces
+previous pending enrollment and freezes its authorization; confirmation never
+looks up that spent proof or consumes another grant.
+
+The pending `maintenance` enrollment binds user, initiating session, captured
+`auth_version`, DPoP JKT and authorization method (`webauthn_uv` or
+`password_contact`); password/contact mode also freezes channel and keyed complete
+contact evidence. Its fixed `expires_at` is the earliest of the configured
+enrollment ceiling (ten-minute default), original fresh grant/proof expiry and the
+initiating session's idle and absolute expiries. Renewal, retry or replacement
+under the same authorization cannot extend that deadline. Confirmation revalidates
+live session/version/JKT, current protection and frozen contact evidence before
+decryption, then checks expiry again at the deciding write. Missing-binding rows
+are rejected before decryption, never inferred or backfilled. Foreign session/JKT
+requests do not burn the legitimate budget. At most five failed TOTP attempts are
+allowed by default; wrong-code counters and expired/exhausted-row deletion commit
+despite a returned domain error, while infrastructure/authorization failures roll back.
+
+Disable never accepts password/contact OTP or `X-Action-Proof` as a bypass. Under
+the username guard, account lock and user-row lock, current policy evaluates the
+proposed `TOTP=false` result. A surviving passkey remains sufficient for primary
+login; zero-passkey removal is allowed only for a nonprivileged account with
+`LOGIN_ENABLED`, a supported usable password and an admitted protected username.
+Any role membership requires a surviving passkey after TOTP removal. Missing or
+unavailable policy evidence is not permission; refusals remain `409 last_credential`
+or `409 last_factor`.
+
+Known-committed setup and already-absent/pending-only disable success use
+`session.OutcomeCommitted`, so post-commit renewal failure cannot replace them.
+A no-op clears pending enrollment without a version bump, disabled-factor event or
+invalidation header. Actual enable/removal commits the factor change, pending-state
+consumption/clearance and one auth-version invalidation; only real changes emit
+the existing `MFATOTPEnabled`/`MFATOTPDisabled` security events. Old sessions, tokens,
+grants and pending authority are invalidated, not renewed or restamped as
+MFA-authenticated. No new audit/lifecycle format is introduced.
+
+Proof errors use `400 invalid_request`, `401 invalid_code`,
+`403 insufficient_user_authentication`, `429 rate_limited`,
+`503 temporarily_unavailable` or `503 outcome_unknown`. MFA preserves
+`400 invalid_request`, `400 mfa_not_setup`, `400 enrollment_expired`,
+`400 invalid_code`, `401 unauthorized`,
+`403 insufficient_user_authentication`, `409 mfa_already_enabled` and the policy
+conflicts above. An uncertain commit returns `503 {"error":"outcome_unknown"}`
+without tentative secret, proof, success or success audit. Never automatically
+retry or refund spent strong grants. Lost setup output requires an explicit fresh
+ceremony to replace pending enrollment; uncertain enable/disable recovers through
+ordinary fresh login/current-state inspection, not a new reconciliation or secret
+retrieval endpoint. The sole pre-handler DPoP nonce retry above remains distinct.
+
 - There is deliberately no general-purpose `/api/v1/auth/mfa/verify-code` endpoint. Enabled TOTP secrets can only be checked inside a purpose-specific login/Step-up flow, preventing an authenticated-session code-validity oracle. Step-up uses `POST /api/v1/auth/stepup/verify` and collapses wrong, replayed, and stale codes into `401 invalid_credentials`.
 - `POST /api/v1/auth/recovery-codes/generate`: Generates a new batch of one-time backup codes (stored securely in PostgreSQL hashed via **SHA-256** to prevent CPU Denial of Service during validation). Requires Step-up authentication in `X-Step-Up-Auth`: a fresh batch is a set of long-lived bypasses for every other factor, so minting one must cost a re-asserted strong factor. This is not circular, because a recovery code cannot itself satisfy Step-up.
 - `GET /api/v1/auth/recovery-codes/status`: Returns only `{"remaining":10,"low":false}`. Generation returns `{"codes":["..."],"count":10}` once and atomically invalidates every previous code. There is no GET endpoint for previous plaintext batches. A lost generation response may mean replacement committed; require explicit new generation and fresh step-up rather than replaying/caching the old response.
@@ -163,7 +257,7 @@ The committed handler marks self-invalidating success before response release; s
 - `POST /api/v1/auth/stepup/challenge`: Generates a challenge for the Step-up auth flow, supporting `userVerification: "required"` (biometrics/PIN via WebAuthn) or TOTP verification. Requires a normal live session and binds the pending WebAuthn assertion to its exact session ID. Returns `methods` (the factors this account can present, WebAuthn first) plus the WebAuthn assertion options when a passkey is enrolled. Unlike the login options endpoint there is no mock/decoy branch — the caller is already authenticated as this account, so there is nothing to enumerate. `409 no_stepup_factor` means the account has neither a passkey nor TOTP and cannot perform Step-up until one is enrolled.
 - `POST /api/v1/auth/stepup/verify`: Verifies the WebAuthn UV assertion or active TOTP token. On success, returns a short-lived (3-5 minutes) Step-up token carrying the ACR claim `https://ref.hatef.ir/acr/stepup`. This token must be passed in the `X-Step-Up-Auth` header for sensitive endpoints.
   - **Grant format:** a compact JWS (`typ: stepup+jwt`) signed by the same rotating keystore as access and ID tokens, carrying `iss`, `sub`, `aud`, `acr`, `amr` (RFC 8176: `["hwk","user"]` for a UV assertion, `["otp"]` for TOTP), `auth_time`, `sid`, `jti`, `iat`, `exp`, and `cnf.jkt` when the earning session is DPoP-bound. The distinct `typ` is load-bearing: access tokens are signed by the same keys and already use `aud == iss`, so without it an access token would satisfy every other check.
-  - **Single use:** the `jti` is consumed on first successful validation, so one grant authorises one operation. Outside explicit development, every replica atomically claims the HMAC-derived replay identity in shared Redis for the remaining grant lifetime; Redis errors fail closed. This is what makes Step-up a per-operation check rather than a 5-minute window of elevated privilege.
+  - **Single use:** the `jti` is consumed on first successful validation, so one grant authorises one operation subject to that endpoint's earned-factor policy; it is not action-scoped. Outside explicit development, every replica atomically claims the HMAC-derived replay identity in shared Redis for the remaining grant lifetime; Redis errors fail closed. This is what makes Step-up a per-operation check rather than a 5-minute window of elevated privilege.
   - **Session bound:** the `sid` claim pins the grant to the session that earned it. A grant cannot be paired with a different session's cookie, even for the same user.
   - **Factors:** Generic step-up accepts WebAuthn with `userVerification: "required"` (verified server-side) or an active TOTP passcode. Deletion is stricter: it requires the verified grant's `hwk` and `user` AMR and never accepts TOTP. A TOTP passcode is single-use across its acceptance window. Recovery codes are not step-up factors.
   - **Rate limited** per subnet and per account (per-minute and per-hour), with the subnet window evaluated first so a saturated shared proxy cannot burn a targeted account's budget.

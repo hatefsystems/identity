@@ -22,6 +22,22 @@ import (
 const accountDeletionProofPath = "/api/v1/auth/action-proofs/account-deletion"
 const passwordChangeProofPath = "/api/v1/auth/action-proofs/password-change" //nolint:gosec // G101: fixed public API route, not a credential.
 const firstPasskeyProofPath = "/api/v1/auth/action-proofs/first-passkey"     //nolint:gosec // G101: fixed public API route, not a credential.
+const mfaEnrollmentProofPath = "/api/v1/auth/action-proofs/mfa-enrollment"
+
+// MFAEnrollmentProofs earns only the start authority consumed by the MFA service.
+type MFAEnrollmentProofs interface {
+	ChallengeMFAEnrollment(context.Context, session.Session, string, string, string) (string, time.Time, error)
+	VerifyMFAEnrollment(context.Context, session.Session, string, string) (string, time.Time, error)
+}
+
+func (s *Server) registerMFAEnrollmentProofRoutes() {
+	guard, ok := s.sessionGuard("mfa enrollment proofs")
+	if !ok {
+		return
+	}
+	s.router.With(guard.Handler).Post(mfaEnrollmentProofPath+"/challenge", s.handleFixedProofCeremony(false, contactcode.PurposeMFAEnrollment))
+	s.router.With(guard.Handler).Post(mfaEnrollmentProofPath+"/verify", s.handleFixedProofCeremony(true, contactcode.PurposeMFAEnrollment))
+}
 
 // AccountDeletionProofs earns deletion-only authority for the request's live
 // browser session. Consumption belongs to the eventual deletion transaction.
@@ -68,6 +84,18 @@ func (s *Server) registerPasswordChangeProofRoutes() {
 }
 
 func readActionProofRequest(r *http.Request, verify bool) (map[string]string, bool) {
+	names := []string{"password", "channel"}
+	if verify {
+		names = []string{"challenge", "code"}
+	}
+	values, ok := readProofStringObject(r, names)
+	if !ok || !verify && values["channel"] != contactcode.ChannelEmail && values["channel"] != contactcode.ChannelSMS {
+		return nil, false
+	}
+	return values, true
+}
+
+func readProofStringObject(r *http.Request, names []string) (map[string]string, bool) {
 	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.Body == nil {
 		return nil, false
 	}
@@ -84,10 +112,6 @@ func readActionProofRequest(r *http.Request, verify bool) (map[string]string, bo
 	if err != nil || len(body) > 8192 || !utf8.Valid(body) || !json.Valid(body) || !uniqueJSONFields(body) {
 		return nil, false
 	}
-	names := []string{"password", "channel"}
-	if verify {
-		names = []string{"challenge", "code"}
-	}
 	fields, ok := exactObject(body, names, nil)
 	if !ok {
 		return nil, false
@@ -103,9 +127,6 @@ func readActionProofRequest(r *http.Request, verify bool) (map[string]string, bo
 			return nil, false
 		}
 		values[name] = value
-	}
-	if !verify && values["channel"] != contactcode.ChannelEmail && values["channel"] != contactcode.ChannelSMS {
-		return nil, false
 	}
 	return values, true
 }
@@ -137,14 +158,28 @@ func (s *Server) handleFixedProofCeremony(verify bool, purpose string) http.Hand
 		if purpose == contactcode.PurposePasswordChange {
 			service = s.deps.PasswordChangeProofs
 		}
-		if purpose != contactcode.PurposeFirstPasskey && service == nil || purpose == contactcode.PurposeFirstPasskey && s.deps.FirstPasskeyProofs == nil {
+		if purpose == contactcode.PurposeMFAEnrollment && s.deps.MFAEnrollmentProofs == nil || purpose != contactcode.PurposeFirstPasskey && purpose != contactcode.PurposeMFAEnrollment && service == nil || purpose == contactcode.PurposeFirstPasskey && s.deps.FirstPasskeyProofs == nil {
 			writeActionProofError(w, actionproof.ErrUnavailable)
 			return
 		}
 		var handle string
 		var deadline time.Time
 		var err error
-		if purpose == contactcode.PurposeFirstPasskey {
+		if purpose == contactcode.PurposeMFAEnrollment {
+			if len(r.Header.Values("X-Action-Proof"))+len(r.Header.Values("X-Step-Up-Auth")) != 0 {
+				writeActionProofError(w, actionproof.ErrInvalid)
+				return
+			}
+			if verify && (len(values["code"]) != 6 || strings.IndexFunc(values["code"], func(r rune) bool { return r < '0' || r > '9' }) >= 0) {
+				writeActionProofError(w, actionproof.ErrInvalid)
+				return
+			}
+			if verify {
+				handle, deadline, err = s.deps.MFAEnrollmentProofs.VerifyMFAEnrollment(r.Context(), sess, values["challenge"], values["code"])
+			} else {
+				handle, deadline, err = s.deps.MFAEnrollmentProofs.ChallengeMFAEnrollment(r.Context(), sess, values["password"], values["channel"], clientip.FromRequest(r))
+			}
+		} else if purpose == contactcode.PurposeFirstPasskey {
 			if verify {
 				handle, deadline, err = s.deps.FirstPasskeyProofs.VerifyFirstPasskey(r.Context(), sess, values["challenge"], values["code"])
 			} else {

@@ -91,12 +91,50 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
 * **Threat T4: Cross-Session Ceremony or Enrollment Transplant**
   * *Description:* An attacker tries to finish another browser session's WebAuthn challenge, TOTP enrollment, phone verification, or Step-up ceremony, potentially burning the victim's pending state while probing it.
   * *Mitigation:* Pending challenges and opaque enrollment identifiers are bound to the exact user, initiating session, purpose, and ceremony flow. Matching and consumption are atomic; a foreign-session mismatch is rejected without consuming the legitimate state. TOTP enrollment returns an `enrollment_id`, phone send returns a 256-bit `verification_id`, and neither completion endpoint accepts client-supplied replacement identity data. The general enabled-TOTP `/auth/mfa/verify-code` oracle is not exposed.
+
+T26 additionally freezes pending TOTP `auth_version`, DPoP JKT, authorizing method
+and, for password/contact mode, channel and keyed complete current contact evidence.
+The fixed `mfa_enrollment` proof is consumed once in the MFA-owned start transaction;
+confirmation read-only revalidates the stored authorization, not the spent proof,
+and accepts no additional grant/proof header. Its deadline is the earliest configured
+enrollment, original fresh authorization, initiating-session idle and absolute
+expiry, frozen at start; renewal, retry and same-authorization replacement cannot
+extend it. Binding, live authority, budget and expiry are checked before decryption
+and at the deciding write after slow work/lock waits. Foreign session/JKT requests
+do not spend legitimate attempts; wrong-code counters and expired/exhausted-row
+deletion commit as domain outcomes, while infrastructure/authorization faults roll
+back. Additive migration `00010_mfa_enrollment_authorization.sql` preserves entirely
+missing metadata without fabricating authority, but new readers reject those rows
+before decrypting secrets; partial bindings fail constraints. No backfill or mixed
+old/new MFA maintenance writers may bypass the frozen checks.
+
 * **Threat T5: Concurrent Removal of the Last Login Factor**
   * *Description:* Concurrent passkey deletion, TOTP disablement or role provisioning races independent credential checks and leaves an account without a usable primary login or a privileged account without its required strong factor.
   * *Mitigation:* The shared resulting-state policy is evaluated in caller-owned READ COMMITTED transactions. When password fallback is enabled, admitted username authority is locked before the shared account mutex and user row; credentials are locked in stable credential-ID order. The final passkey may be removed only if enabled username/password login has a supported usable verifier and a retained admitted username. Any privileged role additionally requires a surviving passkey or enabled TOTP backed by secret material. TOTP, contacts, backup codes and sessions are not primary credentials. Role admission uses the same policy; revocation remains possible without demanding stronger protection. `can_remove` is a per-entry locked-snapshot hint, not authority: stale DELETE is refused with `last_credential` or `last_factor` and remains localized in both portal languages.
 
+T26 disable requires fresh Step-up earned through enrolled TOTP (`otp`) or actual
+WebAuthn UV (`hwk` AND `user`), never password/contact control. Under those same
+locks, evaluate authoritative `TOTP=false` resulting-state policy: zero-passkey
+removal needs a nonprivileged account, enabled usable supported password login and
+an admitted protected username. Any role membership, including custom roles with
+administrative HTTP disabled, requires a surviving passkey after TOTP removal.
+Unavailable policy/session evidence fails closed. Enabled `is_mfa_enabled`
+continues to require independently earned TOTP at normal-session boundaries even
+after UV-passkey login; there is no separate optional/required flag or exemption.
+
 * **Threat T6: Credential Mutation After Session Revocation**
   * *Mitigation:* Factor/recovery changes carry the admitted auth version, take the shared subject lock and lock/recheck the active nondeleted user before pending/attempt/credential writes. Successful passkey enrollment/removal and actual TOTP/verified-phone security changes advance `auth_version` once without changing `lifecycle_revision`, invalidating all existing authority including the initiating session. Cosmetic renames and true no-ops do not revoke. A stale session snapshot cannot finish enrollment or replace codes after revocation. Already admitted work is not retrospectively cancelled; deciding transaction order matters. Committed self-invalidating success bypasses activity renewal and carries bounded `X-Identity-Auth-Invalidated: true` result metadata. The portal decodes that success before clearing private state and keeps its localized saved outcome visible until explicit login return; it does not treat a follow-up `401` as failed mutation, replay an operation or create a repeated login loop. Unreadable/lost responses remain uncertain. Restricted recovery enrollment keeps one return-to-login outcome.
+
+Known T26 setup/no-op commits use `session.OutcomeCommitted` so renewal faults cannot
+replace a decided success. Enable/removal use committed-security-change handling,
+never renew old authority or mark the initiating session MFA-authenticated. Only
+real changes emit existing MFA enabled/disabled events; already-absent/pending-only
+disable has no auth-version bump, disabled-factor audit or invalidation header.
+Unknown commit acknowledgement returns bounded `503 outcome_unknown` without
+tentative setup secret, success or success audit, and never refunds/retries spent
+strong grants. SQL rollback restores SQL state, not consumed Redis authority. Lost
+setup output needs an explicit fresh ceremony; uncertain enable/disable needs fresh
+ordinary login/current-state inspection, not automatic replay or reconciliation.
 
 * **Threat T7: Loss Or Fabrication Of Verified Contact Evidence**
   * *Description:* A security change removes the only proven contact, or treats a populated legacy email/phone/backup field as verified recovery authority.
@@ -142,7 +180,24 @@ The system is segmented into distinct trust boundaries to prevent lateral moveme
   * *Mitigation:* Recovery start is account-enumeration resistant and produces a one-time, ten-minute transaction. Successful code verification consumes the transaction and physically deletes the code atomically, then issues a distinct `recovery_enrollment` session. That restricted session can claim at most one UV-required replacement-passkey enrollment and cannot reach ordinary authenticated or Step-up-gated routes; completion revokes it and requires a normal login.
 * **Threat E4: Replay of Step-up Grants or TOTP Proofs**
   * *Description:* A valid short-lived grant or still-valid TOTP code is replayed against multiple high-risk operations or replicas.
-  * *Mitigation:* Grants are signed, session-bound, short-lived, and single-use. Production replicas share a Redis replay guard that performs atomic `SET NX` for the remaining lifetime under an HMAC-SHA-256-derived opaque key. TOTP-to-grant exchanges use the same guard for their validity window. Redis errors fail closed, and all replicas use the same `STEPUP_REPLAY_HMAC_KEY`; mixed-key rolling rotation is prohibited because it would create disjoint replay domains.
+  * *Mitigation:* Grants are signed, session/version/JKT-bound, short-lived, and single-use, not action-scoped; each consumer checks its required actually earned factor. Production replicas share a Redis replay guard that performs atomic `SET NX` for the remaining lifetime under an HMAC-SHA-256-derived opaque key. TOTP-to-grant exchanges use the same guard for their validity window. Redis errors fail closed, and all replicas use the same `STEPUP_REPLAY_HMAC_KEY`; mixed-key rolling rotation is prohibited because it would create disjoint replay domains.
+
+Only the new T26 password/contact proof is purpose-specific `mfa_enrollment`. Fresh
+password verification and exact protected canonical-contact evidence are required
+before delivery and rechecked at issuance/start/confirmation; populated contacts,
+available factors or an old login do not confer fresh authority. Eligibility is
+active nondeleted nonprivileged password-only, zero passkeys, no enabled/configured
+active TOTP and usable enabled admitted password sign-in. Enrollment start accepts
+exactly one UV strong Step-up OR its purpose proof, with malformed/mixed/misplaced
+headers rejected before consumption. Codes/proofs cannot cross signup, login,
+deletion, password-change, first-passkey, recovery or disable boundaries; no general
+password Step-up grant is created. Default-off independent issuance/channel switches,
+a dedicated binding key, shared bounded contact-code quotas and a distinct SMS
+template prevent silent activation or authority/template reuse. Delivery/password
+verification happen outside long-held SQL locks, with no automatic billed retries.
+Provider acceptance is not receipt; reader/key availability is retained for bounded
+pending work after issuance is disabled, without requiring a delivery provider at
+final confirmation. See [rollout and rollback](devops-operations.md#first-passkey-proofs-t25).
 
 ### 2.7 DPO/Legal Browser Boundary (Task 7.6)
 
