@@ -247,8 +247,8 @@ func checkRegistrationRestoredState(ctx context.Context, t *testing.T, pool *pgx
 	t.Helper()
 	var tables, appliedRegistration, appliedUsername, attemptCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 48 {
-		t.Fatal("restore lost the exact 48-table application inventory")
+WHERE n.nspname='public' AND c.relkind='r' AND c.relname<>'identity_schema_version'`).Scan(&tables); err != nil || tables != 49 {
+		t.Fatal("restore lost the exact 49-table application inventory")
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM identity_schema_version WHERE version_id=2 AND is_applied`).Scan(&appliedRegistration); err != nil || appliedRegistration != 1 {
 		t.Fatal("restored registration migration metadata is missing")

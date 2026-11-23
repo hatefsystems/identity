@@ -834,20 +834,21 @@ func TestMFAPasswordContactFrozenPendingLifecycleIntegration(t *testing.T) {
 			if err := f.pool.QueryRow(f.ctx, `SELECT failed_attempts FROM mfa_totp_enrollments WHERE id=$1`, id).Scan(&attempts); err != nil || attempts != 1 {
 				t.Fatal("domain error rolled back failed-attempt counter", err)
 			}
-			if state == "exhausted" {
+			switch state {
+			case "exhausted":
 				for range 4 {
 					if err := svc.VerifyAndEnable(f.ctx, current, setup.EnrollmentID, wrong); !errors.Is(err, mfa.ErrInvalidCode) {
 						t.Fatal(err)
 					}
 				}
-			} else if state == "expired" {
+			case "expired":
 				if _, err := f.pool.Exec(f.ctx, `UPDATE mfa_totp_enrollments SET created_at=clock_timestamp()-interval '2 seconds',expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, id); err != nil {
 					t.Fatal(err)
 				}
 				if err := svc.VerifyAndEnable(f.ctx, current, setup.EnrollmentID, wrong); !errors.Is(err, mfa.ErrEnrollmentExpired) {
 					t.Fatal("expiry deletion did not report domain outcome", err)
 				}
-			} else {
+			default:
 				code, err := totp.GenerateCode(setup.Secret, time.Now())
 				if err != nil {
 					t.Fatal(err)
@@ -879,13 +880,14 @@ func TestMFAPasswordContactFrozenPendingLifecycleIntegration(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				if state == "complete_issuance_disabled" {
+				switch state {
+				case "complete_issuance_disabled":
 					body := loginHTTPBody(t, map[string]string{"enrollment_id": setup.EnrollmentID, "code": code})
 					response := f.bound(t, current, cookies, http.MethodPost, "/api/v1/auth/mfa/verify", body, nil, http.StatusOK)
 					if response.Header().Get(session.HeaderAuthInvalidated) != "true" || len(recorder.events) != 1 || recorder.events[0].EventType != audit.EventMFATOTPEnabled {
 						t.Fatal("known enable did not invalidate and audit once")
 					}
-				} else if state == "concurrent_confirmation" {
+				case "concurrent_confirmation":
 					results := make(chan error, 2)
 					start := make(chan struct{})
 					for range 2 {
@@ -908,7 +910,7 @@ func TestMFAPasswordContactFrozenPendingLifecycleIntegration(t *testing.T) {
 					if wins != 1 {
 						t.Fatal("confirmation did not have exactly one winner")
 					}
-				} else {
+				default:
 					err := svc.VerifyAndEnable(f.ctx, current, setup.EnrollmentID, code)
 					want := actionproof.ErrUnauthorized
 					if state == "version_revoked" {
@@ -1479,11 +1481,13 @@ func mfaGapOperatorMutation(ctx context.Context, f *realPasswordFixture, databas
 		return tx.Commit(ctx)
 	}
 	op.Event = audit.Event{EventType: "admin.role.granted", ActorID: uuid.New(), ActorSPIFFEID: "spiffe://identity.test/mfa-custom-role", ActionStatus: audit.StatusSuccess,
-		SubjectID: &id, Payload: map[string]any{"role_id": customRole, "noop": false}}
+		SubjectID: &id, Payload: map[string]any{"noop": false}}
 	ctx = adminaction.WithContext(ctx, op)
+	// Custom labels stay in encrypted context, outside the general-audit role allowlist.
 	if err := adminaction.SetDetails(ctx, struct {
 		Target uuid.UUID `json:"target"`
-	}{id}); err != nil {
+		Role   string    `json:"role_id"`
+	}{id, customRole}); err != nil {
 		return err
 	}
 	return op.Commit(ctx)
@@ -1659,7 +1663,7 @@ func TestMFAMaintenanceOverlapsFencedAccountWritersBothOrdersIntegration(t *test
 							if err != nil {
 								t.Fatal(err)
 							}
-							phone := "+989139876543"
+							phone := strings.Replace(a.phone, "+98912", "+98913", 1)
 							blob, err := f.cipher.Encrypt(ctx, []byte(phone))
 							if err != nil {
 								t.Fatal(err)
@@ -1728,10 +1732,7 @@ func TestMFAMaintenanceOverlapsFencedAccountWritersBothOrdersIntegration(t *test
 						workers.Wait()
 						roleWriter := writer == "role_grant" || writer == "custom_role_grant"
 						mfaSuccess := ordering == "mfa_first" || roleWriter && !uv && !disableMode
-						writerSuccess := true
-						if roleWriter && !uv && (startMode || ordering == "writer_first" && confirmMode || ordering == "mfa_first" && disableMode) {
-							writerSuccess = false
-						}
+						writerSuccess := !roleWriter || uv || !startMode && (ordering != "writer_first" || !confirmMode) && (ordering != "mfa_first" || !disableMode)
 						if !roleWriter && writer != "version_revoke" && ordering == "mfa_first" && !startMode {
 							writerSuccess = false
 						}
@@ -1790,7 +1791,7 @@ func TestMFAMaintenanceOverlapsFencedAccountWritersBothOrdersIntegration(t *test
 						if writerSuccess && writer == "passkey_remove" {
 							passkeys--
 						}
-						if after.AuthVersion != version || after.IsMfaEnabled != mfaEnabled || (len(after.MfaTotpSecretEncrypted) > 0) != mfaEnabled || state.Passkeys != passkeys || state.Password != !(writerSuccess && writer == "password_remove") || state.Privileged != (roleWriter && writerSuccess) {
+						if after.AuthVersion != version || after.IsMfaEnabled != mfaEnabled || (len(after.MfaTotpSecretEncrypted) > 0) != mfaEnabled || state.Passkeys != passkeys || state.Password != (!writerSuccess || writer != "password_remove") || state.Privileged != (roleWriter && writerSuccess) {
 							t.Fatal("race retained partial writes or extra version increments")
 						}
 						if writer == "contact_replace" && bytes.Equal(after.PhoneEncrypted, a.user.PhoneEncrypted) == writerSuccess {

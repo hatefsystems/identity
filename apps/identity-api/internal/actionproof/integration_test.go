@@ -778,7 +778,7 @@ func TestAccountDeletionProofSchemaCleanupAndForwardOnlyIntegration(t *testing.T
 	if _, err := provider.ApplyVersion(f.ctx, 7, false); err == nil {
 		t.Fatal("forward-only proof migration allowed rollback")
 	}
-	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 9 {
+	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 10 {
 		t.Fatal("forward-only refusal changed final lineage")
 	}
 }

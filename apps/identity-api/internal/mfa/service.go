@@ -702,7 +702,7 @@ func (s *Service) validatePending(ctx context.Context, tx pgx.Tx, sess session.S
 	}
 	if *row.AuthorizationMethod == AuthorizationPasswordContact {
 		err := s.proofs.ValidateMFAEnrollmentTx(ctx, tx, sess, actionproof.MFAEnrollmentAuthorization{ExpiresAt: row.ExpiresAt.Time, Channel: *row.Channel, ContactBinding: row.ContactBinding}, authority)
-		if err != nil && !(errors.Is(err, actionproof.ErrMFAEnrollmentExpired) && !s.now().Before(row.ExpiresAt.Time)) {
+		if err != nil && (!errors.Is(err, actionproof.ErrMFAEnrollmentExpired) || s.now().Before(row.ExpiresAt.Time)) {
 			return err
 		}
 	}

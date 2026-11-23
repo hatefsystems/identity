@@ -23,7 +23,7 @@ import (
 	"github.com/hatefsystems/identity/apps/identity-api/internal/username"
 )
 
-func newRealMFAEnrollmentProofFixture(t *testing.T) realProofFixture {
+func newRealMFAEnrollmentProofFixture(t *testing.T, assignUsername bool) realProofFixture {
 	t.Helper()
 	f := newRealProofFixtureFor(t, contactcode.PurposeMFAEnrollment)
 	// This admitted authority exists only inside the run-owned fixture database.
@@ -61,20 +61,22 @@ func newRealMFAEnrollmentProofFixture(t *testing.T) realProofFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := normalizer.Normalize("\u0645\u0627\u0644\u06a9")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(f.ctx, tx)
-	if err := names.Assign(f.ctx, tx, f.user.ID, f.user.AuthVersion, value); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(f.ctx); err != nil {
-		t.Fatal(err)
+	if assignUsername {
+		value, err := normalizer.Normalize("\u0645\u0627\u0644\u06a9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rollback(f.ctx, tx)
+		if err := names.Assign(f.ctx, tx, f.user.ID, f.user.AuthVersion, value); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(f.ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	names, err = username.NewStore(f.runtime, f.service.deps.Cipher, normalizer)
 	if err != nil {
@@ -120,7 +122,7 @@ func (f realProofFixture) lockedMFAProof(t *testing.T) (pgx.Tx, username.GuardAu
 func TestMFAEnrollmentProofRealChannelsFrozenStartAndDisabledReader(t *testing.T) {
 	for _, channel := range []string{"email", "sms"} {
 		t.Run(channel, func(t *testing.T) {
-			f := newRealMFAEnrollmentProofFixture(t)
+			f := newRealMFAEnrollmentProofFixture(t, true)
 			proof, deadline := f.issueMFAEnrollment(t, channel)
 			digest := sha256.Sum256([]byte(proof))
 			var stored time.Time
@@ -177,7 +179,19 @@ func TestMFAEnrollmentProofRealChannelsFrozenStartAndDisabledReader(t *testing.T
 func TestMFAEnrollmentProofRealPolicyAndCurrentBindingRefusals(t *testing.T) {
 	for _, scenario := range []string{"login-off", "password", "username-missing", "username-stale", "mfa-flag", "mfa-secret", "role", "passkey", "contact", "contact-time", "version", "foreign-session", "foreign-jkt"} {
 		t.Run(scenario, func(t *testing.T) {
-			f := newRealMFAEnrollmentProofFixture(t)
+			f := newRealMFAEnrollmentProofFixture(t, scenario != "username-missing")
+			if scenario == "username-missing" {
+				// An earned immutable assignment cannot be cleared to create this state.
+				challenge, deadline, err := f.service.ChallengeMFAEnrollment(f.ctx, f.sess, testSecret, "email", "203.0.113.8")
+				if !errors.Is(err, ErrUnauthorized) || challenge != "" || !deadline.IsZero() || f.delivery.calls != 0 {
+					t.Fatal("missing username issued enrollment authority or delivered a code", err)
+				}
+				var count int
+				if err := f.pool.QueryRow(f.ctx, "SELECT count(*) FROM mfa_enrollment_action_proofs").Scan(&count); err != nil || count != 0 {
+					t.Fatal("missing username persisted enrollment authority", err)
+				}
+				return
+			}
 			proof, deadline := f.issueMFAEnrollment(t, "email")
 			digest := sha256.Sum256([]byte(proof))
 			var binding []byte
@@ -198,8 +212,6 @@ func TestMFAEnrollmentProofRealPolicyAndCurrentBindingRefusals(t *testing.T) {
 				f.service.SetAccountPolicy(policy)
 			case "password":
 				exec("UPDATE users SET password_hash='unsupported' WHERE id=$1", f.user.ID)
-			case "username-missing":
-				exec("UPDATE users SET username_key=NULL,username_details_encrypted=NULL,username_policy_id=NULL,username_policy_fingerprint=NULL,username_policy_epoch=NULL,username_lookup_key_id=NULL WHERE id=$1", f.user.ID)
 			case "username-stale":
 				exec("UPDATE username_active_policy SET epoch=epoch+1 WHERE singleton")
 			case "mfa-flag":
@@ -249,7 +261,7 @@ func TestMFAEnrollmentProofRealPolicyAndCurrentBindingRefusals(t *testing.T) {
 func TestMFAEnrollmentProofRealRollbackAndConcurrentSingleStart(t *testing.T) {
 	for _, scenario := range []string{"insert", "lost-commit-ack"} {
 		t.Run(scenario, func(t *testing.T) {
-			f := newRealMFAEnrollmentProofFixture(t)
+			f := newRealMFAEnrollmentProofFixture(t, true)
 			challenge, _, err := f.service.ChallengeMFAEnrollment(f.ctx, f.sess, testSecret, "email", "203.0.113.8")
 			if err != nil {
 				t.Fatal(err)
@@ -279,7 +291,7 @@ func TestMFAEnrollmentProofRealRollbackAndConcurrentSingleStart(t *testing.T) {
 			}
 		})
 	}
-	f := newRealMFAEnrollmentProofFixture(t)
+	f := newRealMFAEnrollmentProofFixture(t, true)
 	proof, deadline := f.issueMFAEnrollment(t, "email")
 	tx, guard := f.lockedMFAProof(t)
 	if _, err := f.service.ConsumeMFAEnrollmentStartTx(f.ctx, tx, f.sess, proof, guard); err != nil {
@@ -343,7 +355,7 @@ func TestMFAEnrollmentProofRealRollbackAndConcurrentSingleStart(t *testing.T) {
 }
 
 func TestMFAEnrollmentProofRealRestrictedGrantsAndBoundedCleanup(t *testing.T) {
-	f := newRealMFAEnrollmentProofFixture(t)
+	f := newRealMFAEnrollmentProofFixture(t, true)
 	proof, _ := f.issueMFAEnrollment(t, "email")
 	var selectOK, insertOK, deleteOK, updateOK, truncateOK bool
 	if err := f.runtime.QueryRow(f.ctx, "SELECT has_table_privilege(current_user,'mfa_enrollment_action_proofs','SELECT'),has_table_privilege(current_user,'mfa_enrollment_action_proofs','INSERT'),has_table_privilege(current_user,'mfa_enrollment_action_proofs','DELETE'),has_any_column_privilege(current_user,'mfa_enrollment_action_proofs','UPDATE'),has_table_privilege(current_user,'mfa_enrollment_action_proofs','TRUNCATE')").Scan(&selectOK, &insertOK, &deleteOK, &updateOK, &truncateOK); err != nil || !selectOK || !insertOK || !deleteOK || updateOK || truncateOK {
@@ -373,7 +385,7 @@ func TestMFAEnrollmentProofRealRestrictedGrantsAndBoundedCleanup(t *testing.T) {
 }
 
 func TestMFAEnrollmentPendingSQLAllOrNoneMetadata(t *testing.T) {
-	f := newRealMFAEnrollmentProofFixture(t)
+	f := newRealMFAEnrollmentProofFixture(t, true)
 	for _, metadata := range []string{
 		"NULL,NULL,NULL,NULL,NULL",
 		"0,'" + f.sess.DPoPJKT + "','webauthn_uv',NULL,NULL",

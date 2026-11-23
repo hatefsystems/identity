@@ -666,7 +666,7 @@ func TestCompetingFreshMigratorsSerialize(t *testing.T) {
 		t.Fatal("no competing migrator completed successfully")
 	}
 	var count int
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 10 {
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM public.identity_schema_version`).Scan(&count); err != nil || count != 11 {
 		t.Fatalf("approved migrations not installed exactly once: %d, %v", count, err)
 	}
 	database.SetMaxOpenConns(1)

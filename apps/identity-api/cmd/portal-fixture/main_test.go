@@ -375,6 +375,10 @@ func (s *seedTransaction) Exec(_ context.Context, sql string, args ...any) (pgco
 		if args[0] != s.user.ID {
 			return pgconn.CommandTag{}, errors.New("wrong TOTP account")
 		}
+		deadline, ok := args[2].(pgtype.Timestamptz)
+		if !ok || !deadline.Valid || deadline.InfinityModifier != 0 || !deadline.Time.After(time.Now()) {
+			return pgconn.NewCommandTag("UPDATE 0"), nil
+		}
 		s.user.IsMfaEnabled = true
 		s.user.MfaTotpSecretEncrypted = args[1].([]byte)
 	}

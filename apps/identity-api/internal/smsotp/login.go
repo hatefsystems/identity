@@ -113,6 +113,7 @@ func (s *Service) MFAEnrollmentDeliveryEnabled() bool {
 	return s != nil && s.cfg.MFAEnrollmentSender != nil
 }
 
+// ContactMFAEnrollmentTTL exposes shared bounds without issuing authority.
 func (s *Service) ContactMFAEnrollmentTTL() time.Duration {
 	if !s.MFAEnrollmentDeliveryEnabled() {
 		return 0

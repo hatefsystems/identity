@@ -265,6 +265,7 @@ func (s *Service) FirstPasskeyChallengeTTL(channel string) time.Duration {
 	return s.actionChallengeTTL(PurposeFirstPasskey, channel)
 }
 
+// MFAEnrollmentChallengeTTL preserves the stricter shared contact-code ceiling.
 func (s *Service) MFAEnrollmentChallengeTTL(channel string) time.Duration {
 	return s.actionChallengeTTL(PurposeMFAEnrollment, channel)
 }
@@ -314,6 +315,7 @@ func (s *Service) RequestFirstPasskey(ctx context.Context, binding DeletionBindi
 	return s.requestAction(ctx, binding, PurposeFirstPasskey, channel, destination, contactBinding, sourceIP)
 }
 
+// RequestMFAEnrollment freezes the earning session and verified-contact binding.
 func (s *Service) RequestMFAEnrollment(ctx context.Context, binding DeletionBinding, channel, destination, contactBinding, sourceIP string) (string, time.Time, error) {
 	return s.requestAction(ctx, binding, PurposeMFAEnrollment, channel, destination, contactBinding, sourceIP)
 }
@@ -470,6 +472,7 @@ func (s *Service) VerifyFirstPasskey(ctx context.Context, binding DeletionBindin
 	return s.verifyAction(ctx, binding, PurposeFirstPasskey, handle, code)
 }
 
+// VerifyMFAEnrollment rejects malformed codes and foreign authority before spending attempts.
 func (s *Service) VerifyMFAEnrollment(ctx context.Context, binding DeletionBinding, handle, code string) (Record, error) {
 	if !validCode(code) {
 		return Record{}, ErrInvalid

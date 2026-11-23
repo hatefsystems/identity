@@ -31,6 +31,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redis/go-redis/v9"
@@ -620,6 +621,7 @@ func seedCredentialAccount(ctx context.Context, pool interface {
 		}
 		affected, err := db.New(tx).CompleteMfaTotpEnrollment(ctx, db.CompleteMfaTotpEnrollmentParams{
 			ID: userID, MfaTotpSecretEncrypted: ciphertext,
+			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true},
 		})
 		if err != nil || affected != 1 {
 			return fixtureAccount{}, errors.New("cannot enable fixture TOTP factor")
