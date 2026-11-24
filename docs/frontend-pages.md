@@ -2,6 +2,12 @@
 
 This document outlines the routing architecture for the Next.js frontend application within the `hatefsystems/identity` monorepo. The application utilizes the **Next.js App Router (`app/` directory)** and relies on **shadcn/ui** for its component system.
 
+Current routes are source-inspected, not deployment acceptance. Planned journeys
+follow the [authentication and recovery policy](authentication-and-recovery-policy.md)
+and [security readiness gates](security-testing-and-readiness.md). The
+[assessment](security-architecture-assessment.md) records implementation conflicts;
+no route or authentication capability is implemented by this documentation.
+
 ## Route Groups
 
 The routing is logically divided using Next.js Route Groups (e.g., `(auth)`, `(dashboard)`) to share layouts without affecting the URL path.
@@ -10,28 +16,30 @@ The routing is logically divided using Next.js Route Groups (e.g., `(auth)`, `(d
 
 ## 1. Authentication & Public Pages: `(auth)`
 
-These pages are accessible to unauthenticated users. Passkey login serves existing
-accounts; separately enabled signup has the conditional contract below. Password
-login/reset and neutral TOTP forms remain deliberately disconnected. No source or
-UI description here asserts final browser acceptance or deployed enablement.
+These pages are accessible to unauthenticated users. Discoverable passkey login
+and opt-in username/password/contact-code login are current capabilities; contact-only
+normal login conflicts with SEC02 and must not be treated as target acceptance.
+Separately enabled signup has the conditional contract below. Password reset and
+neutral TOTP previews remain disconnected. No UI description asserts deployed enablement.
 
-- `/login` : Passkey-first login screen with an email/password alternative and links to registration and password reset.
+- `/login` : Localized login screen. `NEXT_PUBLIC_LOGIN_ENABLED` selects the current opt-in login composition; discoverable passkey sign-in remains available. Target named identification is mandatory username or explicitly selected current verified unique primary email, never mobile or implicit fallback (SEC01).
 - `/login/webauthn` : Live discoverable-passkey sign-in, started only by the explicit "Use a passkey" button. The device chooses an existing account; the portal does not ask for an email first.
-- `/login/recovery` : Restricted recovery flow for a user who has lost every normal MFA/WebAuthn factor. The UI first submits the email to `POST /api/v1/auth/recovery/start`, retains the opaque `transaction_id` only in memory, and submits it with the backup code to `POST /api/v1/auth/mfa/verify-recovery-code`. The uniform start response must not be interpreted as proof that an account exists. Success creates a ten-minute `recovery_enrollment` session whose only authority is enrolling one UV-required replacement passkey. The UI completes `POST /api/v1/auth/enrollment/webauthn/register/generate-options` and `/verify` in that same session, then returns the user to normal login; it must never render the dashboard or normal security settings under this restricted cookie. A `409 {"error":"enrollment_already_used"}` means the one permitted enrollment was already claimed and the user must restart recovery.
-- `/register` : Existing owned Unicode email and Iranian mobile input, explicit ownership proofs, then resident UV-passkey creation. No password/confirmation, new mailbox, role or session is created; completion links to normal login.
-- `/verify-totp` : Neutral six-digit authenticator-code form. This is not an active login challenge, enrollment confirmation, or Step-up session.
-- `/forgot-password` : Primary-email reset-link request form with an account-enumeration-resistant acknowledgement presentation. Backup Email and Verified Phone (SMS) recovery choices remain planned, outside Task 7.2.
-- `/reset-password` : New-password and confirmation form, with invalid/expired-link presentations. Real reset-link validation and password changes are not connected.
+- `/register` : Current owned Unicode email, Iranian mobile and username input, explicit ownership proofs, then resident UV-passkey creation. No password, new mailbox, role or session is created; completion links to normal login. T31-T37 extend this same route, not a second registration implementation.
+- `/verify-totp` : Localized availability notice, not an active login challenge, enrollment confirmation or Step-up session. Neutral form components remain test-only previews; active login MFA uses its own bound client flow.
+- `/forgot-password` : Localized availability notice, not connected reset-link issuance. Planned lost-factor ARC repair is a separate contract, not email-only reset.
+- `/reset-password` : Localized availability notice, not connected token validation or anonymous password repair. Existing authenticated password-management API does not make this page a reset journey.
 - `/register/verify-email` : Signup-specific fragment landing page. Scrub `/register/verify-email#attempt_id=...&token=...` immediately, then require explicit ownership verification with the original browser JKT; no capability transfer or page-load redemption.
+
+<a id="task-72-ui-boundary"></a>
 
 ### Public Form Boundary (Tasks 7.2 and 7.3)
 
-- The six screens use the existing shadcn components exported by `@hatef/ui`, an English shared auth layout, and application-local field/status compositions. The light default, system font, and existing dark tokens are preserved; Tailwind explicitly retains the `dark` class so production builds do not remove its palette variables. There is no new theme switcher or localization framework.
-- Disconnected password/reset/neutral-TOTP forms retain truthful warnings and disabled initial-HTML submit buttons. Registration uses its separate passkey flow, not a fake password-success handler. Passkey actions remain disabled before hydration/with JavaScript off and never allocate keys, fetch/send proofs or invoke credentials on page load.
+- Public screens use the existing shadcn components exported by `@hatef/ui` and application-local field/status compositions. English and Persian, System/Light/Dark appearance and explicit calendar/time-zone preferences are implemented under [localization](localization.md); `libs/ui` stays locale-agnostic. Stable providers and ceremony identities must survive preference changes.
+- Disconnected reset/neutral-TOTP previews retain truthful warnings and disabled initial-HTML submit buttons. Current opt-in login and registration use real bounded clients, not fake success handlers. Passkey actions remain disabled before hydration/with JavaScript off and never allocate keys, fetch/send proofs or invoke credentials on page load.
 - Loading, success, cancellation, unsupported-passkey, rate-limit, and reset-link presentations are exercised through test-only handlers/props on the underlying form components. No public fixture route, magic credential, query parameter, or environment flag can simulate authentication or reset delivery. Reset forms default to an unverified link state; tests must explicitly provide a ready state and a handler to enable submission.
 - Inactive form values stay in component state, not URLs, cookies, storage, telemetry or logs. Passkey sign-in checks the authenticated profile before entering the portal. Return paths are restricted to fixed dashboard/admin routes; expired admin detail links return to `/admin/users` without the account reference. Arbitrary redirects and OAuth continuations are unsupported. No public fixture route or magic account simulates login success.
-- Fields have visible labels, stable help/error associations, appropriate autocomplete, keyboard-operable password toggles, and at least 44px control targets. Local errors appear on blur; a test-enabled invalid submission focuses the first invalid field. Submission feedback is announced, duplicate submissions are blocked, and successful completion clears form values. A single text input preserves leading zeroes in TOTP codes, accepts whole-code paste, and requires exactly six ASCII digits without silently normalizing whitespace or non-ASCII digits. It never auto-submits or offers to resend an authenticator code.
-- Disconnected password forms do not invent backend password policy. Signup has no password field or reset authority. Existing backend TOTP enrollment/Step-up endpoints are not public login verification.
+- Fields have visible labels, stable help/error associations, appropriate autocomplete, keyboard-operable password toggles, and at least 44px control targets. Local errors appear on blur; invalid submission focuses the first invalid field. Feedback is announced and duplicate submissions are blocked. A single text input preserves leading zeroes, accepts whole-code paste and validates exactly six canonical ASCII digits after the explicitly scoped Persian/Arabic-Indic numeric-control conversion in [localization](localization.md#direction-typography-and-display-dates). It never strips whitespace/bidi junk, auto-submits or offers to resend TOTP.
+- Disconnected preview forms do not invent backend password policy. Current signup has no password field or reset authority. Existing TOTP enrollment/Step-up are distinct from the opt-in login client's primary-bound MFA completion.
 - Auth HTML remains dynamically rendered and private/no-store under strict nonce CSP, with existing tokens/local resources and no new CSP exception. Required acceptance includes both palettes, desktop/mobile reflow, keyboard/focus/status, leading-zero code paste and JavaScript-disabled safety. Historical UI evidence is not signup acceptance; screen-reader/physical-authenticator/native-browser/deployed-ingress checks remain separately evidenced gates.
 
 ### Conditional Signup UX
@@ -73,10 +81,12 @@ required, not asserted by these UX instructions.
 
 ## 2. SSO Authorization: `/oauth2`
 
-These routes handle the OpenID Connect (OIDC) Authorization Code flow when third-party applications or other Hatef services request authentication.
+These are planned Next.js screens, not implemented routes. Current
+`GET /oauth2/auth` validates requests and redirects to them, but interactive
+login/consent completion is missing. The portal does not support OAuth continuation.
 
-- `/oauth2/authorize` : The Consent Screen. Displays "Application X wants to access your profile." If the user is not logged in, they are redirected to `/login` and then back here.
-- `/oauth2/error` : Displayed if the authorization request is invalid or rejected.
+- `/oauth2/authorize` : Planned consent screen after approved durable authorization and full-policy normal login; preauthentication and restricted repair never authorize consent.
+- `/oauth2/error` : Planned localized, inert authorization-failure presentation. Deployed routing alone cannot make this an implemented screen.
 
 ---
 
@@ -86,10 +96,15 @@ Task 7.3 implements four routes under `app/dashboard/layout.tsx`. The server ren
 
 - `/dashboard`: Truthful profile, passkey/recovery status and session summaries. No fabricated login history, security score or device geography.
 - `/dashboard/profile`: Repeated display-name saves with read-only primary email/status. Names are optional, single-line Unicode text, at most 80 code points after trimming outer whitespace; control/line-separator characters are rejected. Empty clears the name. Exact decimal lifecycle revisions support optimistic concurrency without JS-number rounding. A conflict refresh preserves the unsaved draft.
-- `/dashboard/security`: List/add/name/rename/remove passkeys and inspect the remaining recovery-code count. Names are user labels, not verified hardware models. A fresh step-up grant is needed for adding, renaming, removing or generating codes. Ordinary registration consumes its grant at options generation, freezes the name, and completes with the same session without a second grant. Final-passkey removal is disabled in the UI and independently rejected by the API with `409 last_credential`.
+- `/dashboard/security`: Current passkey list/add/name/rename/remove and untyped recovery-code status/viewer. Names are labels, not verified hardware models. Current generic step-up governs these actions; it is not the future purpose-specific code issuance authority. Credential removal follows the server's resulting-primary policy, including an admitted usable password where configured; `409 last_credential` rejects removal of the last usable primary, not necessarily the last passkey. Planned family-specific controls remain blocked on T28 and anti-chaining enforcement.
 - `/dashboard/sessions`: List current/other server-side browser sessions using public IDs and the server's `current` flag. Show bounded, escaped reported user-agent/IP metadata without asserting a physical device or location. Confirm individual remote revocation or current-session sign-out. A disappeared target prompts a list refresh, not a conclusion about another account. There is no bulk-revocation control.
 
-Avatar uploads, password changes, email/phone/backup-contact changes, TOTP enrollment, recovery-login UI, OAuth consent, general exports and localization remain outside this portal scope. Task 7.4 supplies the separate privacy/deletion view. Task 7.5 adds a neutral Admin entry, but ordinary dashboard bootstrap never requests admin capabilities. Existing TOTP may satisfy step-up when advertised; independent backend requirements remain authoritative.
+Avatar uploads, password/contact/TOTP-management UI, lost-factor repair, OAuth
+consent and general exports remain separate portal work even where API primitives
+exist. Localization is implemented. Task 7.4 supplies privacy/deletion; ordinary
+dashboard bootstrap never requests admin capabilities. Existing TOTP may satisfy
+current step-up when advertised; future privileged admission requires verified
+hardware-backed UV plus independently enrolled backup, with no TOTP-only downgrade.
 
 ---
 
@@ -118,7 +133,7 @@ Local Task 7.5 completion may be recorded only after the required automated chec
 
 ### 4.1 DPO/Legal Workspace (Task 7.6)
 
-`/admin/legal` reuses `PortalProvider(surface="admin")`, the shared `PortalClient`, existing native Step-up dialog and English `@hatef/ui` design. It has no second session, capability cache or retry loop. Its SSR/Flight/no-JavaScript output is a neutral shell with actions disabled. Only the selected authorized section mounts; section controls have accessible names, selected state and keyboard support. Shared labels/errors, visible focus, 44px targets, light/dark tokens and local table scrolling at 320px remain required. Long identifiers and narrative text wrap; all legal text/telemetry is inert, never rendered as HTML or links. No new CSP/style exception is introduced.
+`/admin/legal` reuses `PortalProvider(surface="admin")`, the shared `PortalClient`, existing native Step-up dialog and locale-agnostic `@hatef/ui` design with application-owned English/Persian messages. It has no second session, capability cache or retry loop. Its SSR/Flight/no-JavaScript output is a neutral shell with actions disabled. Only the selected authorized section mounts; section controls have accessible names, selected state and keyboard support. Shared labels/errors, visible focus, 44px targets, light/dark tokens and local table scrolling at 320px remain required. Long identifiers and narrative text wrap; all legal text/telemetry is inert, never rendered as HTML or links. No new CSP/style exception is introduced.
 
 Presentation uses the five exact capabilities `legal_holds_read`, `legal_holds_apply`, `legal_holds_release`, `preservation_requests_create`, and `legal_inquiry_lookup`. Each operation still requires live backend authorization and durable audit handling. Read permission does not imply write permission; a write-only principal need not gain list/profile browsing. Missing step-up does not remove eligible reads. Loading, no access, unavailable/unmounted and valid empty results are not interchangeable.
 
@@ -214,7 +229,7 @@ The shared portal ceremony supports account security actions, Task 7.5 moderatio
 2. **Step-up Overlay:** Instead of directing to a separate page, a secure, modal dialog (overlay) interrupts the flow. `POST /api/v1/auth/stepup/challenge` reports which factors the account can present (`methods`) plus the WebAuthn assertion options when a passkey is enrolled. Keep the returned challenge state in memory and complete it from the same authenticated session: the server binds the challenge to its exact user, session, and Step-up flow, and a mismatched session cannot consume the legitimate challenge. A `409 {"error": "no_stepup_factor"}` means the account has neither a passkey nor TOTP and must enrol one before sensitive operations become reachable.
 3. **MFA/Biometric Challenge:**
    - The dialog triggers a WebAuthn prompt utilizing platform authenticators (TouchID, FaceID, Windows Hello) with **`userVerification: "required"`** to confirm biometrics/PIN, OR requests the user's active TOTP token.
-   - Recovery codes are **not** accepted here. They are a login bypass, so honouring one would let a stolen code authorise the very operations this gate protects — including regenerating the code batch itself.
+   - Current untyped recovery codes are not accepted here. Planned MFA Backup Codes complete only primary-bound MFA; ARCs plus eligible old-contact proof authorize only one repair. Neither family is generic Step-up, code-generation or administrative authority (SEC05-SEC06).
 4. **Step-up Assertion:** Upon user confirmation, the frontend sends this assertion to `POST /api/v1/auth/stepup/verify`. A `403 {"error": "user_verification_required"}` means the authenticator only proved presence (a security key tapped without a PIN); the remedy is a PIN/biometric-capable device, or TOTP.
 5. **Short-Lived Authorization:** On success, the frontend receives a temporary **Step-up ACR token** carrying `https://ref.hatef.ir/acr/stepup`. Honor the returned expiry and the earlier session deadline; never assume a fixed remaining lifetime.
 6. **Execution:** Send the in-memory grant once in `X-Step-Up-Auth`, alongside the bound cookie, DPoP proof and `X-Portal-Session`. `Authorization` is not used for portal cookies. Registration spends the grant at options generation, then completes with its bound pending state. Cancelled/uncertain operations discard the grant and reconcile only non-secret state where safe.
@@ -223,14 +238,20 @@ The shared portal ceremony supports account security actions, Task 7.5 moderatio
 
 ### 5.4 Account-Harvesting Resistant Login UX & Discoverable Credentials
 
-To completely prevent user-enumeration (account harvesting) through timing side-channels, the platform implements two distinct defenses:
+Current controls reduce identifier exposure; they do not completely prevent
+enumeration or establish timing indistinguishability:
 
-- **Discoverable Credentials (Usernameless Passkeys) as Primary:** The primary login route relies on discoverable credentials. The user is prompted for biometrics directly without inputting an email first (`navigator.credentials.get` is called with an empty `allowCredentials` list). The authenticator resolves the user's registered identity locally and securely transfers the associated username/ID within the signed cryptographic assertion, completely eliminating the possibility of account harvesting.
-- **Legacy user-named fallback:** The backend retains decoy options and a timing floor for legacy clients, but the portal does not offer this flow. Browser credential lookup can behave differently for dummy IDs, so a uniform server response alone does not eliminate that client-side enumeration risk. The live portal starts discoverable ceremonies without naming an account.
+- **Discoverable login:** The portal explicitly invokes `navigator.credentials.get` with empty `allowCredentials`, avoiding a named-account credential-list query. Native UV may use PIN or biometrics; the application never collects either.
+- **Named API login:** Decoy options and a timing floor exist as an intentional named capability, not a hypothetical legacy lane. Real multi-key descriptor counts can still expose account existence. SEC01 requires inventory-resistant named options and negative size/count/timing evidence before target acceptance.
 
 The admin UI follows [API section 1.7](api-design.md#17-admin--moderation-api): exact-email account search and Task 7.6 legal attribution are body-only. Super Admin receives content-free verification only; Support receives no email, roles or hold details. DPO attribution grants do not imply permission to browse live account profiles.
 
 ### 5.5 One-Time Recovery Viewer
+
+This is the current untyped saved-code viewer, not evidence of two implemented
+families. T28/T38 must label MFA Backup Codes and Account Recovery Codes separately,
+explain their distinct purposes, and require independent fresh issuance authority.
+Never deliver ARCs through email/SMS or reinterpret one stored code as both families.
 
 Use `remaining`/`low` status for existing batches, never an old-plaintext GET. Generation explicitly warns that all prior codes become invalid and requires fresh step-up. Returned codes live only in the security view's memory. Copy and plaintext Download are deliberate actions with success/failure feedback and a private-storage warning; the filename contains no account identifier and temporary object URLs are promptly revoked. There is no auto-copy, auto-download, email or print workflow, and CSP is not weakened for exports.
 
@@ -246,7 +267,13 @@ Explain immediate identity-platform deactivation, the original 30-day recovery w
 
 The provider owns confirmed/unconfirmed terminal screens outside authenticated children. Confirmed `204` clears private state and emits one neutral invalidation, without another logout request or deleting the shared browser signing key. Post-send cancellation, dropped responses and ambiguous failures remain unconfirmed: no automatic replay, cached success or inference from a subsequent `401`. The screen says notification is queued, not delivered; the email carries the authoritative deadline.
 
-`/recover-account` is an anonymous, noindex auth-card page, separate from the dashboard and backup-code recovery. Capture one canonical 43-character fragment token, scrub the URL immediately, and retain private memory for at most five minutes. Explicit user action fetches the single server-selected UV/TOTP factor. TOTP is one six-digit text field with leading-zero/paste support. Tokens never enter server props, browser persistence, telemetry or broadcasts; loading a link sends no recovery request.
+`/recover-account` is exclusively anonymous deletion cancellation/reclaim, noindex
+and separate from dashboard or planned lost-factor ARC repair. Capture one canonical
+43-character fragment token, scrub immediately and retain private memory for at
+most five minutes. Explicit action fetches the single server-selected UV/TOTP
+factor; TOTP uses six-digit text with leading-zero/paste support. Tokens never
+enter server props, persistence, telemetry or broadcasts; loading a link sends no
+redemption request.
 
 Backgrounding aborts work and clears codes/proofs/challenges. The bounded token can survive a brief authenticator-app switch, followed by explicit fresh options. Pagehide, unmount, expiry and completion clear it. Hash replacement fails closed rather than silently switching authority; reopen the email as a new document after cleanup. Invalid tokens/factors remain opaque, uncertain completion is not replayed, and confirmed recovery offers normal login without issuing a session.
 
@@ -257,6 +284,41 @@ Backgrounding aborts work and clears codes/proofs/challenges. The bounded token 
 The suite covers login/profile/security/sessions plus UV-only deletion, durable SMTP enqueue/restart/retry/cleanup, cross-session revocation, lost responses/post-send aborts, keyless UV/TOTP reclaim across replicas, bounded token cleanup and used/malformed links. It also covers strict CSP, focus/announcements, six no-JavaScript routes and eighteen light/dark mobile/desktop viewports. One-time JSON is observed with bounded capture at the actual upstream connection, not replayed requests or cached browser bodies. Artifacts contain masked screenshots and metadata-only evidence, not tokens, mail bodies, browser traces or plaintext batches. Unobserved native hidden-tab/bfcache behavior remains a manual gate.
 
 Repository test execution is not deployment approval. Manual assistive-technology/platform-authenticator review, real deployed HTTPS ingress/log-redaction verification and compatible downstream lifecycle consumers remain release gates unless separately evidenced. Follow [portal cutover](devops-operations.md#user-portal-cutover-task-73); do not mark task acceptance or operator gates complete solely because tests exist.
+
+## Planned Authentication and Repair Journeys (T38/T39)
+
+These requirements are not current routes or API contracts. `/recover-account`
+remains exclusively deletion cancellation/reclaim; the separate lost-factor route
+must be approved in the API/UI contract before implementation.
+
+| Journey                  | Required authority and outcome                                                                                                                                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Normal login             | Eligible password or server-verified UV passkey, then all required independent MFA. Primary success alone produces preauthentication when MFA is required; no portal/OAuth/admin access (SEC02-SEC03).                                                                                     |
+| MFA Backup Code          | An explicitly chosen policy-admitted backup completes the same primary-bound MFA challenge. Record backup consumption separately from actual TOTP and UV; no ARC substitution or privileged downgrade (SEC03-SEC05).                                                                       |
+| Lost password or passkey | Ordinary eligible account: ARC plus fresh proof of an old-current verified recovery-eligible contact, one restricted repair only. UV is required for new passkey binding; the new credential is not old-factor evidence (SEC06).                                                           |
+| Lost TOTP                | The same restricted ARC/contact ceremony additionally requires an eligible pre-existing primary. Keep the old TOTP active until new-secret verification and atomic replacement; insufficient surviving evidence stays blocked.                                                             |
+| Post-repair              | Clear restricted UI and return to explicit fresh full-policy normal login. SQL-recorded repaired-password login can clear the barrier for an ordinary password-only policy; with required MFA it cannot clear it until actual required TOTP or eligible MFA Backup Code completes (SEC07). |
+| Privileged total loss    | Deny consumer recovery, support override and backup-code downgrade. Explain that no separately approved higher-assurance recovery procedure exists (SEC04).                                                                                                                                |
+
+Preserve one original ceremony deadline, proposed at most ten minutes, and a repair
+grant capped at five minutes and the remaining ceremony time. Native prompts,
+sends, verifies, copy/download and final mutations require explicit actions.
+Navigation, resend, locale/calendar/time-zone changes, key loss and uncertain
+responses never extend/recreate authority. Contacts newly added/replaced have a
+mandatory 24-hour server-provenance cooldown; registration verification is exempt,
+unknown provenance fails closed, and unchanged eligible contacts may survive (SEC08).
+While the durable repair barrier is set, alternate credential/MFA/contact settings
+must not offer a second repair or policy downgrade. No contact OTP, refresh, time,
+code regeneration or new session/challenge clears it.
+
+Required bilingual evidence covers desktop/tablet/mobile, both palettes, keyboard,
+focus/announcements, explicit cancellation and uncertainty, exact secret bytes,
+structural privacy masks and stable identities/deadlines (SEC15). Browser capability,
+platform availability, a matching RP credential and physical hardware-backed
+acceptance are separate observations; preserve USB/hybrid options and do not claim
+virtual-authenticator screenshots establish physical assurance.
+
+## Current Admin Validation Boundary
 
 Task 7.6 extends the existing `web:test-admin-browser` gate, not an independent authentication/browser harness or new CI job. Required evidence includes the **real** signer plus `admin-legal --operation=lookup-probe` before/after synthetic-account deletion, two API replicas, fixture omission/mismatch, DPO success and other seeded-role denial, strict contracts/string precision, independent/replayed/released holds, fresh verification per page, opt-in fields, actual audit-failure rollback and committed-but-lost write responses without retransmission. Exercise privacy clearing and late replies, direct routes/revoked capability, no-JavaScript shells, desktop/320px, both palettes, focus/keyboard/dialog escape and strict CSP. Mask legal narrative/result regions explicitly in artifacts; retain only sanitized scenarios/status/counts and masked screenshots, not raw traces or storage snapshots. These are required gates, **not recorded passing results**. Manual screen-reader, physical-authenticator, native zoom, hidden-tab/bfcache and deployed-ingress checks remain unfinished until separately observed; no Task 5.3/5.4/5.5 status or production approval is implied.
 

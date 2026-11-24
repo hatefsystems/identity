@@ -1,12 +1,21 @@
 # Hatef Identity Platform - Client Integration Guide
 
-This document is an integration handbook for client applications and microservices (e.g., Search Core and Email Service) within the Hatef ecosystem. It details public client integration (using OAuth 2.1 / OIDC and DPoP), confidential client authentication, and internal gRPC communication secured via SPIFFE/SPIRE.
+This guide separates current OAuth/OIDC, first-party browser and private gRPC
+contracts from planned integration requirements. OAuth 2.1 remains an active draft,
+not a final specification or achieved conformance claim. Target authority is the
+[authentication and recovery policy](authentication-and-recovery-policy.md), with
+source conflicts in the [assessment](security-architecture-assessment.md) and
+release blockers in [security readiness](security-testing-and-readiness.md).
 
 ---
 
-## 1. Public Clients Integration (OAuth 2.1 & OIDC)
+## 1. Public Clients Integration (OAuth/OIDC)
 
-Third-party public clients and mobile applications use the OIDC/OAuth 2.1 mechanisms below. The first-party Task 7.3 account portal instead manages a Go-issued browser session through the same-origin cookie/DPoP contract in section 1.3; it does not obtain access or refresh tokens for portal state.
+The flow below is the intended public-client contract, not a complete working SSO
+journey: request validation and PKCE/token mechanisms exist, but interactive
+authorization/login/consent and durable grant/session prerequisites remain blocked.
+The first-party portal uses the separate Go cookie plus browser-key proof profile
+in section 1.3, not OAuth access/refresh tokens for portal state.
 
 ### 1.1 Mandatory PKCE (S256)
 
@@ -20,6 +29,7 @@ including bare `?`/`#`, while preserving supported issuer paths. No custom-schem
 wildcard/prefix or provider-alias exception is added.
 
 #### Flow Sequence:
+
 1. Generate a high-entropy random cryptographically secure string (minimum 43 characters) known as the `code_verifier`.
 2. Generate the `code_challenge` by hashing the verifier using SHA-256 and base64url-encoding the result:
    $$\text{code\_challenge} = \text{BASE64URL-ENCODE}\big(\text{SHA-256}(\text{code\_verifier})\big)$$
@@ -50,45 +60,56 @@ wildcard/prefix or provider-alias exception is added.
 
 ### 1.2 Demonstrating Proof-of-Possession (DPoP - RFC 9449)
 
-To prevent session hijacking via token theft, public clients must bind access and refresh tokens to an ephemeral client-side private key using **DPoP**.
+DPoP constrains stolen access/refresh token use to the bound key; it does not
+prevent all session hijacking or same-origin XSS. RFC 9449 resource requests use
+`Authorization: DPoP <access_token>` with matching proof and access-token `ath`.
+Token-endpoint proofs do not require resource-token `ath`. Canonical `htu` excludes
+query/fragment; generate a fresh JTI and handle only explicit nonce challenges.
+The cookie plus proof profile in section 1.3 is a Hatef profile, not automatically
+RFC 9449 access-token DPoP.
 
 #### 1.2.1 Ephemeral Key Generation (Browser)
+
 Clients generate an asymmetric ECDSA P-256 keypair via WebCrypto with `extractable: false`. This prevents API export of the private key, but same-origin malicious JavaScript may still invoke its signing operations. Non-exportability is not an XSS authorization boundary.
 
 ```javascript
-// Generate ECDSA P-256 keypair in IndexedDB
+// Generate a keypair; persistence requires a reviewed IndexedDB transaction.
 async function generateDPoPKey() {
   const keyPair = await window.crypto.subtle.generateKey(
     {
-      name: "ECDSA",
-      namedCurve: "P-256"
+      name: 'ECDSA',
+      namedCurve: 'P-256',
     },
     false, // extractable: false prevents private key extraction
-    ["sign", "verify"]
+    ['sign', 'verify']
   );
   return keyPair;
 }
 ```
 
 #### 1.2.2 Generating the DPoP Proof Assertion
+
 On every token-bound request, the client must generate and sign a JWT assertion included in the `DPoP` request header.
 
 ```javascript
-async function createDPoPProof(keyPair, httpMethod, requestUrl, nonce) {
+async function createDPoPProof(keyPair, httpMethod, requestUrl, nonce, accessToken) {
   const header = {
-    typ: "dpop+jwt",
-    alg: "ES256",
-    jwk: await window.crypto.subtle.exportKey("jwk", keyPair.publicKey)
+    typ: 'dpop+jwt',
+    alg: 'ES256',
+    jwk: await window.crypto.subtle.exportKey('jwk', keyPair.publicKey),
   };
 
   const payload = {
     jti: generateRandomString(16), // Single-use identifier
     htm: httpMethod.toUpperCase(),
-    htu: requestUrl,
+    htu: canonicalProofUrl(requestUrl), // excludes query/fragment
     iat: Math.floor(Date.now() / 1000),
-    ath: await computeAccessTokenHash() // required on token usage endpoints
   };
-  
+
+  if (accessToken) {
+    payload.ath = await computeAccessTokenHash(accessToken); // resource requests only
+  }
+
   if (nonce) {
     payload.nonce = nonce; // Bind to server-supplied nonce
   }
@@ -97,10 +118,16 @@ async function createDPoPProof(keyPair, httpMethod, requestUrl, nonce) {
 }
 ```
 
+This is illustrative pseudocode: reviewed canonical URL, token hashing, random JTI
+and JWT helpers are required. Do not use it as a runnable SDK or apply its
+access-token hash to HttpOnly cookie requests.
+
 #### 1.2.3 Token Endpoint Authentication Configuration
+
 Public clients are incapable of maintaining secrets securely. Therefore:
-* Public clients must be registered with their client metadata parameter `token_endpoint_auth_method` set strictly to `"none"`.
-* Public clients do **not** use `private_key_jwt` for OIDC authentication. Only confidential back-end services are allowed to use `private_key_jwt`.
+
+- Public clients must be registered with their client metadata parameter `token_endpoint_auth_method` set strictly to `"none"`.
+- Public clients do **not** use `private_key_jwt` for OIDC authentication. Only confidential back-end services are allowed to use `private_key_jwt`.
 
 ### 1.3 First-Party Portal Sessions (Task 7.3)
 
@@ -130,19 +157,19 @@ There is no cross-origin API mode, BFF or cookie-only fallback.
    plus `DPoP-Nonce`, generating a new proof/JTI. Do not retry uncertain mutations,
    authenticator responses or spent grants after transport failure.
 6. Unsafe requests require the exact Origin and valid bounded JSON where a body
-    is sent. Fetch uses same-origin cookies, no-store, abort signals and no arbitrary
-    redirects. Its `mode: 'cors'` preserves the Origin header under `no-referrer`;
-    strict URL validation still forbids cross-origin API calls. Using
-    `mode: 'same-origin'` with that referrer policy can send `Origin: null` instead.
-    APIs themselves enforce private/no-store/no-referrer on all responses.
+   is sent. Fetch uses same-origin cookies, no-store, abort signals and no arbitrary
+   redirects. Its `mode: 'cors'` preserves the Origin header under `no-referrer`;
+   strict URL validation still forbids cross-origin API calls. Using
+   `mode: 'same-origin'` with that referrer policy can send `Origin: null` instead.
+   APIs themselves enforce private/no-store/no-referrer on all responses.
 7. Pin each sensitive action/target, obtain fresh UV/TOTP step-up when advertised,
    and spend the in-memory grant through `X-Step-Up-Auth`. Registration consumes it
    at options generation and finishes with the same session, without another grant.
    Profile display-name edits need no step-up but require an exact decimal revision.
 8. Broadcast invalidation notices only. Clear private views and cancel late work
-    on account/session change, sign-out, hide/pagehide or detected loss; resume with
-    a new authority check. Do not send credentials/profile data between tabs or poll
-    in the background to keep sessions alive.
+   on account/session change, sign-out, hide/pagehide or detected loss; resume with
+   a new authority check. Do not send credentials/profile data between tabs or poll
+   in the background to keep sessions alive.
 
 An ordinary hidden-tab transition may retain a narrow non-secret TOTP action
 intent in component/provider memory so switching to an authenticator app is usable.
@@ -224,11 +251,47 @@ exclusion until the original deadline. Cancellation, refusal, response loss or
 uncertainty do not refund it or release the slot early. No new portal UI, password/
 OTP dialog, provider, preference, dashboard or login journey is implemented here.
 
+### Planned Authentication and Restricted Repair
+
+SEC01 identification uses immutable mandatory username, or explicitly selected
+current verified uniquely associated primary email. Mobile is a recovery contact,
+not an identifier; discoverable passkey login remains available. Current
+contact-code login can issue ordinary authority without a primary and is not
+target-compliant. Every target passkey assertion requires server-verified UV;
+enabled/required independent MFA remains mandatory even after UV (SEC02-SEC03).
+
+MFA Backup Codes complete only the original eligible-primary-bound MFA challenge;
+ARCs plus fresh old-current eligible verified-contact proof authorize one ordinary
+factor repair. TOTP repair additionally requires an eligible pre-existing primary.
+Never substitute families or turn repair into a normal cookie, OAuth grant, admin,
+legal, contact/deletion or general Step-up authority (SEC04-SEC06). `/recover-account`
+is exclusively deletion cancellation/reclaim; a loss-factor journey requires a
+separately approved route/contract and is not currently implemented.
+
+After repair, the durable SQL barrier prohibits further repair/equivalent factor
+mutation until fresh login satisfies the entire authoritative policy. An ordinary
+password-only account may clear it with fresh SQL-recorded repaired-password
+login; required-MFA accounts remain preauthenticated until actual required TOTP
+or an eligible MFA Backup Code completes. Refresh, time, contact OTP, new challenges,
+code regeneration and a repaired primary alone under an MFA policy cannot clear
+it. Changed contacts have a mandatory 24-hour provenance-based cooldown, with
+registration exemption and unknown provenance denied (SEC07-SEC08).
+
+These are target requirements, not new DTOs or current SDK methods. Preserve exact
+original deadlines/subject/JKT/purpose/version/contact bindings and explicit
+native/send/verify actions; preference changes never replay work. Unknown results
+create no authority, refund, automatic retry or cached authentication. SQL-earned
+authority and final deciding-transaction checks must precede activation (SEC09-SEC11).
+
 ### 1.4 Conditional New-Account Registration
 
-See the authoritative [registration contract](registration-contract.md) for live
-flow versus username increment versus deferred final target. The enabled contract
-below adds usernames only; email links and separate discoverable login remain.
+See the [registration contract](registration-contract.md) for current versus
+planned target. Current enabled signup includes usernames, both email/mobile
+proofs and UV passkey; it has no authenticated completion session. T31-T37 extend
+that same service and `/register`, never a v2 registration service. Planned atomic
+birth/fresh SQL session issuance (SEC13) authenticates only a known fresh successful
+commit under the original browser key and expected subject. Receipt, replay and
+result lookup never authenticate or recreate an account.
 
 Registration and SMS default disabled. Enabled signup uses the
 [fixed POST routes](api-design.md#15-new-account-registration), exact Origin,
@@ -296,19 +359,26 @@ by these integration instructions or historical acceptance.
 
 ## 2. Confidential Clients Integration (`private_key_jwt`)
 
-Confidential clients (such as the C++ Search Core backend or Go Email Service) have secure, private infrastructure. They must authenticate to the token endpoint `/oauth2/token` using signed assertions (RFC 7523) instead of static client secrets.
+Confidential clients protect signing keys in approved backend custody; private
+infrastructure alone does not establish security. Current `private_key_jwt`
+authentication applies to client-credentials exchanges. Its absence from
+authorization-code/refresh confidential-client exchanges is a release blocker,
+not a supported unauthenticated confidential profile. Planned exchanges must
+authenticate the exact client as well as enforcing PKCE/grant/key/session
+bindings (SEC16).
 
 ### 2.1 Client Authentication Parameters
 
-* **Authentication Method:** `private_key_jwt`
-* **Token Endpoint:** `https://identity.hatef.ir/oauth2/token`
-* **Assertion Signing Algorithm:** `RS256` (min 2048-bit RSA) or `ES256` (NIST Curve P-256).
+- **Authentication Method:** `private_key_jwt`
+- **Token Endpoint:** `https://identity.hatef.ir/oauth2/token`
+- **Assertion Signing Algorithm:** `RS256` (min 2048-bit RSA) or `ES256` (NIST Curve P-256).
 
 ### 2.2 Constructing the Client JWT Assertion
 
 To authenticate, the client generates a JWT signed with its local private key.
 
 #### Header:
+
 ```json
 {
   "alg": "ES256",
@@ -318,23 +388,27 @@ To authenticate, the client generates a JWT signed with its local private key.
 ```
 
 #### Payload Claims:
-* `iss` (Issuer): The pre-registered `client_id` of the client (e.g., `search-core`).
-* `sub` (Subject): The same `client_id` (`search-core`).
-* `aud` (Audience): The URL of the IdP token endpoint (`https://identity.hatef.ir/oauth2/token`).
-* `jti` (JWT ID): A cryptographically secure random string unique to this request (validated by the server to prevent replay attacks).
-* `exp` (Expiration Time): Unix epoch timestamp. Must not be longer than 5 minutes in the future.
-* `iat` (Issued At): Unix epoch timestamp of creation.
 
-Replay claims are scoped to the canonical client/audience/JTI tuple and atomically
+- `iss` (Issuer): The pre-registered `client_id` of the client (e.g., `search-core`).
+- `sub` (Subject): The same `client_id` (`search-core`).
+- `aud` (Audience): The URL of the IdP token endpoint (`https://identity.hatef.ir/oauth2/token`).
+- `jti` (JWT ID): A cryptographically secure random string unique to this request (validated by the server to prevent replay attacks).
+- `exp` (Expiration Time): Unix epoch timestamp. Must not be longer than 5 minutes in the future.
+- `iat` (Issued At): Unix epoch timestamp of creation.
+
+Current replay claims are scoped to the canonical client/audience/JTI tuple and atomically
 shared in Redis outside explicit development. Retention covers the entire accepted
 `exp + 60s` leeway window with rounded absolute expiry. Redis `TIME`, not each
 replica's wall clock, governs admission and the atomic claim's deadline check.
 A recognized replay, corrupt/no-TTL state, clock failure or storage outage fails
 authentication, never memory fallback. Different
 replicas must share the same replay authority. This is a runtime contract, not
-evidence of deployed Redis/fleet acceptance.
+evidence of deployed Redis/fleet acceptance. SEC09/SEC16 require durable SQL-owned
+admission before Redis becomes non-authoritative; do not flush/restore current
+replay markers as disposable cache state.
 
 #### Exchange Request:
+
 ```http
 POST /oauth2/token HTTP/1.1
 Host: identity.hatef.ir
@@ -446,12 +520,12 @@ Install these options before additional business interceptor chains and never ov
 
 At each admission the guard requires a completed TLS connection, exactly one URI SAN containing a non-root SPIFFE workload identity in the configured trust domain, a currently valid chain, and valid SVID leaf key usages. Other SAN types do not supply identity. Custom SPIFFE TLS verification can leave `VerifiedChains` empty; the guard verifies the actual peer chain against a snapshot of the current bundle rather than trusting that field or `TLSInfo.SPIFFEID` alone.
 
-| Admission result | gRPC status |
-|---|---|
-| Missing/invalid TLS, certificate, identity, validity period, or trust | `Unauthenticated` |
-| Required trust bundle missing, empty, or unavailable | `Unavailable` |
-| Authenticated workload without the exact method grant | `PermissionDenied` |
-| Authenticated and explicitly granted | Handler receives the verified ID via `grpcauth.IdentityFromContext`; its result is preserved |
+| Admission result                                                      | gRPC status                                                                                  |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Missing/invalid TLS, certificate, identity, validity period, or trust | `Unauthenticated`                                                                            |
+| Required trust bundle missing, empty, or unavailable                  | `Unavailable`                                                                                |
+| Authenticated workload without the exact method grant                 | `PermissionDenied`                                                                           |
+| Authenticated and explicitly granted                                  | Handler receives the verified ID via `grpcauth.IdentityFromContext`; its result is preserved |
 
 Health and reflection methods have no automatic exemption. Unregistered methods may return gRPC's native `Unimplemented`. TLS-handshake failures occur before interceptor invocation and need not appear as an application authentication status.
 
@@ -480,9 +554,8 @@ The runtime bounds initial dependency/SVID acquisition to ten seconds, handshake
 
 Deploy issuers and shared stores together, drain old process-local sessions and require reauthentication before enabling consumers. Legacy access JWTs without the new grant/session/version claims are inactive through this RPC. Generated clients must supply the new request context. A lost/reset Redis namespace invalidates credentials; do not reconstruct authority from JWTs or restore stale credential/replay snapshots. Disable/drain the private listener for rollback rather than silently falling back to local-only JWT validation. SPIRE, federation, public ingress, resource-audience issuance and independent offline grants are not deployed by this change.
 
-The bundled `00001_initial_schema.sql`, `00002_registration_attempts.sql` and
-additive `00003_username_reservations.sql` and `00004_geography_catalog.sql` install uses
-`public.identity_schema_version`, refusing all legacy `public.goose_db_version`,
+The [canonical packaged migration inventory](devops-operations.md#canonical-packaged-migration-inventory) install uses
+`public.identity_schema_version`, refusing all retired `public.goose_db_version`,
 untracked nonempty application schemas and contradictory histories without
 upgrade/adoption. Stop all old writers before switching to explicitly scoped fresh
 PostgreSQL and matching fresh/isolated Redis/NATS state; do not reuse old sessions,
@@ -498,25 +571,42 @@ scoped authorization. See [active setup](admin-operations.md#migration-and-contr
 
 Send the exact raw access token, observed authorization scheme and expected audience. For DPoP, forward the proof plus original HTTP method and absolute URI observed at the resource's trusted HTTP edge. Do not extract method/URI from the proof or trust end-user forwarding headers. The service excludes query data during RFC 9449 URI comparison and never fetches the supplied URI. A bound token cannot be sent as Bearer or rebound to another key during refresh.
 
-| Result | Consumer behavior |
-|---|---|
-| `active=true` | Use `principal_type` and `subject`; only USER has `user_id`. Enforce the resource's scopes/permissions and bind the action to this subject. Do not cache until `expires_at`. |
-| `active=false`, unspecified DPoP outcome | Reject the access token without claims; typically HTTP 401 `invalid_token`. |
-| `DPOP_OUTCOME_INVALID_PROOF` | Reject with HTTP 401 and the appropriate DPoP `WWW-Authenticate` error. No identity claims are returned. |
-| `DPOP_OUTCOME_USE_NONCE` | Return HTTP 401, `DPoP-Nonce: <dpop_nonce>` and `WWW-Authenticate: DPoP error="use_dpop_nonce"`. The external client creates a new proof/JTI containing that nonce. |
-| `Unavailable` | Treat as a dependency outage, not user inactivity. Fail closed; never authorize from an old success or switch to an offline verifier. |
-| `InvalidArgument` / `PermissionDenied` | Correct the request or operator policy; neither is resolved by repeatedly submitting a user proof. |
-| `Canceled` / `DeadlineExceeded` | Preserve cancellation semantics. An ambiguous proof-consuming attempt must not be automatically replayed. |
+| Result                                   | Consumer behavior                                                                                                                                                            |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `active=true`                            | Use `principal_type` and `subject`; only USER has `user_id`. Enforce the resource's scopes/permissions and bind the action to this subject. Do not cache until `expires_at`. |
+| `active=false`, unspecified DPoP outcome | Reject the access token without claims; typically HTTP 401 `invalid_token`.                                                                                                  |
+| `DPOP_OUTCOME_INVALID_PROOF`             | Reject with HTTP 401 and the appropriate DPoP `WWW-Authenticate` error. No identity claims are returned.                                                                     |
+| `DPOP_OUTCOME_USE_NONCE`                 | Return HTTP 401, `DPoP-Nonce: <dpop_nonce>` and `WWW-Authenticate: DPoP error="use_dpop_nonce"`. The external client creates a new proof/JTI containing that nonce.          |
+| `Unavailable`                            | Treat as a dependency outage, not user inactivity. Fail closed; never authorize from an old success or switch to an offline verifier.                                        |
+| `InvalidArgument` / `PermissionDenied`   | Correct the request or operator policy; neither is resolved by repeatedly submitting a user proof.                                                                           |
+| `Canceled` / `DeadlineExceeded`          | Preserve cancellation semantics. An ambiguous proof-consuming attempt must not be automatically replayed.                                                                    |
 
 Browser logout, individual session revocation, idle expiry and absolute expiry end all linked user access/refresh authority. Validation and refresh do not count as browser activity. The existing `offline_access` scope name remains accepted, but does not extend that browser lifetime. Client-credentials tokens have no browser or user identity. Read-only permission/profile RPCs are independently workload-authorized queries: a returned profile is not an authorization decision. Profiles disclose email and display name only for active/pending-verification accounts, omit both for suspended/banned accounts, and return NotFound for deleting/deleted accounts. Name and lifecycle revision come from the same snapshot.
 
-WebAuthn challenges, browser nonce/replay, bound sessions and independently scoped client-assertion claims use shared Redis outside development. Missing authority/corrupt state fails closed; no readiness/source change certifies fleet rollout. See [API design](api-design.md#22-identityservice) for freshness and [Redis state](data-architecture.md#3-redis-session--otp-storage-layout) for lifetime details.
+Email is an existing optional protobuf field: preserve presence/absence, do not
+remove it, fabricate a mailbox or substitute an empty string/hash. Subject identity
+is the validated `(iss, sub)` pair plus explicit `USER` versus `CLIENT` principal
+type. A UUID-shaped client ID never creates a human account or consumer recovery
+eligibility. Bind subject, permissions and exact same-snapshot revisions; profile
+data, method inventory and a role label are not earned MFA/hardware evidence.
+SEC04/SEC16 privileged consumers need policy-admitted evidence and live
+authorization at the action boundary; existing `active=true` is not proof that
+that stronger consumer fence is delivered. Do not claim offline JWTs instantly
+observe revocation or retroactively cancel already admitted work.
+
+Current WebAuthn challenges, browser nonce/replay, bound sessions and scoped
+client-assertion claims use shared Redis outside development. Missing/corrupt state
+fails closed under current checks, but forged earned claims or lost replay markers
+are not made trustworthy by SQL version checks. SEC09 requires primary SQL-earned
+authority, and SEC16 requires durable tokens/consumer/restore gates before launch.
+See [API design](api-design.md#22-identityservice) and
+[security-state architecture](data-architecture.md).
 
 ## 4. User Lifecycle Consumption
 
 The [lifecycle contract](api-design.md#3-asynchronous-events-nats-jetstream) is metadata-only. Each service needs its own durable pull consumer on `IDENTITY_USERS`, subscribing to all four subjects with explicit acknowledgements. Do not share a durable between different microservices: that distributes work instead of synchronizing both services. Subscribers need explicitly granted broker credentials and independent gRPC grants to fetch allowed profile data.
 
-1. Validate the subject, schema, UUIDs, revision and bounded field set. Keep v1 validation unchanged (`status`/`email` only), and explicitly support v2's added `display_name` field. Only display-name writes produce v2 in Task 7.3; existing producers and legacy tombstone adaptation remain v1. ProtoJSON uint64 revisions are decimal strings; never round them through a JavaScript `number`. Unknown versions/fields and malformed events require quarantine/alerting, not silent acknowledgement.
+1. Validate subject, schema, UUIDs, revision and bounded fields. V1 supports `status`/`email`; v2 adds `display_name` and the coarse `private_profile` marker (updated active account, that marker alone). Current real email changes emit v1, display-name/private-profile writes emit v2; creation/status/deletion and supported revision-less tombstone adaptation remain v1. No private value or exact private-field list enters the event. ProtoJSON uint64 revisions are decimal strings; never round through JavaScript `number`. Unknown versions/fields or malformed events require quarantine/alerting, not silent acknowledgement.
 2. Commit projection changes, idempotency information and the processing checkpoint together before acknowledging. A crashed consumer may receive the same event again, and publisher duplicates can outlive JetStream's two-minute deduplication window. Reject already-applied/older revisions even if the transport sequence is new.
 3. Treat a validated deletion as terminal for that UUID, including a supported revision-less legacy deletion. Scrub local Class A profile data without erasing independently protected legal/security evidence. Older created/updated messages must never resurrect it. Keep tombstone/revision protection while older replay/redelivery remains possible; policy-driven expiry requires a reconciled baseline.
 4. For other events, use the exact status to invalidate or disable the projection. Pending deletion is reversible, not permanent erasure. Fetch current allowed data through `GetInternalUserInfo` when needed; its `lifecycle_revision` must be at least the event revision. Apply the returned snapshot only if it has not been superseded locally. This RPC is not an authorization decision.
@@ -526,12 +616,23 @@ The [lifecycle contract](api-design.md#3-asynchronous-events-nats-jetstream) is 
 Limits retention is a finite replay buffer: acknowledgements do not delete history, and an indefinitely offline consumer has no delivery guarantee. Bootstrap for existing users and full reconciliation after a gap are deployment prerequisites; this task provides neither an enumeration/snapshot RPC nor production consumers. New consumers must establish an authoritative baseline and matching stream checkpoint before activation. The integration suite contains executable contract fixtures, not a downstream implementation.
 
 Deploy and validate dual-version readers/publishers and actual downstream consumers
-before enabling display-name writers. A `display_name` event contains no name value;
-fetch the allowed current gRPC snapshot and apply it only if its revision is not
-superseded. Preserve mixed v1/v2 replay and terminal legacy tombstones. During
+before enabling display-name/private-profile writers. A `display_name` event contains
+no name value; fetch the allowed current snapshot only under independent grants
+and apply exact revision protection. A `private_profile` marker grants no private
+attribute disclosure; use only separately authorized snapshot/grant contracts.
+Preserve mixed v1/v2 replay and terminal legacy tombstones. During
 rollback, keep v2-capable publishing/consumption while v2 outbox or retained broker
 history exists; never run an old strict-v1 worker over those rows. Consumer code and
 deployment outside this repository remain explicit operator release gates.
+
+Planned T40/T41 security events stay metadata-only and preserve exact revision,
+optional email and existing audit/envelope formats/readers (SEC14). Never insert
+private attributes, code values, recipient/token payloads or new audit bytes into
+these lifecycle events to make recovery observable. Reader compatibility and
+notification foundation precede writers; schema documentation is not downstream
+consumer deployment or baseline reconciliation. During failover/restore quarantine,
+consumers reject stale authority and reconcile checkpoints without resurrecting
+erased accounts, revoked credentials or spent codes (SEC16).
 
 ## 5. Geography Selector (T08/T09)
 

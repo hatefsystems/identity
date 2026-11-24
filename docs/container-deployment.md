@@ -1,5 +1,13 @@
 # Containers and GHCR
 
+These are current packaging/install instructions, not approval to deploy or proof
+of planned security behavior. Configuration and schema authority is
+[the operations playbook](devops-operations.md#canonical-packaged-migration-inventory);
+the [authentication policy](authentication-and-recovery-policy.md),
+[assessment](security-architecture-assessment.md) and
+[security readiness](security-testing-and-readiness.md) define outstanding target gates.
+No application, migration or environment is changed by this documentation.
+
 ## Local full stack
 
 Docker Engine/Desktop with Linux containers and Docker Compose v2 is sufficient;
@@ -56,12 +64,21 @@ Host (including the port), Origin, DPoP, cookies and application CSP/cache heade
 Signup, SMS, SMTP, admin, legal workflow, gRPC and operational workers are not
 automatically enabled. They retain their existing activation requirements;
 this stack does not seed users or claim that a fresh installation can send mail/SMS.
+Login/action-proof/contact capabilities also retain their explicit default-disabled
+switches and selected-provider requirements; nullable email does not activate
+mobile-only production eligibility or retire T27's primary-email-removal gate.
 
 ### Enable real local signup
 
 The default `REGISTRATION_ENABLED=false` deliberately leaves
 `POST /api/v1/auth/register/start` unmounted (404 after origin validation).
 To use the registration form with real SMS.ir and email delivery:
+
+This overlay implements the current email + Iranian mobile + mandatory username +
+resident UV-passkey signup contract and separate normal login, not the planned
+one-selected-contact/password/passkey/both/fresh-session target. Future selected
+contact capabilities require their own approved compatible overlay and lifecycle
+gates; do not disable one current proof to approximate that target.
 
 1. Copy `.env.registration.example` to **`.env.registration`** and fill it privately.
    It is gitignored. Single-quote credentials containing `$` to preserve their
@@ -183,6 +200,17 @@ deadlines must survive rollback. No deployment, database reset, worker activatio
 or production approval is performed by GitHub Actions. Optional capabilities need
 reviewed Compose overrides for their existing configuration and separate worker
 credentials; see the corresponding operations sections.
+
+Image publication gates are current regression gates, not SEC01-SEC16 completion,
+certification or deployed HA. Before target activation, require primary SQL-owned
+earned/session/replay authority, truthful independent MFA, verified privileged
+hardware/backup and durable restricted ARC repair/anti-chaining/cooldown. Retain
+real v1/v2 notification readers before writers and throughout live queued work;
+do not rewrite accepted bytes, recipients, locales, tokens or deadlines on rollback.
+Preserve stronger deletion authorization, original 30-day grace/holds/retained
+factors and T27 until complete password/mobile notification/deletion/reclaim is
+independently verified. A restored image/DB is not safe merely because Redis
+sessions are cleared: follow [security-authority quarantine](disaster-recovery.md#36-security-authority-quarantine-and-reconciliation).
 
 Verify the real deployed HTTPS ingress, strict cookies, DPoP origin binding,
 request-unique CSP/nonces and no-store HTML before allowing traffic. Existing

@@ -13,37 +13,50 @@ for the one-time CA import, persistent keys, production environment template and
 host Nginx setup. GitHub Actions publishes tested API/web images on `main` and
 version tags; it does not deploy a server.
 
-The **Hatef Identity Platform (LDP)** is a centralized, privacy-first Identity Provider (IdP) and Single Sign-On (SSO) system designed to serve as the unified authentication and authorization backbone for the entire Hatef ecosystem (including the Search Engine, Email Service, and future applications). 
+The **Hatef Identity Platform (LDP)** is a centralized, privacy-first Identity Provider (IdP) and Single Sign-On (SSO) system designed to serve as the unified authentication and authorization backbone for the entire Hatef ecosystem (including the Search Engine, Email Service, and future applications).
 
-Built with Go (Golang) and Next.js, and managed inside an Nx monorepo, the platform enforces strict zero-trust security principles, enterprise-grade cryptography, and standards-compliant authentication protocols.
+Built with Go and Next.js inside an Nx monorepo, the platform has scoped
+authentication, cryptographic and browser protections. Identity is pre-launch;
+repository support and historical local acceptance are not deployed security or
+blanket standards-conformity claims. The 2026-11-24
+[security assessment](docs/security-architecture-assessment.md) distinguishes
+current behavior from the owner-confirmed
+[authentication and recovery policy](docs/authentication-and-recovery-policy.md).
+The [ADR](docs/adr/0001-authentication-recovery-and-security-state-authority.md)
+remains Proposed; application implementation requires separate owner approval.
 
 ---
 
 ## 1. System Overview & Architecture
 
-LDP is architected as a decentralized, highly scalable client-agnostic system consisting of three primary layers:
-* **Frontend Layer (Next.js):** Handles the user-facing portal, OAuth/OIDC authorization pages, user profile management, and the administrator dashboard.
-* **Identity & API Layer (Go):** The core Identity Provider (IdP) engine. Exposes standard OpenID Connect (OIDC) and OAuth 2.1 endpoints externally and high-performance gRPC services internally. Uses `sqlc` for compile-time type-safe PostgreSQL queries instead of heavy, unpredictable ORMs.
-* **Storage & Queue Layer:**
-  * **PostgreSQL:** Transactional storage for users, credentials, and state.
-  * **Redis:** High-speed in-memory session caching, OAuth token metadata, and distributed rate limiting.
-  * **NATS JetStream:** Lightweight, ultra-fast, and persistent message broker for asynchronous events.
+LDP is a centralized, client-agnostic IdP with three primary layers:
+
+- **Frontend (Next.js):** Public authentication, account and administrator portals. Interactive OAuth/OIDC consent remains incomplete, not a completed public page.
+- **Identity/API (Go):** Scoped OIDC/OAuth endpoints and opt-in private gRPC, using `sqlc`/`pgx`. OAuth 2.1 is an active draft, not a finalized compliance label.
+- **Storage/Queue:** PostgreSQL accounts/credentials/private data and deciding mutations; Redis currently carries earned session/preauthentication/token/replay authority, not only a disposable cache; NATS JetStream distributes durable metadata intents.
+
+Planned target: primary PostgreSQL governs earned authority, deadlines, revocation,
+replay, policy/security versions and repair barriers. Redis becomes non-authoritative
+acceleration/coordination/rate limiting; loss cannot silently remove critical
+limits. No SQL+Redis/provider atomicity is claimed.
 
 ### Zero-Trust & Security-First Safeguards
-* **Mutual TLS (mTLS) with SPIFFE/SPIRE:** Dynamic, certificate-less service-to-service communication within the microservices grid, with method-level gRPC RBAC verified via SAN checks.
-* **OAuth 2.1 & OpenID Connect Compliance:** Enforces Proof Key for Code Exchange (PKCE S256), Refresh Token Rotation (RTR), and sender-constrained access tokens via **DPoP (RFC 9449)**.
-* **Phishing-Resistant Passwordless (WebAuthn / FIDO2):** Primary secure path using passkeys, platform authenticators, and discoverable credentials.
-* **Advanced Cryptography:** Argon2id password hashing, real AES-GCM-256 envelope encryption with environment-injected process-local key custody, and SHA-256 database-indexed recovery codes. Infisical/SOPS/Sealed Secrets are operator provisioning options, not live application key-fetch, cache or hot-rotation integrations.
-* **Restricted Recovery:** A backup code is physically deleted in the same ACID transaction that verifies it and yields only a ten-minute `recovery_enrollment` session, limited to one UV-required replacement passkey before normal login.
-* **Single-Use Step-up Authorization:** High-risk factor and contact operations consume short-lived ACR grants bound to the authenticated session. Redis enforces replay claims cluster-wide under opaque HMAC-derived keys.
+
+- **Opt-in mTLS/SPIFFE:** Workload certificates and exact-method SAN admission are implemented; deployment of SPIRE and consumers is a separate gate, not certificate-less communication.
+- **Scoped OAuth/OIDC:** PKCE S256, key-bound refresh and applicable access-token DPoP controls exist. Interactive authorization and confidential authentication on code/refresh exchanges remain prerequisites. The first-party cookie-plus-browser-key profile is distinct from RFC 9449 resource-token DPoP.
+- **WebAuthn:** Discoverable/named passkeys and actual assertion-UV recording exist; ordinary login currently permits non-UV assertions under preferred UV. The target requires actual UV on every passkey authentication and independently required MFA afterward. Physical hardware admission remains unverified.
+- **Advanced Cryptography:** Argon2id password hashing, real AES-GCM-256 envelope encryption with environment-injected process-local key custody, and SHA-256 database-indexed recovery codes. Infisical/SOPS/Sealed Secrets are operator provisioning options, not live application key-fetch, cache or hot-rotation integrations.
+- **Recovery, current versus planned:** The untyped saved-code pool consumes a code before restricted UV-passkey enrollment, but old-contact proof, privileged denial, final expiry continuity and a durable anti-chaining barrier are missing. Enabled TOTP still gates subsequent normal login. The target separates primary-bound MFA Backup Codes from ARC-plus-eligible-old-contact one-factor repair; neither grants general authority.
+- **Step-up:** Fresh UV/TOTP and fixed-purpose actionproofs protect scoped mutations. Current Redis replay and incomplete final deciding-transaction continuity require SQL remediations, not a blanket one-use/freshness guarantee.
 
 ---
 
 ## 2. MVP Resource Optimization Strategy
 
 To support early development and minimize hosting overhead during the **MVP (Minimum Viable Product) Phase**, the system incorporates lightweight fallbacks while retaining robust post-MVP production schemas in design:
-* **Nginx Edge Ingress:** Replaces Traefik temporarily to route traffic based on path rules directly to loopback/private container ports, conserving memory. The API trusts forwarding headers only from exact `TRUSTED_PROXY_CIDRS`, and Nginx overwrites client-supplied `X-Forwarded-For`.
-* **PostgreSQL Audit Ledger (`mvp_audit_logs`):** Replaces the ~1.2 GB RAM ClickHouse analytical cluster. Audit logs are written asynchronously via NATS to PostgreSQL, strictly maintaining append-only database policies and cryptographic ledger-chain integrity.
+
+- **Nginx Edge Ingress:** Replaces Traefik temporarily to route traffic based on path rules directly to loopback/private container ports, conserving memory. The API trusts forwarding headers only from exact `TRUSTED_PROXY_CIDRS`, and Nginx overwrites client-supplied `X-Forwarded-For`.
+- **PostgreSQL Audit Ledger (`mvp_audit_logs`):** Replaces the ~1.2 GB RAM ClickHouse analytical cluster. Audit logs are written asynchronously via NATS to PostgreSQL, strictly maintaining append-only database policies and cryptographic ledger-chain integrity.
 
 ---
 
@@ -68,34 +81,52 @@ The project is structured as an Nx-driven monorepo to maximize code reuse, enfor
 
 ## 4. Documentation Index
 
-The `docs/` directory contains deep-dive low-level (LLD) and high-level (HLD) specifications covering every facet of the system. Developers must consult these files before executing changes:
+The policy owns target invariants, the assessment owns current-source findings,
+and readiness owns evidence gates. Other guides apply that authority to their
+scope; no documented prerequisite is completed merely because its design exists.
 
-1. [System Architecture (`docs/architecture.md`)](docs/architecture.md)
-   * Core design, communication flows, mTLS SPIFFE/SPIRE, monorepo setup, and the MVP Nginx routing.
-2. [API Design (`docs/api-design.md`)](docs/api-design.md)
-   * Full specification of REST APIs, OIDC well-known endpoints, gRPC protobuf methods, and response models.
-3. [Data Architecture (`docs/data-architecture.md`)](docs/data-architecture.md)
-   * PostgreSQL DDL, index optimizations, Redis key layouts, envelope encryption workflow, and the cryptographic append-only ledger chain.
-4. [Threat Modeling (`docs/threat-modeling.md`)](docs/threat-modeling.md)
-   * STRIDE security threat assessments, trust boundaries, mitigations, and application-level controls.
-5. [Client Integration Guide (`docs/client-integration.md`)](docs/client-integration.md)
-   * Guidelines for third-party or internal applications (Go, C++) to authenticate against the IdP via OIDC and validate tokens.
-6. [Frontend Pages & UX (`docs/frontend-pages.md`)](docs/frontend-pages.md)
-   * User interaction maps, UI templates, session cookie security (`__Host-` prefix), and Next.js Content Security Policy (CSP).
-7. [DevOps & Operations (`docs/devops-operations.md`)](docs/devops-operations.md)
-   * Kubernetes deployment, CI/CD pipeline structures with Nx, Prometheus metrics, and secret management.
-8. [Disaster Recovery Plan (`docs/disaster-recovery.md`)](docs/disaster-recovery.md)
-   * Data backup regimes, RTO/RPO metrics, recovery dry-runs, and ledger-integrity validation playbooks.
+| Document                                                                          | Responsibility                                                                                                                                                     |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [Authentication and Recovery Policy](docs/authentication-and-recovery-policy.md)  | Normative glossary, SEC01-SEC16, account/evidence/operation matrix and code/credential lifecycle.                                                                  |
+| [Security Architecture Assessment](docs/security-architecture-assessment.md)      | Refreshed source strengths, conditional findings and missing prerequisites.                                                                                        |
+| [ADR 0001](docs/adr/0001-authentication-recovery-and-security-state-authority.md) | Proposed decision, alternatives, consequences and approval boundary.                                                                                               |
+| [Security Testing and Readiness](docs/security-testing-and-readiness.md)          | Required tests, independent/manual gates, standards and source-bound evidence.                                                                                     |
+| [Documentation Alignment Report](docs/documentation-alignment-report.md)          | A-K map, inventory, supersessions, traceability and actual documentation checks.                                                                                   |
+| [Revised Task Backlog](.github/tasks/registration-single-contract-tasks.md)       | T01-T42 IDs, bounded remediation subtasks, DAG and explicit acceptance. Historical `tasks.md`/local plans remain unchanged evidence, not current target authority. |
+| [Architecture](docs/architecture.md)                                              | Current/target trust boundaries, IdP and service scope.                                                                                                            |
+| [API Design](docs/api-design.md)                                                  | Current versus planned HTTP/gRPC/event contracts and client obligations.                                                                                           |
+| [Data Architecture](docs/data-architecture.md)                                    | Persisted facts, constraints, lock order, revisions and security-state authority.                                                                                  |
+| [Threat Modeling](docs/threat-modeling.md)                                        | STRIDE/precondition/control/gap/residual-risk/evidence matrix.                                                                                                     |
+| [Registration Contract](docs/registration-contract.md)                            | One current service and planned fields, credentials, atomic birth and fresh-only session.                                                                          |
+| [Frontend Pages](docs/frontend-pages.md)                                          | Distinct normal/MFA/repair/deletion journeys and browser authority boundaries.                                                                                     |
+| [Localization](docs/localization.md)                                              | Typed bilingual presentation, exact secrets and stable ceremony/deadline contracts.                                                                                |
+| [Localization Validation](docs/localization-validation.md)                        | Preserved historical counts and new bilingual/manual acceptance gaps.                                                                                              |
+| [Client Integration](docs/client-integration.md)                                  | OIDC subject/proof profiles, private gRPC and consumer authority prerequisites.                                                                                    |
+| [Admin Operations](docs/admin-operations.md)                                      | Privileged admission, provisioning, legal/audit boundaries and open release gates.                                                                                 |
+| [DevOps Operations](docs/devops-operations.md)                                    | Canonical migration/configuration inventory, SQL/Redis, workers and rollout/rollback.                                                                              |
+| [Container Deployment](docs/container-deployment.md)                              | Current local/container install, default-disabled capabilities and ingress gates.                                                                                  |
+| [Disaster Recovery](docs/disaster-recovery.md)                                    | Restore quarantine, durability/failover and security rollback prevention.                                                                                          |
+| [Compliance and Data Governance](docs/compliance-and-data-governance.md)          | Data/retention/rights/vendor obligations and non-certifying applicability.                                                                                         |
+| [Page Gallery](docs/page-gallery.md)                                              | Sanitized illustrations only, not runtime/physical security evidence.                                                                                              |
 
 ---
+
+The complete original acceptance narratives and execution input are available in
+the [archived registration backlog](docs/history/registration-backlog-2026-11-23.md)
+and [archived security architecture plan](docs/history/security-architecture-plan-2026-11-24.md).
+Both are superseded history, not executable task sources. Shared documentation
+does not require private agent settings or one machine's temporary artifacts.
+See [reproducible documentation checks](docs/security-testing-and-readiness.md#reproducible-documentation-checks)
+for the repository-owned checker and pinned optional diagram tooling.
 
 ## 5. Local Setup & Development (MVP Targeted Stack)
 
 Ensure the following prerequisites are installed locally:
-* **Docker & Docker Compose**
-* **Go (latest stable release)**
-* **Node.js (LTS version)**
-* **Workspace-local Nx** (invoke through `npm exec -- nx`)
+
+- **Docker & Docker Compose**
+- **Go 1.26.x**, matching `.github/workflows/identity-api.yml`, with `GOTOOLCHAIN=local` after verifying the selected installed toolchain.
+- **Node.js 24.18.0** from `.nvmrc` and **npm 11.21.0** matching CI. Verify actual command resolution; a minimal non-interactive PATH may need a local verified NVM `bin` prefix.
+- **Workspace-local Nx** (invoke through `npm exec -- nx`)
 
 > Note: `buf` (Protobuf) and `sqlc` (SQL codegen) are **not** installed
 > globally. They are pinned as Go `tool` dependencies (in `libs/schemas/go.mod`
@@ -105,28 +136,34 @@ Ensure the following prerequisites are installed locally:
 ### Getting Started
 
 1. **Clone the repository:**
+
    ```bash
    git clone https://github.com/hatefsystems/identity.git
    cd identity
    ```
 
 2. **Install frontend/workspace dependencies:**
+
    ```bash
-   npm install
+    npm ci
    ```
 
 3. **Create the local environment file:**
+
    ```bash
    cp .env.example .env
    ```
+
    Inject/export the selected variables into each process; copying the file does not automatically load it into Go. `APP_ENV` must be exactly `development`, `test`, or `production`; missing, empty, whitespace and unknown modes fail. Test is not a development exemption. KEK/pepper placeholders are intentionally unusable. Keep `TRUSTED_PROXY_CIDRS` empty for direct API access. The empty `STEPUP_REPLAY_HMAC_KEY` is development-only; test/production require a private base64 key of at least 32 decoded bytes, identical across replicas. See [key custody and rotation](docs/devops-operations.md#2-secrets-injection--configuration).
 
 4. **Spin up local backing services (PostgreSQL, Redis, NATS):**
+
    ```bash
    docker compose -f docker-compose.dev.yml up -d
    ```
 
 5. **Compile schemas and generate database code:**
+
    ```bash
    # Generate TypeScript and Go contracts from Proto definitions
    # (buf, pinned as a go tool in libs/schemas)
@@ -146,18 +183,13 @@ Ensure the following prerequisites are installed locally:
 
 ### Active Installation and Registration
 
-The forward-only bundle is unchanged
-`apps/identity-api/db/migrations/00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql`, tracked through version 2 in
-`public.identity_schema_version`. Migration 2 does not rewrite baseline 1 or
-adopt legacy `public.goose_db_version` history. Supported entrypoints refuse
-legacy/untracked/contradictory targets; Down/reset are not recovery paths. Stop
-incompatible writers and select explicitly scoped fresh PostgreSQL and isolated
-Redis/NATS state. No instruction here authorizes resets or live target use.
-Obsolete legal Backfill/plaintext compatibility is absent from active setup;
-dated records and prior plans retain historical meaning. Genesis, actual grants,
-key inventory and policy approval remain separate operator obligations. See
-[installation](docs/admin-operations.md#migration-and-contraction).
+Use the [canonical packaged migration inventory](docs/devops-operations.md#canonical-packaged-migration-inventory)
+and [installation runbook](docs/admin-operations.md#migration-and-contraction),
+not a duplicated version list here. Current packaged migrations are forward-only
+and tracked by `public.identity_schema_version`; unsupported histories are refused,
+not adopted or stamped. No Down/reset/live-target mutation is authorized by this
+guide. Genesis, actual grants, custody inventory and policy approval remain separate
+operator obligations; preserve historical migration/acceptance evidence.
 
 `REGISTRATION_ENABLED=false` and `SMS_ENABLED=false` are safe defaults. When
 explicitly enabled with complete dependencies and approved budgets, `/register`
@@ -169,18 +201,23 @@ fresh proof after ambiguity; external email/SMS delivery is not exactly once.
 See [HTTP contract](docs/api-design.md#15-new-account-registration) and
 [enablement/cleanup](docs/devops-operations.md#registration-enablement-and-cleanup).
 
-Final-source acceptance remains required under
-[automated validation](docs/admin-operations.md#automated-validation). This setup
-note is not a test result, deployed gate or production approval; historical
-statuses and dated acceptance remain unchanged.
+The target keeps one `/register` implementation but adds mandatory private
+attributes, one selected verified contact, password/passkey/both and legal evidence;
+only a known fresh committed birth may issue the expected-subject session. Those
+features, two-family recovery, privileged admission and complete password/mobile
+lifecycle remain Planned/Blocked. `/recover-account` stays deletion-exclusive.
+See the [backlog](.github/tasks/registration-single-contract-tasks.md) and
+[readiness gates](docs/security-testing-and-readiness.md). Final-source acceptance
+remains required under [automated validation](docs/admin-operations.md#automated-validation);
+this setup is not a test result or production approval.
 
 ---
 
 ## 6. Coding Standards & Contribution Policy
 
-* **Go Code:** Formatted using `gofmt` and linted with `golangci-lint`. Avoid manual database manipulation or inline SQL; define queries in `.sql` files and let `sqlc` build type-safe abstractions.
-* **TypeScript/React:** Enforce strict ESLint rules and Prettier formats defined in the workspace root.
-* **Security Checks:** Every pull request is subject to static security analysis. Secret commits, plain-text PII storage, or insecure hashing algorithms (e.g., MD5, SHA-1, or raw bcrypt for passwords) are strictly rejected.
+- **Go Code:** Formatted using `gofmt` and linted with `golangci-lint`. Avoid manual database manipulation or inline SQL; define queries in `.sql` files and let `sqlc` build type-safe abstractions.
+- **TypeScript/React:** Enforce strict ESLint rules and Prettier formats defined in the workspace root.
+- **Security Checks:** Every pull request is subject to static security analysis. Secret commits, plain-text PII storage, or insecure hashing algorithms (e.g., MD5, SHA-1, or raw bcrypt for passwords) are strictly rejected.
 
 ## Browser localization
 

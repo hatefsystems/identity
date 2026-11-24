@@ -3,6 +3,22 @@
 This playbook describes MVP operating requirements and later Kubernetes designs,
 not deployed gates, executed acceptance or production approval.
 
+Current-source inspection is not target implementation. Planned authentication,
+SQL authority and lifecycle changes follow the
+[authentication and recovery policy](authentication-and-recovery-policy.md)
+and [assessment](security-architecture-assessment.md); activation is blocked on
+[security readiness](security-testing-and-readiness.md). Dated acceptance records
+below retain their original sources/counts/toolchains, not current-policy passes.
+
+Current executable scope is the
+[canonical backlog](../.github/tasks/registration-single-contract-tasks.md).
+The [registration snapshot](history/registration-backlog-2026-11-23.md) and
+[architecture-plan snapshot](history/security-architecture-plan-2026-11-24.md)
+preserve complete superseded historical narratives, not operating instructions.
+All temporary paths in dated acceptance records identify historical local
+evidence only; they are neither required fresh-clone inputs nor destinations for
+new acceptance runs. New artifacts use an explicitly selected run-owned directory.
+
 ---
 
 ## ⚠️ MVP Phase Disclaimer: Single-Node Deployment (No Kubernetes, No ClickHouse & No Traefik)
@@ -17,9 +33,29 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ## Fresh-Baseline Environment Cutover
 
-Current bundled installation uses unchanged `00001_initial_schema.sql` plus additive
-`00002_registration_attempts.sql`, `00003_username_reservations.sql` and
-`00004_geography_catalog.sql`, through version 4 in
+### Canonical Packaged Migration Inventory
+
+At inspected HEAD `85abb13a27196c229efa7f59d7ef5beebb1d7e49`,
+`apps/identity-api/db/embed.go` embeds `migrations/*.sql`. The actual packaged
+inventory is the eleven files below, not historical one/two/four-file bundles.
+Other install/restore guides crosslink here rather than defining another inventory.
+These are current schema capabilities, not migrations implementing SEC01-SEC16.
+
+| Version | Packaged file under `apps/identity-api/db/migrations/` |
+| ------- | ------------------------------------------------------ |
+| 1       | `00001_initial_schema.sql`                             |
+| 2       | `00002_registration_attempts.sql`                      |
+| 3       | `00003_username_reservations.sql`                      |
+| 4       | `00004_geography_catalog.sql`                          |
+| 5       | `00005_private_account_data.sql`                       |
+| 6       | `00006_optional_email_contact_evidence.sql`            |
+| 7       | `00007_account_deletion_action_proofs.sql`             |
+| 8       | `00008_password_change_action_proofs.sql`              |
+| 9       | `00009_first_passkey_enrollment_action_proofs.sql`     |
+| 10      | `00010_mfa_enrollment_authorization.sql`               |
+| 11      | `00011_contact_management.sql`                         |
+
+Current `migrate up` applies known packaged versions through 11 in
 `public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
 are refused regardless of their version or apparent equivalence; untracked nonempty
 application schemas and contradictory histories also fail closed. There is no
@@ -30,10 +66,11 @@ they are not evidence that this baseline passed.
 
 1. Record an explicitly scoped **fresh PostgreSQL 16** database and matching fresh
    Redis 7/NATS JetStream 2.10 resources or isolated namespaces, with exact ownership,
-   names and ports. Default Compose names/volumes are not necessarily fresh. Existing
-   Identity data was confirmed disposable, but any reset of an existing named
-   developer/shared environment needs a separate explicit request naming the exact
-   targets. Do not run broad volume deletion or shared-schema reset commands.
+   names and ports. Default Compose names/volumes are not necessarily fresh.
+   Historical disposal assertions are not current authority over real data. Any
+   reset of an existing named developer/shared environment needs a separate
+   explicit request naming exact targets; preserve real data and queued work.
+   Do not run broad volume deletion or shared-schema reset commands.
 2. Close affected intake and stop/drain all old API, signer, publisher and maintenance
    writers before switching. Inventory queued intent and old envelopes separately;
    do not import old Redis sessions/grants or NATS events/consumer checkpoints into
@@ -41,22 +78,59 @@ they are not evidence that this baseline passed.
    Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
 3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
    `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
-    fresh `up` records versions 1 through 4; repeated `up` verifies a no-op. Do not stamp, rename
+   fresh `up` records versions 1 through 11; repeated `up` verifies a no-op. Do not stamp, rename
    or clear metadata after refusal. Verify packaged embedded inventory and final
    schema before starting compatible binaries.
 4. Provision separate non-owner roles, exact grants/RLS, approved governance, both
    explicit genesis heads and retention subject settings using
    [admin operations](admin-operations.md#migration-and-contraction). None of those
    initialization/approval actions is a migration seed. Complete real key inventory,
-    readiness and separately authorized deployed signer lookup probing. Obsolete
-    legal Backfill/plaintext compatibility is removed, not an install/upgrade step.
+   readiness and separately authorized deployed signer lookup probing. Obsolete
+   legal Backfill/plaintext compatibility is removed, not an install/upgrade step.
 5. Reconcile isolated consumer baselines and require fresh authentication before
    compatible every-replica/caller activation. Keep intake/destructive schedules off
    until their existing policy, retention, ingress, manual and production gates pass.
    Automated suites create/tear down only run-owned resources and run serially. The
-    coordinator records uncached final-source outcomes separately only after actual
-    [required acceptance](admin-operations.md#automated-validation), without reusing
-    historical evidence or certifying production readiness.
+   coordinator records uncached final-source outcomes separately only after actual
+   [required acceptance](admin-operations.md#automated-validation), without reusing
+   historical evidence or certifying production readiness.
+
+### Planned SQL Authority and Lifecycle Rollout
+
+SEC09 requires primary PostgreSQL authority for earned primary/MFA evidence,
+preauthentication, session issuance/deadlines/revocation, proofs, TOTP replay,
+security versions, code generations, contact provenance and the repair barrier.
+Current Redis session/challenge/replay records are security-authoritative dependencies,
+not disposable caches; SQL version checks do not authenticate their earned claims.
+Do not flush/restore them casually or describe the SQL target as implemented.
+Future Redis is non-authoritative coordination/acceleration/rate limiting; corruption,
+loss or flush must grant no authority and must not silently remove critical abuse limits.
+
+Before separately authorized rollout, agree SQL ownership, primary-only reads,
+global lock order and final transaction bindings with T16A/T19A/T21A/T22A.
+Mutations, applicable proof consumption/version/barrier and metadata audit/notification
+intent share one deciding SQL transaction (SEC10). Keep hashing/native/provider work
+outside long-held locks; unknown commits/providers are unconfirmed, with no restored
+proof, recreated account or new session. Read-only reconciliation reports facts only.
+No SQL+Redis atomicity or exactly-once external delivery is claimed.
+
+| Activation gate                        | Required operational evidence                                                                                                                                                                                                                                             |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Privileged admission (SEC04)           | Policy-verified hardware-backed phishing-resistant UV and independent separately enrolled backup at role grant and use; no consumer recovery/support override or backup-code downgrade. Current passkey/TOTP inventory is insufficient.                                   |
+| Code families/repair (SEC05-SEC08)     | Distinct purpose/account/generation-bound keyed verifiers and keys separate from DB; owner-approved inventory of real untyped artifacts; fresh issuance authority, no email/SMS ARC delivery, durable one-repair barrier and 24-hour changed-contact provenance cooldown. |
+| Notifications/lifecycle (SEC12, SEC14) | Verified-destination notification foundation, compatible v1/v2 readers before writers, preserved queued bytes/recipients/locale/token/deadline, password/mobile-capable deletion and reclaim with original 30-day grace/holds/retained factors.                           |
+| T27 gate retirement                    | Independent verification of alternative identification, ARC repair, notifications, deletion and reclaim before primary-email removal or mobile-only production eligibility. Do not toggle dependencies or infer completeness from nullable SQL.                           |
+| Single registration (SEC13)            | Extend current service/route, atomic birth and fresh known-success SQL session issuance under original browser key/expected subject; receipt/replay/result lookup never authenticate.                                                                                     |
+| Tokens/consumers/restore (SEC16)       | Durable OAuth grants and confidential-client exchanges, complete interactive OIDC, evidence-bearing privileged consumer admission, reconciled lifecycle baselines and rollback-safe security-state restore.                                                               |
+
+Selected providers require approval for selected contact capabilities; current
+signup still requires both owned email and Iranian SMS plus UV passkey. Password or
+mobile-only activation is not enabled by this future design. Preserve default-off
+login/proof/contact/signup/SMS/admin/legal/deletion/gRPC switches and existing stronger
+deletion authorization until independent gates pass. Queue contracts/readers must
+precede security-changing writers; do not break real v1/v2 rollback readers.
+See [disaster recovery](disaster-recovery.md#36-security-authority-quarantine-and-reconciliation)
+for stale-replica, failover and restore quarantine requirements.
 
 ## First-Passkey Proofs (T25)
 
@@ -72,8 +146,8 @@ Never reuse deletion/password-change binding keys. Email uses the admitted TLS
 login, deletion and password-change templates. Provider acceptance is not receipt.
 
 Apply additive forward-only migration
-`00009_first_passkey_enrollment_action_proofs.sql` after the unchanged 00001..00008
-lineage. Explicitly grant the API role only `SELECT, INSERT, DELETE` on
+9 from the [canonical inventory](#canonical-packaged-migration-inventory).
+Explicitly grant the API role only `SELECT, INSERT, DELETE` on
 `public.first_passkey_enrollment_action_proofs`, never `UPDATE` or `TRUNCATE`.
 The table stores only a capability digest, bound subject/session/JKT/version,
 fixed action/channel, keyed contact MAC and original expiry; cleanup processes at
@@ -117,8 +191,7 @@ different SMS template, and T26 adds no notification wire version/locale negotia
 No purpose key, recipient, password, code, proof or setup secret belongs in logs or
 browser/CI artifacts. Provider acceptance is not mailbox/handset receipt.
 
-Additive forward-only `00010_mfa_enrollment_authorization.sql` follows unchanged
-00001..00009 in `public.identity_schema_version`. It creates
+Additive forward-only version 10 in the [canonical inventory](#canonical-packaged-migration-inventory) creates
 `public.mfa_enrollment_action_proofs` and adds captured `auth_version`, `jkt`,
 `authorization_method`, `channel` and `contact_binding` to the existing
 `mfa_totp_enrollments`. Proof rows store only digest, subject/session/JKT/version,
@@ -172,12 +245,10 @@ Lost setup output requires an explicit fresh ceremony; uncertain enable/disable
 requires ordinary fresh login/current-state inspection, not reconciliation or
 setup-secret retrieval. Issuance switches do not weaken enabled required MFA.
 
-T26 runtime/CI evidence is unrun for these documentation edits: required native
-Linux Node `24.18.0`, npm `11.21.0` and Go `1.26.5+` are unavailable in the current
-agent environment, and no installation is authorized. No generation, build,
-unit/race/vet/lint, disposable-service integration or browser gate was executed;
-no migration/provider/shared-service operation was performed. The integrating
-implementation owner must run the final combined-source gates from
+No T26 runtime/CI gate was run for this documentation-only alignment. An earlier
+documentation note reported unavailable native toolchains; that is not a current
+machine/toolchain diagnosis or a T26 passing result. The integrating implementation
+owner must run final combined-source gates from
 `.github/workflows/identity-api.yml` and resolved Nx targets with the required
 toolchains. Historical acceptance remains unchanged and is not T26 evidence.
 Real email/SMS receipt, physical-authenticator use, independent Persian security
@@ -215,8 +286,7 @@ positive `CONTACT_CHANGE_SMS_IR_TEMPLATE_ID` and
 purpose templates. New phone ownership keeps the existing ownership template.
 UI locale does not choose provider templates or create notification negotiation.
 
-Additive forward-only `00011_contact_management.sql` follows the unchanged
-00001..00010 lineage. Runtime proof and pending tables
+Additive forward-only version 11 is in the [canonical inventory](#canonical-packaged-migration-inventory). Runtime proof and pending tables
 `contact_management_action_proofs` / `contact_change_attempts` require only
 `SELECT, INSERT, DELETE`, never generic `UPDATE` or `TRUNCATE`. Public authority is
 digest-only and the exact pending destination is account/attempt/target/authorization
@@ -326,11 +396,11 @@ provisioned migrator identity. Do not grant membership, schema/database CREATE,
 trigger bypass, deletion/truncation, account access or grant options to importers.
 The operator commands validate their effective restricted privileges.
 
-| Role | Required catalog grants |
-|---|---|
-| Reader / check | `SELECT` on all five geography tables only; schema `USAGE` and database `CONNECT`. |
-| Importer | Reader grants; `INSERT` on types, places and place versions; column `INSERT` on catalogs' revision/country/source/hash/size/count/importer/normalization metadata; `UPDATE(last_seen_revision)` on places; `UPDATE(active_revision)` on state. |
-| Migrator | Existing independently approved schema authority, not an API/importer credential. |
+| Role           | Required catalog grants                                                                                                                                                                                                                        |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reader / check | `SELECT` on all five geography tables only; schema `USAGE` and database `CONNECT`.                                                                                                                                                             |
+| Importer       | Reader grants; `INSERT` on types, places and place versions; column `INSERT` on catalogs' revision/country/source/hash/size/count/importer/normalization metadata; `UPDATE(last_seen_revision)` on places; `UPDATE(active_revision)` on state. |
+| Migrator       | Existing independently approved schema authority, not an API/importer credential.                                                                                                                                                              |
 
 `geography_catalogs.imported_at` and `writing_tx` are server-owned, not importer
 input. No sequence grant is needed: revisions are allocated under import exclusion.
@@ -390,10 +460,10 @@ separate MVP worker, not in request handlers or the audit signer. It needs no
 Redis, encryption keys or SPIRE. Broker outages accumulate durable intent instead
 of turning into log-only delivery.
 
-| Mode | Credentials and behavior |
-|---|---|
-| `provision` | Broker/topology credentials only. Create `IDENTITY_USERS` or validate compatible existing topology; never overwrite drift or the audit stream. |
-| `publish` (default) | Scoped `DATABASE_URL` and `NATS_URL`. Open existing topology, claim committed intent, mark delivered only after the expected stream's PubAck. |
+| Mode                | Credentials and behavior                                                                                                                                                      |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provision`         | Broker/topology credentials only. Create `IDENTITY_USERS` or validate compatible existing topology; never overwrite drift or the audit stream.                                |
+| `publish` (default) | Scoped `DATABASE_URL` and `NATS_URL`. Open existing topology, claim committed intent, mark delivered only after the expected stream's PubAck.                                 |
 | `cleanup-published` | Separate `LIFECYCLE_CLEANUP_DATABASE_URL` and approved `LIFECYCLE_OUTBOX_RETENTION`, no broker/API secrets. Bounded, hold-aware deletion of acknowledged lifecycle rows only. |
 
 The stream uses the four exact lifecycle subjects, File storage, Limits retention,
@@ -452,13 +522,15 @@ new DPoP-required and old cookie-only replicas.
    Verify deployed DB grants
    for profile reads/writes and transactional outbox insertion.
 2. Deploy dual-version lifecycle publishers/readers and upgrade actual downstream
-   consumers before deploying writers that emit display-name v2 events. V1 and
+   consumers before deploying writers that emit display-name/private-profile v2 events. V1 and
    legacy revision-less deletion adaptation remain supported. Validate mixed
    replay and gRPC name/revision snapshots. External consumer deployment and
    baseline/checkpoint reconciliation are operator prerequisites, not implied by CI.
-3. Use shared standalone Redis for browser sessions, DPoP nonce/replay, step-up
+3. For current code, use shared standalone Redis for browser sessions, DPoP nonce/replay, step-up
    claims and `webauthn:challenge:v1:<sha256 challenge>`. Configure appropriate
-   ACLs/TLS, capacity and availability; credential state is authority, not a cache.
+   ACLs/TLS, capacity and availability; in current code credential state is
+   authority, not a cache. SEC09's SQL replacement must precede treating Redis
+   as non-authoritative.
    WebAuthn state is capped at 64 KiB, native TTL at fifteen minutes (five-minute
    default), and operations at two seconds. Anonymous login options/verification
    and reclaim options share 30 requests/subnet/minute, including nonce retries.
@@ -509,18 +581,18 @@ Disabled SMS requires no provider credentials and retains DB-only removal/recove
 Enable only after separately approved state, logins, private secrets, budgets and
 operational gates; `.env.example` supplies no usable public registration budgets.
 
-| Required enabled configuration | Contract |
-|---|---|
-| `REGISTRATION_PENDING_CAPACITY` | Explicit `1..10000`; finite SQL pending-state admission, not approved public capacity. |
-| `REGISTRATION_GLOBAL_DAILY_LIMIT` | Explicit `1..100000`, shared finite registration admission budget. |
-| `REGISTRATION_EMAIL_HOURLY_LIMIT` | Explicit `1..10`, canonical-email admission budget. |
-| `SMS_PROVIDER`, `SMS_IR_KEY_MODE` | Exactly `smsir`; enabled registration requires explicit `live`. Standalone nonproduction SMS may explicitly use `sandbox`; production is live-only. |
-| `SMS_GATEWAY_API_KEY`, `SMS_IR_TEMPLATE_ID`, `SMS_IR_CODE_PARAMETER` | Private key, positive integer template, exact case-sensitive parameter without `#`. No sample key/template is operator authorization. |
-| `SMS_OTP_HASH_PEPPER` | Independent private HMAC secret, required when SMS is enabled. |
-| `SMS_OTP_GLOBAL_PER_DAY`, `SMS_OTP_MAX_PENDING_SIGNUP` | Explicit finite send budget and pending cap; cap must equal registration capacity. Shared signup/enrollment phone/subnet/global send bounds apply. |
+| Required enabled configuration                                                                                        | Contract                                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REGISTRATION_PENDING_CAPACITY`                                                                                       | Explicit `1..10000`; finite SQL pending-state admission, not approved public capacity.                                                                                                             |
+| `REGISTRATION_GLOBAL_DAILY_LIMIT`                                                                                     | Explicit `1..100000`, shared finite registration admission budget.                                                                                                                                 |
+| `REGISTRATION_EMAIL_HOURLY_LIMIT`                                                                                     | Explicit `1..10`, canonical-email admission budget.                                                                                                                                                |
+| `SMS_PROVIDER`, `SMS_IR_KEY_MODE`                                                                                     | Exactly `smsir`; enabled registration requires explicit `live`. Standalone nonproduction SMS may explicitly use `sandbox`; production is live-only.                                                |
+| `SMS_GATEWAY_API_KEY`, `SMS_IR_TEMPLATE_ID`, `SMS_IR_CODE_PARAMETER`                                                  | Private key, positive integer template, exact case-sensitive parameter without `#`. No sample key/template is operator authorization.                                                              |
+| `SMS_OTP_HASH_PEPPER`                                                                                                 | Independent private HMAC secret, required when SMS is enabled.                                                                                                                                     |
+| `SMS_OTP_GLOBAL_PER_DAY`, `SMS_OTP_MAX_PENDING_SIGNUP`                                                                | Explicit finite send budget and pending cap; cap must equal registration capacity. Shared signup/enrollment phone/subnet/global send bounds apply.                                                 |
 | `REGISTRATION_SMTP_HOST`, `PORT`, `TLS_MODE`, `USERNAME`, `PASSWORD`, `FROM`, `TIMEOUT`, `CA_BUNDLE`, `PUBLIC_ORIGIN` | Variable prefix is `REGISTRATION_SMTP_` for each field. Authenticated verified TLS, ASCII system sender/auth, positive timeout at most 5s; canonical public origin exactly equals `PORTAL_ORIGIN`. |
-| `REGISTRATION_CLEANUP_DATABASE_URL` | Dedicated actual non-owner NOINHERIT login, separate from API pool; required for enabled startup's nonmutating privilege/schema probe. |
-| `REGISTRATION_CLEANUP_BATCH_SIZE` | `1..500`, default 100, for the packaged maintenance command. |
+| `REGISTRATION_CLEANUP_DATABASE_URL`                                                                                   | Dedicated actual non-owner NOINHERIT login, separate from API pool; required for enabled startup's nonmutating privilege/schema probe.                                                             |
+| `REGISTRATION_CLEANUP_BATCH_SIZE`                                                                                     | `1..500`, default 100, for the packaged maintenance command.                                                                                                                                       |
 
 These ceilings are engineering safety bounds, **not approved operator budgets**.
 SMS.ir uses fixed POST `https://api.sms.ir/v1/send/verify`, Iranian
@@ -568,16 +640,16 @@ the existing email-link + mobile-SMS + resident-UV flow, not the final one-conta
 or password flow. Schema/config/operator code is not a live installation. No
 production policy, reserved-name set, deployment privileges, cutover timing or
 zero-pause upgrade has been approved by this documentation.
-`00003_username_reservations.sql` preserves legacy NULLs, creates the unique
+The version-3 migration in the [canonical inventory](#canonical-packaged-migration-inventory) preserves existing NULLs, creates the unique
 reservation/immutability boundary and seeds an **uninstalled** authority record,
 not an active policy. It provisions no runtime/maintenance login or reindex bypass.
 
-| Username configuration | Required meaning when enabled |
-|---|---|
-| `USERNAME_ENABLED` | Explicit username enablement, including authenticated reads when signup is off. Enabled registration requires username support; no username-less fallback. |
-| `USERNAME_REGEX` | One bounded Go expression, compiled once with whole-string anchoring against NFC display. Initial syntax is the reviewed Persian repertoire/Arabic Yeh-Kaf aliases with single internal dots, not `7..40`, Latin mode, ZWNJ or another spelling validator. |
-| `USERNAME_POLICY_JSON` | Explicit keys `id` (nonzero UUID), `normalization` (`nfc-four-fold-v1`), `folds` (the exact four `{from,to}` scalar pairs) and owner-reviewed `reserved_names`. The complete artifact, exact regex and pinned Unicode/normalizer version are fingerprinted. No implicit reserved names or invented system accounts. |
-| `USERNAME_LOOKUP_KEY`, `USERNAME_LOOKUP_KEY_ID` | Dedicated base64 secret of at least 32 random bytes and explicit ID; never email/phone/ledger pepper. Actual key verifier must match database authority, not just its label. |
+| Username configuration                          | Required meaning when enabled                                                                                                                                                                                                                                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `USERNAME_ENABLED`                              | Explicit username enablement, including authenticated reads when signup is off. Enabled registration requires username support; no username-less fallback.                                                                                                                                                          |
+| `USERNAME_REGEX`                                | One bounded Go expression, compiled once with whole-string anchoring against NFC display. Initial syntax is the reviewed Persian repertoire/Arabic Yeh-Kaf aliases with single internal dots, not `7..40`, Latin mode, ZWNJ or another spelling validator.                                                          |
+| `USERNAME_POLICY_JSON`                          | Explicit keys `id` (nonzero UUID), `normalization` (`nfc-four-fold-v1`), `folds` (the exact four `{from,to}` scalar pairs) and owner-reviewed `reserved_names`. The complete artifact, exact regex and pinned Unicode/normalizer version are fingerprinted. No implicit reserved names or invented system accounts. |
+| `USERNAME_LOOKUP_KEY`, `USERNAME_LOOKUP_KEY_ID` | Dedicated base64 secret of at least 32 random bytes and explicit ID; never email/phone/ledger pepper. Actual key verifier must match database authority, not just its label.                                                                                                                                        |
 
 Owner review is required for the production regex/artifact and actual system/support
 reserved set; sample empty sets are not approval. Missing enabled configuration,
@@ -589,16 +661,16 @@ HMAC rotation is permitted. Input/normalized bytes, regex source and artifact ha
 
 Operator entry points are `cmd/username install` and `cmd/username preflight`.
 Before either, verify the explicitly authorized target database/schema through
-bundled migration 3, approved policy/reserved set, actual login grants and key
+the relevant installed schema from the canonical inventory, approved policy/reserved set, actual login grants and key
 inventory. Provision secrets through the existing secret manager, not command
 arguments or checked-in files. Run each mode with its own process environment;
 both read **`DATABASE_URL`**, not dedicated username-specific DSN variables.
 
-| Mode | Database identity and environment |
-|---|---|
-| Both | `APP_ENV` (`development`, `test` or `production`), `USERNAME_ENABLED=true`, and all four policy/lookup variables above. These configure the operator; they do not enable API traffic or activate a policy. |
-| `install` | Separate non-owner installer `DATABASE_URL`; SELECT/INSERT only on `username_policy_artifacts` and `username_lookup_keys`, with no active-row/account mutation, role assumption, grant options, DDL or trigger bypass. Loads the candidate from `USERNAME_*`; no envelope, review, SMS or Redis secret is required. |
-| `preflight` | Separate non-owner read-only scanner `DATABASE_URL`; SELECT on `users`, `username_policy_artifacts`, `username_lookup_keys` and `username_active_policy`, with no application writes/DDL/role assumption. If authority exists, `USERNAME_*` must match its current artifact and actual key verifier; on the uninstalled baseline it describes the installed candidate. |
+| Mode              | Database identity and environment                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Both              | `APP_ENV` (`development`, `test` or `production`), `USERNAME_ENABLED=true`, and all four policy/lookup variables above. These configure the operator; they do not enable API traffic or activate a policy.                                                                                                                                                                                     |
+| `install`         | Separate non-owner installer `DATABASE_URL`; SELECT/INSERT only on `username_policy_artifacts` and `username_lookup_keys`, with no active-row/account mutation, role assumption, grant options, DDL or trigger bypass. Loads the candidate from `USERNAME_*`; no envelope, review, SMS or Redis secret is required.                                                                            |
+| `preflight`       | Separate non-owner read-only scanner `DATABASE_URL`; SELECT on `users`, `username_policy_artifacts`, `username_lookup_keys` and `username_active_policy`, with no application writes/DDL/role assumption. If authority exists, `USERNAME_*` must match its current artifact and actual key verifier; on the uninstalled baseline it describes the installed candidate.                         |
 | Preflight secrets | Independent base64 `USERNAME_REVIEW_KEY` (32..1024 decoded bytes) for restricted opaque review references, never the lookup/envelope/pepper secret. `ENVELOPE_MASTER_KEK` is the actual 32-byte base64 decryption key and `ENVELOPE_MASTER_KEK_VERSION` its actual version (`0..255`, default `1`); unavailable/wrong-key records block clearance. No `ENVELOPE_BLIND_INDEX_PEPPER` is needed. |
 
 The commands probe effective restricted privileges; an API/schema-owner credential
@@ -617,9 +689,9 @@ Install success reports `{"installed":true,"active":false}`: it inserts immutabl
 artifact/key-verifier registry entries only. It cannot open/close admission, change
 the active row, reindex or assign usernames. There is **no activation helper**.
 
-| CLI flags | Exact bounds / meaning |
-|---|---|
-| `--page-size`, `--max-rows`, `--max-issues`, `--timeout` | Defaults `250`, `100000`, `100`, `5m`; permitted ranges `1..1000`, `1..1000000`, `1..1000`, `1s..1h`. A row cap is incomplete, not a clean prefix. An issue cap sets `issues_truncated`; it cannot turn a nonclean scan into clearance. |
+| CLI flags                                                                              | Exact bounds / meaning                                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--page-size`, `--max-rows`, `--max-issues`, `--timeout`                               | Defaults `250`, `100000`, `100`, `5m`; permitted ranges `1..1000`, `1..1000000`, `1..1000`, `1s..1h`. A row cap is incomplete, not a clean prefix. An issue cap sets `issues_truncated`; it cannot turn a nonclean scan into clearance.                                                                                                                                                                                          |
 | `--candidate-policy`, `--candidate-regex`, `--candidate-key-id`, `--candidate-key-env` | Optional **preflight-only, all-or-none** comparison against an already inactive-installed candidate. First two are bounded policy-JSON/regex-source file paths; regex bytes are exact, with no trimming. Last two are the candidate key ID and the name of an environment variable holding its base64 key (at least 32 decoded bytes), never the secret itself. Without these flags, candidate equals configured current policy. |
 
 Preflight JSON reports `snapshot_only`, `complete`, `clean`, aggregate counts and
@@ -653,7 +725,7 @@ merge, backfill, choose winners or change account status as remediation.
 Controlled installation/evolution requires separate operational approval:
 
 1. Install only an inactive immutable candidate and complete preflight against the
-   actual target baseline, including reserved names. Repository NULL legacy rows
+   actual target baseline, including reserved names. Repository NULL stored rows
    do not prove a deployed database has no usernames. Uniqueness on discovered
    populated data must wait for complete collision review.
 2. Prove no protected equivalence class splits: for the retained alphabet/aliases,
@@ -674,9 +746,11 @@ Controlled installation/evolution requires separate operational approval:
    classes is refused. Key replacement uses the same fenced approved path.
 
 These are gates, not claims that activation/reindex tooling, maintenance access or
-live installation has been delivered. Public legacy claim and its username-bound
-fresh-WebAuthn-proof extension remain deferred; neither generic step-up nor a
-shared initial-assignment primitive authorizes a public POST/UI. Keep accepted
+live installation has been delivered. T12 public one-time username claim is out of
+scope, not deferred implementation. Mandatory production username ownership must
+be satisfied by registration and reviewed constraints, not a hypothetical legacy
+lane. Neither generic step-up nor an initial-assignment primitive authorizes a
+public claim POST/UI. Keep accepted
 accounts/receipts, original deadlines, history and unrelated session policy intact.
 Real-data inventory, serial disposable-database races/rollback, bilingual browser
 checks, deployed ingress/redaction, real delivery/physical authenticators and
@@ -726,7 +800,7 @@ The final normal service gate is exactly eight one-suite cells under
 `max-parallel: 1`, `fail-fast: false`, unchanged target/job deadlines (30m/60m),
 nonzero executed evidence, zero failures/skips and verified run-owned cleanup.
 The [eight-suite inventory](admin-operations.md#automated-validation) is explicit;
-new package coverage is additive and overlapping runs must remain. Eight affected
+new package coverage is additive and overlapping runs must remain. Thirteen affected
 Linux CGO race cells/aggregate are separate, with `-json -tags=integration -race
 -count=1 -p=1 -timeout=20m`, never replacements for normal suite evidence.
 
@@ -741,7 +815,7 @@ npm exec -- nx exec -p schemas -- node "$REPO/.github/scripts/portal-harness.mjs
 ```
 
 Partial mode identifies itself as partial and cannot satisfy publication. Require
-exact-eight unique expected normal and race results, source/generated/run identity,
+exact-eight unique normal and exact-thirteen unique race results, source/generated/run identity,
 test/package evidence and cleanup; missing/stale/duplicate/wrong-source reports,
 zero exit without tests or any skip fail. Resolve final targets before running.
 Never overlap independent service or browser harnesses against the same Docker
@@ -827,7 +901,7 @@ The browser target builds its API/web/fixture/signer/publisher/notifier dependen
 
 Windows cannot deliver a graceful Go `SIGTERM` using Node's process kill. For Windows admin browser acceptance, first build and inspect the fresh production API image, then set `ADMIN_BROWSER_SIGNER_IMAGE` to its immutable `sha256:` image ID before running `web:test-admin-browser`. The harness uses its real non-root `/usr/local/bin/audit-signer` on the private run-owned service network and `docker stop` for graceful retirement; it still requires exit 0 before destructive fixtures. The signer and publisher receive separate restricted real logins, and publisher reads/delivery updates use its exact subject/marker RLS policies. No production image is inferred from a mutable tag and no forced termination is accepted as clean signer shutdown. Linux CI retains the normal locally built signer binary.
 
-CI requires the separate `admin-browser` job before image publication in addition to the existing quality, security, frontend and portal-browser jobs. For acceptance, set `ADMIN_BROWSER_ARTIFACT_DIR` to a fresh run-specific directory under `/tmp/kilo` for masked desktop/320px light/dark screenshots and sanitized `admin-evidence.json`. Do not retain raw traces, storage snapshots, fixture credentials, proofs, grants, account identifiers or audit bodies. Diagnostic output is restricted to route templates, counts, static failure categories and sanitized scenario labels; require confirmed cleanup of all run-owned services.
+CI requires the separate `admin-browser` job before image publication in addition to the existing quality, security, frontend and portal-browser jobs. For acceptance, set `ADMIN_BROWSER_ARTIFACT_DIR` to an absolute fresh run-specific directory under the execution environment's temporary directory (`TMPDIR`, `TEMP` or `TMP`, as applicable) for masked desktop/320px light/dark screenshots and sanitized `admin-evidence.json`. Do not retain raw traces, storage snapshots, fixture credentials, proofs, grants, account identifiers or audit bodies. Diagnostic output is restricted to route templates, counts, static failure categories and sanitized scenario labels; require confirmed cleanup of all run-owned services.
 
 Local Task 7.5 completion may be recorded in `tasks.md` only after all required automated gates pass. Record the date, tested worktree, exact commands and final exit statuses, fresh sanitized evidence and successful teardown. Existing JSON, partial runs or test source alone are not passing evidence. Until then, leave Task 7.5 uncompleted; this runbook does not assert a pass. After successful validation, reconcile only Task 7.5's local status and leave unrelated task statuses and production enablement unchanged.
 
@@ -861,20 +935,21 @@ Rollback **first closes affected ingress**, then removes/disables the new UI ent
 
 This section lists the required validation inventory; dated local results are recorded below. Use the checked-in `.github/workflows/identity-api.yml` commands/flags with `NX_DAEMON=false npm exec -- nx run <project>:<target> --skipNxCache`; do not substitute cached or earlier-task evidence. Resolve the current targets before execution. The inventory is:
 
-| Gate | Required coverage |
-|---|---|
-| Backend quality | `identity-api:test`, `test-race` on Linux with CGO/compiler, `vet`, `lint`, `test-portal-fixture`, plus the existing integration-tag vet/lint flags. |
-| Generated contracts | `identity-api:sqlc-vet`, `sqlc-generate`; `schemas:lint`, `generate-go`; repeat generation and compare as CI does. No schema/protobuf change is intended. |
-| Serial real services | `identity-api:test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, `test-portal-integration` on disposable PostgreSQL 16/Redis 7/JetStream 2.10. Workflow tests are regressions, not added panel scope. Missing/skipped mandatory integrations must fail. |
-| Frontend/helpers | `web:lint`, `ui:lint`, `web:typecheck`, `ui:typecheck`, `web:test`, `ui:test`, `web:build` and the existing Nx-executed `.github/scripts/*.test.mjs` suite. |
-| Binaries/images | `identity-api:build`, all existing quality-job operator/worker targets including `build-admin-legal`, fresh API/web images and existing entrypoint/image-CSP smoke. |
-| Production browsers | Uncached `web:test-admin-browser` and `web:test-portal-browser`, retaining the independent image/CSP suite and existing `admin-browser` CI/image-release dependency, not a new parallel release job. |
+| Gate                                  | Required coverage                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Backend quality                       | `identity-api:test`, `test-race` on Linux with CGO/compiler, `vet`, `lint`, `test-portal-fixture`, plus the existing integration-tag vet/lint flags.                                                                                                                                                                                                                      |
+| Generated contracts                   | `identity-api:sqlc-vet`, `sqlc-generate`; `schemas:lint`, `generate`; repeat Go/TypeScript/SQL generation and compare as current CI does. No schema/protobuf change is intended.                                                                                                                                                                                          |
+| Serial real services                  | `identity-api:test-security-db`, `test-admin-integration`, `test-retention-integration`, `test-legal-workflow-integration`, `test-grpc-integration`, `test-lifecycle-integration`, `test-portal-integration` on disposable PostgreSQL 16/Redis 7/JetStream 2.10. Workflow tests are regressions, not added panel scope. Missing/skipped mandatory integrations must fail. |
+| Current additional service/race gates | `test-geography-integration` completes the exact eight normal suites; thirteen race packages are listed in [current validation](admin-operations.md#current-bundle-requirements). Historical seven-suite records remain unchanged.                                                                                                                                        |
+| Frontend/helpers                      | `web:lint`, `ui:lint`, `web:typecheck`, `ui:typecheck`, `web:test`, `ui:test`, `web:build` and the existing Nx-executed `.github/scripts/*.test.mjs` suite.                                                                                                                                                                                                               |
+| Binaries/images                       | `identity-api:build`, all existing quality-job operator/worker targets including `build-admin-legal`, fresh API/web images and existing entrypoint/image-CSP smoke.                                                                                                                                                                                                       |
+| Production browsers                   | Uncached `web:test-admin-browser` and `web:test-portal-browser`, retaining the independent image/CSP suite and existing `admin-browser` CI/image-release dependency, not a new parallel release job.                                                                                                                                                                      |
 
 The admin browser target needs `identity-api:build-admin-legal` as an explicit dependency so its standalone CI job can execute the real probe. It extends the existing production Next.js/two-real-API harness with signer/admin publisher, a run-owned synthetic governance baseline and the repaired real probe **before** starting the APIs. Keep `APP_ENV=test`, `LEGAL_WORKFLOW_ENABLED=false`, production security enforcement and build-tagged private fixtures only. No public fixture route or production fixture binary is permitted. Run legal scenarios before destructive ledger-state tests; deliberately restart the owned APIs with fixture omission when testing that unavailable state rather than bypassing a deleted fixture's readiness check. Before intentionally removing a signed head, drain real delivery and verify the owned signer's clean retirement; do not race its correct fail-closed missing-head behavior or exempt any other process from health checks.
 
 Required legal scenarios include seeded DPO success and Support/Moderator/Super-Admin denial, legal-only/combined grants, direct-route and revoked-capability handling, strict query/body errors, exact sequences above JavaScript safe integers, both create forms, independent/replayed/released/cleaned holds, deleted-account reference selection, opt-in metadata and fresh step-up on every page. Exercise current retention/hold eligibility, real audit-outage rollback and committed-but-lost create/release responses with no automatic retransmission. Prove clearing of detached controls, grants, queries/results and late replies on cancellation/hide/navigation/session/permission changes, plus no-JavaScript, desktop/320px, light/dark, keyboard/focus/dialog and CSP behavior.
 
-Store fresh masked evidence under a run-specific `/tmp/kilo` directory using `ADMIN_BROWSER_ARTIFACT_DIR` and the portal equivalent. Mask legal narrative paragraphs and result regions explicitly, not just inputs/tables. Allowed retained evidence is sanitized scenarios/status/counts and masked screenshots; no raw traces, storage snapshots, emails, narratives, account/hold/operation IDs, cursors, proofs, grants or result bodies. Restrict temporary in-memory capture/API-probe exceptions to exact authorized route/method/header combinations, with template-only diagnostics. Run schema-resetting suites serially and verify teardown of every run-owned service/volume. The acceptance record must name the dated source/worktree, exact commands, final exit statuses, sanitized evidence and cleanup. Plans, test source and partial runs are not passes and must not alter unrelated task statuses.
+Store fresh masked evidence in an absolute run-specific directory under the execution environment's temporary directory (`TMPDIR`, `TEMP` or `TMP`, as applicable), using `ADMIN_BROWSER_ARTIFACT_DIR` and `PORTAL_BROWSER_ARTIFACT_DIR`. Mask legal narrative paragraphs and result regions explicitly, not just inputs/tables. Allowed retained evidence is sanitized scenarios/status/counts and masked screenshots; no raw traces, storage snapshots, emails, narratives, account/hold/operation IDs, cursors, proofs, grants or result bodies. Restrict temporary in-memory capture/API-probe exceptions to exact authorized route/method/header combinations, with template-only diagnostics. Run schema-resetting suites serially and verify teardown of every run-owned service/volume. The acceptance record must name the dated source/worktree, exact commands, final exit statuses, sanitized evidence and cleanup. Plans, test source and partial runs are not passes and must not alter unrelated task statuses.
 
 ### Local Acceptance (2026-11-02)
 
@@ -981,7 +1056,8 @@ findings; no dependency upgrades or audit-policy changes were made in this task.
 
 ## 1. Kubernetes Deployment & Networking
 
-The platform leverages **Traefik** as the Ingress Controller and API Gateway at the cluster boundary, and **SPIRE** to orchestrate dynamic zero-trust workloads.
+Post-MVP examples propose **Traefik** ingress and **SPIRE** workload identities.
+They are not deployed infrastructure, current HA or operator approval.
 
 ### 1.0 MVP Phase: Host-Level Nginx Configuration (Reverse Proxy & TLS Termination)
 
@@ -989,7 +1065,11 @@ In the MVP phase, we use the host's existing **Nginx** web server running on Ubu
 
 The API trusts `X-Forwarded-For` only when its immediate socket peer is listed in `TRUSTED_PROXY_CIDRS`. For host Nginx connecting over loopback, use `TRUSTED_PROXY_CIDRS=127.0.0.1/32` (and `::1/128` only when that path is actually used). If Docker NAT makes the peer appear as a bridge gateway, inspect the API's observed peer and allow only that exact address or narrowly controlled ingress CIDR. Empty means no proxy is trusted, malformed entries and `/0` networks are rejected, and broad Docker or public ranges are prohibited. Nginx must overwrite any client-supplied forwarding chain with `$remote_addr`; do not use `$proxy_add_x_forwarded_for` at this single public edge. The API deliberately ignores `X-Real-IP` and `True-Client-IP`.
 
-Below is the production-ready Nginx configuration file (`/etc/nginx/sites-available/identity.hatef.ir`) for the MVP:
+The Nginx sketch below is illustrative, not a validated deployable configuration.
+Current install/configuration authority is [container deployment](container-deployment.md)
+and `tools/docker/nginx.production.conf.example` / `tools/docker/proxy-headers.conf`.
+Verify routing, sensitive-page diagnostics and actual TLS/CSP/Origin behavior
+against deployed ingress; copying the sketch does not close gates.
 
 ```nginx
 # http{} scope: constant route template, never request URI/query/referrer/headers.
@@ -1174,13 +1254,16 @@ the replay Lua script in the authorized Redis ACL. A denied or malformed clock
 reply fails authentication rather than using a replica-local clock. Independent offline grants and
 consent UI completion remain separate tasks.
 
-Operate Redis as security authority: use appropriate ACLs/TLS and an eviction
+For current code, operate Redis as security authority: use appropriate ACLs/TLS and an eviction
 policy that does not silently treat credential state as expendable cache data.
 Missing records invalidate credentials, while errors/corruption fail validation
 with Unavailable. Runtime clients honor context deadlines, have bounded I/O, and
 do not transparently retry consumptive commands. Never roll Redis back to a
 snapshot that could restore revoked grants or forget consumed proofs; discard
-credential/replay namespaces and reauthenticate instead.
+credential/replay namespaces and reauthenticate instead under controlled incident
+handling. Clearing sessions alone cannot repair rollback of SQL credentials/spent
+codes/replay or recreate critical abuse limits. SEC09/SEC16 require primary SQL
+authority and independent rollback-safe reconciliation before reopening.
 
 Enabled `/readyz` verifies the private listener, current usable SVID/bundle,
 PostgreSQL and Redis; `/healthz` remains dependency-independent. SVID acquisition
@@ -1252,8 +1335,8 @@ spec:
     stsPreload: true
     stsIncludeSubdomains: true
     frameDeny: true
-    # Next.js and Go templates dynamically generate strict random nonces for CSP.
-    # Traefik forwards these headers verbatim.
+    # Next.js owns per-request document CSP nonces; Go API headers are separate.
+    # This proposed ingress must preserve application headers verbatim.
 ```
 
 ### 1.2 SPIRE Runtime Environment Agent Deployment
@@ -1407,7 +1490,10 @@ Observability is core to detecting anomalies, token-theft attempts, and system e
 
 ### 3.1 Core Operational Metrics
 
-The Go backend and Next.js applications expose Prometheus metrics on `/metrics`.
+The metrics and rules below are a proposed observability inventory, not implemented
+Go/Next `/metrics` endpoints or deployed alerts. Verify actual instrumentation,
+units, template-only labels, thresholds and paging ownership before installation.
+Do not infer global session revocation or delivery from an illustrative alert string.
 
 | Metric Name                            | Type      | Labels                             | Description                                                    |
 | :------------------------------------- | :-------- | :--------------------------------- | :------------------------------------------------------------- |

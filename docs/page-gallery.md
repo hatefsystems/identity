@@ -6,6 +6,15 @@ inventory and launch sequence. Its helpers reuse `.github/scripts` for real
 application fixtures, browser preferences, immutable image validation and cleanup.
 The formal browser acceptance framework remains unchanged.
 
+Current gallery states illustrate existing UI only. They do not demonstrate
+planned MFA Backup Code completion, ARC/contact repair, anti-chaining/cooldown,
+selected-contact registration or policy-verified physical hardware authentication.
+See the [frontend journey boundary](frontend-pages.md#planned-authentication-and-repair-journeys-t38t39),
+[authentication policy](authentication-and-recovery-policy.md) and
+[security readiness](security-testing-and-readiness.md). The original 464-frame
+gallery and later run-owned artifacts remain historical illustrations with their
+original inventories; this documentation does not regenerate or certify them.
+
 ## Supported Environment
 
 Use Linux with native Linux tools and a local Docker Unix socket. WSL2 with Linux
@@ -18,16 +27,16 @@ validated host path. Other architectures and Docker emulation are untested.
 
 Install these prerequisites before checking or generating:
 
-| Prerequisite | Requirement |
-| --- | --- |
-| Node.js | >=24.0.0, as in root `package.json`; Linux Node, not a Windows bridge |
-| npm | >=11.0.0; use `npm ci` and the tracked npm lockfile |
-| Go | >=1.26.5, currently declared by `apps/identity-api/go.mod`; the checker reads this declaration |
-| Git | A real checkout with HEAD and a matching workspace root |
-| Docker | Running local Linux daemon and CLI with Unix socket access; modern image build, inspect, save/load and network/volume commands; no remote TCP daemon |
-| OpenSSL | >=3.0, executable on PATH for ephemeral fixture certificates |
-| Playwright | Lockfile-installed version plus its matching Chromium and Linux system libraries |
-| Temporary storage | Writable OS temporary directory; optional `TMPDIR` must already exist; private run directories are created automatically |
+| Prerequisite      | Requirement                                                                                                                                          |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js           | >=24.0.0, as in root `package.json`; Linux Node, not a Windows bridge                                                                                |
+| npm               | >=11.0.0; use `npm ci` and the tracked npm lockfile                                                                                                  |
+| Go                | >=1.26.5, currently declared by `apps/identity-api/go.mod`; the checker reads this declaration                                                       |
+| Git               | A real checkout with HEAD and a matching workspace root                                                                                              |
+| Docker            | Running local Linux daemon and CLI with Unix socket access; modern image build, inspect, save/load and network/volume commands; no remote TCP daemon |
+| OpenSSL           | >=3.0, executable on PATH for ephemeral fixture certificates                                                                                         |
+| Playwright        | Lockfile-installed version plus its matching Chromium and Linux system libraries                                                                     |
+| Temporary storage | Writable OS temporary directory; optional `TMPDIR` must already exist; private run directories are created automatically                             |
 
 On a Playwright-supported Debian/Ubuntu Linux distribution, install Chromium and
 its system dependencies with `npm exec -- playwright install --with-deps chromium`.

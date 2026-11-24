@@ -1,21 +1,25 @@
 # Registration Contract (T01)
 
-This is the authoritative registration contract for the existing service, client,
-form, public `/register` page and `/api/v1/auth/register` prefix. It separates
-repository behavior from the username increment and the deferred final target.
-It is not deployed acceptance, policy approval or authorization to execute the
-[remaining backlog](../.kilo/plans/registration-single-contract-tasks.md).
+This scopes the single existing service/client/form, public `/register` page and
+`/api/v1/auth/register` prefix. Current source was inspected at
+`85abb13a27196c229efa7f59d7ef5beebb1d7e49` on 2026-11-24; planned fields/requests
+are not current behavior, deployed acceptance or implementation authorization.
+[Policy](authentication-and-recovery-policy.md) owns SEC01-SEC16;
+[assessment](security-architecture-assessment.md) owns source gaps;
+[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) is Proposed;
+[backlog](../.github/tasks/registration-single-contract-tasks.md) and
+[readiness](security-testing-and-readiness.md) own dependencies/acceptance.
 
 ## Delivery Boundaries
 
-| Layer                     | Contract and limits                                                                                                                                                                                                                                                                                                   |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Existing conditional flow | Email-link ownership, then Iranian mobile SMS ownership, then a resident UV-required passkey. Completion returns `next: "login"`; discoverable login is separate. Registration and SMS default disabled.                                                                                                              |
-| Username increment        | Add one required username to that same flow, explicit advisory username validation, atomic reservation, and an authenticated read of the saved username or truthful absence. No contact choice, password, private-data editor or six-stage shell is activated by this increment.                                      |
-| Geography increment (T08/T09) | An independently imported immutable geography catalog, anonymous bounded reads, server snapshot validator and reusable bilingual selector. Registration requests, stages and completion remain unchanged. T10 encrypted storage and T34/T37 integration remain deferred. |
-| Existing-account MFA maintenance (T26) | Extend existing TOTP routes with a default-off, password/contact `mfa_enrollment` start proof and fresh strong-factor disable. No registration fields/stages, login policy, optional-MFA flag, management UI or other task status changes. |
-| Existing-account primary contacts (T27) | Unified normal-session email/phone maintenance, frozen strong or action/target-specific password-contact authorization and separate new-destination ownership. Present-email removal is temporarily refused pending independently verified T28/T41. No signup, backup-contact, notification or T38 UI changes. |
-| Deferred final target     | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
+| Layer                                    | Contract and limits                                                                                                                                                                                                                                                                                                   |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Current conditional flow                 | Required email+Iranian mobile+username, email-link then mobile-SMS ownership, then resident UV passkey. Atomic completion returns `next: "login"`, not a normal session. Registration/SMS default disabled.                                                                                                           |
+| Current username support                 | Advisory validation, admitted-policy frozen username, atomic reservation and normal-authenticated saved read/truthful NULL. No claim/rename or second route; no selected-contact/password/private/legal registration collection yet.                                                                                  |
+| Current geography/private data (T08-T10) | Immutable imported geography catalog, bounded public reads/shared validator and bilingual selector; normal-authenticated private-data snapshots/edits encrypt validated attributes. Registration collection/integration remains planned T31-T37; private editor UI is separate T38.                                   |
+| Existing-account MFA maintenance (T26)   | Extend existing TOTP routes with a default-off, password/contact `mfa_enrollment` start proof and fresh strong-factor disable. No registration fields/stages, login policy, optional-MFA flag, management UI or other task status changes.                                                                            |
+| Existing-account primary contacts (T27)  | Unified normal-session email/phone maintenance, frozen strong or action/target-specific password-contact authorization and separate new-destination ownership. Present-email removal is temporarily refused pending independently verified T28/T41. No signup, backup-contact, notification or T38 UI changes.        |
+| Deferred final target                    | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
 
 Do not add a second registration implementation or versioned registration route.
 Do not alter generic BlindIndex/email normalization, signed history, audit/lifecycle
@@ -26,11 +30,14 @@ tasks remain independently scoped; documenting them does not complete them.
 
 ## Existing Flow and Username Increment
 
-The pre-increment baseline was inspected in `internal/server/registration.go` and
-`internal/registration/{service,store}.go` under `apps/identity-api`, and in the
-existing browser registration client. It accepted `/start` with
-`{email,phone}`; the coordinated username increment requires
-`{email,phone,username}` and adds `username_display` to the start response.
+Current `apps/identity-api/internal/registration/service.go:122-140` requires
+`{email,phone,username}`; `internal/server/registration.go:281-294` under that
+application returns completion/result, not a session. Birth and protected contact
+evidence share `internal/registration/service.go:573-677`. The mounted browser
+uses the existing shell (`apps/web/app/_components/registration.tsx:147-166`),
+not the final names/personal/username/contact/credentials/review journey yet.
+Earlier `{email,phone}` descriptions are superseded historical contract context,
+not a second supported implementation.
 See [exact current-flow requests](api-design.md#15-new-account-registration) and
 [client handling](client-integration.md#14-conditional-new-account-registration).
 Neither repository inspection nor these enabled-feature contracts prove live
@@ -151,8 +158,12 @@ HMAC-SHA256(username_lookup_key,
 Use a dedicated secret, not email/phone/ledger pepper. Policy/key IDs are provenance,
 not HMAC-message or uniqueness partitions. Protected details bind account UUID,
 username purpose, NFC display, security name and policy provenance/activation epoch.
-The tuple is all absent or all present. Existing NULL accounts remain unclaimed; no backfill is
-derived from email/display name and no legacy normalization version is invented.
+The tuple is currently all absent or all present. Existing NULL rows are read
+truthfully; no backfill is derived from email/display name and no normalization
+version is fabricated. **Planned SEC01/SEC13:** every production human birth and
+admission requires immutable username ownership; current nullable constraints do
+not enforce that everywhere (`apps/identity-api/db/migrations/00003_username_reservations.sql:59-71,97-137`).
+This missing prerequisite is not authorization for T12 or a username-less lane.
 
 One unconditional unique key reserves the whole equivalence class across every
 surviving account, including suspended, banned, pending and soft-deleted rows.
@@ -182,10 +193,11 @@ no-split evolution, writer drain and rollback gates are in
 ### Confirmed Private-Name Validation (T02)
 
 `internal/profile.NormalizePersonalName` under `apps/identity-api` is the shared
-standalone validator for required `given_name` and `family_name`. Current
-registration requests and stage selectors do not yet accept these fields; this
-validator does not store names or infer them for existing accounts. The optional
-cosmetic `NormalizeName` validator and its empty/Latin/emoji behavior are unchanged.
+validator for required private `given_name`/`family_name`. Current registration
+does not collect them; existing-account `PrivateService` stores validated encrypted
+attributes (`apps/identity-api/internal/profile/private.go:29-49,93-119,258-307,310-368`).
+It is inaccurate to describe every endpoint as standalone-validator-only. No
+private value is inferred; cosmetic `NormalizeName` remains independent.
 
 - Reject invalid raw UTF-8 and input over 1024 bytes before normalization. Apply
   NFC and only Arabic Yeh/Kaf-to-Persian Yeh/Kaf normalization. Preserve standalone
@@ -213,10 +225,12 @@ cosmetic `NormalizeName` validator and its empty/Latin/emoji behavior are unchan
 `internal/profile.NormalizeBirthday(calendar, date string, now time.Time)` returns
 one `Birthday` with canonical ASCII `Gregorian` and `Jalali` date-only strings.
 `ValidateGender(raw string)` returns a string-backed `Gender` with explicit
-`GenderFemale` and `GenderMale` constants. These are standalone validators only:
-current endpoints do not accept, require or store birthday/gender, `/validate`
-remains username-only, and `/start` still requires `{email,phone,username}`. No UI
-controls, preselection behavior, private storage or legacy backfill was delivered.
+`GenderFemale` and `GenderMale` constants. Registration `/validate` remains
+username-only and `/start` requires `{email,phone,username}`; registration does not
+collect birthday/gender. Existing-account private-data endpoints use these validators
+and encrypted storage, while final registration controls/integration are planned.
+Preserved T05/T06 validator acceptance below is dated evidence, not target
+registration completion or fabricated backfill.
 
 - Require calendar exactly `gregorian` or `jalali`; preference identifiers
   `gregory`/`persian`, locale/browser inference and missing values are invalid.
@@ -266,7 +280,7 @@ controls, preselection behavior, private storage or legacy backfill was delivere
 | `username`                  | Chosen spelling under the namespace above; required for new accounts, immutable after assignment.                                                                                                                                                                                                                               |
 | `contact`                   | Exactly `{type: "email" \| "mobile", value: string}`. Verify the exact server-canonical selected destination. Unselected contact is absent, never a fabricated mailbox or empty-email digest.                                                                                                                                   |
 | `authentication_method`     | Explicit `passkey`, `password` or `both`, with corresponding primary credentials required. No code-only account creation. Password bytes remain exact, including spaces; confirmation is client-only. T15 owns creation strength and bounded hashing.                                                                           |
-| `location`                  | `{country: "IR", province_id: string, locality_id?: string}`; exact positive BIGINT decimal source IDs with correct active province ancestry. T08/T09 supply the catalog and independent selector, not registration persistence/integration or dataset redistribution rights. |
+| `location`                  | `{country: "IR", province_id: string, locality_id?: string}`; exact positive BIGINT decimal source IDs with correct active province ancestry. T08/T09 supply the catalog and independent selector, not registration persistence/integration or dataset redistribution rights.                                                   |
 | `legal_acceptance`          | Separate `terms` and `privacy` entries, each `{version, accepted: true}`, referring to approved server-configured documents. Acceptance time is server-owned; document approval is not supplied here.                                                                                                                           |
 
 Six stages, in order: names; personal information (birthday/gender); username;
@@ -277,6 +291,10 @@ complete candidate before native enrollment; cancellation never silently downgra
 `both`. These frontend guarantees are target behavior, not current acceptance.
 
 ## Deferred Final Requests
+
+Every request/selector in this section is **planned**, except the already-current
+username validation branch. This is an extension contract for owner-approved
+implementation, not registration-v2 or a currently mounted API promise.
 
 Let `A = {attempt_id,capability}` and `F` contain every final field except
 `contact`, which is canonicalized and attempt-bound. Operations below are POSTs
@@ -299,8 +317,55 @@ Only deferred T33 may issue a normal session after a known fresh commit, using t
 same browser key and bootstrapping exactly the returned new subject. Result reads
 and replayed receipts never mint sessions. Failed session issuance leaves the
 committed account eligible for ordinary login, not account recreation. Password,
-username/contact-code login, MFA alternatives, optional-email consumers,
+eligible password/passkey login, independent-MFA alternatives, optional-email consumers,
 notifications, private snapshots/editing and broader recovery remain separate tasks.
+
+## Planned Atomic Birth and Fresh Session
+
+SEC01/SEC02/SEC13 govern one production-human account birth: required immutable
+username, validated private names/date-only pair/gender/location, exactly one selected
+verified contact, selected password/passkey/both primary credentials and separate
+approved terms/privacy versions. Contacts are individually optional but at least
+one verified destination is mandatory. No mailbox creation, empty-email digest,
+contact-only account or implicit fallback identifier. Initial registration
+verification records its cooldown exemption explicitly; later association changes
+never inherit it.
+
+The same existing service owns one caller-controlled SQL commit for account,
+private attributes, unique username reservation, exact selected-contact evidence,
+consumption of proofs/ceremony, selected primary credentials, immutable legal
+acceptance and metadata intent/receipt. Freeze/revalidate the full candidate,
+admitted username/geography/legal versions and exact contact/browser-key identity.
+Bound expensive password/native work outside long-held locks in the target, then
+perform final SQL checks after waits under the [global order](data-architecture.md#global-lock-order).
+Password-bearing intent fingerprints use a dedicated keyed construction, not an
+offline dictionary-testable plain hash. A collision/failed proof leaves no partial
+account and never attaches to an existing account.
+
+Only a known **fresh** birth may cause T33 SQL-authoritative normal session issuance
+for the returned new subject and original browser JKT. All selected primary and
+applicable policy evidence must be proven; passkey requires actual UV. Receipt
+replay, `/result`, uncertain reconciliation, refresh or reconstructed pending state
+never issue a session or bootstrap another subject. Lost fresh-session output or
+issuance failure leaves the committed account for ordinary login, not another
+birth. Registration contact codes never become authentication, and deletion/repair
+grants never become birth authority.
+
+## Planned Dependencies and Gates
+
+| Capability                              | Prerequisite / invariant                                                                                                                                  | Evidence before activation                                                                                                                             |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| One birth (T31/T32)                     | T01-T15 names/username/date/gender/geography/password/legal contracts; SEC01/SEC02/SEC13/SEC14                                                            | Full candidate, all credential choices, SQL collision/rollback/proof/legal-version tests; private storage does not mean registration collects it.      |
+| Fresh session (T33)                     | T16A/T21A SQL-earned full-policy authority; known fresh T32 commit, SEC03/SEC09/SEC11/SEC13                                                               | Expected subject/original key; no session from replay/result/unknown commit or duplicate birth after output failure.                                   |
+| Phone-only production / T27 retirement  | Alternative recovery identification, code/barrier/cooldown, verified notification readers and password/mobile deletion/reclaim (T28-T30/T41); SEC06-SEC12 | Complete independently verified lifecycle/real delivery and retained reclaim factors; NULL readers alone do not retire the gate.                       |
+| Six-stage browser integration (T34-T37) | Fixed API/legal/private/credential/session contracts and current shell; SEC15                                                                             | Both locales, progress preserved, original UTC deadlines, explicit send/native work, no silent `both` downgrade, once-only expected-subject bootstrap. |
+| Broader release (T42)                   | Durable token/interactive OIDC/confidential client/privileged consumer/restore foundations; SEC04/SEC16                                                   | Independent security, real provider/hardware/Persian/accessibility/ingress/legal/data-rights evidence. T12 remains excluded.                           |
+
+Dependencies form a DAG, not numeric task order. Security-event contracts/readers
+and verified-destination notifications precede security-changing writers and
+phone-only lifecycle activation. UI consumes fixed contracts, never invents
+authority. Historical statuses/counts retain their original evidence and do not
+approve these target gates.
 
 ## Username Claim Scope and Evidence
 

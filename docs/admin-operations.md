@@ -1,9 +1,22 @@
 # Admin and Ledger Retention Operations
 
-The implementation remains opt-in. This document describes conditional runtime contracts and outstanding release gates, not production sign-off. The active inventory is `.kilo/plans/1793976266705-preproduction-cleanup-launch-hardening.md`; prior technical-closure and panel plans and their dated evidence remain historical. Existing task statuses are unchanged; they do not certify the current bundle. Fresh final-source evidence and the independently unchecked production/manual gates below remain required.
+The implementation remains opt-in. This document describes conditional current
+runtime contracts and outstanding release gates, not production sign-off. Active
+target authority is the [authentication and recovery policy](authentication-and-recovery-policy.md),
+[assessment](security-architecture-assessment.md) and
+[security readiness](security-testing-and-readiness.md), with executable work in
+the [canonical backlog](../.github/tasks/registration-single-contract-tasks.md).
+The [archived architecture plan](history/security-architecture-plan-2026-11-24.md)
+preserves historical planning, not operating instructions. The unavailable
+historical plan ID `1793976266705-preproduction-cleanup-launch-hardening.md`
+is a literal provenance identifier only. Existing dated task acceptance remains
+unchanged and does not certify the current bundle or new target. Historical
+temporary evidence locations are not current artifact destinations or required
+fresh-clone inputs.
 
-Active schema installation follows the unchanged baseline plus additive registration,
-username and geography migration contract below. Dated acceptance records
+Active schema installation follows the
+[canonical packaged inventory](devops-operations.md#canonical-packaged-migration-inventory).
+Dated acceptance records
 and prior plans retain their original migration evidence unchanged; they do not
 certify this bundle. New acceptance must be recorded separately only after actual
 final runs satisfy [current requirements](#automated-validation).
@@ -11,7 +24,7 @@ This documentation update changes no task status or production authorization.
 
 ## Enablement
 
-1. Inventory schema/history first using the migration identity and follow [setup](#migration-and-contraction). Apply unchanged `00001_initial_schema.sql` plus additive registration, username and geography migrations through `00004_geography_catalog.sql` only to a separately approved scoped target, tracked through version 4 in `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked nonempty schemas and contradictory histories are refused. No instruction here authorizes live mutation, resets, adoption, genesis reset or hash rewriting.
+1. Inventory schema/history first using the migration identity and follow [setup](#migration-and-contraction) and the canonical packaged inventory. Apply the reviewed current bundle only to a separately approved scoped target under `public.identity_schema_version`. Retired `public.goose_db_version`, untracked nonempty schemas and contradictory histories are refused. No instruction here authorizes live mutation, resets, adoption, genesis reset or hash rewriting.
 2. Deploy account-version-aware issuers on **every** instance and restart old process-local credential stores before moderation is enabled. Ban, suspension, deletion and reactivation advance persistent versions. Old sessions, codes, refresh tokens and step-up grants cannot regain validity. Task 6.2's `ValidateToken` checks that version and live Redis authority; downstream clients using offline JWT verification still retain the configured lifetime, at most ten minutes.
 3. Inject one KEK/version and one blind-index pepper/version through the approved secret delivery mechanism. The adapter holds loaded keys locally, with no live Infisical fetch/cache/hot rotation or historical multi-key reader. Hold encryption is independent of attribution; SMS uses its separate required OTP HMAC pepper only when enabled. Preserve retired backup keys and coordinated recovery/rotation obligations. Exact `APP_ENV=development|test|production` is mandatory; test is not development.
 4. Verify final encrypted-or-legitimately-purged legal storage and actual key/data inventory before intake. Obsolete legal Backfill/plaintext compatibility is removed; unexpected layouts fail closed. Retain key recovery and consistent backups; startup crypto readiness is not a full real-data/key inventory or restore proof.
@@ -23,18 +36,16 @@ This documentation update changes no task status or production authorization.
 ## Migration and Contraction
 
 The heading is retained for existing links; installation no longer performs a
-staged legacy contraction. The active bundle is unchanged
-`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`,
-`00003_username_reservations.sql` and `00004_geography_catalog.sql`.
-`migrate up` applies through version 4 in **`public.identity_schema_version`**, not
-`public.goose_db_version`. Future changes use `00005` and later bundled
-migrations in this new lineage; generic `up-to` is not an old-lineage escape hatch.
+staged legacy contraction. The active bundle and terminal version are defined
+only in the [canonical packaged inventory](devops-operations.md#canonical-packaged-migration-inventory).
+`migrate up` uses **`public.identity_schema_version`**, not
+`public.goose_db_version`. Future migrations follow the inspected packaged lineage;
+generic `up-to` is not an old-lineage escape hatch.
 
 Before any migration mutation, the guarded wrapper performs fail-closed read-only
 inventory and repeats it under lock-held exclusion. It refuses **all** legacy
 `public.goose_db_version` relations regardless of version, row count or apparent
-schema equivalence, including old version 1, intermediate history and old version
-20. It also refuses both history tables, an untracked nonempty application schema,
+schema equivalence, including old version 1, intermediate history and old version 20. It also refuses both history tables, an untracked nonempty application schema,
 malformed relation/column shapes and contradictory new histories. New history
 requires exactly one applied zero, unique known versions with true applied flags,
 and baseline 1 before later applied versions; zero-row bookkeeping, missing zero,
@@ -48,9 +59,9 @@ credentials:
 
 1. Identify the exact fresh PostgreSQL 16 database and matching fresh Redis 7/NATS
    JetStream 2.10 resources or isolated service namespaces. Record their ownership
-   and isolation; do not assume default Compose names/volumes are fresh. All existing
-   Identity data was confirmed disposable, but that is **not** authorization to
-   reset an existing named environment. Any reset requires a separate explicit
+   and isolation; do not assume default Compose names/volumes are fresh. Historical
+   disposal assertions do not authorize changes to present real data. Any reset
+   of an existing named environment requires a separate explicit
    request identifying its exact disposable targets. Never run broad volume deletion
    or shared-database schema reset commands.
 2. Close affected intake and stop/drain **all old writers**, including API replicas,
@@ -62,7 +73,8 @@ credentials:
 3. Set the scoped migration `DATABASE_URL`; run `migrate status` then `migrate up`
    (Nx: `identity-api:migrate-status`, `identity-api:migrate-up`). Public status/version
    inspection is read-only and creates no bookkeeping on a fresh target. Verify
-   applied version 2 and the new history table; repeated `up` must be a verified
+   the terminal version from the canonical inventory and the new history table;
+   repeated `up` must be a verified
    no-op. A failed baseline transaction leaves no partial application objects or
    applied version-1 record. Migration-2 failure must leave version 1 valid/retryable
    without partial registration objects. Do not bypass refusal to force a retry.
@@ -90,7 +102,7 @@ never named developer/shared environments.
 Legacy Backfill commands in dated records are not supported operations in this
 bundle. Do not recreate plaintext columns, convert legacy history, stamp metadata
 or reset a laboratory environment to make it acceptable. Existing version-1
-new-lineage state may advance to reviewed migration 2 only with separately scoped
+new-lineage state may advance through reviewed packaged migrations only with separately scoped
 authorization; this is not permission to adopt an old lineage.
 
 ## Production Checklist
@@ -99,43 +111,59 @@ Every item remains unchecked here. Local automated acceptance can close a define
 implementation task, never these production/governance/manual authorizations.
 
 - [ ] Approve numeric baseline/workflow/Class B/Class C policies and the actual
-  personal/pseudonymous inventories and lifetimes, including `no_expiry` residuals,
-  legal basis, privacy notices, ROPA/DPIA and truthful DSAR responses.
+      personal/pseudonymous inventories and lifetimes, including `no_expiry` residuals,
+      legal basis, privacy notices, ROPA/DPIA and truthful DSAR responses.
 - [ ] Inventory real data, ciphertext/key versions, retained backup keys and recovery
-  material; verify final encrypted storage and consistent forward recovery. Fresh
-  setup never adopts legacy history or exposes obsolete Backfill.
+      material; verify final encrypted storage and consistent forward recovery. Fresh
+      setup never adopts legacy history or exposes obsolete Backfill.
 - [ ] Install real externally approved policy through the restricted trusted
-  installer and provision operators from an authenticated MFA-protected launcher.
-  Environment actor/SPIFFE strings alone are not authentication.
+      installer and provision operators from an authenticated MFA-protected launcher.
+      Environment actor/SPIFFE strings alone are not authentication.
 - [ ] Validate effective deployed non-owner grants, PUBLIC/column/sequence ACLs,
-  ownership/membership/SET ROLE paths, RLS/subject scoping, armed guards and separate
-  API/signer/publisher/purge/maintenance/reconciliation secrets.
+      ownership/membership/SET ROLE paths, RLS/subject scoping, armed guards and separate
+      API/signer/publisher/purge/maintenance/reconciliation secrets.
 - [ ] Close/drain affected intake and coordinate compatible migration, all replicas,
-  callers, open forms and v1 envelope inventory before reopening; preserve accepted
-  intent, original clocks and rollback compatibility.
+      callers, open forms and v1 envelope inventory before reopening; preserve accepted
+      intent, original clocks and rollback compatibility.
 - [ ] Run the real deployed signer lookup probe with actual schema/keys, privately
-  provision its fixture, and verify authenticated post-deletion attribution.
+      provision its fixture, and verify authenticated post-deletion attribution.
 - [ ] Prove acknowledged outbox delivery, signer dedup/restart and separately
-  reconciled chained receipts/manifest coverage; pending intent/PubAck is not chaining.
+      reconciled chained receipts/manifest coverage; pending intent/PubAck is not chaining.
 - [ ] Verify ingress/API/worker/APM redaction with synthetic sensitive sentinels,
-  including rejected paths/queries and operator diagnostics.
+      including rejected paths/queries and operator diagnostics.
 - [ ] Perform bounded scoped-login dry-runs, consistent deployed restore/forward-
-  recovery drills, hold/deletion reconciliation and key recovery without data wiping.
+      recovery drills, hold/deletion reconciliation and key recovery without data wiping.
 - [ ] Connect aggregate backlog/age/due-review/publisher/failure signals to monitoring
-  with approved thresholds and incident ownership; explicitly authorize destructive
-  scheduling only after the other gates are satisfied.
+      with approved thresholds and incident ownership; explicitly authorize destructive
+      scheduling only after the other gates are satisfied.
 - [ ] Complete manual assistive-technology, physical-authenticator, native-browser
-  zoom/hidden-tab/bfcache and actual-ingress checks not observed by automated suites.
+      zoom/hidden-tab/bfcache and actual-ingress checks not observed by automated suites.
 - [ ] Approve live SMS.ir key/template/parameter, Iranian routing, egress/spend limits
-  and an explicitly authorized handset receipt; sandbox success is not delivery.
+      and an explicitly authorized handset receipt; sandbox success is not delivery.
 - [ ] Approve Unicode-mailbox SMTPUTF8 submission, temporary registration retention
-  and admission budgets; verify dedicated cleanup supervision before enablement.
+      and admission budgets; verify dedicated cleanup supervision before enablement.
+- [ ] Establish SEC04 policy-verified hardware-backed phishing-resistant UV plus a
+      separately enrolled independent backup at privileged role grant and every use
+      boundary; current passkey/TOTP inventory does not satisfy this gate.
+- [ ] Verify SQL-earned session/preauthentication/proof/TOTP replay authority,
+      final deciding-transaction bindings and rollback-safe restore (SEC09-SEC11, SEC16).
+- [ ] Deny all consumer ARC/contact repair, backup-code downgrade, support override
+      and administrative bypass for privileged accounts; total loss stays blocked until
+      a separately approved higher-assurance procedure exists.
 
 ## Operator role provisioning
 
 Use `npm exec -- nx run identity-api:admin-roles -- --user-id=<uuid> --role=<role>`; add `--revoke` for revocation. Roles are `super_admin`, `moderator`, `support`, `dpo`. The command first loads the installed baseline (optionally pinned by `ADMIN_GOVERNANCE_POLICY_ID`), validates `APP_ENV`/fixture policy and derives context retention from it. Explicit `ADMIN_CONTEXT_RETENTION` or `ADMIN_LEGAL_RELEASED_RETENTION` mismatch, or absent policy, refuses before role/context/outbox changes. Provisioning rechecks the baseline and context retention in the transaction. Install policy separately first; no pre-baseline unaudited provisioning exception exists. A grant requires an active account with an enrolled passkey or enabled MFA. Revocation works for inactive targets too. Changes serialize with moderation and commit encrypted target reference plus durable audit intent; retries are audited no-ops, and old context expiries are never rewritten.
 
 Run from an authenticated, MFA-protected operator environment with separately scoped `DATABASE_URL`. Its trusted launcher supplies `ADMIN_OPERATOR_ID` and `ADMIN_OPERATOR_SPIFFE_ID` from the authenticated identity. These environment values are **attribution, not authentication**; arbitrary callers must not control the launcher or database credentials. Provisioning approval remains an organizational control. No HTTP route assigns roles, no unaudited one-row bootstrap is documented, and no two-person HTTP workflow is claimed.
+
+The current enrolled-passkey-or-MFA eligibility test above is not SEC04 assurance.
+Planned role provisioning and privileged API/gRPC/consumer use require verified
+hardware-backed phishing-resistant UV and a separately enrolled independent backup.
+UV, AAGUID, transport and backup flags alone cannot establish hardware backing.
+Neither consumer recovery nor support/legal/operator authority may lower that
+policy. Consumers must receive and enforce truthful earned evidence, not infer
+assurance from an administrator label. Keep activation blocked on T17A and SEC16.
 
 Initial operator enrollment uses the ordinary approved registration/passkey flow,
 which grants no role or session. Policy installation and an approved role grant
@@ -225,16 +253,16 @@ Earlier failed attempts remain in the evidence history. They include fixture-iso
 
 Production identities must be non-owner and non-superuser. Migrations and test owners are not runtime accounts. Apply and verify deployment-specific grants before enabling ingress:
 
-| Identity | Required scope | Must not receive |
-|---|---|---|
-| API | Existing authentication table access; live RBAC SELECT; legal request SELECT/INSERT/UPDATE; restricted context INSERT; admin outbox INSERT; chain/head/erasure SELECT for gated routes; auth epoch sequence USAGE | RBAC membership writes; ledger/audit/chain INSERT, UPDATE, DELETE, TRUNCATE; `advance_chain_head` EXECUTE; outbox delivery UPDATE; trigger bypass |
-| Admin publisher | Outbox SELECT/row locks and column UPDATE of `published_at`, `attempts`, `next_attempt_at`, `last_error`; enabled RLS with exact configured-subject/`admin_action` SELECT/UPDATE policies required by startup probe | Other table reads/writes, narrative keys, evidence/role writes, payload/subject/marker updates, PUBLIC/extra/widened policies or RLS bypass |
-| Signer | Both payloads/chains SELECT + INSERT; chain-sequence USAGE; both heads and ledger erasures SELECT; validated `advance_chain_head` EXECUTE; users SELECT and UPDATE(`id`) for existing FK row locking | Payload/chain UPDATE/DELETE/TRUNCATE, direct head mutation, role/DDL authority, legal narratives; users column UPDATE remains SQL authority, not an enforced lock-only API |
-| Operator | Target eligibility/credential and role access, account locks, outbox/context insertion | API network exposure; unrestricted evidence editing |
-| Metadata maintenance | Hold checks, subject locks and bounded context/released-narrative cleanup | Ledger DELETE or trigger bypass |
-| Ledger purge worker | Dedicated `identity_ledger_purge` login; payload `SELECT` + `DELETE`; erasure-index `SELECT` + `INSERT`; outbox `INSERT`; chain/head/hold/settings `SELECT` | Any write on chain, head or erasure index beyond the insert; payload `UPDATE`/`TRUNCATE`; sequence usage; `advance_chain_head` EXECUTE; role/trigger/schema changes; superuser or replication privileges |
-| Receipt reconciliation | Separate SELECT-only login for `security_ledger_erasures`, `event_outbox`, `mvp_audit_logs`, `audit_log_chain`, `audit_log_head`; `LEDGER_RECEIPTS_DATABASE_URL` only | Purge DELETE, outbox/evidence writes, other table reads, sequences, narrative keys, role/DDL authority or fallback to purge/API credentials |
-| Chain-head routine owner (optional) | `identity_chain_head_owner` NOLOGIN; `advance_chain_head` ownership with chain `SELECT` and head `SELECT`/`UPDATE` | Runtime login; membership granted to API/signer/worker; ownership of application tables/schema/database |
+| Identity                            | Required scope                                                                                                                                                                                                      | Must not receive                                                                                                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API                                 | Existing authentication table access; live RBAC SELECT; legal request SELECT/INSERT/UPDATE; restricted context INSERT; admin outbox INSERT; chain/head/erasure SELECT for gated routes; auth epoch sequence USAGE   | RBAC membership writes; ledger/audit/chain INSERT, UPDATE, DELETE, TRUNCATE; `advance_chain_head` EXECUTE; outbox delivery UPDATE; trigger bypass                                                        |
+| Admin publisher                     | Outbox SELECT/row locks and column UPDATE of `published_at`, `attempts`, `next_attempt_at`, `last_error`; enabled RLS with exact configured-subject/`admin_action` SELECT/UPDATE policies required by startup probe | Other table reads/writes, narrative keys, evidence/role writes, payload/subject/marker updates, PUBLIC/extra/widened policies or RLS bypass                                                              |
+| Signer                              | Both payloads/chains SELECT + INSERT; chain-sequence USAGE; both heads and ledger erasures SELECT; validated `advance_chain_head` EXECUTE; users SELECT and UPDATE(`id`) for existing FK row locking                | Payload/chain UPDATE/DELETE/TRUNCATE, direct head mutation, role/DDL authority, legal narratives; users column UPDATE remains SQL authority, not an enforced lock-only API                               |
+| Operator                            | Target eligibility/credential and role access, account locks, outbox/context insertion                                                                                                                              | API network exposure; unrestricted evidence editing                                                                                                                                                      |
+| Metadata maintenance                | Hold checks, subject locks and bounded context/released-narrative cleanup                                                                                                                                           | Ledger DELETE or trigger bypass                                                                                                                                                                          |
+| Ledger purge worker                 | Dedicated `identity_ledger_purge` login; payload `SELECT` + `DELETE`; erasure-index `SELECT` + `INSERT`; outbox `INSERT`; chain/head/hold/settings `SELECT`                                                         | Any write on chain, head or erasure index beyond the insert; payload `UPDATE`/`TRUNCATE`; sequence usage; `advance_chain_head` EXECUTE; role/trigger/schema changes; superuser or replication privileges |
+| Receipt reconciliation              | Separate SELECT-only login for `security_ledger_erasures`, `event_outbox`, `mvp_audit_logs`, `audit_log_chain`, `audit_log_head`; `LEDGER_RECEIPTS_DATABASE_URL` only                                               | Purge DELETE, outbox/evidence writes, other table reads, sequences, narrative keys, role/DDL authority or fallback to purge/API credentials                                                              |
+| Chain-head routine owner (optional) | `identity_chain_head_owner` NOLOGIN; `advance_chain_head` ownership with chain `SELECT` and head `SELECT`/`UPDATE`                                                                                                  | Runtime login; membership granted to API/signer/worker; ownership of application tables/schema/database                                                                                                  |
 
 Repository migrations do not create deployment login roles or deploy RLS policies. Deployment/validation remains a release gate. The publisher startup probe now requires enabled `event_outbox` RLS and the exact two applicable role-specific SELECT/UPDATE policies described below, in addition to trusted subject/marker query predicates. Startup probes inspect effective PUBLIC/table/column/sequence privileges, ownership, membership/SET ROLE paths, database/schema CREATE, replication/trigger bypass and armed guards, not only group-role grants. All maintenance/signer/publisher/reconciliation identities are non-owner NOINHERIT logins without memberships. The trusted Go purge enforces retention/holds; ordinary DELETE is not a database-enforced policy boundary against compromised credentials. Protect backups, restricted context and all secret delivery paths.
 
@@ -292,16 +320,16 @@ Resolve fresh targets from the repository root using `npm exec -- nx show projec
 identity-api --json` and `npm exec -- nx show project web --json`. The mandatory
 normal service matrix has exactly these eight identities:
 
-| Required suite |
-|---|
-| `identity-api:test-security-db` |
-| `identity-api:test-admin-integration` |
-| `identity-api:test-retention-integration` |
+| Required suite                                 |
+| ---------------------------------------------- |
+| `identity-api:test-security-db`                |
+| `identity-api:test-admin-integration`          |
+| `identity-api:test-retention-integration`      |
 | `identity-api:test-legal-workflow-integration` |
-| `identity-api:test-grpc-integration` |
-| `identity-api:test-lifecycle-integration` |
-| `identity-api:test-geography-integration` |
-| `identity-api:test-portal-integration` |
+| `identity-api:test-grpc-integration`           |
+| `identity-api:test-lifecycle-integration`      |
+| `identity-api:test-geography-integration`      |
+| `identity-api:test-portal-integration`         |
 
 Run one suite per owned-service cell with `max-parallel: 1`, `fail-fast: false`,
 unchanged 30-minute target and 60-minute job deadlines, `-count=1`, `-p=1` and
@@ -312,11 +340,15 @@ gate: matching source/generated fingerprints, nonzero package/test evidence,
 zero failures/skips and verified cleanup are mandatory. Missing/stale/duplicate/
 wrong-source/partial reports or zero exit without evidence fail the gate.
 
-Eight affected race packages are a separate serial inventory: `internal/recovery`,
+Thirteen affected race packages are a separate serial inventory: `internal/recovery`,
 `internal/mfa`, `internal/oidc/clientauth`, `internal/adminaction`, `internal/smsotp`,
-`internal/registration`, `internal/audit/signer` and `internal/geography`. Owned-service race mode uses
+`internal/registration`, `internal/audit/signer`, `internal/geography`,
+`internal/contactcode`, `internal/actionproof`, `internal/passwordmanager`,
+`internal/webauthn` and `internal/contactmanager`. Owned-service race mode uses
 Linux CGO, `-json -tags=integration -race -count=1 -p=1 -timeout=20m` and a separate
-exact-eight race aggregate; it cannot replace normal suite evidence.
+exact-thirteen race aggregate; it cannot replace normal suite evidence. This is
+the inspected `.github/workflows/identity-api.yml` matrix, not eight historical
+packages or a claim that the new policy tests are implemented.
 
 Require final generated-tree reproducibility, lint/vet/typechecks/builds,
 image/entrypoint/fixture-exclusion smoke and existing portal/admin/CSP browsers,
@@ -342,7 +374,14 @@ The new regressions cover hold/purge locking in both orders, independent legal r
 
 Run the Nx `sqlc-vet`, `lint`, `vet`, `test`, `test-race`, `build`, worker/operator builds, `test-security-db`, and `test-admin-integration` targets. Integration runs require run-owned disposable PostgreSQL 16, Redis and NATS JetStream, serialized and isolated from developer/shared environments. The mandatory admin target fails on missing service configuration.
 
-The unchanged `00001` plus additive `00002` bundle is forward-only; `Down`, reset and rollback to zero refuse. Disable admin ingress/routes first and preserve holds, ciphertext, replay tombstones, auth versions, outbox intent, registration state and evidence. A clean up/down/up is unavailable; test refusal and forward recovery only on run-owned disposable fixtures. Current-bundle acceptance is separate from historical upgrade evidence.
+The current [canonical bundle](devops-operations.md#canonical-packaged-migration-inventory)
+is baseline-forward-only; reset and rollback to zero refuse. Disable admin ingress
+first and preserve holds, ciphertext, replay tombstones, auth versions, outbox
+intent, registration state and evidence. A clean baseline up/down/up is unavailable;
+test refusal and forward recovery only on run-owned fixtures. Current acceptance
+is separate from historical upgrade evidence. Session clearance alone cannot
+make a restored SQL snapshot safe: follow
+[security-authority quarantine](disaster-recovery.md#36-security-authority-quarantine-and-reconciliation).
 
 Existing task statuses and historical October/November results are unchanged and do not certify this bundle. Fresh final-source acceptance, forward recovery/consistent local restore, generated outputs, images and browser gates remain required. Production ingress/privacy, policy, deployed privilege/restore and manual checks remain independently open in the [production checklist](#production-checklist). Task 5.4 annotations and receipt reconciliation are database-relative, not legal-policy proof or protection against coherent privileged rewrite. Task 6.2 does not close those gates or change offline-JWT residual authority. Phone attribution and historical key rotation remain separate work.
 
@@ -363,17 +402,17 @@ of intake flags.
 The operator supplies a bounded JSON file with these fields. No example numeric
 retention values are production defaults:
 
-| Field | Required meaning |
-|---|---|
-| `id`, `approval_reference`, `fixture` | Immutable UUID, opaque external approval reference, explicit boolean. Fixtures are rejected outside development/test. |
-| `context_retention_seconds`, `released_hold_retention_seconds` | Positive approved integer seconds matching configured baseline values. |
-| `context_clock`, `released_hold_clock` | Exactly `created_at` and `released_at`. |
-| `hold_tombstone_fields`, `hold_tombstone_lifetime` | Exact actual retained field inventory and explicit `no_expiry` approval. |
-| `legacy_inventory_reference` | Opaque inventory attestation required when binding existing holds/contexts. Existing context clocks must match; they are never rewritten. |
-| `workflow` | Optional baseline extension; required for case intake/reporting. |
-| `workflow.max_case_age_seconds`, `workflow.closed_case_retention_seconds` | Positive approved case expiry durations. |
-| `workflow.case_clock` | Exactly `created_at_max_closed_at_min`: closure can shorten, never extend the original maximum. |
-| `workflow.replay_fields`, `workflow.replay_lifetime` | Exact minimized replay inventory and explicit `no_expiry` approval. |
+| Field                                                                     | Required meaning                                                                                                                          |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `approval_reference`, `fixture`                                     | Immutable UUID, opaque external approval reference, explicit boolean. Fixtures are rejected outside development/test.                     |
+| `context_retention_seconds`, `released_hold_retention_seconds`            | Positive approved integer seconds matching configured baseline values.                                                                    |
+| `context_clock`, `released_hold_clock`                                    | Exactly `created_at` and `released_at`.                                                                                                   |
+| `hold_tombstone_fields`, `hold_tombstone_lifetime`                        | Exact actual retained field inventory and explicit `no_expiry` approval.                                                                  |
+| `legacy_inventory_reference`                                              | Opaque inventory attestation required when binding existing holds/contexts. Existing context clocks must match; they are never rewritten. |
+| `workflow`                                                                | Optional baseline extension; required for case intake/reporting.                                                                          |
+| `workflow.max_case_age_seconds`, `workflow.closed_case_retention_seconds` | Positive approved case expiry durations.                                                                                                  |
+| `workflow.case_clock`                                                     | Exactly `created_at_max_closed_at_min`: closure can shorten, never extend the original maximum.                                           |
+| `workflow.replay_fields`, `workflow.replay_lifetime`                      | Exact minimized replay inventory and explicit `no_expiry` approval.                                                                       |
 
 The existing hold inventory is `id`, `account_ref`, `applied_by`, `is_active`,
 `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`,
@@ -457,12 +496,12 @@ Use separate non-owner, non-superuser deployment logins with no inherited owner,
 DDL, replication or trigger-bypass authority. Migrations revoke public table
 access; they do not create deployment logins or grant production approval.
 
-| Identity | Additional scope |
-|---|---|
-| API | SELECT policy/baseline; required workflow SELECT/INSERT and state-column UPDATE; append-only encrypted history INSERT; transactional replay/counter/report operations. No policy INSERT, narrative/history DELETE, evidence maintenance, or outbox delivery updates. |
-| Policy operator | SELECT/INSERT policy and first baseline binding, legacy inventory reads, outbox INSERT. No workflow cleanup or evidence editing. |
+| Identity             | Additional scope                                                                                                                                                                                                                                                                   |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API                  | SELECT policy/baseline; required workflow SELECT/INSERT and state-column UPDATE; append-only encrypted history INSERT; transactional replay/counter/report operations. No policy INSERT, narrative/history DELETE, evidence maintenance, or outbox delivery updates.               |
+| Policy operator      | SELECT/INSERT policy and first baseline binding, legacy inventory reads, outbox INSERT. No workflow cleanup or evidence editing.                                                                                                                                                   |
 | Workflow maintenance | SELECT cases/replays/subjects/hold reviews/holds/policy/baseline; existing legal_cases UPDATE; replay UPDATE only `erased`, `event_id`; DELETE events/subjects/case-hold links/hold-review state; outbox INSERT. No user/role/policy/evidence mutation, sequences or head EXECUTE. |
-| Publisher/signer | Existing Task 5.3/5.4 scopes only; no restricted workflow plaintext or keys. |
+| Publisher/signer     | Existing Task 5.3/5.4 scopes only; no restricted workflow plaintext or keys.                                                                                                                                                                                                       |
 
 Restrict mutable columns rather than granting table-wide rewriting where possible.
 Keep report payload/provenance and history immutable. Verify the actual login's
@@ -569,8 +608,7 @@ claim that production provisioning, verification or deployment has passed.
    to drain acknowledged work and verify signer shutdown; account for queued
    envelopes rather than silently discarding them. The initial cutover is not a
    routine hourly shutdown requirement. Keep all old signer instances stopped.
-3. Install unchanged `00001_initial_schema.sql` plus additive
-   `00002_registration_attempts.sql` in an explicitly scoped fresh PostgreSQL
+3. Install the reviewed [canonical packaged bundle](devops-operations.md#canonical-packaged-migration-inventory) in an explicitly scoped fresh PostgreSQL
    environment with matching isolated Redis/NATS through the
    [baseline procedure](#migration-and-contraction). All legacy
    `public.goose_db_version`, untracked nonempty application schemas and contradictory
@@ -613,13 +651,13 @@ Under canonical format v2 there is **no purge routine**. Erasure is an ordinary
 bounded `DELETE` executed by the separately credentialed worker, so the authority
 contract is a privilege contract rather than a function-ownership contract.
 
-| Surface | Runtime authority |
-|---|---|
-| `public.security_event_ledger` | `identity_ledger_purge` holds `SELECT` and `DELETE`; signer may SELECT/INSERT. No other runtime deletion, payload UPDATE or TRUNCATE is permitted. The trigger does not enforce DELETE retention/holds. |
-| `public.security_ledger_erasures` | `identity_ledger_purge` holds `SELECT` and `INSERT`. Append-only for everyone. |
-| `public.event_outbox` | `identity_ledger_purge` holds `INSERT` only, for its receipt. |
-| `public.security_ledger_chain`, `public.audit_log_chain` | Signer SELECT/INSERT; purge SELECT on ledger chain only; API/read tools have their scoped SELECT. No runtime UPDATE/DELETE/TRUNCATE; no maintenance exemption. |
-| `public.advance_chain_head(text,bigint,bigint,bigint,bigint)` | Only the signer may execute. SECURITY DEFINER, pinned `search_path`, PUBLIC EXECUTE revoked. |
+| Surface                                                       | Runtime authority                                                                                                                                                                                       |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `public.security_event_ledger`                                | `identity_ledger_purge` holds `SELECT` and `DELETE`; signer may SELECT/INSERT. No other runtime deletion, payload UPDATE or TRUNCATE is permitted. The trigger does not enforce DELETE retention/holds. |
+| `public.security_ledger_erasures`                             | `identity_ledger_purge` holds `SELECT` and `INSERT`. Append-only for everyone.                                                                                                                          |
+| `public.event_outbox`                                         | `identity_ledger_purge` holds `INSERT` only, for its receipt.                                                                                                                                           |
+| `public.security_ledger_chain`, `public.audit_log_chain`      | Signer SELECT/INSERT; purge SELECT on ledger chain only; API/read tools have their scoped SELECT. No runtime UPDATE/DELETE/TRUNCATE; no maintenance exemption.                                          |
+| `public.advance_chain_head(text,bigint,bigint,bigint,bigint)` | Only the signer may execute. SECURITY DEFINER, pinned `search_path`, PUBLIC EXECUTE revoked.                                                                                                            |
 
 The worker's startup probe refuses to run unless all of the following hold, so an
 over-provisioned role fails closed at boot rather than at the first erasure:
@@ -668,7 +706,7 @@ the chain rows are the only surviving record of what was already erased.
 ### First-Time Provisioning SQL
 
 Run the following in an authenticated `psql` operator session connected to the
-separately authorized new-lineage target after bundle version 2 in `public.identity_schema_version`, with
+separately authorized new-lineage target after verifying the canonical bundle in `public.identity_schema_version`, with
 writers stopped and the schedule disabled.
 The operator must be authorized to create roles and transfer function ownership;
 these are not runtime privileges. Replace the four uppercase role placeholders
@@ -687,7 +725,7 @@ publisher subject-scoped outbox permissions remain required.
 \set reconciler_role 'DEPLOYED_RECEIPT_RECONCILIATION_ROLE'
 SELECT current_database() AS ledger_database \gset
 
--- Canonical format v2 remains from unchanged 00001; additive 00002 adds registration.
+-- Canonical format v2 is unchanged; verify the current canonical bundle separately.
 --
 -- There is no maintenance-owner role here and no SECURITY DEFINER purge routine
 -- to own. Erasure is an ordinary DELETE on the payload table, so the authority
@@ -817,10 +855,10 @@ For a demonstrably new ledger only, set sequence `0` with
 from an empty table. At sequence `0` the digest must be the chain's **derived
 genesis seed**, which the `CHECK` constraints enforce:
 
-| Chain | Genesis digest |
-| --- | --- |
+| Chain                  | Genesis digest                                                     |
+| ---------------------- | ------------------------------------------------------------------ |
 | `security_ledger_head` | `6ece92219999993f2dc5b43d677c333fa6836745079b919355360170f3ea2c54` |
-| `audit_log_head` | `5c358544585235f7ae29b4a8370d5541ddd6bd40c81321fc92bbb54b31887ebb` |
+| `audit_log_head`       | `5c358544585235f7ae29b4a8370d5541ddd6bd40c81321fc92bbb54b31887ebb` |
 
 These are `SHA-256(chain_prefix || "genesis")`, not 32 zero bytes. v1 used zeros,
 which made a blanked or default-initialized column indistinguishable from a real
@@ -1107,8 +1145,9 @@ Keep signer and verifier binaries compatible with canonical-v2 storage throughou
 rollback. Pre-v2 binaries expect the retired payload/`chain_hash` layout and are
 not a recovery path. Treat initialized proof state and erasure as forward-only;
 repair with a compatible release, never downgrade storage or rewrite stored
-hashes. The unchanged `00001` plus additive `00002` bundle refuses Down, including against
-a seemingly empty database; reset and rollback to zero are not recovery paths.
+hashes. The baseline in the [canonical bundle](devops-operations.md#canonical-packaged-migration-inventory)
+refuses Down, including against a seemingly empty database; reset and rollback
+to zero are not recovery paths.
 
 Restore `public.identity_schema_version`, both chain/payload tables and sequence
 state, both heads, erasure index, holds, governance/workflow, registration attempts, retention settings
@@ -1124,6 +1163,13 @@ coherent database rewrite or rolled-back backup. External anchoring remains
 deferred; Task 5.3 deployment sign-off and Task 5.5 narrative-retention approval
 and cleanup are not satisfied by this worker.
 
+Historical source literals below are evidence identifiers, not authoritative links.
+`1793893850853-phase-5-technical-closure.md` and the later
+`1793914256582-single-migration-baseline.md` are unavailable in the
+inspected checkout and are not required fresh-clone inputs. The following dated
+acceptance text/counts/source identities are preserved unchanged; current
+authority and validation requirements are linked at the top of this guide.
+
 ## Phase 5 Technical Closure (2026-11-05)
 
 The plan `.kilo/plans/1793893850853-phase-5-technical-closure.md` passed fresh
@@ -1138,16 +1184,16 @@ JetStream 2.10, sequentially through the existing Nx harness. Every final exit w
 affirmatively confirmed. Counts include nested test records and repeated package
 coverage across suites, not 6,462 distinct test functions.
 
-| Suite | Passing Package Runs | Passing Test/Subtest Records |
-|---|---:|---:|
-| `test-security-db` | 19 | 1,577 |
-| `test-admin-integration` | 7 | 819 |
-| `test-retention-integration` | 3 | 355 |
-| `test-legal-workflow-integration` | 4 | 671 |
-| `test-grpc-integration` | 4 | 560 |
-| `test-lifecycle-integration` | 1 | 370 |
-| `test-portal-integration` | 11 | 2,110 |
-| Total | 49 | 6,462 |
+| Suite                             | Passing Package Runs | Passing Test/Subtest Records |
+| --------------------------------- | -------------------: | ---------------------------: |
+| `test-security-db`                |                   19 |                        1,577 |
+| `test-admin-integration`          |                    7 |                          819 |
+| `test-retention-integration`      |                    3 |                          355 |
+| `test-legal-workflow-integration` |                    4 |                          671 |
+| `test-grpc-integration`           |                    4 |                          560 |
+| `test-lifecycle-integration`      |                    1 |                          370 |
+| `test-portal-integration`         |                   11 |                        2,110 |
+| Total                             |                   49 |                        6,462 |
 
 Coverage included single-connection migration entrypoints and cancellation,
 pre-00015 populated/initialized/erased-v1 refusal without lost history,
@@ -1219,11 +1265,11 @@ bytes were independently checked against the original executable's embedded
 filesystem; transient loss of temporary copies was recovered with identical
 fingerprints, including working-tree migrations that differed from HEAD.
 
-| Artifact | SHA-256 |
-|---|---|
-| Final `00001_initial_schema.sql` | `1ffe1d6bde9f5d9a80a8d04e9dc2df8410a035af4fdca07c5dc2c0f23a1cc107` |
-| Frozen 20-file fingerprint manifest | `e3826b85f52a2d1ba7f40c05003f1b17ebbb14fb78573d7469ba96388146961f` |
-| Original supported reference runner | `30dccfa9be6bcc529cc2dfd24935ab54a88c9540bea66229335debab9b496bd2` |
+| Artifact                                  | SHA-256                                                            |
+| ----------------------------------------- | ------------------------------------------------------------------ |
+| Final `00001_initial_schema.sql`          | `1ffe1d6bde9f5d9a80a8d04e9dc2df8410a035af4fdca07c5dc2c0f23a1cc107` |
+| Frozen 20-file fingerprint manifest       | `e3826b85f52a2d1ba7f40c05003f1b17ebbb14fb78573d7469ba96388146961f` |
+| Original supported reference runner       | `30dccfa9be6bcc529cc2dfd24935ab54a88c9540bea66229335debab9b496bd2` |
 | Latest guarded standalone baseline runner | `5c8345dbf325517da1cc18f1d9a69d45e65a632302184d61eae6e61dba0d9e27` |
 
 The completed admin browser run identified HEAD
@@ -1241,15 +1287,15 @@ Only fingerprints and sanitized summaries are retained in this document.
 
 ### Schema And Runner
 
-| Evidence | Verified Outcome |
-|---|---|
-| Executable inventory | Exactly one embedded baseline. No historical SQL remains in runtime, test-fixture, build or sqlc schema inputs; the in-memory future migration is test-only. |
-| Complete schema parity | 34 application tables, 242 columns, 153 constraints, 78 indexes, 3 sequences, 11 functions and 17 triggers matched. All 181 non-Goose schema-dump blocks matched after ordering normalization. |
-| Security and seeds | Exact 4-role, 13-permission and 15-grant contents, all application row counts, 2,454 bare effective-privilege checks and 19,648 provisioned ownership/grant-option/RLS checks matched. Provisioning comparison transactions were rolled back and catalog parity rechecked. |
-| Normalization limits | Incidental OIDs, dropped-column holes, seed timestamps, dump ordering and intentional old/new Goose metadata differences only. No function, expression, predicate, default, grant or application row-count differences were accepted. |
-| Lineage and atomicity | Full PostgreSQL migration/CLI tests passed without skips, including immutable legacy version-1/intermediate/20 refusal, coexistence, complete malformed/contradictory histories, permission failures, untracked objects, read-only status/version, lock-held initialization/reinspection and atomic failure/retry. |
-| Forward-only and future | Reset/baseline rollback/rollback-to-zero refused before partial rollback, including after a test-only later version. Future exact-version prerequisites, ordinary up/down/reapply, concurrent first install, one-connection retry, cancellation and bad-session lock cleanup passed. |
-| Final invariants | Auth epoch/status/deletion semantics, encrypted holds, FK actions, immutable audit/ledger tables, effective PUBLIC execute denial, head-function SECURITY DEFINER/search path/timeout, unchanged genesis vectors and both phantom-terminal refusals passed. |
+| Evidence                | Verified Outcome                                                                                                                                                                                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Executable inventory    | Exactly one embedded baseline. No historical SQL remains in runtime, test-fixture, build or sqlc schema inputs; the in-memory future migration is test-only.                                                                                                                                                       |
+| Complete schema parity  | 34 application tables, 242 columns, 153 constraints, 78 indexes, 3 sequences, 11 functions and 17 triggers matched. All 181 non-Goose schema-dump blocks matched after ordering normalization.                                                                                                                     |
+| Security and seeds      | Exact 4-role, 13-permission and 15-grant contents, all application row counts, 2,454 bare effective-privilege checks and 19,648 provisioned ownership/grant-option/RLS checks matched. Provisioning comparison transactions were rolled back and catalog parity rechecked.                                         |
+| Normalization limits    | Incidental OIDs, dropped-column holes, seed timestamps, dump ordering and intentional old/new Goose metadata differences only. No function, expression, predicate, default, grant or application row-count differences were accepted.                                                                              |
+| Lineage and atomicity   | Full PostgreSQL migration/CLI tests passed without skips, including immutable legacy version-1/intermediate/20 refusal, coexistence, complete malformed/contradictory histories, permission failures, untracked objects, read-only status/version, lock-held initialization/reinspection and atomic failure/retry. |
+| Forward-only and future | Reset/baseline rollback/rollback-to-zero refused before partial rollback, including after a test-only later version. Future exact-version prerequisites, ordinary up/down/reapply, concurrent first install, one-connection retry, cancellation and bad-session lock cleanup passed.                               |
+| Final invariants        | Auth epoch/status/deletion semantics, encrypted holds, FK actions, immutable audit/ledger tables, effective PUBLIC execute denial, head-function SECURITY DEFINER/search path/timeout, unchanged genesis vectors and both phantom-terminal refusals passed.                                                        |
 
 ### Quality, Images And Browsers
 
@@ -1258,20 +1304,20 @@ entry point for workspace tasks. Linux test-target command overrides used a
 read-only workspace mount, Go 1.26.9 and CGO/GCC for race checks; no assertion was
 weakened for the Windows host.
 
-| Gate | Verified Outcome |
-|---|---|
-| `schemas:lint`, `identity-api:sqlc-vet`, `identity-api:sqlc-generate` | Passed. All 28 generated files reproduced identically on repeat generation. Against the frozen reference, only four query-comment files differed; models, SQL statements, signatures and protobuf output did not change. |
-| `identity-api:test` and `identity-api:test-race` | Full Linux unit and race targets passed. A separate integration-tagged, real-PostgreSQL Linux race run passed `internal/migrate` and `cmd/migrate` (502.189s and 1.019s). |
-| `identity-api:vet`, `identity-api:lint` | Normal and integration-tagged whole-backend checks passed; lint reported zero issues. A competing-linter attempt was rerun serially. |
-| `identity-api:test-portal-fixture` | Passed. |
-| CI API/worker/operator binaries | All ten resolved build targets passed uncached: API, admin audit publisher, admin roles, admin legal, lifecycle publisher, audit signer, purge worker, security-ledger purge, deletion notifier and portal fixture. |
-| Fresh Linux/amd64 image | Built from the hardened runner. Immutable image ID: `sha256:7ed607ffc66457cb2d5facc617944752382128267400cca6b0a03058eb1fc210`. Maintenance-entrypoint/missing-credential smoke passed. |
-| Packaged migrator | Eleven image-level smoke operations passed on an owned database: exactly one pending/applied source, read-only fresh status, history 0/1, repeated/up-to-1 no-ops, immutable down/reset/unknown-target and legacy refusals, and missing-DSN status. The standalone guarded runner's separate 14-check smoke also passed. |
-| Consistent restoration | Matching PostgreSQL 16 clients exercised both ordinary and expanded `pg_dump`/`pg_restore` paths plus four repeated frozen TEMPLATE clones: nine checks passed, zero failures/skips. Data, sequences, proofs, crypto/binding, replay, signing and forward-only invariants were retained. This is local restoration evidence, not deployed-backup certification. |
-| Existing helper/image harness tests | 142 tests passed, zero skips. |
-| Frontend unit/production build | `web:test` passed 25 suites/586 tests; `web:build` passed. |
-| `web:test-admin-browser` | Production-built real-API/signing/probe run passed: 42 layout checks and 27 legal verifications. Run `ce30ed9c1bd60a7ada15b24dfaf6995c`; service namespace `b89de3b6a7148ed8600f23719061cd9a`; assertions and teardown passed, worktree identity matched. Windows used the immutable image above for the production signer. |
-| `web:test-portal-browser` | Production-built real-API portal/deletion/recovery run passed: 18 light/dark viewports and six no-JavaScript shells; teardown completed. |
+| Gate                                                                  | Verified Outcome                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schemas:lint`, `identity-api:sqlc-vet`, `identity-api:sqlc-generate` | Passed. All 28 generated files reproduced identically on repeat generation. Against the frozen reference, only four query-comment files differed; models, SQL statements, signatures and protobuf output did not change.                                                                                                                                        |
+| `identity-api:test` and `identity-api:test-race`                      | Full Linux unit and race targets passed. A separate integration-tagged, real-PostgreSQL Linux race run passed `internal/migrate` and `cmd/migrate` (502.189s and 1.019s).                                                                                                                                                                                       |
+| `identity-api:vet`, `identity-api:lint`                               | Normal and integration-tagged whole-backend checks passed; lint reported zero issues. A competing-linter attempt was rerun serially.                                                                                                                                                                                                                            |
+| `identity-api:test-portal-fixture`                                    | Passed.                                                                                                                                                                                                                                                                                                                                                         |
+| CI API/worker/operator binaries                                       | All ten resolved build targets passed uncached: API, admin audit publisher, admin roles, admin legal, lifecycle publisher, audit signer, purge worker, security-ledger purge, deletion notifier and portal fixture.                                                                                                                                             |
+| Fresh Linux/amd64 image                                               | Built from the hardened runner. Immutable image ID: `sha256:7ed607ffc66457cb2d5facc617944752382128267400cca6b0a03058eb1fc210`. Maintenance-entrypoint/missing-credential smoke passed.                                                                                                                                                                          |
+| Packaged migrator                                                     | Eleven image-level smoke operations passed on an owned database: exactly one pending/applied source, read-only fresh status, history 0/1, repeated/up-to-1 no-ops, immutable down/reset/unknown-target and legacy refusals, and missing-DSN status. The standalone guarded runner's separate 14-check smoke also passed.                                        |
+| Consistent restoration                                                | Matching PostgreSQL 16 clients exercised both ordinary and expanded `pg_dump`/`pg_restore` paths plus four repeated frozen TEMPLATE clones: nine checks passed, zero failures/skips. Data, sequences, proofs, crypto/binding, replay, signing and forward-only invariants were retained. This is local restoration evidence, not deployed-backup certification. |
+| Existing helper/image harness tests                                   | 142 tests passed, zero skips.                                                                                                                                                                                                                                                                                                                                   |
+| Frontend unit/production build                                        | `web:test` passed 25 suites/586 tests; `web:build` passed.                                                                                                                                                                                                                                                                                                      |
+| `web:test-admin-browser`                                              | Production-built real-API/signing/probe run passed: 42 layout checks and 27 legal verifications. Run `ce30ed9c1bd60a7ada15b24dfaf6995c`; service namespace `b89de3b6a7148ed8600f23719061cd9a`; assertions and teardown passed, worktree identity matched. Windows used the immutable image above for the production signer.                                     |
+| `web:test-portal-browser`                                             | Production-built real-API portal/deletion/recovery run passed: 18 light/dark viewports and six no-JavaScript shells; teardown completed.                                                                                                                                                                                                                        |
 
 Masked browser artifacts and sanitized reports are retained only under the
 approved temporary `baseline-admin-browser` and `baseline-portal-browser` roots.
@@ -1288,15 +1334,15 @@ interrupted lifecycle. Its successful suites are not claimed as one complete
 uninterrupted job. Lifecycle and portal completed in a second fresh serial batch with
 the same implementation and assertions, not reduced test selections.
 
-| Target | Packages | Passed Checks | Failed | Skipped | Final Outcome |
-|---|---:|---:|---:|---:|---|
-| `test-security-db` | 19 | 2030 | 0 | 0 | Passed. |
-| `test-admin-integration` | 7 | 825 | 0 | 0 | Passed. |
-| `test-retention-integration` | 3 | 355 | 0 | 0 | Passed. |
-| `test-legal-workflow-integration` | 4 | 671 | 0 | 0 | Passed. |
-| `test-grpc-integration` | 4 | 560 | 0 | 0 | Passed. |
-| `test-lifecycle-integration` | 1 | 370 | 0 | 0 | Passed in the second fresh batch. |
-| `test-portal-integration` | 11 | 2110 | 0 | 0 | Passed in the second fresh batch. |
+| Target                            | Packages | Passed Checks | Failed | Skipped | Final Outcome                     |
+| --------------------------------- | -------: | ------------: | -----: | ------: | --------------------------------- |
+| `test-security-db`                |       19 |          2030 |      0 |       0 | Passed.                           |
+| `test-admin-integration`          |        7 |           825 |      0 |       0 | Passed.                           |
+| `test-retention-integration`      |        3 |           355 |      0 |       0 | Passed.                           |
+| `test-legal-workflow-integration` |        4 |           671 |      0 |       0 | Passed.                           |
+| `test-grpc-integration`           |        4 |           560 |      0 |       0 | Passed.                           |
+| `test-lifecycle-integration`      |        1 |           370 |      0 |       0 | Passed in the second fresh batch. |
+| `test-portal-integration`         |       11 |          2110 |      0 |       0 | Passed in the second fresh batch. |
 
 The earlier development batch, started before final fixture corrections, was
 deadline-limited and is not accepted as final-source evidence. Scoped migration,

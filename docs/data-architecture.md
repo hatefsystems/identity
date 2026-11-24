@@ -1,6 +1,14 @@
 # Hatef Identity Platform - Data Architecture & Database Schemas
 
-This document defines the storage topology, physical database schemas, application-layer encryption workflows, and logging systems for the Hatef Identity Platform. It covers PostgreSQL (primary transactional system), Redis (session, rate limit, and temporary storage), and ClickHouse (append-only analytical audit ledger).
+This document separates current storage at HEAD
+`85abb13a27196c229efa7f59d7ef5beebb1d7e49` (inspected 2026-11-24) from planned
+security-state ownership. PostgreSQL is currently authoritative for account/policy
+versions and mutations; Redis still carries earned sessions/preauth/token/replay
+authority. ClickHouse is a later target, not a deployed analytical ledger.
+[Policy](authentication-and-recovery-policy.md) governs SEC01-SEC16;
+[assessment](security-architecture-assessment.md) records current conflicts;
+[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) is Proposed;
+[readiness](security-testing-and-readiness.md) owns observed validation.
 
 ---
 
@@ -12,10 +20,10 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 
 The following is a selected schema illustration, not executable production
 provisioning or a substitute for the applied migrations in
-`apps/identity-api/db/migrations`. The active forward-only bundle is unchanged
-`00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`,
-`00003_username_reservations.sql` and `00004_geography_catalog.sql`, tracked
-through version 4 in `public.identity_schema_version`. No legacy history adoption,
+`apps/identity-api/db/migrations`. The active forward-only bundle is `00001`
+through `00011`, including private data, optional email/evidence and purpose-bound
+maintenance. [Packaged migration inventory](devops-operations.md#canonical-packaged-migration-inventory)
+is the canonical install authority; `public.identity_schema_version` tracks it. No history adoption,
 baseline rewrite or Down/reset is implied. Additional columns/state are described
 below and in the bundle. Canonical-v2 payloads do not contain their
 own event UUID or chain digest, and contracted legal requests have no plaintext
@@ -36,25 +44,25 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- 1. Users Table (Core Identity)
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email VARCHAR(255) NOT NULL, -- Global UNIQUE constraint removed to allow reuse after Soft Delete/Deactivation
+    email VARCHAR(255) NULL, -- Migration 00006 permits absence, never an empty fabricated address
     password_hash VARCHAR(255) NULL, -- NULL for passwordless WebAuthn-only accounts
     backup_email_encrypted BYTEA NULL, -- Wrapped PII (AES-GCM-256)
-    backup_email_blind_index VARCHAR(64) NULL, -- Cryptographic blind index: SHA-256(Email + Pepper)
+    backup_email_blind_index VARCHAR(64) NULL, -- Keyed HMAC under the explicit email identity profile
     phone_encrypted BYTEA NULL,        -- Wrapped PII (AES-GCM-256)
-    phone_blind_index VARCHAR(64) NULL, -- Cryptographic blind index: SHA-256(Phone + Pepper)
+    phone_blind_index VARCHAR(64) NULL, -- Keyed HMAC index
     mfa_totp_secret_encrypted BYTEA NULL, -- Wrapped PII (AES-GCM-256)
     is_mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'pending_verification', 'pending_deletion')),
+    status VARCHAR(50) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'pending_verification', 'pending_deletion', 'banned')),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP WITH TIME ZONE NULL -- Support soft deletion for Right to be Forgotten retention windows (30-day Grace Period)
 );
 
--- Partial Unique Index to enforce email uniqueness only for active accounts, permitting reuse after soft-deletion
-CREATE UNIQUE INDEX idx_users_email ON users(email) WHERE deleted_at IS NULL;
+-- Pending deletion retains reservations throughout its original reclaim window.
+CREATE UNIQUE INDEX idx_users_email ON users(email) WHERE deleted_at IS NULL OR status = 'pending_deletion';
 CREATE INDEX idx_users_status ON users(status);
-CREATE UNIQUE INDEX idx_users_phone_blind ON users(phone_blind_index) WHERE deleted_at IS NULL AND phone_blind_index IS NOT NULL;
-CREATE UNIQUE INDEX idx_users_backup_email_blind ON users(backup_email_blind_index) WHERE deleted_at IS NULL AND backup_email_blind_index IS NOT NULL;
+CREATE UNIQUE INDEX idx_users_phone_blind ON users(phone_blind_index) WHERE (deleted_at IS NULL OR status = 'pending_deletion') AND phone_blind_index IS NOT NULL;
+CREATE UNIQUE INDEX idx_users_backup_email_blind ON users(backup_email_blind_index) WHERE (deleted_at IS NULL OR status = 'pending_deletion') AND backup_email_blind_index IS NOT NULL;
 
 -- 2. Roles & Permissions Table (RBAC)
 CREATE TABLE roles (
@@ -115,7 +123,7 @@ CREATE TABLE mfa_totp_enrollments (
 CREATE INDEX idx_mfa_totp_enrollments_user ON mfa_totp_enrollments(user_id);
 CREATE INDEX idx_mfa_totp_enrollments_expires ON mfa_totp_enrollments(expires_at);
 
--- 5. Recovery Codes (Backup Codes) Table
+-- 5. Current untyped recovery pool, not the planned two-family schema
 CREATE TABLE recovery_codes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -124,7 +132,7 @@ CREATE TABLE recovery_codes (
     used_at TIMESTAMP WITH TIME ZONE NULL
 );
 
--- Index is critical to perform O(1) matching. It avoids sequential password-like decryption loops.
+-- Indexed matching avoids sequential password-KDF work, not O(1) timing.
 CREATE UNIQUE INDEX idx_recovery_codes_hash ON recovery_codes(code_hash) WHERE used_at IS NULL;
 CREATE INDEX idx_recovery_codes_user_id ON recovery_codes(user_id);
 
@@ -242,12 +250,12 @@ inventory/verify history and explicitly bootstrap both
 known terminal positions with writers stopped as described in
 [admin operations](admin-operations.md#security-ledger-retention-task-54).
 
-| Protected relation | State |
-|---|---|
-| `audit_log_chain`, `security_ledger_chain` | `seq bigint`, unique `event_id uuid`, `leaf_hash bytea(32)`, `chain_hash bytea(32)`; one append-only node per event with no expiry. |
-| `audit_log_head`, `security_ledger_head` | `singleton boolean` primary key constrained to true, nonnegative `seq bigint`, 32-byte `chain_hash`; each head must match its actual terminal node, or its derived chain-specific genesis when empty. |
-| `security_ledger_erasures` | Positive inclusive `first_seq`, `last_seq`, `operation_id uuid`, `erased_at timestamptz`; append-only span annotations, not checkpoint digests or policy certificates. |
-| `security_ledger_retention_settings` | `singleton boolean` primary key constrained to true, `audit_subject text`; explicitly provisioned subject binding for maintenance receipts, never worker-writable. |
+| Protected relation                         | State                                                                                                                                                                                                 |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_log_chain`, `security_ledger_chain` | `seq bigint`, unique `event_id uuid`, `leaf_hash bytea(32)`, `chain_hash bytea(32)`; one append-only node per event with no expiry.                                                                   |
+| `audit_log_head`, `security_ledger_head`   | `singleton boolean` primary key constrained to true, nonnegative `seq bigint`, 32-byte `chain_hash`; each head must match its actual terminal node, or its derived chain-specific genesis when empty. |
+| `security_ledger_erasures`                 | Positive inclusive `first_seq`, `last_seq`, `operation_id uuid`, `erased_at timestamptz`; append-only span annotations, not checkpoint digests or policy certificates.                                |
+| `security_ledger_retention_settings`       | `singleton boolean` primary key constrained to true, `audit_subject text`; explicitly provisioned subject binding for maintenance receipts, never worker-writable.                                    |
 
 Genesis is explicit initialized proof state, not an inference from empty payloads.
 Missing/malformed heads and terminal mismatches fail closed even for historical or
@@ -300,7 +308,6 @@ PubAck or `published_at` is not chaining; missing retained material is unavailab
 assurance. All-erased is not content verification. Neither operation independently
 detects coherent privileged rewrite/rollback; external anchoring stays deferred.
 
-
 ### 1.1.3 Lifecycle Revisions and Outbox (Task 6.3)
 
 The fresh baseline includes nonnegative `users.lifecycle_revision`, independent
@@ -350,25 +357,28 @@ together; outbox failure rolls back the name. Credential auth-version/epoch and
 sessions are unchanged. HTTP revisions stay decimal strings to avoid JavaScript
 rounding. gRPC name and revision are read from the same minimized snapshot.
 
-V1 lifecycle validation/producers are retained. V2 adds only the explicit
-`display_name` changed-field capability; both versions and legacy v1 tombstones
-remain readable. Unknown versions/fields still fail validation. Retain additive
-columns and v2-compatible publisher/readers during rollback, and upgrade downstream
-consumers before deploying name writers.
+V1 lifecycle validation/producers are retained, including actual primary-email
+metadata changes. V2 supports `display_name` and `private_profile`; both versions
+and existing v1 tombstones remain readable. Unknown versions/fields fail. Current
+private-profile ciphertext, exact revision and coarse v2 marker share one transaction
+(`apps/identity-api/internal/profile/private.go:310-368`,
+`apps/identity-api/internal/lifecycle/enqueue.go:105-131`). Keep compatible readers
+through rollback and deploy consumers before security-changing writers; no queued
+payload rewrite or new invented format.
 
 ### 1.1.5 Durable Registration Attempts
 
 Migration 2 adds `registration_attempts`, not users or privileged seeds. Pending
 attempts cannot log in and have no resulting account. The durable contract is:
 
-| Material | Binding / lifetime |
-|---|---|
-| Attempt ID, capability SHA-256 hash, browser JKT | Independent opaque ID and 256-bit capability, hashed at rest; exact original JKT. ID/email alone cannot resume or recover authority. |
-| Pending envelope | Existing AES-GCM format binds attempt/JKT/signup purpose and freezes exact canonical email, Iranian E.164 phone, random eight-byte WebAuthn handle and ceremony revision. No raw capability/email token/OTP/private authenticator key is persisted. |
-| Token/proof/challenge metadata | Hashes, bounded references/revisions and verification timestamps are separate from delivery ACKs. Email proof at most 10m; passkey challenge at most 5m, each capped by immutable pending expiry. |
-| Pending/failed state | Original pending lifetime 15m; resends/holds/retries do not restart it. Failed outcomes retain their bounded stored terminal/receipt metadata. Finite SQL capacity/admission bounds cannot be bypassed by cleanup failure. |
-| Completion fingerprint and resulting-user FK | Final caller-owned commit creates user+resident UV credential+encrypted verified phone+revision-1 created intent+receipt atomically. Transient envelope/token/challenge fields clear. No role/password/mailbox/session; existing-user attachment is never conflict recovery. |
-| Completed receipt / cleanup | One hour from completion, subject to current holds and original-user FK `ON DELETE CASCADE`. Receipt access remains capability+JKT-bound and cannot authenticate or prevent lawful purge. |
+| Material                                         | Binding / lifetime                                                                                                                                                                                                                                                           |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Attempt ID, capability SHA-256 hash, browser JKT | Independent opaque ID and 256-bit capability, hashed at rest; exact original JKT. ID/email alone cannot resume or recover authority.                                                                                                                                         |
+| Pending envelope                                 | Existing AES-GCM format binds attempt/JKT/signup purpose and freezes exact canonical email, Iranian E.164 phone, random eight-byte WebAuthn handle and ceremony revision. No raw capability/email token/OTP/private authenticator key is persisted.                          |
+| Token/proof/challenge metadata                   | Hashes, bounded references/revisions and verification timestamps are separate from delivery ACKs. Email proof at most 10m; passkey challenge at most 5m, each capped by immutable pending expiry.                                                                            |
+| Pending/failed state                             | Original pending lifetime 15m; resends/holds/retries do not restart it. Failed outcomes retain their bounded stored terminal/receipt metadata. Finite SQL capacity/admission bounds cannot be bypassed by cleanup failure.                                                   |
+| Completion fingerprint and resulting-user FK     | Final caller-owned commit creates user+resident UV credential+encrypted verified phone+revision-1 created intent+receipt atomically. Transient envelope/token/challenge fields clear. No role/password/mailbox/session; existing-user attachment is never conflict recovery. |
+| Completed receipt / cleanup                      | One hour from completion, subject to current holds and original-user FK `ON DELETE CASCADE`. Receipt access remains capability+JKT-bound and cannot authenticate or prevent lawful purge.                                                                                    |
 
 Dedicated cleanup has only registration SELECT/DELETE and legal-hold SELECT with
 actual non-owner login checks. It takes the subject lock before completed-row
@@ -384,26 +394,35 @@ credential-free lookup probes are not signup bootstrap.
 To generate the idiomatic, type-safe Go code, the database queries must be defined inside `.sql` files.
 
 #### Sample `query.sql` for Recovery Code verification and atomic deletion:
+
 ```sql
 -- name: GetActiveRecoveryCodeForUpdate :one
-SELECT id, user_id, code_hash 
-FROM recovery_codes 
-WHERE code_hash = $1 AND user_id = $2 AND used_at IS NULL 
+SELECT id, user_id, code_hash
+FROM recovery_codes
+WHERE code_hash = $1 AND user_id = $2 AND used_at IS NULL
 FOR UPDATE;
 
 -- name: DeleteRecoveryCodePhysically :exec
-DELETE FROM recovery_codes 
+DELETE FROM recovery_codes
 WHERE id = $1;
 ```
 
 #### Verification Lifecycle:
+
 1. When a user supplies a recovery code, the Go backend SHA-256 hashes the code.
-2. The hash is used in a single query via `GetActiveRecoveryCodeForUpdate` passing both the hash and the authenticating `user_id`. The database uses `idx_recovery_codes_hash` to locate it in $O(1)$ time and applies a row-level lock (`FOR UPDATE`).
+2. The hash is queried with the bound account ID and `FOR UPDATE`. B-tree lookup avoids sequential KDF work, not constant-time SQL or O(1) execution. Anonymous recovery's selected account is not already normal-authenticated.
 3. If a match is found, the backend directly triggers its permanent, transactional physical deletion (`DeleteRecoveryCodePhysically`) in the same ACID database transaction, avoiding redundant intermediate database UPDATE operations.
 
 #### Factor-mutation lock invariant:
 
-Passkey deletion and TOTP disablement both begin a transaction and acquire `GetUserByIDForUpdate` first. Passkey deletion then locks that user's WebAuthn rows in stable credential-ID order before it counts and deletes. TOTP disablement counts passkeys while holding the same user-row mutex before clearing the secret. This common lock order serializes cross-factor races and guarantees at least one passkey remains, reflecting that WebAuthn is currently the only browser session-issuing login surface.
+Current password-fallback mutations acquire username policy guard before account
+advisory/user-row locks; passkeys are locked in stable credential-ID order. The
+shared resulting-state policy admits last-passkey removal only when eligible
+enabled username/password remains. It is inaccurate to say only WebAuthn issues
+normal sessions or every account must retain a passkey. Current privileged
+passkey-or-TOTP protection is weaker than planned verified hardware plus independent
+backup. Source: `apps/identity-api/internal/accountpolicy/policy.go:31-80` and
+`apps/identity-api/internal/webauthn/service.go:797-887`.
 
 Credential/recovery/SMS mutations also carry the session's admitted auth version,
 take the subject lock and recheck locked active/nondeleted user state before
@@ -415,7 +434,10 @@ separate shared Redis tuple claim through the full accepted leeway window.
 
 ## 2. PII Storage & Application-Layer Encryption
 
-To comply with high-security privacy directives, Personal Identifiable Information (PII) is encrypted at the application layer before reaching PostgreSQL. This is handled using **AES-GCM-256 Envelope Encryption**.
+Selected phone, backup-email, MFA, private-attribute and pending-ceremony payloads
+use application-layer **AES-GCM-256 Envelope Encryption**. Primary `users.email`
+and linkable metadata remain plaintext exposure; this is not encryption of all
+PII or proof of compliance with a privacy directive.
 
 ```
                            +--------------------------------------+
@@ -425,8 +447,8 @@ To comply with high-security privacy directives, Personal Identifiable Informati
                                               | Injects one KEK/version at process startup
                                               v
 +------------------+       +--------------------------------------+
-| Plaintext PII    | ----> |       Go Application Layer           |
-| (Phone / Email)  |       |                                      |
+| Selected private | ----> |       Go Application Layer           |
+| payloads only    |       |                                      |
 +------------------+       | 1. Generates 256-bit cryptographically|
                            |    secure random DEK (Data Enc Key).  |
                            | 2. Encrypts PII with DEK (AES-GCM).  |
@@ -486,37 +508,148 @@ use the same profile/generation before acceptance. Do not send digest/pepper to 
 browser, rewrite signed history, rehash old Unicode records or add dual-normalized/
 historical multi-pepper search. Existing ASCII and generic-index bytes remain intact.
 
-- **Uniqueness & Indexing:** Blind indexes are stored in separate database columns (`phone_blind_index`, `backup_email_blind_index`) and indexed via B-tree. This enables $O(1)$ fast lookups without revealing plain text.
+- **Uniqueness & Indexing:** B-tree indexes enable exact keyed lookup without scanning/decrypting all values. Neither O(1) complexity nor SQL timing secrecy is claimed; equality/frequency/linkage metadata remains visible to database readers.
 - **Key Custody:** Operators inject one KEK/version and one pepper/version into local process memory. There is no live Infisical fetch/cache/hot rotation, historical key retrieval or transparent multi-generation reader. Retired backup keys, controlled rotation/re-encryption and verified recovery remain operator obligations. Non-exact PII queries remain prohibited.
 
 ---
 
+## Planned Security Authority
+
+This is a **proposed SQL model**, not an applied migration or generated query
+contract. Extend existing services and `auth_version`/`auth_epoch` semantics;
+never repurpose `lifecycle_revision` or rewrite signed/queued history. Primary
+PostgreSQL, not stale replicas or Redis claims, decides earned evidence,
+normal/preauth issuance, deadlines/revocation, proof/code/TOTP replay, policy/security
+generations and repair barriers (SEC09). Every production human birth requires
+mandatory immutable username and at least one verified contact; existing nullable
+records/readers are real contracts, not a hypothetical claim/login lane.
+
+### Earned Facts and Constraints
+
+Relation/column names below are illustrative; final DDL/retention/ACLs require task
+review. References are opaque durable IDs, never raw password/code/session secrets
+or private material in diagnostics, notifications or events.
+
+| Planned SQL relation                                    | Explicit earned facts / deciding constraints                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `account_security_state` / existing `users`             | Nonnegative exact security version, `auth_version`, ordering `auth_epoch`, authoritative policy/category version, independent-MFA requirement and primary/factor generations; one per account. Lifecycle revision is separate. Every relevant credential/contact/role/recovery mutation serializes on the account. Missing policy is denial. An epoch inside a restored backup is not an independent rollback witness.                                                                                                              |
+| `authentication_evidence`                               | Account, primary method (`password`/`passkey` only), primary credential/generation, primary verification UTC, actual assertion UV (`verified`/`not_applicable`), actual TOTP factor/generation/matched step/time, separately nullable consumed MFA-backup ID/family generation, original `auth_time`, full-policy completion UTC, captured security/policy versions and original JKT. No contact primary, no `TOTP=true` from backup/enrollment and no full-policy time before all required evidence passes.                        |
+| `preauthentication`                                     | Hashed capability, account/evidence ID, JKT, captured versions, fixed absolute UTC expiry, bounded attempts and consumed/revoked state. No normal authority. Primary/MFA facts revalidated at completion; consume once with durable replay/backup consumption and normal session creation in the same transaction.                                                                                                                                                                                                                  |
+| `browser_sessions`                                      | Hashed random token, unique public ID, account/evidence ID, kind, original JKT, captured versions, created/activity/idle/absolute UTC and revocation. `created_at <= last_seen_at < idle_expires_at <= absolute_expires_at`. Activity cannot alter evidence/auth time/absolute ceiling. Valid SQL evidence/current policy required at issuance and deciding use; revoked/expired IDs cannot be recreated by delayed retry. Restricted repair is never normal authority.                                                             |
+| `action_authorizations` / existing purpose proofs       | Hashed handle or signed-grant reference, immutable account/SID/JKT/purpose/target/earned-evidence/version bindings, original deadline, issuance source and consumed/revoked state. Current generic Step-up is not action-scoped; planned consumers need explicit purpose admission or exact frozen authorization, not invented current claims. Caller-owned deciding SQL transaction spends authority.                                                                                                                              |
+| `saved_code_families`, `saved_codes`                    | Account, `family` (`mfa_backup`/`arc`), positive generation, key version, admitted policy and one active generation per account/family. >=128 random bits; purpose/account/generation-bound HMAC-SHA-256 under dedicated external key and distinct family domains. Unique bound verifier; consumed/revoked rows or durable tombstones preserve one-use evidence under approved retention. No routine saved-code expiry; grant/viewer deadlines are distinct.                                                                        |
+| `recovery_ceremonies`, `repair_grants`                  | Hashed capabilities, account/target/JKT, original ten-minute deadline, ARC consumption reference, old-contact association/provenance/generation, fresh ownership evidence, captured versions and eligible pre-existing primary evidence for TOTP repair. Grant expiry <=5m and remaining ceremony. One consumed grant mutates one named factor; ordinary category/clear barrier rechecked at admission and final write.                                                                                                             |
+| `repair_barriers`                                       | Account, successful repair ID/factor/generation/time, repair-era security/policy versions and nullable later fresh full-policy evidence that cleared it. Never browser/cache/countdown scoped. Clear only at later genuinely fresh full-policy normal admission. A repaired password qualifies for unchanged ordinary password-only policy; required MFA needs actual TOTP/admitted backup.                                                                                                                                         |
+| `totp_replay_claims`                                    | Account, TOTP factor ID/generation, matched RFC 6238 step, original acceptance end and outcome. Unique `(account_id,factor_id,factor_generation,time_step)` across login, Step-up, reclaim and replacement. Retain through complete acceptance/skew and uncertainty; Redis flush cannot imply unseen. No raw six-digit code/hash. Multiple accepted-step matching needs a deterministic documented rule.                                                                                                                            |
+| `contact_associations` / evidence history               | Account/channel, opaque association ID, exact encrypted canonical destination/keyed index, association/verification UTC, proof method/generation, registration exemption, replaced/removed UTC, `recovery_eligible_at` and security version. Evidence matches exact current association. Added/replaced verified contact eligible >=verification+24h; unknown provenance ineligible. Re-add creates new association; reverification cannot shorten an existing restriction. Last eligible destination protected under account lock. |
+| `security_admission`, replay/nonce state                | Purpose-scoped account/destination/subnet/global budgets, verified proof JKT/JTI/nonce identities, fixed windows and bounded capacity. Critical limits cannot silently reset on Redis loss/corruption: durable SQL floors or closed admission required. Preserve stricter existing budgets.                                                                                                                                                                                                                                         |
+| OAuth grants/code/refresh/assertion consumption         | Durable principal kind/client/subject/scope/key/session/evidence/version/deadline/revocation and successor/spent metadata; confidential authentication for every applicable exchange. CLIENT has no human/session authority. SQL issuance/rotation preserves one-winner and ambiguous-result refusal.                                                                                                                                                                                                                               |
+| Existing privacy/lifecycle/audit/notification relations | Same-snapshot exact private/lifecycle revisions and privacy grants/statuses, nullable email/stable NULL-aware account attribution, metadata-only wire formats and v1/v2 readers. Approved transactional intents precede security-changing writers; never include private values or invent an audit format. Preserve queued recipient/locale/token/deadline exactly.                                                                                                                                                                 |
+
+Illustrative **planned constraint sketches**, not runnable provisioning:
+
+```sql
+UNIQUE (account_id, family, generation, verifier);
+UNIQUE (account_id, totp_factor_id, factor_generation, time_step);
+CHECK (primary_method IN ('password', 'passkey'));
+CHECK (primary_method <> 'passkey' OR actual_uv = 'verified');
+CHECK (actual_totp = FALSE OR verified_totp_claim_id IS NOT NULL);
+CHECK (repair_grant_expires_at <= ceremony_expires_at);
+CHECK (repair_grant_expires_at <= grant_created_at + INTERVAL '5 minutes');
+CHECK (initial_registration OR recovery_eligible_at >= verified_at + INTERVAL '24 hours');
+```
+
+Cross-row complete-policy admission, last-factor/contact counts, barriers and
+consumption require transactions; CHECK alone cannot establish them. Persist
+verified hardware admission provenance/policy with the authenticator and separately
+enrolled independent backup. UV/AAGUID/transport/sync/backup flags are not hardware
+proof. Evaluate role admission and privileged use, not inventory alone. HMAC helps
+database-read compromise; SQL-writer/application/key compromise remains distinct.
+
+### Global Lock Order
+
+**Planned order agreed with policy/ADR:** global username/security policy guards
+in fixed order; applicable existing ledger coordination; account advisory locks in
+UUID order; `users` rows in UUID order; deterministic operation rows; intent writes.
+Never acquire an earlier class after a later class. Fresh deciding READ COMMITTED
+statements follow waits, not a pre-wait CTE snapshot. Current
+`apps/identity-api/internal/username/store.go:77-129` and
+`apps/identity-api/internal/pglock/account.go:13-39` already impose policy before
+account and applicable ledger before account. The whole proposed protocol is not
+claimed implemented in every current service.
+
+Proposed operation-row suborder: session/evidence/preauth, contact association,
+code family/code, action/repair/ceremony proof, credential/MFA/replay, hold/lifecycle,
+then outbox; sort keys within each class. Callers take only needed classes but
+declare them before locking, with no mid-operation upgrade. Registration for a
+not-yet-existing account takes policy guard then attempt row; allocation of the
+new account/children stays inside its birth transaction, never existing-account
+attachment. Ledger/audit head locks are separate domains; never invoke synchronous
+signing from an account-locked transaction. Durable intent is not chain signing.
+Final review must check trigger/FK/purge/hold/role lock effects; documentation is not
+a deadlock proof. Existing worker/run/head lock domains remain distinct.
+
+### Deciding Transaction and Failure Behavior
+
+1. Perform bounded password/native/provider work outside long-held locks. Its result is provisional and bound to captured account/policy/factor/ceremony, not authority after a state change.
+2. Begin caller-owned primary SQL transaction, take ordered guards/locks and read fresh status/category/security/policy, live session/evidence/JKT, original deadline, purpose/target, family/contact versions, barrier and surviving factors. Check after all waits/slow dependencies and immediately before deciding writes. Missing/expired/stale/unknown facts deny.
+3. Consume applicable proof/code/TOTP replay once with mutation or normal issuance; advance versions, set barrier for repair or clear only at fresh full-policy login and preserve required MFA. Metadata audit/notification intent shares this commit. Competing repairs/role/removal operations see one serialized deciding state.
+4. Return authority/secret/success only after known commit. Unknown SQL/provider acknowledgement is not rollback: no refund, session reissue, secret retrieval, duplicate birth or automatic replay. Explicit task-defined read-only inspection reports committed/absent/unknown facts, never re-earns authority. Failed fresh-session delivery leaves the account for ordinary login.
+5. Update Redis acceleration and dispatch durable intents after commit. **No SQL+Redis/provider atomicity** exists. Cache errors cannot change committed facts or revive authority. A cache hit/miss is not authorization; primary reread or closed admission is required, never reconstruction from unsigned claims.
+
+Regeneration increments only its family generation, revokes derived grants and
+never clears the barrier. Ordinary password/passkey changes retain unrelated
+uncompromised saved codes but fence derived sessions/proofs via security version.
+TOTP changes revoke MFA Backup generation; privilege changes/deletion revoke
+consumer families; compromise revokes implicated credentials/families. Preserve
+unrelated credentials and actual untyped artifacts until concrete dependency
+inventory/owner-approved handling; never interpret one code as both purposes.
+[Policy code lifecycle](authentication-and-recovery-policy.md#code-lifecycle)
+owns exact issuance/revocation rules.
+
+### Primary, Failover and Restore
+
+Primary-only authority reads need bounded indexes/pooling/contention. Acknowledged
+write durability, fencing, replication lag/failover acceptance must be observed;
+synchronous HA/zero-loss is not established. A snapshot may resurrect spent codes,
+removed credentials, old grants and a clear barrier even after sessions are cleared.
+An epoch inside the same backup is not independent rollback evidence. Keep authority
+quarantined until post-backup mutations are independently reconciled or affected
+authority safely invalidated under approved incident policy. Reconciliation never
+recreates earned authority. [Disaster recovery](disaster-recovery.md), SEC16/T42D
+own gates; these sketches authorize no database/migration/deployment execution.
+
 ## 3. Redis Session & OTP Storage Layout
 
-Redis provides low-latency credential authority and temporary state. Session/grant misses are not cache misses that may be reconstructed from a signed token. Task 7.3 also shares WebAuthn ceremonies across API replicas, separately from the existing session/grant and DPoP namespaces.
+The following inventory is **current authority-bearing Redis**, not the planned
+non-authoritative topology above. Session/grant misses cannot reconstruct authority
+from signed tokens; structural validation of Redis evidence still does not prove
+it was earned (assessment F06). WebAuthn ceremonies share replica state separately
+from sessions/grants/DPoP. Redis ACL/TLS/availability remain necessary now, but do
+not establish future SEC09 completion.
 
 ### 3.1 Redis Keyspaces & TTL Policies
 
-| Keyspace Pattern | Data Type | TTL Value | Purpose |
-| :--- | :--- | :--- | :--- |
-| `identity:session:v1:token:<token_hash>` | Hash | Remaining idle lifetime | User, kind, captured auth-version, IP/device metadata, key binding, absolute/idle times and restricted-enrollment claim. Normal sessions default to 2h idle / 24h absolute; restricted sessions have a hard 10-minute lifetime. |
-| `identity:session:v1:id:<n>:<user_id>:<session_id>` | String | Idle lifetime; revoked marker until absolute expiry | Owner-scoped public-ID lookup. `<n>` is the UTF-8 byte length of the user ID. Revoked markers prevent delayed creation retries from restoring authority. |
-| `identity:session:v1:user:<n>:<user_id>` | Hash | Latest indexed absolute expiry | Owner index for live-session lists and atomic account-wide session revocation. |
-| `identity:v1:oauth:code:<code_hash>` | String (JSON) | At most 60s, capped by parent absolute expiry | Single-use code with captured normal-session ID/version, client, redirect URI and PKCE challenge. Consumed with `GETDEL`. |
-| `identity:v1:oauth:grant:<grant_id>` | String (JSON) | Parent browser absolute expiry; client grant at most 10m | Immutable principal/client/scope/key/session/version binding and active/revoked state. Every access JWT references this authority. |
-| `identity:v1:oauth:refresh:<token_hash>` | String (JSON) | Grant lifetime | Active/rotated/revoked refresh metadata. Active-token expiry is checked separately; retired evidence survives while the grant can remain usable. Atomic rotation writes the successor and retires the old token together. |
-| `identity:v1:oauth:user:<user_id>` | ZSET | Latest grant expiry | Account-wide grant index, never a global key scan on the request path. |
-| `dpop:v1:replay:<scoped_hash>` | String | Complete acceptance window plus a rounded-up Redis millisecond | Hash of realm, verified JKT and JTI; includes allowed future-clock skew and proof-age skew rather than a fixed 60-second cache. |
-| `dpop:v1:nonce:<scoped_hash>` | String | 5 Minutes | Single-use nonce bound to the authorization-server, resource-origin or dedicated browser realm and verified proof key. No raw proof, nonce or JTI is stored in a key. |
-| `webauthn:challenge:v1:<sha256_challenge>` | Hash | Ceremony TTL, default 5m, maximum 15m | Versioned, bounded pending ceremony with exact flow/account/session/applicable DPoP binding and frozen optional registration name. Atomic binding check precedes deletion; wrong bindings do not consume it. |
-| `otp:sms:secret:{verification_id}` | Hash | 3 Minutes | Pending phone proof addressed by a 256-bit opaque ID and bound to the exact user, initiating session, normalized phone, HMAC-SHA-256 code hash, issue time, and attempt counter. |
-| `recovery:transaction:{sha256(transaction_id)}` | String | 10 Minutes | One-time recovery-start subject. `GETDEL` consumes the transaction before the submitted recovery code is evaluated, so spent, invalid, and replayed transactions converge on the same failure surface. |
-| `rate:otp:phone:{phone}` | String | 1 Hour | Tracks SMS OTP requests made to a specific phone number. |
-| `rate:otp:subnet:{ip_subnet}` | String | 1 Hour | Tracks SMS OTP requests made by an IP subnet to prevent distributed spam. |
-| `stepup:replay:v1:{hmac_sha256}` | String | Remaining logical lifetime (<=5 min) | Cluster-wide replay claim for either a grant JTI or a TOTP exchange. The suffix is HMAC-SHA-256 over the namespaced logical identity with `STEPUP_REPLAY_HMAC_KEY`; Redis never receives a raw JTI, user ID, or guessable TOTP-derived value. Atomic `SET NX` permits exactly one claimant. |
-| `rate:stepup:verify:subnet:{ip_subnet}` | ZSET | 1 Hour | Bounds Step-up verification attempts per IP subnet. |
-| `rate:stepup:verify:account:minute:{user_id}` | ZSET | 1 Minute | Bounds Step-up verification attempts per account per minute. This is the window that keeps a 6-digit TOTP passcode out of brute-force reach. |
-| `rate:stepup:verify:account:hour:{user_id}` | ZSET | 1 Hour | Bounds sustained Step-up verification attempts per account. |
+| Keyspace Pattern                                    | Data Type     | TTL Value                                                      | Purpose                                                                                                                                                                                                                                                                                     |
+| :-------------------------------------------------- | :------------ | :------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `identity:session:v1:token:<token_hash>`            | Hash          | Remaining idle lifetime                                        | User, kind, captured auth-version, IP/device metadata, key binding, absolute/idle times and restricted-enrollment claim. Normal sessions default to 2h idle / 24h absolute; restricted sessions have a hard 10-minute lifetime.                                                             |
+| `identity:session:v1:id:<n>:<user_id>:<session_id>` | String        | Idle lifetime; revoked marker until absolute expiry            | Owner-scoped public-ID lookup. `<n>` is the UTF-8 byte length of the user ID. Revoked markers prevent delayed creation retries from restoring authority.                                                                                                                                    |
+| `identity:session:v1:user:<n>:<user_id>`            | Hash          | Latest indexed absolute expiry                                 | Owner index for live-session lists and atomic account-wide session revocation.                                                                                                                                                                                                              |
+| `identity:v1:oauth:code:<code_hash>`                | String (JSON) | At most 60s, capped by parent absolute expiry                  | Single-use code with captured normal-session ID/version, client, redirect URI and PKCE challenge. Consumed with `GETDEL`.                                                                                                                                                                   |
+| `identity:v1:oauth:grant:<grant_id>`                | String (JSON) | Parent browser absolute expiry; client grant at most 10m       | Immutable principal/client/scope/key/session/version binding and active/revoked state. Every access JWT references this authority.                                                                                                                                                          |
+| `identity:v1:oauth:refresh:<token_hash>`            | String (JSON) | Grant lifetime                                                 | Active/rotated/revoked refresh metadata. Active-token expiry is checked separately; retired evidence survives while the grant can remain usable. Atomic rotation writes the successor and retires the old token together.                                                                   |
+| `identity:v1:oauth:user:<user_id>`                  | ZSET          | Latest grant expiry                                            | Account-wide grant index, never a global key scan on the request path.                                                                                                                                                                                                                      |
+| `dpop:v1:replay:<scoped_hash>`                      | String        | Complete acceptance window plus a rounded-up Redis millisecond | Hash of realm, verified JKT and JTI; includes allowed future-clock skew and proof-age skew rather than a fixed 60-second cache.                                                                                                                                                             |
+| `dpop:v1:nonce:<scoped_hash>`                       | String        | 5 Minutes                                                      | Single-use nonce bound to the authorization-server, resource-origin or dedicated browser realm and verified proof key. No raw proof, nonce or JTI is stored in a key.                                                                                                                       |
+| `webauthn:challenge:v1:<sha256_challenge>`          | Hash          | Ceremony TTL, default 5m, maximum 15m                          | Versioned, bounded pending ceremony with exact flow/account/session/applicable DPoP binding and frozen optional registration name. Atomic binding check precedes deletion; wrong bindings do not consume it.                                                                                |
+| `otp:sms:secret:{verification_id}`                  | Hash          | 3 Minutes                                                      | Pending phone proof addressed by a 256-bit opaque ID and bound to the exact user, initiating session, normalized phone, HMAC-SHA-256 code hash, issue time, and attempt counter.                                                                                                            |
+| `recovery:transaction:{sha256(transaction_id)}`     | String        | 10 Minutes                                                     | One-time recovery-start subject. `GETDEL` consumes the transaction before the submitted recovery code is evaluated, so spent, invalid, and replayed transactions converge on the same failure surface.                                                                                      |
+| `rate:otp:phone:{phone}`                            | String        | 1 Hour                                                         | Tracks SMS OTP requests made to a specific phone number.                                                                                                                                                                                                                                    |
+| `rate:otp:subnet:{ip_subnet}`                       | String        | 1 Hour                                                         | Tracks SMS OTP requests made by an IP subnet to prevent distributed spam.                                                                                                                                                                                                                   |
+| `stepup:replay:v1:{hmac_sha256}`                    | String        | Remaining logical lifetime (<=5 min)                           | Cluster-wide replay claim for either a grant JTI or a TOTP exchange. The suffix is HMAC-SHA-256 over the namespaced logical identity with `STEPUP_REPLAY_HMAC_KEY`; Redis never receives a raw JTI, user ID, or guessable TOTP-derived value. Atomic `SET NX` permits exactly one claimant. |
+| `rate:stepup:verify:subnet:{ip_subnet}`             | ZSET          | 1 Hour                                                         | Bounds Step-up verification attempts per IP subnet.                                                                                                                                                                                                                                         |
+| `rate:stepup:verify:account:minute:{user_id}`       | ZSET          | 1 Minute                                                       | Bounds Step-up verification attempts per account per minute. This is the window that keeps a 6-digit TOTP passcode out of brute-force reach.                                                                                                                                                |
+| `rate:stepup:verify:account:hour:{user_id}`         | ZSET          | 1 Hour                                                         | Bounds sustained Step-up verification attempts per account.                                                                                                                                                                                                                                 |
 
 > **Deployment invariant:** outside explicit development, Step-up replay claims
 > use Redis and every replica must share the same `STEPUP_REPLAY_HMAC_KEY`.
@@ -546,7 +679,9 @@ TTLs and two-second request deadlines; and never falls back after Redis errors.
 Anonymous login options/verification and reclaim options share subnet rate limits
 before allocating challenge/nonce state.
 
-Redis eviction/reset fails closed and requires reauthentication or a new ceremony. Use appropriate
+Loss of session/grant records refuses their authority, but loss of a TOTP/Step-up
+replay marker can make the same still-valid proof appear unseen (F06). It is not
+accurate to claim every eviction/reset fails closed. Use appropriate
 ACLs/TLS and an eviction/availability policy suitable for authority, not a
 disposable performance cache. Never restore stale session/grant/replay snapshots
 after revocation; invalidate the namespace and require new authentication instead.
@@ -563,9 +698,10 @@ Atomic replay authority does not by itself certify fleet rollout or Redis operat
 To prevent toll-fraud and SMS bombing, SMS OTP triggers are tracked across independent Redis keys instead of composite structures (e.g., `phone:IP`).
 
 #### Sliding Window Implementation via Redis sorted sets (ZSET):
-* **Key:** `rate:otp:phone:{phone}`
-* **Key:** `rate:otp:subnet:{ip_subnet}` (Subnet calculations group IPs to `/24` for IPv4 and `/48` for IPv6 to block proxy-rotation scripts).
-* **Process:** On each request, execution is performed atomically inside a single round-trip using a Redis Lua script:
+
+- **Key:** `rate:otp:phone:{phone}`
+- **Key:** `rate:otp:subnet:{ip_subnet}` (Subnet calculations group IPs to `/24` for IPv4 and `/48` for IPv6 to block proxy-rotation scripts).
+- **Process:** On each request, execution is performed atomically inside a single round-trip using a Redis Lua script:
   ```lua
   local key = KEYS[1]
   local now = tonumber(ARGV[1])
@@ -606,7 +742,7 @@ CREATE TABLE audit_logs (
     user_agent String,
     payload String,               -- Minimized JSON; audit records still contain personal data
     timestamp DateTime64(6, 'UTC') DEFAULT now64(),
-    
+
     -- Chained Cryptographic hash for auditing integrity
     chain_hash FixedString(32)    -- SHA-256 hash chaining records together
 ) ENGINE = MergeTree()
@@ -624,8 +760,9 @@ To prevent parallel write bottlenecks and lock contention inherent to multi-writ
    $$\text{chain\_hash}(N) = \text{SHA-256}\Big(\text{chain\_prefix} \ \big|\big|\ \text{chain\_hash}(N-1) \ \big|\big|\ \text{leaf\_hash}(N)\Big)$$
 
 Where:
-* `record(N)` is serialized by the existing Go canonical serializer with chain-specific NUL-terminated prefixes; nullable Class C `user_id` is excluded. Stored bytes/hashes are never retroactively rewritten.
-* Verification checks links/retained leaves/ledger annotations against the durable heads. Monitoring integration and thresholds remain operator gates; sequence allocation gaps alone are not integrity failures.
+
+- `record(N)` is serialized by the existing Go canonical serializer with chain-specific NUL-terminated prefixes; nullable Class C `user_id` is excluded. Stored bytes/hashes are never retroactively rewritten.
+- Verification checks links/retained leaves/ledger annotations against the durable heads. Monitoring integration and thresholds remain operator gates; sequence allocation gaps alone are not integrity failures.
 
 ### Task 5.5 workflow storage
 
@@ -667,10 +804,11 @@ ancestor at the requested revision; an unversioned retired lookup uses its last-
 revision, not an invented original meaning. A historical/retired lookup cannot
 authorize a new selection. See [geography operations](devops-operations.md#geography-catalog-t08t09).
 
-Future T10 must encrypt the validated `catalog_revision` together with the exact
-country/province/locality IDs in its account/purpose-bound payload. Saving must
-revalidate and bind the server snapshot; client labels, paths and revisions are
-never authority. Unversioned legacy evidence cannot establish an original revision.
+Current T10 private-data writes encrypt the validated `catalog_revision` with
+country/province/locality IDs in the account/purpose-bound payload and revalidate
+the server snapshot. Registration collection/integration remains planned T31-T37.
+Client labels/paths/revisions are never authority; absent original version evidence
+cannot establish historical provenance.
 
 These are actual current inventories, not blanket legal approval. `no_expiry`
 means no implemented finite expiry, not anonymous data, approved indefinite
@@ -679,24 +817,24 @@ and workflow's five-field replay approvals do not cover every table below.
 The DDL migrations and current cleanup/replay serializers remain the source of
 truth; restore their state consistently and include them in notices/ROPA/DPIA/DSAR.
 
-| Relation / material | Retained fields and linkage | Actual lifetime / cleanup |
-|---|---|---|
-| `registration_attempts` pending/failed | Opaque attempt, capability hash, original JKT, encrypted frozen contacts/handle/ceremony, proof hashes/times/references and immutable expiry/revisions. Transient Class A personal data, not an account or authentication session. | Pending 15m, email <=10m, passkey <=5m; proof checks expire independently of physical cleanup. Dedicated bounded cleanup; finite admission capacity prevents unbounded allocation. |
-| `registration_attempts` completed receipt | Capability/JKT-bound outcome, fingerprint, proof/terminal timestamps and resulting-user reference; transient envelope/token/challenge material cleared. | Receipt 1h after completion, current-subject-hold aware. Hold never renews authority; resulting-user FK cascade cannot block lawful purge. Backups keep their independent protected rotation policy. |
-| `admin_action_contexts` | `action_id`, nullable `account_ref`, `details_encrypted`, `created_at`, `retain_until`; encrypted moderation/inquiry context is still personal data. | Original `created_at +` approved context duration; strict `retain_until < cutoff`, hold-aware physical cleanup. No clock rewriting. |
-| Contracted `legal_holds` | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives. | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns in the fresh baseline. |
-| Live workflow/case associations | `legal_cases` original clocks, policy/state/revision and preparer/approver/auth-version fields; `legal_case_subjects(case_id,account_ref,current)`; `legal_case_holds(case_id,hold_id,account_ref,current)`. Historical associations remain even when not current. | Expiry is `min(created_at + max_age, closed_at + closed_retention)` where closed; at-or-after equality cleanup only without any historically associated subject hold. Reviews/retries/releases do not reset it. |
-| `legal_workflow_events` | `id`, `scope`, `scope_kind`, `revision`, `purpose`, `actor`, `auth_version`, `action_id`, `created_at`, `body_encrypted`. Bound encrypted revision/review/response/delivery narratives are restricted personal data. | Physical deletion with case/hold-review cleanup at original workflow expiry, subject to independent holds. Not a permanent narrative archive. |
-| `legal_hold_reviews` | `hold_id`, `account_ref`, `policy_id`, `version`, nullable `next_review_at`; original `legal_holds.review_at` is not overwritten. | At-or-after release-relative approved expiry, absent any active hold on account; state and encrypted history are deleted, not represented as never-created history. |
-| `legal_workflow_replays` | Before cleanup, five fields plus `event_id` joining encrypted history. After cleanup exactly `operation`, `scope`, `idempotency_key`, `result_id`, `erased` (`event_id=NULL`). `hold_review` scope/result joins the surviving hold tombstone, so subject/actor/time correlation remains possible. Case scope/result joins a case sentinel/external intake. | `no_expiry` remains the supported replay protocol. No narratives, actors or fingerprints inside the erased stub, but no claim of absence of joinable personal metadata. |
-| Erased `legal_cases` sentinel | Retains `id`, `status='erased'`, zero `version`, `content_revision`, `proposal_revision`, `reviewed_revision`, `response_content_revision`, `approved_proposal_revision`, and `decision='pending'`. Policy, received/created/closed/review/expiry times, content/response event IDs, preparer/approver/auth versions become NULL; associations/history are deleted. | No sentinel expiry implemented (`no_expiry`). ID remains correlatable with replay or external records; it is not a reconstructed case or narrative. |
-| `legal_transparency_reports` | `id`, `version`, `year`, `data_version`, `schema_version`, `policy_id`, exact `payload`, `digest`, `status`, `prepared_by`, `prepared_auth_version`, `prepared_at`, nullable `approved_by`, `approved_auth_version`, `approved_at`, `downloaded_at`. Restricted personal approval provenance differs from export-safe aggregate payload. | No report/provenance cleanup implemented (`no_expiry`). Snapshot/provenance is immutable apart from permitted approval/download transitions. |
-| `legal_transparency_replays` | `operation`, `scope`, `idempotency_key`, bounded JSON `input`, exact-byte `result`. Prepare/approve results retain `id`, `version`, `year`, `data_version`, `policy_version`, `digest`, `payload`, `status`, `prepared_by`, optional `approved_by`, `stale`, `replayed`; download result retains `payload`, `replayed`. Inputs include year/version or exact approval data version/policy/digest; scope links a year or report. | No expiry/minimization worker (`no_expiry`). Not covered by the five-field erased workflow-stub approval. No actor/auth-version timestamps are fabricated into the result, but report actor provenance remains joinable. |
-| Governance provenance | `legal_governance_policies`: `id`, complete `artifact` (approval/inventory references, fixture, clocks, numeric periods, field inventories/lifetimes and optional workflow), `installed_by`, `operator_identity`, `action_id`, `installed_environment`, `installed_at`. Baseline: `singleton`, `policy_id`, `bound_at`. | Immutable with no expiry (`no_expiry`). Personal operator/action/time provenance and external approval/inventory references require their own governance inventory, not inferred replay approval. |
-| Aggregate reporting state | Coverage `singleton,started_at`; years `year,data_version`; months `month,received,answered,full_disclosure,partial_disclosure,no_responsive_data,refusal,preservation_acknowledgement`. No per-case IDs. | Permanent/no expiry. Exact small-cell counters stay internal; suppression is not anonymity or differential privacy. |
-| Both chain nodes/heads | Chain `seq,event_id,leaf_hash,chain_hash`; heads `singleton,seq,chain_hash`; sequence allocation state. Event UUIDs/digests can correlate to other records and remain one node per event after body erasure. | No expiry (`no_expiry`), no constant-size post-erasure compaction. Class B payload expiry does not delete these nodes. |
-| Ledger erasures/receipts/outbox | Erasures `first_seq,last_seq,operation_id,erased_at`; settings `singleton,audit_subject`. Receipt body `operation_id,cutoff,deleted_count,held_count,dry_run,outcome,highwater_seq` and new `span_manifest_version,span_manifest_sha256`; Class C carries system actor/event UUID/time and leaf/chain digest. Shared outbox retains `id,subject,payload,created_at,published_at,attempts,last_error,admin_action,next_attempt_at` and nullable lifecycle IDs/revisions. These are operation/time/digest-correlatable metadata, not account narratives. | Erasures/settings and retained administrative receipt outbox/Class C material have no finite cleanup here (`no_expiry`); publication is not chaining. Missing future retained receipt material is unavailable assurance, not success. Lifecycle rows have separate approved acknowledged/transport cleanup, not the admin receipt policy. |
-| Class C retained payload | `seq,user_id,actor_id,actor_spiffe_id,event_type,action_status,client_ip,user_agent,payload,timestamp`; nullable user FK can clear but actor/network/action/hold/digest linkage remains. | No Class C purge worker or approved implemented expiry supplied here; current indefinite retention is an open storage-limitation gap, not approval. |
+| Relation / material                       | Retained fields and linkage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Actual lifetime / cleanup                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `registration_attempts` pending/failed    | Opaque attempt, capability hash, original JKT, encrypted frozen contacts/handle/ceremony, proof hashes/times/references and immutable expiry/revisions. Transient Class A personal data, not an account or authentication session.                                                                                                                                                                                                                                                                                                                     | Pending 15m, email <=10m, passkey <=5m; proof checks expire independently of physical cleanup. Dedicated bounded cleanup; finite admission capacity prevents unbounded allocation.                                                                                                                                                        |
+| `registration_attempts` completed receipt | Capability/JKT-bound outcome, fingerprint, proof/terminal timestamps and resulting-user reference; transient envelope/token/challenge material cleared.                                                                                                                                                                                                                                                                                                                                                                                                | Receipt 1h after completion, current-subject-hold aware. Hold never renews authority; resulting-user FK cascade cannot block lawful purge. Backups keep their independent protected rotation policy.                                                                                                                                      |
+| `admin_action_contexts`                   | `action_id`, nullable `account_ref`, `details_encrypted`, `created_at`, `retain_until`; encrypted moderation/inquiry context is still personal data.                                                                                                                                                                                                                                                                                                                                                                                                   | Original `created_at +` approved context duration; strict `retain_until < cutoff`, hold-aware physical cleanup. No clock rewriting.                                                                                                                                                                                                       |
+| Contracted `legal_holds`                  | `id`, `account_ref`, `applied_by`, `is_active`, `applied_at`, `review_at`, `released_at`, `released_by`, `request_kind`, nullable `idempotency_key`, `details_purged_at`; `details_encrypted` persists while needed. Original subject/actor/time linkage survives.                                                                                                                                                                                                                                                                                     | Active until explicit release. Narrative clears only strict-before approved release-relative expiry and absent all independent active holds. Eleven-field tombstone remains `no_expiry`; no runtime plaintext columns in the fresh baseline.                                                                                              |
+| Live workflow/case associations           | `legal_cases` original clocks, policy/state/revision and preparer/approver/auth-version fields; `legal_case_subjects(case_id,account_ref,current)`; `legal_case_holds(case_id,hold_id,account_ref,current)`. Historical associations remain even when not current.                                                                                                                                                                                                                                                                                     | Expiry is `min(created_at + max_age, closed_at + closed_retention)` where closed; at-or-after equality cleanup only without any historically associated subject hold. Reviews/retries/releases do not reset it.                                                                                                                           |
+| `legal_workflow_events`                   | `id`, `scope`, `scope_kind`, `revision`, `purpose`, `actor`, `auth_version`, `action_id`, `created_at`, `body_encrypted`. Bound encrypted revision/review/response/delivery narratives are restricted personal data.                                                                                                                                                                                                                                                                                                                                   | Physical deletion with case/hold-review cleanup at original workflow expiry, subject to independent holds. Not a permanent narrative archive.                                                                                                                                                                                             |
+| `legal_hold_reviews`                      | `hold_id`, `account_ref`, `policy_id`, `version`, nullable `next_review_at`; original `legal_holds.review_at` is not overwritten.                                                                                                                                                                                                                                                                                                                                                                                                                      | At-or-after release-relative approved expiry, absent any active hold on account; state and encrypted history are deleted, not represented as never-created history.                                                                                                                                                                       |
+| `legal_workflow_replays`                  | Before cleanup, five fields plus `event_id` joining encrypted history. After cleanup exactly `operation`, `scope`, `idempotency_key`, `result_id`, `erased` (`event_id=NULL`). `hold_review` scope/result joins the surviving hold tombstone, so subject/actor/time correlation remains possible. Case scope/result joins a case sentinel/external intake.                                                                                                                                                                                             | `no_expiry` remains the supported replay protocol. No narratives, actors or fingerprints inside the erased stub, but no claim of absence of joinable personal metadata.                                                                                                                                                                   |
+| Erased `legal_cases` sentinel             | Retains `id`, `status='erased'`, zero `version`, `content_revision`, `proposal_revision`, `reviewed_revision`, `response_content_revision`, `approved_proposal_revision`, and `decision='pending'`. Policy, received/created/closed/review/expiry times, content/response event IDs, preparer/approver/auth versions become NULL; associations/history are deleted.                                                                                                                                                                                    | No sentinel expiry implemented (`no_expiry`). ID remains correlatable with replay or external records; it is not a reconstructed case or narrative.                                                                                                                                                                                       |
+| `legal_transparency_reports`              | `id`, `version`, `year`, `data_version`, `schema_version`, `policy_id`, exact `payload`, `digest`, `status`, `prepared_by`, `prepared_auth_version`, `prepared_at`, nullable `approved_by`, `approved_auth_version`, `approved_at`, `downloaded_at`. Restricted personal approval provenance differs from export-safe aggregate payload.                                                                                                                                                                                                               | No report/provenance cleanup implemented (`no_expiry`). Snapshot/provenance is immutable apart from permitted approval/download transitions.                                                                                                                                                                                              |
+| `legal_transparency_replays`              | `operation`, `scope`, `idempotency_key`, bounded JSON `input`, exact-byte `result`. Prepare/approve results retain `id`, `version`, `year`, `data_version`, `policy_version`, `digest`, `payload`, `status`, `prepared_by`, optional `approved_by`, `stale`, `replayed`; download result retains `payload`, `replayed`. Inputs include year/version or exact approval data version/policy/digest; scope links a year or report.                                                                                                                        | No expiry/minimization worker (`no_expiry`). Not covered by the five-field erased workflow-stub approval. No actor/auth-version timestamps are fabricated into the result, but report actor provenance remains joinable.                                                                                                                  |
+| Governance provenance                     | `legal_governance_policies`: `id`, complete `artifact` (approval/inventory references, fixture, clocks, numeric periods, field inventories/lifetimes and optional workflow), `installed_by`, `operator_identity`, `action_id`, `installed_environment`, `installed_at`. Baseline: `singleton`, `policy_id`, `bound_at`.                                                                                                                                                                                                                                | Immutable with no expiry (`no_expiry`). Personal operator/action/time provenance and external approval/inventory references require their own governance inventory, not inferred replay approval.                                                                                                                                         |
+| Aggregate reporting state                 | Coverage `singleton,started_at`; years `year,data_version`; months `month,received,answered,full_disclosure,partial_disclosure,no_responsive_data,refusal,preservation_acknowledgement`. No per-case IDs.                                                                                                                                                                                                                                                                                                                                              | Permanent/no expiry. Exact small-cell counters stay internal; suppression is not anonymity or differential privacy.                                                                                                                                                                                                                       |
+| Both chain nodes/heads                    | Chain `seq,event_id,leaf_hash,chain_hash`; heads `singleton,seq,chain_hash`; sequence allocation state. Event UUIDs/digests can correlate to other records and remain one node per event after body erasure.                                                                                                                                                                                                                                                                                                                                           | No expiry (`no_expiry`), no constant-size post-erasure compaction. Class B payload expiry does not delete these nodes.                                                                                                                                                                                                                    |
+| Ledger erasures/receipts/outbox           | Erasures `first_seq,last_seq,operation_id,erased_at`; settings `singleton,audit_subject`. Receipt body `operation_id,cutoff,deleted_count,held_count,dry_run,outcome,highwater_seq` and new `span_manifest_version,span_manifest_sha256`; Class C carries system actor/event UUID/time and leaf/chain digest. Shared outbox retains `id,subject,payload,created_at,published_at,attempts,last_error,admin_action,next_attempt_at` and nullable lifecycle IDs/revisions. These are operation/time/digest-correlatable metadata, not account narratives. | Erasures/settings and retained administrative receipt outbox/Class C material have no finite cleanup here (`no_expiry`); publication is not chaining. Missing future retained receipt material is unavailable assurance, not success. Lifecycle rows have separate approved acknowledged/transport cleanup, not the admin receipt policy. |
+| Class C retained payload                  | `seq,user_id,actor_id,actor_spiffe_id,event_type,action_status,client_ip,user_agent,payload,timestamp`; nullable user FK can clear but actor/network/action/hold/digest linkage remains.                                                                                                                                                                                                                                                                                                                                                               | No Class C purge worker or approved implemented expiry supplied here; current indefinite retention is an open storage-limitation gap, not approval.                                                                                                                                                                                       |
 
 `SECURITY_LEDGER_RETENTION=8760h` is exactly 365 days, between 4320h (180 days)
 and 13140h (547.5 days); it is not the top of that range. Those are engineering
@@ -710,7 +848,7 @@ Legal requests are independent encrypted rows, unique by `(account_ref, request_
 
 Review/expiry dates are advisory. Released legal narratives and action contexts require explicitly approved retention durations and hold-aware cleanup. The inherited replay tombstones are linkable pseudonymous records requiring explicit approval of their actual field inventory and nonexpiring lifetime, not anonymous tokens; no finite expiry is implemented. Matching replay returns current state without reactivating a released hold; cleaned narrative tombstones conflict rather than recreating a request. Fresh storage has no plaintext narrative columns; obsolete Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 adds separately credentialed ledger payload retention, structural verification and read-only receipt reconciliation, not Task 5.3 deployment approval or Task 5.5 narrative-retention approval. External anchors, phone attribution and pepper rotation remain separate. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002` through `public.identity_schema_version`, stop incompatible writers and isolate PostgreSQL/Redis/NATS before approved cutover. Down/reset refuse; any existing-environment reset needs separate explicit scoped authorization.
+Task 5.4 adds separately credentialed ledger payload retention, structural verification and read-only receipt reconciliation, not Task 5.3 deployment approval or Task 5.5 narrative-retention approval. External anchors, phone attribution and pepper rotation remain separate. Do not grant API ledger DELETE, head EXECUTE or trigger bypass. Install the complete [packaged inventory](devops-operations.md#canonical-packaged-migration-inventory) through `public.identity_schema_version`, stop incompatible writers and isolate PostgreSQL/Redis/NATS before approved cutover. Down/reset refuse; existing-environment reset needs separate explicit scoped authorization.
 
 ### Task 7.6 Legal Disclosure Boundary
 

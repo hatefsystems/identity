@@ -1,18 +1,26 @@
 # Hatef Identity Platform - Disaster Recovery & High Availability
 
-This document outlines the replication topologies, failover procedures, backup strategies, and emergency recovery drills required to maintain a minimum of 99.99% operational uptime for the Hatef Identity Platform.
+This document separates the single-node deployment design and current recovery
+constraints from proposed HA, backup and security-state recovery requirements.
+No deployed HA, measured 99.99% uptime, executed backup schedule or zero-loss
+failover is established. The [authentication policy](authentication-and-recovery-policy.md)
+(SEC09-SEC12, SEC16), [assessment](security-architecture-assessment.md) and
+[security readiness](security-testing-and-readiness.md) govern target release gates.
 
 ---
 
 ## ⚠️ MVP Phase Disclaimer: No HA Deployment
-Due to physical memory constraints in the initial MVP phase, **all clustering and High Availability (HA) mechanisms outlined in this document (including Patroni PostgreSQL and Redis Sentinel) are postponed**. 
+
+Due to physical memory constraints in the initial MVP phase, **all clustering and High Availability (HA) mechanisms outlined in this document (including Patroni PostgreSQL and Redis Sentinel) are postponed**.
 For Phase-1 (MVP), a robust **Single-Instance deployment** of PostgreSQL and Redis is strictly enforced. The HA specifications documented here serve as the blueprint for post-MVP scaling.
 
 ---
 
 ## 1. Database High Availability & Failover
 
-To prevent single points of failure, the databases (PostgreSQL, Redis, and ClickHouse) are configured in multi-node clusters with automated failover orchestration.
+The following topology is a post-MVP proposal, not configured infrastructure.
+Current Compose is single-instance PostgreSQL/Redis; ClickHouse is postponed.
+Future primary SQL authority must not use stale replicas for deciding security reads.
 
 ```
        [ Client Request / Go APIs ]
@@ -45,14 +53,15 @@ To prevent single points of failure, the databases (PostgreSQL, Redis, and Click
 
 ### 1.1 PostgreSQL Patroni-Driven Clustering
 
-Primary-replica failover is managed dynamically using **Patroni** with an **etcd** or **Consul** Distributed Consensus Store (DCS).
+**Patroni** with **etcd** or **Consul** is a proposed orchestration option, not
+deployed automatic failover. Illustrative parameters below require review and drills.
 
-* **Replication Mode:** Asynchronous Streaming Replication with a physical replication slot to prevent WAL segments from being recycled before replica consumption.
-* **Failover Parameters (etcd):**
-  * `ttl`: 30 seconds (time-to-live for leader lock in etcd).
-  * `loop_wait`: 10 seconds (frequency of leader heartbeat checks).
-  * `retry_timeout`: 10 seconds (consecutive network failures before step-down is forced).
-* **Automatic Failover Flow:**
+- **Replication Mode:** The earlier asynchronous streaming sketch can lose acknowledged security mutations. A physical slot protects WAL availability, not acknowledged-write durability. SEC16 forbids promotion that resurrects spent codes, old factors, sessions or revoked policy. Choose and demonstrate a durability/fencing protocol before enabling security authority; no synchronous/zero-loss deployment is claimed.
+- **Failover Parameters (etcd):**
+  - `ttl`: 30 seconds (time-to-live for leader lock in etcd).
+  - `loop_wait`: 10 seconds (frequency of leader heartbeat checks).
+  - `retry_timeout`: 10 seconds (consecutive network failures before step-down is forced).
+- **Automatic Failover Flow:**
   1. If the primary node crashes, the etcd lease expires after 30 seconds.
   2. Standby nodes initiate leader election. The node with the most advanced log sequence number (LSN) is elected.
   3. Patroni reconfigures PgBouncer to route write-traffic to the new leader immediately.
@@ -60,7 +69,10 @@ Primary-replica failover is managed dynamically using **Patroni** with an **etcd
 
 ### 1.2 Redis Sentinel Setup
 
-To prevent token validation and rate-limiting outages, Redis is deployed in a high-availability master-replica topology supervised by **Redis Sentinel**.
+The Sentinel sketch is a proposed availability option, not current Redis deployment
+or security-consistency assurance. Current code relies on Redis earned session,
+challenge and replay state; asynchronous failover can lose claims. Target Redis is
+non-authoritative under SEC09, but critical abuse limits must still fail safely.
 
 ```
                 +-----------------+
@@ -76,12 +88,12 @@ To prevent token validation and rate-limiting outages, Redis is deployed in a hi
     +------------+        +------------+
 ```
 
-* **Cluster Sizing:** 3 Sentinel nodes, 1 Redis Master node, 2 Redis Replica nodes.
-* **Sentinel Core Settings:**
-  * `sentinel monitor hatef-cache redis-master.internal 6379 2` (Quorum is set to 2).
-  * `sentinel down-after-milliseconds hatef-cache 3000` (Sentinel marks Master dead after 3 seconds of unresponsiveness).
-  * `sentinel failover-timeout hatef-cache 10000` (Max duration of the failover process).
-* **Failover Process:**
+- **Cluster Sizing:** 3 Sentinel nodes, 1 Redis Master node, 2 Redis Replica nodes.
+- **Sentinel Core Settings:**
+  - `sentinel monitor hatef-cache redis-master.internal 6379 2` (Quorum is set to 2).
+  - `sentinel down-after-milliseconds hatef-cache 3000` (Sentinel marks Master dead after 3 seconds of unresponsiveness).
+  - `sentinel failover-timeout hatef-cache 10000` (Max duration of the failover process).
+- **Failover Process:**
   1. Once two Sentinels agree the master is down, one Sentinel is elected leader to orchestrate the promotion.
   2. The chosen replica is promoted to Master (`SLAVEOF NO ONE`).
   3. The remaining replica is reconfigured to follow the new master.
@@ -115,42 +127,52 @@ be demonstrated separately. Primitive unit tests do not prove any of these gates
 
 ### 2.2 Master Key Encryption Key (KEK) Rotation Schedule
 
-* **Controlled Rotation:** Operators own the approved schedule and compromise-response procedure. Drain affected writes/readers and inventory retained versions before replacing the single loaded key; current code does not automatically rewrap data or fetch retired keys.
-* **Retired-Key Custody:** Retain protected original keys with backup recovery obligations. Key erasure, backup rotation and lawful erasure require coordinated policy; changing the active KEK alone does not preserve old-row readability.
-* **Pepper and Replay Keys:** Exact canonical-email capture/fallback/lookup must share one declared pepper generation. Generic BlindIndex NFKC behavior is unchanged; no signed-history rehash or dual-normalization/multi-pepper lookup is supplied. Coordinate replay-key cutover across replicas rather than splitting replay domains. See [secret rollout](devops-operations.md#2-secrets-injection--configuration).
+- **Controlled Rotation:** Operators own the approved schedule and compromise-response procedure. Drain affected writes/readers and inventory retained versions before replacing the single loaded key; current code does not automatically rewrap data or fetch retired keys.
+- **Retired-Key Custody:** Retain protected original keys with backup recovery obligations. Key erasure, backup rotation and lawful erasure require coordinated policy; changing the active KEK alone does not preserve old-row readability.
+- **Pepper and Replay Keys:** Exact canonical-email capture/fallback/lookup must share one declared pepper generation. Generic BlindIndex NFKC behavior is unchanged; no signed-history rehash or dual-normalization/multi-pepper lookup is supplied. Coordinate replay-key cutover across replicas rather than splitting replay domains. See [secret rollout](devops-operations.md#2-secrets-injection--configuration).
 
 ---
 
 ## 3. Backup & Recovery Playbook
 
-Data backup strategies must prevent data loss and support recovery within a designated target window.
-* **Recovery Point Objective (RPO):** $<15$ minutes.
-* **Recovery Time Objective (RTO):** $<2$ hours.
+The following are proposed business recovery objectives, not measured guarantees:
+
+- **Business Recovery Point Objective (RPO):** $<15$ minutes.
+- **Recovery Time Objective (RTO):** $<2$ hours.
+
+A business RPO does not authorize fifteen minutes of lost security consumption,
+revocation, replay, barrier or contact-provenance state. Authority remains
+quarantined until rollback-safe reconciliation or approved invalidation is complete.
 
 ### 3.1 Backup Schedules & Specifications
 
-| Database | Backup Type | Frequency | Storage Location | Retention |
-| :--- | :--- | :--- | :--- | :--- |
-| **PostgreSQL** | `pg_dump` Logical Backup | Daily (01:00 UTC) | S3-Compatible Encrypted Object Storage (Air-Gapped) | 30 Days |
-| | WAL-G Physical Backup | Continuous (WAL archiving) | S3-Compatible Storage | 14 Days |
-| **Redis** | RDB Snapshot | Every 6 hours | Local Kubernetes Persistent Volume + S3 | 7 Days |
-| | AOF file | Continuous (fsync every sec) | Local High-IOPS SSD | 24 Hours |
-| **ClickHouse** | Disk-Level Parts Copy | Weekly (03:00 UTC) | Cold Object Storage (Postponed; Post-MVP only) | 90 Days |
+This is an illustrative proposed schedule/storage inventory. Actual providers,
+encryption/access controls, retention, isolation and quarterly drill ownership
+remain unobserved operational gates. Object storage is not inherently air-gapped;
+Redis snapshots must never restore earned/consumed/revoked authority.
+
+| Database       | Backup Type              | Frequency                    | Storage Location                                                          | Retention         |
+| :------------- | :----------------------- | :--------------------------- | :------------------------------------------------------------------------ | :---------------- |
+| **PostgreSQL** | `pg_dump` Logical Backup | Daily (01:00 UTC), proposed  | Approved encrypted object storage; independent isolation must be verified | 30 Days, proposed |
+|                | WAL-G Physical Backup    | Continuous (WAL archiving)   | S3-Compatible Storage                                                     | 14 Days           |
+| **Redis**      | RDB Snapshot             | Every 6 hours                | Local Kubernetes Persistent Volume + S3                                   | 7 Days            |
+|                | AOF file                 | Continuous (fsync every sec) | Local High-IOPS SSD                                                       | 24 Hours          |
+| **ClickHouse** | Disk-Level Parts Copy    | Weekly (03:00 UTC)           | Cold Object Storage (Postponed; Post-MVP only)                            | 90 Days           |
 
 ### 3.2 Recovery Validation Drills
 
-A backup is only as good as its recovery validation. The operations team executes simulated disaster recovery drills quarterly:
+Quarterly isolated drills are required proposed operations, not recorded execution:
 
-1. **Clean Environment Bootstrapping:** Provision a temporary, isolated Kubernetes namespace.
+1. **Clean Environment Bootstrapping:** Use separately authorized run-owned isolated resources; the MVP does not require Kubernetes. Preserve original incident state and keys.
 2. **PostgreSQL Base Recovery:**
-   * Fetch the latest physical base backup via WAL-G.
-   * Replay WAL files up to a targeted Point-In-Time recovery (PITR) coordinate.
+   - Fetch the latest physical base backup via WAL-G.
+   - Replay WAL files up to a targeted Point-In-Time recovery (PITR) coordinate.
 3. **MFA Encryption Validation:**
-   * Validate retained PII/envelope bindings with the exact separately recovered original KEK/version, not a fictitious contingency key or live/mock Infisical fetch. Record private-key recovery independently of primitive crypto tests.
-4. **Redis Cache Reconstruction:**
-   * Restore the latest RDB file. Validate that the rate limiting sliding window sets are parsed correctly.
+   - Validate retained PII/envelope bindings with the exact separately recovered original KEK/version, not a fictitious contingency key or live/mock Infisical fetch. Record private-key recovery independently of primitive crypto tests.
+4. **Redis State Handling:**
+   - Never restore RDB/AOF earned session/grant/challenge/replay authority. Withdraw affected admission and require controlled reauthentication; verify critical limits survive or fail closed, not silently become empty/unlimited. Target Redis reconstruction cannot earn SQL authority. SQL security rollback still requires section 3.6 reconciliation.
 5. **Ledger Integrity Audit (MVP PostgreSQL / Post-MVP ClickHouse):**
-   * Verify canonical-v2 `audit_log_chain` and `security_ledger_chain` against their own durable heads and derived genesis, recomputing leaves only from retained `mvp_audit_logs` / `security_event_ledger` bodies. Ledger erasure annotations explain absent bodies; they do not prove receipt chaining or legal authorization. These are database-relative checks, not complete-ingestion assurance or detection of a coherently rolled-back backup. Post-MVP ClickHouse still requires its separately approved verification procedure.
+   - Verify canonical-v2 `audit_log_chain` and `security_ledger_chain` against their own durable heads and derived genesis, recomputing leaves only from retained `mvp_audit_logs` / `security_event_ledger` bodies. Ledger erasure annotations explain absent bodies; they do not prove receipt chaining or legal authorization. These are database-relative checks, not complete-ingestion assurance or detection of a coherently rolled-back backup. Post-MVP ClickHouse still requires its separately approved verification procedure.
 
 ### 3.3 Security Ledger Retention Recovery
 
@@ -203,8 +225,8 @@ work, retain both chains/heads/payloads/erasures/holds/settings/outbox, and repa
 with compatible code. A pre-v2 signer or verifier is
 not a safe downgrade. Exact provisioning, revocation and rollout commands are
 in [admin operations](admin-operations.md#security-ledger-retention-task-54).
-The unchanged `00001_initial_schema.sql` plus additive `00002_registration_attempts.sql`
-bundle is forward-only; reset/rollback to zero refuse even after later migrations. Use forward recovery,
+The baseline in the [canonical packaged inventory](devops-operations.md#canonical-packaged-migration-inventory)
+is forward-only; reset/rollback to zero refuse even after later migrations. Use forward recovery,
 not an up/down/up drill, even when payload tables appear empty. Recovery restores
 matching new-lineage metadata and application state consistently; it is not an
 in-place upgrade or adoption of legacy backups. Supported migration entrypoints
@@ -217,8 +239,8 @@ For replacement installation, stop all old writers and identify an explicitly
 scoped fresh PostgreSQL 16 target plus matching fresh/isolated Redis 7/NATS JetStream
 2.10 state. Do not carry stale sessions, queued envelopes or consumer checkpoints
 into the replacement database; recovery of accepted intent needs separate consistent
-reconciliation. Existing data was confirmed disposable, not approved for automatic
-reset: any reset of an existing named environment needs a separate explicit request
+reconciliation. Historical disposal assertions are not authority over current real
+data: any reset of an existing named environment needs a separate explicit request
 identifying its exact targets. No broad volume deletion or shared-schema reset is
 part of these instructions. Follow [active setup](admin-operations.md#migration-and-contraction).
 
@@ -252,8 +274,8 @@ anchor or proof of complete external-response history.
 
 ### 3.5 Registration Recovery
 
-Keep signup intake and cleanup scheduling disabled while restoring migration
-versions 1+2, users/credentials, `registration_attempts`, created-event intent and
+Keep signup intake and cleanup scheduling disabled while restoring the
+[canonical packaged schema](devops-operations.md#canonical-packaged-migration-inventory), users/credentials, `registration_attempts`, created-event intent and
 holds from one consistent point with matching private KEK/pepper generations.
 Preserve original attempt/proof/receipt clocks and current authoritative hold/
 deletion instructions. Restoring a snapshot never extends 15m pending, 10m email,
@@ -274,3 +296,55 @@ Live SMS.ir provenance, billing/egress/handset receipt, Unicode-mailbox delivery
 retention budgets and deployed restore evidence remain independently approved
 gates, not supplied by these instructions or local primitive tests. No reset,
 legacy adoption, automatic target replacement or new live permission is granted.
+
+### 3.6 Security Authority Quarantine and Reconciliation
+
+These are planned SEC09/SEC16 prerequisites, not a delivered restore tool. Existing
+database-relative chain checks and local dated restore drills cannot establish
+that current security authority is newer than a rolled-back snapshot.
+
+1. Close normal/preauthentication/recovery/token/admin/legal admission and affected
+   security writers before restore or uncertain promotion. Fence the old primary
+   and every writer; split-brain or unknown authority stays closed. Quarantine is
+   not erasure: retain evidence, keys, accepted notifications and original clocks.
+2. Restore all coupled SQL security state consistently: accounts/status/policy and
+   security versions, credentials/TOTP generations, saved-code generations and
+   spent/revoked records, authoritative sessions/preauthentication/deadlines,
+   proof consumption/TOTP replay, repair barrier, contact history/provenance,
+   deletion/reclaim/legal holds, registration birth/legal evidence and audit/outbox
+   intent. Current migrations do not yet persist every target fact.
+3. Compare acknowledged post-backup changes against an independently protected
+   rollback witness or authoritative incident/legal/security records. An epoch
+   restored inside the same database is not independent evidence. Restore can
+   resurrect passwords/passkeys and unspent-looking codes even after all sessions
+   are cleared; do not use fresh login against that state as automatic clearance.
+4. Reconcile actual consumption, revocation, MFA/role changes, deletion/holds,
+   contact cooldown provenance and one-repair barriers, or safely invalidate the
+   affected authority through a separately approved procedure. Unknown provenance
+   is not eligible, an unspent ARC cannot earn another repair with the barrier set,
+   and regeneration never clears it. Invalidation must not remove the only valid
+   factor/contact or fabricate another recovery path; unresolved cases stay blocked.
+5. Make all authority reads use the fenced current primary and demonstrate
+   replication-lag/acknowledged-write/failover bounds, pool/index/contention and
+   timeout behavior. A stale read-only replica or successful health check cannot
+   approve session/proof issuance. Unknown commit/provider outcomes require
+   read-only fact reconciliation, never proof refunds, automatic resend, account
+   recreation or renewed authentication.
+6. Restore/reconcile consumers with exact `(iss, sub)`, principal type, lifecycle
+   revisions/tombstones and stream checkpoints. Never infer a human from a client
+   ID, replay an erased user birth or reopen privileged access without verified
+   hardware/backup evidence. Preserve optional email and metadata-only formats.
+7. Retain v1/v2 notification readers and queued recipient/payload/locale/template/
+   token/deadline bytes; missing delivery markers do not prove nondelivery. Resolve
+   original accepted work without extending the 30-day deletion deadline or
+   changed-contact 24-hour cooldown. Preserve T27 until complete lifecycle gates pass.
+8. Require fresh full-policy authentication only after safe authority is established,
+   with original-time truthful primary/UV/TOTP/backup evidence. Fresh SQL-recorded
+   repaired-password login clears an ordinary password-only barrier, but a required
+   MFA policy needs actual TOTP or eligible MFA Backup Code too. Time, refresh,
+   contact OTP and restored/new challenges cannot reset it.
+
+Reopening requires separately observed SQL/Redis loss, forged-state, stale-replica,
+ambiguous-commit, failover/restore and consumer tests plus independent operations
+review under [security readiness](security-testing-and-readiness.md). No zero-loss
+HA, independent anchoring, restore safety or legal approval is supplied by this guide.

@@ -3,8 +3,9 @@
 > fresh checks. Current integration adds localized passkey-only registration,
 > frozen-descriptor preference tests and the newer Unicode/SMTPUTF8 contracts;
 > the original SMS prose adaptation is superseded by operator-owned SMS.ir VERIFY.
-> Hosted CI results on the synchronized PR and final main are authoritative for
-> this integration. Historical counts are not replacement evidence.
+> Hosted CI results belong to their exact synchronized PR/main source. Neither
+> those results nor the historical counts certify the new planned authentication
+> and recovery policy or this documentation-only alignment.
 
 # Persian localization validation
 
@@ -14,6 +15,12 @@ existing routes. The implementation and rollout contract are described in
 verification from manual release acceptance. No production deployment or merge
 is authorized by these results.
 
+The recorded checks, counts, source/toolchain descriptions and unperformed gates
+below are preserved historical evidence verbatim, not current execution. Current
+registration is separately implemented; the historical disconnected-signup and
+ASCII-only presentation descriptions are superseded by the current
+[localization contract](localization.md), not rewritten into new acceptance.
+
 ## Recorded checks
 
 All Nx checks below use `NX_DAEMON=false`, `CI=true`,
@@ -21,25 +28,25 @@ All Nx checks below use `NX_DAEMON=false`, `CI=true`,
 The API checks use Go 1.26.5; the integration runner reads the checked-in module
 version explicitly instead of inheriting a newer host Go.
 
-| Check | Current evidence |
-| --- | --- |
-| Web Jest with coverage | PASS: 31 suites / 704 tests, including router-history, legal-catalog and single-word prose-guard regressions |
-| Shared UI Jest with coverage | PASS: 3 suites / 17 tests |
-| Web/UI lint and typecheck | PASS; repeated after the router-history repair |
-| Recovery/router and localization regression tests | PASS: 83 tests |
-| Go unit and race | PASS: 3,524 passing test/subtest events and 47 tested packages in each run |
-| Go vet and golangci-lint 2.12.2 | PASS, normal and integration-tagged; lint reports zero issues |
-| Go portal and excluded fixture tests | PASS |
-| Protobuf lint, sqlc vet and generated reproducibility | PASS: 27 generated files compared, zero mismatches |
-| API and operational binaries | PASS: ten build targets |
-| API runtime image and packaged command smoke | PASS: actual Dockerfile, nine entrypoints, non-root amd64 runtime |
-| Web runtime image | PASS: actual Dockerfile, non-root amd64 runtime, both-locale image CSP/auth acceptance |
-| Seven serial DB integrations | PASS: security 1,464; admin 758; retention 81; legal workflow 620; gRPC 560; lifecycle 370; portal 2,106. Zero failed or skipped tests in the pinned-toolchain run |
-| Supplemental initial-schema migration | PASS: eight test/subtest events against a disposable database |
-| Existing browser/release/container-policy script tests | PASS: 168 tests, zero failures or skips; repeated with a fresh TMPDIR and no existing `kilo` parent |
-| Production image CSP/auth | PASS: English and Persian; strict nonce/CSP attack probes, keyboard/contrast/reflow, no-JS and exact same-origin font bytes |
-| Real-API portal browser | PASS per locale: 13 checks, 30 viewport states and six no-JS documents; teardown completed |
-| Real-API admin browser | PASS per locale: 28 checks and 70 layouts; teardown completed and worktree identity unchanged throughout each run |
+| Check                                                  | Current evidence                                                                                                                                                   |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Web Jest with coverage                                 | PASS: 31 suites / 704 tests, including router-history, legal-catalog and single-word prose-guard regressions                                                       |
+| Shared UI Jest with coverage                           | PASS: 3 suites / 17 tests                                                                                                                                          |
+| Web/UI lint and typecheck                              | PASS; repeated after the router-history repair                                                                                                                     |
+| Recovery/router and localization regression tests      | PASS: 83 tests                                                                                                                                                     |
+| Go unit and race                                       | PASS: 3,524 passing test/subtest events and 47 tested packages in each run                                                                                         |
+| Go vet and golangci-lint 2.12.2                        | PASS, normal and integration-tagged; lint reports zero issues                                                                                                      |
+| Go portal and excluded fixture tests                   | PASS                                                                                                                                                               |
+| Protobuf lint, sqlc vet and generated reproducibility  | PASS: 27 generated files compared, zero mismatches                                                                                                                 |
+| API and operational binaries                           | PASS: ten build targets                                                                                                                                            |
+| API runtime image and packaged command smoke           | PASS: actual Dockerfile, nine entrypoints, non-root amd64 runtime                                                                                                  |
+| Web runtime image                                      | PASS: actual Dockerfile, non-root amd64 runtime, both-locale image CSP/auth acceptance                                                                             |
+| Seven serial DB integrations                           | PASS: security 1,464; admin 758; retention 81; legal workflow 620; gRPC 560; lifecycle 370; portal 2,106. Zero failed or skipped tests in the pinned-toolchain run |
+| Supplemental initial-schema migration                  | PASS: eight test/subtest events against a disposable database                                                                                                      |
+| Existing browser/release/container-policy script tests | PASS: 168 tests, zero failures or skips; repeated with a fresh TMPDIR and no existing `kilo` parent                                                                |
+| Production image CSP/auth                              | PASS: English and Persian; strict nonce/CSP attack probes, keyboard/contrast/reflow, no-JS and exact same-origin font bytes                                        |
+| Real-API portal browser                                | PASS per locale: 13 checks, 30 viewport states and six no-JS documents; teardown completed                                                                         |
+| Real-API admin browser                                 | PASS per locale: 28 checks and 70 layouts; teardown completed and worktree identity unchanged throughout each run                                                  |
 
 The ordinary Go unit/race commands explicitly skip
 `TestInitialSchemaMigration` and `TestPgAdvisoryLockerMutualExclusion` when
@@ -85,8 +92,9 @@ mechanism (`auth-browser-evidence`, `portal-browser-evidence`, and
 `admin-browser-evidence`). Representative local English/Persian auth, privacy
 and legal screenshots were visually inspected. The local successful runs contain
 128 auth, 60 portal and 140 admin masked screenshots. Runtime services, mail,
-tokens, storage snapshots, HARs and traces are not source or artifact inputs. Local execution records are kept under the ignored
-`.kilo/localization-evidence` directory and are not committed.
+tokens, storage snapshots, HARs and traces are not source or artifact inputs.
+The original local execution records were not committed; they are not required
+fresh-clone inputs and are not replaced by a claim of available raw evidence.
 
 The unmodified upstream `OFL.txt` and `AUTHORS.txt` contain two trailing-space
 lines. Their bytes are preserved for provenance; source whitespace checks exclude
@@ -107,3 +115,36 @@ not upstream signature authentication.
 These gates remain explicitly open. Disabled password/signup/reset/TOTP previews
 stay disconnected; primary-email verification, backup-code login, invitations,
 password-reset delivery and OAuth consent/error pages remain separate product work.
+
+## Required New Policy Acceptance
+
+Historical local execution-record paths above are literal provenance only, not
+required fresh-clone inputs or current artifact locations. No raw browser
+artifacts are published with this documentation. The
+[registration backlog archive](history/registration-backlog-2026-11-23.md) and
+[architecture-plan archive](history/security-architecture-plan-2026-11-24.md)
+preserve their separate historical scope and evidence; they do not add a new
+localization passing run. Current authority remains the policy, localization
+contract, canonical backlog and readiness links below.
+
+This section is planned evidence, not a passing run. Follow
+[security readiness](security-testing-and-readiness.md) and the
+[authentication and recovery policy](authentication-and-recovery-policy.md).
+No application/browser checks were executed for this documentation-only work.
+
+| Required bilingual acceptance                                                                                                                                                                     | Status                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Normal password/UV-passkey login with truthful primary, actual UV/TOTP and separately consumed MFA Backup Code evidence; required-MFA preauthentication never mounts private views (SEC02-SEC05). | Planned; implementation and fresh tests required.                         |
+| Distinct lost-factor ARC plus old eligible contact repair; TOTP repair requires pre-existing primary, privileged recovery denied, `/recover-account` remains deletion-only (SEC04-SEC06).         | Planned; no current lost-factor page acceptance.                          |
+| Durable anti-chaining through alternate settings, new sessions/challenges, code regeneration, restart and preference changes; password-only versus MFA-required reset semantics (SEC07).          | Planned; server persistence and browser contracts required.               |
+| Absolute ten-minute ceremony/five-minute-or-shorter grant; 24-hour contact provenance cooldown, unknown provenance/reverification/re-add denial and registration exemption (SEC08, SEC15).        | Planned; no timer or locale bypass acceptance.                            |
+| Independent family issuance/viewer/download, exact bytes, no auto-copy/delivery, privacy clearing and unknown-write outcomes (SEC05, SEC11).                                                      | Planned; existing untyped viewer evidence is insufficient.                |
+| Current v1/v2 notification replay/rollback with immutable recipients/bytes/locale/token/deadline; nullable email, exact revisions and metadata-only events (SEC14).                               | Required for new writers; preserved historical readers are not removable. |
+| English/Persian desktop/tablet/mobile, light/dark, explicit accessible names, keyboard/focus/status, structural masks and stable provider/ceremony identity (SEC15).                              | Fresh source-bound automated and manual evidence required.                |
+
+Independent Persian security/legal review, physical hardware-backed UV and backup,
+assistive technology/native zoom, real selected email/SMS receipt and deployed
+HTTPS/Server Action/CSP/cookie/log-redaction evidence remain open. Virtual
+authenticators and illustrative gallery frames do not close them. Final combined
+documentation formatting/path validation belongs to the integrating parent and is
+recorded in [the alignment report](documentation-alignment-report.md).

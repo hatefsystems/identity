@@ -2,23 +2,42 @@
 
 This document describes the platform's gRPC/protobuf, REST/OIDC and strict first-party JSON contracts. Browser enrollment shapes below are not new protobuf/event versions. Enabled-feature descriptions are conditional contracts, not acceptance results or deployed capability claims.
 
+Source baseline: `85abb13a27196c229efa7f59d7ef5beebb1d7e49`, inspected 2026-11-24.
+[Policy](authentication-and-recovery-policy.md) owns SEC01-SEC16 and proposed
+authority; [assessment](security-architecture-assessment.md) owns exact findings.
+[ADR](adr/0001-authentication-recovery-and-security-state-authority.md),
+[readiness](security-testing-and-readiness.md) and
+[backlog](../.github/tasks/registration-single-contract-tasks.md) do not activate
+routes. Current shapes below stay current until separately authorized implementation;
+planned shapes are not client-compatible promises or already mounted interfaces.
+
 ## 1. External APIs (REST & OIDC)
+
 These endpoints use the canonical ingress (host Nginx for MVP; Traefik is a later target) and are consumed by the Next.js frontend and authorized OIDC clients.
 
 ### 1.1 Standard OIDC/OAuth2 Endpoints
-Implemented strictly according to OpenID Connect Core 1.0 and OAuth 2.1 specifications.
+
+Scoped current protocol support, not complete OIDC/OAuth conformity. OAuth 2.1 is
+an active draft. Interactive login/consent/code issuance is incomplete
+(`apps/identity-api/internal/server/authorize.go:34-65`).
+
 - `GET /.well-known/openid-configuration`: Discovery endpoint. Indicates mandatory PKCE support (`code_challenge_methods_supported: ["S256"]`), DPoP support, and supported client authentication methods (`token_endpoint_auth_methods_supported: ["private_key_jwt", "none"]`).
 - `GET /oauth2/jwks`: Returns the JSON Web Key Set containing only asymmetric public keys (**RS256** and **ES256**) mapped across a graceful 3-key rotation cycle: `active` (currently signing new tokens), `next` (pre-generated and published key), and `previous` (recently expired key, kept to verify outstanding unexpired tokens).
 - `GET /oauth2/auth`: Authorization endpoint (redirects to login/consent UI). Requires `code_challenge` (S256) and `code_challenge_method=S256` for public clients.
 - `POST /oauth2/token`: Token exchange endpoint (Auth Code, Refresh Token, Client Credentials).
   - **PKCE Verification:** Rejects exchange requests using the `plain` method; strictly validates `code_verifier` with SHA-256 (`S256`).
-  - **Refresh Token Rotation (RTR):** Invalidates the old refresh token and issues a new one. If a previously exchanged/used refresh token is presented, immediate breach detection triggers and revokes all active session tokens for that user.
-  - **DPoP Binding (RFC 9449):** Expects a `DPoP` header containing a valid signed proof JWT. Validates the server-issued `DPoP-Nonce` and verifies that the `jti` of the proof has not been replayed. Returns sender-constrained access and refresh tokens bound to the thumbprint of the client's public key, and issues a `DPoP-Nonce` response header if a nonce refresh is required.
-  - **Client Authentication (`private_key_jwt`):** Confidential clients must authenticate by sending a signed client assertion (`client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`) signed with their pre-registered asymmetric private key. The assertion must contain a unique `jti` and an expiration time `exp` no greater than 5 minutes from generation.
+  - **Refresh Token Rotation (RTR):** One-use grant/session/version/key-bound rotation retains spent metadata. Recognized reuse invokes account-wide breach handling only after required original proof-key validation; a stolen sender-constrained secret alone cannot trigger revocation. Already-admitted work/offline JWT lifetime remains residual.
+  - **DPoP Binding (RFC 9449):** Validated proofs use bounded nonce/JTI replay and produce the bound JKT. The token service selects bearer if no validated proof is supplied (`apps/identity-api/internal/oidc/token/service.go:670-679`); actual client/handler admission determines whether that profile is reachable. Do not claim every token is sender-constrained. Applicable resource-token DPoP and cookie+proof are distinct profiles.
+  - **Client Authentication (`private_key_jwt`):** Current client-credentials exchange invokes client authentication; authorization-code/refresh exchange does not (`apps/identity-api/internal/oidc/token/service.go:283-483,521-525`). **Planned SEC16:** every applicable confidential exchange authenticates a registered asymmetric assertion with bound audience, bounded expiry and durable one-use JTI. Discovery metadata is not proof that every exchange implements its advertised method.
 
 ### 1.2 Authentication Flow (Frontend API)
+
 Discoverable-passkey sign-in issues normal browser sessions. Separately enabled new-account registration verifies an existing owned email/phone and resident UV passkey; it never authenticates the browser or allocates a mailbox. See [registration](#15-new-account-registration).
-- `POST /api/v1/auth/login`: Username/password sign-in when `LOGIN_ENABLED` and the admitted username authority are configured. A usable supported password verifier and retained admitted username are required; populated legacy fields alone do not establish a working login route.
+
+- `POST /api/v1/auth/login`: Current `{username,password}` sign-in when `LOGIN_ENABLED` and admitted username authority are configured. Supported password and admitted immutable username are required; populated fields alone are not authority. Returns normal `204` cookie only when full current policy permits, otherwise `{status:"mfa_required",preauthentication,expires_at}` without normal cookie.
+- `POST /api/v1/auth/login/code/request`: Current `{username,channel}` (`email`/`sms`) conditional contact-code request; returns opaque `202 {status:"code_requested",challenge,expires_at}`. Server selects the protected current contact; acceptance is not receipt.
+- `POST /api/v1/auth/login/code/verify`: Current `{challenge,code}` may issue normal contact-code authority if MFA is disabled, otherwise only preauth. This conflicts with planned SEC02: contacts are never eligible normal primaries.
+- `POST /api/v1/auth/login/mfa`: Current `{preauthentication,code}` with original JKT completes enabled TOTP, not a normal session/grant lookup or MFA Backup Code. Fixed-lifetime three-attempt Redis preauth is current; SQL preauth/replay and truthful backup evidence are planned SEC03/SEC09. Source: `apps/identity-api/internal/server/login.go:18-48,82-141`.
 - `POST /api/v1/auth/logout`: Revokes the current live bound session and clears its cookie. Requires browser proof and matching session intent while a live session exists. Missing/expired-cookie logout remains an idempotent `204`, with exact Origin still required. Dependency failure is not successful revocation.
 
 #### First-Party Browser Boundary (Task 7.3)
@@ -47,37 +66,40 @@ transliteration or ASCII downgrade. Sender/auth values remain ASCII.
 
 - Normal authenticated routes require a live `__Host-` Secure/HttpOnly/SameSite=Strict cookie, an active account and a DPoP proof using the session's originally bound key. Restricted recovery-enrollment and old unbound cookies cannot bootstrap the portal. A missing browser key requires fresh passkey authentication, not attaching a replacement key to an old cookie.
 - Every unsafe first-party request, including login/logout, requires one exact `Origin`. Missing, `null`, multiple, sibling and noncanonical origins are rejected. JSON bodies are bounded UTF-8 objects with valid media types; duplicate fields/trailing documents are rejected, and endpoint-specific schemas reject unknown fields where specified. OAuth token and private gRPC protocols retain their separate admission rules; admin RBAC/Origin requirements are not replaced.
-- Browser DPoP uses its own realm and shared Redis nonce/replay authority. The proof has a fresh JTI, `htm`, canonical `htu`, `iat`, public JWK and server nonce, but no fabricated access-token `ath`. Wrong session kind/key/intent must fail before consuming nonce or replay state. Only fully authorized successful requests renew browser activity.
+- Browser proof uses its own realm and current shared Redis nonce/replay authority. The proof has fresh JTI, `htm`, canonical `htu`, `iat`, public JWK and server nonce, but no fabricated access-token `ath`. This cookie+proof profile is not automatically RFC 9449 resource access-token DPoP. Wrong kind/key/intent fails before consumption; only authorized success renews activity. Planned SEC09 moves earned/replay authority to primary SQL without cookie-only fallback.
 - A pre-handler `401 {"error":"use_dpop_nonce"}` includes `DPoP-Nonce` and `WWW-Authenticate: DPoP error="use_dpop_nonce"`. Retry at most once with a fresh proof/JTI and that nonce. No handler, grant or ceremony has been consumed by this challenge. Do not retry uncertain mutations, authenticator responses or used grants after transport failures.
 - Bootstrap supplies `session.id`; send it as `X-Portal-Session` on authenticated mutations. The portal also sends it on post-bootstrap reads. A supplied mismatched/empty/duplicate intent returns `409 session_changed`, including on reads; discard old account state and re-bootstrap. This public ID is an intent marker, not an authentication credential.
 - All first-party API responses, including errors and empty responses, are `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`. They do not inherit Next.js document middleware. Never log bodies, proofs, cookies, grants, recovery codes, names or identity-bearing URLs; use route-template diagnostics.
 
-| Response | Client handling |
-|---|---|
-| `401 session_required` with Cookie challenge | Normal browser authority is missing, expired, revoked, restricted, unbound or inactive. Clear private state and require authentication. |
-| `401 invalid_dpop_proof` | Proof/key/method/URI/replay validation failed; never downgrade to cookie-only access. |
-| `401 invalid_credentials` during login/step-up | Credential verification failed, not proof that an existing session was lost. An incorrect TOTP stays in the dialog. |
-| `403 insufficient_user_authentication` | Obtain a new, single-use step-up grant. |
-| `409 profile_conflict` | Refresh the saved profile/revision without discarding the unsaved draft. |
-| `409 session_changed` | Clear the stale session snapshot before any further account operation. |
-| `409 last_credential` / `409 last_factor` | The proposed security change would violate current primary-login or privileged-factor policy. The change was refused, even if an earlier list hint allowed it; refresh/review the current state without automatic mutation replay. |
-| `429 rate_limited` | Surface throttling; do not loop challenges or mutations. |
-| `503 temporarily_unavailable` | Dependency failure; do not authorize from cached state or report a successful mutation. |
-| `503 outcome_unknown` | The mutation may have committed. Do not automatically retry, restore spent authority or infer rollback from a later `401`; no tentative setup secret or success is returned. |
+| Response                                       | Client handling                                                                                                                                                                                                                    |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `401 session_required` with Cookie challenge   | Normal browser authority is missing, expired, revoked, restricted, unbound or inactive. Clear private state and require authentication.                                                                                            |
+| `401 invalid_dpop_proof`                       | Proof/key/method/URI/replay validation failed; never downgrade to cookie-only access.                                                                                                                                              |
+| `401 invalid_credentials` during login/step-up | Credential verification failed, not proof that an existing session was lost. An incorrect TOTP stays in the dialog.                                                                                                                |
+| `403 insufficient_user_authentication`         | Obtain a new, single-use step-up grant.                                                                                                                                                                                            |
+| `409 profile_conflict`                         | Refresh the saved profile/revision without discarding the unsaved draft.                                                                                                                                                           |
+| `409 session_changed`                          | Clear the stale session snapshot before any further account operation.                                                                                                                                                             |
+| `409 last_credential` / `409 last_factor`      | The proposed security change would violate current primary-login or privileged-factor policy. The change was refused, even if an earlier list hint allowed it; refresh/review the current state without automatic mutation replay. |
+| `429 rate_limited`                             | Surface throttling; do not loop challenges or mutations.                                                                                                                                                                           |
+| `503 temporarily_unavailable`                  | Dependency failure; do not authorize from cached state or report a successful mutation.                                                                                                                                            |
+| `503 outcome_unknown`                          | The mutation may have committed. Do not automatically retry, restore spent authority or infer rollback from a later `401`; no tentative setup secret or success is returned.                                                       |
 
 ### 1.3 Advanced Security, WebAuthn & Step-up Auth
+
 Endpoints for phishing-resistant logins, Multi-Factor Authentication, and short-lived Step-up verification.
 
 #### WebAuthn Device Management
+
 - `GET /api/v1/auth/webauthn/keys`: Array of owned credentials, including `id`, `name`, enrollment/last-use metadata, existing authenticator flags and required boolean `can_remove` on every entry. The shared server policy evaluates removal from the same locked account snapshot. This is an advisory presentation hint, not authorization or a reservation: DELETE rechecks the proposed result. Registration/rename credential responses keep their existing shape without `can_remove`. Never includes COSE keys. A user-chosen label is not a verified device model.
 - `PATCH /api/v1/auth/webauthn/keys/{id}`: Strict required `{"name":"..."}` plus fresh `X-Step-Up-Auth`; returns the updated credential projection. Foreign/missing IDs share `404 credential_not_found`. Names use the same optional, single-line, 80-code-point normalization as display names below; an empty string clears the label.
 - `DELETE /api/v1/auth/webauthn/keys/{id}`: Remove a specific WebAuthn device (Requires Step-up authentication in `X-Step-Up-Auth`). `{id}` is the unpadded base64url credential ID as returned by `GET /keys`. Scoped to the caller's account: a credential belonging to another account is reported as `404 credential_not_found`, identical to one that does not exist, so credential IDs cannot be probed. Refuses with `409 {"error":"last_credential"}` if neither a passkey nor eligible username/password sign-in would remain. The last passkey is removable only when password login is enabled, its verifier is supported and usable, and the username is retained under the current admitted policy. Accounts with any privileged role also require a surviving passkey or enabled TOTP backed by configured secret material, otherwise `409 {"error":"last_factor"}`. TOTP, verified contacts, backup codes and existing sessions are not primary-login substitutes.
 
 #### WebAuthn Registration & Login Flows
+
 - `POST /api/v1/auth/webauthn/register/generate-options`: Optional `{"name":"..."}` for a new credential on an already authenticated account. The normalized name is frozen in pending state. Accepts exactly one `X-Step-Up-Auth` or the fixed first-passkey `X-Action-Proof` described below. Authority is consumed at start, before options are returned. Enforces RP ID as a clean domain name and validates the exact clientDataJSON origin. The returned `user.id` is a CSPRNG-generated random 64-bit handle, not the account UUID.
 - `POST /api/v1/auth/webauthn/register/verify`: Existing serialized credential-response body; it cannot supply a replacement name. Requires the same bound session and accepts neither start authorization header. Returns `201` with the created named credential and security-invalidation outcome. A foreign-session attempt neither completes nor consumes the pending ceremony.
-- `POST /api/v1/auth/webauthn/login/generate-options`: Get challenge for WebAuthn login. Supports discoverable credentials (usernameless login with an empty `allowCredentials` list) to completely neutralize account harvesting. For legacy user-named flows, if the input identity is unregistered, the endpoint returns a mock challenge with identical structure and delay, although discoverable credentials remain the recommended path due to browser-level key-lookup speed variances on local devices.
-- `POST /api/v1/auth/webauthn/login/verify`: Verify the assertion using the same verified DPoP key that started options generation, issue a bound session cookie and return `204`. The client must then bootstrap `/users/me` before rendering private content.
+- `POST /api/v1/auth/webauthn/login/generate-options`: Current empty/`{}` body starts discoverable login with empty `allowCredentials`; optional `{email}` selects named primary-email lookup. Current named lookup does not prove fresh/current verified contact and exposes all real descriptors versus one decoy, including a multi-key count signal (assessment F03). No universal enumeration-immunity claim. Planned SEC01/SEC02 email selection requires current verified uniquely associated primary email; named responses cannot expose inventories.
+- `POST /api/v1/auth/webauthn/login/verify`: Current same-JKT assertion verification records actual UV, which may be false under preferred UV; full current policy issues `204` cookie or enabled TOTP yields `mfa_required` preauth. Only confirmed normal issuance may bootstrap `/users/me`. Planned SEC02 requires actual UV on every passkey assertion, while SEC03 still requires independent MFA afterward.
 
 Every pending WebAuthn challenge is tagged with its ceremony flow and applicable account/session/key bindings. Shared Redis atomically checks bindings before single-use consumption, allowing start on one API replica and completion on another. Wrong bindings do not burn legitimate state; concurrent valid finishes have one winner. The versioned store has native TTLs (configured default five minutes, maximum fifteen), bounded 64-KiB serialized state and two-second operation deadlines. Redis faults fail closed without process-local fallback. Anonymous login options/verification and reclaim-options admission share a 30-request/IP-subnet/minute budget before allocating challenge/nonce state; the explicit nonce retry also counts. Memory storage is for isolated tests/development only.
 
@@ -88,12 +110,12 @@ wiring or bootstrap capability hint. Normal live session, exact Origin,
 DPoP/JKT, `X-Portal-Session`, strict bounded UTF-8 JSON and no-store protections
 remain required. Recovery-enrollment sessions cannot use it.
 
-| POST operation | Exact request | Successful result |
-|---|---|---|
+| POST operation                                       | Exact request                                                                                | Successful result                                                                            |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `/api/v1/auth/action-proofs/first-passkey/challenge` | `{password, channel}`; `email` or `sms` selects the currently evidenced server-owned contact | `202 {challenge, expires_at}` after one delivery attempt; provider acceptance is not receipt |
-| `/api/v1/auth/action-proofs/first-passkey/verify` | `{challenge, code}` | `200 {action_proof, expires_at}` with the original contact-code deadline |
-| `/api/v1/auth/webauthn/register/generate-options` | Existing optional `{name}` and exactly one start header | Existing `publicKey` plus authoritative `expires_at` for first enrollment |
-| `/api/v1/auth/webauthn/register/verify` | Existing creation response, neither start header | Existing safe `201` credential with truthful `user_verified: true`; ordinary login follows |
+| `/api/v1/auth/action-proofs/first-passkey/verify`    | `{challenge, code}`                                                                          | `200 {action_proof, expires_at}` with the original contact-code deadline                     |
+| `/api/v1/auth/webauthn/register/generate-options`    | Existing optional `{name}` and exactly one start header                                      | Existing `publicKey` plus authoritative `expires_at` for first enrollment                    |
+| `/api/v1/auth/webauthn/register/verify`              | Existing creation response, neither start header                                             | Existing safe `201` credential with truthful `user_verified: true`; ordinary login follows   |
 
 The fixed proof authorizes only one first-enrollment start. It requires a fresh
 exact-byte existing-password verification, active nondeleted account, supported
@@ -147,13 +169,13 @@ cannot use it. Enabled `is_mfa_enabled` still requires independently earned TOTP
 at normal-session boundaries, including UV-passkey sign-in. There is no new
 optional/required-MFA flag or privilege exemption.
 
-| Operation | Exact request / authority | Successful response |
-|---|---|---|
-| `POST /api/v1/auth/action-proofs/mfa-enrollment/challenge` | `{"password":"...","channel":"email"}` or `{"password":"...","channel":"sms"}`; neither authority header | `202 {"challenge":"...","expires_at":"..."}` after one delivery attempt; acceptance is not receipt |
-| `POST /api/v1/auth/action-proofs/mfa-enrollment/verify` | `{"challenge":"...","code":"123456"}`; neither authority header | `200 {"action_proof":"...","expires_at":"..."}` retaining the original contact-code deadline |
-| `POST /api/v1/auth/mfa/generate` | Empty body, no query; exactly one fresh UV `X-Step-Up-Auth` OR fixed-purpose `X-Action-Proof` | `200 {"enrollment_id":"...","secret":"...","otpauth_url":"...","issuer":"...","account_name":"...","expires_at":"..."}` only after known commit |
-| `POST /api/v1/auth/mfa/verify` | `{"enrollment_id":"...","code":"123456"}`; neither authority header | `200 {"status":"enabled"}` and committed security-invalidation metadata |
-| `DELETE /api/v1/auth/mfa` | Empty body, no query; only fresh `X-Step-Up-Auth` earned through enrolled TOTP (`otp`) or UV WebAuthn (`hwk` AND `user`) | Empty `204`; security-invalidation metadata only for actual removal |
+| Operation                                                  | Exact request / authority                                                                                                | Successful response                                                                                                                             |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/v1/auth/action-proofs/mfa-enrollment/challenge` | `{"password":"...","channel":"email"}` or `{"password":"...","channel":"sms"}`; neither authority header                 | `202 {"challenge":"...","expires_at":"..."}` after one delivery attempt; acceptance is not receipt                                              |
+| `POST /api/v1/auth/action-proofs/mfa-enrollment/verify`    | `{"challenge":"...","code":"123456"}`; neither authority header                                                          | `200 {"action_proof":"...","expires_at":"..."}` retaining the original contact-code deadline                                                    |
+| `POST /api/v1/auth/mfa/generate`                           | Empty body, no query; exactly one fresh UV `X-Step-Up-Auth` OR fixed-purpose `X-Action-Proof`                            | `200 {"enrollment_id":"...","secret":"...","otpauth_url":"...","issuer":"...","account_name":"...","expires_at":"..."}` only after known commit |
+| `POST /api/v1/auth/mfa/verify`                             | `{"enrollment_id":"...","code":"123456"}`; neither authority header                                                      | `200 {"status":"enabled"}` and committed security-invalidation metadata                                                                         |
+| `DELETE /api/v1/auth/mfa`                                  | Empty body, no query; only fresh `X-Step-Up-Auth` earned through enrolled TOTP (`otp`) or UV WebAuthn (`hwk` AND `user`) | Empty `204`; security-invalidation metadata only for actual removal                                                                             |
 
 All listed JSON fields are required strings. Proof and confirmation bodies are
 strict UTF-8 `application/json` objects of at most 8192 bytes, with no unknown,
@@ -236,7 +258,7 @@ ordinary fresh login/current-state inspection, not a new reconciliation or secre
 retrieval endpoint. The sole pre-handler DPoP nonce retry above remains distinct.
 
 - There is deliberately no general-purpose `/api/v1/auth/mfa/verify-code` endpoint. Enabled TOTP secrets can only be checked inside a purpose-specific login/Step-up flow, preventing an authenticated-session code-validity oracle. Step-up uses `POST /api/v1/auth/stepup/verify` and collapses wrong, replayed, and stale codes into `401 invalid_credentials`.
-- `POST /api/v1/auth/recovery-codes/generate`: Generates a new batch of one-time backup codes (stored securely in PostgreSQL hashed via **SHA-256** to prevent CPU Denial of Service during validation). Requires Step-up authentication in `X-Step-Up-Auth`: a fresh batch is a set of long-lived bypasses for every other factor, so minting one must cost a re-asserted strong factor. This is not circular, because a recovery code cannot itself satisfy Step-up.
+- `POST /api/v1/auth/recovery-codes/generate`: Current untyped recovery-pool generation, stored as high-entropy SHA-256 or configured HMAC verifiers with indexed SQL lookup. Requires fresh generic Step-up, not a recovery code; ordinary password-only issuance is missing (F07). These codes authorize restricted replacement-passkey enrollment, not direct normal login or truthful MFA Backup completion. Two explicit families and dedicated issuance purposes are planned SEC05.
 - `GET /api/v1/auth/recovery-codes/status`: Returns only `{"remaining":10,"low":false}`. Generation returns `{"codes":["..."],"count":10}` once and atomically invalidates every previous code. There is no GET endpoint for previous plaintext batches. A lost generation response may mean replacement committed; require explicit new generation and fresh step-up rather than replaying/caching the old response.
 
 #### Primary Contact Maintenance (T27)
@@ -245,15 +267,15 @@ T27 manages primary email and phone through the normal authenticated cookie,
 exact Origin, DPoP/JKT and session-intent boundary. It does not change registration,
 backup contacts, login/recovery, notifications or the T38 management UI.
 
-| Operation | Exact request / authority | Successful response |
-|---|---|---|
-| `GET /api/v1/users/me/contacts` | Empty body/query; neither authority header | `{email,phone}`; each is `null` or `{value,verified,verified_at}` from one snapshot |
-| `POST /api/v1/auth/action-proofs/contact-change/challenge` | `{password,channel,target}`; `channel` is `email`/`sms`, `target` is `email`/`phone`; neither authority header | `202 {challenge,expires_at}` after one old-contact delivery attempt |
-| `POST /api/v1/auth/action-proofs/contact-removal/challenge` | Same fields, removal-only purpose; neither authority header | Same `202` shape; present-email removal is refused before avoidable password work/delivery |
-| Corresponding action-proof `/verify` routes | `{challenge,code}`; neither authority header | `200 {action_proof,expires_at}` with the original deadline and frozen action/target |
-| `POST /api/v1/users/me/phone/send-code` or `/email/send-code` | `{phone}` or `{email}`; exactly one fresh `X-Step-Up-Auth` OR matching change `X-Action-Proof` | `200 {status:"sent",verification_id,expires_at}` only after known pending commit and code submission/activation |
-| Corresponding contact `/verify` routes | `{verification_id,code}`; neither authority header or replacement destination | `200 {status:"verified"}` and committed security-invalidation metadata |
-| `DELETE /api/v1/users/me/phone` or `/email` | Empty body/query; exactly one fresh strong grant OR matching removal proof | Empty `204`; real changes invalidate authority, authorized absent-contact no-ops do not |
+| Operation                                                     | Exact request / authority                                                                                      | Successful response                                                                                             |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `GET /api/v1/users/me/contacts`                               | Empty body/query; neither authority header                                                                     | `{email,phone}`; each is `null` or `{value,verified,verified_at}` from one snapshot                             |
+| `POST /api/v1/auth/action-proofs/contact-change/challenge`    | `{password,channel,target}`; `channel` is `email`/`sms`, `target` is `email`/`phone`; neither authority header | `202 {challenge,expires_at}` after one old-contact delivery attempt                                             |
+| `POST /api/v1/auth/action-proofs/contact-removal/challenge`   | Same fields, removal-only purpose; neither authority header                                                    | Same `202` shape; present-email removal is refused before avoidable password work/delivery                      |
+| Corresponding action-proof `/verify` routes                   | `{challenge,code}`; neither authority header                                                                   | `200 {action_proof,expires_at}` with the original deadline and frozen action/target                             |
+| `POST /api/v1/users/me/phone/send-code` or `/email/send-code` | `{phone}` or `{email}`; exactly one fresh `X-Step-Up-Auth` OR matching change `X-Action-Proof`                 | `200 {status:"sent",verification_id,expires_at}` only after known pending commit and code submission/activation |
+| Corresponding contact `/verify` routes                        | `{verification_id,code}`; neither authority header or replacement destination                                  | `200 {status:"verified"}` and committed security-invalidation metadata                                          |
+| `DELETE /api/v1/users/me/phone` or `/email`                   | Empty body/query; exactly one fresh strong grant OR matching removal proof                                     | Empty `204`; real changes invalidate authority, authorized absent-contact no-ops do not                         |
 
 JSON is bounded to 8192 bytes of valid UTF-8, with required string fields and no
 duplicates, unknown/null fields, trailing document or query. All public handles
@@ -323,12 +345,20 @@ freshly authorized new start. Provider submission is not mailbox/handset receipt
 The sole explicit pre-handler DPoP nonce retry remains unchanged.
 
 #### Restricted Recovery Flow
-- `POST /api/v1/auth/recovery/start`: Anonymous start endpoint. Accepts `{"email":"user@example.com"}` and always returns the same no-store `202` shape for active, inactive, deleted, and unknown accounts: `transaction_id` (256-bit opaque base64url value), `expires_at`, and `expires_in` (600 seconds). The transaction is stored by SHA-256 hash, expires after 10 minutes, and is atomically single-use. A lookup timing floor and deterministic decoy subject prevent account enumeration.
+
+- `POST /api/v1/auth/recovery/start`: Anonymous start endpoint. Accepts `{"email":"user@example.com"}` and returns the same no-store `202` shape for active, inactive, deleted, and unknown accounts after valid request and admission checks: `transaction_id` (256-bit opaque base64url value), `expires_at`, and `expires_in` (600 seconds). The transaction is stored by SHA-256 hash, expires after 10 minutes, and is atomically single-use. A lookup timing floor and deterministic decoy reduce enumeration exposure; content, size and timing-distribution evidence remain required, not guaranteed indistinguishability.
 - `POST /api/v1/auth/mfa/verify-recovery-code`: Accepts `{"transaction_id":"...","code":"..."}`. The transaction is consumed before the code check, so a failed guess cannot be retried under it. A valid high-entropy code is located and physically deleted in the same ACID transaction, then the server issues a 10-minute `recovery_enrollment` session and returns `{"next":"enroll_factor","expires_in":600}`. Invalid, spent, foreign, and decoy transactions collapse into `401 {"error":"invalid_credentials"}`; a saturated recovery limit returns `429 {"error":"rate_limited"}`.
 - `POST /api/v1/auth/enrollment/webauthn/register/generate-options`: The only ceremony a `recovery_enrollment` session may start. It requires WebAuthn user verification (`UV`), is bound to the restricted session, and cannot be called by a normal session.
 - `POST /api/v1/auth/enrollment/webauthn/register/verify`: Completes that UV-required ceremony. The restricted session may claim at most one replacement passkey and is revoked after success; the response is `{"next":"login"}`. A duplicate or already-claimed use returns `409 {"error":"enrollment_already_used"}`. It never becomes a normal authenticated session and cannot access profile, Step-up, recovery-code generation, or other account-management routes.
 
 If issuing the restricted session fails after a recovery code was consumed, the server fails closed and does not resurrect the code. The user must start again with another unused code.
+
+The current restricted flow is not the target ordinary recovery policy. No old
+contact proof or privileged exclusion is required and the final restricted-session
+deadline is not rechecked in recovery's deciding SQL transaction (F01/F02).
+Generation does not revoke already-derived recovery sessions. Enabled TOTP still
+gates later normal login; it is inaccurate to describe universal TOTP bypass or
+safe consumer recovery merely because the restricted cookie cannot open the portal.
 
 #### Security Mutation Commit And Session Lifetime (T23)
 
@@ -337,6 +367,7 @@ Successful passkey enrollment/removal, actual TOTP enable/disable, and verified-
 The committed handler marks self-invalidating success before response release; session middleware does not attempt to renew now-invalid authority or replace that successful result with a refresh/activity failure. `X-Identity-Auth-Invalidated: true` on a marked successful response is outcome metadata only, never authentication authority. The portal strictly decodes a successful mutation, clears private authority, and presents a whole localized saved-outcome message with one explicit return-to-login link. It does not fetch the old session again, automatically log out/replay, or reinterpret a later `401` as a failed mutation. Phone/TOTP no-op successes are unmarked and retain authority. Restricted recovery enrollment retains its existing single `next: login` outcome rather than adding a second redirect. Lost/unreadable responses remain uncertain, not confirmed success.
 
 #### Short-Lived Step-up Authentication
+
 - `POST /api/v1/auth/stepup/challenge`: Generates a challenge for the Step-up auth flow, supporting `userVerification: "required"` (biometrics/PIN via WebAuthn) or TOTP verification. Requires a normal live session and binds the pending WebAuthn assertion to its exact session ID. Returns `methods` (the factors this account can present, WebAuthn first) plus the WebAuthn assertion options when a passkey is enrolled. Unlike the login options endpoint there is no mock/decoy branch — the caller is already authenticated as this account, so there is nothing to enumerate. `409 no_stepup_factor` means the account has neither a passkey nor TOTP and cannot perform Step-up until one is enrolled.
 - `POST /api/v1/auth/stepup/verify`: Verifies the WebAuthn UV assertion or active TOTP token. On success, returns a short-lived (3-5 minutes) Step-up token carrying the ACR claim `https://ref.hatef.ir/acr/stepup`. This token must be passed in the `X-Step-Up-Auth` header for sensitive endpoints.
   - **Grant format:** a compact JWS (`typ: stepup+jwt`) signed by the same rotating keystore as access and ID tokens, carrying `iss`, `sub`, `aud`, `acr`, `amr` (RFC 8176: `["hwk","user"]` for a UV assertion, `["otp"]` for TOTP), `auth_time`, `sid`, `jti`, `iat`, `exp`, and `cnf.jkt` when the earning session is DPoP-bound. The distinct `typ` is load-bearing: access tokens are signed by the same keys and already use `aud == iss`, so without it an access token would satisfy every other check.
@@ -351,6 +382,7 @@ The committed handler marks self-invalidating success before response release; s
 **Fail-closed mounting.** When the Step-up service cannot be constructed (for example, its required database is absent in development), gated endpoints are **not mounted at all** rather than served without their gate. Outside development, missing Redis or replay-key configuration prevents startup. A user with no enrolled Step-up factor receives `409 no_stepup_factor`; no condition turns a gated route into an ungated one.
 
 ### 1.4 User Profile & Privacy (GDPR)
+
 - `GET /api/v1/users/me`: Bootstrap projection: `id`, nullable `email`, `email_verified`, nullable `email_verified_at`, `display_name`, `status`, decimal-string `lifecycle_revision`, `deletion_enabled`, and `session: {id, expires_at}`. An absent email is JSON `null`, not an omitted field or replacement mailbox. Verification is true only for protected evidence matching the current account and exact canonical email; its timestamp is the original server verification time, not account creation or a receipt replay. `deletion_enabled` is a server-controlled capability, not a legal-hold disclosure; clients default a missing field to false during rollout. `expires_at` is the session's real absolute RFC 3339 deadline. No private-profile attributes, roles, backup contacts, factor secrets, ciphertext or legal data.
 - `PATCH /api/v1/users/me`: Strict required string fields `{"display_name":"Example","expected_revision":"42"}`; returns the same projection. No step-up is required for this cosmetic field. Revision strings are canonical nonnegative decimals, at most `9223372036854775807`; JSON numbers, signs, leading zeros, nulls, unknown/duplicate fields and trailing bodies are rejected.
 - `GET /api/v1/users/me/username`: When username support is enabled, normal authenticated admission returns `{username: {display}}` or `{username: null}`. No claim/rename/clear mutation is mounted; absence is not derived from email or `display_name`. See the [username contract](registration-contract.md#username-namespace).
@@ -358,7 +390,8 @@ The committed handler marks self-invalidating success before response release; s
 - `PATCH /api/v1/users/me/private-data`: Requires the existing captured session-intent header and canonical decimal-string `expected_revision`. First save requires both names, `birthday: {calendar: "gregorian" | "jalali", date}`, explicit `gender`, and `location: {country: "IR", province_id, locality_id?}` together. Subsequent saves may omit unchanged attributes; birthday and location are replaced as whole fields. Unknown, duplicate or null fields and username/display-name/email/mobile edits are rejected. Names, both birthday representations, gender and server-resolved catalog selection are encrypted together. Stale revisions return `409 profile_conflict` before no-op decisions. A normalized no-op preserves ciphertext, timestamps, revision and outbox; a real edit atomically stores the profile, advances the revision once, and enqueues one metadata-only `private_profile` update. Public `display_name` remains independent; the full private editor UI is T38.
 - `GET /api/v1/users/me/sessions`: Array of live owned browser authority with public `id`, `current`, creation/activity times and bounded IP/user-agent metadata. A session is not a physical-device identity or standalone OAuth grant.
 - `DELETE /api/v1/users/me/sessions/{session_id}`: Owner-scoped individual revocation (`204`/`404`); deleting the current session also clears its cookie. Linked access/refresh authority fails subsequent live validation immediately. Already admitted requests may finish; remote DOM clears on detection, not instantaneously. No bulk-revocation portal action.
-- `PUT /api/v1/users/me/password` and `POST /api/v1/users/me/export-data`: Planned interfaces, outside this portal implementation.
+- `PUT /api/v1/users/me/password`: Current strict `{operation:"add"|"change",new_password}` under normal bound-session admission. Exactly one fresh strong `X-Step-Up-Auth`, or fixed password-change `X-Action-Proof` for `change` only. `DELETE` on the same path removes with strong authority and empty body. Resulting-state primary/privileged checks and known-commit handling remain; the settings UI and planned durable repair barrier are separate. Source: `apps/identity-api/internal/server/passwords.go:20-70,84-118`. This is normal maintenance, not anonymous lost-password recovery.
+- `POST /api/v1/users/me/export-data`: Planned, unmounted interface; no completed data-export capability is implied.
 
 Display and credential names reject invalid UTF-8, Unicode control characters and line/paragraph separators, then trim outer Unicode whitespace and limit the result to 80 code points. Empty clears the optional name; names are not unique. The profile service locks the account and rechecks active status/captured auth-version before comparing the expected lifecycle revision. A stale revision returns `409 profile_conflict`. A no-op at the current revision changes no timestamps/revision and emits no event. A real display-name edit commits the name, one lifecycle revision increment and metadata-only v2 outbox intent in one transaction; enqueue failure rolls it all back. It does not change auth-version or revoke sessions. Name values are excluded from audit/event payloads; ordinary sanitized audit recording remains best-effort, not a durable commit guarantee.
 
@@ -373,6 +406,7 @@ Task 7.4 adds `/dashboard/privacy` and an independent `/recover-account` page.
 - **Limits and authority:** the account/day limit defaults to 3 and returns `429 rate_limited` on saturation. Production recovery/purge policy is exactly `720h`. Live account/version validation prevents recovery from reviving old authority; offline JWT-only consumers retain residual authority until expiry, at most ten minutes. Already admitted requests may finish.
 
 #### Account Reclamation (cancel a pending deletion)
+
 A `pending_deletion` account cannot log in at all, so reclamation is a separate anonymous ceremony rather than an ordinary login: the emailed single-use token plus one verified strong factor. Both endpoints are token-bearing and mounted outside the session group — they deliberately do not live under `/users/me`, because that prefix implies a session and there is none.
 
 - `POST /api/v1/auth/deletion/reclaim/options`: Accepts `{"token":"..."}` and returns the single factor to present: `{"factor":"webauthn","webauthn":{...}}` (a `userVerification: "required"` assertion challenge bound to this deletion request) or `{"factor":"totp"}`. It does **not** consume the token, so a user who abandons the ceremony halfway can restart it. Exactly one factor is named; the response never enumerates the account's factors.
@@ -401,17 +435,17 @@ Signup uses public DPoP without access-token `ath`, Authorization or
 `attempt_id` is not authority: follow-ups also need the returned capability,
 except email verification, which needs its distinct token and original JKT.
 
-| POST route | Exact request fields | Successful result / meaning |
-|---|---|---|
-| `/api/v1/auth/register/validate` | `{stage:"username",registration:{username}}` | `200 {username_display,available}`; read-only NFC display and advisory availability, no proof/reservation/owner disclosure. No other validation stage is mounted by this increment. |
-| `/api/v1/auth/register/start` | `{email,phone,username}` | `201 {attempt_id,capability,canonical_email,username_display,expires_at,email_sent}`; freezes username/policy but reserves nothing until final commit. `email_sent` is submission acceptance, not inbox delivery. |
-| `/api/v1/auth/register/email/resend` | `{attempt_id,capability}` | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send. |
-| `/api/v1/auth/register/email/verify` | `{attempt_id,token}` | Marks only email ownership from the original JKT; no capability/session/role issuance. |
-| `/api/v1/auth/register/phone/send` | `{attempt_id,capability}` | `{verification_id}` for the frozen Iranian phone after verified email; no automatic billed retry. |
-| `/api/v1/auth/register/phone/verify` | `{attempt_id,capability,verification_id,code}` | Consumes the exact signup/JKT/phone OTP and persists phone proof. Code is a six-digit string, including leading zeros. |
-| `/api/v1/auth/register/passkey/options` | `{attempt_id,capability}` | `{publicKey}` for a signup-purpose resident UV-required ceremony after both ownership proofs. |
-| `/api/v1/auth/register` | `{attempt_id,capability,credential}` | `200`; WebAuthn creation JSON completes the ceremony; `{state:"completed",next:"login",receipt_expires_at,email_verified:true,phone_verified:true}`. |
-| `/api/v1/auth/register/result` | `{attempt_id,capability}` | Pending: `{state:"pending",expires_at,email_verified,phone_verified}`. Failed: `{state:"failed",receipt_expires_at,email_verified,phone_verified}`. Completed: same shape as final. Not a login or email-based capability recovery. |
+| POST route                              | Exact request fields                           | Successful result / meaning                                                                                                                                                                                                         |
+| --------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/v1/auth/register/validate`        | `{stage:"username",registration:{username}}`   | `200 {username_display,available}`; read-only NFC display and advisory availability, no proof/reservation/owner disclosure. No other validation stage is mounted by this increment.                                                 |
+| `/api/v1/auth/register/start`           | `{email,phone,username}`                       | `201 {attempt_id,capability,canonical_email,username_display,expires_at,email_sent}`; freezes username/policy but reserves nothing until final commit. `email_sent` is submission acceptance, not inbox delivery.                   |
+| `/api/v1/auth/register/email/resend`    | `{attempt_id,capability}`                      | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send.                                                         |
+| `/api/v1/auth/register/email/verify`    | `{attempt_id,token}`                           | Marks only email ownership from the original JKT; no capability/session/role issuance.                                                                                                                                              |
+| `/api/v1/auth/register/phone/send`      | `{attempt_id,capability}`                      | `{verification_id}` for the frozen Iranian phone after verified email; no automatic billed retry.                                                                                                                                   |
+| `/api/v1/auth/register/phone/verify`    | `{attempt_id,capability,verification_id,code}` | Consumes the exact signup/JKT/phone OTP and persists phone proof. Code is a six-digit string, including leading zeros.                                                                                                              |
+| `/api/v1/auth/register/passkey/options` | `{attempt_id,capability}`                      | `{publicKey}` for a signup-purpose resident UV-required ceremony after both ownership proofs.                                                                                                                                       |
+| `/api/v1/auth/register`                 | `{attempt_id,capability,credential}`           | `200`; WebAuthn creation JSON completes the ceremony; `{state:"completed",next:"login",receipt_expires_at,email_verified:true,phone_verified:true}`.                                                                                |
+| `/api/v1/auth/register/result`          | `{attempt_id,capability}`                      | Pending: `{state:"pending",expires_at,email_verified,phone_verified}`. Failed: `{state:"failed",receipt_expires_at,email_verified,phone_verified}`. Completed: same shape as final. Not a login or email-based capability recovery. |
 
 The email link is `/register/verify-email#attempt_id=...&token=...`; the browser
 scrubs the fragment immediately and verifies only after explicit user action.
@@ -461,62 +495,91 @@ provider secrets. Enabled sending uses SMS.ir VERIFY's fixed HTTPS POST endpoint
 Iranian destinations and explicit live/sandbox key mode (production live-only).
 Sandbox success-shaped responses send nothing; neither message ID/cost nor ACK
 proves handset delivery. No SMS login, password reset or provider-switch fallback
-is added. Phone/backup data stays envelope encrypted.
-- `POST /api/v1/users/me/phone/send-code`: Sends a 6-digit verification code via SMS to the provided phone number. Requires Step-up authentication in `X-Step-Up-Auth`, because adding a password-reset/recovery channel changes account authority. Returns `{"status":"sent","verification_id":"..."}`; `verification_id` is a 256-bit opaque base64url handle, not the phone number or an authorization credential.
-- `POST /api/v1/users/me/phone/verify`: Verifies `{"verification_id":"...","code":"123456"}` and marks the server-side pending phone as verified, returning `{"status":"verified"}`. The pending record is bound to the account, exact initiating session, normalized phone, and code hash. The client cannot replace the phone during verification; a foreign account/session sees `no_active_code` and does not consume the challenge or an attempt. The Step-up grant was consumed at `/send-code`, so this endpoint needs the same live session but no second grant.
-- `DELETE /api/v1/users/me/phone`: Removes the phone number from the account (Requires Step-up authentication in `X-Step-Up-Auth`). Under the shared account lock and captured `auth_version` check, the server validates current protected contact evidence and requires a surviving verified primary email before deleting an evidenced phone; otherwise `409 {"error":"last_verified_contact"}`. Populated email/backup fields, timestamps or legacy phone payloads without matching evidence are not proof of verification. Corrupt or incorrectly bound evidence fails closed, not as absent. The encrypted payload, blind index and phone-verification evidence are cleared together so they cannot drift apart. Returns `204`; removing an absent phone is a no-op and does not revoke sessions.
-- `POST /api/v1/users/me/backup-email/send-code`: Sends a verification link/code to an alternative backup email address.
-- `POST /api/v1/users/me/backup-email/verify`: Verifies and links the backup email to the account.
-- `DELETE /api/v1/users/me/backup-email`: Removes the backup email from the account (Requires Step-up authentication in `X-Step-Up-Auth`).
+is added by registration. Current optional contact-code login is documented
+separately above and conflicts with the target. Phone/backup data stays encrypted.
+The current email/phone routes and their exact authorization are owned by
+[T27 maintenance](#primary-contact-maintenance-t27), not a second implementation.
+Backup-email maintenance routes are **planned/unmounted**, not implemented by T27.
+No backup field alone supplies verified recovery authority.
 
-### 1.6 Password Reset & Account Recovery
-The password/reset interfaces below are future work, unmounted and disabled in
-the public UI. Registration does not add password/SMS login or reset authority;
-existing restricted backup-code and deletion-reclaim flows remain separate.
-- `POST /api/v1/auth/password-reset/request`: Initiates password reset flow. Can be routed to the Primary Email, Backup Email, or Verified Phone (via SMS).
-- `POST /api/v1/auth/password-reset/verify-otp`: Validates the OTP received via SMS or Backup Email to authorize a password change.
-- `POST /api/v1/auth/password-reset/confirm`: Confirms the new password securely.
+### 1.6 Planned Authentication and Factor Repair Contracts
+
+All rows below are **planned design shapes**, not currently mounted API contracts.
+Final route spelling requires task contract review; existing services/prefixes are
+extended rather than a second auth service. Old contact-OTP-only password-reset
+proposals are superseded by SEC05-SEC07, not a supported fallback. `/recover-account`
+remains deletion-cancellation exclusive, and `/register` remains unchanged as the
+single public registration route.
+
+| Planned operation / illustrative request                                                                                             | Required authority / outcome                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Normal login identification `{identifier:{type:"username"\|"email",value},primary:{method:"password",password}}` or passkey ceremony | Explicit username or current verified unique primary email; no implicit fallback/mobile identifier. Eligible primary, actual passkey UV and all required independent MFA. No contact-only normal issuance; SQL records original evidence/deadlines.                                                                                                                         |
+| Primary-bound MFA completion `{preauthentication,method:"totp"\|"mfa_backup_code",code}`                                             | Exact account/JKT/security/policy/primary binding, original preauth expiry and durable one-use replay/backup. Backup is not `TOTP=true`; no normal authority until deciding full-policy SQL validation. Privileged downgrade is denied.                                                                                                                                     |
+| Family issuance/regeneration `{family:"arc"\|"mfa_backup",issuance_proof}`                                                           | Fresh family-specific authority. Ordinary password-only ARC issuance requires dedicated exact password+fresh eligible old-contact purpose, not generic Step-up or deletion proof; independent-MFA/privileged policy applies. Returns plaintext once in an authorized transient viewer; no ARC email/SMS delivery or previous-batch GET.                                     |
+| Ordinary repair start `{identifier,target_factor,channel}`                                                                           | Bounded non-enumerating start; server selects eligible current old destination and captures its association/provenance. No authority from identifier or send acceptance. New/replaced contacts younger than 24h and unknown provenance are denied.                                                                                                                          |
+| Repair admission `{ceremony,arc,contact_proof,primary_proof?}`                                                                       | ARC and fresh old-contact proof; TOTP repair additionally eligible pre-existing primary. SQL consumes ARC/proofs and records one target grant only when barrier clear and account ordinary. Ten-minute original ceremony, grant <=5m and remaining deadline.                                                                                                                |
+| Password / one-passkey / TOTP repair finish `{repair_grant,repair_material}`                                                         | Final deciding transaction validates exact purpose/account/JKT/factor/destination/generation/version/policy/deadline and original earned evidence. One repair, barrier set, old sessions fenced, durable intents. New passkey UV; verified atomic TOTP swap preserves old TOTP until success. No normal cookie or OAuth/admin/legal/contact/deletion/general-Step-up grant. |
+| Fresh normal login after repair                                                                                                      | SQL-recorded full-policy evidence alone may clear barrier. Repaired password is sufficient only for unchanged ordinary password-only policy; required MFA needs actual TOTP/admitted backup. Refresh/contact proof/ARC/time/regeneration cannot clear it or bypass management endpoints.                                                                                    |
+| Password/mobile-capable deletion/reclaim                                                                                             | Extend current deletion-exclusive service without ARC/backup/repair-grant reuse. Preserve stronger UV deletion, 30 days, holds, original deadlines and required retained reclaim factors. Release only after verified destination/readers/notification/lifecycle and T27 dependencies.                                                                                      |
+| Bounded operation result inspection `{operation_capability}` where a task explicitly defines one                                     | Read-only known committed/absent/unknown facts, not receipt authentication, replay/refund, deadline extension or authority reissue. Do not invent a universal reconciliation endpoint.                                                                                                                                                                                      |
+
+Every planned authority binds account, purpose, target, original browser JKT,
+captured security/policy/family/contact versions and absolute UTC expiry. Errors
+remain opaque for invalid/unknown/spent/revoked/foreign authority; bounded
+`rate_limited`, `temporarily_unavailable`, `outcome_unknown` and policy conflicts
+do not reveal inventories or justify automatic fallback. A pre-handler fresh DPoP
+nonce retry is distinct from replay of a transmitted mutation. SQL/provider
+uncertainty never refunds a saved code, recreates a user or sends tentative secret
+material. Primary SQL consumption/mutation is atomic; Redis/provider effects are not.
+
+Planned gRPC/consumer extensions carry trustworthy policy/earned-assurance/freshness
+references only after durable token foundations. Preserve `(iss, sub)`, principal
+kind, scopes, expected audience, observed proof context and optional protobuf email
+presence. `CheckPermission(user_id,permission)` alone is neither end-user delegation
+nor privileged hardware evidence. No current RPC is relabeled as enforcing these
+planned obligations. Security-event contracts/readers precede notification writers;
+events carry metadata only, never repaired secrets, contacts or private attributes.
 
 ### 1.7 Admin & Moderation API
 
 Admin routes require an active, non-deleted account, a normal DPoP-bound browser session under the first-party boundary above, and live database permissions. Recovery-enrollment sessions cannot access them. The existing admin Origin allow-list and audit/permission checks remain additional requirements. Mutations and legal attribution consume a single-use, session-bound step-up grant **after** permission checks. All responses use `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`. Session activity renews only when the final authorized response is released after the durable admin transaction commits, not when a handler writes a tentative buffered response.
 
-| Route under `/api/v1/admin` | Seeded role | Contract |
-|---|---|---|
-| `GET /capabilities` | Any permitted, mounted section 1.7 operation | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes, including legal-only grants. No role catalogue, personal data, or section 1.8 workflow flags in the response. Durably audited before disclosure. |
-| `GET /users`, `GET /users/{user_id}` | Support, Moderator | Safe account summary with canonical-string `lifecycle_revision` from the status snapshot; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets. |
-| `POST /users/lookup` | Moderator | Exact canonical email in JSON `{email}`; response includes mandatory `canonical_email` bound to the returned user row. Legacy `GET /users?email=...` is rejected. |
-| `PATCH /users/{user_id}/status` | Moderator + step-up | Required `{status, reason, expected_revision}` with an exact decimal-string revision. Active/suspended/banned only; no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. Stale pins return `409 account_conflict` under the existing account locks, before status/auth/lifecycle writes. |
-| `GET /audit-logs` | DPO | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes. |
-| `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin | Content-free verification; no actors, network data, payloads or account data. |
-| `POST /legal-holds` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional advisory `review_at`; UUID `Idempotency-Key` header. |
-| `GET /legal-holds` | DPO | Optional `account_ref`; `status=active\|released\|all`; true snapshot total. |
-| `DELETE /legal-holds/{hold_id}` | DPO + step-up | Releases only that request; 204 for release or already released, 404 for unknown ID. |
-| `POST /preservation-requests` | DPO + step-up | Required `account_ref`, `reason`, `requesting_authority`; optional advisory `expires_at`; UUID `Idempotency-Key`. Atomically records a hold and observed evidence presence even without a live account. |
-| `POST /legal-inquiry/lookup` | DPO + step-up | JSON identifier/type (`email` only), authority/case context, time bounds, optional fields and cursor. Requires a verified signer fixture before mounting. No GET alias. |
+| Route under `/api/v1/admin`                    | Seeded role                                  | Contract                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /capabilities`                            | Any permitted, mounted section 1.7 operation | Fixed capability booleans and effective numeric limits from primary-database permissions and mounted routes, including legal-only grants. No role catalogue, personal data, or section 1.8 workflow flags in the response. Durably audited before disclosure.                                                                                 |
+| `GET /users`, `GET /users/{user_id}`           | Support, Moderator                           | Safe account summary with canonical-string `lifecycle_revision` from the status snapshot; only Moderator receives email. No roles, legal-hold state, encrypted material or authentication secrets.                                                                                                                                            |
+| `POST /users/lookup`                           | Moderator                                    | Exact canonical email in JSON `{email}`; response includes mandatory `canonical_email` bound to the returned user row. Legacy `GET /users?email=...` is rejected.                                                                                                                                                                             |
+| `PATCH /users/{user_id}/status`                | Moderator + step-up                          | Required `{status, reason, expected_revision}` with an exact decimal-string revision. Active/suspended/banned only; no self or privileged-account moderation. Pending verification/deletion and deleted accounts are refused. Stale pins return `409 account_conflict` under the existing account locks, before status/auth/lifecycle writes. |
+| `GET /audit-logs`                              | DPO                                          | Required `start_time`, `end_time` (RFC3339 or Unix seconds), at most 31 days; optional bounded `event_type`. Returns stored row hashes.                                                                                                                                                                                                       |
+| `GET /audit-logs/verify`, `GET /ledger/verify` | DPO, Super Admin                             | Content-free verification; no actors, network data, payloads or account data.                                                                                                                                                                                                                                                                 |
+| `POST /legal-holds`                            | DPO + step-up                                | Required `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional advisory `review_at`; UUID `Idempotency-Key` header.                                                                                                                                                                                                        |
+| `GET /legal-holds`                             | DPO                                          | Optional `account_ref`; `status=active\|released\|all`; true snapshot total.                                                                                                                                                                                                                                                                  |
+| `DELETE /legal-holds/{hold_id}`                | DPO + step-up                                | Releases only that request; 204 for release or already released, 404 for unknown ID.                                                                                                                                                                                                                                                          |
+| `POST /preservation-requests`                  | DPO + step-up                                | Required `account_ref`, `reason`, `requesting_authority`; optional advisory `expires_at`; UUID `Idempotency-Key`. Atomically records a hold and observed evidence presence even without a live account.                                                                                                                                       |
+| `POST /legal-inquiry/lookup`                   | DPO + step-up                                | JSON identifier/type (`email` only), authority/case context, time bounds, optional fields and cursor. Requires a verified signer fixture before mounting. No GET alias.                                                                                                                                                                       |
 
 #### Capabilities and Shared Limits
 
 The capability response is `{capabilities,limits}`. Its existing booleans are `users_read`, `users_pii`, `users_lookup`, `users_status_write`, `audit_logs_read`, `audit_chain_verify`, and `ledger_verify`. Task 7.6 adds exactly these five booleans; each is true only with the existing permission **and** the corresponding mounted operation:
 
-| Capability | Permission | Operation | Fresh step-up |
-|---|---|---|---|
-| `legal_holds_read` | `legal.holds.read` | `GET /legal-holds` | No |
-| `legal_holds_apply` | `legal.holds.write` | `POST /legal-holds` | Yes |
-| `legal_holds_release` | `legal.holds.write` | `DELETE /legal-holds/{hold_id}` | Yes |
-| `preservation_requests_create` | `legal.holds.write` | `POST /preservation-requests` | Yes |
-| `legal_inquiry_lookup` | `legal.inquiry.lookup` | `POST /legal-inquiry/lookup` | Every page |
+| Capability                     | Permission             | Operation                       | Fresh step-up |
+| ------------------------------ | ---------------------- | ------------------------------- | ------------- |
+| `legal_holds_read`             | `legal.holds.read`     | `GET /legal-holds`              | No            |
+| `legal_holds_apply`            | `legal.holds.write`    | `POST /legal-holds`             | Yes           |
+| `legal_holds_release`          | `legal.holds.write`    | `DELETE /legal-holds/{hold_id}` | Yes           |
+| `preservation_requests_create` | `legal.holds.write`    | `POST /preservation-requests`   | Yes           |
+| `legal_inquiry_lookup`         | `legal.inquiry.lookup` | `POST /legal-inquiry/lookup`    | Every page    |
 
 The three write flags are separate mount capabilities, not new permissions. Seeded grants are unchanged: DPO has the legal permissions; Support, Moderator and Super Admin do not gain them. Account lookup still requires both account-read and PII permission. Combined grants expose their union. Missing step-up leaves eligible reads available but gated operations unmounted. Attribution additionally requires the verified signer fixture; hold/preservation management does not require an indexer. A false flag does not distinguish missing permission from missing deployment prerequisites. When no permitted operation is available, capability discovery yields `403 forbidden`; an unmounted surface is unavailable, not an empty result. Capability/storage failure withholds the response. Capabilities guide presentation only, never replace live authorization, and denial must not sign out an otherwise valid ordinary session.
 
 Limits remain numeric, with no new legal-only limit keys:
 
-| Limit | Effective contract |
-|---|---|
-| `page_size_default` | Configured integer default, 50 by default, within `1..page_size_max`. |
-| `page_size_max` | Configured integer ceiling, 200 by default, within `1..200`. |
+| Limit                      | Effective contract                                                                                                                                                                 |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `page_size_default`        | Configured integer default, 50 by default, within `1..page_size_max`.                                                                                                              |
+| `page_size_max`            | Configured integer ceiling, 200 by default, within `1..200`.                                                                                                                       |
 | `audit_max_window_seconds` | Positive configured window, at most 2678400 seconds (31 days). Applies to **both** audit search and legal attribution, including smaller/fractional durations; do not round it up. |
-| `chain_verify_max_limit` | Existing integer verification ceiling, 5000 by default and at most 5000. |
+| `chain_verify_max_limit`   | Existing integer verification ceiling, 5000 by default and at most 5000.                                                                                                           |
 
 The legal browser workspace caps page size at `min(page_size_max, 50)` and defaults to `min(page_size_default, that cap)`. This is a presentation/disclosure bound, not a change to server pagination.
 
@@ -536,11 +599,11 @@ Legal subjects are the original `account_ref` UUID (`users.id`, retained indepen
 
 Legal POST bodies are single UTF-8 JSON objects bounded to **32 KiB of serialized bytes**. Use `Content-Type: application/json` (optional UTF-8 charset); exact field spelling/types are required, with unknown fields, case aliases, duplicates, null strings, malformed UTF-8/JSON and trailing documents rejected. Live session and permission checks precede bounded declared/chunked body preflight, which precedes grant consumption; interrupted/oversized input cannot consume the grant or buffer unbounded data. The backend 32-KiB ceiling does not depend on browser enforcement. All legal POSTs and release reject query strings, including bare `?`. Release sends no body or idempotency header; the backend refuses either rather than ignoring it. There is no GET lookup alias, by-key recovery/detail endpoint, preservation-list endpoint, release narrative or moderation revision on these routes.
 
-| Operation | JSON request | Success |
-|---|---|---|
-| `POST /legal-holds` | Required strings `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional string `review_at`. | `201` with a `LegalHold` for new creation; `200` with `replayed=true` for the matching request's **current** state. |
-| `POST /preservation-requests` | Required strings `account_ref`, `reason`, `requesting_authority`; optional string `expires_at`. No client-supplied `legal_basis`. | `201` new / `200` replay with `{hold,replayed,account_present,ledger_evidence_present,observed_at,note}`. `hold` is a `LegalHold`; the three following flags are booleans. |
-| `DELETE /legal-holds/{hold_id}` | Path is the nonzero UUID of exactly one request. | Empty `204` for released **or already released**; `404 hold_not_found` for an unknown request. |
+| Operation                       | JSON request                                                                                                                      | Success                                                                                                                                                                    |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /legal-holds`             | Required strings `account_ref`, `reason`, `requesting_authority`, `legal_basis`; optional string `review_at`.                     | `201` with a `LegalHold` for new creation; `200` with `replayed=true` for the matching request's **current** state.                                                        |
+| `POST /preservation-requests`   | Required strings `account_ref`, `reason`, `requesting_authority`; optional string `expires_at`. No client-supplied `legal_basis`. | `201` new / `200` replay with `{hold,replayed,account_present,ledger_evidence_present,observed_at,note}`. `hold` is a `LegalHold`; the three following flags are booleans. |
+| `DELETE /legal-holds/{hold_id}` | Path is the nonzero UUID of exactly one request.                                                                                  | Empty `204` for released **or already released**; `404 hold_not_found` for an unknown request.                                                                             |
 
 Reason is nonblank and at most **4096 UTF-8 bytes**; authority and normal-hold legal basis are each nonblank and at most **255 UTF-8 bytes**. The service checks the supplied byte lengths before trimming outer whitespace, then stores/compares trimmed values. This is not moderation's 2000-byte rule. The server fixes preservation legal basis to `preservation_request`, request kind to `preservation`, and maps `expires_at` to the hold's `review_at`.
 
@@ -548,14 +611,14 @@ Optional dates may be omitted/empty and may be in the past. The API date parser 
 
 The exact `LegalHold` projection is:
 
-| Fields | JSON type / meaning |
-|---|---|
-| `id`, `account_ref`, `applied_by` | UUID strings: request, original subject and opaque applying actor. |
-| `request_kind` | `legal_hold` or `preservation`. |
+| Fields                                          | JSON type / meaning                                                                                                               |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `account_ref`, `applied_by`               | UUID strings: request, original subject and opaque applying actor.                                                                |
+| `request_kind`                                  | `legal_hold` or `preservation`.                                                                                                   |
 | `reason`, `requesting_authority`, `legal_basis` | Optional strings, omitted when restricted details have been purged. Omission is not evidence that the original values were empty. |
-| `is_active`, `details_purged`, `replayed` | Booleans. List projections have `replayed=false`; the normal create response sets it for replay. |
-| `applied_at`, `review_at`, `released_at` | RFC3339 UTC timestamp strings or `null`; clients must handle nullable dates. |
-| `released_by` | Opaque actor UUID string or `null`. |
+| `is_active`, `details_purged`, `replayed`       | Booleans. List projections have `replayed=false`; the normal create response sets it for replay.                                  |
+| `applied_at`, `review_at`, `released_at`        | RFC3339 UTC timestamp strings or `null`; clients must handle nullable dates.                                                      |
+| `released_by`                                   | Opaque actor UUID string or `null`.                                                                                               |
 
 `GET /legal-holds` accepts exactly `account_ref`, `status`, `limit`, `offset`. Its strict raw-query parser rejects malformed escaping and duplicate/unknown keys. Omit `account_ref` only for an intentional all-subject query; present-but-empty, invalid or zero UUIDs are `400 invalid_request`, never a widened query. `status` is `active|released|all`, defaulting to `active` when omitted/empty. `limit`/`offset` use nonnegative signed-32-bit decimal parsing: omitted/empty/zero limit uses the configured default, an in-range integer above the configured max is clamped, and omitted/empty offset is zero. Negative, noninteger or overflowing values fail. Response is `200 {items: LegalHold[],total,limit,offset}` with numeric count/effective bounds, ordered by `applied_at DESC, id DESC`. One statement supplies the page and total, not a stable inventory across multiple requests. Both kinds appear; no request-kind filter is supported.
 
@@ -573,16 +636,16 @@ Any independent active hold overrides erasure eligibility until **explicit relea
 
 `POST /legal-inquiry/lookup` accepts exactly these fields and consumes fresh step-up on **every page**:
 
-| Field | Request contract |
-|---|---|
-| `identifier_type` | Required string, exactly `email`; all other values return `400 unsupported_identifier_type`. |
-| `identifier` | Required bare-email string; valid UTF-8 raw bound 1024 bytes, canonical bound 254 bytes with local part <=64 bytes. No display-name/list/quoted/literal address. |
-| `requesting_authority`, `case_reference` | Required nonblank strings, each at most 255 UTF-8 bytes before trim. |
-| `purpose` | Required nonblank string, at most 4096 UTF-8 bytes before trim. |
-| `start_time`, `end_time` | Required nonzero timestamps as strings; API accepts RFC3339 or Unix seconds, within years 1..9999. Require `start <= end` and span no greater than the effective `audit_max_window_seconds`. SQL bounds are inclusive after conversion to microsecond precision. The browser requires explicit RFC3339 UTC (`Z`) bounds. |
-| `limit` | Optional signed-32-bit JSON integer; omitted/zero uses `page_size_default`. Effective value must be `1..page_size_max` (at most 200). Unlike the GET list, an excessive limit is **rejected**, not clamped. |
-| `fields` | Optional array of at most six distinct exact names: `client_ip`, `ip_subnet`, `user_agent`, `device_fingerprint`, `client_id`, `scope`. Unknown/duplicate names fail. Omission/empty array gives core fields only; the panel initially sends `[]`. |
-| `cursor` | Optional opaque string, at most 4096 bytes, returned by the prior page. Omit for the first page. Invalid, tampered or scope-mismatched cursors return `400 invalid_request`. |
+| Field                                    | Request contract                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `identifier_type`                        | Required string, exactly `email`; all other values return `400 unsupported_identifier_type`.                                                                                                                                                                                                                             |
+| `identifier`                             | Required bare-email string; valid UTF-8 raw bound 1024 bytes, canonical bound 254 bytes with local part <=64 bytes. No display-name/list/quoted/literal address.                                                                                                                                                         |
+| `requesting_authority`, `case_reference` | Required nonblank strings, each at most 255 UTF-8 bytes before trim.                                                                                                                                                                                                                                                     |
+| `purpose`                                | Required nonblank string, at most 4096 UTF-8 bytes before trim.                                                                                                                                                                                                                                                          |
+| `start_time`, `end_time`                 | Required nonzero timestamps as strings; API accepts RFC3339 or Unix seconds, within years 1..9999. Require `start <= end` and span no greater than the effective `audit_max_window_seconds`. SQL bounds are inclusive after conversion to microsecond precision. The browser requires explicit RFC3339 UTC (`Z`) bounds. |
+| `limit`                                  | Optional signed-32-bit JSON integer; omitted/zero uses `page_size_default`. Effective value must be `1..page_size_max` (at most 200). Unlike the GET list, an excessive limit is **rejected**, not clamped.                                                                                                              |
+| `fields`                                 | Optional array of at most six distinct exact names: `client_ip`, `ip_subnet`, `user_agent`, `device_fingerprint`, `client_id`, `scope`. Unknown/duplicate names fail. Omission/empty array gives core fields only; the panel initially sends `[]`.                                                                       |
+| `cursor`                                 | Optional opaque string, at most 4096 bytes, returned by the prior page. Omit for the first page. Invalid, tampered or scope-mismatched cursors return `400 invalid_request`.                                                                                                                                             |
 
 The server canonicalizes NFC/local lowercase/NFC plus strict IDNA and computes
 email HMAC-SHA256 over those exact bytes, without generic BlindIndex's unchanged
@@ -610,22 +673,22 @@ Class B is **pseudonymized personal data**, not anonymous or non-PII. The entere
 
 Legal and shared errors use the JSON `error` code (with the existing step-up challenge fields where applicable):
 
-| Outcome | Meaning / required handling |
-|---|---|
-| `400 invalid_request` | Invalid body, UUID/key, date/page/field/type bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page. |
-| `413 invalid_request` | Backend legal preflight rejects declared or streamed body above 32 KiB before consuming step-up; no browser-only guarantee. |
-| `415 invalid_content_type` | Missing, duplicated or unsupported media type/charset for a nonempty body. |
-| `400 unsupported_identifier_type` | Only email attribution is supported. |
-| `401 use_dpop_nonce` | Explicit pre-handler challenge permits one retry with a fresh proof and the **same** body/key/grant; no handler/grant has been consumed. |
-| `401 session_required`, `401 invalid_dpop_proof`, `409 session_changed` | Clear private state and rebootstrap/re-authenticate through the shared session boundary; never infer write success. |
-| `401 invalid_credentials` during step-up | Factor failure, not ordinary-session loss. |
-| `403 insufficient_user_authentication` | Fresh single-use verification required. Never reuse an old grant. |
-| `403 forbidden` / `forbidden_origin` | Live permission or exact-Origin admission denied. Clear the privileged view/recheck capabilities for permission loss, without signing out a valid ordinary session. |
-| `404 hold_not_found` | Release target does not exist. Routing/unmounted-service errors are not this observation or proof of no historical record. |
-| `409 idempotency_conflict` | Reconcile the original tuple/payload externally; never replace its key or reactivate it. |
-| `429 rate_limited` | Bounded `Retry-After` feedback only; no automatic challenge/request scheduling. |
-| `503 legal_unavailable`, `audit_unavailable`, `service_unavailable`, `rate_limit_unavailable`, `temporarily_unavailable` | Dependencies/audit unavailable; withhold results and reconcile transmitted writes as unconfirmed where commit is uncertain. |
-| `500 response_too_large`, `500 server_error`, lost/malformed/oversized/interrupted responses | Do not accept partial results or promise rollback. Explicit smaller-scope recovery for reads; original-tuple recovery for creates. |
+| Outcome                                                                                                                  | Meaning / required handling                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `400 invalid_request`                                                                                                    | Invalid body, UUID/key, date/page/field/type bounds, strict query or cursor. Correct explicitly; never remove a filter or turn failure into an empty page.          |
+| `413 invalid_request`                                                                                                    | Backend legal preflight rejects declared or streamed body above 32 KiB before consuming step-up; no browser-only guarantee.                                         |
+| `415 invalid_content_type`                                                                                               | Missing, duplicated or unsupported media type/charset for a nonempty body.                                                                                          |
+| `400 unsupported_identifier_type`                                                                                        | Only email attribution is supported.                                                                                                                                |
+| `401 use_dpop_nonce`                                                                                                     | Explicit pre-handler challenge permits one retry with a fresh proof and the **same** body/key/grant; no handler/grant has been consumed.                            |
+| `401 session_required`, `401 invalid_dpop_proof`, `409 session_changed`                                                  | Clear private state and rebootstrap/re-authenticate through the shared session boundary; never infer write success.                                                 |
+| `401 invalid_credentials` during step-up                                                                                 | Factor failure, not ordinary-session loss.                                                                                                                          |
+| `403 insufficient_user_authentication`                                                                                   | Fresh single-use verification required. Never reuse an old grant.                                                                                                   |
+| `403 forbidden` / `forbidden_origin`                                                                                     | Live permission or exact-Origin admission denied. Clear the privileged view/recheck capabilities for permission loss, without signing out a valid ordinary session. |
+| `404 hold_not_found`                                                                                                     | Release target does not exist. Routing/unmounted-service errors are not this observation or proof of no historical record.                                          |
+| `409 idempotency_conflict`                                                                                               | Reconcile the original tuple/payload externally; never replace its key or reactivate it.                                                                            |
+| `429 rate_limited`                                                                                                       | Bounded `Retry-After` feedback only; no automatic challenge/request scheduling.                                                                                     |
+| `503 legal_unavailable`, `audit_unavailable`, `service_unavailable`, `rate_limit_unavailable`, `temporarily_unavailable` | Dependencies/audit unavailable; withhold results and reconcile transmitted writes as unconfirmed where commit is uncertain.                                         |
+| `500 response_too_large`, `500 server_error`, lost/malformed/oversized/interrupted responses                             | Do not accept partial results or promise rollback. Explicit smaller-scope recovery for reads; original-tuple recovery for creates.                                  |
 
 Every successful read commits sanitized disclosure intent before any response bytes. Mutations, encrypted restricted context and audit intent commit together; pre-commit audit failure withholds disclosure and rolls back changes. An unavailable store cannot guarantee durable recording of a rejected attempt. **A write can commit before session-activity renewal fails with `503 temporarily_unavailable`** or its response is lost. A transmitted write without a valid success response remains unconfirmed, never an automatic replay or claimed rollback. Confirmed writes remain confirmed if a later list refresh fails; a lost lookup is no accepted result, not "no match" or an uncertain business mutation.
 
@@ -664,24 +727,24 @@ are rejected. Read responses and mutations are withheld until durable audit
 intent commits. New workflow responses do not create permanent response-body
 fingerprints in audit.
 
-| Method and suffix | Contract |
-|---|---|
-| `POST /legal-cases` | `expected_version=0`, UTC `received_at`, optional advisory `next_review_at`, encrypted `content`, `subject_ids`, `hold_ids`. One request, zero-to-many subjects. |
-| `GET /legal-cases`, `GET /legal-cases/{case_id}` | Bounded `{items,total,limit,offset}` summary list (`status=all|open|closed`) or restricted detail/history; expired unheld/erased detail is unavailable. |
-| `POST /legal-cases/{case_id}/revisions` | Expected state version, replacement content and current subject/hold selection; historical subject protection is retained. |
-| `POST /legal-cases/{case_id}/reviews` | Expected state version, `content_revision`, decision, rationale and optional next review. |
-| `POST /legal-cases/{case_id}/close` | Explicit closure without a response; never releases a hold. |
-| `GET /legal-reviews` | Due review queue requiring both case-read and hold-read permissions. |
-| `POST /legal-holds/{hold_id}/reviews` | Advisory review/history, starting at `expected_version=0`; original hold replay fields are unchanged. |
-| `GET /legal-holds/{hold_id}/reviews` | Gated audited handoff requiring live `legal.holds.read` only, no case-read or step-up. Returns effective schedule, current version and bounded decrypted newest-first history. No query/body/idempotency key. |
-| `POST /legal-cases/{case_id}/response` | Exact content revision, outcome, rationale and encrypted manifest (recipient/evidence/legal basis and exact subject/time/field/artifact selection). |
-| `POST /legal-cases/{case_id}/response/approve` | Exact expected state, content and proposal revisions; different DPO for data-bearing outcomes. |
-| `POST /legal-cases/{case_id}/response/delivery` | Same approved revisions, UTC `delivered_at`, external `receipt_reference`; attests one final delivery and closes the case. |
-| `GET /legal-transparency/monthly?start=YYYY-MM&months=N` | Exact audited aggregates for 1-12 months, explicit coverage and late-entry limitations. |
-| `POST /legal-transparency/reports` | Prepare a completed UTC `year`, `expected_version=0`; immutable snapshot. |
-| `GET /legal-transparency/reports/{report_id}` | Internal approval representation including digest, source/policy version and staleness. |
-| `POST /legal-transparency/reports/{report_id}/approve` | Different DPO approves exact `expected_version`, `data_version`, `policy_version`, `digest`. |
-| `POST /legal-transparency/reports/{report_id}/download` | Expected version; returns only the approved aggregate JSON bytes, not the internal report representation. |
+| Method and suffix                                        | Contract                                                                                                                                                                                                      |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /legal-cases`                                      | `expected_version=0`, UTC `received_at`, optional advisory `next_review_at`, encrypted `content`, `subject_ids`, `hold_ids`. One request, zero-to-many subjects.                                              |
+| `GET /legal-cases`, `GET /legal-cases/{case_id}`         | Bounded `{items,total,limit,offset}` summary list (`status=all                                                                                                                                                | open | closed`) or restricted detail/history; expired unheld/erased detail is unavailable. |
+| `POST /legal-cases/{case_id}/revisions`                  | Expected state version, replacement content and current subject/hold selection; historical subject protection is retained.                                                                                    |
+| `POST /legal-cases/{case_id}/reviews`                    | Expected state version, `content_revision`, decision, rationale and optional next review.                                                                                                                     |
+| `POST /legal-cases/{case_id}/close`                      | Explicit closure without a response; never releases a hold.                                                                                                                                                   |
+| `GET /legal-reviews`                                     | Due review queue requiring both case-read and hold-read permissions.                                                                                                                                          |
+| `POST /legal-holds/{hold_id}/reviews`                    | Advisory review/history, starting at `expected_version=0`; original hold replay fields are unchanged.                                                                                                         |
+| `GET /legal-holds/{hold_id}/reviews`                     | Gated audited handoff requiring live `legal.holds.read` only, no case-read or step-up. Returns effective schedule, current version and bounded decrypted newest-first history. No query/body/idempotency key. |
+| `POST /legal-cases/{case_id}/response`                   | Exact content revision, outcome, rationale and encrypted manifest (recipient/evidence/legal basis and exact subject/time/field/artifact selection).                                                           |
+| `POST /legal-cases/{case_id}/response/approve`           | Exact expected state, content and proposal revisions; different DPO for data-bearing outcomes.                                                                                                                |
+| `POST /legal-cases/{case_id}/response/delivery`          | Same approved revisions, UTC `delivered_at`, external `receipt_reference`; attests one final delivery and closes the case.                                                                                    |
+| `GET /legal-transparency/monthly?start=YYYY-MM&months=N` | Exact audited aggregates for 1-12 months, explicit coverage and late-entry limitations.                                                                                                                       |
+| `POST /legal-transparency/reports`                       | Prepare a completed UTC `year`, `expected_version=0`; immutable snapshot.                                                                                                                                     |
+| `GET /legal-transparency/reports/{report_id}`            | Internal approval representation including digest, source/policy version and staleness.                                                                                                                       |
+| `POST /legal-transparency/reports/{report_id}/approve`   | Different DPO approves exact `expected_version`, `data_version`, `policy_version`, `digest`.                                                                                                                  |
+| `POST /legal-transparency/reports/{report_id}/download`  | Expected version; returns only the approved aggregate JSON bytes, not the internal report representation.                                                                                                     |
 
 Cases distinguish optimistic state version from immutable content revision, so
 review bookkeeping does not invalidate itself. Pending/needs-information/rejected
@@ -726,7 +789,7 @@ are not verification of distinct humans, and delivery remains operator attestati
 
 Here, baseline cleanup means the governance-policy cleanup operation, not migration
 installation. Obsolete legal Backfill/plaintext compatibility is removed.
-Unchanged `00001` plus additive `00002` installation and fail-closed history refusal follow
+The complete packaged migration inventory and fail-closed history refusal follow
 [admin operations](admin-operations.md#migration-and-contraction); no HTTP, signed
 canonical, wire-format or operator approval contract changes with consolidation.
 
@@ -736,11 +799,11 @@ Anonymous same-origin GET requests require `country=IR` and retain the existing
 browser API no-store/no-referrer/nosniff headers. They do not bootstrap a session,
 require DPoP, create a CORS exception or expose an import/write endpoint.
 
-| Route | Additional query | Result |
-|---|---|---|
-| `/api/v1/geography/provinces` | Optional `q`, `limit`, `cursor` | Active province roots (source type 2). |
-| `/api/v1/geography/localities` | Required `province_id`; optional `q`, `limit`, `cursor` | Active source types 5 and 7 within the selected active province. |
-| `/api/v1/geography/places/{id}` | Optional `revision` | Current identity or last-seen retired snapshot; explicit revision resolves that complete historical snapshot. |
+| Route                           | Additional query                                        | Result                                                                                                        |
+| ------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `/api/v1/geography/provinces`   | Optional `q`, `limit`, `cursor`                         | Active province roots (source type 2).                                                                        |
+| `/api/v1/geography/localities`  | Required `province_id`; optional `q`, `limit`, `cursor` | Active source types 5 and 7 within the selected active province.                                              |
+| `/api/v1/geography/places/{id}` | Optional `revision`                                     | Current identity or last-seen retired snapshot; explicit revision resolves that complete historical snapshot. |
 
 Lists return `{catalog_revision,items,next_cursor}`. Each item/lookup returns
 `{id,label,type:{id,label},province,ancestors,retired,selectable,catalog_revision}`;
@@ -756,13 +819,13 @@ name with deterministic `C` collation and ID keyset tie-breaker. Empty `q` brows
 query. They are continuation tokens, not authorization. Database reads have a
 one-second deadline and one consistent catalog snapshot.
 
-| Status | Meaning |
-|---|---|
-| 200 | Valid bounded list, including genuinely empty search results, or resolved identity. |
-| 400 `invalid_request` | Malformed/duplicate/unsupported query, noncanonical ID or invalid province. |
-| 404 `not_found` | Unknown identity or absent requested snapshot membership. |
-| 409 `catalog_changed` | Active revision changed since the supplied continuation; restart browsing explicitly. |
-| 429 `rate_limited` | Geography's separate trusted-IP/subnet Redis budget exceeded; honor `Retry-After`. |
+| Status                        | Meaning                                                                                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------- |
+| 200                           | Valid bounded list, including genuinely empty search results, or resolved identity.         |
+| 400 `invalid_request`         | Malformed/duplicate/unsupported query, noncanonical ID or invalid province.                 |
+| 404 `not_found`               | Unknown identity or absent requested snapshot membership.                                   |
+| 409 `catalog_changed`         | Active revision changed since the supplied continuation; restart browsing explicitly.       |
+| 429 `rate_limited`            | Geography's separate trusted-IP/subnet Redis budget exceeded; honor `Retry-After`.          |
 | 503 `temporarily_unavailable` | Uninitialized catalog, database/deadline or limiter failure; never a successful empty list. |
 
 Default geography budgets are 120 requests/IP/minute and 600/subnet/minute,
@@ -774,11 +837,13 @@ inside one snapshot. It separates invalid selections from availability errors.
 Registration does not yet call this validator or persist location.
 
 ## 2. Internal APIs (gRPC)
+
 These services are strictly internal, protected by mTLS, and never exposed to the public internet. They allow other microservices in the Hatef ecosystem (e.g., Email Service, Search Core) to interact with the IdP securely and efficiently.
 
 Task 6.1 supplies `internal/grpcauth`; Task 6.2 composes it with `IdentityService` and an opt-in private listener in the existing API process. `GRPC_ENABLED=false` retains HTTP-only operation. Enabling requires PostgreSQL, Redis, a local Workload API socket, an explicit trust domain, exact method grants, and caller validation policies. No SPIRE deployment, production grants, or public gRPC routing is implied.
 
 ### 2.1 Identity SAN Validation (gRPC RBAC)
+
 `grpcauth` verifies the client's X.509-SVID at each unary call or stream creation, using exactly one URI **Subject Alternative Name (SAN)** containing a valid workload **SPIFFE ID**, for example `spiffe://hatef.ir/ns/identity/sa/email-service`. The identity must belong to the explicitly configured trust domain and its certificate chain must verify against the current injected bundle. CN, DNS SANs, metadata, forwarding headers, OAuth clients, and administrator roles are not workload authentication.
 
 Service RBAC is an immutable exact-full-method-to-SPIFFE-ID allowlist supplied by the composition root. There are no default, wildcard, or prefix grants. Unknown grants are never inferred from service names, and health/reflection methods have no exemption. Authorization denies the RPC, not other independently permitted calls on the same authenticated connection. The helper installs TLS 1.3 mTLS credentials and both guards without opening a listener or owning credential-source lifetime.
@@ -786,12 +851,13 @@ Service RBAC is an immutable exact-full-method-to-SPIFFE-ID allowlist supplied b
 RPC-stage authentication failures return `Unauthenticated`, unavailable trust material returns `Unavailable`, and authenticated callers without a matching grant receive `PermissionDenied`. Allowed handlers can read the verified service identity through `grpcauth.IdentityFromContext`. Streaming authorization is admission-only; already-open streams are not revoked automatically. Interceptor denials produce sanitized, best-effort `grpc.access.denied` audit events, without user/security-ledger attribution or request contents. Handshake failures and unregistered-method dispatch can occur before an interceptor. See [client integration](client-integration.md#3-internal-grpc-integration-zero-trust) for wiring, certificate renewal, error, and audit limits.
 
 ### 2.2 `IdentityService`
+
 Implemented by `internal/identitygrpc` using the [canonical protobuf contract](../libs/schemas/proto/hatef/identity/v1/identity_service.proto). Workload admission does not replace token, account, scope, or permission checks.
 
-| RPC | Contract |
-|---|---|
-| `ValidateToken` | Required raw `access_token`, explicit `expected_audience`, and observed `authorization_scheme` (`Bearer` or `DPoP`). DPoP also requires `dpop_proof`, original `http_method`, and independently observed absolute `http_uri`. Any supplied HTTP context is validated against the caller's exact permitted origins. |
-| `CheckPermission` | Nonzero `user_id` UUID and exact `permission` identifier, at most 100 characters. Uses the existing primary-DB predicate for active, nondeleted accounts. Role names, OAuth scopes, wildcard expansion, and administrator bypasses are not supported. Unknown users/permissions return `allowed=false`. |
+| RPC                   | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ValidateToken`       | Required raw `access_token`, explicit `expected_audience`, and observed `authorization_scheme` (`Bearer` or `DPoP`). DPoP also requires `dpop_proof`, original `http_method`, and independently observed absolute `http_uri`. Any supplied HTTP context is validated against the caller's exact permitted origins.                                                                                                                                             |
+| `CheckPermission`     | Nonzero `user_id` UUID and exact `permission` identifier, at most 100 characters. Uses the existing primary-DB predicate for active, nondeleted accounts. Role names, OAuth scopes, wildcard expansion, and administrator bypasses are not supported. Unknown users/permissions return `allowed=false`.                                                                                                                                                        |
 | `GetInternalUserInfo` | Nonzero `user_id` UUID. Active/pending-verification users return ID, primary email, display name, status and `lifecycle_revision`; suspended/banned users omit both email and display name. Missing, deleted and pending-deletion users return `NotFound`. Name and revision come from the same snapshot. The revision orders shared-profile changes, not credentials or authorization. No encrypted contacts, factors, hashes or legal metadata are returned. |
 
 `ValidateToken` verifies the local rotating key, `typ=at+jwt`, algorithm, issuer, audience, expiry and required claims. User tokens require the matching live normal browser session, OAuth grant, and captured primary-DB `auth_version`; client-credentials tokens use an explicit `CLIENT` principal and never acquire a user identity, even when the client ID is UUID-shaped. Recovery-enrollment sessions, ID tokens, step-up grants, assertions and legacy unlinked access JWTs are rejected.
@@ -810,14 +876,14 @@ Refresh rotation is atomic across instances, cannot change its original DPoP key
 
 Task 6.3 uses the canonical [`UserLifecycleEvent`](../libs/schemas/proto/hatef/identity/v1/user_lifecycle_event.proto) contract and a separate `IDENTITY_USERS` stream. The Go worker publishes committed outbox intent with JetStream acknowledgements. The audit stream, signer and legal evidence retention are independent.
 
-| Subject | Trigger |
-|---|---|
-| `identity.user.created` | Transactional new-account creation, including enabled registration's final commit only. Start/options/proof failures and existing-account passkey enrollment do not create an account or event; synthetic lookup probes are not operator bootstrap. |
-| `identity.user.updated` | Actual ban/reactivation, pending-deletion or reclamation transition (v1), or a real display-name update (v2). `changed_fields` names the changed shared fields, never their values. Primary-email changes remain reserved; that mutation endpoint is separate work. |
-| `identity.user.suspended` | Actual transition into the literal `suspended` status, including from banned. Repeating the same status does not emit an event even when credentials are invalidated. |
-| `identity.user.deleted` | Exactly one hold-checked physical user DELETE and its terminal intent commit atomically. Soft deletion, dry runs, held subjects, no-row deletes and rolled-back transactions never emit a tombstone. |
+| Subject                   | Trigger                                                                                                                                                                                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `identity.user.created`   | Transactional new-account creation, including enabled registration's final commit only. Start/options/proof failures and existing-account passkey enrollment do not create an account or event; synthetic lookup probes are not operator bootstrap.      |
+| `identity.user.updated`   | Actual ban/reactivation, pending-deletion/reclamation and primary-email value transitions (v1), or real display-name/private-profile updates (v2). `changed_fields` names fields, never values. Email mutation is current T27, not reserved future work. |
+| `identity.user.suspended` | Actual transition into the literal `suspended` status, including from banned. Repeating the same status does not emit an event even when credentials are invalidated.                                                                                    |
+| `identity.user.deleted`   | Exactly one hold-checked physical user DELETE and its terminal intent commit atomically. Soft deletion, dry runs, held subjects, no-row deletes and rolled-back transactions never emit a tombstone.                                                     |
 
-Both supported versions use ProtoJSON with snake_case keys: `schema_version`, UUID `event_id`, exact `event_type`, UUID `user_id`, UTC `occurred_at`, positive `revision` as a decimal JSON string, optional named-enum `status`, and `changed_fields`. Version 1 validation remains unchanged (`status`/`email` only). Version 2 explicitly adds `display_name` to the bounded changed-field set. Only display-name updates emit v2 in this task; existing creation/status/deletion producers and legacy deletion adaptation stay v1. Unknown versions/fields remain errors, and persisted v1 payloads are never rewritten. Deletion omits status/changed fields. Payloads are limited to 16 KiB and exclude name/email/contact values, credentials, ciphertexts, IPs and moderation narratives. Identifiers/timestamps remain linkable metadata, not anonymous data.
+Both supported versions use ProtoJSON with snake_case keys: `schema_version`, UUID `event_id`, exact `event_type`, UUID `user_id`, UTC `occurred_at`, positive `revision` as a decimal JSON string, optional named-enum `status`, and `changed_fields`. V1 supports `status`/`email`; v2 additionally supports `display_name` and `private_profile` (`apps/identity-api/internal/lifecycle/event.go:157-174`, `enqueue.go:105-131`). Existing creation/status/deletion and legacy deletion adaptation stay v1. Unknown versions/fields fail, persisted v1 payloads are not rewritten, deletion omits status/changed fields. The 16-KiB envelope excludes private values, credentials, ciphertext, IPs and narratives. Identifiers/timestamps remain linkable metadata, not anonymous data.
 
 `users.lifecycle_revision` is independent of `auth_version` and `auth_epoch`. Existing accounts begin at 0 without synthetic history; transaction-aware creation starts at 1. Each real captured change increments once, and deletion uses the locked account's last revision plus one. Outbox IDs/times/revisions stay stable across retries. Phone, MFA, password, passkey, recovery-code, role and session mutations do not belong to this shared-profile stream. Direct SQL and fixtures are outside the explicit Go capture boundary.
 

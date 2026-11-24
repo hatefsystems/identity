@@ -5,6 +5,13 @@ URLs. English is the initial presentation until the user explicitly saves a vali
 browser preference. `Accept-Language` does not redirect, authenticate, or choose a
 language automatically. Preferences belong to a browser, not an account profile.
 
+Security terminology and future journeys follow the
+[authentication and recovery policy](authentication-and-recovery-policy.md)
+(SEC05-SEC08, SEC14-SEC15). Existing implementation and historical localization
+acceptance do not establish the planned recovery model; required new evidence is
+tracked in [security readiness](security-testing-and-readiness.md) and
+[localization validation](localization-validation.md).
+
 ## Request and preference boundary
 
 `apps/web/i18n/config.ts` defines the supported locales, calendar, appearance and zone
@@ -69,6 +76,35 @@ Registration uses whole English/Persian messages and stable descriptors, includi
 pending, uncertain and completed states. Preference changes preserve the mounted
 client, in-memory capabilities and original wall/monotonic deadlines. Existing
 Unicode email validation and canonical identity bytes remain server-owned.
+
+Current registration requires email, mobile, username and a UV resident passkey,
+then returns to login without a session. Planned selected-contact and
+password/passkey/both choices extend this same `/register` implementation only
+after T31-T37 dependencies pass. Never translate a capability, credential response,
+password fingerprint, saved code or contact provenance into new authority.
+
+## Planned Security Terminology
+
+Owned English/Persian messages must distinguish the following, without changing
+stored or queued contracts:
+
+| Term                                  | Meaning to preserve in whole messages                                                                                                                                          |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| MFA Backup Code                       | One policy-admitted saved code completes independent MFA after an eligible primary. It does not prove TOTP or repair a factor.                                                 |
+| Account Recovery Code (ARC)           | One saved code plus fresh old-current eligible verified-contact proof permits one restricted ordinary-account repair, not normal login or Step-up. Never send it by email/SMS. |
+| Contact verification code             | Fresh proof for its exact account/destination/purpose; never a primary credential or generic MFA.                                                                              |
+| Deletion cancellation/reclaim         | The existing `/recover-account` journey only; not lost-factor recovery. Keep its exact token/link/deadline and retained-factor requirements.                                   |
+| Restricted repair / preauthentication | Distinct from normal authority; neither opens portal, OAuth, admin, legal, contact/deletion or generic security controls.                                                      |
+| Repair barrier / contact cooldown     | A durable one-repair barrier cleared only by fresh full-policy login, and a mandatory 24-hour UTC/provenance restriction on changed contacts, not preference-dependent timers. |
+
+Explain deliberate denial when surviving evidence is insufficient or privileged
+hardware/backup requirements are unmet. Do not translate that into a support
+override, automatic downgrade or a promise of recovery after total factor loss.
+For an ordinary password-only account, fresh SQL-recorded login with the repaired
+password may clear the barrier; if independent MFA is required, that password
+alone creates preauthentication and cannot clear it. Messages must not label backup
+consumption as TOTP, new-passkey UV as old-factor ownership, or successful repair
+as authentication. Persian security/legal wording requires independent review.
 
 ## Catalogs and maintenance
 
@@ -177,8 +213,8 @@ typed and restricted to the deletion route; request bodies, DPoP canonical URLs,
 middleware, factors, rate limits and recipient selection are unchanged.
 
 The Go `internal/notification` catalog is small and typed and renders privacy
-notifications. Its legacy SMS prose is retained as catalog data only. Encrypted deletion payload v2 freezes validated locale and template
-version atomically with the existing intent. Legacy v1 decodes as English/template
+notifications. Its historical SMS prose is retained as catalog data only. Encrypted deletion payload v2 freezes validated locale and template
+version atomically with the existing intent. Stored v1 decodes as English/template
 1; malformed v2 values fail closed. Existing envelope/row/request/token/deadline
 bindings and size bounds remain enforced. No new preference column or worker
 privilege is needed. Primary and backup recipients receive the same frozen
@@ -219,6 +255,15 @@ No retention, independent-hold, session, factor or cryptographic policy changes 
 part of localization. Repository execution is not permission to deploy shared
 infrastructure.
 
+Planned security-change writers require verified-destination selection and
+compatible readers before activation (T40/T41); current mailbox-only deletion
+notices do not establish a complete mobile-only lifecycle. Preserve every accepted
+recipient, payload byte, locale/template, token and absolute deadline. New-family
+notifications report issuance/regeneration, consumption/repair and security changes
+without plaintext ARCs, MFA Backup Codes, passwords, TOTP secrets or private
+attributes. Distinguish queued, provider-accepted, observed-delivered and unknown.
+Do not add locale changes as security effects or replay API work to translate a notice.
+
 ## Validation and evidence boundary
 
 Use fresh configured Nx targets with `NX_DAEMON=false CI=true
@@ -252,7 +297,7 @@ or unavailable check explicitly. Public authentication offers implemented passke
 sign-in and registration, including its separate email-verification tab. Password
 reset and general authenticator-login URLs remain localized availability notices
 with supported next actions; disconnected forms are covered only by test fixtures.
-Backup-code login UI, invitations, password-reset delivery and OAuth consent/error
+Separate MFA Backup Code and lost-factor repair UI, invitations, password-reset delivery and OAuth consent/error
 pages are separate product work. Browser/OS-owned WebAuthn prompts cannot be
 translated by this application.
 
@@ -272,16 +317,16 @@ frames do not certify human/platform/deployed-ingress acceptance. Release remain
 blocked until actual owners are assigned and the following observations are
 recorded; no reviewer or device owner is implicitly assigned by a test run.
 
-| Gate | Required Owner | Current Observation |
-| --- | --- | --- |
-| Persian deletion cancellation, passkey interruption, sessions and irreversible actions | Independent professional Persian security reviewer, not assigned | Unrun |
-| Persian UTC queries, legal references, holds and integrity interpretation | Independent professional Persian legal reviewer, not assigned | Unrun |
-| Same-phone authenticator return/restart, native typing/paste/autofill/IME and cross-tab registration handoff | Platform/device owner, not assigned | Unrun on physical devices |
-| Native passkey prompts, orientation, short landscape and mobile safe areas | Platform/device owner, not assigned | Unrun on physical devices |
-| Screen reader announcements, native keyboard and implicit Enter in long reviews | Accessibility reviewer, not assigned | Unrun with native assistive technology |
-| Native browser zoom at 200% and 400%, plus supported system text scaling | Accessibility/device owner, not assigned | Unrun; CSS viewport/text probes are not substitutes |
-| Deployed HTTPS nonces, Server Actions, strict cookies, fonts and ingress/log redaction | Deployment/security operator, not assigned | Unrun against deployed ingress |
-| Real mailbox/provider behavior and compatible notifier rollout/rollback | Mail/platform operator, not assigned | Unrun against production providers |
+| Gate                                                                                                         | Required Owner                                                   | Current Observation                                 |
+| ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- | --------------------------------------------------- |
+| Persian deletion cancellation, passkey interruption, sessions and irreversible actions                       | Independent professional Persian security reviewer, not assigned | Unrun                                               |
+| Persian UTC queries, legal references, holds and integrity interpretation                                    | Independent professional Persian legal reviewer, not assigned    | Unrun                                               |
+| Same-phone authenticator return/restart, native typing/paste/autofill/IME and cross-tab registration handoff | Platform/device owner, not assigned                              | Unrun on physical devices                           |
+| Native passkey prompts, orientation, short landscape and mobile safe areas                                   | Platform/device owner, not assigned                              | Unrun on physical devices                           |
+| Screen reader announcements, native keyboard and implicit Enter in long reviews                              | Accessibility reviewer, not assigned                             | Unrun with native assistive technology              |
+| Native browser zoom at 200% and 400%, plus supported system text scaling                                     | Accessibility/device owner, not assigned                         | Unrun; CSS viewport/text probes are not substitutes |
+| Deployed HTTPS nonces, Server Actions, strict cookies, fonts and ingress/log redaction                       | Deployment/security operator, not assigned                       | Unrun against deployed ingress                      |
+| Real mailbox/provider behavior and compatible notifier rollout/rollback                                      | Mail/platform operator, not assigned                             | Unrun against production providers                  |
 
 The internal [page-gallery workflow](page-gallery.md) uses tracked tooling under
 `tools/page-gallery/`, not local Kilo scripts. The original 464-frame gallery

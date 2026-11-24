@@ -1,15 +1,25 @@
 # Hatef Identity Platform - Compliance & Data Governance
 
-This document is the single authoritative reference for the legal, privacy, and data-governance posture of the Hatef Identity Platform (IdP). It defines what data we retain, for how long, on what basis, and how we respond to lawful requests, account-deletion requests, and abuse investigations.
+This document records engineering data inventories, current retention constraints
+and proposed governance obligations. It is not legal advice, evidence of approved
+processing, delivered data-subject rights or compliance certification. Target
+authority belongs to the [authentication policy](authentication-and-recovery-policy.md);
+source findings and release blockers belong to the
+[assessment](security-architecture-assessment.md) and
+[security readiness](security-testing-and-readiness.md).
 
-Principles in this document are written to be **law-agnostic** (they hold regardless of jurisdiction). Where a specific statute reinforces a principle, it is cited inline as a supporting reference (e.g., GDPR Article 17, Iran Computer Crimes Law). The platform launches first in Iran and expands to other jurisdictions afterward; the governance model is designed so that entering a new jurisdiction adds obligations without rewriting these principles.
+The intended initial market is Iran; applicable jurisdiction, controller duties,
+lawful bases and disclosure restrictions require qualified legal approval before
+launch. GDPR and other statutory references are applicability examples, not
+universal authority or proof that an exemption is available. Engineering policy
+cannot guarantee identical legal outcomes across jurisdictions.
 
 ---
 
 ## 1. Purpose & Scope
 
-- **Purpose:** Guarantee that the IdP can simultaneously (a) honor user privacy and deletion rights, and (b) remain able to answer legitimate abuse and law-enforcement inquiries, without either goal defeating the other.
-- **Scope:** Applies to all identity data processed by `apps/identity-api` (the Go IdP) and the identity records propagated to downstream services (e.g., Email Service, Search Core). It does not govern the *content* handled by those downstream services (e.g., email bodies); each service owns its own content-retention policy and must respect the identity-level signals defined here.
+- **Purpose:** Support purpose-limited privacy/deletion and lawful security investigations while documenting conflicts, retention gaps and independently required legal decisions; no guaranteed compliance or complete attribution is claimed.
+- **Scope:** Applies to all identity data processed by `apps/identity-api` (the Go IdP) and the identity records propagated to downstream services (e.g., Email Service, Search Core). It does not govern the _content_ handled by those downstream services (e.g., email bodies); each service owns its own content-retention policy and must respect the identity-level signals defined here.
 
 ---
 
@@ -18,10 +28,14 @@ Principles in this document are written to be **law-agnostic** (they hold regard
 All data handled by the IdP falls into exactly one of three classes. The class determines its lifecycle.
 
 ### 2.1 Class A - Deletable PII (User-Owned)
+
 Personal data that exists to serve the user and is erased when the user is deleted.
+
 - Primary email, name/display name, avatar.
 - Phone number, backup email, MFA/TOTP secrets (stored envelope-encrypted).
-- Password hash, WebAuthn credentials, recovery codes.
+- Password hash, WebAuthn credentials and current untyped recovery codes. Planned
+  separate MFA Backup Codes/ARCs and their verifiers remain credential data; never
+  put plaintext codes or TOTP secrets in notifications/audit/lifecycle events.
 - Active sessions and refresh tokens.
 - Durable registration attempts: encrypted frozen email/phone/handle/ceremony,
   capability/token hashes, original browser JKT and bounded proof/outcome metadata.
@@ -33,19 +47,28 @@ Pending signup has no user subject and expires via its separate bounded cleanup;
 completed receipt retains the original-subject FK cascade and hold-aware policy.
 
 ### 2.2 Class B - Minimal Security Metadata (Platform-Owned), Pseudonymized Personal Data
+
 Non-content, minimized metadata retained to attribute abusive or security-relevant actions even after an account is deleted. This is the class that answers "who did this, and when" after the fact.
+
 - Stable account reference (`account_ref`). Stable, but **not** anonymous: it is the join key that makes post-deletion attribution work.
-- Identity **blind index** only (keyed HMAC-SHA-256 over a normalized identifier), never raw PII, plus the `blind_index_version` pepper generation that produced it.
+- Optional identity **blind index** (keyed HMAC-SHA-256 over declared canonical
+  email input), never raw email, plus recorded `blind_index_version`. NULL
+  attribution is legitimate absence, not an empty-email digest, mobile index
+  or fabricated mailbox; stable `account_ref` remains the event subject.
 - Event type, timestamp, source IP / subnet, user-agent / device fingerprint.
 - Token/authorization issuance metadata (client_id, scope, issued-at).
 - Security signals (RTR breach, suspicious login, risk-based lockout).
 
-**Lifecycle:** Independent retention (see Section 7). **Not** deleted when the account is hard-deleted. Contains no raw PII and no action content.
+**Lifecycle:** Independent retention (see Section 7). **Not** deleted when the
+account is hard-deleted. It excludes raw email/contact and action content but
+retains personal network/device metadata; it is not free of personal data.
 
 **Classification:** This is **pseudonymized personal data**, not non-PII - see Section 7.0 for why the distinction is load-bearing and what it obliges. Retaining it past an erasure request relies on an Art. 17(3) exemption that must be documented and disclosed.
 
 ### 2.3 Class C - Immutable Audit Logs
+
 Tamper-evident administrative and system audit trail.
+
 - Append-only, cryptographically chained. Under canonical format v2 the chain lives in `audit_log_chain` (leaf digest + chain digest, one row per event), separate from the `mvp_audit_logs` payload.
 - No runtime role holds chain `UPDATE`/`DELETE`/`TRUNCATE`; signer INSERT is separate, with no maintenance exemption. Class C payload mutation permits only its existing `user_id` FK nulling, not narrative rewriting.
 
@@ -54,7 +77,7 @@ Tamper-evident administrative and system audit trail.
 **Note on Class C retention.** Class C payload rows also carry `client_ip` and
 `user_agent`, which are personal data, and there is currently no Class C purge
 worker - so that retention policy has no implementation, and the data is retained
-indefinitely. The v2 split makes a purge *possible* for the first time (erasing a
+indefinitely. The v2 split makes a purge _possible_ for the first time (erasing a
 payload no longer breaks the chain, and `DELETE` on `mvp_audit_logs` can be
 granted to a dedicated role), but the worker and its retention number remain
 outstanding. Until they exist, Class C indefinite retention is a known
@@ -64,20 +87,28 @@ storage-limitation gap under Art. 5(1)(e), not a settled position.
 
 ## 3. Data Retention Schedule
 
-Retention is purpose-bound and time-boxed. Expiry-driven purges run after their operational enablement gates pass, unless a Legal Hold (Section 6) is active. Class C audit retention remains a separate policy, not a cleanup performed by the Class B worker.
+Retention must be purpose-bound and approved. Some current minimized metadata
+has `no_expiry` and Class C has no finite purge implementation; those are explicit
+governance gaps, not time-boxed controls. Expiry purges require operational
+approval and hold checks. Class C is not purged by the Class B worker.
 
-| Data Category | Class | Default Retention | Basis | Purge Mechanism |
-| :--- | :--- | :--- | :--- | :--- |
-| Active account PII & credentials | A | Life of account | Contract / consent | Hard-delete on erasure |
-| Sessions & refresh tokens | A | Until logout / expiry | Contract | TTL + revocation |
-| Pending registration | A | 15m; email proof <=10m, passkey <=5m, capped by original deadline | Account enrollment / abuse prevention, subject to approved notices and lawful basis | Dedicated bounded cleanup; expiry checks alone are not physical erasure |
-| Registration completion receipt | A | 1h after completion, subject to current original-subject holds | Bounded outcome reconciliation | Dedicated hold-aware cleanup; user FK cascade cannot prevent lawful account purge |
-| Deletion grace record | A | 30 days | Contract / user recovery | Cron after grace window |
-| Security event ledger | B | 365 days (`8760h`; validated `4320h..13140h` range) | Legitimate interest / legal obligation | Separately credentialed hourly worker after rollout gates |
-| Admin/system audit logs | C | Long-term (policy-defined) | Legal obligation / accountability | Append-only; no ad-hoc delete |
-| Backups (PostgreSQL) | Mixed | Per backup retention (e.g., 14-30 days) | Operational continuity | Backup rotation |
+| Data Category                    | Class | Default Retention                                                   | Basis                                                                               | Purge Mechanism                                                                   |
+| :------------------------------- | :---- | :------------------------------------------------------------------ | :---------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------- |
+| Active account PII & credentials | A     | Life of account                                                     | Contract / consent                                                                  | Hard-delete on erasure                                                            |
+| Sessions & refresh tokens        | A     | Until logout / expiry                                               | Contract                                                                            | TTL + revocation                                                                  |
+| Pending registration             | A     | 15m; email proof <=10m, passkey <=5m, capped by original deadline   | Account enrollment / abuse prevention, subject to approved notices and lawful basis | Dedicated bounded cleanup; expiry checks alone are not physical erasure           |
+| Registration completion receipt  | A     | 1h after completion, subject to current original-subject holds      | Bounded outcome reconciliation                                                      | Dedicated hold-aware cleanup; user FK cascade cannot prevent lawful account purge |
+| Deletion grace record            | A     | 30 days                                                             | Contract / user recovery                                                            | Cron after grace window                                                           |
+| Security event ledger            | B     | 365 days (`8760h`; validated `4320h..13140h` range)                 | Legitimate interest / legal obligation                                              | Separately credentialed hourly worker after rollout gates                         |
+| Admin/system audit logs          | C     | Currently indefinite; numeric policy and purge remain unimplemented | Proposed legal obligation / accountability, subject to approval                     | Immutable chains; no Class C purge worker                                         |
+| Backups (PostgreSQL)             | Mixed | Per backup retention (e.g., 14-30 days)                             | Operational continuity                                                              | Backup rotation                                                                   |
 
-The configured security-ledger policy is `SECURITY_LEDGER_RETENTION=8760h` (365 days). Changes within the validated range require a documented policy decision. The signer derives expiry from event occurrence, not ingestion time. The worker honors persisted `retain_until`; it neither rewrites signed timestamps nor restarts retention after a hold release. A shorter window is more privacy-protective; a longer window reduces the risk of being unable to answer a late-arriving lawful request. There is no "keep everything indefinitely" fallback.
+The configured security-ledger default is `SECURITY_LEDGER_RETENTION=8760h`
+(365 days), not legal approval. Changes within the validated range require a
+documented decision. The signer derives expiry from occurrence, not ingestion;
+the worker honors persisted `retain_until` without rewriting signed timestamps or
+restarting retention after hold release. This finite Class B payload default does
+not remove current `no_expiry` metadata or Class C's storage-limitation gap.
 
 Registration/SMS default disabled. Transient windows and finite admission/send
 ceilings are not production budget/legal-basis approval. Complete ROPA/DPIA/notices,
@@ -93,6 +124,7 @@ PII, and protected backups retain their independent rotation/recovery obligation
 ## 4. Right to Erasure & Its Limits
 
 Users may request deletion of their data ("Right to be Forgotten"). Erasure is the default outcome. It is limited only in narrow, documented cases:
+
 - **Legal obligation:** A law requires the data to be retained (supporting reference: GDPR Art. 17(3)(b); local retention duties such as those under Iran's Computer Crimes Law for service providers).
 - **Legal claims:** The data is needed for the establishment, exercise, or defense of legal claims, or an active investigation (supporting reference: GDPR Art. 17(3)(e)).
 
@@ -104,11 +136,28 @@ When a limit applies, the corresponding data is placed under Legal Hold (Section
 
 Deletion is a staged, reversible-then-permanent process:
 
-1. **Request:** Fresh WebAuthn UV step-up is required; TOTP cannot authorize deletion. The transaction rechecks authority, sets `pending_deletion`, advances the auth version, and persists the hashed reclaim request plus encrypted per-recipient notification intents. Sessions/refresh families are revoked, and a separate authenticated TLS SMTP worker retries primary/configured-backup notices without changing the token or deadline.
+1. **Current request:** Fresh WebAuthn UV step-up is required; TOTP cannot authorize deletion. Middleware validates the grant before the service transaction, which rechecks captured account version, sets `pending_deletion` and persists reclaim plus per-recipient notice intent. Exact earned session/grant/deadline/JKT binding is not yet joined to the deciding transaction; T30/SEC10 must close that gap without weakening the stronger route. Old linked authority is revoked; SMTP retries retain original notice tokens/deadlines.
 2. **Grace window (30 days):** Pending accounts cannot log in. Cancellation uses the separate anonymous email-token plus WebAuthn UV/TOTP ceremony, followed by fresh normal login. Production uses exactly 720 hours from the original request. Retries and holds do not extend recovery access. Neither relay acknowledgement nor HTTP `204` proves inbox delivery.
 3. **Hard-delete:** After the window, the existing worker checks current eligibility and holds before erasing Class A data in a per-subject ACID transaction and committing the terminal lifecycle event. Downstream consumers apply their own data policies; this is not a promise that every service's content or backup disappears at the deadline.
 
-The notification outbox is operational Class A data, separate from lifecycle metadata and the security ledger. Recipient/token payloads are envelope encrypted and identity-bound. They become eligible for cleanup after relay acceptance, request invalidation or expiry; cleanup retains held/undecidable subjects without extending token validity. Hard deletion cascades these rows. Approve this payload-retention policy, truthful public retention wording, provider terms and incident escalation before enablement. At least one configured mailbox must remain accessible independently of the deactivated IdP; this task adds no contact-enrollment or weaker recovery bypass.
+The notification outbox is operational Class A data, separate from lifecycle
+metadata/security ledger. Recipient/token payloads are encrypted and identity-bound,
+with real v1 English/template-1 and v2 frozen-locale readers. Cleanup follows relay
+acceptance, invalidation or expiry, retaining held/undecidable subjects without
+extending token validity; hard deletion cascades rows. Current selection accepts
+nullable primary and configured backup mailboxes, but is mailbox-only and does not
+establish a verified-destination notification foundation. Approve retention/provider/
+escalation rules and independent mailbox access before enablement; do not claim
+mobile-only lifecycle completeness.
+
+Planned T40/T41 writers select eligible verified destinations and transactionally
+record metadata-only security intent before changing factors/contacts. Retain
+v1/v2 readers before writers and throughout rollback; preserve queued bytes,
+recipients, locale/template, token and deadline. Report queued, accepted, observed
+delivered and unknown distinctly. Optional email/grpc fields and current signed
+audit formats remain intact (SEC14). T27 primary-email removal and password/mobile
+activation stay blocked until complete recovery/notification/deletion/reclaim is
+independently verified (SEC12).
 
 The 30-day window is a **user-recovery** mechanism only. It is **not** a legal-retention period and is **independent** of Legal Hold (Section 6) and security-ledger retention (Section 7).
 
@@ -118,13 +167,16 @@ The 30-day window is a **user-recovery** mechanism only. It is **not** a legal-r
 
 A Legal Hold is a **precedence lock**, not a timer.
 
-- **Precedence rule:** An active hold overrides every retention timer, including the 30-day grace window and the security-ledger retention. Holds > retention.
+- **Precedence rule:** Active holds defer physical erasure/cleanup. They never
+  extend the 30-day cancellation deadline, restore authentication, reset code/grant
+  expiry or turn advisory review dates into authority. Holds > erasure, not holds
+  > authentication deadlines.
 - **No time cap:** A hold has no predefined duration. It stays until explicitly released (e.g., case closed, order satisfied).
 - **Activation:** Applied by an authorized role (e.g., DPO / Legal). Each hold records: subject reference, reason, requesting authority / case reference, legal basis, start time, and optional expected review date.
 - **Enforcement:** The hard-delete Cron **must** check for an active hold before purging any record. If a hold covers the subject, the purge is skipped entirely and logged.
 - **Release:** Releasing a hold re-subjects the data to the normal retention timers (data past its window is then purged on the next cycle).
 
-**Important limitation:** A Legal Hold only helps if it is applied **before** the data is purged. It cannot resurrect already-deleted data. For requests that arrive *after* deletion, the answer comes from the minimal security ledger (Section 7), not from the hold.
+**Important limitation:** A Legal Hold only helps if it is applied **before** the data is purged. It cannot resurrect already-deleted data. For requests that arrive _after_ deletion, the answer comes from the minimal security ledger (Section 7), not from the hold.
 
 ---
 
@@ -133,8 +185,14 @@ A Legal Hold is a **precedence lock**, not a timer.
 The ledger is the mechanism that answers a lawful request that arrives **after** an account has been deleted (e.g., a court inquiry at day 60 about an action taken before a day-30 deletion).
 
 - **Decoupled lifecycle:** Ledger rows survive account hard-delete. Their lifetime is tied to the ledger's own retention (Section 3), not to the account.
-- **Minimal, and pseudonymized rather than anonymous:** Rows carry a stable `account_ref`, an identity **blind index** (keyed HMAC, never raw email/phone), its pepper generation, network/device metadata, event type, and timestamp - never action content and never raw PII.
-- **Attribution on request:** When an authority provides a person's identifier, we compute the blind index and match it against the ledger. This attributes an action to an identity without us having retained raw PII.
+- **Pseudonymized, not anonymous:** Rows carry stable `account_ref`, optional
+  canonical-email blind index/generation, network/device metadata, event type and
+  timestamp. No raw email/contact or action content is stored, but IP/user-agent
+  and linkable references remain personal data.
+- **Conditional attribution:** Current gated inquiry accepts email only and
+  matches available eligible indexed records. NULL-email rows preserve stable
+  attribution without an email digest; phone attribution/multi-generation lookup
+  are not implemented. Matches do not verify a real-world person or complete history.
 - **Legal basis:** Art. 17(3)(e) (establishment, exercise or defence of legal claims) and/or Art. 17(3)(b) (legal obligation), supported by legitimate interest in abuse prevention and security - never user consent.
 
 This is the load-bearing difference from a design that only masks and nulls audit rows on deletion: the ledger is intentionally kept attributable (via blind index and stable ref) within a bounded, documented window.
@@ -148,7 +206,7 @@ This must be stated plainly, because an earlier framing of this table as
   (Recital 26). It remains personal data for as long as the controller can
   re-derive it - which is precisely the design goal, since re-deriving it is how
   a lawful post-deletion inquiry is answered.
-- **IP addresses are personal data**, including dynamic ones (CJEU *Breyer*,
+- **IP addresses are personal data**, including dynamic ones (CJEU _Breyer_,
   C-582/14). `client_ip` and `ip_subnet` are therefore personal data, not
   metadata.
 - **`device_fingerprint` and `user_agent` are online identifiers** under
@@ -344,22 +402,31 @@ manual governance decision.
 
 ## 10. Data Subject Rights
 
-The platform supports the standard data-subject rights:
-- **Access:** Obtain a copy of one's data (downloadable archive).
-- **Rectification:** Correct inaccurate profile data.
-- **Portability:** Machine-readable export.
-- **Erasure:** Section 4-5.
-- **Object / Restrict:** Object to or restrict certain processing.
-- **Be informed:** Clear notice of what is collected, why, and for how long.
+Applicable rights and fulfillment procedures require legal review; they are not
+all delivered through endpoints/dashboard controls. Current profile editing,
+private-attribute API primitives and conditional deletion are narrower capabilities.
+General archives, portability, objection/restriction workflows and approved
+complete notices/DSAR handling are not established here.
 
-Each right is exposed through user-facing endpoints and dashboard controls, and each fulfillment is audit-logged.
+| Proposed right/obligation       | Current evidence boundary                                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Access / portability            | No complete archive/export journey or downstream fulfillment is demonstrated.                                                 |
+| Rectification                   | Current bounded profile/private-attribute edits are not complete rights fulfillment; preserve exact revisions/privacy grants. |
+| Erasure                         | Conditional 30-day deletion/holds pipeline; downstream content, backups and retained metadata remain separate obligations.    |
+| Object / restrict / be informed | Approved procedures/notices and receipt/response evidence remain legal/operator gates.                                        |
+
+Never report complete erasure or rights fulfillment from `204`, missing profile
+or NULL email. Account for retained Class B/Class C/backup/hold data in responses.
 
 ---
 
 ## 11. Consent Management
 
-- Consent is recorded with its **version** and **timestamp**, tied to the policy text in force at the time.
-- Consent can be withdrawn; withdrawal is recorded and honored going forward.
+- Planned registration records exact approved legal versions and separate
+  acceptance evidence in account birth. Current registration does not collect
+  final legal evidence; no delivered withdrawal workflow is claimed.
+- Approval/withdrawal behavior and prospective effects need defined legal
+  contracts and observable implementation, not inferred consent from a checkbox.
 - Processing that relies on a basis other than consent (legitimate interest / legal obligation, e.g., the security ledger) is documented as such and is not gated on consent.
 
 ---
@@ -367,21 +434,31 @@ Each right is exposed through user-facing endpoints and dashboard controls, and 
 ## 12. Breach Notification & Incident Response
 
 - **Detection & classification:** Incidents are triaged by severity with a defined escalation path.
-- **Regulator notification:** Where required, the supervisory authority is notified without undue delay (supporting reference: GDPR's 72-hour expectation); affected users are notified when the risk warrants.
+- **Regulator notification:** Define applicable notification decisions, incident
+  ownership and observed delivery procedures before launch. Where GDPR applies,
+  Article 33's 72-hour rule has conditions; user notice under Article 34 is distinct.
+  No actual response capability or timely delivery is certified here.
 - **Post-incident:** Root-cause analysis and remediation are documented; audit trail integrity is verified.
 
 ---
 
 ## 13. Records of Processing & Impact Assessments
 
-- **Records of Processing Activities (RoPA):** A maintained inventory of processing activities, purposes, categories of data, and recipients (supporting reference: GDPR Art. 30).
-- **Data Protection Impact Assessment (DPIA):** Conducted for high-risk processing before launch (supporting reference: GDPR Art. 35).
+- **Records of Processing Activities (RoPA):** Required approved inventory of
+  processing, purposes, categories and recipients where applicable (GDPR Art. 30);
+  maintained approved records are not evidenced here.
+- **Data Protection Impact Assessment (DPIA):** Required applicability/risk decision
+  and completed review before high-risk launch where applicable (GDPR Art. 35);
+  this technical guide is not a completed DPIA.
 
 ---
 
 ## 14. Roles & Accountability
 
-- **Data Protection Officer (DPO):** Read-only access to audit logs; oversees deletion pipelines, data-export requests, and Legal Holds.
+- **Data Protection Officer (DPO):** Current seeded grants include gated audit,
+  verification, holds/preservation/attribution and optional legal workflows,
+  not a globally read-only role or delivered general export capability. Every use
+  requires live permissions and its audit/assurance prerequisites.
 - **Least privilege & segregation of duties:** No admin can perform a manual hard-delete of a user. Hard-delete is triggered only by the user's self-service erasure flow and executed by the scheduled job. Moderators can suspend/ban but not erase.
 - **Documentation as accountability:** Every policy here is written, versioned, and auditable - this is what an investor or auditor reviews.
 
@@ -392,8 +469,10 @@ Each right is exposed through user-facing endpoints and dashboard controls, and 
 - Inventory proposed/enabled SMS.ir and SMTP processors and operator secret-delivery
   tools. Current crypto loads environment-injected local keys; it does not fetch
   live Infisical material or supply cached/offline/hot-rotation guarantees.
-- Each has a data-processing agreement (DPA) defining scope, security obligations, and data handling.
-- Sub-processors are reviewed before onboarding and periodically thereafter.
+- Required DPAs/terms, processing/transfer inventory and security review are launch
+  gates; signed agreements or completed reviews are not evidenced in this repository.
+- Assign processor review and periodic reassessment owners before onboarding;
+  proposed providers/environment-injected secret tools are not approved vendors.
 
 SMS.ir VERIFY sends only to the supported Iranian mobile policy with explicit
 key/template/parameter and budget approval. Sandbox shares the endpoint and
@@ -416,12 +495,19 @@ coordinated rotation remain operator obligations, not primitive-test assurance.
 
 ## 16. Standards & Certifications Posture
 
-The platform is engineered toward, and documents its posture against, recognized standards:
-- **SOC 2 Type II** - operational security controls (target).
-- **ISO/IEC 27001** (information security) and **ISO/IEC 27701** (privacy information management) - target.
-- **NIST SP 800-63B** and **OWASP ASVS Level 4** - implemented and auditable in the IdP's authentication design.
+SOC 2 Type II and ISO/IEC 27001/27701 are organizational aspirations, not observed
+certifications. Technical mapping uses NIST SP 800-63B-4/C-4, ASVS 5.0.0 (L1-L3
+only), WebAuthn Level 3 and applicable OAuth/OIDC RFCs; OAuth 2.1 remains a draft.
+There is no ASVS Level 4, blanket NIST AAL/FAL, OAuth conformance, identity-proofing
+or XSS-immunity claim. See the policy's standards applicability and readiness matrix.
 
-These are stated as posture and targets; formal certification is pursued as the platform matures.
+Password-only consumer authentication, online saved-code issuance at lower assurance,
+one-contact recovery/notification, lost-MFA identity-proofing and TOTP windows need
+explicit standards-gap assessment. Independent MFA after UV, >=128-bit purpose-bound
+HMAC codes and privileged hardware/backup are Hatef choices; documentation does
+not prove implementation or legal approval. Exact-byte passwords align with ASVS
+but diverge from NIST's NFC recommendation. Preserve high-entropy SHA-256 code
+artifacts; HMAC is a proposed stronger choice, not proof existing verifiers are insecure.
 
 ---
 
@@ -436,4 +522,14 @@ These are stated as posture and targets; formal certification is pursued as the 
 
 Legal requests are independent encrypted rows, unique by account, kind and opaque idempotency key. The original account reference survives deletion. Restricted narratives are encrypted under the durable action ID; general audit excludes raw lookup identifiers, blind indexes and legal narratives but remains personal data. Review dates are advisory. Approved retention and hold-aware cleanup retain replay tombstones without reapplying cleaned holds. Fresh storage has no plaintext narratives; obsolete legal Backfill/plaintext compatibility is removed. See [admin operations](admin-operations.md#migration-and-contraction).
 
-Task 5.4 owns separately credentialed payload retention, structural verification and read-only receipt reconciliation, not erasure certification or Task 5.5 approval. External anchors, phone attribution and pepper rotation remain separate. API must not get ledger DELETE, head EXECUTE or trigger bypass. Install unchanged `00001` plus additive `00002_registration_attempts.sql` through `public.identity_schema_version`; legacy/untracked/contradictory histories refuse without adoption. Stop incompatible writers and isolate matching PostgreSQL/Redis/NATS. Down/reset refuse; any existing-environment reset requires separate explicit scoped authorization and never waives retention/hold/backup obligations. Historical statuses/evidence/plans remain unchanged and do not certify this bundle. Fresh final-source acceptance and [production/manual gates](admin-operations.md#production-checklist) remain independently required.
+Task 5.4 owns separately credentialed payload retention, structural verification
+and read-only receipt reconciliation, not erasure certification or Task 5.5 approval.
+External anchors, phone attribution and pepper rotation remain separate. API must
+not receive ledger DELETE, head EXECUTE or trigger bypass. Installation follows
+the [canonical inventory](devops-operations.md#canonical-packaged-migration-inventory)
+under `public.identity_schema_version`; retired/untracked/contradictory histories
+refuse without adoption. Stop incompatible writers and isolate matching resources;
+baseline Down/reset refuse. Any existing-environment reset needs explicit scoped
+authorization and never waives retention/hold/backup obligations. Historical evidence
+remains unchanged, not current acceptance. Fresh final-source and
+[production/manual gates](admin-operations.md#production-checklist) remain required.
