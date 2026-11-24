@@ -46,7 +46,7 @@ import {
 import { identityGoModule, integrationPackages, racePackages, raceToolchainProfile } from './acceptance-report.mjs';
 import { decodeQuotedPrintableUTF8, deletionMail, firstPasskeyMail, loginMail, startMailSink } from './portal-mail-sink.mjs';
 import { adminAppearance, adminInvocation, adminWorktreeIdentity, observeAdminMarkers, observeLegalPrivacy, observeLegalWrites, observeStatusPatches, reviewAppearance, runAdminBrowser, visibleKeyboardStops } from './web-admin.browser.mjs';
-import { api, clean, destructiveAppearance, keyStorage, nativeFirstPasskey, newContext, recoveryAction, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
+import { api, clean, destructiveAppearance, keyStorage, nativeFirstPasskey, newContext, operationResponse, recoveryAction, runPortalBrowser, validatePortal } from './web-portal.browser.mjs';
 
 function testDirectory(prefix) {
   const parent = join(tmpdir(), 'kilo');
@@ -394,6 +394,40 @@ test('browser failures never print request headers, bodies or locator values', (
   const helperMessage = browserFailure(helperFailure, 'profile-sessions');
   assert.match(helperMessage, /at browser-localization\.mjs:187:9/);
   assert.doesNotMatch(helperMessage, /PRIVATE|cookie=|secret/);
+});
+
+test('portal response waits skip nonce challenges but expose real authentication failures', async () => {
+  const path = '/api/v1/auth/login/mfa';
+  let predicate;
+  const response = await operationResponse({ waitForResponse: async (match) => {
+    predicate = match;
+    return 'owned-response';
+  } }, path, 'POST');
+  assert.equal(response, 'owned-response');
+  const candidate = (status, headers = {}, route = path, method = 'POST') => ({
+    url: () => 'https://localhost:43210' + route,
+    request: () => ({ method: () => method }),
+    status: () => status,
+    headers: () => headers,
+  });
+  assert.equal(predicate(candidate(401, { 'dpop-nonce': 'owned-nonce' })), false);
+  for (const status of [200, 204, 401, 403]) assert.equal(predicate(candidate(status)), true);
+  assert.equal(predicate(candidate(204, { 'dpop-nonce': 'unexpected-nonce' })), true);
+  assert.equal(predicate(candidate(204, {}, '/api/v1/users/me')), false);
+  assert.equal(predicate(candidate(204, {}, path, 'GET')), false);
+});
+
+test('pre-armed portal response rejection stays owned until the UI trigger is awaited', () => {
+  const source = `import assert from 'node:assert/strict';
+    import { operationResponse } from ${JSON.stringify(new URL('./web-portal.browser.mjs', import.meta.url).href)};
+    const pending = operationResponse({ waitForResponse: () => Promise.reject(new Error('PRIVATE cookie=secret')) }, '/api/v1/auth/login/mfa', 'POST');
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(pending, /^Error: Timed out waiting for POST \\/api\\/v1\\/auth\\/login\\/mfa$/);
+    process.stdout.write('waiter failure observed');`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8' });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, 'waiter failure observed');
+  assert.equal(result.stderr, '');
 });
 
 test('portal cleanup shares one promise and waits for every resource in reverse order', async () => {

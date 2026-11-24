@@ -235,8 +235,7 @@ async function freshTOTP(harness, fixture) {
 async function signIn(page, origin, path = '/login/webauthn', { harness, fixture, mfa = false } = {}) {
   await page.bringToFront();
   await visit(page, origin, path);
-  const completed = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/auth/webauthn/login/verify' &&
-    response.request().method() === 'POST' && !response.headers()['dpop-nonce']);
+  const completed = operationResponse(page, '/api/v1/auth/webauthn/login/verify', 'POST');
   const pending = mfa ? harness.captureJSON('/api/v1/auth/webauthn/login/verify', 'POST', 200) : null;
   await page.getByTestId('passkey-login').click();
   const verified = await completed;
@@ -738,16 +737,20 @@ async function totpStepUp(page, context, harness, fixture, evidence, trigger, be
 }
 
 function operationResponse(page, path, method) {
-  return page
+  const pending = page
     .waitForResponse(
       (response) =>
         new URL(response.url()).pathname === path &&
         response.request().method() === method &&
-        response.status() !== 401
+        !(response.status() === 401 && response.headers()['dpop-nonce'])
     )
     .catch(() => {
       throw new Error(`Timed out waiting for ${method} ${portalRoute(path)}`);
     });
+  // Callers arm this before UI interactions. Observe early rejection without
+  // changing the original promise's failure when the caller awaits it.
+  pending.catch(() => {});
+  return pending;
 }
 
 async function concurrentTabs(browser, harness, evidence, contexts) {
@@ -2076,6 +2079,7 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   contexts.push(current.context);
   current.page = await current.context.newPage();
   current.authenticator = await addAuthenticator(current.page, fixture.credentials[0]);
+  progress('deletion-primary-login');
   await signIn(current.page, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
   const tab = await current.context.newPage();
   await visit(tab, harness.origin, '/dashboard/privacy');
@@ -2084,11 +2088,13 @@ async function deletionLifecycle(browser, harness, evidence, contexts) {
   contexts.push(remote.context);
   const remotePage = await remote.context.newPage();
   await addAuthenticator(remotePage, fixture.credentials[1]);
+  progress('deletion-remote-login');
   await signIn(remotePage, harness.origin, '/login/webauthn', { harness, fixture, mfa: true });
   const remoteCookies = await remote.context.cookies(harness.origin);
   harness.secrets.push(...remoteCookies.map((cookie) => cookie.value));
   await current.page.bringToFront();
   await current.page.getByTestId('portal-ready').waitFor({ state: 'visible' });
+  progress('deletion-policy');
   await deletionPolicy(current.page, harness, fixture, current.authenticator, evidence);
   const original = harness.fixture('deletion-state', { user_id: fixture.user_id });
   const oldAuthority = [{ page: remotePage, context: remote.context, cookies: remoteCookies }];

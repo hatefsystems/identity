@@ -131,3 +131,27 @@ Your mission is to build secure, scalable, reliable, maintainable, production-gr
 - Communicate concisely, precisely, and transparently.
 - Explain important architectural decisions and non-obvious trade-offs.
 - After implementation, summarize what changed, what was verified, remaining risks, and any required follow-up.
+
+
+
+# Pre-launch Architecture Policy
+
+Hatef Identity is currently in the pre-launch development phase and has not been publicly launched.
+
+## Architectural Principles
+
+- Design for the intended production architecture, not hypothetical legacy accounts.
+- Do not introduce backward compatibility for historical contracts, APIs, account structures, or authentication flows unless an actual dependency is verified.
+- Treat username assignment as mandatory for all production accounts.
+- Do not introduce special legacy-account authentication or recovery paths without an explicitly confirmed requirement.
+- Prefer a single, clean, consistent implementation over compatibility layers, duplicate services, and transitional architectures.
+- Email and username identification, where supported, must be intentional product capabilities rather than legacy compatibility mechanisms.
+- Preserve security invariants, transactional integrity, audit integrity, and data protection.
+- Preserve existing real user data and verified consumer dependencies.
+- Do not automatically delete existing data, migration history, or working functionality without explicit authorization.
+- Development and test fixtures must not dictate the production architecture.
+- Build for future scalability and controlled post-launch migrations without implementing speculative compatibility mechanisms today.
+
+When planning or implementing a task, challenge every legacy compatibility requirement. If no actual dependency exists, prefer the clean target architecture.
+
+Do not expand the scope of the requested task automatically. Report obsolete legacy requirements in the backlog for explicit owner review.
