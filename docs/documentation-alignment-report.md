@@ -150,7 +150,7 @@ is not a link-validation waiver for active guidance.
 | SEC02/SEC03       | Policy, assessment, API, client, frontend             | T16A/T18/T20/T21A/T28B; TEST03/TEST04, F04/F05/F06.                                 |
 | SEC04             | Policy/ADR, admin/client/architecture/threat          | T17A/T28/T29/T42C; TEST05/TEST21, G03/G08, F01/F05/F12.                             |
 | SEC05/SEC06       | Policy/ADR, API/data/frontend/localization            | T28A/T28B/T28C/T29A-T29C/T38; TEST06-TEST10, F01/F02/F07.                           |
-| SEC07/SEC08       | Policy, data/threat/API/operations                    | T16A/T21A/T23-T29/T27A/T41C; TEST11/TEST12/TEST14, F02/F09.                         |
+| SEC07/SEC08       | Policy, data/threat/API/operations                    | T16A/T21A/T23A/T24-T26/T29A-T29C/T27A/T41C; TEST11/TEST12/TEST14, F02/F09.          |
 | SEC09/SEC10/SEC11 | Data/architecture/assessment/ADR, API/operations/DR   | T16A/T19A/T21A/T22A/T28-T33/T42A/T42D; TEST13-TEST15/TEST22, F02/F06/F08.           |
 | SEC12             | Policy, privacy API/frontend/admin/ops/DR/governance  | T27/T30/T41C; TEST16/TEST19, G05, F08/F09.                                          |
 | SEC14             | Data/API/client/governance/localization/admin         | T15/T40/T41; TEST18/TEST19, G10/G13, current-reader/nullable/metadata preservation. |
@@ -181,6 +181,7 @@ flowchart TD
     Lifecycle --> Gate[T27 retirement and mobile-only eligibility]
     Approval --> Fields[Validated attributes username geography legal]
     Fields --> Birth[Single service atomic birth and fresh session]
+    Gate --> Birth
     SQL --> Birth
     Birth --> UI[Registration and account UI integration]
     Backup --> UI
@@ -195,8 +196,9 @@ After authority/evidence/event contracts are agreed, code/recovery foundations a
 notification infrastructure may run in parallel with disjoint responsibilities.
 UI consumes fixed contracts, never invents purposes/deadlines. Security review
 checkpoints remain policy/ADR approval; SQL/lock/rollback design; MFA/privileged/
-recovery admission; barrier/cooldown; full lifecycle; registration/session/consumer;
-independent launch review. The future integrating implementation agent owns final
+recovery admission; barrier/cooldown; full lifecycle; CP06 registration and
+fresh-session authority; CP06b token, interactive OIDC, and privileged-consumer
+authority; independent launch review. The future integrating implementation agent owns final
 combined uncached verification. Documentation work has not passed these gates.
 
 ## Validation Results
