@@ -150,8 +150,10 @@ display, then derive a separate `security_name` with exactly these scalar folds:
 Display receives no security folds. NFC-supported decompositions may compose into
 admitted letters; remaining combining/vowel marks, numeral/mixed scripts, controls,
 bidi marks, whitespace, ZWNJ/ZWJ, presentation forms and unsupported aliases are
-rejected, not stripped. Dots are unchanged; leading/trailing/double dots and
-underscores fail. Alef with madda remains distinct from Alef; standalone Hamza and
+rejected, not stripped. The initial assignment expression rejects leading,
+trailing and doubled dots. Lookup keeps dots exactly as assigned under the
+bounded security normalizer. Underscores are outside the supported repertoire.
+Alef with madda remains distinct from Alef; standalone Hamza and
 sound-alike letters remain significant. No trim, NFKC, transliteration, general
 confusable skeleton, deletion or spelling-combination enumeration is allowed.
 

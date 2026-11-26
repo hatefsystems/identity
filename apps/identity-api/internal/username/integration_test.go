@@ -521,6 +521,110 @@ func TestUsernameAssignmentRacesAndLockedAuthorizationIntegration(t *testing.T) 
 	}
 }
 
+func TestUsernameAssignmentRechecksPolicyAfterConcurrentSwitchIntegration(t *testing.T) {
+	f := usernameFixture(t)
+	usernameActivateFixture(t, f)
+	const input = "\u062a"
+	user := usernameUser(t, f)
+	candidate, available, err := f.store.Validate(f.ctx, input)
+	if err != nil || !available {
+		t.Fatal("active policy did not admit the candidate", err)
+	}
+
+	policy := f.normalizer.Policy()
+	policy.ID = uuid.New()
+	next, err := New(policy, fixtureRegex, bytes.Repeat([]byte{0x59}, 32), f.normalizer.Authority().KeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextAuthority := next.Authority()
+	usernameExec(t, f, `INSERT INTO username_policy_artifacts(policy_id,fingerprint,artifact) VALUES($1,$2,$3)`, nextAuthority.PolicyID, nextAuthority.Fingerprint[:], next.CanonicalArtifact())
+	transition, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackUsername(transition)
+	var transitionPID int32
+	if err := transition.QueryRow(f.ctx, `UPDATE username_active_policy SET policy_id=$1,fingerprint=$2,epoch=epoch+1
+		WHERE singleton RETURNING pg_catalog.pg_backend_pid()`, nextAuthority.PolicyID, nextAuthority.Fingerprint[:]).Scan(&transitionPID); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, err := f.pool.BeginTx(f.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var assignmentPID int32
+	if err := assignment.QueryRow(f.ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&assignmentPID); err != nil {
+		rollbackUsername(assignment)
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer rollbackUsername(assignment)
+		err := f.store.Assign(f.ctx, assignment, user.ID, user.AuthVersion, candidate)
+		if err == nil {
+			err = assignment.Commit(f.ctx)
+		}
+		result <- err
+	}()
+	defer func() {
+		rollbackUsername(transition)
+		<-done
+	}()
+
+	// Observe the actual PostgreSQL wait before committing the synthetic switch.
+	waitCtx, cancel := context.WithTimeout(f.ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked bool
+		if err := f.pool.QueryRow(waitCtx, `SELECT $1::integer = ANY(pg_catalog.pg_blocking_pids($2::integer))`, transitionPID, assignmentPID).Scan(&blocked); err != nil {
+			t.Fatal("could not observe assignment waiting for the policy switch", err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatal("assignment finished before the policy switch committed", err)
+		case <-waitCtx.Done():
+			t.Fatal("assignment did not wait for the policy switch")
+		case <-ticker.C:
+		}
+	}
+	if err := transition.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrPolicyMismatch) {
+		t.Fatal("waiting assignment used superseded policy authority", err)
+	}
+	if resolved, err := f.store.Lookup(f.ctx, input); !errors.Is(err, ErrPolicyMismatch) || resolved != uuid.Nil {
+		t.Fatal("superseded lookup returned an account or an absence result", err)
+	}
+	if available, err := f.store.Available(f.ctx, candidate); !errors.Is(err, ErrPolicyMismatch) || available {
+		t.Fatal("superseded validation returned availability", err)
+	}
+
+	nextStore, err := NewStore(f.pool, f.cipher, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := nextStore.Get(f.ctx, user.ID, user.AuthVersion); err != nil || saved != nil {
+		t.Fatal("rejected assignment left username ownership", err)
+	}
+	current := usernameChosen(t, next, input)
+	if err := usernameAssign(f, nextStore, user.ID, user.AuthVersion, current); err != nil {
+		t.Fatal("active policy refused fresh assignment after the switch", err)
+	}
+	if resolved, err := nextStore.Lookup(f.ctx, input); err != nil || resolved != user.ID {
+		t.Fatal("active policy did not resolve the assigned account", err)
+	}
+}
+
 func TestUsernamePolicyFencesWrongKeyAndPhysicalReleaseIntegration(t *testing.T) {
 	f := usernameFixture(t)
 	usernameActivateFixture(t, f)

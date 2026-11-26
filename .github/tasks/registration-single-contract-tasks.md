@@ -54,7 +54,7 @@ recorded documentation evidence.
 | ---------- | --------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
 | T01        | T01                               | Completed contract audit, 2026-11-15                | Documentation complete, 2026-11-26                   |
 | T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
-| T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Planned policy reconciliation                        |
+| T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Verified 2026-11-26                                  |
 | T04        | T04                               | Partially implemented; approval-pending             | Blocked approved policy/reservation inventory        |
 | T05        | T05                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
 | T06        | T06                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
@@ -253,7 +253,7 @@ authorization and acceptance requirements.
 
 | Section                         | Requirement                                                                                                                                    |
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T03 - Reconcile Username Validation Policy. Status: Planned.                                                                                   |
+| ID/title                        | T03 - Reconcile Username Validation Policy. Status: Verified, 2026-11-26.                                                                      |
 | Objective                       | Retain the admitted configured full-match policy and immutable namespace, not superseded 7..40/Latin/ZWNJ rules.                               |
 | Scope                           | Bounded UTF-8/NFC display, separate four-fold security name, active policy/key provenance and lookup versus assignment distinction.            |
 | Explicit out of scope           | New business length/alphabet/reserved names, general confusable skeleton, trim/NFKC, rename, T12 or production policy activation.              |
@@ -268,6 +268,42 @@ authorization and acceptance requirements.
 | Browser/accessibility tests     | T03-B01: N/A for normalization service; T35 covers explicit validation and truthful absence/no-claim states.                                   |
 | Documentation updates           | T03-D01: mark original syntax superseded, link registration namespace and approved-policy operational gates.                                   |
 | Completion criteria             | T03-C01: GATE01 and policy reconciliation reviewed; T04's artifact approval remains an independent blocker.                                    |
+
+**T03-C01 verification, 2026-11-26 (Asia/Tehran).** Reviewed the configured
+whole-string assignment expression, NFC display and four separate security
+folds, and lookup that preserves the admitted ownership domain. The PostgreSQL
+regression observes a blocked assignment across a policy switch and checks
+stale assignment, availability and lookup denial, absence of partial ownership,
+and successful assignment under the current policy.
+
+- The uncached `identity-api:test-username` target passed three packages. The
+  uncached `identity-api:test-username-integration` target passed 557 checks
+  across username and migration packages with zero failures or skips, the Go
+  race detector, and confirmed run-owned service teardown. Go lint and vet
+  passed with default and integration build tags.
+- The release and container policy tests passed 524 checks with zero skips.
+  The `test-retention-integration` run passed 355 checks in three packages with
+  zero skips and confirmed teardown. The tested runtime sources and toolchain
+  match this delivery.
+- The portal harness ran `test-portal-integration` with directly connected,
+  run-owned PostgreSQL and Redis on their Docker bridge after reproducing a
+  connection refusal on the published loopback route. The full target passed
+  4,577 checks across 21 packages with zero failures or skips and confirmed
+  teardown using the existing test target and assertions.
+- The uncached `web:test-admin-browser` target passed all assertions in both
+  `en` and `fa-IR`, with confirmed teardown and unchanged source at finish.
+  The Linux build used the cached Next.js 16.1.7 SWC binary verified against
+  the dependency lockfile and loaded from a temporary directory.
+
+The portal and browser gates ran against HEAD
+`228548064c53de0b5f3553b1ce5a799fda08c2a4`, with unstaged diff SHA-256
+`a7c2b696e3399d1ab73630a6f4e26d706b1d9000afe59e1a965fb3726930a887`.
+The portal harness source fingerprint was
+`33454de7bc33765b7ee3993d4629378320493b77e8b3d55c056cc3ca3e8a481a`.
+Verification used Linux amd64, Node 24.21.0, npm 11.21.0, Nx 23.1.0, local
+Go 1.26.11, GCC 15.2.0 and golangci-lint 2.12.2.
+This dated evidence was added after runtime verification. T04 retains its own
+production artifact and inventory approval requirements.
 
 ### T04
 
