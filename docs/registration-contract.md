@@ -12,8 +12,8 @@ revisions are documentation. The T01 working-tree delta is documentation only.
 The [policy](authentication-and-recovery-policy.md#stable-invariants) owns SEC01–SEC16.
 The [assessment](security-architecture-assessment.md) records source findings,
 including F10 and F11. [Readiness](security-testing-and-readiness.md#release-gates)
-owns release evidence and records G01 as approval pending. [ADR 0001](adr/0001-authentication-recovery-and-security-state-authority.md#status)
-remains Proposed. See the [T01 backlog record](../.github/tasks/registration-single-contract-tasks.md#t01)
+owns release evidence and records G01 as approved on 2026-11-26. [ADR 0001](adr/0001-authentication-recovery-and-security-state-authority.md#status)
+records the owner's acceptance. See the [T01 backlog record](../.github/tasks/registration-single-contract-tasks.md#t01)
 for scope and the CP01 disposition.
 
 ## Delivery Boundaries

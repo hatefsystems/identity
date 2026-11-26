@@ -8,7 +8,7 @@ acceptance. Planned sections describe the owner-confirmed target but do not
 authorize application work. [Policy](authentication-and-recovery-policy.md) owns
 SEC01-SEC16; [assessment](security-architecture-assessment.md) owns classified source
 findings; [ADR](adr/0001-authentication-recovery-and-security-state-authority.md)
-remains Proposed; [readiness](security-testing-and-readiness.md) owns release evidence.
+records CP01 acceptance. [Readiness](security-testing-and-readiness.md) owns release evidence.
 The [backlog](../.github/tasks/registration-single-contract-tasks.md) implements
 dependencies, not a second authentication service or registration-v2 route.
 

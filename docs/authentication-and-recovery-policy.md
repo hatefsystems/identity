@@ -5,7 +5,7 @@
 Owner-confirmed target direction, documented 2026-11-24. This is normative **Hatef
 product policy**, not a description of completed implementation or a compliance
 certificate. The [ADR](adr/0001-authentication-recovery-and-security-state-authority.md)
-remains Proposed pending approval of the delivered architecture. Application work
+records the owner's acceptance under CP01 on 2026-11-26. Application work
 requires separate owner authorization. Current-source conflicts are recorded in
 the [assessment](security-architecture-assessment.md); execution and observed
 acceptance belong in the [backlog](../.github/tasks/registration-single-contract-tasks.md)

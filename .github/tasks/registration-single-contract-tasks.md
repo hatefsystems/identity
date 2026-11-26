@@ -13,7 +13,7 @@ owns SEC01-SEC16 and admission/lifecycle decisions. The
 [assessment](../../docs/security-architecture-assessment.md) owns current-source
 findings; [readiness](../../docs/security-testing-and-readiness.md) owns release
 evidence. The [ADR](../../docs/adr/0001-authentication-recovery-and-security-state-authority.md)
-is Proposed pending explicit approval. The
+was accepted by the project owner under [CP01](#t01) on 2026-11-26. The
 [registration contract](../../docs/registration-contract.md) owns the single
 registration shape. Do not invent a second registration/authentication service or
 public route. `/register` remains registration; `/recover-account` remains
@@ -52,7 +52,7 @@ recorded documentation evidence.
 
 | Primary ID | Target Executable IDs / Alias     | Historical T Status                                 | Target Disposition                                   |
 | ---------- | --------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
-| T01        | T01                               | Completed contract audit, 2026-11-15                | Docs checked 2026-11-24; C01 pending CP01            |
+| T01        | T01                               | Completed contract audit, 2026-11-15                | Documentation complete, 2026-11-26                   |
 | T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
 | T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Planned policy reconciliation                        |
 | T04        | T04                               | Partially implemented; approval-pending             | Blocked approved policy/reservation inventory        |
@@ -148,7 +148,7 @@ run in parallel only after shared authority/contracts are reviewed. UI owners
 consume those contracts; they do not invent new proofs, routes or deadlines.
 
 Security checkpoints require explicit review artifacts before downstream writes:
-CP01 policy/Proposed ADR approval; CP02 SQL ownership/lock/replay/rollback design;
+CP01 policy and ADR approval; CP02 SQL ownership/lock/replay/rollback design;
 CP03 primary/MFA/privileged/code issuance admission; CP04 repair/barrier/cooldown;
 CP05 complete password/mobile lifecycle and T27 activation; CP06 registration
 and fresh-session authority; CP06b token, interactive OIDC, and privileged-consumer
@@ -192,11 +192,11 @@ are independently observed gates, not virtual/synthetic substitutions.
 
 | Section                         | Requirement                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ID/title                        | T01 - Align the Single Registration Contract. Documentation implemented and checked 2026-11-24; C01 open pending CP01.                                 |
+| ID/title                        | T01 - Align the Single Registration Contract. Documentation complete, 2026-11-26.                                                                      |
 | Objective                       | Reconcile the existing contract with SEC01-SEC16 without labeling deferred behavior current.                                                           |
 | Scope                           | One existing service/client/form, mandatory private fields/username, one selected verified contact, password/passkey/both and approved legal versions. |
 | Explicit out of scope           | Implementation, registration-v2, T12, fabricated old-account attributes or new public routes.                                                          |
-| Dependencies                    | None; external CP01 owner approval is required before application work.                                                                                |
+| Dependencies                    | None. The owner approved CP01 on 2026-11-26. Application tasks require separate authorization.                                                         |
 | Security invariants             | SEC01, SEC02, SEC13, SEC15.                                                                                                                            |
 | Authorization requirements      | Contract review is not registration/action/login authority; future API operations retain GATE02.                                                       |
 | Functional acceptance           | T01-F01: every current and planned request/stage/response is labeled; six stages and one final contract resolve all fields without duplicate services. |
@@ -219,12 +219,15 @@ T01-U01, T01-I01 and T01-B01 retain their stated documentation-only N/A reasons.
 Application CI, SQL/HTTP, browser, provider and deployed checks belong to separate
 implementation or release work.
 
-**CP01 disposition, 2026-11-24.** The owner confirmed the target direction and
-authorized T01 documentation only. The delivered ADR, full architecture,
-documents and backlog still await explicit owner approval. [ADR 0001](../../docs/adr/0001-authentication-recovery-and-security-state-authority.md#status)
-is Proposed and [readiness G01](../../docs/security-testing-and-readiness.md#release-gates)
-records approval pending. There is no recorded CP01 approval. T01-C01 remains
-open and this entry grants no downstream authorization.
+**CP01 decision, 2026-11-26 (Asia/Tehran).** The project owner explicitly stated
+“I approve CP01” in the workspace conversation, in response to the request to
+approve the delivered authentication and recovery policy, ADR 0001, architecture,
+supporting documents and revised backlog. The checkout at approval was HEAD
+`bdc4cf4da699ea5fa21fe8034329e3ba3c642fc6`. [ADR 0001](../../docs/adr/0001-authentication-recovery-and-security-state-authority.md#status)
+records Accepted and [readiness G01](../../docs/security-testing-and-readiness.md#release-gates)
+records the approval. T01-C01 is satisfied for the documentation contract and its
+reviewed request and field trace. Each application task retains its own
+authorization and acceptance requirements.
 
 ### T02
 
@@ -1807,7 +1810,8 @@ historical T27 section; do not turn verification-in-progress into Completed.
 
 ## Documentation Handoff Status
 
-This file alone was created by the backlog owner. Historical tasks.md and local
+This section records the original 2026-11-24 backlog handoff. The backlog owner
+created this file alone. Historical tasks.md and local
 plans remain unchanged; no application/configuration/test-source, install,
 database/provider/runtime or Git mutation is part of this delivery. Full plan,
 historical root and local T backlog, registration/frontend/localization contracts

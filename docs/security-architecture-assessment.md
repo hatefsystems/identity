@@ -12,7 +12,7 @@ compliance certification were performed. Paths and line ranges refer to this HEA
 not future implementation. Tests cited here show intended assertions, not a passing run.
 
 Authority: [authentication and recovery policy](authentication-and-recovery-policy.md),
-[proposed ADR](adr/0001-authentication-recovery-and-security-state-authority.md),
+[ADR 0001](adr/0001-authentication-recovery-and-security-state-authority.md),
 [readiness](security-testing-and-readiness.md),
 [implementation backlog](../.github/tasks/registration-single-contract-tasks.md), and
 [alignment report](documentation-alignment-report.md). SEC01-SEC16 are shared policy

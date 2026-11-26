@@ -7,7 +7,7 @@ versions and mutations; Redis still carries earned sessions/preauth/token/replay
 authority. ClickHouse is a later target, not a deployed analytical ledger.
 [Policy](authentication-and-recovery-policy.md) governs SEC01-SEC16;
 [assessment](security-architecture-assessment.md) records current conflicts;
-[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) is Proposed;
+[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) records CP01 acceptance;
 [readiness](security-testing-and-readiness.md) owns observed validation.
 
 ---

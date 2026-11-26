@@ -6,9 +6,10 @@
 Security Architecture plan. This report covers A-K below. Application code, tests,
 configuration, migrations, database/provider operations, deployment, dependency
 manifests/Nx targets, historical plans/`tasks.md` and Git mutations are excluded.
-No application task was completed, no runtime pass is claimed, and implementation
-remains blocked pending explicit owner approval of the delivered architecture,
-documents and revised backlog followed by separate bounded implementation approval.
+At delivery, application verification and owner approval were pending. The
+[CP01 decision record](../.github/tasks/registration-single-contract-tasks.md#t01)
+records the subsequent owner approval. Implementation requires separate bounded
+authorization.
 
 Refreshed HEAD: `85abb13a27196c229efa7f59d7ef5beebb1d7e49`; initial working tree
 clean. Planning HEAD `f9d2119ff15927d382d860b7f62584682c5b5f31` is unavailable, so
@@ -36,7 +37,7 @@ deployment. Required code-task regression gates apply to the checker/test change
 | A Current architecture assessment      | [Assessment](security-architecture-assessment.md)                                                                                                                                       | Current-source strengths and twelve classified findings with exact paths/ranges; static inspection only.                                                                                         |
 | B Authentication/recovery target       | [Policy](authentication-and-recovery-policy.md)                                                                                                                                         | Owner-confirmed SEC01-SEC16, categories/identifiers/factors, code families and restricted authority.                                                                                             |
 | C Evidence/operation/result model      | [Policy admission matrix](authentication-and-recovery-policy.md#admission-matrix) and state/lifecycle sections                                                                          | Explicit allow/preauth/restricted/deny/unknown outcomes, unavailable-factor and provenance cases, full-policy barrier reset.                                                                     |
-| D Decisions/aligned design             | [ADR](adr/0001-authentication-recovery-and-security-state-authority.md), architecture/API/data/registration and scoped guides                                                           | One Proposed ADR, current-versus-planned designs and trade-offs; owner approval pending.                                                                                                         |
+| D Decisions/aligned design             | [ADR](adr/0001-authentication-recovery-and-security-state-authority.md), architecture/API/data/registration and scoped guides                                                           | One ADR delivered for owner review, with current and planned designs and trade-offs.                                                                                                             |
 | E Revised tasks/dependencies           | [Canonical backlog](../.github/tasks/registration-single-contract-tasks.md)                                                                                                             | All primary T01-T42 retained: 64 executable records, six aggregate aliases and excluded T12 (71 IDs); fifteen sections each and 512 stable acceptance criteria, no fabricated target completion. |
 | F Threat model                         | [STRIDE matrix](threat-modeling.md#authoritative-stride-matrix)                                                                                                                         | Preconditions/assets/current controls/gaps/mitigations/residual risks/invariants/tasks/evidence for all requested threat classes.                                                                |
 | G Implementation conflicts/remediation | [F01-F12 assessment](security-architecture-assessment.md#findings) and task/invariant owners                                                                                            | Source-proven conditional findings distinct from missing prerequisites and safety gates; no dynamic exploit claim.                                                                               |
@@ -51,7 +52,7 @@ deployment. Required code-task regression gates apply to the checker/test change
 | -------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Target policy/glossary/SEC IDs                     | Authentication and recovery policy             | Crosslink and apply requirements; do not invent weaker fallback or duplicate policy.                                       |
 | Current source/findings/F IDs                      | Security architecture assessment               | Scoped behavior must agree with current inspected source and its limitations.                                              |
-| Decision/alternatives                              | Proposed ADR 0001                              | Preserve approval status and separate implementation authorization.                                                        |
+| Decision/alternatives                              | ADR 0001                                       | Preserve approval status and separate implementation authorization.                                                        |
 | Executable task/criterion/dependency IDs           | Canonical backlog                              | Historical aliases resolve without relabeling old delivery as new policy compliance.                                       |
 | STRIDE threat/control/residual evidence            | Threat modeling                                | Link required tests and unresolved threat evidence; current controls not target completion.                                |
 | Tests/launch/source-bound evidence                 | Security testing and readiness                 | Distinguish future required gates from historical/local/deployed observations.                                             |

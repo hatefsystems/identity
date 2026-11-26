@@ -2,11 +2,12 @@
 
 ## Status
 
-**Proposed**, 2026-11-24. Owner-confirmed direction is captured in the
-[policy](../authentication-and-recovery-policy.md). Approval of this delivered ADR,
-architecture, documents and backlog is still required before separately authorized
-application implementation. Documentation publication is not implementation,
-deployment approval, completed remediation or compliance certification.
+**Accepted**, 2026-11-26. The project owner approved the delivered
+[authentication and recovery policy](../authentication-and-recovery-policy.md),
+this ADR, the architecture and supporting documents, and the revised backlog
+under CP01. The [decision record](../../.github/tasks/registration-single-contract-tasks.md#t01)
+records the owner's explicit confirmation. Implementation remains subject to
+separate task authorization and acceptance gates.
 
 ## Context
 

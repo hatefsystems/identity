@@ -6,7 +6,7 @@ Source baseline: `85abb13a27196c229efa7f59d7ef5beebb1d7e49`, inspected 2026-11-2
 This is static analysis, not exploitation, deployed-control acceptance or certification.
 [Policy](authentication-and-recovery-policy.md) owns SEC01-SEC16;
 [assessment](security-architecture-assessment.md) owns F01-F12 exact source evidence;
-[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) is Proposed;
+[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) records CP01 acceptance;
 [readiness](security-testing-and-readiness.md) and
 [backlog](../.github/tasks/registration-single-contract-tasks.md) own future
 acceptance. Planned mitigations are not current controls. Supplemental inventories

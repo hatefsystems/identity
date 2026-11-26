@@ -23,7 +23,7 @@ blanket standards-conformity claims. The 2026-11-24
 current behavior from the owner-confirmed
 [authentication and recovery policy](docs/authentication-and-recovery-policy.md).
 The [ADR](docs/adr/0001-authentication-recovery-and-security-state-authority.md)
-remains Proposed; application implementation requires separate owner approval.
+was accepted under CP01 on 2026-11-26. Application tasks require separate owner authorization.
 
 ---
 
@@ -89,7 +89,7 @@ scope; no documented prerequisite is completed merely because its design exists.
 | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [Authentication and Recovery Policy](docs/authentication-and-recovery-policy.md)  | Normative glossary, SEC01-SEC16, account/evidence/operation matrix and code/credential lifecycle.                                                                  |
 | [Security Architecture Assessment](docs/security-architecture-assessment.md)      | Refreshed source strengths, conditional findings and missing prerequisites.                                                                                        |
-| [ADR 0001](docs/adr/0001-authentication-recovery-and-security-state-authority.md) | Proposed decision, alternatives, consequences and approval boundary.                                                                                               |
+| [ADR 0001](docs/adr/0001-authentication-recovery-and-security-state-authority.md) | Accepted decision, alternatives, consequences and approval boundary.                                                                                               |
 | [Security Testing and Readiness](docs/security-testing-and-readiness.md)          | Required tests, independent/manual gates, standards and source-bound evidence.                                                                                     |
 | [Documentation Alignment Report](docs/documentation-alignment-report.md)          | A-K map, inventory, supersessions, traceability and actual documentation checks.                                                                                   |
 | [Revised Task Backlog](.github/tasks/registration-single-contract-tasks.md)       | T01-T42 IDs, bounded remediation subtasks, DAG and explicit acceptance. Historical `tasks.md`/local plans remain unchanged evidence, not current target authority. |

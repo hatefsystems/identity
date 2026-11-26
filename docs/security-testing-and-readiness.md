@@ -53,13 +53,13 @@ real primary SQL/HTTP and browser boundaries remain separately required.
 
 ## Release Gates
 
-All gates below are **Blocked or Not Run** for the planned target. Local historical
-passes remain independently scoped historical evidence, not target completion.
-No prerequisite is complete because documentation or test source exists.
+G01 records the owner's design approval of 2026-11-26. The remaining gates retain their
+individual implementation and evidence requirements. Local historical passes
+retain their original source and scope.
 
 | Gate                          | Required Decision / Observation                                                                                                                                                       | Status and Owner Boundary                                                              |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| G01 Policy/ADR                | Owner approves delivered policy, full architecture, documents and revised backlog; separately authorizes bounded implementation.                                                      | Approval pending; product/security owner, not implicitly assigned by this review.      |
+| G01 Policy/ADR                | Owner approves delivered policy, full architecture, documents and revised backlog; separately authorizes bounded implementation.                                                      | Approved under [CP01](../.github/tasks/registration-single-contract-tasks.md#t01).     |
 | G02 SQL ownership             | Persisted evidence/consumption/replay/limit inventory, common final-check protocol/global lock order, custody and rollback design accepted.                                           | Planned/Blocked, security and database owners.                                         |
 | G03 MFA/privileged/recovery   | TEST03-TEST11 complete with truthful evidence, hardware/backup admission, restricted authority and deliberate total-loss denial.                                                      | Planned/Blocked, authentication/security owners plus physical-device reviewer.         |
 | G04 Contact/barrier           | TEST11-TEST14 prove durable alternate-endpoint barrier, 24h provenance/cooldown and last eligible destination under conflicting mutations.                                            | Planned/Blocked, authentication/contact owners.                                        |
