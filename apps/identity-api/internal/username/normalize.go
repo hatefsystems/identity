@@ -143,7 +143,7 @@ func (n *Normalizer) Normalize(input string) (Value, error) {
 }
 
 // NormalizeLookup preserves the historical security domain without enforcing
-// current assignment syntax. It never trims or strips invalid input.
+// current assignment syntax or length. It never trims or strips invalid input.
 func (n *Normalizer) NormalizeLookup(input string) (Value, error) {
 	return n.normalize(input, false)
 }
@@ -159,8 +159,11 @@ func (n *Normalizer) normalize(input string, admission bool) (Value, error) {
 	if !boundedUTF8(display) {
 		return Value{}, ErrInvalidUsername
 	}
-	if admission && !n.admission.MatchString(display) {
-		return Value{}, ErrInvalidUsername
+	if admission {
+		codePoints := utf8.RuneCountInString(display)
+		if codePoints > n.policy.MaxCodePoints || codePoints-strings.Count(display, ".") < n.policy.MinLetters || !n.admission.MatchString(display) {
+			return Value{}, ErrInvalidUsername
+		}
 	}
 	for _, scalar := range display {
 		if !strings.ContainsRune(supportedScalars, scalar) {

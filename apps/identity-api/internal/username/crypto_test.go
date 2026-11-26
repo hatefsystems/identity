@@ -77,7 +77,7 @@ func TestUsernameExactCryptoProperties(t *testing.T) {
 			return false
 		}
 		input := "\u0643"
-		for _, index := range indices {
+		for _, index := range indices[:min(len(indices), p.MaxCodePoints-1)] {
 			input += string(alphabet[int(index)%(len(alphabet)-1)])
 		}
 		v, err := n.Normalize(input)

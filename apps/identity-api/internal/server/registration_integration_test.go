@@ -259,13 +259,19 @@ func newSignupIntegration(t *testing.T) *signupIntegration {
 
 func signupIntegrationUsernames(ctx context.Context, t *testing.T, database *signupIntegrationDB, cipher *envelope.Encryptor) *username.Store {
 	t.Helper()
-	policy := username.Policy{
-		ID: uuid.New(), Normalization: username.NormalizationV1,
-		Folds:         []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}},
-		ReservedNames: []string{},
+	policyJSON, err := os.ReadFile("../username/testdata/policy-review/policy.json")
+	if err != nil {
+		t.Fatal(err)
 	}
-	const syntax = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
-	normalizer, err := username.New(policy, syntax, bytes.Repeat([]byte{11}, 32), "signup-integration-only")
+	policy, err := username.DecodePolicy(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regex, err := os.ReadFile("../username/testdata/policy-review/regex.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalizer, err := username.New(policy, string(regex), bytes.Repeat([]byte{11}, 32), "signup-integration-only")
 	if err != nil {
 		t.Fatal("construct approved username fixture policy failed")
 	}
@@ -297,7 +303,7 @@ func signupIntegrationUsername() string {
 	const hex = "0123456789abcdef"
 	letters := []rune("\u0627\u0628\u067e\u062a\u062b\u062c\u0686\u062d\u062e\u062f\u0630\u0631\u0632\u0698\u0633\u0634")
 	var suffix strings.Builder
-	for _, scalar := range strings.ReplaceAll(uuid.NewString(), "-", "") {
+	for _, scalar := range strings.ReplaceAll(uuid.NewString(), "-", "")[:30] {
 		suffix.WriteRune(letters[strings.IndexRune(hex, scalar)])
 	}
 	return "\u0639\u0644\u064a.\u0645\u0624\u0645\u0646\u06cc." + suffix.String()
@@ -499,6 +505,57 @@ func (a *signupAuthenticator) assertion(t *testing.T, options *protocol.Credenti
 	enc := base64.RawURLEncoding.EncodeToString
 	body, _ := json.Marshal(map[string]any{"id": enc(a.id), "rawId": enc(a.id), "type": "public-key", "response": map[string]any{"clientDataJSON": enc(clientData), "authenticatorData": enc(authData), "signature": enc(signature), "userHandle": enc(a.handle)}})
 	return body
+}
+
+func TestRegistrationHTTPUsernameLengthAdmissionIntegration(t *testing.T) {
+	f := newSignupIntegration(t)
+	for _, tt := range []struct {
+		name, input, display string
+	}{
+		{"three", "سلا", ""},
+		{"four", "سلام", "سلام"},
+		{"three_with_dots", "س.ل.ا", ""},
+		{"four_with_dots_and_aliases", "كي.سل", "كي.سل"},
+		{"forty_after_nfc", strings.Repeat("س", 39) + "و\u0654", strings.Repeat("س", 39) + "ؤ"},
+		{"forty_one_with_dot", strings.Repeat("س", 39) + ".س", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f.sequence++
+			validate := map[string]any{"stage": "username", "registration": map[string]string{"username": tt.input}}
+			start := map[string]string{"email": tt.name + "@example.test", "phone": signupRandomPhone(t), "username": tt.input}
+			if tt.display == "" {
+				previousMail := f.mail.token
+				for path, body := range map[string]any{"validate": validate, "start": start} {
+					response := f.request(t, path, body, http.StatusBadRequest)
+					var failure struct {
+						Fields map[string]string `json:"field_errors"`
+					}
+					if json.Unmarshal(response.Body.Bytes(), &failure) != nil || failure.Fields["username"] != "invalid_username" {
+						t.Fatal("assignment entry point did not return the username field error")
+					}
+				}
+				if f.mail.token != previousMail {
+					t.Fatal("length rejection issued a proof")
+				}
+				return
+			}
+			advice := f.request(t, "validate", validate, http.StatusOK)
+			var result struct {
+				Display   string `json:"username_display"`
+				Available bool   `json:"available"`
+			}
+			if json.Unmarshal(advice.Body.Bytes(), &result) != nil || result.Display != tt.display || !result.Available {
+				t.Fatal("advisory validation rejected an admitted spelling")
+			}
+			started := f.request(t, "start", start, http.StatusCreated)
+			var pending struct {
+				Display string `json:"username_display"`
+			}
+			if json.Unmarshal(started.Body.Bytes(), &pending) != nil || pending.Display != tt.display {
+				t.Fatal("registration start disagreed with advisory validation")
+			}
+		})
+	}
 }
 
 func TestRegistrationHTTPAtomicBirthAndLostResponseFreshLoginIntegration(t *testing.T) {

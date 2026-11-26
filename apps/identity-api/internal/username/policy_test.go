@@ -22,6 +22,14 @@ func TestUsernameStrictPolicyJSON(t *testing.T) {
 		[]byte(strings.Replace(string(data), `"id":`, `"id":"d0bbd127-a362-42d0-91e1-78bb8b273d79","id":`, 1)),
 		[]byte(strings.Replace(string(data), `"reserved_names":[]`, `"reserved_names":null`, 1)),
 		[]byte(strings.Replace(string(data), `,"reserved_names":[]`, ``, 1)),
+		[]byte(strings.Replace(string(data), `,"min_letters":1`, ``, 1)),
+		[]byte(strings.Replace(string(data), `,"max_code_points":40`, ``, 1)),
+		[]byte(strings.Replace(string(data), `"min_letters":1`, `"min_letters":null`, 1)),
+		[]byte(strings.Replace(string(data), `"min_letters":1`, `"min_letters":"4"`, 1)),
+		[]byte(strings.Replace(string(data), `"min_letters":1`, `"min_letters":4.5`, 1)),
+		[]byte(strings.Replace(string(data), `"min_letters":1`, `"min_letters":1,"min_letters":4`, 1)),
+		[]byte(strings.Replace(string(data), `"max_code_points":40`, `"max_code_points":true`, 1)),
+		[]byte(strings.Replace(string(data), `"max_code_points":40`, `"max_code_points":9223372036854775808`, 1)),
 		[]byte(strings.Replace(string(data), `"from":`, `"from":"\u064a","from":`, 1)),
 		[]byte(strings.Replace(string(data), `"from":`, `"From":`, 1)),
 		[]byte(strings.Replace(string(data), `"from":`, `"extra":1,"from":`, 1)),
@@ -31,6 +39,34 @@ func TestUsernameStrictPolicyJSON(t *testing.T) {
 		if _, err := DecodePolicy(bad); err == nil {
 			t.Fatal("malformed/ambiguous policy accepted")
 		}
+	}
+}
+
+func TestUsernamePolicyLengthConfiguration(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		min, max int
+	}{
+		{"zero", 0, 40},
+		{"negative", -1, 40},
+		{"zero_max", 4, 0},
+		{"min_above_max", 40, 39},
+		{"max_above_safe_bound", 4, maxPolicyCodePoints + 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := fixturePolicy()
+			policy.MinLetters, policy.MaxCodePoints = tt.min, tt.max
+			data, err := json.Marshal(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodePolicy(data); err != ErrInvalidPolicy {
+				t.Fatal("decoding accepted an invalid length pair", err)
+			}
+			if _, err := New(policy, fixtureRegex, bytes.Repeat([]byte{1}, 32), "test"); err != ErrInvalidPolicy {
+				t.Fatal("constructor accepted an invalid length pair", err)
+			}
+		})
 	}
 }
 
@@ -104,7 +140,12 @@ func TestUsernameCanonicalArtifactAndFingerprint(t *testing.T) {
 	if err != nil || reordered.Authority() != n.Authority() {
 		t.Fatal("fold order changed canonical artifact")
 	}
-	for _, change := range []func(*Policy){func(p *Policy) { p.ID = uuid.New() }, func(p *Policy) { p.ReservedNames = []string{"\u0633"} }} {
+	for _, change := range []func(*Policy){
+		func(p *Policy) { p.ID = uuid.New() },
+		func(p *Policy) { p.ReservedNames = []string{"\u0633"} },
+		func(p *Policy) { p.MinLetters++ },
+		func(p *Policy) { p.MaxCodePoints-- },
+	} {
 		p = fixturePolicy()
 		change(&p)
 		changed, err := New(p, source, bytes.Repeat([]byte{0x59}, 32), "username-test-1")

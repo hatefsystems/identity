@@ -635,35 +635,53 @@ original clocks; no Down/reset/adoption or automatic laboratory transformation.
 
 ### Username Policy and Preflight Gates
 
+[T04A](../.github/tasks/registration-single-contract-tasks.md#t04a) verifies
+the namespace and [approved assignment policy](registration-contract.md#approved-initial-username-assignment-policy)
+on disposable PostgreSQL. Feature development consumes that local evidence.
+[T04B](../.github/tasks/registration-single-contract-tasks.md#t04b) owns actual
+production inventory and separately authorized activation. It gates public
+launch through T42.
+
 The [registration contract](registration-contract.md) adds username support to
 the existing email-link + mobile-SMS + resident-UV flow, not the final one-contact
-or password flow. Schema/config/operator code is not a live installation. No
-production policy, reserved-name set, deployment privileges, cutover timing or
-zero-pause upgrade has been approved by this documentation.
+or password flow. Schema/config/operator code is not a live installation. The owner approved the exact lengths and six canonical reservations on
+2026-11-27. Deployment privileges, cutover timing and zero-pause operation
+require separate operational review.
 The version-3 migration in the [canonical inventory](#canonical-packaged-migration-inventory) preserves existing NULLs, creates the unique
 reservation/immutability boundary and seeds an **uninstalled** authority record,
 not an active policy. It provisions no runtime/maintenance login or reindex bypass.
 
-| Username configuration                          | Required meaning when enabled                                                                                                                                                                                                                                                                                       |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `USERNAME_ENABLED`                              | Explicit username enablement, including authenticated reads when signup is off. Enabled registration requires username support; no username-less fallback.                                                                                                                                                          |
-| `USERNAME_REGEX`                                | One bounded Go expression, compiled once with whole-string anchoring against NFC display. Initial syntax is the reviewed Persian repertoire/Arabic Yeh-Kaf aliases with single internal dots, not `7..40`, Latin mode, ZWNJ or another spelling validator.                                                          |
-| `USERNAME_POLICY_JSON`                          | Explicit keys `id` (nonzero UUID), `normalization` (`nfc-four-fold-v1`), `folds` (the exact four `{from,to}` scalar pairs) and owner-reviewed `reserved_names`. The complete artifact, exact regex and pinned Unicode/normalizer version are fingerprinted. No implicit reserved names or invented system accounts. |
-| `USERNAME_LOOKUP_KEY`, `USERNAME_LOOKUP_KEY_ID` | Dedicated base64 secret of at least 32 random bytes and explicit ID; never email/phone/ledger pepper. Actual key verifier must match database authority, not just its label.                                                                                                                                        |
+| Username configuration                          | Required meaning when enabled                                                                                                                                                                                                                                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `USERNAME_ENABLED`                              | Explicit username enablement, including authenticated reads when signup is off. Enabled registration requires username support; no username-less fallback.                                                                                                                                          |
+| `USERNAME_REGEX`                                | One bounded Go expression, compiled once with whole-string anchoring against NFC display. Initial syntax is the approved Persian repertoire and Arabic Yeh/Kaf aliases with single internal dots.                                                                                                   |
+| `USERNAME_POLICY_JSON`                          | Explicit keys `id` (nonzero UUID), `normalization` (`nfc-four-fold-v1`), `folds` (the exact four `{from,to}` scalar pairs), `min_letters`, `max_code_points` and the six approved exact `reserved_names`. Both limits, the exact regex and the pinned Unicode/normalizer version are fingerprinted. |
+| `USERNAME_LOOKUP_KEY`, `USERNAME_LOOKUP_KEY_ID` | Dedicated base64 secret of at least 32 random bytes and explicit ID; never email/phone/ledger pepper. Actual key verifier must match database authority, not just its label.                                                                                                                        |
 
-Owner review is required for the production regex/artifact and actual system/support
-reserved set; sample empty sets are not approval. Missing enabled configuration,
+The approved initial values are `min_letters: 4` after NFC excluding dots and
+`max_code_points: 40` after NFC including dots. The decoder requires integer
+values satisfying `1 <= min_letters <= max_code_points <= 512`. At most 512
+two-byte letters fit the technical ceiling, even when no single-byte dots are
+present. The schema revision is pinned in the artifact as `hatef.username.v2`.
+Changing either bound changes the fingerprint and requires a new artifact ID
+and the separately approved installation and activation path. If earlier
+artifacts are discovered on the actual target, reconcile them under T04B
+before activation.
+
+Missing enabled configuration,
 same-ID changed content, wrong secret under a key ID, malformed/duplicate/unknown
 artifact fields, unsafe mappings and invalid/empty/over-budget regexes fail closed.
 No hot reload, env-only override/rollback, concurrent active namespaces or transparent
 HMAC rotation is permitted. Input/normalized bytes, regex source and artifact have
-1024-byte/4096-byte/16-KiB technical ceilings, not a business length policy.
+independent technical ceilings of 1024/4096 bytes and 16 KiB, respectively.
 
 Operator entry points are `cmd/username install` and `cmd/username preflight`.
-Before either, verify the explicitly authorized target database/schema through
-the relevant installed schema from the canonical inventory, approved policy/reserved set, actual login grants and key
-inventory. Provision secrets through the existing secret manager, not command
-arguments or checked-in files. Run each mode with its own process environment;
+Identify the actual intended production database, schema revision and scoped
+operator identity before connecting. Read-only access, inactive installation,
+activation and deployment require separate owner authorization. Confirm the
+exact approved regex and policy fingerprint, approved reserved inventory,
+dedicated key ID and actual verifier from approved key custody before namespace
+operations. Provision secrets through the existing secret manager. Run each mode with its own process environment;
 both read **`DATABASE_URL`**, not dedicated username-specific DSN variables.
 
 | Mode              | Database identity and environment                                                                                                                                                                                                                                                                                                                                                              |
@@ -698,10 +716,13 @@ Preflight JSON reports `snapshot_only`, `complete`, `clean`, aggregate counts an
 restricted issue references, with `reason`/`issues_truncated` where applicable.
 Exit `0` requires successful complete **and** clean preflight; exit `1` covers
 nonclean, incomplete, invalid configuration/privileges and operation/report failure.
-Restrict reports and review-key access; no names, raw account IDs, namespace digests
-or keys belong in ordinary logs/artifacts. A clean snapshot is not activation
-approval. These instructions were checked against source/target definitions only;
-no operator command, migration or live-data scan was run for this documentation.
+Write the report to the authorized protected destination outside the public
+repository. Record the verified target identity, migration revision, artifact
+fingerprint, key ID and provenance decision, snapshot counts, completeness and
+no-split result. Restrict report and review-key access. Ordinary diagnostics
+contain only counts and non-sensitive status. Activation requires its own
+authorization and a fenced rescan. T04A's disposable database evidence applies
+to the local run. Production evidence remains pending under T04B.
 
 The active database policy/key identity is checked under a shared guard for each
 username read/assignment, held through its deciding transaction. Hard deletion and
@@ -718,16 +739,22 @@ Inventory every surviving claimed row and reviewed reserved name; count NULL
 unclaimed rows separately. Decrypt original display with account/purpose/provenance
 checks, derive candidate keys and detect collisions across pages. Unreadable,
 unknown-policy or inconsistent rows, collisions, timeouts and capped/incomplete
-scans block clearance. A failed inventory is never an empty inventory. Restricted
-review references/counts replace ordinary logs of names/digests; never rename,
-merge, backfill, choose winners or change account status as remediation.
+scans block clearance. For a newly provisioned target, establish its identity
+and use authorized read-only inspection to verify the actual schema and zero
+account rows. The complete namespace preflight must also show `scanned = 0`
+for an empty production baseline. A zero `claimed` count can coexist with real
+unclaimed rows. A collision-clean report with unclaimed rows requires explicit
+owner review of that observed population before activation. Preserve the
+accounts and their data during that review.
 
 Controlled installation/evolution requires separate operational approval:
 
-1. Install only an inactive immutable candidate and complete preflight against the
-   actual target baseline, including reserved names. Repository NULL stored rows
-   do not prove a deployed database has no usernames. Uniqueness on discovered
-   populated data must wait for complete collision review.
+1. Use explicitly authorized read-only access to establish the actual target
+   and inventory scope. Verify the approved policy and key provenance. With
+   separate installation authorization, install only the immutable inactive
+   candidate if required by the preflight. Complete the read-only preflight
+   against that target, including reserved names. Review any actual collisions
+   before activating a unique namespace.
 2. Prove no protected equivalence class splits: for the retained alphabet/aliases,
    `C_new(C_old(x)) = C_new(x)`, with NFC/dots unchanged. Additional mergers still
    require separately approved semantics; a new ID and clean scan are insufficient.

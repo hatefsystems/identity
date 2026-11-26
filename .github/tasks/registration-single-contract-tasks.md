@@ -42,58 +42,58 @@ dependencies, not a hypothetical legacy-user design. T12 is excluded.
 
 ## Inventory and Historical Aliases
 
-There are **42 primary IDs, 64 executable target records, six aggregate aliases
-and one excluded ID: 71 distinct IDs in total**. This is not a fixed 42-task
+There are **42 primary IDs, 65 executable target records, seven aggregate aliases
+and one excluded ID: 73 distinct IDs in total**. This is not a fixed 42-task
 implementation count. Aggregates select no implicit implementation; callers must
 name their executable children. Planned work requires owner authorization and
 independently completed dependencies. Blocked names an approval, lifecycle or
 acceptance prerequisite. A dated documentation delivery establishes only the
 recorded documentation evidence.
 
-| Primary ID | Target Executable IDs / Alias     | Historical T Status                                 | Target Disposition                                   |
-| ---------- | --------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
-| T01        | T01                               | Completed contract audit, 2026-11-15                | Documentation complete, 2026-11-26                   |
-| T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
-| T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Verified 2026-11-26                                  |
-| T04        | T04                               | Partially implemented; approval-pending             | Blocked approved policy/reservation inventory        |
-| T05        | T05                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
-| T06        | T06                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
-| T07        | T07                               | No explicit status recorded                         | Blocked source-access/data-rights authorization      |
-| T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                   |
-| T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                    |
-| T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract            |
-| T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                   |
-| T12        | Excluded; no executable record    | Excluded by original purpose and AGENTS.md          | Out of scope, no claim lane                          |
-| T13        | T13                               | No explicit status recorded                         | Planned truthful optional email                      |
-| T14        | T14                               | No explicit status recorded                         | Planned exact verified-contact evidence              |
-| T15        | T15                               | No explicit status recorded                         | Planned unchanged exact-byte hashing                 |
-| T16        | T16, T16A                         | No explicit status recorded                         | Planned evidence contract and SQL authority          |
-| T17        | T17, T17A                         | No explicit status recorded                         | Planned role fences and hardware admission           |
-| T18        | T18, T18A                         | No explicit status recorded                         | Planned primary login and deliberate identifiers     |
-| T19        | T19, T19A                         | No explicit status recorded                         | Planned isolated codes and durable admission         |
-| T20        | T20                               | No explicit status recorded                         | Planned contact proof; normal login denied           |
-| T21        | T21, T21A                         | No explicit status recorded                         | Planned primary-bound MFA and durable replay         |
-| T22        | T22, T22A                         | No explicit status recorded                         | Planned scoped proof and deciding checks             |
-| T23        | T23, T23A                         | No explicit status recorded                         | Planned resulting-state and repair barrier           |
-| T24        | T24                               | No explicit status recorded                         | Planned policy-aligned password management           |
-| T25        | T25                               | No explicit status recorded                         | Planned policy-aligned first passkey                 |
-| T26        | T26                               | Completed local verification, 2026-11-23            | Planned target revalidation, not historical closure  |
-| T27        | T27, T27A                         | Implemented; verification in progress, 2026-11-23   | Planned maintenance/cooldown; keep email gate        |
-| T28        | Aggregate: T28A, T28B, T28C       | No explicit status recorded                         | Planned distinct code families/uses                  |
-| T29        | Aggregate: T29A, T29B, T29C       | No explicit status recorded                         | Planned three bounded repairs                        |
-| T30        | Aggregate: T30A, T30B             | No explicit status recorded                         | Planned deletion transaction and reclaim             |
-| T31        | T31                               | No explicit status recorded                         | Blocked validated fields/legal/full mobile lifecycle |
-| T32        | T32                               | No explicit status recorded                         | Planned atomic birth                                 |
-| T33        | T33                               | No explicit status recorded                         | Planned fresh-only normal session                    |
-| T34        | T34                               | No explicit status recorded                         | Planned six-stage shell                              |
-| T35        | T35                               | No explicit status recorded                         | Planned personal/username controls                   |
-| T36        | T36                               | No explicit status recorded                         | Planned selected contact/credentials                 |
-| T37        | T37                               | No explicit status recorded                         | Blocked approved legal documents/fresh session       |
-| T38        | Aggregate: T38A, T38B, T38C, T38D | No explicit status recorded                         | Planned four independent UI responsibilities         |
-| T39        | T39                               | No explicit status recorded                         | Blocked independent physical acceptance              |
-| T40        | Aggregate: T40A, T40B             | No explicit status recorded                         | Planned private snapshot and early event contract    |
-| T41        | Aggregate: T41A, T41B, T41C       | No explicit status recorded                         | Planned foundation/attribution; Blocked activation   |
-| T42        | T42A, T42B, T42C, T42D, T42       | No explicit status recorded                         | Planned bounded prerequisites; Blocked final release |
+| Primary ID | Target Executable IDs / Alias     | Historical T Status                                 | Target Disposition                                    |
+| ---------- | --------------------------------- | --------------------------------------------------- | ----------------------------------------------------- |
+| T01        | T01                               | Completed contract audit, 2026-11-15                | Documentation complete, 2026-11-26                    |
+| T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
+| T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Approved length revision verified 2026-11-27          |
+| T04        | Aggregate: T04A, T04B             | Partially implemented; approval-pending             | T04A verified 2026-11-27, T04B required before launch |
+| T05        | T05                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
+| T06        | T06                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
+| T07        | T07                               | No explicit status recorded                         | Blocked source-access/data-rights authorization       |
+| T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                    |
+| T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                     |
+| T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract             |
+| T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                    |
+| T12        | Excluded; no executable record    | Excluded by original purpose and AGENTS.md          | Out of scope, no claim lane                           |
+| T13        | T13                               | No explicit status recorded                         | Planned truthful optional email                       |
+| T14        | T14                               | No explicit status recorded                         | Planned exact verified-contact evidence               |
+| T15        | T15                               | No explicit status recorded                         | Planned unchanged exact-byte hashing                  |
+| T16        | T16, T16A                         | No explicit status recorded                         | Planned evidence contract and SQL authority           |
+| T17        | T17, T17A                         | No explicit status recorded                         | Planned role fences and hardware admission            |
+| T18        | T18, T18A                         | No explicit status recorded                         | Planned primary login and deliberate identifiers      |
+| T19        | T19, T19A                         | No explicit status recorded                         | Planned isolated codes and durable admission          |
+| T20        | T20                               | No explicit status recorded                         | Planned contact proof; normal login denied            |
+| T21        | T21, T21A                         | No explicit status recorded                         | Planned primary-bound MFA and durable replay          |
+| T22        | T22, T22A                         | No explicit status recorded                         | Planned scoped proof and deciding checks              |
+| T23        | T23, T23A                         | No explicit status recorded                         | Planned resulting-state and repair barrier            |
+| T24        | T24                               | No explicit status recorded                         | Planned policy-aligned password management            |
+| T25        | T25                               | No explicit status recorded                         | Planned policy-aligned first passkey                  |
+| T26        | T26                               | Completed local verification, 2026-11-23            | Planned target revalidation, not historical closure   |
+| T27        | T27, T27A                         | Implemented; verification in progress, 2026-11-23   | Planned maintenance/cooldown; keep email gate         |
+| T28        | Aggregate: T28A, T28B, T28C       | No explicit status recorded                         | Planned distinct code families/uses                   |
+| T29        | Aggregate: T29A, T29B, T29C       | No explicit status recorded                         | Planned three bounded repairs                         |
+| T30        | Aggregate: T30A, T30B             | No explicit status recorded                         | Planned deletion transaction and reclaim              |
+| T31        | T31                               | No explicit status recorded                         | Blocked validated fields/legal/full mobile lifecycle  |
+| T32        | T32                               | No explicit status recorded                         | Planned atomic birth                                  |
+| T33        | T33                               | No explicit status recorded                         | Planned fresh-only normal session                     |
+| T34        | T34                               | No explicit status recorded                         | Planned six-stage shell                               |
+| T35        | T35                               | No explicit status recorded                         | Planned personal/username controls                    |
+| T36        | T36                               | No explicit status recorded                         | Planned selected contact/credentials                  |
+| T37        | T37                               | No explicit status recorded                         | Blocked approved legal documents/fresh session        |
+| T38        | Aggregate: T38A, T38B, T38C, T38D | No explicit status recorded                         | Planned four independent UI responsibilities          |
+| T39        | T39                               | No explicit status recorded                         | Blocked independent physical acceptance               |
+| T40        | Aggregate: T40A, T40B             | No explicit status recorded                         | Planned private snapshot and early event contract     |
+| T41        | Aggregate: T41A, T41B, T41C       | No explicit status recorded                         | Planned foundation/attribution; Blocked activation    |
+| T42        | T42A, T42B, T42C, T42D, T42       | No explicit status recorded                         | Planned bounded prerequisites; Blocked final release  |
 
 Historic Phase aliases are references, not one-to-one equivalences or inherited
 target completion: Task 4.1 -> T16/T16A; 4.2/4.3 -> T17A/T18A/T25/T39;
@@ -117,7 +117,7 @@ implementation DAG, not numerical ordering; each row waits on earlier rows only.
 | ---- | --------------------------------- |
 | 0    | T01, T02, T05, T06, T07, T15, T39 |
 | 1    | T03, T08, T13, T16, T34           |
-| 2    | T04, T09, T14, T40B               |
+| 2    | T04A, T09, T14, T40B              |
 | 3    | T10, T16A, T19, T23               |
 | 4    | T11, T19A                         |
 | 5    | T20, T41A, T41B, T38D             |
@@ -134,9 +134,13 @@ implementation DAG, not numerical ordering; each row waits on earlier rows only.
 | 16   | T41C                              |
 | 17   | T31                               |
 | 18   | T32, T35, T36                     |
-| 19   | T33                               |
+| 19   | T33, T04B                         |
 | 20   | T37                               |
 | 21   | T42                               |
+
+T04A supports development against disposable PostgreSQL. T18/T18A and T31/T32/T35
+depend on T04A. T04B is a mandatory pre-launch dependency of T42 and carries
+the actual-target preflight and separately authorized activation evidence.
 
 T34's shell can proceed after T01 but cannot enable final submission. T38D can
 proceed after T11/T13 without waiting for unrelated recovery UI.
@@ -251,23 +255,23 @@ authorization and acceptance requirements.
 
 ### T03
 
-| Section                         | Requirement                                                                                                                                    |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T03 - Reconcile Username Validation Policy. Status: Verified, 2026-11-26.                                                                      |
-| Objective                       | Retain the admitted configured full-match policy and immutable namespace, not superseded 7..40/Latin/ZWNJ rules.                               |
-| Scope                           | Bounded UTF-8/NFC display, separate four-fold security name, active policy/key provenance and lookup versus assignment distinction.            |
-| Explicit out of scope           | New business length/alphabet/reserved names, general confusable skeleton, trim/NFKC, rename, T12 or production policy activation.              |
-| Dependencies                    | T01.                                                                                                                                           |
-| Security invariants             | SEC01, SEC09, SEC10.                                                                                                                           |
-| Authorization requirements      | Availability is advisory and never ownership; assignment requires active authoritative policy and owner-approved artifact.                     |
-| Functional acceptance           | T03-F01: one normalizer returns unchanged NFC display and exact admitted security folds; lookup does not retroactively narrow old assignments. |
-| Security acceptance             | T03-S01: stale/unknown policy/key, invalid UTF-8, numerals/mixed scripts/bidi/forbidden dots fail closed; no implicit identifier fallback.     |
-| Unit tests                      | T03-U01: each fold, significant near match, NFC idempotence, raw/normalized technical bounds and configured regex rejection vectors pass.      |
-| Database/HTTP integration tests | T03-I01: active versus stale policy assignment/lookup transactions return denial/unavailability, never false availability.                     |
-| Concurrency/failure tests       | T03-X01: policy switch while validating cannot commit under stale policy; losing requests retain no ownership/proof.                           |
-| Browser/accessibility tests     | T03-B01: N/A for normalization service; T35 covers explicit validation and truthful absence/no-claim states.                                   |
-| Documentation updates           | T03-D01: mark original syntax superseded, link registration namespace and approved-policy operational gates.                                   |
-| Completion criteria             | T03-C01: GATE01 and policy reconciliation reviewed; T04's artifact approval remains an independent blocker.                                    |
+| Section                         | Requirement                                                                                                                                                             |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ID/title                        | T03 - Reconcile Username Validation Policy. Status: Approved revision verified 2026-11-27.                                                                              |
+| Objective                       | Apply the approved four-letter minimum and 40-code-point maximum through the authoritative server normalizer.                                                           |
+| Scope                           | Fingerprint both explicit length bounds. Count NFC letters excluding dots and total code points including dots. Preserve the four folds and immutable namespace.        |
+| Explicit out of scope           | New alphabet or normalization, prefix reservations, rename, T12, production access and policy activation.                                                               |
+| Dependencies                    | T01.                                                                                                                                                                    |
+| Security invariants             | SEC01, SEC09, SEC10.                                                                                                                                                    |
+| Authorization requirements      | Availability is advisory and never ownership; assignment requires active authoritative policy and owner-approved artifact.                                              |
+| Functional acceptance           | T03-F01: one server normalizer applies the configured NFC lengths at every assignment boundary. Lookup retains the existing security domain.                            |
+| Security acceptance             | T03-S01: malformed, missing or unsafe bounds and stale policy/key fail closed. Existing input and identifier restrictions apply.                                        |
+| Unit tests                      | T03-U01: verify 3/4 letters with and without dots, 40/41 total code points, NFC before counting, aliases, fingerprints and unchanged technical limits.                  |
+| Database/HTTP integration tests | T03-I01: real validation, availability, registration start and final assignment agree. Stale authority denies admission, and lookup keeps the existing identity domain. |
+| Concurrency/failure tests       | T03-X01: policy switch while validating cannot commit under stale policy; losing requests retain no ownership/proof.                                                    |
+| Browser/accessibility tests     | T03-B01: N/A for normalization service; T35 covers explicit validation and truthful absence/no-claim states.                                                            |
+| Documentation updates           | T03-D01: record owner approval and trace both superseded length rules to the authoritative registration and operations contract.                                        |
+| Completion criteria             | T03-C01: GATE01 passes for the exact approved policy. T04B owns actual-target production verification and launch evidence.                                              |
 
 **T03-C01 verification, 2026-11-26 (Asia/Tehran).** Reviewed the configured
 whole-string assignment expression, NFC display and four separate security
@@ -302,28 +306,152 @@ The portal harness source fingerprint was
 `33454de7bc33765b7ee3993d4629378320493b77e8b3d55c056cc3ca3e8a481a`.
 Verification used Linux amd64, Node 24.21.0, npm 11.21.0, Nx 23.1.0, local
 Go 1.26.11, GCC 15.2.0 and golangci-lint 2.12.2.
-This dated evidence was added after runtime verification. T04 retains its own
-production artifact and inventory approval requirements.
+This dated evidence was added after runtime verification. T04A uses it as an
+implementation prerequisite. T04B retains separate production approval and
+actual inventory requirements.
 
 ### T04
 
-| Section                         | Requirement                                                                                                                                                          |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T04 - Index and Reserve Usernames. Status: Blocked by approved policy/reserved inventory.                                                                            |
-| Objective                       | Preserve unconditional namespace ownership and prove production-required username assignments without inventing old usernames.                                       |
-| Scope                           | Dedicated HMAC domain/key, all-status uniqueness, immutable assignment, approved system/support reservations and real bounded preflight.                             |
-| Explicit out of scope           | Transparent key rotation, clearing/renaming, dataset deletion, email-derived usernames, claim lane or unapproved reservation candidates.                             |
-| Dependencies                    | T03; external approved artifact, scoped read-only inventory access and protected report destination.                                                                 |
-| Security invariants             | SEC01, SEC10, SEC12.                                                                                                                                                 |
-| Authorization requirements      | Separate approved policy/key/install permissions; no application principal bypasses SQL immutability or namespace guard.                                             |
-| Functional acceptance           | T04-F01: every surviving active/suspended/banned/pending/deleted row reserves its equivalence class; only committed physical deletion releases it.                   |
-| Security acceptance             | T04-S01: ordinary SQL rejects partial/absent production tuples, clear/rename/substitution and stale-key/policy writes; unknown inventory remains blocked, not clean. |
-| Unit tests                      | T04-U01: domain-encoding/key mismatch, all-absent/all-present constraints and reserved exact/security-name near-match vectors pass.                                  |
-| Database/HTTP integration tests | T04-I01: real restricted-logins exercise every-status uniqueness, immutability, advisory availability and hold/purge reservation lifetime.                           |
-| Concurrency/failure tests       | T04-X01: separate-connection equivalent-name/policy/purge races have one winner; rollback leaves neither released nor partially assigned ownership.                  |
-| Browser/accessibility tests     | T04-B01: N/A for SQL reservation; T35 tests server conflict feedback with no owner/status disclosure.                                                                |
-| Documentation updates           | T04-D01: preserve original approval-pending evidence and record owner-reviewed inventory/policy decisions without exposing private collision reports.                |
-| Completion criteria             | T04-C01: GATE01, approved artifact/inventory and no-split preflight recorded; synthetic reserved fixtures alone do not unblock production.                           |
+This aggregate refers to [T04A](#t04a) for local implementation and verification
+and [T04B](#t04b) for the mandatory pre-launch production gate. The original
+T04-F01, T04-U01 and T04-X01 are preserved in T04A. The original security,
+integration, documentation and completion criteria are covered by both records
+within their respective scopes. T04-B01 remains N/A in both records for the
+reasons recorded there.
+
+### T04A
+
+| Section                         | Requirement                                                                                                                                                                                                                                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ID/title                        | T04A - Username Namespace Implementation and Verification. Status: Approved revision verified 2026-11-27.                                                                                                                                                                      |
+| Objective                       | Verify immutable ownership and the approved initial Persian policy on isolated PostgreSQL.                                                                                                                                                                                     |
+| Scope                           | Dedicated HMAC, unconditional uniqueness, canonical equivalence, protected assignment, the approved regex, length fields and six exact reservations and real isolated PostgreSQL evidence.                                                                                     |
+| Explicit out of scope           | Production database access, policy activation, approved inventory claims, generated old usernames, account creation for reserved names, rename, transparent key rotation or T12.                                                                                               |
+| Dependencies                    | T03.                                                                                                                                                                                                                                                                           |
+| Security invariants             | SEC01, SEC10, SEC12.                                                                                                                                                                                                                                                           |
+| Authorization requirements      | The owner approved the exact limits, schema and six reservations on 2026-11-27. Isolated PostgreSQL and synthetic identities are authorized.                                                                                                                                   |
+| Functional acceptance           | T04A-F01: surviving active/suspended/banned/pending/deleted owners reserve the whole equivalence class; committed physical deletion alone releases it.                                                                                                                         |
+| Security acceptance             | T04A-S01: restricted SQL rejects partial tuples, clear/rename/substitution and stale-key/policy writes. Existing all-absent records are represented truthfully. T04B checks mandatory assignment at the production birth and admission boundaries implemented by T32 and T18A. |
+| Unit tests                      | T04A-U01: load the exact approved regex and JSON. Verify length boundaries, input syntax, four folds, no-split, HMAC separation and exact reservations.                                                                                                                        |
+| Database/HTTP integration tests | T04A-I01: real restricted logins verify all-status uniqueness, immutability, the approved reservations, assignment length consistency, protected assignment and hold/purge lifetime. A disposable preflight may prove only its own snapshot.                                   |
+| Concurrency/failure tests       | T04A-X01: separate connections exercise equivalent-name collision, policy switch and purge races. Rollback preserves prior ownership and leaves no partial assignment or release.                                                                                              |
+| Browser/accessibility tests     | T04A-B01: N/A for SQL reservation. T35 owns public conflict feedback and disclosure checks. Shared GATE01 still applies.                                                                                                                                                       |
+| Documentation updates           | T04A-D01: preserve original dated evidence, publish the approved artifact and reservation list and identify the separate pre-launch gate.                                                                                                                                      |
+| Completion criteria             | T04A-C01: GATE01 passes for the exact approved source artifact, including real isolated SQL. T04B verifies the actual production target and activation evidence.                                                                                                               |
+
+The 2026-11-26 record below applies to pre-approval policy ID
+`dea9253a-a92c-4ae6-adac-d1ccd88527e2`. The registration contract now links its
+approved successor.
+
+**T04A verification, 2026-11-26 (Asia/Tehran).** The tested candidate is the
+exact regex and JSON linked from the [registration contract](../../docs/registration-contract.md#approved-initial-username-assignment-policy).
+It exercises the existing assignment path, including normalized aliases,
+dedicated HMAC, unconditional uniqueness, immutability, policy/assignment races,
+and rollback. The restricted-role candidate test rejected all six reservations
+and their aliases, showed no partial ownership and admitted a distinct dotted
+name. Read-only preflight observed zero accounts before fixture account
+creation and one claimed account after assignment. Those counts describe the disposable database only.
+
+- Uncached Nx `identity-api:test-username` passed three packages. Normal and
+  integration-tagged `identity-api:lint` and `identity-api:vet` passed. The
+  release-policy script tests passed 524 checks with zero failures or skips.
+- Uncached `identity-api:test-username-integration` passed 559 checks in two
+  packages with the Go race detector. The official harness targets
+  `identity-api:test-retention-integration` and `identity-api:test-portal-integration`
+  passed 355 checks in three packages and 4,579 in 21 packages, respectively.
+  All three disposable service runs had zero failed or skipped tests and
+  confirmed teardown. The local username and portal harnesses routed to the
+  run-owned PostgreSQL and Redis bridge addresses with the same test targets.
+- The uncached Nx `web:test-admin-browser` target passed all assertions in
+  `en` and `fa-IR` with matching worktree identities and completed teardown.
+  Two earlier attempts stopped on a disposable login fixture exit and a
+  numeric match in the audit-signer log privacy assertion, respectively.
+  Both completed teardown. The passing rerun used the unchanged target and
+  a lockfile-verified cached Linux Next.js 16.1.7 SWC binary.
+- Formatting, combined diff review and the references-only documentation checker
+  passed. The checker verified 65 executable records, 520 criteria and 287
+  dependency edges. The original historical evidence was preserved byte-for-byte.
+
+The runtime runs used HEAD `2a8c6903018f0cb8db1a12180f53303defbbec88` plus the
+T04A/T04B working-tree edits, including the untracked proposal and unit test.
+The three SQL reports agree on source SHA-256
+`2fb5b32ff9866bad008cb90abe1386894575197f01387151ba29a35354f66ccf`
+and their generated outputs. Verification used Linux amd64, Node 24.21.0,
+npm 11.21.0, Nx 23.1.0, Go 1.26.11, GCC 15.2.0 and golangci-lint 2.12.2.
+This dated record was added after runtime verification. Production approval,
+key provenance and actual-target evidence remain under T04B.
+
+**Owner decision, 2026-11-27 (Asia/Tehran).** The project owner explicitly
+approved configurable NFC counts of four admitted letters minimum (separator
+dots excluded) and 40 total Unicode code points maximum (separator dots
+included), the policy JSON schema revision, and the six exact canonical
+reservations listed in the [registration contract](../../docs/registration-contract.md#approved-initial-username-assignment-policy).
+This decision supersedes the historical 7–40 canonical-code-point requirement
+and the later unbounded business-length policy. It authorizes implementation,
+testing and documentation for T03 and T04A. T04B retains separate authorization
+for actual-target inventory, installation, activation and deployment.
+
+**T03-C01 and T04A-C01 revised verification, 2026-11-27 (Asia/Tehran).** The exact
+approved artifact is `e9fa486e-db81-4dd0-8225-1e99e5399c1d`. Its canonical
+SHA-256 fingerprint is
+`a2a74767ae7f42bdcd7e08ab6e65e21985f1dd9130e7d989b3ecf2220ad588cb`.
+The unit, PostgreSQL and registration HTTP/browser fixtures used the approved
+limits and reservation list. The checks covered NFC before counting, aliases,
+boundary lengths, fail-closed JSON, fingerprint changes, preserved lookup,
+restricted-store availability and final assignment, uniqueness, rollback and
+a blocked waiter across a length-policy switch.
+
+- Fresh Nx `identity-api:test` and `identity-api:test-race` each passed 69 Go
+  packages. `identity-api:test-username` passed three packages. Normal and
+  integration-tagged Go lint and vet passed. The release-policy scripts passed
+  524 tests with zero skips.
+- `identity-api:test-username-integration` passed 577 race checks in two packages.
+  The owned-service harnesses passed 4,604 portal checks in 21 packages, 355
+  retention checks in three packages, 161 registration race checks and 3,530
+  security database checks in 22 packages. All runs had zero skips and confirmed
+  teardown. The security database rerun used matching PostgreSQL 16 clients
+  from its run-owned container.
+- Uncached Nx `web:test-admin-browser` passed in `en` and `fa-IR` with matching
+  worktree identities and confirmed teardown. Uncached
+  `web:test-registration-browser` passed 36 checks with four journeys per
+  locale on the checksum-verified API image
+  `sha256:0b2fb6419dfc0b5f5e79d8ee88f05c722111af0738d13b5e4784f69d2b81e271`.
+  The manifest verifier passed and teardown completed. Earlier attempts stopped
+  on inherited debug configuration and a Persian browser evaluation. The
+  passing rerun used the same image and unchanged assertions.
+- Packaged API smoke, registration Compose and the full Compose HTTPS, restart,
+  persistence and teardown checks passed. Local containers supplied disposable
+  services and simulated providers. Formatting, combined diff review and the
+  references-only documentation checker passed.
+
+Runtime evidence used HEAD `2a8c6903018f0cb8db1a12180f53303defbbec88` plus the
+combined staged and working-tree edits. SQL, the API manifest and registration
+browser agreed on source SHA-256
+`8fd625abce339164273b1ef8f46443a110ca2fb9c15e6fae05c2815a49049021`
+and generated fingerprints. Verification used Linux amd64, Node 24.21.0,
+npm 11.21.0, Nx 23.1.0, Go 1.26.11, GCC 15.2.0 and golangci-lint 2.12.2.
+This dated record follows runtime verification. T04B still requires separately
+authorized actual-target inventory, key provenance and activation evidence.
+
+### T04B
+
+| Section                         | Requirement                                                                                                                                                                                                                                                                            |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ID/title                        | T04B - Production Username Namespace Preflight and Activation. Status: Blocked by production authorization and evidence.                                                                                                                                                               |
+| Objective                       | Verify the actual intended production namespace and record explicit activation clearance before public launch.                                                                                                                                                                         |
+| Scope                           | Approved regex/policy/reserved names, authenticated key provenance, scoped read-only production inventory, protected report, fenced installation and activation under separate authorization.                                                                                          |
+| Explicit out of scope           | Speculative legacy compatibility, inferred empty baseline, public reports, deletion/rename/backfill/merge, or implied installation, activation or deployment permission.                                                                                                               |
+| Dependencies                    | T04A, T18A, T32 and verification of the approved artifact, key provenance, scoped read-only access and a protected evidence destination.                                                                                                                                               |
+| Security invariants             | SEC01, SEC09, SEC10, SEC12, SEC13.                                                                                                                                                                                                                                                     |
+| Authorization requirements      | Verify the owner-approved artifact ID, fingerprint, length limits and exact six reservations on the authorized target. Inventory uses a restricted read-only identity. Installation, activation and deployment each require separate owner authorization.                              |
+| Functional acceptance           | T04B-F01: verify the actual intended database and schema, exact approved length fields, regex and six reservations, and key provenance. A newly provisioned baseline needs a complete observed zero-account inventory.                                                                 |
+| Security acceptance             | T04B-S01: unknown, incomplete, colliding, inconsistent or unreadable inventory blocks activation. Preserve real data, equivalent names and protected security guarantees. Restrict the report outside the public repository and keep production keys in the approved custody boundary. |
+| Unit tests                      | T04B-U01: N/A for the operational gate. T04A owns configuration and algorithm tests.                                                                                                                                                                                                   |
+| Database/HTTP integration tests | T04B-I01: complete a bounded read-only snapshot on the authorized target and record source/schema, policy/key identity, no-split results and actual counts in protected evidence. Verify all production human birth and admission paths require an assigned username before reopening. |
+| Concurrency/failure tests       | T04B-X01: drain/fence writers and revalidate the full actual inventory before separately authorized activation. Failed or uncertain cutover retains last proven safe authority and keeps affected writers fenced until reconciled.                                                     |
+| Browser/accessibility tests     | T04B-B01: N/A for restricted operator and database checks. T35 owns public conflict feedback and T42 owns final release acceptance.                                                                                                                                                    |
+| Documentation updates           | T04B-D01: record review and operation decisions and non-sensitive outcome references. Retain protected inventory and collision reports outside the public repository.                                                                                                                  |
+| Completion criteria             | T04B-C01: verify the approved artifact and key provenance, complete actual-target no-split preflight, store protected evidence and observe separately authorized activation. Mandatory before public launch under T42.                                                                 |
 
 ### T05
 
@@ -613,7 +741,7 @@ production artifact and inventory approval requirements.
 | Objective                       | Preserve intentional username/password login and require actual UV for every passkey authentication.                                                                                                    |
 | Scope                           | Existing login/session/browser-proof infrastructure, eligible exact-byte password or passkey assertion, bounded preauth for required independent MFA.                                                   |
 | Explicit out of scope           | Contact-only normal login, mobile identifier, implicit fallback, assertion UP acceptance or automatic session by recovery.                                                                              |
-| Dependencies                    | T15, T16A, T17A, T04.                                                                                                                                                                                   |
+| Dependencies                    | T15, T16A, T17A, T04A.                                                                                                                                                                                  |
 | Security invariants             | SEC01, SEC02, SEC03, SEC04, SEC09.                                                                                                                                                                      |
 | Authorization requirements      | Verify eligible pre-existing primary and actual assertion UV for passkeys; full authoritative policy decides normal versus preauth.                                                                     |
 | Functional acceptance           | T18-F01: ordinary no-MFA password/UV passkey login earns normal; required MFA earns bounded preauth only, with original primary/auth_time.                                                              |
@@ -633,7 +761,7 @@ production artifact and inventory approval requirements.
 | Objective                       | Admit intentional current verified unique primary-email identification without credential-count enumeration.                                                        |
 | Scope                           | Explicit identifier kind, shared username normalization, eligible email association and discoverable/named passkey option/error shape.                              |
 | Explicit out of scope           | Legacy-email label, mobile identification, identifier guessing/fallback, owner/status/credential inventory disclosure or universal timing-immunity claim.           |
-| Dependencies                    | T18, T03, T04, T14, T17A.                                                                                                                                           |
+| Dependencies                    | T18, T03, T04A, T14, T17A.                                                                                                                                          |
 | Security invariants             | SEC01, SEC02, SEC04, SEC09.                                                                                                                                         |
 | Authorization requirements      | Selection is not proof; primary-email association must be current/verified/unique and final primary policy still applies.                                           |
 | Functional acceptance           | T18A-F01: explicit username/email and discoverable flows select only eligible accounts; known shared/unverified/stale email does not choose an arbitrary subject.   |
@@ -1093,7 +1221,7 @@ production artifact and inventory approval requirements.
 | Objective                       | Implement the final contract in the existing service, with one verified contact and no code-only human accounts.                                                               |
 | Scope                           | Mandatory private names/birthday/gender/username/location, one email OR mobile, password/passkey/both, approved terms/privacy versions and verified selected primary.          |
 | Explicit out of scope           | Second service/client/versioned route, username-less production accounts, inferred old data, unselected fabricated contact, automatic both downgrade or code-family issuance.  |
-| Dependencies                    | T01, T02, T03, T04, T05, T06, T09, T10, T13, T14, T15, T19A, T23, T41C; external approved legal versions/source-data rights.                                                   |
+| Dependencies                    | T01, T02, T03, T04A, T05, T06, T09, T10, T13, T14, T15, T19A, T23, T41C; external approved legal versions/source-data rights.                                                  |
 | Security invariants             | SEC01, SEC02, SEC08, SEC12, SEC13, SEC15.                                                                                                                                      |
 | Authorization requirements      | Original registration capability/JKT/attempt/deadlines; exact selected contact proof and server-verified selected primary, complete field/legal validation before native work. |
 | Functional acceptance           | T31-F01: every supported final field/stage validates under existing authoritative validators; passkey/password/both require exactly corresponding credential inputs.           |
@@ -1113,7 +1241,7 @@ production artifact and inventory approval requirements.
 | Objective                       | Ensure account/attributes/username/proofs/credentials/legal evidence/intents share one known deciding SQL transaction.                                                                                                                                                      |
 | Scope                           | Existing registration store/service, final authoritative validation/locks, keyed password-bearing intent fingerprint, exact receipt/result reconciliation and creation metadata.                                                                                            |
 | Explicit out of scope           | Two-phase partial account birth, account recreation by retry/result, unkeyed password digest, normal session T33 or exactly-once external delivery claim.                                                                                                                   |
-| Dependencies                    | T31, T16A, T40B, T41A, T04.                                                                                                                                                                                                                                                 |
+| Dependencies                    | T31, T16A, T40B, T41A, T04A.                                                                                                                                                                                                                                                |
 | Security invariants             | SEC01, SEC02, SEC09, SEC10, SEC11, SEC13, SEC14.                                                                                                                                                                                                                            |
 | Authorization requirements      | Recheck original capability/JKT/contact proof/credential/policy/catalog/legal/deadline after locks; native/hash results are bound and earned outside long-held locks.                                                                                                       |
 | Functional acceptance           | T32-F01: one commit persists all required birth rows/evidence/intent and explicit initial-contact exemption; no-op receipt/result reads mutate nothing.                                                                                                                     |
@@ -1173,7 +1301,7 @@ production artifact and inventory approval requirements.
 | Objective                       | Bind the existing shell to unchanged server validators with complete bilingual accessible feedback.                                                                    |
 | Scope                           | Given/family names, exact date-only calendar input/pair, explicit gender and advisory username validation; typed status descriptors.                                   |
 | Explicit out of scope           | New name/gender/geography/password rules, inferred defaults, DOB timestamp, client username regex or availability as reservation.                                      |
-| Dependencies                    | T34, T31, T02, T03, T04, T05, T06.                                                                                                                                     |
+| Dependencies                    | T34, T31, T02, T03, T04A, T05, T06.                                                                                                                                    |
 | Security invariants             | SEC01, SEC13, SEC14, SEC15.                                                                                                                                            |
 | Authorization requirements      | Validation is advisory only; authoritative final birth revalidates every field/policy. Preferences affect presentation, not canonical values.                          |
 | Functional acceptance           | T35-F01: field errors/normalized results match server validators, birthday keeps explicit calendar/date-only pair and gender has no preselection.                      |
@@ -1507,23 +1635,23 @@ production artifact and inventory approval requirements.
 
 ### T42
 
-| Section                         | Requirement                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T42 - Independently Integrate and Verify the Final Combined Target. Status: Blocked by all executable prerequisites and independent release gates.                                                                                                                                                                                                      |
-| Objective                       | Close only observed final security/readiness evidence, never implicitly implement missing prerequisites.                                                                                                                                                                                                                                                |
-| Scope                           | Final combined integration, traceable SEC/test/control matrix, review/scan/abuse/rollback evidence and non-destructive documented rollout/rollback.                                                                                                                                                                                                     |
-| Explicit out of scope           | Missing feature implementation, deployment/reset/Git mutations, silent critical/high risk acceptance, fixture-as-human/provider evidence or compliance certification.                                                                                                                                                                                   |
-| Dependencies                    | T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T13, T14, T15, T16, T16A, T17, T17A, T18, T18A, T19, T19A, T20, T21, T21A, T22, T22A, T23, T23A, T24, T25, T26, T27, T27A, T28A, T28B, T28C, T29A, T29B, T29C, T30A, T30B, T31, T32, T33, T34, T35, T36, T37, T38A, T38B, T38C, T38D, T39, T40A, T40B, T41A, T41B, T41C, T42A, T42B, T42C, T42D. |
-| Security invariants             | SEC01-SEC16.                                                                                                                                                                                                                                                                                                                                            |
-| Authorization requirements      | Independent CP07 review and explicit owner approval of source-bound architecture/evidence/risk decisions; documentation never grants runtime or privileged authority.                                                                                                                                                                                   |
-| Functional acceptance           | T42-F01: all supported ordinary/privileged/workload registration/login/MFA/code/repair/contact/private/deletion/IdP/consumer lifecycles match one approved contract and DAG.                                                                                                                                                                            |
-| Security acceptance             | T42-S01: all matrix deny outcomes observed; no unresolved critical/high auth/recovery/authorization/credential/session issue is silently accepted; exceptions need explicit documented owner risk acceptance.                                                                                                                                           |
-| Unit tests                      | T42-U01: complete focused/unit/property/fuzz matrix, truthful evidence, exact bytes/revisions/purpose bindings and supply-chain/dependency/secret/SAST/container scan results recorded.                                                                                                                                                                 |
-| Database/HTTP integration tests | T42-I01: current resolved CI real SQL/HTTP/gRPC/NATS/Redis suites and complete nullable lifecycle/token/consumer admission pass with exact expected inventories and zero mandatory skips.                                                                                                                                                               |
-| Concurrency/failure tests       | T42-X01: current 13-package race matrix plus one-winner/barrier/cooldown/SQL-Redis forgery-loss/unknown-commit/stale replica/failover/restore adversarial coverage, DAST/abuse penetration testing and independent review recorded.                                                                                                                     |
-| Browser/accessibility tests     | T42-B01: GATE03 actual bilingual full journeys plus independently observed real email/SMS, Windows Hello/physical keys, screen reader/native zoom/bfcache, Persian security/legal and deployed ingress/redaction gates.                                                                                                                                 |
-| Documentation updates           | T42-D01: readiness/alignment/README/API/policy/ADR/install/DR and task status evidence include exact source/toolchain/command/exits/identities, remaining blockers and approved rights/legal documents.                                                                                                                                                 |
-| Completion criteria             | T42-C01: GATE01/GATE02/GATE03, CP01-CP07 and CP06b, every prerequisite criterion and independent observed release gate pass; any not-run/failed/unknown/unsupported source remains explicit Blocked, not launch authorization.                                                                                                                          |
+| Section                         | Requirement                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ID/title                        | T42 - Independently Integrate and Verify the Final Combined Target. Status: Blocked by all executable prerequisites and independent release gates.                                                                                                                                                                                                             |
+| Objective                       | Close only observed final security/readiness evidence, never implicitly implement missing prerequisites.                                                                                                                                                                                                                                                       |
+| Scope                           | Final combined integration, traceable SEC/test/control matrix, review/scan/abuse/rollback evidence and non-destructive documented rollout/rollback.                                                                                                                                                                                                            |
+| Explicit out of scope           | Missing feature implementation, deployment/reset/Git mutations, silent critical/high risk acceptance, fixture-as-human/provider evidence or compliance certification.                                                                                                                                                                                          |
+| Dependencies                    | T01, T02, T03, T04A, T04B, T05, T06, T07, T08, T09, T10, T11, T13, T14, T15, T16, T16A, T17, T17A, T18, T18A, T19, T19A, T20, T21, T21A, T22, T22A, T23, T23A, T24, T25, T26, T27, T27A, T28A, T28B, T28C, T29A, T29B, T29C, T30A, T30B, T31, T32, T33, T34, T35, T36, T37, T38A, T38B, T38C, T38D, T39, T40A, T40B, T41A, T41B, T41C, T42A, T42B, T42C, T42D. |
+| Security invariants             | SEC01-SEC16.                                                                                                                                                                                                                                                                                                                                                   |
+| Authorization requirements      | Independent CP07 review and explicit owner approval of source-bound architecture/evidence/risk decisions; documentation never grants runtime or privileged authority.                                                                                                                                                                                          |
+| Functional acceptance           | T42-F01: all supported ordinary/privileged/workload registration/login/MFA/code/repair/contact/private/deletion/IdP/consumer lifecycles match one approved contract and DAG.                                                                                                                                                                                   |
+| Security acceptance             | T42-S01: all matrix deny outcomes observed; no unresolved critical/high auth/recovery/authorization/credential/session issue is silently accepted; exceptions need explicit documented owner risk acceptance.                                                                                                                                                  |
+| Unit tests                      | T42-U01: complete focused/unit/property/fuzz matrix, truthful evidence, exact bytes/revisions/purpose bindings and supply-chain/dependency/secret/SAST/container scan results recorded.                                                                                                                                                                        |
+| Database/HTTP integration tests | T42-I01: current resolved CI real SQL/HTTP/gRPC/NATS/Redis suites and complete nullable lifecycle/token/consumer admission pass with exact expected inventories and zero mandatory skips.                                                                                                                                                                      |
+| Concurrency/failure tests       | T42-X01: current 13-package race matrix plus one-winner/barrier/cooldown/SQL-Redis forgery-loss/unknown-commit/stale replica/failover/restore adversarial coverage, DAST/abuse penetration testing and independent review recorded.                                                                                                                            |
+| Browser/accessibility tests     | T42-B01: GATE03 actual bilingual full journeys plus independently observed real email/SMS, Windows Hello/physical keys, screen reader/native zoom/bfcache, Persian security/legal and deployed ingress/redaction gates.                                                                                                                                        |
+| Documentation updates           | T42-D01: readiness/alignment/README/API/policy/ADR/install/DR and task status evidence include exact source/toolchain/command/exits/identities, remaining blockers and approved rights/legal documents.                                                                                                                                                        |
+| Completion criteria             | T42-C01: GATE01/GATE02/GATE03, CP01-CP07 and CP06b, every prerequisite criterion and independent observed release gate pass; any not-run/failed/unknown/unsupported source remains explicit Blocked, not launch authorization.                                                                                                                                 |
 
 ## Preserved Historical Definitions
 

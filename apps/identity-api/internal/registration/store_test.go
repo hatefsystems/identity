@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -28,11 +29,19 @@ const fixtureUsername = "\u0639\u0644\u06cc.\u0645\u0624\u0645\u0646\u06cc"
 
 func usernameNormalizer(t *testing.T) *username.Normalizer {
 	t.Helper()
-	policy, err := username.DecodePolicy([]byte(`{"id":"4793a0e0-60b0-4571-a9b1-3879123819bb","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"reserved_names":[]}`))
+	policyJSON, err := os.ReadFile("../username/testdata/policy-review/policy.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := username.New(policy, `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`, bytes.Repeat([]byte{0x62}, 32), "registration-fixture-v1")
+	policy, err := username.DecodePolicy(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regex, err := os.ReadFile("../username/testdata/policy-review/regex.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := username.New(policy, string(regex), bytes.Repeat([]byte{0x62}, 32), "registration-fixture-v1")
 	if err != nil {
 		t.Fatal(err)
 	}

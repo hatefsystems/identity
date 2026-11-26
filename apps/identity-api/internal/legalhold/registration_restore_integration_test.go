@@ -185,7 +185,7 @@ VALUES($1,$2,$3,'completed',$4,$5,$6,$7,$8,$9,3,4,$10,$11)`, completedID, comple
 func registrationRestoreUsernames(t *testing.T, pool *pgxpool.Pool, cipher Encryptor) *username.Store {
 	t.Helper()
 	policy := username.Policy{
-		ID: uuid.MustParse("1bc0aee3-4d3f-48f7-a6d5-4960b412c5ac"), Normalization: username.NormalizationV1,
+		ID: uuid.MustParse("1bc0aee3-4d3f-48f7-a6d5-4960b412c5ac"), Normalization: username.NormalizationV1, MinLetters: 1, MaxCodePoints: 40,
 		Folds:         []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}},
 		ReservedNames: []string{},
 	}

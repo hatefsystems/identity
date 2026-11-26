@@ -92,7 +92,7 @@ func newPasswordDatabaseFixture(t *testing.T) passwordDatabaseFixture {
 		t.Fatal("run-owned password migration failed", err)
 	}
 	n, err := username.New(username.Policy{
-		ID: uuid.New(), Normalization: username.NormalizationV1, ReservedNames: []string{},
+		ID: uuid.New(), Normalization: username.NormalizationV1, MinLetters: 1, MaxCodePoints: 40, ReservedNames: []string{},
 		Folds: []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}},
 	}, `\x{0633}+`, bytes.Repeat([]byte{0x49}, 32), "password-policy-fixture")
 	if err != nil {

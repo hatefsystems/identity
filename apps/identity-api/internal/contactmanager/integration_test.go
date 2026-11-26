@@ -1075,7 +1075,7 @@ func (f managerFixture) passwordProofs(t *testing.T) *actionproof.Service {
 	if _, err := f.pool.Exec(f.ctx, "UPDATE users SET password_hash=$2 WHERE id=$1", f.user.ID, hash); err != nil {
 		t.Fatal(err)
 	}
-	normalizer, err := username.New(username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1, Folds: []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}}, ReservedNames: []string{}}, `[\x{0621}-\x{06CC}]+`, bytes.Repeat([]byte{0x71}, 32), "contactmanager-fixture-key")
+	normalizer, err := username.New(username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1, MinLetters: 1, MaxCodePoints: 40, Folds: []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}}, ReservedNames: []string{}}, `[\x{0621}-\x{06CC}]+`, bytes.Repeat([]byte{0x71}, 32), "contactmanager-fixture-key")
 	if err != nil {
 		t.Fatal(err)
 	}

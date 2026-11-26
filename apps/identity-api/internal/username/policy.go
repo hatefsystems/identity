@@ -22,8 +22,10 @@ const (
 	MaxRegexBytes    = 4096
 	MaxArtifactBytes = 16 * 1024
 	NormalizationV1  = "nfc-four-fold-v1"
+	// Every admitted letter occupies two UTF-8 bytes in NFC.
+	maxPolicyCodePoints = MaxUsernameBytes / 2
 	// ImplementationVersion pins the implementation and dependency in each artifact.
-	ImplementationVersion = "hatef.username.v1;golang.org/x/text@v0.40.0"
+	ImplementationVersion = "hatef.username.v2;golang.org/x/text@v0.40.0"
 )
 
 // Username errors distinguish invalid input, authority drift and protected data failures.
@@ -48,6 +50,8 @@ type Policy struct {
 	ID            uuid.UUID `json:"id"`
 	Normalization string    `json:"normalization"`
 	Folds         []Fold    `json:"folds"`
+	MinLetters    int       `json:"min_letters"`
+	MaxCodePoints int       `json:"max_code_points"`
 	ReservedNames []string  `json:"reserved_names"`
 }
 
@@ -65,7 +69,7 @@ func DecodePolicy(data []byte) (Policy, error) {
 		return Policy{}, ErrInvalidPolicy
 	}
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(data, &fields) != nil || !exactJSONFields(fields, "id", "normalization", "folds", "reserved_names") {
+	if json.Unmarshal(data, &fields) != nil || !exactJSONFields(fields, "id", "normalization", "folds", "min_letters", "max_code_points", "reserved_names") {
 		return Policy{}, ErrInvalidPolicy
 	}
 	var folds []map[string]json.RawMessage
@@ -85,6 +89,9 @@ func DecodePolicy(data []byte) (Policy, error) {
 
 func (p Policy) validate(requireAll bool) error {
 	if p.ID == uuid.Nil || p.Normalization != NormalizationV1 || p.Folds == nil || p.ReservedNames == nil {
+		return ErrInvalidPolicy
+	}
+	if p.MinLetters < 1 || p.MinLetters > p.MaxCodePoints || p.MaxCodePoints > maxPolicyCodePoints {
 		return ErrInvalidPolicy
 	}
 	if requireAll && len(p.Folds) != 4 {

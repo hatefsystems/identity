@@ -223,7 +223,7 @@ func enabledRegistrationEnvironment(t *testing.T) {
 		"REGISTRATION_SMTP_PUBLIC_ORIGIN":   "https://identity.example.test",
 		"REGISTRATION_CLEANUP_DATABASE_URL": "",
 		"USERNAME_ENABLED":                  "true",
-		"USERNAME_POLICY_JSON":              `{"id":"4793a0e0-60b0-4571-a9b1-3879123819bb","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"reserved_names":[]}`,
+		"USERNAME_POLICY_JSON":              `{"id":"4793a0e0-60b0-4571-a9b1-3879123819bb","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"min_letters":4,"max_code_points":40,"reserved_names":[]}`,
 		"USERNAME_REGEX":                    `[\x{0639}\x{0644}\x{06CC}]+`,
 		"USERNAME_LOOKUP_KEY":               base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x61}, 32)),
 		"USERNAME_LOOKUP_KEY_ID":            "startup-fixture-v1",

@@ -8,7 +8,7 @@ import (
 	"testing/quick"
 )
 
-const usernamePolicyFixture = `{"id":"d0bbd127-a362-42d0-91e1-78bb8b273d79","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"reserved_names":[]}`
+const usernamePolicyFixture = `{"id":"d0bbd127-a362-42d0-91e1-78bb8b273d79","normalization":"nfc-four-fold-v1","folds":[{"from":"\u064a","to":"\u06cc"},{"from":"\u0643","to":"\u06a9"},{"from":"\u0624","to":"\u0648"},{"from":"\u0626","to":"\u06cc"}],"min_letters":4,"max_code_points":40,"reserved_names":[]}`
 const usernameRegexFixture = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
 
 func setUsernameFixture(t *testing.T) {

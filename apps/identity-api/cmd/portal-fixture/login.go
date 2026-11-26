@@ -52,7 +52,7 @@ func loginFixture(ctx context.Context, pool *pgxpool.Pool, runID, action string,
 			return nil, errors.New("cannot generate owned username key")
 		}
 		defer clear(key)
-		policy := username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1,
+		policy := username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1, MinLetters: 4, MaxCodePoints: 40,
 			Folds: []username.Fold{{From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u064a", To: "\u06cc"}}, ReservedNames: []string{}}
 		regex := `[\x{0627}\x{0628}\x{062A}-\x{062F}]+`
 		keyID := "portal-login-" + runID

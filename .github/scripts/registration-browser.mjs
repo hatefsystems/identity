@@ -11,6 +11,7 @@ import {
   X509Certificate,
 } from 'node:crypto';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as httpServer, request as httpRequest } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
@@ -777,21 +778,13 @@ export function registrationPasskeyEnvironment(origin) {
 // mirrors the pinned Go artifact serialization, not username normalization or a
 // deployment activation path. A normalizer/version change must update this fixture.
 export function registrationUsernameFixture() {
-  const policy = {
-    id: randomUUID(),
-    normalization: 'nfc-four-fold-v1',
-    folds: [
-      { from: '\u0624', to: '\u0648' },
-      { from: '\u0626', to: '\u06cc' },
-      { from: '\u0643', to: '\u06a9' },
-      { from: '\u064a', to: '\u06cc' },
-    ],
-    reserved_names: [],
-  };
-  const alphabet = String.raw`[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]`;
-  const regex = `${alphabet}+(?:\\.${alphabet}+)*`;
+  const policyPath = resolve(workspace, 'apps/identity-api/internal/username/testdata/policy-review');
+  const policy = JSON.parse(readFileSync(resolve(policyPath, 'policy.json'), 'utf8'));
+  policy.folds.sort((a, b) => Buffer.compare(Buffer.from(a.from), Buffer.from(b.from)));
+  policy.reserved_names.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  const regex = readFileSync(resolve(policyPath, 'regex.txt'), 'utf8');
   const artifact = Buffer.from(JSON.stringify({
-    policy, regex, implementation: 'hatef.username.v1;golang.org/x/text@v0.40.0',
+    policy, regex, implementation: 'hatef.username.v2;golang.org/x/text@v0.40.0',
     // golang.org/x/text@v0.40.0 selects Unicode 15.0.0 for Go <1.27.
     // Go 1.27 selects Unicode 17.0.0, which changes the authority fingerprint;
     // keep this fixture pinned to the production Go 1.26.x toolchain.

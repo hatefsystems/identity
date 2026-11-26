@@ -128,17 +128,25 @@ and verification evidence are separate from real delivery or release activation.
 
 ## Username Namespace
 
-The confirmed policy supersedes the backlog's historical T03 `7..40`, Latin-mode
-and ZWNJ wording. One environment-configured full-match Go regex owns syntax, not
-a second hard-coded length/spelling validator or JavaScript/HTML `pattern`.
-The initial policy candidate admits the 32 Persian letters, Alef with madda,
-standalone Hamza, Waw/Yeh with Hamza, and only Arabic Yeh/Kaf keyboard aliases,
-with nonempty letter sequences separated by single internal dots. No business
-length limit was approved. Technical ceilings are 1024 UTF-8 bytes for input and
-each normalized representation, 4096 regex-source bytes and 16 KiB for the artifact.
+The owner approved a minimum of four admitted Persian-script letters and a
+maximum of 40 total Unicode code points on 2026-11-27. This assignment ruleset
+supersedes both historical T03's 7–40 canonical code points and the subsequently
+unbounded business-length policy. The fingerprinted policy JSON requires explicit
+`min_letters` and `max_code_points`. The server counts each admitted letter once,
+including both Arabic keyboard aliases. ASCII separator dots count toward the
+maximum and are excluded from the minimum.
 
-Validate UTF-8/bounds, compute `display = NFC(input)`, full-match admission against
-display, then derive a separate `security_name` with exactly these scalar folds:
+The existing full-match Go regex owns spelling within the same server normalizer.
+It admits the 32 Persian letters, Alef with madda, standalone Hamza, Waw/Yeh with
+Hamza and Arabic Yeh/Kaf keyboard aliases. Single internal dots separate
+nonempty letter sequences. Technical ceilings are 1024 UTF-8 bytes for input
+and each normalized representation, 4096 regex-source bytes and 16 KiB for the
+artifact.
+
+Validate UTF-8 and byte bounds, compute `display = NFC(input)`, and apply the
+regex and both counts to that display for advisory validation, availability
+for new assignments, registration start, and final guarded assignment.
+Derive a separate `security_name` with exactly these scalar folds:
 
 | Input                   | Security scalar      |
 | ----------------------- | -------------------- |
@@ -187,15 +195,36 @@ policy/key identity and activation epoch in their transaction and hold a shared
 policy guard through the deciding operation/commit. Lock order is policy guard, account/attempt locks,
 then separate deciding reads/writes. Hard deletion and maintenance share that
 coordination. Startup/readiness alone cannot fence stale writers. Lookup uses the
-same bounded security normalizer without retroactively applying a narrowed
-new-assignment regex, then applies account/login policy separately.
+same bounded security normalizer and preserves assigned names across changes to
+the assignment regex or length bounds. Account/login policy still applies.
 
-The production regex, artifact and system/support reserved-name set require owner
-review. This document supplies no reserved names, system accounts, installed policy
-or activation approval. A new ID, structurally valid artifact or clean scan does
-not approve additional mergers. Installation/cutover, complete real-data preflight,
-no-split evolution, writer drain and rollback gates are in
-[operations](devops-operations.md#username-policy-and-preflight-gates).
+### Approved Initial Username Assignment Policy
+
+[T04A](../.github/tasks/registration-single-contract-tasks.md#t04a) publishes the
+exact [Go assignment regex](../apps/identity-api/internal/username/testdata/policy-review/regex.txt)
+and [policy JSON](../apps/identity-api/internal/username/testdata/policy-review/policy.json)
+approved by the owner on 2026-11-27. The regex file contains the exact source bytes with
+no terminal newline. The JSON supplies `id`, `normalization`, the four
+`{from,to}` folds, `min_letters: 4`, `max_code_points: 40` and `reserved_names`. The existing normalizer combines
+this policy with the regex and pinned implementation/Unicode identity to form
+the canonical artifact. Key material and key custody are separate.
+
+| Approved Persian reservation | Intended use           |
+| ---------------------------- | ---------------------- |
+| `هاتف`                       | Main service identity  |
+| `هاتف.سامانه`                | System notices         |
+| `هاتف.مدیریت`                | Service administration |
+| `هاتف.امنیت`                 | Security response      |
+| `هاتف.پشتیبانی`              | User support           |
+| `هاتف.حریم.خصوصی`            | Privacy inquiries      |
+
+Each entry reserves its exact security name and the existing four-fold
+equivalents. Dotted extensions and other distinct spellings use the ordinary
+namespace. A reservation creates no account or role. The source artifact defines initial assignment policy. Production requires its
+verified fingerprint, key provenance and actual inventory evidence under
+[T04B](../.github/tasks/registration-single-contract-tasks.md#t04b).
+[Operations](devops-operations.md#username-policy-and-preflight-gates) owns the
+read-only preflight, separate authorizations, writer fence and rollback gates.
 
 ## Deferred Final Fields
 
@@ -302,7 +331,7 @@ submission through the [planned requests](#deferred-final-requests).
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1. Names                     | Required `given_name` and `family_name`, owned by `profile.NormalizePersonalName` (T02)                                                                                                                                                                                               | `/validate` with `stage: "names"` and exactly the two names                                                                                                                                                                                           | Both normalized private names or redacted errors on the invalid fields. Cosmetic display name cannot substitute.                                                                                        |
 | 2. Personal information      | Required `birthday` and `gender`, owned by `profile.NormalizeBirthday` and `profile.ValidateGender` (T05/T06)                                                                                                                                                                         | `/validate` with `stage: "personal_information"` and exactly birthday and gender                                                                                                                                                                      | The equivalent Gregorian/Jalali date-only pair and the explicit gender, or redacted errors. Retain the explicit input calendar/date for subsequent requests.                                            |
-| 3. Username                  | Required `username`, owned by `username.Normalizer.Normalize` and the guarded SQL namespace (T03/T04)                                                                                                                                                                                 | `/validate` with `stage: "username"` and exactly username                                                                                                                                                                                             | NFC display and advisory availability. Assignment is immutable and succeeds only in the deciding birth transaction.                                                                                     |
+| 3. Username                  | Required `username`, owned by `username.Normalizer.Normalize` and the guarded SQL namespace (T03/T04A)                                                                                                                                                                                | `/validate` with `stage: "username"` and exactly username                                                                                                                                                                                             | NFC display and advisory availability. Assignment is immutable and succeeds only in the deciding birth transaction.                                                                                     |
 | 4. Contact verification      | One `contact` with `type` and `value`. The server owns canonicalization using `emailaddress.Canonicalize` or the admitted Iranian-mobile normalization around `smsotp.NormalizePhone`. T19/T19A and the registration service own selected-purpose code verification and T14 evidence. | Explicit `/start` with the selected contact, then its channel's send/resend and verify requests as needed                                                                                                                                             | Original attempt authority and deadline; successful verification proves only that exact selected destination. Choosing another destination requires a separate explicit attempt; proof cannot transfer. |
 | 5. Authentication method     | Required `authentication_method`. T15 owns `password.Validate` and bounded `password.HashContext`; the registration WebAuthn service owns resident enrollment verification with actual UV.                                                                                            | Select `password`, `passkey` or `both` and collect the applicable password locally. Password confirmation is client-only. Server review and any native work occur in stage 6.                                                                         | The candidate specifies what must be verified. Native cancellation leaves passkey/both incomplete.                                                                                                      |
 | 6. Location and final review | Required `location`, owned by `geography.Service.Validate` (T08/T09), and distinct `legal_acceptance.terms` and `legal_acceptance.privacy`, owned by the server's approved legal configuration and T31/T32. Review includes both birthday representations.                            | Use existing geography reads for explicit selection and approved document links for independent acceptance. Submit `full_review` before any `/passkey/options` and explicit native action, then submit the final request with the chosen credentials. | Review returns validated fields or redacted errors. A valid final request commits one complete birth. T33 alone adds a possible fresh-session handoff.                                                  |
@@ -474,17 +503,19 @@ observations remain independent.
 
 ## Planned Dependencies and Gates
 
-| Capability                              | Prerequisite / invariant                                                                                                                                                                                                                                                                                                                                                                                               | Evidence before activation                                                                                                                             |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| One birth (T31/T32)                     | T31 depends on T01, T02, T03, T04, T05, T06, T09, T10, T13, T14, T15, T19A, T23, and T41C, plus approved legal versions and source-data rights. See the [T32 backlog record](../.github/tasks/registration-single-contract-tasks.md#t32) for its direct dependencies. Selected-single-contact birth stays Blocked until T41C. Default-off field code is not a separate registration contract. SEC01/SEC02/SEC13/SEC14. | Full candidate, all credential choices, SQL collision/rollback/proof/legal-version tests; private storage does not mean registration collects it.      |
-| Fresh session (T33)                     | T16A/T21A SQL-earned full-policy authority; known fresh T32 commit, SEC03/SEC09/SEC11/SEC13                                                                                                                                                                                                                                                                                                                            | Expected subject/original key; no session from replay/result/unknown commit or duplicate birth after output failure.                                   |
-| Phone-only production / T27 retirement  | Alternative recovery identification, code/barrier/cooldown, verified notification readers and password/mobile deletion/reclaim (T28-T30/T41); SEC06-SEC12                                                                                                                                                                                                                                                              | Complete independently verified lifecycle/real delivery and retained reclaim factors; NULL readers alone do not retire the gate.                       |
-| Six-stage browser integration (T34-T37) | Fixed API/legal/private/credential/session contracts and current shell; SEC15                                                                                                                                                                                                                                                                                                                                          | Both locales, progress preserved, original UTC deadlines, explicit send/native work, no silent `both` downgrade, once-only expected-subject bootstrap. |
-| Broader release (T42)                   | Durable token/interactive OIDC/confidential client/privileged consumer/restore foundations; SEC04/SEC16                                                                                                                                                                                                                                                                                                                | Independent security, real provider/hardware/Persian/accessibility/ingress/legal/data-rights evidence. T12 remains excluded.                           |
+| Capability                              | Prerequisite / invariant                                                                                                                                                                                                                                                                                                                                                                                                | Evidence before activation                                                                                                                             |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| One birth (T31/T32)                     | T31 depends on T01, T02, T03, T04A, T05, T06, T09, T10, T13, T14, T15, T19A, T23, and T41C, plus approved legal versions and source-data rights. See the [T32 backlog record](../.github/tasks/registration-single-contract-tasks.md#t32) for its direct dependencies. Selected-single-contact birth stays Blocked until T41C. Default-off field code is not a separate registration contract. SEC01/SEC02/SEC13/SEC14. | Full candidate, all credential choices, SQL collision/rollback/proof/legal-version tests; private storage does not mean registration collects it.      |
+| Fresh session (T33)                     | T16A/T21A SQL-earned full-policy authority; known fresh T32 commit, SEC03/SEC09/SEC11/SEC13                                                                                                                                                                                                                                                                                                                             | Expected subject/original key; no session from replay/result/unknown commit or duplicate birth after output failure.                                   |
+| Phone-only production / T27 retirement  | Alternative recovery identification, code/barrier/cooldown, verified notification readers and password/mobile deletion/reclaim (T28-T30/T41); SEC06-SEC12                                                                                                                                                                                                                                                               | Complete independently verified lifecycle/real delivery and retained reclaim factors; NULL readers alone do not retire the gate.                       |
+| Six-stage browser integration (T34-T37) | Fixed API/legal/private/credential/session contracts and current shell; SEC15                                                                                                                                                                                                                                                                                                                                           | Both locales, progress preserved, original UTC deadlines, explicit send/native work, no silent `both` downgrade, once-only expected-subject bootstrap. |
+| Production username launch (T04B)       | Verified T04A, T18A and T32 plus authorized actual-target access, approved policy/reservations and verified key provenance.                                                                                                                                                                                                                                                                                             | Complete protected production inventory and no-split evidence, separate installation/activation/deployment authorization and observed activation.      |
+| Broader release (T42)                   | Durable token/interactive OIDC/confidential client/privileged consumer/restore foundations; SEC04/SEC16                                                                                                                                                                                                                                                                                                                 | Independent security, real provider/hardware/Persian/accessibility/ingress/legal/data-rights evidence. T12 remains excluded.                           |
 
 Dependencies form a DAG, not numeric task order. Security-event contracts/readers
 and verified-destination notifications precede security-changing writers and
-phone-only lifecycle activation. UI consumes fixed contracts, never invents
+phone-only lifecycle activation. T31–T37 can verify development flows using
+T04A without the separate production gate. T42 requires T04B before launch. UI consumes fixed contracts, never invents
 authority. Historical statuses/counts retain their original evidence and do not
 approve these target gates.
 

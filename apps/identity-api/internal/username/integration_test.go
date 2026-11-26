@@ -210,6 +210,106 @@ func usernameRole(t *testing.T, f usernameDatabase, kind string) *pgxpool.Pool {
 	return pool
 }
 
+func approvedUsernameFixture(t *testing.T) usernameDatabase {
+	t.Helper()
+	f := usernameFixture(t)
+	f.normalizer = reviewCandidateNormalizer(t)
+	store, err := NewStore(f.pool, f.cipher, f.normalizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.store = store
+	return f
+}
+
+func TestUsernameReviewCandidateReservationsAndInventoryIntegration(t *testing.T) {
+	f := approvedUsernameFixture(t)
+	usernameActivateFixture(t, f)
+	reader := usernameRole(t, f, "reader")
+	api := usernameRole(t, f, "api")
+	store, err := NewStore(api, f.cipher, f.normalizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved := f.normalizer.Policy().ReservedNames
+	checkSnapshot := func(accounts int64) {
+		t.Helper()
+		report, err := Preflight(f.ctx, reader, f.cipher, f.normalizer, f.normalizer, preflightOptions())
+		if err != nil || !report.SnapshotOnly || !report.Complete || !report.Clean ||
+			report.Scanned != accounts || report.Claimed != accounts || report.Unclaimed != 0 || report.ReservedNames != int64(len(reserved)) {
+			t.Fatal("disposable preflight did not observe the expected accounts and reservations", err)
+		}
+	}
+	checkSnapshot(0)
+
+	user := usernameUser(t, f)
+	for _, test := range []struct{ name, spelling string }{
+		{"three", "سلا"}, {"three_with_dots", "س.ل.ا"}, {"forty_one", strings.Repeat("س", 39) + ".س"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spelling := test.spelling
+			if _, available, err := store.Validate(f.ctx, spelling); available || !errors.Is(err, ErrInvalidUsername) {
+				t.Fatal("advisory validation accepted an invalid length", err)
+			}
+			lookupValue, err := f.normalizer.NormalizeLookup(spelling)
+			if err != nil {
+				t.Fatal("lookup acquired assignment length constraints", err)
+			}
+			if available, err := store.Available(f.ctx, lookupValue); available || !errors.Is(err, ErrInvalidUsername) {
+				t.Fatal("availability accepted an out-of-policy lookup value", err)
+			}
+			tx, err := api.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rollbackUsername(tx)
+			if err := store.Assign(f.ctx, tx, user.ID, user.AuthVersion, lookupValue); !errors.Is(err, ErrInvalidUsername) {
+				t.Fatal("transactional assignment accepted an out-of-policy lookup value", err)
+			}
+			if err := tx.Commit(f.ctx); err != nil {
+				t.Fatal("length rejection unexpectedly wrote or aborted the transaction", err)
+			}
+		})
+	}
+	for _, name := range reserved {
+		for _, spelling := range []string{name, strings.ReplaceAll(name, "\u06cc", "\u064a")} {
+			value, available, err := store.Validate(f.ctx, spelling)
+			if err != nil || available {
+				t.Fatal("proposed reservation or its alias was reported available", err)
+			}
+			if err := usernameAssign(f, store, user.ID, user.AuthVersion, value); !errors.Is(err, ErrConflict) {
+				t.Fatal("proposed reservation or its alias was assignable", err)
+			}
+		}
+	}
+	if saved, err := store.Get(f.ctx, user.ID, user.AuthVersion); err != nil || saved != nil {
+		t.Fatal("rejected reservation left username ownership", err)
+	}
+	near := reserved[0] + ".\u0633"
+	value, available, err := store.Validate(f.ctx, near)
+	if err != nil || !available {
+		t.Fatal("distinct dotted name was incorrectly reserved", err)
+	}
+	if err := usernameAssign(f, store, user.ID, user.AuthVersion, value); err != nil {
+		t.Fatal("distinct dotted name could not be assigned", err)
+	}
+	if resolved, err := store.Lookup(f.ctx, near); err != nil || resolved != user.ID {
+		t.Fatal("assigned name did not resolve to its owner", err)
+	}
+	checkSnapshot(1)
+	for _, spelling := range []string{"س.لام", strings.Repeat("س", 38) + ".س"} {
+		user := usernameUser(t, f)
+		value, available, err := store.Validate(f.ctx, spelling)
+		if err != nil || !available {
+			t.Fatal("availability rejected an exact length boundary", err)
+		}
+		if err := usernameAssign(f, store, user.ID, user.AuthVersion, value); err != nil {
+			t.Fatal("assignment disagreed with availability at an exact length boundary", err)
+		}
+	}
+	checkSnapshot(3)
+}
+
 func TestUsernameActiveReservedEquivalenceAndAuthorityOrderingIntegration(t *testing.T) {
 	f := usernameFixture(t)
 	// Synthetic canonical fixture only, not the proposed official reserved list.
@@ -421,7 +521,7 @@ func TestUsernameGlobalReservationsAndOrdinaryImmutabilityIntegration(t *testing
 }
 
 func TestUsernameAssignmentRacesAndLockedAuthorizationIntegration(t *testing.T) {
-	f := usernameFixture(t)
+	f := approvedUsernameFixture(t)
 	usernameActivateFixture(t, f)
 	value := usernameChosen(t, f.normalizer, "\u0643\u06cc\u0648\u0627\u0646")
 	alias := usernameChosen(t, f.normalizer, "\u06a9\u06cc\u0648\u0627\u0646")
@@ -460,7 +560,7 @@ func TestUsernameAssignmentRacesAndLockedAuthorizationIntegration(t *testing.T) 
 	account := usernameUser(t, f)
 	start = make(chan struct{})
 	outcomes = make(chan error, 2)
-	for _, input := range []string{"\u0633", "\u0635"} {
+	for _, input := range []string{"س.لام", "ص.لام"} {
 		v := usernameChosen(t, f.normalizer, input)
 		go func() { <-start; outcomes <- usernameAssign(f, f.store, account.ID, account.AuthVersion, v) }()
 	}
@@ -511,7 +611,7 @@ func TestUsernameAssignmentRacesAndLockedAuthorizationIntegration(t *testing.T) 
 	}
 	result := make(chan error, 1)
 	go func() {
-		result <- usernameAssign(f, f.store, user.ID, user.AuthVersion, usernameChosen(t, f.normalizer, "\u062b"))
+		result <- usernameAssign(f, f.store, user.ID, user.AuthVersion, usernameChosen(t, f.normalizer, "ث.لام"))
 	}()
 	if err := blocker.Commit(f.ctx); err != nil {
 		t.Fatal(err)
@@ -522,9 +622,9 @@ func TestUsernameAssignmentRacesAndLockedAuthorizationIntegration(t *testing.T) 
 }
 
 func TestUsernameAssignmentRechecksPolicyAfterConcurrentSwitchIntegration(t *testing.T) {
-	f := usernameFixture(t)
+	f := approvedUsernameFixture(t)
 	usernameActivateFixture(t, f)
-	const input = "\u062a"
+	const input = "سلام"
 	user := usernameUser(t, f)
 	candidate, available, err := f.store.Validate(f.ctx, input)
 	if err != nil || !available {
@@ -533,6 +633,7 @@ func TestUsernameAssignmentRechecksPolicyAfterConcurrentSwitchIntegration(t *tes
 
 	policy := f.normalizer.Policy()
 	policy.ID = uuid.New()
+	policy.MinLetters++
 	next, err := New(policy, fixtureRegex, bytes.Repeat([]byte{0x59}, 32), f.normalizer.Authority().KeyID)
 	if err != nil {
 		t.Fatal(err)
@@ -616,11 +717,15 @@ func TestUsernameAssignmentRechecksPolicyAfterConcurrentSwitchIntegration(t *tes
 	if saved, err := nextStore.Get(f.ctx, user.ID, user.AuthVersion); err != nil || saved != nil {
 		t.Fatal("rejected assignment left username ownership", err)
 	}
-	current := usernameChosen(t, next, input)
+	if _, available, err := nextStore.Validate(f.ctx, input); available || !errors.Is(err, ErrInvalidUsername) {
+		t.Fatal("new minimum did not take effect after the policy switch", err)
+	}
+	const admitted = "سلامت"
+	current := usernameChosen(t, next, admitted)
 	if err := usernameAssign(f, nextStore, user.ID, user.AuthVersion, current); err != nil {
 		t.Fatal("active policy refused fresh assignment after the switch", err)
 	}
-	if resolved, err := nextStore.Lookup(f.ctx, input); err != nil || resolved != user.ID {
+	if resolved, err := nextStore.Lookup(f.ctx, admitted); err != nil || resolved != user.ID {
 		t.Fatal("active policy did not resolve the assigned account", err)
 	}
 }

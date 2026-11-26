@@ -15,7 +15,7 @@ import (
 const fixtureRegex = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
 
 func fixturePolicy() Policy {
-	return Policy{ID: uuid.MustParse("d0bbd127-a362-42d0-91e1-78bb8b273d79"), Normalization: NormalizationV1, Folds: approvedFolds(), ReservedNames: []string{}}
+	return Policy{ID: uuid.MustParse("d0bbd127-a362-42d0-91e1-78bb8b273d79"), Normalization: NormalizationV1, Folds: approvedFolds(), MinLetters: 1, MaxCodePoints: 40, ReservedNames: []string{}}
 }
 
 func fixtureNormalizer(t testing.TB) *Normalizer {
@@ -49,21 +49,24 @@ func TestUsernameApprovedEquivalenceAndDisplay(t *testing.T) {
 	}
 }
 
-func TestUsernameDistinctLettersAndNoBusinessLengthDefault(t *testing.T) {
+func TestUsernameLookupPreservesDistinctLettersAndTechnicalBounds(t *testing.T) {
 	n := fixtureNormalizer(t)
 	spellings := []string{"\u0627", "\u0622", "\u0621", "\u0633", "\u0635", "\u062b"}
 	keys := map[[32]byte]bool{}
 	for _, spelling := range spellings {
-		v, err := n.Normalize(spelling)
+		v, err := n.NormalizeLookup(spelling)
 		if err != nil || keys[v.Key()] {
-			t.Fatal("unapproved letter merger or one-letter rejection")
+			t.Fatal("lookup merged distinct letters or rejected a one-letter identity")
 		}
 		keys[v.Key()] = true
 	}
 	for _, length := range []int{41, 512} {
-		if _, err := n.Normalize(strings.Repeat("\u0633", length)); err != nil {
-			t.Fatal("business length default added")
+		if _, err := n.NormalizeLookup(strings.Repeat("\u0633", length)); err != nil {
+			t.Fatal("lookup applied the new assignment ceiling")
 		}
+	}
+	if _, err := n.NormalizeLookup(strings.Repeat("\u0633", 513)); err != ErrInvalidUsername {
+		t.Fatal("lookup allowed input beyond the technical ceiling")
 	}
 }
 
@@ -136,6 +139,9 @@ func TestUsernameNormalizationProperties(t *testing.T) {
 	property := func(indices []uint8) bool {
 		if len(indices) == 0 {
 			indices = []uint8{0}
+		}
+		if len(indices) > 40 {
+			indices = indices[:40]
 		}
 		var input strings.Builder
 		for _, index := range indices {

@@ -116,7 +116,7 @@ func newUsernamePurgeDatabase(t *testing.T) usernamePurgeDatabase {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1,
+	policy := username.Policy{ID: uuid.New(), Normalization: username.NormalizationV1, MinLetters: 1, MaxCodePoints: 40,
 		Folds: []username.Fold{{From: "\u064a", To: "\u06cc"}, {From: "\u0643", To: "\u06a9"}, {From: "\u0624", To: "\u0648"}, {From: "\u0626", To: "\u06cc"}}, ReservedNames: []string{}}
 	const admission = `[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+(?:\.[\x{0621}\x{0622}\x{0624}\x{0626}-\x{0628}\x{062A}-\x{063A}\x{0641}-\x{0648}\x{064A}\x{067E}\x{0686}\x{0698}\x{06A9}\x{06AF}\x{06CC}]+)*`
 	normalizer, err := username.New(policy, admission, bytes.Repeat([]byte{0x59}, 32), "purge-fixture-only")
