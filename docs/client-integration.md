@@ -285,22 +285,29 @@ authority and final deciding-transaction checks must precede activation (SEC09-S
 
 ### 1.4 Conditional New-Account Registration
 
-See the [registration contract](registration-contract.md) for current versus
-planned target. Current enabled signup includes usernames, both email/mobile
-proofs and UV passkey; it has no authenticated completion session. T31-T37 extend
-that same service and `/register`, never a v2 registration service. Planned atomic
-birth/fresh SQL session issuance (SEC13) authenticates only a known fresh successful
-commit under the original browser key and expected subject. Receipt, replay and
-result lookup never authenticate or recreate an account.
+The [canonical registration contract](registration-contract.md) defines the
+existing and planned flows for the same `/register` form and signup client.
 
-Registration and SMS default disabled. Enabled signup uses the
+#### Current Mounted Form
+
+The initial form collects email, Iranian mobile and username, with an explicit
+username-check button and a separate Start submission. Start initiates email
+link delivery. The email phase offers explicit result checking and resend.
+After email proof, the mobile phase offers explicit send/verify. After both
+proofs, the passkey phase requests options, opens native resident UV enrollment
+and submits the credential through one explicit action. Completion clears
+transient signup state and offers `/login`. The uncertain phase offers explicit
+outcome checking and ordinary login. The closed phase offers an explicit restart.
+The separate verification page uses the same browser key for email-link proof.
+
+Registration and SMS are disabled by default. Enabled signup uses the
 [fixed POST routes](api-design.md#15-new-account-registration), exact Origin,
 bounded strict JSON and public DPoP nonce/replay, without session cookies as
 authority, Authorization, `ath` or `X-Portal-Session`. Start accepts exactly
 `{email,phone,username}` and returns `{attempt_id,capability,canonical_email,
 username_display,expires_at,email_sent}`. Submission acceptance is not mailbox
-ownership; use explicit proof verification and bounded resend, never automatic
-mail/SMS sends.
+ownership. Start sends the initial email in response to the explicit submission.
+Verification, resend and SMS sends require explicit actions.
 
 Explicit `/validate` with `{stage:"username",registration:{username}}` returns
 `{username_display,available}`; availability does not reserve a name. Use the
@@ -328,11 +335,13 @@ Normal discoverable login follows separately. Start/options/proof failure cannot
 create an account or created-event intent. Resend replaces proof and clears phone/
 ceremony progress without resetting attempt expiry or abuse counters.
 
-After an ambiguous final response, explicitly query `/api/v1/auth/register/result`
-with the same capability/JKT and a new proof/JTI. Pending returns `expires_at`,
+After an ambiguous final response or `503 result_required`, explicitly POST
+`/api/v1/auth/register/result` with the same capability/JKT and a new proof/JTI. Pending returns `expires_at`,
 failed returns `receipt_expires_at`, completed returns the final shape, all with
-proof flags. Identical authorized completion can return the same receipt; changed
-completion conflicts. This narrow result/retry contract does not relax ordinary
+proof flags. An observed pending result restores the applicable phase under the
+original deadline. The form does not automatically repeat the final body or native
+ceremony. An identical authorized completion can return the same receipt, while
+changed completion data conflicts. Completed receipts never bootstrap a session. This narrow result/retry contract does not relax ordinary
 portal/admin mutation rules, resurrect a consumed OTP or recover capability by
 email. Lost memory/key authority requires restart or normal login. No exactly-once
 external delivery or inbox/handset receipt is implied by relay/provider ACK.
@@ -354,6 +363,36 @@ fallback; the additive field grants no new permission. Enablement, fixed SMS.ir
 VERIFY/live-versus-sandbox rules and dedicated cleanup gates are in
 [operations](devops-operations.md#registration-enablement-and-cleanup), not asserted
 by these integration instructions or historical acceptance.
+
+#### Planned Six-Stage Form and Handoff
+
+The [stage trace](registration-contract.md#planned-stage-to-request-trace)
+defines names, personal information, username, contact verification,
+authentication method, and location/final review. T34 provides the shared shell,
+T35 connects personal/username validators, T36 connects contact and credential
+choice, and T37 connects final review and session handoff. The client keeps the
+same form, provider, key and absolute deadlines across back navigation and
+preference changes. Explicitly validate the complete reviewed candidate and legal
+versions before any native prompt. A cancelled passkey step leaves `both`
+incomplete.
+
+Only the direct response to the active final action may carry the T33 handoff.
+Use the cookie-capable completion transport only at the T33 final boundary. The
+response must report a known fresh commit and the exact new subject under the
+original browser JKT, with a usable normal cookie. Discard prior authenticated state and
+transient signup secrets while retaining the original key for one ordinary
+bootstrap. Match the returned profile to that subject before mounting the existing
+`/dashboard` portal or showing private data. Missing/unusable cookie, key/subject
+mismatch, late response or bootstrap failure goes to ordinary `/login`.
+
+On unknown commit or lost final/session response, offer explicit protected
+`/result` checking and ordinary login. A completed receipt clears signup state
+and offers ordinary login even if a session was originally issued. It does not
+authorize bootstrap or another final submission. Only an authoritative pending
+result can return to eligible in-attempt progress within the original deadline.
+Failed or still-unknown outcomes never automatically start a new account,
+resend or reopen a native prompt. See the
+[completion response matrix](registration-contract.md#target-completion-and-reconciliation).
 
 ---
 

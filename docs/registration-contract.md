@@ -1,14 +1,20 @@
 # Registration Contract (T01)
 
-This scopes the single existing service/client/form, public `/register` page and
-`/api/v1/auth/register` prefix. Current source was inspected at
-`85abb13a27196c229efa7f59d7ef5beebb1d7e49` on 2026-11-24; planned fields/requests
-are not current behavior, deployed acceptance or implementation authorization.
-[Policy](authentication-and-recovery-policy.md) owns SEC01-SEC16;
-[assessment](security-architecture-assessment.md) owns source gaps;
-[ADR](adr/0001-authentication-recovery-and-security-state-authority.md) is Proposed;
-[backlog](../.github/tasks/registration-single-contract-tasks.md) and
-[readiness](security-testing-and-readiness.md) own dependencies/acceptance.
+This is the canonical contract for the existing registration service, client and
+mounted form at `/register`, using the `/api/v1/auth/register` prefix. The T01
+source review on 2026-11-24 inspected HEAD
+`17d2ff19412ac1aea9489cd7206c79ff3d68149e` with no staged, unstaged or untracked
+changes at intake. The reviewed routes, handlers, registration service, client
+and mounted form are identical to the corresponding files at the assessment's
+`85abb13a27196c229efa7f59d7ef5beebb1d7e49`; the relevant differences between those
+revisions are documentation. The T01 working-tree delta is documentation only.
+
+The [policy](authentication-and-recovery-policy.md#stable-invariants) owns SEC01–SEC16.
+The [assessment](security-architecture-assessment.md) records source findings,
+including F10 and F11. [Readiness](security-testing-and-readiness.md#release-gates)
+owns release evidence and records G01 as approval pending. [ADR 0001](adr/0001-authentication-recovery-and-security-state-authority.md#status)
+remains Proposed. See the [T01 backlog record](../.github/tasks/registration-single-contract-tasks.md#t01)
+for scope and the CP01 disposition.
 
 ## Delivery Boundaries
 
@@ -30,18 +36,19 @@ tasks remain independently scoped; documenting them does not complete them.
 
 ## Existing Flow and Username Increment
 
-Current `apps/identity-api/internal/registration/service.go:122-140` requires
-`{email,phone,username}`; `internal/server/registration.go:281-294` under that
-application returns completion/result, not a session. Birth and protected contact
-evidence share `internal/registration/service.go:573-677`. The mounted browser
-uses the existing shell (`apps/web/app/_components/registration.tsx:147-166`),
-not the final names/personal/username/contact/credentials/review journey yet.
-Earlier `{email,phone}` descriptions are superseded historical contract context,
-not a second supported implementation.
-See [exact current-flow requests](api-design.md#15-new-account-registration) and
-[client handling](client-integration.md#14-conditional-new-account-registration).
-Neither repository inspection nor these enabled-feature contracts prove live
-installation, runtime tests, real delivery or physical-authenticator acceptance.
+The current API mounts only when a registration service is provisioned. The
+[route list](../apps/identity-api/internal/server/registration.go#L24-L32),
+[strict request parser](../apps/identity-api/internal/server/registration.go#L43-L115)
+and [handler](../apps/identity-api/internal/server/registration.go#L218-L303) define
+the current wire behavior. The [existing service](../apps/identity-api/internal/registration/service.go#L122-L179)
+admits `{email,phone,username}`; its [completion path](../apps/identity-api/internal/registration/service.go#L542-L678)
+commits the birth and receipt together. The [public page](../apps/web/app/%28auth%29/register/page.tsx#L9-L11)
+mounts [RegistrationScreen](../apps/web/app/%28auth%29/_components/screens.tsx#L22-L24)
+and the [current form](../apps/web/app/_components/registration.tsx#L415-L649)
+uses the [existing client](../apps/web/app/_lib/portal/registration-client.ts).
+The [current API table](api-design.md#15-new-account-registration) lists all nine
+POSTs, their exact bodies and their success responses. The [current browser flow](client-integration.md#14-conditional-new-account-registration)
+maps form phases to those calls. Static inspection supplies no runtime acceptance.
 
 - `POST /validate` accepts exactly
   `{stage: "username", registration: {username}}` and returns
@@ -283,73 +290,185 @@ registration completion or fabricated backfill.
 | `location`                  | `{country: "IR", province_id: string, locality_id?: string}`; exact positive BIGINT decimal source IDs with correct active province ancestry. T08/T09 supply the catalog and independent selector, not registration persistence/integration or dataset redistribution rights.                                                   |
 | `legal_acceptance`          | Separate `terms` and `privacy` entries, each `{version, accepted: true}`, referring to approved server-configured documents. Acceptance time is server-owned; document approval is not supplied here.                                                                                                                           |
 
-Six stages, in order: names; personal information (birthday/gender); username;
-contact verification; authentication method; location/final review. Back navigation,
-legal links and language/calendar changes preserve ordinary progress and original
-meaning without replaying API/native work or extending deadlines. Validate the
-complete candidate before native enrollment; cancellation never silently downgrades
-`both`. These frontend guarantees are target behavior, not current acceptance.
+### Planned Stage-to-Request Trace
+
+All six stages below are planned. The existing username validator is the sole
+current stage selector. Each row contributes to the same candidate and final
+submission through the [planned requests](#deferred-final-requests).
+
+| Stage                        | Fields and validator owner                                                                                                                                                                                                                                                            | Request or action                                                                                                                                                                                                                                     | Expected outcome                                                                                                                                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Names                     | Required `given_name` and `family_name`, owned by `profile.NormalizePersonalName` (T02)                                                                                                                                                                                               | `/validate` with `stage: "names"` and exactly the two names                                                                                                                                                                                           | Both normalized private names or redacted errors on the invalid fields. Cosmetic display name cannot substitute.                                                                                        |
+| 2. Personal information      | Required `birthday` and `gender`, owned by `profile.NormalizeBirthday` and `profile.ValidateGender` (T05/T06)                                                                                                                                                                         | `/validate` with `stage: "personal_information"` and exactly birthday and gender                                                                                                                                                                      | The equivalent Gregorian/Jalali date-only pair and the explicit gender, or redacted errors. Retain the explicit input calendar/date for subsequent requests.                                            |
+| 3. Username                  | Required `username`, owned by `username.Normalizer.Normalize` and the guarded SQL namespace (T03/T04)                                                                                                                                                                                 | `/validate` with `stage: "username"` and exactly username                                                                                                                                                                                             | NFC display and advisory availability. Assignment is immutable and succeeds only in the deciding birth transaction.                                                                                     |
+| 4. Contact verification      | One `contact` with `type` and `value`. The server owns canonicalization using `emailaddress.Canonicalize` or the admitted Iranian-mobile normalization around `smsotp.NormalizePhone`. T19/T19A and the registration service own selected-purpose code verification and T14 evidence. | Explicit `/start` with the selected contact, then its channel's send/resend and verify requests as needed                                                                                                                                             | Original attempt authority and deadline; successful verification proves only that exact selected destination. Choosing another destination requires a separate explicit attempt; proof cannot transfer. |
+| 5. Authentication method     | Required `authentication_method`. T15 owns `password.Validate` and bounded `password.HashContext`; the registration WebAuthn service owns resident enrollment verification with actual UV.                                                                                            | Select `password`, `passkey` or `both` and collect the applicable password locally. Password confirmation is client-only. Server review and any native work occur in stage 6.                                                                         | The candidate specifies what must be verified. Native cancellation leaves passkey/both incomplete.                                                                                                      |
+| 6. Location and final review | Required `location`, owned by `geography.Service.Validate` (T08/T09), and distinct `legal_acceptance.terms` and `legal_acceptance.privacy`, owned by the server's approved legal configuration and T31/T32. Review includes both birthday representations.                            | Use existing geography reads for explicit selection and approved document links for independent acceptance. Submit `full_review` before any `/passkey/options` and explicit native action, then submit the final request with the chosen credentials. | Review returns validated fields or redacted errors. A valid final request commits one complete birth. T33 alone adds a possible fresh-session handoff.                                                  |
+
+Back navigation, legal links and presentation changes preserve ordinary draft meaning,
+the original browser key and absolute deadlines. They do not trigger sends, retries,
+native prompts or bootstrap. Server validation reruns on final submission. Changes
+to an already bound candidate require validation and, for passkey/both, newly bound
+options and explicit native enrollment within the original authority and deadlines.
 
 ## Deferred Final Requests
 
-Every request/selector in this section is **planned**, except the already-current
-username validation branch. This is an extension contract for owner-approved
-implementation, not registration-v2 or a currently mounted API promise.
+These are the target POST contracts under the existing prefix. The username
+`/validate` branch already exists with the same request and response. The
+[other current wire shapes](api-design.md#15-new-account-registration) continue
+to apply until a separately authorized cutover. GATE02 applies to all target calls.
 
-Let `A = {attempt_id,capability}` and `F` contain every final field except
-`contact`, which is canonicalized and attempt-bound. Operations below are POSTs
-under the existing registration prefix, not a second route version. Only username
-validation above belongs to the increment. Final validation stage selectors are
-`names`, `personal_information`, `username` and `full_review`; these deferred
-selectors do not imply currently mounted branches.
+Let `A = {attempt_id,capability}`. In review, `registration` contains exactly
+all fields in [Deferred Final Fields](#deferred-final-fields). Let `F` be those
+same fields with `contact` omitted. The service loads the single canonical contact
+from the attempt for options and completion, forming the same full candidate used
+in review. The selected contact, proof generation, attempt, browser JKT, candidate
+and policy/catalog/legal versions must still match at commit. `password` and
+`credential` are top-level credential inputs. Omit inapplicable fields entirely.
 
-| Operation                        | Final request / meaning                                                                                                                                                                                                                                                                                                           |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/validate`                      | `{stage,registration,password?}`. Exact subsets: `names` (`given_name`,`family_name`), `personal_information` (`birthday`,`gender`), `username` (`username`), or `full_review` (all final fields, with password only for password/both). Read-only normalized results/field errors; no proof, reservation or credential creation. |
-| `/start`                         | `{contact}`. Explicit selected-channel issuance starts a bounded attempt and returns authority, canonical contact, original deadline and bounded code/submission information, never delivery evidence. This is not the increment's `{email,phone,username}` body.                                                                 |
-| `/email/resend`, `/phone/send`   | `A`. Explicit selected-channel replacement preserves original expiry/budgets and invalidates superseded proof/ceremony.                                                                                                                                                                                                           |
-| `/email/verify`, `/phone/verify` | `A + {verification_id,code}`. Selected-purpose/destination proof only. T19/T31 own email codes; do not remove the current email-link page in anticipation.                                                                                                                                                                        |
-| `/passkey/options`               | `A + {registration: F,password?}` for passkey/both. Validate and bind the complete candidate before native enrollment; password-bearing intent fingerprints must be keyed.                                                                                                                                                        |
-| Registration root                | `A + {registration: F,password?,credential?}`. Passkey requires credential/no password; password requires password/no credential; both require both. One atomic creation transaction includes protected attributes, selected verified contact, legal versions, credentials and creation intent.                                   |
-| `/result`                        | `A`. Bounded pending/failed/completed information; no session issuance or recreation.                                                                                                                                                                                                                                             |
+| POST                               | Exact target request                                                         | Target success response and authority                                                                                                                                                                                                       |
+| ---------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/validate`                        | `{stage,registration,password?}`, with exact stage fields listed below       | `200` with stage-specific normalized results. Read-only and advisory. Invalid candidates return redacted field errors.                                                                                                                      |
+| `/start`                           | `{contact}`                                                                  | `201 {attempt_id,capability,canonical_contact,expires_at,submission}`. `canonical_contact` has `{type,value}`. The first send follows explicit submission and targets only that destination.                                                |
+| `/email/resend` or `/phone/send`   | `A`                                                                          | `200 {submission}` for the matching selected channel. Replacement invalidates superseded proof and ceremony, preserving original expiry and budgets.                                                                                        |
+| `/email/verify` or `/phone/verify` | `A + {verification_id,code}`                                                 | `204` after selected-destination proof only. The code is an exact six-digit ASCII string under T19, preserving leading zeros. Target email codes use this body; current email-link verification uses `{attempt_id,token}` until transition. |
+| `/passkey/options`                 | `A + {registration: F,password?}`. Passkey omits password; both requires it. | `200 {publicKey}` for explicit resident UV enrollment after selected contact proof and full candidate validation. The ceremony is bound to the complete candidate and original JKT. Password-only never calls this operation.               |
+| Registration root                  | `A + {registration: F,password?,credential?}`                                | `200` for the known committed outcomes below. Password requires password only, passkey requires credential only, and both requires both. A successful response after replay is a non-authenticating receipt.                                |
+| `/result`                          | `A`                                                                          | `200` for the observed pending, failed or completed receipt shape below; `503 result_required` if the authoritative outcome remains unknown. Read-only and unauthenticated in every case.                                                   |
 
-Only deferred T33 may issue a normal session after a known fresh commit, using the
-same browser key and bootstrapping exactly the returned new subject. Result reads
-and replayed receipts never mint sessions. Failed session issuance leaves the
-committed account eligible for ordinary login, not account recreation. Password,
-eligible password/passkey login, independent-MFA alternatives, optional-email consumers,
-notifications, private snapshots/editing and broader recovery remain separate tasks.
+For the selected-channel responses, `submission` carries `state` of
+`"accepted"` or `"unconfirmed"`. Accepted submission includes `verification_id`
+and a server `expires_at` for the current code, bounded by the original attempt
+expiry. Unconfirmed submission supplies no usable challenge reference and does
+not itself authorize a resend. Provider acceptance is not inbox or handset
+delivery. Wrong-channel calls are denied. Both channel proofs are signup-only
+and cannot authorize login, repair, deletion or factor management.
+
+The target `/validate` subsets and successful response shapes are exact:
+
+- `names` takes `{given_name,family_name}` and returns those normalized fields.
+- `personal_information` takes `{birthday,gender}`, with input birthday
+  `{calendar,date}`, and returns `{birthday:{gregorian,jalali},gender}`.
+- `username` takes `{username}` and returns `{username_display,available}`.
+- `full_review` takes the full `registration` object and the top-level password
+  only for password/both. It returns `{registration}` with server-normalized
+  review fields, using the birthday pair, NFC username display and canonical
+  contact. It returns no password, proof, credential or reservation.
+
+The legal inputs must each contain the approved version string for that document
+and literal boolean `accepted: true`. The server owns document identity/version
+checks and the acceptance time. Reject missing, stale, swapped, unapproved or
+mismatched versions. Approval of versions and links is an independent prerequisite.
 
 ## Planned Atomic Birth and Fresh Session
 
-SEC01/SEC02/SEC13 govern one production-human account birth: required immutable
-username, validated private names/date-only pair/gender/location, exactly one selected
-verified contact, selected password/passkey/both primary credentials and separate
-approved terms/privacy versions. Contacts are individually optional but at least
-one verified destination is mandatory. No mailbox creation, empty-email digest,
-contact-only account or implicit fallback identifier. Initial registration
-verification records its cooldown exemption explicitly; later association changes
-never inherit it.
+SEC01/SEC02/SEC13 require all final fields and the actual selected primary
+credentials. Contact proof alone cannot create an account or authorize normal or
+preauthentication login. Username is mandatory and immutable. Eligible primary
+email may identify an account only when deliberately selected under SEC01 and
+currently verified and uniquely associated. Email is never an implicit fallback
+after username failure. Mobile is never a login identifier. The unselected contact
+stays absent. Initial contact verification records its explicit SEC08 cooldown
+exemption; later associations do not inherit it.
 
-The same existing service owns one caller-controlled SQL commit for account,
-private attributes, unique username reservation, exact selected-contact evidence,
-consumption of proofs/ceremony, selected primary credentials, immutable legal
-acceptance and metadata intent/receipt. Freeze/revalidate the full candidate,
-admitted username/geography/legal versions and exact contact/browser-key identity.
-Bound expensive password/native work outside long-held locks in the target, then
-perform final SQL checks after waits under the [global order](data-architecture.md#global-lock-order).
-Password-bearing intent fingerprints use a dedicated keyed construction, not an
-offline dictionary-testable plain hash. A collision/failed proof leaves no partial
-account and never attaches to an existing account.
+The existing service owns one caller-controlled SQL commit for the account,
+protected attributes, username reservation, exact selected-contact evidence,
+consumption of the required proofs/ceremony, selected credentials, immutable legal
+evidence, metadata creation intent and receipt. Validate and bind expensive
+password/native work outside long-held locks. Recheck authority, versions,
+candidate, proof and absolute deadlines after waits under the
+[global lock order](data-architecture.md#global-lock-order). Password-bearing
+intent fingerprints use a dedicated keyed construction with domain separation.
+Advisory availability grants no reservation. If two allowed spellings resolve to
+the same security name, the database unique constraint decides. The losing
+transaction rolls back every birth write, cannot leave a partial account, and
+cannot attach a credential to the winner. Contact/credential collisions and
+final proof or field failures also leave no partial birth.
 
-Only a known **fresh** birth may cause T33 SQL-authoritative normal session issuance
-for the returned new subject and original browser JKT. All selected primary and
-applicable policy evidence must be proven; passkey requires actual UV. Receipt
-replay, `/result`, uncertain reconciliation, refresh or reconstructed pending state
-never issue a session or bootstrap another subject. Lost fresh-session output or
-issuance failure leaves the committed account for ordinary login, not another
-birth. Registration contact codes never become authentication, and deletion/repair
-grants never become birth authority.
+### Target Completion and Reconciliation
+
+| Observation                                                 | Target result and client action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Direct known fresh commit, T33 session issued               | Final returns `{state:"completed",next:"portal",subject,receipt_expires_at}` with the normal strict session-cookie handoff. Only the direct response from the active final action may enter bootstrap. Use the original browser JKT and match the authenticated profile to the returned new subject exactly once before private portal mount. Clear obsolete in-memory authority without replacing the browser key.                                                                                                                                     |
+| Known commit with no session issuance                       | Final returns the completed receipt below with `next:"login"`. Clear registration secrets and offer ordinary login for the committed account. A missing/unusable cookie, wrong subject/key, stale reply or failed bootstrap also goes to ordinary login.                                                                                                                                                                                                                                                                                                |
+| Matching completion replay or completed `/result`           | `{state:"completed",next:"login",receipt_expires_at}`. Read-only receipt, without subject/session material or `Set-Cookie`. A changed body cannot replay the receipt. The client never submits again or calls session bootstrap from this branch.                                                                                                                                                                                                                                                                                                       |
+| Known absent birth within a readable attempt                | `/result` reports `{state:"pending",expires_at,contact_verified}` or `{state:"failed",receipt_expires_at,contact_verified}`. Pending can return to the indicated stage only with still-valid original authority and appropriate fresh proof or ceremony when required. Failed is closed. Neither restores a spent proof nor automatically repeats a request.                                                                                                                                                                                            |
+| Unknown commit, ambiguous completion or lost final response | Use explicit `/result` with original `A`/JKT and a fresh DPoP proof. An authoritative read may resolve committed or absent after the deciding outcome is known. A pending snapshot while completion may still be in flight, unavailable or expired authority, and an unknown read are never evidence of absence. While unknown, keep outcome checking bounded and offer ordinary login without automatic body/native work, a new attempt, or a session bootstrap. If `Set-Cookie` may have been lost, a completed receipt still directs ordinary login. |
+
+T33 may issue a normal session only from the in-flight, known fresh successful
+birth, for its exact returned subject and original JKT, after current SQL account,
+role, revocation and full-policy checks. All selected primary evidence must be
+server-verified, including actual UV for passkey. Enrollment does not substitute
+for an assertion on ordinary passkey login or satisfy independent MFA where required.
+Old completions, receipts, concurrent duplicate submissions, `/result`, uncertain
+reconciliation and replacement keys cannot issue a session. A birth stays committed
+if session issuance or delivery fails. T32 completion before T33 can return only
+the unauthenticated target receipt. Current completion always returns the current
+login receipt with its two proof flags and performs no T33 issuance.
+
+### T01 Verification Trace
+
+**T01-U01** is N/A for the documentation contract. These are required future
+unit cases, with the field owners listed in the [stage trace](#planned-stage-to-request-trace):
+
+- [T31-U01](../.github/tasks/registration-single-contract-tasks.md#t31) exercises
+  the registration handler's exact top-level and nested objects for every row
+  in the [request table](#deferred-final-requests). Test each admitted selector
+  and reject unknown selectors, missing or extra fields (including cross-stage
+  fields), duplicates at every level, casing aliases, nulls, wrong types, array
+  or nonobject bodies, malformed UTF-8/JSON/string encodings, trailing content,
+  over-limit bodies and query strings. Preserve canonical nonzero UUIDs for
+  attempt IDs and canonical unpadded base64url encodings for 32-byte capabilities
+  and verification references. Reject the current `{email,phone,username}` start
+  and email-link token body as target inputs. Verify current reader compatibility
+  separately under T31-I01.
+- Exercise one email or one mobile; reject both, neither, unknown type, empty
+  value, extra contact keys and non-ASCII/numeric or lost-leading-zero code
+  representations. Test exact matching channel, purpose, canonical destination,
+  proof ID, generation, key and deadline. Test the password/passkey/both matrix
+  for review, options and final, including each missing, extra, null or wrong-type
+  credential, wrong WebAuthn envelope, client confirmation, code-only birth and
+  cancelled `both`. Final/options reject any caller contact, subject, role,
+  verification status, normalized birthday pair or acceptance time.
+- Reuse T02/T05–T11/T15 rule fixtures through the exact registration shapes.
+  Include missing/invalid names, wrong calendar or impossible/future date, absent
+  or nonadmitted gender, invalid username-policy input, wrong country or
+  inactive/mismatched decimal province/locality IDs, and exact password bytes
+  including spaces. For legal, check both exact nested tuples, missing entries,
+  false or string acceptance, unknown keys and stale/unapproved/swapped versions.
+- [T32-U01](../.github/tasks/registration-single-contract-tasks.md#t32) tests
+  required-row and receipt invariants for all three credential modes. Check keyed
+  and domain-separated password-bearing fingerprints, matching canonical candidate
+  replay and mismatch on changed password bytes, other fields, selected contact,
+  proof generation or authority. A changed candidate cannot reuse a ceremony or
+  an existing completion. Exercise known, absent and unknown results without
+  deriving proof, subject admission or a session from a receipt.
+
+**T01-I01** is N/A for documentation execution. The required future SQL/HTTP
+evidence maps as follows:
+
+| Planned outcome                                                                                                                                               | SQL/HTTP acceptance                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Admitted fields, selected proof only and correct credential mode; deny wrong channel/capability/JKT/generation/deadline, code-only and invalid/missing fields | [T31-I01](../.github/tasks/registration-single-contract-tasks.md#t31) exercises the existing HTTP registration routes, exact schemas, default-off incomplete composition and concrete reader compatibility. T31-S01/X01 cover invalid proof and stale policy/catalog/legal or provider uncertainty. |
+| One full birth with selected proof consumed, credentials and legal evidence committed; no partial rows, winner attachment or extra creation intent            | [T32-I01](../.github/tasks/registration-single-contract-tasks.md#t32) injects failures at every real SQL write and checks exactly one expected subject on success. T32-S01/X01 cover locked deciding checks, collision races on separate connections, and read-only known/absent/unknown results.   |
+| Fresh full-policy session for exact subject/JKT, strict cookies; receipt/replay/result/unknown commit and failure mint no new authority or birth              | [T33-I01](../.github/tasks/registration-single-contract-tasks.md#t33) verifies real SQL/HTTP admission and unauthenticated reconciliation. T33-S01/X01 cover mismatches, intervening role/revocation, duplicate completion and lost session delivery.                                               |
+
+**T01-B01** is N/A for contract-only work. [T34-B01](../.github/tasks/registration-single-contract-tasks.md#t34)
+covers the shared shell for stages 1–6 including labels, progress, focus/back,
+stable key/provider/deadlines and safe no-JavaScript states.
+[T35-B01](../.github/tasks/registration-single-contract-tasks.md#t35) owns stages
+1, 2 and 3, [T36-B01](../.github/tasks/registration-single-contract-tasks.md#t36)
+owns stages 4 and 5 including explicit native action after review,
+and [T37-B01](../.github/tasks/registration-single-contract-tasks.md#t37) owns
+stage 6 with separate legal controls, validate-before-native and expected-subject
+handoff verified under T33-B01. All follow
+[GATE03](../.github/tasks/registration-single-contract-tasks.md#per-record-delivery-rules)
+and [localization](localization.md#registration-synchronization) for typed
+`en`/`fa-IR` messages, accessible names, keyboard/focus/status, responsive reflow,
+palettes, privacy clearing, structural screenshot masks and exact wire bytes.
+Physical authenticator/Windows Hello, screen reader/native zoom/bfcache, real
+provider receipt, professional Persian/security/legal and deployed ingress
+observations remain independent.
 
 ## Planned Dependencies and Gates
 

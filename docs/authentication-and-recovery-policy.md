@@ -17,8 +17,10 @@ A UUID-shaped client ID is not a human account, and consumer recovery must never
 create, resolve or authenticate a human from that identifier. No hypothetical
 username-less account lane, T12 username claim, duplicate authentication service
 or registration-v2 implementation is authorized. `/register` remains the public
-registration route. `/recover-account` is exclusively deletion cancellation and
-reclamation, not lost-factor repair.
+registration route. The [canonical contract](registration-contract.md) defines
+the current and target registration requests under these invariants.
+`/recover-account` is exclusively deletion cancellation and reclamation, not
+lost-factor repair.
 
 ## Glossary
 

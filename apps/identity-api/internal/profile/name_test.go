@@ -168,6 +168,29 @@ func TestPersonalNameRepertoireAndSeparatorProperties(t *testing.T) {
 	}
 }
 
+func TestNormalizePersonalNameConcurrent(t *testing.T) {
+	const input = "  \u0643\u064a   \u0627\u0653\u200c\u0648\u0654  "
+	const want = "\u06a9\u06cc \u0622\u200c\u0624"
+	const malformed = "\u0628\xff\u0628"
+
+	for worker := range 16 {
+		t.Run(strconv.Itoa(worker), func(t *testing.T) {
+			t.Parallel()
+			for range 32 {
+				name, err := NormalizePersonalName(input)
+				if err != nil || name != want {
+					t.Fatal("concurrent private-name normalization changed")
+				}
+				name, err = NormalizePersonalName(malformed)
+				if err == nil {
+					t.Fatal("concurrent normalization accepted malformed UTF-8")
+				}
+				assertPersonalNameInvariant(t, name, err)
+			}
+		})
+	}
+}
+
 func FuzzNormalizePersonalName(f *testing.F) {
 	for _, input := range []string{"", "   ", "\u0639\u0644\u06cc", " \u0643\u064a  \u0628 ", "\u0627\u0653", "\u0648\u0654", "\u064a\u0654", "\u0628\u200c\u0628", "\u0628 \u200c\u0628", "\u0628\u202e", "\u0628\u06f1", "private\xffname", strings.Repeat("\u0628", 80), strings.Repeat("\u0628", 81), strings.Repeat(" ", 1022) + "\u0628", strings.Repeat(" ", 1023) + "\u0628"} {
 		f.Add(input)

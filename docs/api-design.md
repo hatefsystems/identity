@@ -32,7 +32,7 @@ an active draft. Interactive login/consent/code issuance is incomplete
 
 ### 1.2 Authentication Flow (Frontend API)
 
-Discoverable-passkey sign-in issues normal browser sessions. Separately enabled new-account registration verifies an existing owned email/phone and resident UV passkey; it never authenticates the browser or allocates a mailbox. See [registration](#15-new-account-registration).
+Discoverable-passkey sign-in issues normal browser sessions. Current, separately enabled new-account registration verifies both contacts and a resident UV passkey and returns an unauthenticated completion receipt. It allocates no mailbox. The planned fresh-session handoff is defined separately. See [registration](#15-new-account-registration).
 
 - `POST /api/v1/auth/login`: Current `{username,password}` sign-in when `LOGIN_ENABLED` and admitted username authority are configured. Supported password and admitted immutable username are required; populated fields alone are not authority. Returns normal `204` cookie only when full current policy permits, otherwise `{status:"mfa_required",preauthentication,expires_at}` without normal cookie.
 - `POST /api/v1/auth/login/code/request`: Current `{username,channel}` (`email`/`sms`) conditional contact-code request; returns opaque `202 {status:"code_requested",challenge,expires_at}`. Server selects the protected current contact; acceptance is not receipt.
@@ -420,32 +420,34 @@ Reclaim is anonymous, not unprotected: exact Origin, bounded JSON, shared admiss
 
 ### 1.5 New-Account Registration
 
-The authoritative [registration contract](registration-contract.md) distinguishes
-the existing flow, this coordinated username increment and the deferred final
-contact-choice/password/six-stage target. The table below is the enabled
-current-flow contract with usernames, not proof of live policy installation.
+The [canonical registration contract](registration-contract.md) defines the
+single existing service, client and public `/register` route. The current and
+planned contracts use the same API prefix.
 
-`REGISTRATION_ENABLED=false` is independently opt-in. When enabled with schema,
-shared Redis, private keys, approved finite admission/send budgets, SMS.ir and
-verified TLS SMTP prerequisites, all routes below require exact Origin, bounded
-strict JSON, public DPoP nonce/replay admission, no-store and no-referrer. Each
+#### Current Registration Requests and Responses
+
+These nine routes mount only when the registration service is provisioned.
+Registration is disabled by default (`REGISTRATION_ENABLED=false`).
+When enabled with schema, shared Redis, private keys, approved finite admission/send
+budgets, SMS.ir and verified TLS SMTP prerequisites, every route below requires exact
+Origin, bounded strict JSON, public DPoP nonce/replay admission, no-store and no-referrer. Each
 transport attempt uses a fresh proof/JTI from the original verified JKT.
 Signup uses public DPoP without access-token `ath`, Authorization or
 `X-Portal-Session`; it does not use an ordinary/recovery session as authority.
 `attempt_id` is not authority: follow-ups also need the returned capability,
 except email verification, which needs its distinct token and original JKT.
 
-| POST route                              | Exact request fields                           | Successful result / meaning                                                                                                                                                                                                         |
-| --------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/v1/auth/register/validate`        | `{stage:"username",registration:{username}}`   | `200 {username_display,available}`; read-only NFC display and advisory availability, no proof/reservation/owner disclosure. No other validation stage is mounted by this increment.                                                 |
-| `/api/v1/auth/register/start`           | `{email,phone,username}`                       | `201 {attempt_id,capability,canonical_email,username_display,expires_at,email_sent}`; freezes username/policy but reserves nothing until final commit. `email_sent` is submission acceptance, not inbox delivery.                   |
-| `/api/v1/auth/register/email/resend`    | `{attempt_id,capability}`                      | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send.                                                         |
-| `/api/v1/auth/register/email/verify`    | `{attempt_id,token}`                           | Marks only email ownership from the original JKT; no capability/session/role issuance.                                                                                                                                              |
-| `/api/v1/auth/register/phone/send`      | `{attempt_id,capability}`                      | `{verification_id}` for the frozen Iranian phone after verified email; no automatic billed retry.                                                                                                                                   |
-| `/api/v1/auth/register/phone/verify`    | `{attempt_id,capability,verification_id,code}` | Consumes the exact signup/JKT/phone OTP and persists phone proof. Code is a six-digit string, including leading zeros.                                                                                                              |
-| `/api/v1/auth/register/passkey/options` | `{attempt_id,capability}`                      | `{publicKey}` for a signup-purpose resident UV-required ceremony after both ownership proofs.                                                                                                                                       |
-| `/api/v1/auth/register`                 | `{attempt_id,capability,credential}`           | `200`; WebAuthn creation JSON completes the ceremony; `{state:"completed",next:"login",receipt_expires_at,email_verified:true,phone_verified:true}`.                                                                                |
-| `/api/v1/auth/register/result`          | `{attempt_id,capability}`                      | Pending: `{state:"pending",expires_at,email_verified,phone_verified}`. Failed: `{state:"failed",receipt_expires_at,email_verified,phone_verified}`. Completed: same shape as final. Not a login or email-based capability recovery. |
+| POST route                              | Exact request fields                           | Successful result / meaning                                                                                                                                                                                                                |
+| --------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/api/v1/auth/register/validate`        | `{stage:"username",registration:{username}}`   | `200 {username_display,available}`; read-only NFC display and advisory availability, no proof/reservation/owner disclosure. The only current validation selector is `username`.                                                            |
+| `/api/v1/auth/register/start`           | `{email,phone,username}`                       | `201 {attempt_id,capability,canonical_email,username_display,expires_at,email_sent}`; freezes username/policy but reserves nothing until final commit. `email_sent` is submission acceptance, not inbox delivery.                          |
+| `/api/v1/auth/register/email/resend`    | `{attempt_id,capability}`                      | `204`; explicit bounded resend replaces email proof and clears phone/ceremony progress, without extending attempt expiry or resetting budgets. No automatic page-load send.                                                                |
+| `/api/v1/auth/register/email/verify`    | `{attempt_id,token}`                           | `204`; records only email ownership from the original JKT. No capability, session or role issuance.                                                                                                                                        |
+| `/api/v1/auth/register/phone/send`      | `{attempt_id,capability}`                      | `200 {verification_id}` for the frozen Iranian phone after verified email. No automatic billed retry.                                                                                                                                      |
+| `/api/v1/auth/register/phone/verify`    | `{attempt_id,capability,verification_id,code}` | `204`; consumes the exact signup/JKT/phone OTP and persists phone proof. Code is a six-digit ASCII string, including leading zeros.                                                                                                        |
+| `/api/v1/auth/register/passkey/options` | `{attempt_id,capability}`                      | `200 {publicKey}` for signup-purpose resident UV enrollment after both ownership proofs.                                                                                                                                                   |
+| `/api/v1/auth/register`                 | `{attempt_id,capability,credential}`           | `200`; WebAuthn creation JSON completes the ceremony or a matching replay returns its receipt. `{state:"completed",next:"login",receipt_expires_at,email_verified:true,phone_verified:true}`.                                              |
+| `/api/v1/auth/register/result`          | `{attempt_id,capability}`                      | `200`. Pending: `{state:"pending",expires_at,email_verified,phone_verified}`. Failed: `{state:"failed",receipt_expires_at,email_verified,phone_verified}`. Completed: same shape as final. Not a login or email-based capability recovery. |
 
 The email link is `/register/verify-email#attempt_id=...&token=...`; the browser
 scrubs the fragment immediately and verifies only after explicit user action.
@@ -453,6 +455,11 @@ Wrong-browser/key links cannot transfer enrollment authority. Attempt/capability
 token/OTP/credential material never belongs in paths, query strings, logs, browser
 persistent storage, analytics or cross-tab messages. Caller-supplied user IDs,
 handles, roles, status, auth versions or proof flags are not accepted.
+Current completion's `credential` envelope requires `id`, matching `rawId`,
+`type: "public-key"` and `response` with `clientDataJSON` and `attestationObject`.
+It permits the validated optional `authenticatorAttachment`,
+`clientExtensionResults` and `response.transports` fields. The server verifies
+the frozen challenge and resident enrollment with actual UV.
 
 Pending state lasts 15 minutes, email proof 10 minutes, passkey challenge at most
 5 minutes (also bounded by pending expiry) and completion receipt 1 hour. Pending
@@ -460,8 +467,9 @@ attempts are not users and cannot log in. Final SQL commit creates exactly one
 active user, canonical email, immutable unique username, frozen handle, resident
 UV credential, encrypted verified phone, revision-1 created-event intent and receipt together. No password,
 mailbox, role or session is created; normal discoverable login follows separately.
-Email/phone/pending-deletion/credential uniqueness remains database-authoritative;
-conflict never attaches a credential to an existing account.
+Contact, username and credential uniqueness remains database-authoritative. A
+losing username assignment rolls back the account and credential writes. No
+credential can attach to the winner.
 
 Username display receives NFC only; the separate four-fold security key reserves
 every equivalent spelling across all surviving account statuses until physical
@@ -471,9 +479,11 @@ deletion. Availability is advisory. `invalid_username` (400) and
 Owner-reviewed policy/reserved names and controlled activation remain
 [operational gates](devops-operations.md#username-policy-and-preflight-gates).
 
-For lost/ambiguous final responses, explicitly read `/register/result` using the
-same capability/JKT and a new DPoP proof. Same-authority identical completion can
-return its committed receipt; changed completion data conflicts. This narrow
+For an unknown commit (including `503 result_required`) or lost final response,
+explicitly POST `/api/v1/auth/register/result` with the same capability/JKT and a
+new DPoP proof. A completed result or receipt always directs ordinary login and
+returns no session. Same-authority identical completion can return its committed
+receipt. Changed completion data conflicts. This narrow
 registration-only reconciliation does not relax other mutation retry rules,
 resurrect spent phone OTPs or promise exactly-once external delivery. Lost browser
 authority requires restart or ordinary login, never capability lookup by email.
@@ -487,6 +497,27 @@ Fixed errors include `invalid_request` (400), `invalid_registration` (401),
 `result_required` directs explicit same-authority outcome checking; failed proof
 commit may require a fresh phone proof rather than restoring a spent OTP. A
 provider throttle is a failed send, not falsely reported as the local limiter.
+
+#### Planned Registration Requests and Responses
+
+The [target request table](registration-contract.md#deferred-final-requests)
+defines all planned bodies and success responses for the same routes. Only the
+username validation branch is current. The target adds names, personal information
+and full review selectors, changes start to one selected contact, and verifies the
+selected email/mobile code with the original attempt/capability/JKT. Successful
+contact proof grants neither account creation nor login. Email identification
+requires an explicit eligible selection under SEC01. Email never falls back
+implicitly after username failure, and mobile is never a login identifier.
+
+T31 owns the final field and proof checks. T32 commits the complete candidate,
+including selected credentials and separate approved terms/privacy versions, in
+one transaction. T33 alone may add a strict cookie handoff from the original,
+known fresh completion for the returned subject and original browser JKT.
+[Target completion and reconciliation](registration-contract.md#target-completion-and-reconciliation)
+defines the fresh handoff, ordinary-login receipt, pending/failed reads and unknown
+outcome. A matching replay or `/result` can report a commit but issues no cookie
+or session. Unknown commit stays read-only until resolved, and failed issuance or
+delivery leaves one committed account for ordinary login.
 
 #### Existing-Account Contact Verification
 

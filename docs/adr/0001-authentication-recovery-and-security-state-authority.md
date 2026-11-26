@@ -74,8 +74,9 @@ and queued recipients/tokens/locales/deadlines are preserved. T12 is out of scop
    capped at five minutes and the remaining ceremony deadline, preserving tighter
    existing limits. New families use at least 128 random bits and purpose/account/
    generation-bound HMAC-SHA-256 with separate domains and custody (SEC05/SEC11).
-10. Preserve one `/register` service and atomic account birth, then issue a session
-    only from a known fresh success to the expected subject/same browser key.
+10. Preserve one [registration service and contract](../registration-contract.md) at
+    `/register` with atomic account birth. Issue a session only from a known fresh
+    success to the expected subject and original browser key.
     Receipt/replay/result lookup never authenticates. `/recover-account` stays
     deletion-exclusive. Keep 30-day grace, holds, username ownership, required
     reclaim factors, exact revisions, optional email and real readers (SEC12-SEC15).

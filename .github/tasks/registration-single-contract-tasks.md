@@ -45,13 +45,14 @@ dependencies, not a hypothetical legacy-user design. T12 is excluded.
 There are **42 primary IDs, 64 executable target records, six aggregate aliases
 and one excluded ID: 71 distinct IDs in total**. This is not a fixed 42-task
 implementation count. Aggregates select no implicit implementation; callers must
-name their executable children. Every target record is Planned or Blocked. A
-Planned record still requires owner authorization and independently completed
-dependencies. Blocked names an approval, lifecycle or acceptance prerequisite.
+name their executable children. Planned work requires owner authorization and
+independently completed dependencies. Blocked names an approval, lifecycle or
+acceptance prerequisite. A dated documentation delivery establishes only the
+recorded documentation evidence.
 
 | Primary ID | Target Executable IDs / Alias     | Historical T Status                                 | Target Disposition                                   |
 | ---------- | --------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
-| T01        | T01                               | Completed contract audit, 2026-11-15                | Planned contract alignment                           |
+| T01        | T01                               | Completed contract audit, 2026-11-15                | Docs checked 2026-11-24; C01 pending CP01            |
 | T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                  |
 | T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Planned policy reconciliation                        |
 | T04        | T04                               | Partially implemented; approval-pending             | Blocked approved policy/reservation inventory        |
@@ -191,7 +192,7 @@ are independently observed gates, not virtual/synthetic substitutions.
 
 | Section                         | Requirement                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ID/title                        | T01 - Align the Single Registration Contract. Status: Planned.                                                                                         |
+| ID/title                        | T01 - Align the Single Registration Contract. Documentation implemented and checked 2026-11-24; C01 open pending CP01.                                 |
 | Objective                       | Reconcile the existing contract with SEC01-SEC16 without labeling deferred behavior current.                                                           |
 | Scope                           | One existing service/client/form, mandatory private fields/username, one selected verified contact, password/passkey/both and approved legal versions. |
 | Explicit out of scope           | Implementation, registration-v2, T12, fabricated old-account attributes or new public routes.                                                          |
@@ -206,6 +207,24 @@ are independently observed gates, not virtual/synthetic substitutions.
 | Browser/accessibility tests     | T01-B01: N/A for contract-only work; map six stages to T34-T37/GATE03 without claiming observed browser acceptance.                                    |
 | Documentation updates           | T01-D01: align registration/API/policy/ADR links and retain historical contract completion distinction.                                                |
 | Completion criteria             | T01-C01: GATE01, reviewed request/field traceability and CP01 decision recorded; no application completion inferred.                                   |
+
+The [canonical contract](../../docs/registration-contract.md) records the inspected
+source and [request/field trace](../../docs/registration-contract.md#planned-stage-to-request-trace),
+including the [future acceptance mapping](../../docs/registration-contract.md#t01-verification-trace).
+This delivery is distinct from the [2026-11-15 historical audit](#h01---original-t01-t04-reports-2026-11-15).
+
+GATE01 scope for this delivery is the final combined documentation diff,
+formatting, local references and reviewer trace against the inspected source.
+T01-U01, T01-I01 and T01-B01 retain their stated documentation-only N/A reasons.
+Application CI, SQL/HTTP, browser, provider and deployed checks belong to separate
+implementation or release work.
+
+**CP01 disposition, 2026-11-24.** The owner confirmed the target direction and
+authorized T01 documentation only. The delivered ADR, full architecture,
+documents and backlog still await explicit owner approval. [ADR 0001](../../docs/adr/0001-authentication-recovery-and-security-state-authority.md#status)
+is Proposed and [readiness G01](../../docs/security-testing-and-readiness.md#release-gates)
+records approval pending. There is no recorded CP01 approval. T01-C01 remains
+open and this entry grants no downstream authorization.
 
 ### T02
 
