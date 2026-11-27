@@ -56,7 +56,7 @@ recorded documentation evidence.
 | T02        | T02                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
 | T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Approved length revision verified 2026-11-27          |
 | T04        | Aggregate: T04A, T04B             | Partially implemented; approval-pending             | T04A verified 2026-11-27, T04B required before launch |
-| T05        | T05                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
+| T05        | T05                               | Completed standalone validator, 2026-11-15          | Standalone validator verified 2026-11-27              |
 | T06        | T06                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
 | T07        | T07                               | No explicit status recorded                         | Blocked source-access/data-rights authorization       |
 | T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                    |
@@ -453,11 +453,25 @@ authorized actual-target inventory, key provenance and activation evidence.
 | Documentation updates           | T04B-D01: record review and operation decisions and non-sensitive outcome references. Retain protected inventory and collision reports outside the public repository.                                                                                                                  |
 | Completion criteria             | T04B-C01: verify the approved artifact and key provenance, complete actual-target no-split preflight, store protected evidence and observe separately authorized activation. Mandatory before public launch under T42.                                                                 |
 
+**Repository preparation, 2026-11-27 (Asia/Tehran).** Inspected clean source
+`117d015d62534d3ea7d19dc4cb769b27112d4036`. Recomputed the canonical
+fingerprint of the [approved source artifact](../../docs/registration-contract.md#approved-initial-username-assignment-policy)
+and matched policy ID `e9fa486e-db81-4dd0-8225-1e99e5399c1d`, the 4-letter
+minimum, the 40-code-point maximum, and all six exact reservations. Its
+fingerprint is `a2a74767ae7f42bdcd7e08ab6e65e21985f1dd9130e7d989b3ecf2220ad588cb`.
+T04A has a verified record. [T18A](#t18a) and [T32](#t32) are still Planned.
+The production prerequisites remain completion of those tasks, explicit
+read-only authorization for the identified target and scanner identity, key
+provenance from the approved custody system, and a protected evidence destination
+outside the repository. Actual inventory and activation evidence are pending.
+The [operations runbook](../../docs/devops-operations.md#username-policy-and-preflight-gates)
+defines separate authorizations for installation, activation, and deployment.
+
 ### T05
 
 | Section                         | Requirement                                                                                                                                                   |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T05 - Validate Date-Only Birthdays. Status: Planned; unchanged product definition.                                                                            |
+| ID/title                        | T05 - Validate Date-Only Birthdays. Status: Standalone validator verified 2026-11-27; unchanged product definition.                                         |
 | Objective                       | Preserve one civil Gregorian/Jalali birthday pair, never a timestamp or inferred age.                                                                         |
 | Scope                           | Explicit gregorian/jalali input; allowed three digit scripts; pinned integer converter; 1900-01-01 through server Tehran today inclusive.                     |
 | Explicit out of scope           | Alternate converters, unlimited calendar certification, timezone-derived DOB timestamps, age policy, UI defaults or inferred old birthdays.                   |
@@ -472,6 +486,64 @@ authorized actual-target inventory, key provenance and activation evidence.
 | Browser/accessibility tests     | T05-B01: N/A for validator; T35/T37 test explicit input calendar and both inert date-only representations under preference changes.                           |
 | Documentation updates           | T05-D01: preserve converter license/pin, supported range/reference caveats and dated acceptance counts.                                                       |
 | Completion criteria             | T05-C01: GATE01 and unchanged calendar contract pass; no physical/official-calendar certification or signup integration inferred.                             |
+
+**T05-C01 verification, 2026-11-27 (Asia/Tehran).** The existing standalone
+validator satisfied T05-F01 and T05-S01 without runtime changes. It accepts one
+explicit input calendar, returns one reverse-checked ASCII civil pair, and uses
+only the trusted server instant to determine the inclusive Tehran upper bound.
+The integer port and MIT notice were rechecked against the pinned upstream source.
+The [registration contract](../../docs/registration-contract.md#confirmed-birthday-and-gender-validation-t05t06)
+retains the reference limitations and supported range. The [original evidence](#h02---original-t05t06-implementation-2026-11-15)
+is unchanged.
+
+T05-U01 and T05-X01 passed: 14 pinned upstream and authority-derived vectors,
+6,561 digit-script combinations per calendar, 46,340 civil days, leap and month
+boundaries, exact static errors with zero pairs, 20 fuzz seeds, and 2,560 concurrent
+validator calls. The clock cases now exercise both the skipped midnight and repeated
+late-evening hour of Tehran's 2021 DST transitions for both input calendars.
+
+| Verification | Observed result |
+| ------------ | --------------- |
+| `npm exec -- nx exec -p schemas -- go -C "$PWD/apps/identity-api" test -count=1 -json -run='^(TestBirthday\|FuzzNormalizeBirthday)' ./internal/profile` | Passed 59 test/subtest events, zero skips. |
+| `npm exec -- nx run identity-api:test --skipNxCache` and `CGO_ENABLED=1 npm exec -- nx run identity-api:test-race --skipNxCache` | Each passed 69 test-bearing packages and 6,487 test/subtest events. Three packages have no tests; 59 existing migration/advisory-lock skip events require a separate database environment. All 59 T05 events passed in both runs. |
+| `npm exec -- nx run identity-api:vet --skipNxCache` (default and with `GOFLAGS=-tags=integration`) | Both passed. |
+| `npm exec -- nx run identity-api:lint --skipNxCache` (default and with `--args='--build-tags=integration'`) | Both passed with zero issues. |
+| `npm exec -- nx exec -p schemas -- node --test "$PWD"/.github/scripts/*.test.mjs` | Passed 524 checks, zero skips. |
+| `npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-target=test-retention-integration` | Passed 355 checks in three packages, zero skips, confirmed teardown. |
+| Portal harness, `--integration-target=test-portal-integration` | Passed 4,609 checks in 21 packages, zero skips, confirmed teardown. The 242 profile checks include whole birthday replacement. |
+| `npm exec -- nx run web:test-admin-browser --skipNxCache` | Passed `en` and `fa-IR`, 29 checks and 70 layouts per locale, with matching worktree identities and confirmed teardown. |
+
+The unit/race reruns used `GOFLAGS=-json` in a private Linux loopback namespace
+after the initial host runs hit ephemeral-port bind errors. The initial portal
+run failed in account-deletion and MFA integration cases and completed teardown.
+The passing portal rerun used the same harness target, inventory and assertions
+via an out-of-tree adapter invoked as
+`npm exec -- nx exec -p schemas -- node "$adapter" "$PWD" --integration-target=test-portal-integration`.
+The adapter changed only PostgreSQL and Redis routing to verified run-owned bridge
+addresses; it is local evidence, not a required tool. Two admin attempts stopped
+in login/theme and Persian legal/theme assertions respectively and confirmed
+teardown; only the complete bilingual rerun is accepted. The browser build used
+the lockfile-verified cached Next.js 16.1.7 Linux SWC binary.
+
+Runtime evidence used HEAD `117d015d62534d3ea7d19dc4cb769b27112d4036`, unstaged
+diff SHA-256 `a8cd5fa9ef083a9f03256c49c4671fd4dd453ea712e5b669db5b01bbe1570ca5`,
+and no staged or untracked source. Both integration reports bound source SHA-256
+`1cca76201aae8e9f2165074df31a4daff5aeb9d0e159fe022119e25c99336b48` with identical
+generated inputs:
+
+| Generated root | Files | SHA-256 |
+| -------------- | ----- | ------- |
+| `apps/identity-api/internal/db` | 32 | `d99ae7539cd4032433c690b4bc37231380ac9c8ed168b68b936503477545eaea` |
+| `libs/schemas/gen/go` | 4 | `75587d9200428ef0535ad7a880a20f341929b111b2be2db397629dd3118f5c2a` |
+| `libs/schemas/gen/ts` | 3 | `c13d5649d6d94d8a873d085c565d777ded166ae7647a5bc09c00e16f0eb90c50` |
+
+Toolchain: Linux amd64, Node 24.21.0, npm 11.21.0, Nx 23.1.0, local Go
+1.26.11, GCC 15.2.0 and golangci-lint 2.12.2. The dated record was added after
+runtime verification.
+T05-I01 and T05-B01 remain N/A for the standalone validator. The portal and
+admin results are regression evidence, not acceptance for registration birthday
+persistence or controls. No official calendar certification, native browser
+bfcache/hidden-tab observation, or launch evidence is claimed.
 
 ### T06
 

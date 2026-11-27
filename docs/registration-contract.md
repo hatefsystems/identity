@@ -267,8 +267,10 @@ one `Birthday` with canonical ASCII `Gregorian` and `Jalali` date-only strings.
 username-only and `/start` requires `{email,phone,username}`; registration does not
 collect birthday/gender. Existing-account private-data endpoints use these validators
 and encrypted storage, while final registration controls/integration are planned.
-Preserved T05/T06 validator acceptance below is dated evidence, not target
-registration completion or fabricated backfill.
+The [standalone T05 record](../.github/tasks/registration-single-contract-tasks.md#t05)
+tracks current birthday verification separately from the original T05/T06
+evidence. Validator acceptance does not establish target registration
+integration, browser acceptance for birthday controls, or backfill.
 
 - Require calendar exactly `gregorian` or `jalali`; preference identifiers
   `gregory`/`persian`, locale/browser inference and missing values are invalid.
@@ -292,7 +294,9 @@ registration completion or fabricated backfill.
   not official-calendar certification or unlimited astronomical accuracy.
 - The server supplies one trusted current instant per validation, never a client
   field. Extract today in explicit `Asia/Tehran`, including historical DST; cache
-  only the immutable location and include standard `time/tzdata` fallback. Zero
+  only the immutable location and include standard `time/tzdata` fallback. The
+  bound advances on the Tehran civil date even when a historical DST transition
+  skipped midnight, and does not advance during a repeated late-evening hour. Zero
   clocks, Tehran years outside `1900..9999`, or zone failure return static
   `ErrBirthdayClock`. Input rejection uses separate static `ErrInvalidBirthday`.
   Every failure returns an entirely zero pair, never DOB-bearing errors/logging.

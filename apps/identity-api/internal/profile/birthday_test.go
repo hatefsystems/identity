@@ -2,6 +2,7 @@ package profile
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -215,6 +216,10 @@ func TestBirthdayRangeAndTehranClock(t *testing.T) {
 		{"after year rollover", time.Date(2026, 12, 31, 20, 30, 1, 0, time.UTC), civilDate{2027, 1, 1}, true},
 		{"before DST midnight", time.Date(2021, 7, 1, 19, 29, 59, 0, time.UTC), civilDate{2021, 7, 2}, false},
 		{"historical DST midnight", time.Date(2021, 7, 1, 19, 30, 0, 0, time.UTC), civilDate{2021, 7, 2}, true},
+		{"before spring DST jump", time.Date(2021, 3, 21, 20, 29, 59, 999999999, time.UTC), civilDate{2021, 3, 22}, false},
+		{"spring DST skips local midnight", time.Date(2021, 3, 21, 20, 30, 0, 0, time.UTC), civilDate{2021, 3, 22}, true},
+		{"autumn DST repeats prior civil date", time.Date(2021, 9, 21, 19, 30, 0, 0, time.UTC), civilDate{2021, 9, 22}, false},
+		{"after repeated hour at midnight", time.Date(2021, 9, 21, 20, 30, 0, 0, time.UTC), civilDate{2021, 9, 22}, true},
 		{"current summer no DST", time.Date(2026, 7, 1, 19, 30, 0, 0, time.UTC), civilDate{2026, 7, 2}, false},
 		{"current summer midnight", time.Date(2026, 7, 1, 20, 30, 0, 0, time.UTC), civilDate{2026, 7, 2}, true},
 		{"today", birthdayTestClock(), civilDate{2026, 11, 15}, true},
@@ -235,7 +240,7 @@ func TestBirthdayRangeAndTehranClock(t *testing.T) {
 						input = jalali
 					}
 					got, err := NormalizeBirthday(calendar, formatCivil(input), clock)
-					if (err == nil) != tc.valid {
+					if (tc.valid && err != nil) || (!tc.valid && err != ErrInvalidBirthday) {
 						t.Fatal("Tehran civil bound mismatch")
 					}
 					assertBirthdayInvariant(t, got, err, clock)
@@ -250,6 +255,41 @@ func TestBirthdayRangeAndTehranClock(t *testing.T) {
 		}
 		assertBirthdayInvariant(t, got, err, now)
 	}
+}
+
+func TestBirthdayConcurrentConversion(t *testing.T) {
+	midnight := time.Date(2025, 3, 20, 20, 30, 0, 0, time.UTC)
+	newYear := Birthday{Gregorian: "2025-03-21", Jalali: "1404-01-01"}
+	cases := []struct {
+		name, calendar, input string
+		clock                 time.Time
+		pair                  Birthday
+		err                   error
+	}{
+		{"Gregorian at midnight", "gregorian", "2025-03-21", midnight, newYear, nil},
+		{"Jalali at midnight", "jalali", "\u06f1\u066404-\u06f01-0\u0661", midnight, newYear, nil},
+		{"before midnight", "gregorian", "2025-03-21", midnight.Add(-time.Nanosecond), Birthday{}, ErrInvalidBirthday},
+		{"nonleap month end", "jalali", "1404-12-30", birthdayTestClock(), Birthday{}, ErrInvalidBirthday},
+		{"zero clock", "jalali", "1404-01-01", time.Time{}, Birthday{}, ErrBirthdayClock},
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Go(func() {
+			<-start
+			for range 32 {
+				for _, tc := range cases {
+					pair, err := NormalizeBirthday(tc.calendar, tc.input, tc.clock)
+					if pair != tc.pair || err != tc.err {
+						t.Errorf("concurrent birthday outcome changed for %s", tc.name)
+						return
+					}
+				}
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
 }
 
 func TestBirthdayDailyRoundTrip(t *testing.T) {
