@@ -57,7 +57,7 @@ recorded documentation evidence.
 | T03        | T03                               | Completed superseding configured policy, 2026-11-15 | Approved length revision verified 2026-11-27          |
 | T04        | Aggregate: T04A, T04B             | Partially implemented; approval-pending             | T04A verified 2026-11-27, T04B required before launch |
 | T05        | T05                               | Completed standalone validator, 2026-11-15          | Standalone validator verified 2026-11-27              |
-| T06        | T06                               | Completed standalone validator, 2026-11-15          | Planned unchanged-rule verification                   |
+| T06        | T06                               | Completed standalone validator, 2026-11-15          | Verified 2026-11-27                                   |
 | T07        | T07                               | No explicit status recorded                         | Blocked source-access/data-rights authorization       |
 | T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                    |
 | T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                     |
@@ -549,7 +549,7 @@ bfcache/hidden-tab observation, or launch evidence is claimed.
 
 | Section                         | Requirement                                                                                                                                  |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T06 - Require Explicit Gender. Status: Planned; unchanged product definition.                                                                |
+| ID/title                        | T06 - Require Explicit Gender. Status: Verified 2026-11-27 for standalone validation.                                                        |
 | Objective                       | Preserve exact female/male input with no preselected or inferred value.                                                                      |
 | Scope                           | Shared string-backed Gender validation, static errors and required final-registration field.                                                 |
 | Explicit out of scope           | New gender product values, aliases/case folding/coercion, default, backfill or unrelated profile-read changes.                               |
@@ -564,6 +564,54 @@ bfcache/hidden-tab observation, or launch evidence is claimed.
 | Browser/accessibility tests     | T06-B01: N/A for validator; T35 owns explicit keyboard-accessible selection with no default in either locale.                                |
 | Documentation updates           | T06-D01: preserve confirmed rule and original local evidence; no inferred migration population.                                              |
 | Completion criteria             | T06-C01: GATE01 and unchanged-rule tests pass independently of UI/storage delivery.                                                          |
+
+**T06-C01 verification, 2026-11-27 (Asia/Tehran).** The existing
+`profile.ValidateGender` and its original
+[2026-11-15 evidence](#h02---original-t05t06-implementation-2026-11-15) are
+preserved. T06-F01 and T06-S01 passed. Only the exact wire strings `female` and
+`male` return a value. Invalid or empty input returns zero `Gender` and the
+same static `ErrInvalidGender`, with no input disclosure or inference.
+Structural absence outside required registration input is preserved.
+
+T06-U01 and T06-X01 passed. Boundary checks cover whitespace, localized text,
+multiple numeral scripts, case changes, invalid UTF-8, control characters and
+oversized input. Eight parallel workers made 4,096 validator calls on mixed
+admitted and rejected inputs, checking exact values and static errors. All
+11 original fuzz seeds passed, and a fresh 15-second campaign with four workers
+completed 143,336 executions without a failure.
+
+| Verification                                                                                                                                                | Observed result                                                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm exec -- nx exec -p schemas -- go -C "$PWD/apps/identity-api" test -count=1 -json -run '^(TestValidateGender\|FuzzValidateGender)' ./internal/profile`  | Passed 22 test/subtest events, zero skips.                                                                                                                                             |
+| `npm exec -- nx exec -p schemas -- go -C "$PWD/apps/identity-api" test -run '^$' -fuzz '^FuzzValidateGender$' -fuzztime=15s -parallel=4 ./internal/profile` | Passed the active fuzz campaign from all 11 seeds.                                                                                                                                     |
+| `npm exec -- nx run identity-api:test --skipNxCache` and `CGO_ENABLED=1 npm exec -- nx run identity-api:test-race --skipNxCache`                            | Each passed 69 test-bearing packages. Three packages have no test files. The nonverbose output does not enumerate individual skips. Both runs used a private Linux loopback namespace. |
+| `npm exec -- nx run identity-api:lint --skipNxCache` (default and with `--args=--build-tags=integration`)                                                   | Both passed with zero issues.                                                                                                                                                          |
+| `npm exec -- nx run identity-api:vet --skipNxCache` (default and with `GOFLAGS='-p=1 -tags=integration'`)                                                   | Both passed.                                                                                                                                                                           |
+| `npm exec -- nx exec -p schemas -- node "$PWD"/.github/scripts/*.test.mjs`                                                                                  | Passed 524 checks, zero skips.                                                                                                                                                         |
+| `npm exec -- nx exec -p schemas -- node "$PWD/.github/scripts/portal-harness.mjs" --integration-target=test-retention-integration`                          | Passed 355 checks in three packages, zero skips, with confirmed teardown.                                                                                                              |
+| Portal harness, `--integration-target=test-portal-integration`                                                                                              | Passed 4,618 checks in 21 packages, zero skips, with confirmed teardown. The 251 profile checks include the concurrent gender validator test.                                          |
+| `npm exec -- nx run web:test-admin-browser --skipNxCache --parallel=2`                                                                                      | Passed `en` and `fa-IR`, 29 checks and 70 layouts per locale, with matching worktree identities and confirmed teardown.                                                                |
+
+The portal invocation was `npm exec -- nx exec -p schemas -- node "$adapter" "$PWD"`.
+The local, out-of-tree adapter ran the stock portal target and routed only
+PostgreSQL and Redis to verified run-owned bridge addresses. The admin browser
+used the lockfile-verified cached Next.js 16.1.7 Linux SWC binary.
+
+Runtime evidence used HEAD `d30ff9259718bd8d6d412a0a8bf1c8a6e6fc22aa`,
+unstaged diff SHA-256 `28316c48f0b7d515833484adf4a5bd8e7bded1c110ee410a1227c3c660398cd2`,
+and no staged or untracked source. Integration source SHA-256 was
+`a467183dd9c05d7dbd7701b9216049cfb3d079ae58b77b4572b7a5e6d5f3cca8`.
+The generated-input checksums match the three roots in the [T05 record](#t05).
+Toolchain was Linux amd64, Node 24.21.0, npm 11.21.0, Nx 23.1.0,
+Go 1.26.11, GCC 15.2.0 and golangci-lint 2.12.2. The dated documentation
+was added after runtime verification.
+
+T06-D01 preserves the [registration contract](../../docs/registration-contract.md#confirmed-birthday-and-gender-validation-t05t06).
+T06-I01 is N/A for the standalone validator. Required registration presence
+belongs to T31 and truthful handling of absent attributes belongs to T10/T11.
+T06-B01 is N/A for the validator. Explicit no-default keyboard-accessible
+controls belong to T35. Portal and admin results cover existing behavior. Native
+hidden-tab and bfcache restoration observations remain outside this evidence.
 
 ### T07
 

@@ -12,8 +12,10 @@ func TestValidateGender(t *testing.T) {
 	}{
 		{"female", GenderFemale}, {"male", GenderMale},
 		{"", ""}, {string(Gender("")), ""}, {" female", ""}, {"male ", ""},
+		{"\t", ""}, {"female\u00a0", ""}, {"null", ""},
 		{"Female", ""}, {"MALE", ""}, {"f", ""}, {"m", ""}, {"woman", ""}, {"man", ""},
 		{"\u0632\u0646", ""}, {"\u0645\u0631\u062f", ""}, {"0", ""}, {"1", ""}, {"2", ""},
+		{"\u06f1", ""}, {"\u0662", ""},
 		{"female\x00", ""}, {"male\n", ""}, {"male\xff", ""}, {"\u202emale", ""},
 		{strings.Repeat("male", 100000), ""},
 	} {
@@ -29,6 +31,21 @@ func TestValidateGender(t *testing.T) {
 		}
 		got, err := ValidateGender("female" + string(r))
 		assertGenderInvariant(t, "female"+string(r), got, err)
+	}
+}
+
+func TestValidateGenderConcurrent(t *testing.T) {
+	inputs := []string{"female", "", "male", "\u0632\u0646", "Male", "female\u00a0", "male\xff", "\u06f1"}
+	for range 8 {
+		t.Run("worker", func(t *testing.T) {
+			t.Parallel()
+			for range 64 {
+				for _, raw := range inputs {
+					got, err := ValidateGender(raw)
+					assertGenderInvariant(t, raw, got, err)
+				}
+			}
+		})
 	}
 }
 

@@ -311,8 +311,10 @@ integration, browser acceptance for birthday controls, or backfill.
   round-trip sweep; round trips alone are not independent correctness evidence.
 - Gender accepts exactly `female` or `male`: no trim, case folding, aliases,
   localized labels, numeric coercion or default. Invalid/missing new values return
-  zero `Gender` and static `ErrInvalidGender`. Existing profile reads are unchanged;
-  absent legacy attributes remain structurally absent, not validated or inferred.
+  zero `Gender` and static, redacted `ErrInvalidGender`. Absent private attributes
+  remain absent. The [standalone T06 record](../.github/tasks/registration-single-contract-tasks.md#t06)
+  tracks exact-input, fuzz and concurrency verification. T31 owns required field
+  presence at registration, and T35 owns explicit selection in the form.
 
 | Field                       | Required final meaning                                                                                                                                                                                                                                                                                                          |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
