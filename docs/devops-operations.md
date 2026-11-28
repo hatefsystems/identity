@@ -328,21 +328,66 @@ acceptance remain separately unverified. T28/T41 activation remains blocked.
 
 ## Geography Catalog (T08/T09)
 
-The catalog is an independent operator import and anonymous read boundary, not
-registration integration. T10 encrypted location storage and T34/T37 registration
-stages remain deferred. Keep the original source files local: `data/cities.json`
-and `data/types.json` are ignored by Git and excluded from both container contexts.
-Do not attach them, source labels, full query results or provenance containing
-private values to CI/browser artifacts. Only synthetic fixtures may be committed.
-This increment does not repeat T07, replace sources or redistribute data rights.
+The catalog provides an operator import and bounded anonymous reads.
+PostgreSQL is the authoritative runtime source. Source retrieval and validation
+are operator work outside the request path. Registration integration remains
+under T31–T37.
+
+### T07 Dataset Release
+
+The [JSON-first T07 decision](../.github/tasks/registration-single-contract-tasks.md#t07)
+uses local `data/cities.json` and the original `data/types.json` as candidates.
+Keep both files out of public Git. The application container contexts exclude
+them. Preserve their exact bytes, including source identifiers, names, parent
+relationships and type codes. Keep source files, full query results and
+restricted provenance out of public CI and browser artifacts. Use synthetic
+fixtures for public tests.
+
+The [processed-catalog review](../.github/tasks/registration-single-contract-tasks.md#proposed-t07-criteria-for-the-processed-catalog)
+records the owner's transformation account and the verified four-field places
+schema with its separate type dictionary. Document the selected coverage and
+exclusions of the processed release, with upstream versions and exact
+transformation inputs where established. The 1404 publication link can be
+credited as a reference without downloading its workbook or refreshing the
+existing JSON files.
+
+For each contributing source, retain the publisher, original URL, pinned tag or
+commit or dated release, exact input file, and independently verifiable digest
+or release record. For a collected dataset, document which files or
+records each source supplied, the selection and combination procedure, conflict
+decisions and the exact reproducible inputs/tool versions. Match the candidate
+IDs, labels, parents and type assignments to the pinned inputs. Have the source
+owner or responsible dataset maintainer substantiate the intended geographic
+coverage, per-type and per-province counts and any exclusions. Record attribution
+to established sources. If an authorized source comparison is needed, use a scoped
+read-only identity. A SQL Server comparison is optional release evidence and has
+no runtime role.
+
+Stage the release under `datasets/geography/iran/` in the approved custody
+location. Pin an immutable version for each complete release:
+
+| Release file          | Contents                                                                                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `iran-geography.json` | Exact candidate places bytes once independently verified.                                                                                                  |
+| `types.json`          | Exact original CenterType dictionary for the same release.                                                                                                 |
+| `schema.json`         | Versioned schema for places, types and release metadata. The strict parser also checks duplicate keys, exact integer syntax and graph invariants.          |
+| `manifest.json`       | Release and schema versions, source references, per-file byte lengths/SHA-256, counts by type and province, coverage and reproduction evidence references. |
+| `README.md`           | Provenance, covered snapshot and reproducibility instructions.                                                                                             |
+| `SHA256SUMS`          | SHA-256 of exact release file bytes. Pin the manifest or release digest through an independently trusted channel.                                          |
+
+Keep the candidate pair in protected versioned storage or an access-controlled
+private repository. Publishing the dataset requires explicit owner approval for
+the exact release. Keep release payloads out of application images. Publish or replace an approved
+release only once the complete package and its evidence have been validated.
 
 ### Complete-Snapshot Procedure
 
 1. Separately apply the guarded version-4 migration using the migrator identity.
    `geography check` and `geography import` never migrate or perform runtime DDL.
    Fresh migration and version-3 upgrades preserve existing accounts/credentials.
-2. Prepare a manifest as an explicit operator assertion of the complete intended
-   snapshot. Its exact fields are `country:"IR"`, `source_release`,
+2. Verify the approved T07 release and its exact places and types files. Prepare
+   a separate T08 import manifest as an explicit operator assertion for the
+   intended snapshot and database base revision. Its exact fields are `country:"IR"`, `source_release`,
    `cities_sha256`, `types_sha256` (lowercase SHA-256), `cities_bytes`, `types_bytes`,
    `place_count`, `type_count`, `province_count`, `expected_current_revision`
    (`null` initially, otherwise an exact positive decimal string), and

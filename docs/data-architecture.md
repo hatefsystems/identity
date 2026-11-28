@@ -787,6 +787,13 @@ for actual tombstone fields and pending retention approval.
 
 ### Retained Metadata Inventory
 
+[T07 release validation](devops-operations.md#t07-dataset-release) binds the
+original places and CenterType files to an immutable release with documented
+provenance and coverage. T08 binds that release to a separate operator manifest
+and a PostgreSQL catalog revision. PostgreSQL owns all runtime geography
+reads and selection validation. GitHub, SQL Server and protected artifact
+storage are outside the request path.
+
 The geography catalog is independent of account personal data. Its five tables
 are `geography_catalogs` (file hashes, sizes, source/importer/normalization versions
 and import provenance), `geography_types` (revision-specific original type labels),
@@ -795,7 +802,7 @@ and import provenance), `geography_types` (revision-specific original type label
 and separate normalized prefix-search value), and `geography_catalog_state`
 (singleton active revision). No user FK, registration column or encrypted private
 location is added in T08/T09. Retired identities and complete historical snapshots
-have no cleanup in this increment; source redistribution rights remain separate.
+have no cleanup in this increment.
 
 Labels remain the original admitted UTF-8 bytes. Search alone uses NFC, Arabic
 Yeh/Kaf folding and collapsed ordinary-space/NBSP/ZWNJ. Composite foreign keys keep

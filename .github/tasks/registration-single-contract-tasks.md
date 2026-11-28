@@ -58,7 +58,7 @@ recorded documentation evidence.
 | T04        | Aggregate: T04A, T04B             | Partially implemented; approval-pending             | T04A verified 2026-11-27, T04B required before launch |
 | T05        | T05                               | Completed standalone validator, 2026-11-15          | Standalone validator verified 2026-11-27              |
 | T06        | T06                               | Completed standalone validator, 2026-11-15          | Verified 2026-11-27                                   |
-| T07        | T07                               | No explicit status recorded                         | Blocked source-access/data-rights authorization       |
+| T07        | T07                               | No explicit status recorded                         | JSON-first approved; source evidence pending          |
 | T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                    |
 | T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                     |
 | T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract             |
@@ -615,23 +615,103 @@ hidden-tab and bfcache restoration observations remain outside this evidence.
 
 ### T07
 
-| Section                         | Requirement                                                                                                                                                   |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T07 - Export IranData Safely. Status: Blocked by source-access/data-rights authorization.                                                                     |
-| Objective                       | Preserve observed geography source identities using a separately authorized read-only export.                                                                 |
-| Scope                           | Local SQL Server dot instance, Windows integrated authentication, IranData dbo.CenterType/dbo.CityData, checksummed complete source export.                   |
-| Explicit out of scope           | Source writes, source-schema changes, shared data access in this documentation task, dataset redistribution or production dependency on developer SQL Server. |
-| Dependencies                    | None; external named source access and usage/redistribution permission.                                                                                       |
-| Security invariants             | SEC14, SEC16; source labels/provenance are protected data, not test artifacts.                                                                                |
-| Authorization requirements      | SELECT-only scoped identity; owner approval names exact source and permissible output destination.                                                            |
-| Functional acceptance           | T07-F01: export preserves original IDs, types, labels and hierarchy with hashes/counts and explicit completeness assertion.                                   |
-| Security acceptance             | T07-S01: attempted INSERT/UPDATE/DELETE/DDL is denied; unavailable/partial source is failure, never fabricated empty success.                                 |
-| Unit tests                      | T07-U01: synthetic export encoding/checksum/count/duplicate-ID fixtures pass without committing real source records.                                          |
-| Database/HTTP integration tests | T07-I01: separately authorized actual read-only source/export comparison proves SELECT scope; no HTTP endpoint is added.                                      |
-| Concurrency/failure tests       | T07-X01: interrupted/inconsistent export is rejected as incomplete and cannot replace an approved complete snapshot.                                          |
-| Browser/accessibility tests     | T07-B01: N/A for operator export; no browser or public dataset artifacts.                                                                                     |
-| Documentation updates           | T07-D01: record source-rights/access provenance, hashes and approved storage; do not publish private labels/results.                                          |
-| Completion criteria             | T07-C01: GATE01 and actual scoped source/right evidence; synthetic fixtures do not satisfy source authorization.                                              |
+| Section                         | Requirement                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ID/title                        | T07 - Validate and Version Iran Geography Dataset. Status: Blocked pending release provenance, coverage and versioned snapshot evidence. JSON-first design approved 2026-11-28.                                                                                                                |
+| Objective                       | Admit and version a complete, traceable Iran geography release for the existing PostgreSQL importer.                                                                                                                                                                                           |
+| Scope                           | Validate the candidate `data/cities.json` and its original `data/types.json`, preserve all source IDs, labels, parents and type codes, and bind the files to an immutable release with schema, manifest and checksums.                                                                         |
+| Explicit out of scope           | Record deletion, merging, correction or rekeying by assumption, source writes, unapproved publication, PostgreSQL import, runtime integration or runtime use of GitHub or SQL Server.                                                                                                          |
+| Dependencies                    | Original source references and pinned releases, file- or component-level lineage and coverage evidence, and an approved artifact destination.                                                                                                                                                  |
+| Security invariants             | SEC14, SEC16. Keep source files and restricted evidence in approved custody. Use synthetic fixtures in public tests, CI and browser artifacts.                                                                                                                                                 |
+| Authorization requirements      | Record the project owner's storage decision. Dataset publication requires explicit owner authorization. A source comparison that requires SQL Server uses separate authorization and a scoped SELECT-only identity.                                                                            |
+| Functional acceptance           | T07-F01: reproduce the approved release from pinned inputs or match an independently attested export. Preserve every original identifier, type, source label and parent. Bind the whole release to exact-byte SHA-256, sizes, counts and a documented coverage assertion.                      |
+| Security acceptance             | T07-S01: reject missing or partial sources, invalid UTF-8 or JSON, duplicate keys/IDs, unknown types, missing parents, cycles, invalid ancestry and hash/count mismatches. Withhold unverified releases from publication and import. Any separately approved SQL comparison remains read-only. |
+| Unit tests                      | T07-U01: synthetic file, encoding, graph, exact-number, checksum and manifest fixtures exercise failed and admitted inputs without committing real records.                                                                                                                                    |
+| Database/HTTP integration tests | T07-I01: compare the actual candidate pair to an independent authoritative release record or separately authorized read-only source comparison. A complete component manifest is required for a composite dataset. No database write or HTTP endpoint is part of T07.                          |
+| Concurrency/failure tests       | T07-X01: interrupted validation, changed files or inconsistent source evidence cannot replace the last approved immutable release.                                                                                                                                                             |
+| Browser/accessibility tests     | T07-B01: N/A for operator dataset validation. T09 owns selector behavior.                                                                                                                                                                                                                      |
+| Documentation updates           | T07-D01: record coverage, source and release references, checksum verification, reproducibility, storage decision and open evidence. Keep protected details outside public Git.                                                                                                                |
+| Completion criteria             | T07-C01: GATE01 passes for the actual candidate pair with independently supported identity and completeness, verified reproducibility and an approved versioned artifact. A structural parser pass alone does not satisfy release acceptance.                                                  |
+
+**Owner decision and candidate review, 2026-11-28 (Asia/Tehran).** The owner
+approved the JSON-first design, supplied the original type dictionary for the
+candidate and reported collecting data through internet searches and GitHub
+repositories. The owner is responsible for source handling and publication
+decisions. Keep the files outside public Git until the owner explicitly approves
+publication. Exact source versions and coverage evidence remain outstanding. The
+[historical SQL Server export decision](../../docs/history/registration-backlog-2026-11-23.md#t07---export-irandata-safely)
+is retained. A separately authorized read-only comparison remains an evidence
+option when the source lineage can be established.
+
+Local review at HEAD `00beca7f9101bbd91ddb5caf1e03c7969245717e` found 84,007 places,
+31 province roots, six distinct types and no missing referenced type, parent,
+cycle or duplicate identifier. Ten groups share the same type, parent and
+display label while retaining distinct IDs. Both raw files were Git-ignored at the time.
+The existing Go parser accepted the actual pair with an in-memory test-only
+manifest. `sha256sum` and OpenSSL agreed on the local file digests. These checks
+establish structural admission and a local fingerprint. The
+[release evidence requirements](../../docs/devops-operations.md#t07-dataset-release)
+list the outstanding independent proof. T07-C01 remains Blocked.
+
+**Source update, 2026-11-28 (Asia/Tehran).** The owner identified the
+[Statistical Center of Iran](https://amar.org.ir/) as the upstream source.
+Direct access to the official site timed out during review. The
+[IranCountryDivisions 1404 release metadata](https://raw.githubusercontent.com/Hameds/IranCountryDivisions/68687cf96cc1852d5d38c7283353c80829331758/data/1404/metadata.json)
+attributes its source to the Center and reports 484 counties and 99,317 settlements.
+The local candidate contains 467 counties and 78,043 settlements. Those counts
+do not establish the candidate's release year, extraction scope, original ID
+mapping.
+
+**Official reference links supplied by the owner.** Cite the
+[Statistical Center of Iran publication page](https://amar.org.ir/statistical-information/statid/58207)
+and the associated
+[1404 workbook link](https://amar.org.ir/Portals/0/Statistics/geo1404_noF_adddressFinal_v2-14050311-14050614125349.xlsx)
+as references for the 1404 release. The publication page was inaccessible during
+review and the workbook was not downloaded. This citation adds no extraction
+or refresh step. T07 retains the existing JSON candidate pair. T07-C01 still
+requires evidence linking those exact files to their source and coverage.
+
+#### Proposed T07 criteria for the processed catalog
+
+**Owner clarification, 2026-11-28 (Asia/Tehran).** The candidate is a filtered,
+restructured geography reference dataset. The owner reports substantial
+processing, removal of unnecessary information and retention of public
+geography identifiers, names, parent relationships and classification types.
+The Statistical Center of Iran is the identified upstream source. The linked
+1404 publication is a reference. The exact historical releases, intermediary
+inputs, processing order, filters, ID mapping and exclusions are still
+unverified. The existing counts describe the candidate's scope as observed.
+They cannot establish the completeness of the source release or which rows the
+processing removed.
+
+Local strict UTF-8/JSON review confirmed that every one of the 84,007 place
+objects has only `Id`, `Name`, `ParentId` and `CenterType`. The six dictionary
+objects have only `Id` and `Name`. The two files carry no statistical measures,
+population totals, census fields, household records or analytical reports in
+their schemas. This is consistent with the owner's statement that no
+confidential data was retained. Each type resolves in the dictionary, place
+IDs are unique, and every parent chain reaches one of the 31 province roots
+within four edges without cycles. Both file digests match the earlier review.
+Preserve the candidate's existing IDs, names, parents and type values.
+
+Record the upstream publisher, source links, established intermediary versions
+and the project's filtering and restructuring in the dataset README and
+manifest. Label the 1404 links as reference-only until lineage is shown.
+
+The following proposal awaits owner approval. The active T07 criteria and T08
+dependencies above and below this proposal retain their existing authority.
+
+| Criteria          | Proposed completion evidence                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T07-F01           | Define the approved geographic coverage, filters, exclusions and ID namespace of the processed catalog. Verify the snapshot is complete against that scope. Preserve the candidate values and bind the version, schema, file sizes, SHA-256, counts and manifest to the admitted bytes.                                                                                                           |
+| T07-S01 / T07-U01 | Preserve strict UTF-8/JSON, exact integer, checksum and count, duplicate ID/key, type, parent, cycle and province-ancestry checks. Use synthetic inputs for development, public CI and browser tests. Validate the actual pair in the approved private custody boundary.                                                                                                                          |
+| T07-I01           | Reconstruct lineage and transformation from retained source artifacts, scripts or notes, or use equivalent independent evidence for the exact candidate. Report unknowns explicitly. Verify reproducibility from pinned inputs or an independently attested fixed snapshot, including repeatable manifest and byte verification. Use read-only source comparison only when authorized and useful. |
+| T07-X01 / T07-B01 | Reject changed, partial or inconsistent input and retain the last approved immutable version on failure. Browser acceptance stays N/A for the operator workflow.                                                                                                                                                                                                                                  |
+| T07-D01           | Record sources, scope, changes, omitted material and attribution. Keep real payloads and restricted evidence out of public Git, CI and browser artifacts.                                                                                                                                                                                                                                         |
+| T07-C01           | Complete technical acceptance when GATE01 passes against the exact pair and the version, coverage, reproducibility and approved private custody are evidenced. Synthetic T08 development can proceed independently if the owner approves the dependency clarification. Real-data activation and any public dataset publication require the owner's explicit approval.                             |
+
+Remaining technical evidence is the filtered coverage specification and
+repeatable or independently attested derivation of the exact versioned pair.
 
 ### T08
 
@@ -640,7 +720,7 @@ hidden-tab and bfcache restoration observations remain outside this evidence.
 | ID/title                        | T08 - Import Geography into PostgreSQL. Status: Planned; unchanged product definition.                                                                                 |
 | Objective                       | Preserve immutable complete catalog revisions and original source identities.                                                                                          |
 | Scope                           | Transactional repeatable importer, explicit checked complete manifest, active-pointer guard, retired identity/history preservation and restricted importer/read roles. |
-| Explicit out of scope           | Dataset-rights approval, source re-export, runtime DDL, partial snapshots, account storage or registration stage changes.                                              |
+| Explicit out of scope           | Dataset publication, source re-export, runtime DDL, partial snapshots, account storage or registration stage changes.                                                  |
 | Dependencies                    | T07.                                                                                                                                                                   |
 | Security invariants             | SEC09, SEC10, SEC14.                                                                                                                                                   |
 | Authorization requirements      | Separate importer/migrator/read-only check identities; import requires exact reviewed plan/retirement digest and admitted base revision.                               |
@@ -666,11 +746,11 @@ hidden-tab and bfcache restoration observations remain outside this evidence.
 | Authorization requirements      | Anonymous reads are bounded/rate-limited, not account/proof authority; new selections use active server snapshot.                                                |
 | Functional acceptance           | T09-F01: IR-only ancestry and original labels distinguish duplicates; saved retired IDs resolve under their actual historical revision.                          |
 | Security acceptance             | T09-S01: wrong country/province/revision, oversized page/query and unavailable catalog return denial/unavailability, never silently empty or reparented success. |
-| Unit tests                      | T09-U01: prefix normalization, cursor/decimal bounds, duplicate-label and active-versus-retired fixtures pass.                                                   |
+| Unit tests                      | T09-U01: prefix normalization, cursor/decimal bounds, duplicate-label cases including identical labels/type/ancestry, and active-versus-retired fixtures pass.   |
 | Database/HTTP integration tests | T09-I01: bounded real SQL/HTTP browse/search/lookup uses one snapshot; measure required warmed query performance without weakening ceilings.                     |
 | Concurrency/failure tests       | T09-X01: catalog change invalidates old cursor explicitly; SQL/limiter outage denies reads rather than inventing an empty catalog.                               |
 | Browser/accessibility tests     | T09-B01: GATE03 selector supports keyboard/prefix/clear/duplicate labels and catalog-changed restart without leaking private selections.                         |
-| Documentation updates           | T09-D01: preserve source labels/types, exact IDs/revisions, selector contract and unresolved rights/manual review.                                               |
+| Documentation updates           | T09-D01: preserve source labels/types, exact IDs/revisions, selector contract and outstanding manual review.                                                     |
 | Completion criteria             | T09-C01: GATE01/GATE03 and bounded/performance evidence; source access is not a production request dependency.                                                   |
 
 ### T10
@@ -1341,7 +1421,7 @@ hidden-tab and bfcache restoration observations remain outside this evidence.
 | Objective                       | Implement the final contract in the existing service, with one verified contact and no code-only human accounts.                                                               |
 | Scope                           | Mandatory private names/birthday/gender/username/location, one email OR mobile, password/passkey/both, approved terms/privacy versions and verified selected primary.          |
 | Explicit out of scope           | Second service/client/versioned route, username-less production accounts, inferred old data, unselected fabricated contact, automatic both downgrade or code-family issuance.  |
-| Dependencies                    | T01, T02, T03, T04A, T05, T06, T09, T10, T13, T14, T15, T19A, T23, T41C; external approved legal versions/source-data rights.                                                  |
+| Dependencies                    | T01, T02, T03, T04A, T05, T06, T09, T10, T13, T14, T15, T19A, T23, T41C; external approved legal versions.                                                                     |
 | Security invariants             | SEC01, SEC02, SEC08, SEC12, SEC13, SEC15.                                                                                                                                      |
 | Authorization requirements      | Original registration capability/JKT/attempt/deadlines; exact selected contact proof and server-verified selected primary, complete field/legal validation before native work. |
 | Functional acceptance           | T31-F01: every supported final field/stage validates under existing authoritative validators; passkey/password/both require exactly corresponding credential inputs.           |

@@ -684,8 +684,10 @@ belong to the application, not transport/domain/UI-library code.
 
 Province is required; city, urban area or village is optional. Locality remains
 disabled until an explicit province selection. Typed search is draft text, never a
-committed ID. Original name, source type and ancestor path disambiguate repeated
-names. Explicit clear/skip actions do not auto-select a result. Changing/clearing
+committed ID. The current selector displays original name, source type and
+ancestor path. T09 acceptance must also distinguish records with the same name,
+type and ancestry while preserving their distinct source IDs. Exercise that case
+with a synthetic fixture. Explicit clear/skip actions do not auto-select a result. Changing/clearing
 province clears incompatible locality and announces it. Retained pages are bounded
 and loaded explicitly; requests debounce 250 ms and use cancellation plus generation
 guards against late responses. Loading, empty, unavailable, rate-limit and catalog
@@ -702,5 +704,6 @@ data is display-only, not eligibility for a new selection.
 
 `web:test-geography-browser` builds an API-connected fixture only inside a
 run-owned disposable test application. No production route or production build
-flag exposes that fixture. Real source snapshots remain operator-local, outside
-Git/container contexts/browser artifacts; only synthetic fixtures are committed.
+flag exposes that fixture. Use synthetic fixtures in public CI and browser
+artifacts. Operators obtain real data through the
+[T07 release and custody process](devops-operations.md#t07-dataset-release).
