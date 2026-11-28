@@ -58,8 +58,8 @@ recorded documentation evidence.
 | T04        | Aggregate: T04A, T04B             | Partially implemented; approval-pending             | T04A verified 2026-11-27, T04B required before launch |
 | T05        | T05                               | Completed standalone validator, 2026-11-15          | Standalone validator verified 2026-11-27              |
 | T06        | T06                               | Completed standalone validator, 2026-11-15          | Verified 2026-11-27                                   |
-| T07        | T07                               | No explicit status recorded                         | JSON-first approved; source evidence pending          |
-| T08        | T08                               | No explicit status recorded                         | Planned unchanged catalog contract                    |
+| T07        | T07                               | No explicit status recorded                         | Local candidate verified. T07-C01 blocked             |
+| T08        | T08                               | No explicit status recorded                         | Implemented and verified locally. Release pending     |
 | T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                     |
 | T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract             |
 | T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                    |
@@ -617,9 +617,9 @@ hidden-tab and bfcache restoration observations remain outside this evidence.
 
 | Section                         | Requirement                                                                                                                                                                                                                                                                                    |
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T07 - Validate and Version Iran Geography Dataset. Status: Blocked pending release provenance, coverage and versioned snapshot evidence. JSON-first design approved 2026-11-28.                                                                                                                |
+| ID/title                        | T07 - Validate and Version Iran Geography Dataset. Status: Local candidate verified and packaged 2026-11-28. T07-C01 blocked on independent provenance, coverage and approved release custody.                                                                                                 |
 | Objective                       | Admit and version a complete, traceable Iran geography release for the existing PostgreSQL importer.                                                                                                                                                                                           |
-| Scope                           | Validate the candidate `data/cities.json` and its original `data/types.json`, preserve all source IDs, labels, parents and type codes, and bind the files to an immutable release with schema, manifest and checksums.                                                                         |
+| Scope                           | Validate the candidate `data/cities.json` and the single `data/types.json` dictionary. Preserve all source IDs, labels, parents and type codes, and bind the files to an immutable release with schema, manifest and checksums.                                                                |
 | Explicit out of scope           | Record deletion, merging, correction or rekeying by assumption, source writes, unapproved publication, PostgreSQL import, runtime integration or runtime use of GitHub or SQL Server.                                                                                                          |
 | Dependencies                    | Original source references and pinned releases, file- or component-level lineage and coverage evidence, and an approved artifact destination.                                                                                                                                                  |
 | Security invariants             | SEC14, SEC16. Keep source files and restricted evidence in approved custody. Use synthetic fixtures in public tests, CI and browser artifacts.                                                                                                                                                 |
@@ -698,6 +698,12 @@ Record the upstream publisher, source links, established intermediary versions
 and the project's filtering and restructuring in the dataset README and
 manifest. Label the 1404 links as reference-only until lineage is shown.
 
+**Owner verification approval, 2026-11-28 (Asia/Tehran).** The owner approved
+verification of the local snapshot and specified country type `1` (`کشور`)
+in the same `data/types.json` dictionary as types `2` through `7`. The
+country is represented in the dictionary. The original places export retains
+its province roots, source IDs, labels, parents and place type values.
+
 The following proposal awaits owner approval. The active T07 criteria and T08
 dependencies above and below this proposal retain their existing authority.
 
@@ -710,14 +716,24 @@ dependencies above and below this proposal retain their existing authority.
 | T07-D01           | Record sources, scope, changes, omitted material and attribution. Keep real payloads and restricted evidence out of public Git, CI and browser artifacts.                                                                                                                                                                                                                                         |
 | T07-C01           | Complete technical acceptance when GATE01 passes against the exact pair and the version, coverage, reproducibility and approved private custody are evidenced. Synthetic T08 development can proceed independently if the owner approves the dependency clarification. Real-data activation and any public dataset publication require the owner's explicit approval.                             |
 
-Remaining technical evidence is the filtered coverage specification and
-repeatable or independently attested derivation of the exact versioned pair.
+**Local candidate verification, 2026-11-28 (Asia/Tehran).** The places bytes
+matched the prior checked export. Two SHA-256 implementations agreed on both
+file digests. The private local candidate package contains both exact payloads,
+a versioned schema, a manifest, checksums and review notes. Schema validation
+passed and the observed counts cover 84,007 places under 31 province roots
+and seven dictionary entries. Country type `1` has zero place rows. The
+manifest records counts by type and province. The strict importer admitted
+the exact pair in the disposable test documented under T08.
+
+T07-C01 remains blocked on independent evidence for the filtered coverage,
+repeatable or independently attested derivation of the pair, and approval of
+the versioned release and its custody destination.
 
 ### T08
 
 | Section                         | Requirement                                                                                                                                                            |
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T08 - Import Geography into PostgreSQL. Status: Planned; unchanged product definition.                                                                                 |
+| ID/title                        | T08 - Import Geography into PostgreSQL. Status: Implemented and locally verified 2026-11-28. Release acceptance pending T07-C01 and hosted evidence.                   |
 | Objective                       | Preserve immutable complete catalog revisions and original source identities.                                                                                          |
 | Scope                           | Transactional repeatable importer, explicit checked complete manifest, active-pointer guard, retired identity/history preservation and restricted importer/read roles. |
 | Explicit out of scope           | Dataset publication, source re-export, runtime DDL, partial snapshots, account storage or registration stage changes.                                                  |
@@ -732,6 +748,24 @@ repeatable or independently attested derivation of the exact versioned pair.
 | Browser/accessibility tests     | T08-B01: N/A for operator importer; T09 owns read selector behavior.                                                                                                   |
 | Documentation updates           | T08-D01: preserve immutable catalog/manifest/rights contract and canonical packaged-migration link, not obsolete installation numbers.                                 |
 | Completion criteria             | T08-C01: GATE01 with complete snapshot/restricted-role evidence; catalog import alone does not enable registration.                                                    |
+
+**Local implementation and verification, 2026-11-28 (Asia/Tehran).** The
+[operator importer](../../apps/identity-api/cmd/geography/main.go) and
+[transactional service](../../apps/identity-api/internal/geography/import.go)
+are part of the checkout. The implementation is recorded at
+`e0129b047db904557b9271fa9c49c4e2e2a9b5a9`. Geography integration ran 68 tests
+both normally and under the race detector on the implementation worktree.
+Both runs passed with zero skips and verified teardown. Coverage includes
+restricted logins, historical ancestry, concurrent imports, migration
+exclusion, cancellation and reconciliation after a lost commit response.
+
+The follow-up full-size run imported the exact T07 candidate into disposable
+PostgreSQL as revision `1` through the restricted reader and importer logins.
+It admitted 84,007 places, seven dictionary entries and 31 province roots.
+The harness confirmed teardown. This run used Go 1.26.10, Node 24.18.0 and
+npm 11.21.0. See the [operator procedure and test targets](../../docs/devops-operations.md#geography-acceptance).
+T08-C01 release acceptance awaits T07-C01 and source-bound hosted checks.
+Deployed catalog activation remains unverified.
 
 ### T09
 

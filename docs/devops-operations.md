@@ -336,7 +336,9 @@ under T31–T37.
 ### T07 Dataset Release
 
 The [JSON-first T07 decision](../.github/tasks/registration-single-contract-tasks.md#t07)
-uses local `data/cities.json` and the original `data/types.json` as candidates.
+uses local `data/cities.json` and a single `data/types.json` dictionary. The
+dictionary includes country type `1` (`کشور`) and the original place types
+`2` through `7`. The place export keeps provinces as its roots.
 Keep both files out of public Git. The application container contexts exclude
 them. Preserve their exact bytes, including source identifiers, names, parent
 relationships and type codes. Keep source files, full query results and
@@ -369,7 +371,7 @@ location. Pin an immutable version for each complete release:
 | Release file          | Contents                                                                                                                                                   |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `iran-geography.json` | Exact candidate places bytes once independently verified.                                                                                                  |
-| `types.json`          | Exact original CenterType dictionary for the same release.                                                                                                 |
+| `types.json`          | Exact bytes of the country and place type dictionary for the same release.                                                                                |
 | `schema.json`         | Versioned schema for places, types and release metadata. The strict parser also checks duplicate keys, exact integer syntax and graph invariants.          |
 | `manifest.json`       | Release and schema versions, source references, per-file byte lengths/SHA-256, counts by type and province, coverage and reproduction evidence references. |
 | `README.md`           | Provenance, covered snapshot and reproducibility instructions.                                                                                             |
