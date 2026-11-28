@@ -162,8 +162,12 @@ export async function startGeographyHarness({ identify = acceptanceIdentity } = 
       const paths = await writeSyntheticSnapshot(temporary, revision, changed);
       const args = [`--cities=${paths.cities}`, `--types=${paths.types}`, `--manifest=${paths.manifest}`];
       const plan = JSON.parse(await run(binaries.geography.path, ['check', ...args], geographyOperatorEnvironment('check', readerURL), backend));
-      assert(/^[0-9a-f]{64}$/.test(plan.plan_digest) && plan.retirements === 0, 'Synthetic geography check failed');
-      await run(binaries.geography.path, ['import', ...args, `--apply-plan=${plan.plan_digest}`], geographyOperatorEnvironment('import', importerURL), backend);
+      assert(/^[0-9a-f]{64}$/.test(plan.plan_digest) && plan.retirements === Number(changed), 'Synthetic geography check failed');
+      const retirement = changed ? [`--retirement-digest=${plan.retirement_digest}`] : [];
+      assert(changed ? /^[0-9a-f]{64}$/.test(plan.retirement_digest) : plan.retirement_digest === '',
+        'Unexpected synthetic geography retirement acknowledgement');
+      await run(binaries.geography.path, ['import', ...args, `--apply-plan=${plan.plan_digest}`, ...retirement],
+        geographyOperatorEnvironment('import', importerURL), backend);
       const result = await run('psql', ['-X', '-At', '-v', 'ON_ERROR_STOP=1', '-h', owner.hostname, '-p', owner.port,
         '-U', 'geography_reader', '-d', owner.pathname.slice(1), '-c', 'SELECT active_revision FROM geography_catalog_state'],
       geographyEnvironment({ PGPASSWORD: readerPassword }));

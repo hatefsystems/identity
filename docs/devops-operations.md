@@ -495,6 +495,10 @@ Use `identity-api:test-geography`, the owned
 The browser fixture is built only in a disposable test application, never a
 production route or opt-in production build mode. Source identity, exact nonzero
 package/test inventories, zero unexpected skips and confirmed cleanup are required.
+The browser fixture checks selection of two identical name/type/ancestry records
+by their distinct accessible ID labels in both locales. It retires one record
+with an acknowledged import and checks last-seen and explicit historical reads
+as well as absence from the newer revision.
 API unit tests and headless keyboard/RTL/focus assertions do not certify manual
 screen-reader/native-touch or professional Persian review.
 

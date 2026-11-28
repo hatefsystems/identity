@@ -60,7 +60,7 @@ recorded documentation evidence.
 | T06        | T06                               | Completed standalone validator, 2026-11-15          | Verified 2026-11-27                                   |
 | T07        | T07                               | No explicit status recorded                         | Local candidate verified. T07-C01 blocked             |
 | T08        | T08                               | No explicit status recorded                         | Implemented and verified locally. Release pending     |
-| T09        | T09                               | No explicit status recorded                         | Planned unchanged search contract                     |
+| T09        | T09                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
 | T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract             |
 | T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                    |
 | T12        | Excluded; no executable record    | Excluded by original purpose and AGENTS.md          | Out of scope, no claim lane                           |
@@ -771,7 +771,7 @@ Deployed catalog activation remains unverified.
 
 | Section                         | Requirement                                                                                                                                                      |
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T09 - Search Provinces and Localities. Status: Planned; unchanged product definition.                                                                            |
+| ID/title                        | T09 - Search Provinces and Localities. Status: Implemented 2026-11-28. Release acceptance pending.                                                               |
 | Objective                       | Serve bounded IR geography selections from PostgreSQL with truthful source labels.                                                                               |
 | Scope                           | Required province, optional related locality, duplicate-label disambiguation, exact decimal IDs/revision, historical retired lookups and bilingual selector.     |
 | Explicit out of scope           | Fabricated translations, renaming source type to city, source redistribution, private location persistence or final registration wiring.                         |
@@ -786,6 +786,16 @@ Deployed catalog activation remains unverified.
 | Browser/accessibility tests     | T09-B01: GATE03 selector supports keyboard/prefix/clear/duplicate labels and catalog-changed restart without leaking private selections.                         |
 | Documentation updates           | T09-D01: preserve source labels/types, exact IDs/revisions, selector contract and outstanding manual review.                                                     |
 | Completion criteria             | T09-C01: GATE01/GATE03 and bounded/performance evidence; source access is not a production request dependency.                                                   |
+
+**Implementation, 2026-11-28 (Asia/Tehran).** The bounded PostgreSQL reads and
+the [bilingual selector](../../docs/client-integration.md#5-geography-selector-t08t09)
+use exact source identities. Options and selected summaries show the original
+name, type, and ancestor path alongside an LTR source ID. Identical labels remain
+distinguishable across pages. The unit fixture covers IDs above JavaScript's safe
+integer range. The real browser fixture covers both locales, retirement and
+historical reads, responsive controls, and the JavaScript-disabled shell.
+T09-C01 release acceptance awaits T08-C01, hosted evidence and manual
+screen-reader, native touch and Persian wording review.
 
 ### T10
 

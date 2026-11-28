@@ -22,6 +22,8 @@ export function syntheticGeography(changed = false) {
       { Id: 12, Name: 'Alpha nested area', ParentId: 11, CenterType: 5 },
       { Id: 13, Name: '\u0643\u064a\u0627\u0646\u200c\u0622\u0628\u0627\u062f', ParentId: 12, CenterType: 7 },
       { Id: 14, Name: 'Literal %_\\ locality', ParentId: 10, CenterType: 7 },
+      { Id: 15, Name: 'Identical village', ParentId: 10, CenterType: 7 },
+      ...(!changed ? [{ Id: 16, Name: 'Identical village', ParentId: 10, CenterType: 7 }] : []),
       { Id: 20, Name: 'Beta village', ParentId: 2, CenterType: 7 },
       ...Array.from({ length: 24 }, (_, index) => ({ Id: 100 + index,
         Name: `Page ${String(index).padStart(2, '0')}${changed && index === 23 ? ' revised' : ''}`,

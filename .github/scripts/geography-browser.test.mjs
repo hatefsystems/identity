@@ -16,7 +16,7 @@ const identity = { revision: 'a'.repeat(40), source: 'b'.repeat(64), runId: '123
   generated: Object.fromEntries(['apps/identity-api/internal/db', 'libs/schemas/gen/go', 'libs/schemas/gen/ts'].map((path) => [path, { files: 1, sha256: 'c'.repeat(64) }])) };
 const binaryEvidence = { api: 'd'.repeat(64), geography: 'e'.repeat(64), migrate: 'f'.repeat(64) };
 const localeEvidence = (locale) => ({ locale, journeys: [...geographyJourneys], checks: [...geographyLocaleChecks],
-  services: { requests: 7, real: 5, delayed: 1, injected: 2, violations: 0, statuses: { 200: 3, 409: 1, 429: 1 }, endpoints: { provinces: 2, localities: 2, lookup: 1 } } });
+  services: { requests: 8, real: 6, delayed: 1, injected: 2, violations: 0, statuses: { 200: 3, 404: 1, 409: 1, 429: 1 }, endpoints: { provinces: 2, localities: 2, lookup: 2 } } });
 const fullReport = () => ({ schema: 1, kind: 'geography-browser', scope: 'full', status: 'passed', identity, binaryEvidence,
   cleanup: { completed: true }, exit: 0, failed: 0, skipped: 0, tests: geographyChecks.length, checks: [...geographyChecks],
   localeEvidence: geographyLocales.map(localeEvidence) });
@@ -46,9 +46,14 @@ test('geography fixture is a complete declared synthetic snapshot with real impo
   for (const place of fixture.cities) assert.deepEqual(Object.keys(place).sort(), ['CenterType', 'Id', 'Name', 'ParentId']);
   assert.equal(fixture.cities.filter((place) => place.CenterType === 2 && place.ParentId === null).length, 2);
   assert(fixture.cities.some((place) => place.CenterType === 5 && fixture.cities.find((parent) => parent.Id === place.ParentId)?.CenterType === 5));
+  const [first, second] = fixture.cities.filter((place) => place.Name === 'Identical village');
+  assert.deepEqual(first, { ...second, Id: 15 });
+  assert.equal(second.Id, 16);
   await writeSyntheticSnapshot(directory, '1', true);
   const changed = JSON.parse(await readFile(paths.manifest));
-  assert.equal(changed.expected_current_revision, '1'); assert.equal(changed.place_count, manifest.place_count);
+  assert.equal(changed.expected_current_revision, '1'); assert.equal(changed.place_count, manifest.place_count - 1);
+  const retained = new Set(JSON.parse(await readFile(paths.cities)).map((place) => place.Id));
+  assert.deepEqual(fixture.cities.filter((place) => !retained.has(place.Id)).map((place) => place.Id), [16]);
   assert.notEqual(changed.cities_sha256, manifest.cities_sha256);
 });
 
@@ -159,6 +164,7 @@ test('geography evidence requires both fresh locales, every journey/check, exact
     (value) => value.localeEvidence[1].locale = 'en', (value) => value.localeEvidence[1].journeys.pop(),
     (value) => value.localeEvidence[1].checks.pop(), (value) => value.localeEvidence[1].services.violations++,
     (value) => value.localeEvidence[1].services.delayed = 0, (value) => value.localeEvidence[1].services.real++,
+    (value) => delete value.localeEvidence[1].services.statuses[404],
     (value) => delete value.localeEvidence[1].services.statuses[409], (value) => delete value.localeEvidence[1].services.statuses[429],
     (value) => value.localeEvidence[1].services.endpoints.lookup = 0,
     (value) => value.localeEvidence[1].services.private = 'PRIVATE', (value) => value.binaryEvidence.api = 'cached',

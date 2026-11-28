@@ -55,6 +55,7 @@ export const geographyLocaleChecks = Object.freeze([
   'anonymous-real-api', 'required-province-optional-locality', 'draft-never-selects',
   'keyboard-selection-escape', 'mobile-dialog-focus', 'clear-skip-province-change',
   'normalized-prefix-literal-search', 'explicit-bounded-pagination', 'stale-response-rejected',
+  'identical-label-disambiguation', 'historical-retired-lookup', 'no-script-safe',
   'unavailable-retry', 'real-rate-limit-retry-after', 'catalog-revision-change', 'rtl-language-preserves-selection',
   'responsive-touch-bounds', 'masked-screenshots', 'private-storage-console-network',
 ]);
@@ -226,7 +227,8 @@ export function assertGeographyReport(report, identity = report?.identity) {
     for (const key of ['delayed', 'injected', 'real', 'requests', 'violations']) assert(Number.isSafeInteger(entry.services[key]) && entry.services[key] >= 0);
     assert(entry.services.requests > 0 && entry.services.real > 0 && entry.services.delayed > 0 && entry.services.injected === 2 && entry.services.violations === 0, 'Missing real geography lifecycle/fault evidence');
     for (const [status, count] of Object.entries(entry.services.statuses)) assert(/^[1-5][0-9]{2}$/.test(status) && Number.isSafeInteger(count) && count > 0);
-    assert(entry.services.statuses['200'] > 0 && entry.services.statuses['409'] > 0 && entry.services.statuses['429'] > 0, 'Missing real geography success/catalog-change/rate-limit responses');
+    assert(['200', '404', '409', '429'].every((status) => entry.services.statuses[status] > 0),
+      'Missing real geography success, historical absence, catalog-change or rate-limit responses');
     assert.equal(Object.values(entry.services.statuses).reduce((sum, count) => sum + count, 0), entry.services.real, 'Geography measured response counts mismatch');
     assert.equal(entry.services.requests, entry.services.real + entry.services.injected, 'Geography requests lacked completed ingress evidence');
     assert.deepEqual(Object.keys(entry.services.endpoints).sort(), ['localities', 'lookup', 'provinces']);

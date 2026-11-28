@@ -353,6 +353,41 @@ it('loads explicit bounded pages, deduplicates and does not replay after selecti
   );
 });
 
+it.each([
+  ['en', 'Location ID:'],
+  ['fa-IR', 'شناسهٔ مکان:'],
+] as const)('distinguishes identical locality records across pages in %s', async (locale, idLabel) => {
+  const first = { ...locality, id: '9007199254740992' };
+  const second = { ...locality, id: '9007199254740993' };
+  api.list.mockResolvedValueOnce(page([first], 'next')).mockResolvedValueOnce(page([second]));
+  api.lookup.mockImplementation(async (id) =>
+    [province, first, second].find((place) => place.id === id)
+  );
+  render(<Fixture initial={{ country: 'IR', province_id: '101' }} />, { locale });
+  await open('locality');
+  const option = (place: GeographyPlace) =>
+    field('locality').getByRole('option', {
+      name: `Synthetic town Urban area · Synthetic north ${idLabel} ${place.id}`,
+    });
+  expect(option(first).querySelector('bdi[dir="ltr"]')?.textContent).toBe(first.id);
+
+  // The continuation must add the second identity without changing the first label.
+  const more = locale === 'en' ? 'Load more results' : 'نمایش نتایج بیشتر';
+  fireEvent.click(screen.getByRole('button', { name: more }));
+  await tick(0);
+  expect(option(first)).toBeTruthy();
+  expect(option(second).querySelector('bdi[dir="ltr"]')?.textContent).toBe(second.id);
+
+  fireEvent.keyDown(input('locality'), { key: 'ArrowDown' });
+  fireEvent.keyDown(input('locality'), { key: 'ArrowDown' });
+  fireEvent.keyDown(input('locality'), { key: 'Enter' });
+  expect(value()).toEqual({ country: 'IR', province_id: '101', locality_id: second.id });
+  await tick();
+  expect(
+    document.querySelector('[data-location-selected="locality"] bdi[dir="ltr"]')?.textContent
+  ).toBe(second.id);
+});
+
 it('retains at most 100 results and requires a refined search at the bound', async () => {
   let batch = 0;
   api.list.mockImplementation(async () => {

@@ -12,12 +12,12 @@ import { trustRegistrationFixtureCA } from './registration-browser.mjs';
 export const geographyNames = Object.freeze({
   en: Object.freeze({ province: 'Province (required)', locality: 'City, urban area, or village (optional)',
     clearProvince: 'Clear province', clearLocality: 'Clear city, urban area, or village', skip: 'Skip city, urban area, or village',
-    more: 'Load more results', retry: 'Retry', close: 'Close picker',
+    more: 'Load more results', retry: 'Retry', close: 'Close picker', placeId: 'Location ID:',
     empty: 'No matching locations. Try a different name.', unavailable: 'Locations are temporarily unavailable. Retry when you are ready.',
     catalogChanged: 'The location catalog changed. Retry to browse the current catalog.', rateLimited: 'Too many location requests. Wait before retrying.' }),
   'fa-IR': Object.freeze({ province: 'استان (الزامی)', locality: 'شهر، منطقه شهری یا روستا (اختیاری)',
     clearProvince: 'پاک کردن استان', clearLocality: 'پاک کردن شهر، منطقه شهری یا روستا', skip: 'رد شدن از انتخاب شهر، منطقه شهری یا روستا',
-    more: 'نمایش نتایج بیشتر', retry: 'تلاش دوباره', close: 'بستن انتخاب‌گر',
+    more: 'نمایش نتایج بیشتر', retry: 'تلاش دوباره', close: 'بستن انتخاب‌گر', placeId: 'شناسهٔ مکان:',
     empty: 'مکانی مطابق جست‌وجو یافت نشد. نام دیگری را امتحان کنید.', unavailable: 'مکان‌ها موقتاً در دسترس نیستند. هر زمان آماده بودید دوباره تلاش کنید.',
     catalogChanged: 'فهرست مکان‌ها تغییر کرده است. برای مرور فهرست فعلی دوباره تلاش کنید.', rateLimited: 'درخواست‌های مکان بیش از حد مجاز است. پیش از تلاش دوباره صبر کنید.' }),
 });
@@ -173,6 +173,20 @@ export async function validateGeographyBrowser(harness, locale, directory) {
     assert(await page.locator('[data-location-selected=locality] bdi').count() >= 4, 'Missing original type/ancestor metadata');
     await page.getByRole('button', { name: names.clearLocality, exact: true }).click();
     await selection(page, { country: 'IR', province_id: '1' });
+    for (const id of ['15', '16']) {
+      const identical = await openPicker(page, locale, 'locality', false);
+      await identical.input.fill('Identical village');
+      const option = identical.scope.getByRole('option', { name: new RegExp(`${names.placeId} ${id}$`) });
+      await option.waitFor({ state: 'visible' });
+      assert.equal(await identical.scope.getByRole('option').count(), 2);
+      assert.deepEqual(await option.locator('bdi[dir="auto"]').allTextContents(),
+        ['Identical village', 'Synthetic village', 'Alpha province', 'Alpha district']);
+      assert.equal(await option.locator('bdi[dir="ltr"]').textContent(), id);
+      await option.click();
+      await selection(page, { country: 'IR', province_id: '1', locality_id: id });
+      await page.locator('[data-location-selected=locality] bdi[dir="ltr"]').filter({ hasText: new RegExp(`^${id}$`) }).waitFor();
+    }
+    checks.add('identical-label-disambiguation');
     await choose(page, locale, 'locality', '11');
     await page.getByRole('button', { name: names.skip, exact: true }).click();
     await selection(page, { country: 'IR', province_id: '1' });
@@ -239,6 +253,22 @@ export async function validateGeographyBrowser(harness, locale, directory) {
     await paging.scope.getByRole('button', { name: names.retry, exact: true }).click();
     await paging.scope.locator('[role=option][id$="-option-100"]').waitFor({ state: 'visible' });
     await paging.input.press('Escape'); checks.add('catalog-revision-change');
+    const retiredURL = harness.origin + '/api/v1/geography/places/16?country=IR';
+    for (const revision of ['', '&revision=1']) {
+      const response = await context.request.get(retiredURL + revision);
+      try {
+        assert.equal(response.status(), 200);
+        const place = await response.json();
+        assert.equal(place.id, '16');
+        assert.equal(place.catalog_revision, '1');
+        assert.equal(place.label, 'Identical village');
+        assert.deepEqual(place.ancestors.map(({ id }) => id), ['1', '10']);
+        assert(place.retired && !place.selectable);
+      } finally { await response.dispose(); }
+    }
+    const missing = await context.request.get(retiredURL + '&revision=2');
+    try { assert.equal(missing.status(), 404); } finally { await missing.dispose(); }
+    checks.add('historical-retired-lookup');
     await choose(page, locale, 'locality', '11');
     await page.locator('[data-location-selected=locality] bdi').first().waitFor();
     await settled(page);
@@ -279,8 +309,27 @@ export async function validateGeographyBrowser(harness, locale, directory) {
     await page.getByTestId('theme').click();
     const dark = await openPicker(page, locale, 'locality', false);
     await screenshot(page, directory, locale, 'dark');
+    await page.setViewportSize({ width: 820, height: 1180 }); await settled(page);
+    assert.deepEqual(await page.evaluate(geographyBounds), []);
     await dark.input.press('Escape');
+    await page.setViewportSize({ width: 320, height: 568 });
+    const darkMobile = await openPicker(page, locale, 'locality', true);
+    await settled(page);
+    assert.deepEqual(await page.evaluate(geographyBounds), []);
+    await darkMobile.input.press('Escape');
+    await darkMobile.scope.waitFor({ state: 'hidden' });
     checks.add('responsive-touch-bounds'); checks.add('masked-screenshots');
+    const noScript = await browser.newContext({ javaScriptEnabled: false, serviceWorkers: 'block' });
+    resources.push(() => noScript.close());
+    const noScriptPage = await noScript.newPage();
+    const requestCount = harness.observed.requests;
+    const noScriptResponse = await noScriptPage.goto(harness.origin + geographyFixtureRoute);
+    assert.equal(noScriptResponse?.status(), 200);
+    await selection(noScriptPage, null);
+    assert(await noScriptPage.getByRole('combobox', { name: geographyNames.en.locality, exact: true }).isDisabled());
+    assert.equal(await noScriptPage.getByRole('option').count(), 0);
+    assert.equal(harness.observed.requests, requestCount);
+    checks.add('no-script-safe');
     // Separate real API probes retain only status/counts. They never record
     // query text, response bodies, cursors, IDs, cookies, traces or storage.
     for (const path of ['/api/v1/geography/provinces?country=IR&limit=51',

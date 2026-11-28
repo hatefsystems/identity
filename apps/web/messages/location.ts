@@ -37,6 +37,7 @@ export const locationEn = {
   selectedLookupFailed:
     'The selected location details could not be loaded. Your selection is unchanged.',
   retryDetails: 'Retry selected location details',
+  placeId: 'Location ID: <value>{id}</value>',
   selectedId: 'Selected location ID: <value>{id}</value>',
 } as const;
 
@@ -77,5 +78,6 @@ export const locationFa = {
     'این مکان ذخیره‌شده برای انتخاب جدید در دسترس نیست. یک مکان فعلی انتخاب کنید.',
   selectedLookupFailed: 'جزئیات مکان انتخاب‌شده دریافت نشد. انتخاب شما تغییر نکرده است.',
   retryDetails: 'تلاش دوباره برای دریافت جزئیات مکان انتخاب‌شده',
+  placeId: 'شناسهٔ مکان: <value>{id}</value>',
   selectedId: 'شناسهٔ مکان انتخاب‌شده: <value>{id}</value>',
 } as const satisfies CatalogShape<typeof locationEn>;

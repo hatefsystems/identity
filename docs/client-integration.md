@@ -684,10 +684,11 @@ belong to the application, not transport/domain/UI-library code.
 
 Province is required; city, urban area or village is optional. Locality remains
 disabled until an explicit province selection. Typed search is draft text, never a
-committed ID. The current selector displays original name, source type and
-ancestor path. T09 acceptance must also distinguish records with the same name,
-type and ancestry while preserving their distinct source IDs. Exercise that case
-with a synthetic fixture. Explicit clear/skip actions do not auto-select a result. Changing/clearing
+committed ID. The selector displays the original name, source type, ancestor
+path and exact source ID in each option and selected summary. The localized ID
+label includes an LTR decimal string so records with identical names, types and
+ancestry remain distinct across pages and in accessible option names. Explicit
+clear/skip actions do not auto-select a result. Changing/clearing
 province clears incompatible locality and announces it. Retained pages are bounded
 and loaded explicitly; requests debounce 250 ms and use cancellation plus generation
 guards against late responses. Loading, empty, unavailable, rate-limit and catalog

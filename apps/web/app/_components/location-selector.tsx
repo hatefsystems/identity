@@ -170,6 +170,7 @@ export function LocationSelector({
 }
 
 function PlaceDetails({ place }: { place: GeographyPlace }) {
+  const t = useTranslations('location');
   return (
     <span className="block break-words">
       <bdi dir="auto" className="block font-medium">
@@ -189,6 +190,12 @@ function PlaceDetails({ place }: { place: GeographyPlace }) {
             ))}
           </span>
         )}
+      </span>
+      <span className="block text-sm leading-relaxed text-muted-foreground">
+        {t.rich('placeId', {
+          id: place.id,
+          value: (chunks) => <bdi dir="ltr">{chunks}</bdi>,
+        })}
       </span>
     </span>
   );
