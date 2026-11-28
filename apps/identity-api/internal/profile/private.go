@@ -56,7 +56,7 @@ type PrivateUpdateResult struct {
 
 // LocationValidator resolves a selection against an authoritative catalog.
 type LocationValidator interface {
-	Validate(context.Context, geography.LocationInput) (geography.ValidatedLocation, error)
+	ValidateForUpdate(context.Context, pgx.Tx, geography.LocationInput) (geography.ValidatedLocation, error)
 }
 
 // SessionAuthority does not reacquire the account lock or renew activity.
@@ -87,11 +87,12 @@ func NewPrivate(database Database, cipher username.Cipher, names *username.Store
 type privatePayload struct {
 	AccountID string      `json:"account_id"`
 	Purpose   string      `json:"purpose"`
+	Revision  string      `json:"revision"`
 	Data      PrivateData `json:"data"`
 }
 
-func (s *PrivateService) seal(ctx context.Context, id uuid.UUID, data PrivateData) ([]byte, error) {
-	raw, err := json.Marshal(privatePayload{id.String(), privatePurpose, data})
+func (s *PrivateService) seal(ctx context.Context, id uuid.UUID, revision int64, data PrivateData) ([]byte, error) {
+	raw, err := json.Marshal(privatePayload{id.String(), privatePurpose, strconv.FormatInt(revision, 10), data})
 	if err != nil || len(raw) > 8192 {
 		return nil, ErrUnavailable
 	}
@@ -103,8 +104,8 @@ func (s *PrivateService) seal(ctx context.Context, id uuid.UUID, data PrivateDat
 	return blob, nil
 }
 
-func (s *PrivateService) open(ctx context.Context, id uuid.UUID, blob []byte) (*PrivateData, error) {
-	if id == uuid.Nil || len(blob) < 90 || len(blob) > 16384 {
+func (s *PrivateService) open(ctx context.Context, id uuid.UUID, revision int64, blob []byte) (*PrivateData, error) {
+	if id == uuid.Nil || revision <= 0 || len(blob) < 90 || len(blob) > 16384 {
 		return nil, ErrUnreadable
 	}
 	raw, err := s.cipher.Decrypt(ctx, blob)
@@ -113,7 +114,8 @@ func (s *PrivateService) open(ctx context.Context, id uuid.UUID, blob []byte) (*
 		return nil, ErrUnreadable
 	}
 	var payload privatePayload
-	if privateJSON(raw, &payload) != nil || payload.AccountID != id.String() || payload.Purpose != privatePurpose || validPrivateData(payload.Data) != nil {
+	if privateJSON(raw, &payload) != nil || payload.AccountID != id.String() || payload.Purpose != privatePurpose ||
+		payload.Revision != strconv.FormatInt(revision, 10) || validPrivateData(payload.Data) != nil {
 		return nil, ErrUnreadable
 	}
 	return &payload.Data, nil
@@ -208,14 +210,17 @@ func (s *PrivateService) snapshot(ctx context.Context, tx pgx.Tx, u db.User, aut
 		return PrivateSnapshot{}, ErrUnavailable
 	}
 	result := PrivateSnapshot{Username: names, LifecycleRevision: strconv.FormatInt(u.LifecycleRevision, 10)}
-	blob, err := db.New(tx).ReadPrivateProfile(ctx, u.ID)
+	stored, err := db.New(tx).ReadPrivateProfile(ctx, u.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return result, nil
 	}
 	if err != nil {
 		return PrivateSnapshot{}, ErrUnavailable
 	}
-	result.PrivateData, err = s.open(ctx, u.ID, blob)
+	if stored.ProfileRevision > u.LifecycleRevision {
+		return PrivateSnapshot{}, ErrUnreadable
+	}
+	result.PrivateData, err = s.open(ctx, u.ID, stored.ProfileRevision, stored.DetailsEncrypted)
 	if err != nil {
 		return PrivateSnapshot{}, err
 	}
@@ -255,7 +260,7 @@ func (s *PrivateService) Get(ctx context.Context, sess session.Session) (Private
 	return result, nil
 }
 
-func (s *PrivateService) merge(ctx context.Context, current *PrivateData, in PrivateUpdate) (PrivateData, error) {
+func (s *PrivateService) merge(ctx context.Context, tx pgx.Tx, current *PrivateData, in PrivateUpdate) (PrivateData, error) {
 	if current == nil && (in.GivenName == nil || in.FamilyName == nil || in.Birthday == nil || in.Gender == nil || in.Location == nil) {
 		return PrivateData{}, ErrInvalidPrivateData
 	}
@@ -290,7 +295,7 @@ func (s *PrivateService) merge(ctx context.Context, current *PrivateData, in Pri
 		}
 	}
 	if in.Location != nil && (current == nil || *in.Location != current.Location.LocationInput) {
-		data.Location, err = s.location.Validate(ctx, *in.Location)
+		data.Location, err = s.location.ValidateForUpdate(ctx, tx, *in.Location)
 		if err != nil {
 			if errors.Is(err, geography.ErrInvalid) || errors.Is(err, geography.ErrNotFound) {
 				return PrivateData{}, ErrInvalidPrivateData
@@ -338,7 +343,7 @@ func (s *PrivateService) Update(ctx context.Context, sess session.Session, in Pr
 	if err != nil {
 		return PrivateUpdateResult{}, err
 	}
-	data, err := s.merge(ctx, current.PrivateData, in)
+	data, err := s.merge(ctx, tx, current.PrivateData, in)
 	if err != nil {
 		return PrivateUpdateResult{}, err
 	}
@@ -348,12 +353,14 @@ func (s *PrivateService) Update(ctx context.Context, sess session.Session, in Pr
 	if revision == math.MaxInt64 {
 		return PrivateUpdateResult{}, ErrUnavailable
 	}
-	blob, err := s.seal(ctx, id, data)
+	blob, err := s.seal(ctx, id, revision+1, data)
 	if err != nil {
 		return PrivateUpdateResult{}, err
 	}
 	q := db.New(tx)
-	count, err := q.SavePrivateProfile(ctx, db.SavePrivateProfileParams{AccountID: id, DetailsEncrypted: blob})
+	count, err := q.SavePrivateProfile(ctx, db.SavePrivateProfileParams{
+		AccountID: id, DetailsEncrypted: blob, ProfileRevision: revision + 1,
+	})
 	if err != nil || count != 1 {
 		return PrivateUpdateResult{}, ErrUnavailable
 	}

@@ -20,9 +20,8 @@ PostgreSQL serves as the primary system of record for accounts, authentication c
 
 The following is a selected schema illustration, not executable production
 provisioning or a substitute for the applied migrations in
-`apps/identity-api/db/migrations`. The active forward-only bundle is `00001`
-through `00011`, including private data, optional email/evidence and purpose-bound
-maintenance. [Packaged migration inventory](devops-operations.md#canonical-packaged-migration-inventory)
+`apps/identity-api/db/migrations`.
+[Packaged migration inventory](devops-operations.md#canonical-packaged-migration-inventory)
 is the canonical install authority; `public.identity_schema_version` tracks it. No history adoption,
 baseline rewrite or Down/reset is implied. Additional columns/state are described
 below and in the bundle. Canonical-v2 payloads do not contain their
@@ -811,11 +810,18 @@ ancestor at the requested revision; an unversioned retired lookup uses its last-
 revision, not an invented original meaning. A historical/retired lookup cannot
 authorize a new selection. See [geography operations](devops-operations.md#geography-catalog-t08t09).
 
-Current T10 private-data writes encrypt the validated `catalog_revision` with
-country/province/locality IDs in the account/purpose-bound payload and revalidate
-the server snapshot. Registration collection/integration remains planned T31-T37.
-Client labels/paths/revisions are never authority; absent original version evidence
-cannot establish historical provenance.
+T10 private-data writes bind the encrypted payload to the account, its private
+profile purpose, and the exact lifecycle revision of the private edit. The child
+row stores that number as `profile_revision` and verifies it on read. An
+independent public profile edit can advance the account's lifecycle revision
+without invalidating the last private write. The private ciphertext, child
+revision, account revision, and metadata-only intent commit together.
+
+New locations are validated in the private write transaction under a shared
+catalog import guard that stays held through commit. The payload includes the
+validated `catalog_revision` with the country, province and locality IDs.
+An unchanged selection retains its original historical revision.
+Registration collection and integration remain planned in T31–T37.
 
 These are actual current inventories, not blanket legal approval. `no_expiry`
 means no implemented finite expiry, not anonymous data, approved indefinite

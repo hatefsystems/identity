@@ -61,7 +61,7 @@ recorded documentation evidence.
 | T07        | T07                               | No explicit status recorded                         | Local candidate verified. T07-C01 blocked             |
 | T08        | T08                               | No explicit status recorded                         | Implemented and verified locally. Release pending     |
 | T09        | T09                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
-| T10        | T10                               | No explicit status recorded                         | Planned unchanged protected-data contract             |
+| T10        | T10                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
 | T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                    |
 | T12        | Excluded; no executable record    | Excluded by original purpose and AGENTS.md          | Out of scope, no claim lane                           |
 | T13        | T13                               | No explicit status recorded                         | Planned truthful optional email                       |
@@ -801,7 +801,7 @@ screen-reader, native touch and Persian wording review.
 
 | Section                         | Requirement                                                                                                                                         |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ID/title                        | T10 - Store Protected Private Attributes. Status: Planned; unchanged product definition.                                                            |
+| ID/title                        | T10 - Store Protected Private Attributes. Status: Implemented 2026-11-28. Release acceptance pending.                                               |
 | Objective                       | Preserve account/purpose-authenticated private data without duplicate plaintext fields.                                                             |
 | Scope                           | Names, atomic birthday pair, gender and server-validated location/catalog revision; username display remains its sole protected assignment source.  |
 | Explicit out of scope           | New product rules, duplicate username/DOB/gender/location plaintext, legacy inference, dataset changes or automatic registration integration.       |
@@ -816,6 +816,15 @@ screen-reader, native touch and Persian wording review.
 | Browser/accessibility tests     | T10-B01: N/A for protected persistence; T38D owns actual private editor/GATE03.                                                                     |
 | Documentation updates           | T10-D01: document actual encryption/revision/location evidence without changing signed event formats or declaring signup fields mounted.            |
 | Completion criteria             | T10-C01: GATE01 with substitution/privacy rollback evidence; historical source capability is not new final target acceptance.                       |
+
+**Implementation, 2026-11-28 (Asia/Tehran).** The private-profile envelope binds
+the account, purpose, and last private write revision. The same transaction
+stores the protected fields and revision, advances the account revision, and
+enqueues the coarse lifecycle marker. A changed location uses a shared catalog
+import guard and validates the active snapshot within that transaction.
+The [packaged migration](../../docs/devops-operations.md#canonical-packaged-migration-inventory)
+preserves existing unbound ciphertext by refusing a populated upgrade.
+T10-C01 release acceptance awaits T02 and T09 acceptance and hosted evidence.
 
 ### T11
 

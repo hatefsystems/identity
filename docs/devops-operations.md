@@ -35,9 +35,7 @@ The K8s manifests, Traefik IngressRoute, SPIRE daemonsets, and ClickHouse monito
 
 ### Canonical Packaged Migration Inventory
 
-At inspected HEAD `85abb13a27196c229efa7f59d7ef5beebb1d7e49`,
-`apps/identity-api/db/embed.go` embeds `migrations/*.sql`. The actual packaged
-inventory is the eleven files below, not historical one/two/four-file bundles.
+`apps/identity-api/db/embed.go` embeds the migration inventory below.
 Other install/restore guides crosslink here rather than defining another inventory.
 These are current schema capabilities, not migrations implementing SEC01-SEC16.
 
@@ -54,8 +52,9 @@ These are current schema capabilities, not migrations implementing SEC01-SEC16.
 | 9       | `00009_first_passkey_enrollment_action_proofs.sql`     |
 | 10      | `00010_mfa_enrollment_authorization.sql`               |
 | 11      | `00011_contact_management.sql`                         |
+| 12      | `00012_private_profile_revision.sql`                    |
 
-Current `migrate up` applies known packaged versions through 11 in
+Current `migrate up` applies known packaged versions through 12 in
 `public.identity_schema_version`. ALL legacy `public.goose_db_version` targets
 are refused regardless of their version or apparent equivalence; untracked nonempty
 application schemas and contradictory histories also fail closed. There is no
@@ -63,6 +62,11 @@ upgrade/adoption of the retired migration lineage or automatic data conversion. 
 `up-to` is for the new bundled lineage, not the old chain. Baseline Down/reset and
 rollback to zero refuse. Historical acceptance and prior plans remain unchanged;
 they are not evidence that this baseline passed.
+
+Version 12 requires an empty `private_profile` table. The migration stops and
+preserves existing ciphertext if it finds rows without an authenticated write
+revision. Drain old private-profile writers before applying version 12 and use
+the revision-aware API when reopening private-profile traffic.
 
 1. Record an explicitly scoped **fresh PostgreSQL 16** database and matching fresh
    Redis 7/NATS JetStream 2.10 resources or isolated namespaces, with exact ownership,
@@ -78,7 +82,7 @@ they are not evidence that this baseline passed.
    Wire formats and existing consumer-first v1/v2 compatibility rules are unchanged.
 3. Set the scoped migration `DATABASE_URL` and run `identity-api:migrate-status` then
    `identity-api:migrate-up` through workspace-local Nx. Status/version are read-only;
-   fresh `up` records versions 1 through 11; repeated `up` verifies a no-op. Do not stamp, rename
+   fresh `up` records versions 1 through 12. Repeated `up` verifies a no-op. Do not stamp, rename
    or clear metadata after refusal. Verify packaged embedded inventory and final
    schema before starting compatible binaries.
 4. Provision separate non-owner roles, exact grants/RLS, approved governance, both

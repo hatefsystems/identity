@@ -16,6 +16,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
+	"github.com/hatefsystems/identity/apps/identity-api/internal/pglock"
 )
 
 // Errors classify input, identity, stale pagination and dependency failures.
@@ -391,21 +392,26 @@ func (s *Service) list(ctx context.Context, in ListInput, endpoint string) (Page
 	return page, nil
 }
 
-// Validate verifies all IDs against one current snapshot, never client metadata.
-func (s *Service) Validate(ctx context.Context, in LocationInput) (ValidatedLocation, error) {
+func locationIDs(in LocationInput) (int64, int64, error) {
 	if in.Country != "IR" {
-		return ValidatedLocation{}, ErrInvalid
+		return 0, 0, ErrInvalid
 	}
 	province, err := decimal(in.ProvinceID)
 	if err != nil {
-		return ValidatedLocation{}, err
+		return 0, 0, err
 	}
 	var locality int64
 	if in.LocalityID != "" {
 		locality, err = decimal(in.LocalityID)
-		if err != nil {
-			return ValidatedLocation{}, err
-		}
+	}
+	return province, locality, err
+}
+
+// Validate verifies all IDs against one current snapshot, never client metadata.
+func (s *Service) Validate(ctx context.Context, in LocationInput) (ValidatedLocation, error) {
+	province, locality, err := locationIDs(in)
+	if err != nil {
+		return ValidatedLocation{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -414,8 +420,33 @@ func (s *Service) Validate(ctx context.Context, in LocationInput) (ValidatedLoca
 		return ValidatedLocation{}, err
 	}
 	defer rollback(tx)
+	return validateLocation(ctx, tx, revision, province, locality, in)
+}
+
+// ValidateForUpdate holds the active catalog stable until the caller's READ
+// COMMITTED write transaction ends. The nonblocking guard lets the caller use
+// its existing account locks without waiting for import or migration locks.
+func (*Service) ValidateForUpdate(ctx context.Context, tx pgx.Tx, in LocationInput) (ValidatedLocation, error) {
+	province, locality, err := locationIDs(in)
+	if err != nil {
+		return ValidatedLocation{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)`, pglock.GeographyImportKey).Scan(&locked); err != nil || !locked {
+		return ValidatedLocation{}, ErrUnavailable
+	}
+	revision, err := db.New(tx).GeographyActiveRevision(ctx)
+	if err != nil || revision == nil {
+		return ValidatedLocation{}, ErrUnavailable
+	}
+	return validateLocation(ctx, tx, *revision, province, locality, in)
+}
+
+func validateLocation(ctx context.Context, tx pgx.Tx, revision, province, locality int64, in LocationInput) (ValidatedLocation, error) {
 	var valid bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.geography_place_versions WHERE revision=$1 AND id=$2 AND type_id=2)
+	err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.geography_place_versions WHERE revision=$1 AND id=$2 AND type_id=2)
       AND ($3::bigint=0 OR EXISTS(SELECT 1 FROM public.geography_place_versions WHERE revision=$1 AND id=$3 AND type_id IN (5,7) AND province_id=$2))`, revision, province, locality).Scan(&valid)
 	if err != nil {
 		return ValidatedLocation{}, ErrUnavailable

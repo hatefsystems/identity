@@ -260,7 +260,7 @@ func TestPasswordChangeProofSchemaGrantsCleanupAndForwardOnlyIntegration(t *test
 	if _, err := provider.ApplyVersion(f.ctx, 8, false); err == nil {
 		t.Fatal("password-change proof migration allowed rollback")
 	}
-	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 11 {
+	if version, err := provider.GetDBVersion(f.ctx); err != nil || version != 12 {
 		t.Fatal("forward-only refusal changed password-change lineage")
 	}
 }

@@ -337,7 +337,7 @@ initialized/purged state is forward-only and must not
 be served by old signer/verifier binaries. Task 5.3 operational approval and
 Task 5.5 narrative-retention policy remain separate gates in the runbook.
 
-Install the complete currently packaged `00001` through `00011` inventory in
+Install the complete packaged migration inventory in
 [canonical operations](devops-operations.md#canonical-packaged-migration-inventory), tracked in
 `public.identity_schema_version`, with final head-terminal/coordination behavior
 and encrypted-only legal storage. Supported entrypoints refuse all legacy

@@ -12,12 +12,14 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/geography"
@@ -63,16 +65,7 @@ func privateDatabaseFixture(t *testing.T) privateDatabase {
 	f := newProfileDatabase(t)
 	geo := geography.New(f.pool)
 	cities := []byte(`[{"Id":7001,"Name":"Province","ParentId":null,"CenterType":2},{"Id":7002,"Name":"Locality","ParentId":7001,"CenterType":5}]`)
-	types := []byte(`[{"Id":2,"Name":"Province"},{"Id":5,"Name":"City"}]`)
-	cityHash, typeHash := sha256.Sum256(cities), sha256.Sum256(types)
-	manifest, err := json.Marshal(geography.Manifest{Country: "IR", SourceRelease: "private-test", CitiesSHA256: hex.EncodeToString(cityHash[:]), TypesSHA256: hex.EncodeToString(typeHash[:]), CitiesBytes: int64(len(cities)), TypesBytes: int64(len(types)), PlaceCount: 2, TypeCount: 2, ProvinceCount: 1, CompleteSnapshot: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := geography.Parse(cities, types, manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	snapshot := privateCatalog(t, cities, 2, nil)
 	plan, err := geo.Check(f.ctx, snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +83,21 @@ func privateDatabaseFixture(t *testing.T) privateDatabase {
 	return privateDatabase{profileDatabase: f, private: svc, geo: geo, manager: manager, u: u, sess: sess}
 }
 
+func privateCatalog(t *testing.T, cities []byte, placeCount int, base *string) *geography.Snapshot {
+	t.Helper()
+	types := []byte(`[{"Id":2,"Name":"Province"},{"Id":5,"Name":"City"}]`)
+	cityHash, typeHash := sha256.Sum256(cities), sha256.Sum256(types)
+	manifest, err := json.Marshal(geography.Manifest{Country: "IR", SourceRelease: "private-test", CitiesSHA256: hex.EncodeToString(cityHash[:]), TypesSHA256: hex.EncodeToString(typeHash[:]), CitiesBytes: int64(len(cities)), TypesBytes: int64(len(types)), PlaceCount: placeCount, TypeCount: 2, ProvinceCount: 1, CompleteSnapshot: true, ExpectedCurrentRevision: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := geography.Parse(cities, types, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
 func privateComplete(revision string) PrivateUpdate {
 	given, family, gender := privateGiven, privateFamily, "female"
 	return PrivateUpdate{ExpectedRevision: revision, GivenName: &given, FamilyName: &family, Gender: &gender, Birthday: &BirthdayInput{Calendar: "gregorian", Date: "2000-03-20"}, Location: &geography.LocationInput{Country: "IR", ProvinceID: "7001", LocalityID: "7002"}}
@@ -98,12 +106,13 @@ func privateComplete(revision string) PrivateUpdate {
 type privateStoredState struct {
 	blob             []byte
 	created, updated time.Time
+	revision         int64
 }
 
 func privateStored(t *testing.T, f privateDatabase) privateStoredState {
 	t.Helper()
 	var state privateStoredState
-	if err := f.pool.QueryRow(f.ctx, `SELECT details_encrypted,created_at,updated_at FROM private_profile WHERE account_id=$1`, f.u.ID).Scan(&state.blob, &state.created, &state.updated); err != nil {
+	if err := f.pool.QueryRow(f.ctx, `SELECT details_encrypted,created_at,updated_at,profile_revision FROM private_profile WHERE account_id=$1`, f.u.ID).Scan(&state.blob, &state.created, &state.updated, &state.revision); err != nil {
 		t.Fatal(err)
 	}
 	return state
@@ -161,7 +170,8 @@ func TestPrivateFirstPartialNoopConflictAndRollbackIntegration(t *testing.T) {
 				t.Fatal("equivalent normalized private profile changed")
 			}
 			after := privateStored(t, f)
-			if !bytes.Equal(before.blob, after.blob) || !before.created.Equal(after.created) || !before.updated.Equal(after.updated) || profileIntentCount(t, f.profileDatabase, f.u.ID) != 1 {
+			if !bytes.Equal(before.blob, after.blob) || !before.created.Equal(after.created) || !before.updated.Equal(after.updated) ||
+				after.revision != before.revision || after.revision != 9007199254740994 || profileIntentCount(t, f.profileDatabase, f.u.ID) != 1 {
 				t.Fatal("no-op rewrote encrypted bytes, time or intent")
 			}
 			noop.ExpectedRevision = initial.LifecycleRevision
@@ -185,7 +195,8 @@ func TestPrivateFirstPartialNoopConflictAndRollbackIntegration(t *testing.T) {
 				t.Fatal("existing child outbox failure accepted")
 			}
 			after = privateStored(t, f)
-			if !bytes.Equal(stable.blob, after.blob) || !stable.updated.Equal(after.updated) || loadProfileUser(t, f.profileDatabase, f.u.ID).LifecycleRevision != 9007199254740995 || profileIntentCount(t, f.profileDatabase, f.u.ID) != 2 {
+			if !bytes.Equal(stable.blob, after.blob) || !stable.updated.Equal(after.updated) || stable.revision != after.revision ||
+				loadProfileUser(t, f.profileDatabase, f.u.ID).LifecycleRevision != 9007199254740995 || profileIntentCount(t, f.profileDatabase, f.u.ID) != 2 {
 				t.Fatal("existing-child failure did not roll back entire edit")
 			}
 		})
@@ -248,26 +259,192 @@ func TestPrivateWholeBirthdayLocationValidationIntegration(t *testing.T) {
 	}
 }
 
+type failingPrivateCipher struct{ username.Cipher }
+
+func (failingPrivateCipher) Encrypt(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("fixture encryption failure")
+}
+
+func privateRuntime(t *testing.T, f privateDatabase) *pgxpool.Pool {
+	t.Helper()
+	name := "private_writer_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	role, password := pgx.Identifier{name}.Sanitize(), uuid.NewString()
+	profileExec(t, f.profileDatabase, "CREATE ROLE "+role+
+		" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD '"+password+"'")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if _, err := f.pool.Exec(ctx, "DROP OWNED BY "+role+"; DROP ROLE "+role); err != nil {
+			t.Error("private writer role cleanup failed")
+		}
+	})
+	for _, grant := range []string{
+		"GRANT USAGE ON SCHEMA public",
+		"GRANT SELECT ON users, username_active_policy, private_profile, geography_catalog_state, geography_place_versions",
+		"GRANT UPDATE (guard) ON username_active_policy",
+		"GRANT UPDATE (lifecycle_revision) ON users",
+		"GRANT INSERT (account_id, details_encrypted, profile_revision), UPDATE (details_encrypted, profile_revision, updated_at) ON private_profile",
+		"GRANT INSERT (id, subject, payload, created_at, next_attempt_at, lifecycle_user_id, lifecycle_revision) ON event_outbox",
+	} {
+		profileExec(t, f.profileDatabase, grant+" TO "+role)
+	}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.User, cfg.ConnConfig.Password = name, password
+	runtime, err := pgxpool.NewWithConfig(f.ctx, cfg)
+	if err != nil {
+		t.Fatal("private writer setup failed")
+	}
+	t.Cleanup(runtime.Close)
+	var current string
+	if err := runtime.QueryRow(f.ctx, "SELECT current_user").Scan(&current); err != nil || current != name {
+		t.Fatal("private writer did not use restricted login")
+	}
+	return runtime
+}
+
+func TestPrivateWriteRevisionWithRestrictedLoginIntegration(t *testing.T) {
+	f := privateDatabaseFixture(t)
+	runtime := privateRuntime(t, f)
+	cipher := privateCipher(t)
+	svc, err := NewPrivate(runtime, cipher, nil, geography.New(runtime), f.manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Update(f.ctx, f.sess, privateComplete("0")); err != nil {
+		t.Fatal("restricted first private write failed", err)
+	}
+	first := privateStored(t, f)
+	public, err := f.service.Update(f.ctx, f.u.ID, f.u.AuthVersion, "Independent public name", "1")
+	if err != nil || public.Profile.LifecycleRevision != "2" {
+		t.Fatal("independent public update failed", err)
+	}
+	if got, err := svc.Get(f.ctx, f.sess); err != nil || got.LifecycleRevision != "2" ||
+		got.PrivateData == nil || got.PrivateData.Gender != GenderFemale || privateStored(t, f).revision != 1 {
+		t.Fatal("public update invalidated private ciphertext", err)
+	}
+	gender := "male"
+	edit := PrivateUpdate{ExpectedRevision: "2", Gender: &gender}
+	svc.cipher = failingPrivateCipher{cipher}
+	if _, err := svc.Update(f.ctx, f.sess, edit); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("encryption failure did not stop write", err)
+	}
+	if stored := privateStored(t, f); stored.revision != 1 || !bytes.Equal(stored.blob, first.blob) ||
+		loadProfileUser(t, f.profileDatabase, f.u.ID).LifecycleRevision != 2 || profileIntentCount(t, f.profileDatabase, f.u.ID) != 2 {
+		t.Fatal("encryption failure changed protected state or intent")
+	}
+	svc.cipher = cipher
+	if _, err := svc.Update(f.ctx, f.sess, edit); err != nil {
+		t.Fatal("restricted private edit failed", err)
+	}
+	latest := privateStored(t, f)
+	if latest.revision != 3 || loadProfileUser(t, f.profileDatabase, f.u.ID).DisplayName != "Independent public name" {
+		t.Fatal("private write revision or independent public name changed unexpectedly")
+	}
+	profileExec(t, f.profileDatabase, `UPDATE private_profile SET details_encrypted=$2 WHERE account_id=$1`, f.u.ID, first.blob)
+	if got, err := svc.Get(f.ctx, f.sess); !errors.Is(err, ErrUnreadable) || got.PrivateData != nil {
+		t.Fatal("older same-account ciphertext was readable at the new revision", err)
+	}
+	for _, statement := range []string{
+		`UPDATE users SET display_name='forbidden'`,
+		`UPDATE geography_catalog_state SET active_revision=NULL`,
+		`DELETE FROM private_profile`,
+		`SELECT * FROM event_outbox`,
+	} {
+		if _, err := runtime.Exec(f.ctx, statement); err == nil {
+			t.Fatal("private writer had excess access", statement)
+		}
+	}
+}
+
+type pausedPrivateCipher struct {
+	username.Cipher
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p pausedPrivateCipher) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) {
+	close(p.entered)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-p.release:
+		return p.Cipher.Encrypt(ctx, plaintext)
+	}
+}
+
+func TestPrivateLocationAndCatalogCommitOrderingIntegration(t *testing.T) {
+	f := privateDatabaseFixture(t)
+	retiring := privateCatalog(t, []byte(`[{"Id":7001,"Name":"Province","ParentId":null,"CenterType":2}]`), 1, new("1"))
+	plan, err := f.geo.Check(f.ctx, retiring)
+	if err != nil || plan.Retirements != 1 {
+		t.Fatal("retirement plan missing", err)
+	}
+	cipher := pausedPrivateCipher{f.private.cipher, make(chan struct{}), make(chan struct{})}
+	f.private.cipher = cipher
+	unblock := sync.OnceFunc(func() { close(cipher.release) })
+	t.Cleanup(unblock)
+	result := make(chan error, 1)
+	go func() {
+		_, err := f.private.Update(f.ctx, f.sess, privateComplete("0"))
+		result <- err
+	}()
+	select {
+	case <-cipher.entered:
+	case err := <-result:
+		t.Fatal("private write missed encryption", err)
+	case <-f.ctx.Done():
+		t.Fatal(f.ctx.Err())
+	}
+	waiter, stop := context.WithTimeout(f.ctx, 250*time.Millisecond)
+	_, err = f.geo.Import(waiter, retiring, plan.PlanDigest, plan.RetirementDigest)
+	stop()
+	if !errors.Is(err, geography.ErrUnavailable) {
+		t.Fatal("catalog activation crossed validated private write", err)
+	}
+	unblock()
+	if err := <-result; err != nil {
+		t.Fatal("private edit failed before catalog activation", err)
+	}
+	f.private.cipher = cipher.Cipher
+	if _, err := f.geo.Import(f.ctx, retiring, plan.PlanDigest, plan.RetirementDigest); err != nil {
+		t.Fatal("catalog failed after private commit released its lock", err)
+	}
+	saved, err := f.private.Get(f.ctx, f.sess)
+	if err != nil || saved.PrivateData == nil || saved.PrivateData.Location.CatalogRevision != "1" {
+		t.Fatal("catalog activation changed the already-committed historical location", err)
+	}
+	other := profileUser(t, f.profileDatabase)
+	otherSession := privateIssue(t, f.manager, other)
+	if _, err := f.private.Update(f.ctx, otherSession, privateComplete("0")); !errors.Is(err, ErrInvalidPrivateData) {
+		t.Fatal("new selection accepted a retired locality", err)
+	}
+	got, err := f.private.Get(f.ctx, otherSession)
+	if err != nil || got.PrivateData != nil || got.LifecycleRevision != "0" || profileIntentCount(t, f.profileDatabase, other.ID) != 0 {
+		t.Fatal("refused private edit left data or intent")
+	}
+}
+
 func TestPrivateSubstitutionAndErasureIntegration(t *testing.T) {
 	f := privateDatabaseFixture(t)
 	var columns string
-	if err := f.pool.QueryRow(f.ctx, `SELECT string_agg(column_name,',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema='public' AND table_name='private_profile'`).Scan(&columns); err != nil || columns != "account_id,details_encrypted,created_at,updated_at" {
+	if err := f.pool.QueryRow(f.ctx, `SELECT string_agg(column_name,',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema='public' AND table_name='private_profile'`).Scan(&columns); err != nil || columns != "account_id,details_encrypted,created_at,updated_at,profile_revision" {
 		t.Fatal("private account child contains plaintext attribute columns")
 	}
 	if _, err := f.private.Update(f.ctx, f.sess, privateComplete("0")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO private_profile(account_id,details_encrypted) VALUES($1,$2)`, f.u.ID, bytes.Repeat([]byte{1}, 100)); err == nil {
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO private_profile(account_id,details_encrypted,profile_revision) VALUES($1,$2,1)`, f.u.ID, bytes.Repeat([]byte{1}, 100)); err == nil {
 		t.Fatal("account can own more than one private profile")
 	}
 	other := profileUser(t, f.profileDatabase)
 	otherSession := privateIssue(t, f.manager, other)
 	stored := privateStored(t, f)
-	profileExec(t, f.profileDatabase, `INSERT INTO private_profile(account_id,details_encrypted) VALUES($1,$2)`, other.ID, stored.blob)
+	profileExec(t, f.profileDatabase, `UPDATE users SET lifecycle_revision=$2 WHERE id=$1`, other.ID, stored.revision)
+	profileExec(t, f.profileDatabase, `INSERT INTO private_profile(account_id,details_encrypted,profile_revision) VALUES($1,$2,$3)`, other.ID, stored.blob, stored.revision)
 	if _, err := f.private.Get(f.ctx, otherSession); !errors.Is(err, ErrUnreadable) {
 		t.Fatal("cross-account encrypted profile substitution accepted")
 	}
-	raw, err := json.Marshal(privatePayload{f.u.ID.String(), "hatef.identity.username.assignment", privateDataFixture(t)})
+	raw, err := json.Marshal(privatePayload{f.u.ID.String(), "hatef.identity.username.assignment", "1", privateDataFixture(t)})
 	if err != nil {
 		t.Fatal(err)
 	}

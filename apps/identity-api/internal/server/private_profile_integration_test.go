@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/envelope"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/crypto/kms"
@@ -25,7 +26,7 @@ import (
 // this fixture isolates the HTTP/session/transaction composition at one revision.
 type privateHTTPCatalog struct{}
 
-func (privateHTTPCatalog) Validate(_ context.Context, in geography.LocationInput) (geography.ValidatedLocation, error) {
+func (privateHTTPCatalog) ValidateForUpdate(_ context.Context, _ pgx.Tx, in geography.LocationInput) (geography.ValidatedLocation, error) {
 	if in.Country != "IR" || in.ProvinceID != "7001" || in.LocalityID != "7002" {
 		return geography.ValidatedLocation{}, geography.ErrInvalid
 	}

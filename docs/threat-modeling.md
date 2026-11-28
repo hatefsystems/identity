@@ -315,7 +315,7 @@ sentinels, report/transparency replay and governance provenance, chain event UUI
 digests and erasure/receipt material. Minimization is not unconditional anonymity
 or blanket approval of permanent retention. See the [exact retained inventory](data-architecture.md#retained-metadata-inventory)
 and unchecked [production checklist](admin-operations.md#production-checklist).
-Fresh installation uses the complete packaged `00001` through `00011` inventory
+Fresh installation uses the complete packaged migration inventory
 in [operations](devops-operations.md#canonical-packaged-migration-inventory), tracked in
 `public.identity_schema_version`. All legacy `public.goose_db_version`, untracked
 nonempty application schemas and contradictory histories refuse without mutation,
