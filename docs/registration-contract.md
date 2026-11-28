@@ -22,7 +22,7 @@ for scope and the CP01 disposition.
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Current conditional flow                 | Required email+Iranian mobile+username, email-link then mobile-SMS ownership, then resident UV passkey. Atomic completion returns `next: "login"`, not a normal session. Registration/SMS default disabled.                                                                                                           |
 | Current username support                 | Advisory validation, admitted-policy frozen username, atomic reservation and normal-authenticated saved read/truthful NULL. No claim/rename or second route; no selected-contact/password/private/legal registration collection yet.                                                                                  |
-| Current geography/private data (T08-T10) | Immutable imported geography catalog, bounded public reads/shared validator and bilingual selector; normal-authenticated private-data snapshots/edits encrypt validated attributes. Registration collection/integration remains planned T31-T37; private editor UI is separate T38.                                   |
+| Current geography/private data (T08–T11) | Immutable imported geography catalog, bounded public reads, shared validator and bilingual selector. Authenticated private snapshots and edits use encrypted attributes and exact revisions. Registration collection is planned in T31–T37 and the private editor in T38D.                                            |
 | Existing-account MFA maintenance (T26)   | Extend existing TOTP routes with a default-off, password/contact `mfa_enrollment` start proof and fresh strong-factor disable. No registration fields/stages, login policy, optional-MFA flag, management UI or other task status changes.                                                                            |
 | Existing-account primary contacts (T27)  | Unified normal-session email/phone maintenance, frozen strong or action/target-specific password-contact authorization and separate new-destination ownership. Present-email removal is temporarily refused pending independently verified T28/T41. No signup, backup-contact, notification or T38 UI changes.        |
 | Deferred final target                    | Required private names, date-only birthday, explicit gender, username, one selected verified contact, selected primary credentials, location and separate legal acceptances; six stages and future fresh-commit session issuance described below. These are specifications, not implemented-task or test-pass claims. |
@@ -225,6 +225,21 @@ verified fingerprint, key provenance and actual inventory evidence under
 [T04B](../.github/tasks/registration-single-contract-tasks.md#t04b).
 [Operations](devops-operations.md#username-policy-and-preflight-gates) owns the
 read-only preflight, separate authorizations, writer fence and rollback gates.
+
+## Existing Private Account Data (T10/T11)
+
+The authenticated self-service GET/PATCH route is the current reader of the
+protected private-data projection. It returns the private attributes and
+read-only saved username with the exact account revision from one locked
+snapshot. Routine account bootstrap and the current `GetInternalUserInfo`
+projection omit these private attributes. Lifecycle readers receive only the
+coarse `private_profile` marker for a real edit.
+
+T40A owns any consumer-facing private projection. It requires independent
+method and per-field grants, authoritative subject privacy checks, and the
+allowed fields and exact revision from the same snapshot. T38D owns browser
+conflict and uncertain-outcome handling. See the [HTTP contract](api-design.md#14-user-profile--privacy-gdpr)
+and the [T40A backlog record](../.github/tasks/registration-single-contract-tasks.md#t40a).
 
 ## Deferred Final Fields
 

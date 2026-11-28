@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hatefsystems/identity/apps/identity-api/internal/db"
 	"github.com/hatefsystems/identity/apps/identity-api/internal/geography"
@@ -23,6 +24,10 @@ import (
 // ErrUnreadable is distinct from a missing, uninitialized profile. Its static
 // text is safe; authentication failures never expose ciphertext or private data.
 var ErrUnreadable = errors.New("profile: protected private data unreadable")
+
+// ErrOutcomeUnknown means an edit reached COMMIT without a definitive result.
+// The caller must read a fresh snapshot before attempting another edit.
+var ErrOutcomeUnknown = errors.New("profile: private edit outcome unknown")
 
 const privatePurpose = "hatef.identity.private-profile"
 
@@ -368,8 +373,14 @@ func (s *PrivateService) Update(ctx context.Context, sess session.Session, in Pr
 	if err != nil || next != revision+1 {
 		return PrivateUpdateResult{}, ErrUnavailable
 	}
-	if tx.Commit(ctx) != nil {
-		return PrivateUpdateResult{}, ErrUnavailable
+	if err := tx.Commit(ctx); err != nil {
+		// An explicit rollback or SQL statement error establishes rejection.
+		// A closed connection can have lost the acknowledgement of a commit.
+		var pgErr *pgconn.PgError
+		if errors.Is(err, pgx.ErrTxCommitRollback) || (errors.As(err, &pgErr) && pgErr.Severity == "ERROR") {
+			return PrivateUpdateResult{}, ErrUnavailable
+		}
+		return PrivateUpdateResult{}, ErrOutcomeUnknown
 	}
 	current.PrivateData, current.LifecycleRevision = &data, strconv.FormatInt(next, 10)
 	return PrivateUpdateResult{Snapshot: current, Changed: true}, nil

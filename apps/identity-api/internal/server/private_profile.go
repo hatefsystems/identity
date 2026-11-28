@@ -85,6 +85,10 @@ func decodePrivateProfileUpdate(w http.ResponseWriter, r *http.Request) (profile
 }
 
 func writePrivateProfileError(w http.ResponseWriter, err error) {
+	if errors.Is(err, profile.ErrOutcomeUnknown) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "outcome_unknown"})
+		return
+	}
 	if errors.Is(err, profile.ErrInvalidPrivateData) || errors.Is(err, profile.ErrInvalidPersonalName) || errors.Is(err, profile.ErrInvalidBirthday) || errors.Is(err, profile.ErrInvalidGender) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
 		return

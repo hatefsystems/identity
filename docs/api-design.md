@@ -393,6 +393,21 @@ The committed handler marks self-invalidating success before response release; s
 - `PUT /api/v1/users/me/password`: Current strict `{operation:"add"|"change",new_password}` under normal bound-session admission. Exactly one fresh strong `X-Step-Up-Auth`, or fixed password-change `X-Action-Proof` for `change` only. `DELETE` on the same path removes with strong authority and empty body. Resulting-state primary/privileged checks and known-commit handling remain; the settings UI and planned durable repair barrier are separate. Source: `apps/identity-api/internal/server/passwords.go:20-70,84-118`. This is normal maintenance, not anonymous lost-password recovery.
 - `POST /api/v1/users/me/export-data`: Planned, unmounted interface; no completed data-export capability is implied.
 
+For private-data edits, copy the exact `lifecycle_revision` string from the
+snapshot into `expected_revision`. It is the shared account revision, so a
+public profile edit can make a private edit stale. The private ciphertext binds
+to its own last write revision. Two real edits at the same revision have one
+winner. Both the new birthday pair and the revision in a successful response
+come from the same locked account transaction.
+
+A PATCH whose commit cannot be confirmed returns
+`503 {"error":"outcome_unknown"}` with no snapshot. A lost response also leaves
+the outcome uncertain. Fetch private data again with live session authority and
+review the current values and revision before submitting a new edit. Automatic
+PATCH replay is unsafe. SQL rejection or failure to enqueue the lifecycle intent
+rolls back the edit. The existing coarse `profile.updated` audit observation is
+best-effort and emitted after an acknowledged real edit.
+
 Display and credential names reject invalid UTF-8, Unicode control characters and line/paragraph separators, then trim outer Unicode whitespace and limit the result to 80 code points. Empty clears the optional name; names are not unique. The profile service locks the account and rechecks active status/captured auth-version before comparing the expected lifecycle revision. A stale revision returns `409 profile_conflict`. A no-op at the current revision changes no timestamps/revision and emits no event. A real display-name edit commits the name, one lifecycle revision increment and metadata-only v2 outbox intent in one transaction; enqueue failure rolls it all back. It does not change auth-version or revoke sessions. Name values are excluded from audit/event payloads; ordinary sanitized audit recording remains best-effort, not a durable commit guarantee.
 
 Task 7.4 adds `/dashboard/privacy` and an independent `/recover-account` page.

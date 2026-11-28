@@ -62,7 +62,7 @@ recorded documentation evidence.
 | T08        | T08                               | No explicit status recorded                         | Implemented and verified locally. Release pending     |
 | T09        | T09                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
 | T10        | T10                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
-| T11        | T11                               | No explicit status recorded                         | Planned unchanged editing contract                    |
+| T11        | T11                               | No explicit status recorded                         | Implemented. Release acceptance pending               |
 | T12        | Excluded; no executable record    | Excluded by original purpose and AGENTS.md          | Out of scope, no claim lane                           |
 | T13        | T13                               | No explicit status recorded                         | Planned truthful optional email                       |
 | T14        | T14                               | No explicit status recorded                         | Planned exact verified-contact evidence               |
@@ -830,7 +830,7 @@ T10-C01 release acceptance awaits T02 and T09 acceptance and hosted evidence.
 
 | Section                         | Requirement                                                                                                                                      |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| ID/title                        | T11 - Read and Edit Private Attributes. Status: Planned; unchanged product definition.                                                           |
+| ID/title                        | T11 - Read and Edit Private Attributes. Status: Implemented 2026-11-28. Release acceptance pending.                                              |
 | Objective                       | Preserve exact revision optimistic concurrency and atomic metadata intent.                                                                       |
 | Scope                           | Existing authenticated GET/PATCH, exact decimal revisions, independent private/public data, real edits versus no-ops and atomic birthday update. |
 | Explicit out of scope           | Product validator changes, JS-number revisions, profile-based authentication, username rename/claim or new event format.                         |
@@ -845,6 +845,26 @@ T10-C01 release acceptance awaits T02 and T09 acceptance and hosted evidence.
 | Browser/accessibility tests     | T11-B01: N/A for API service; T38D tests conflicts preserving ordinary unsaved drafts and clearing private data on session changes.              |
 | Documentation updates           | T11-D01: preserve exact revision/no-op contract and actual readers; map T40A snapshot obligations.                                               |
 | Completion criteria             | T11-C01: GATE01 and exact snapshot/no-op/concurrency evidence, without upgrading historical acceptance.                                          |
+
+**Implementation, 2026-11-28 (Asia/Tehran).** The authenticated GET/PATCH routes
+reuse T10 from `3c2e0bf`, including its encrypted private write revision and
+transactional lifecycle intent. Acknowledged SQL or outbox failure rolls back
+the edit. A lost commit acknowledgement returns `503 outcome_unknown` and
+the caller reconciles with a fresh authenticated GET. The separate coarse audit
+observation is best-effort and runs only after an acknowledged real edit.
+
+**Local evidence.** The focused PostgreSQL-backed Go 1.26 race run passed 46
+tests and subtests in `internal/profile` and `internal/server` with zero skips
+and completed teardown. It exercised exact revisions above JavaScript's safe
+integer range, normalized no-ops, atomic birthday pairs, concurrent edits,
+rollback on SQL/outbox rejection, and lost acknowledgement with both committed
+and rolled-back data. The [HTTP contract](../../docs/api-design.md#14-user-profile--privacy-gdpr)
+describes reconciliation. The [registration contract](../../docs/registration-contract.md#existing-private-account-data-t10t11)
+maps current readers and the T40A grant and snapshot requirements.
+
+The broader portal suite reached its 30-minute deadline after 20 of 22
+packages completed. Teardown completed. T11-C01 release acceptance awaits
+T10-C01 and hosted evidence.
 
 ### T13
 

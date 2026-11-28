@@ -199,6 +199,18 @@ func TestPrivateFirstPartialNoopConflictAndRollbackIntegration(t *testing.T) {
 				loadProfileUser(t, f.profileDatabase, f.u.ID).LifecycleRevision != 9007199254740995 || profileIntentCount(t, f.profileDatabase, f.u.ID) != 2 {
 				t.Fatal("existing-child failure did not roll back entire edit")
 			}
+
+			profileExec(t, f.profileDatabase, `ALTER TABLE event_outbox DROP CONSTRAINT reject_private`)
+			profileExec(t, f.profileDatabase, `ALTER TABLE private_profile ADD CONSTRAINT reject_next_write CHECK(profile_revision < 9007199254740996)`)
+			if failed, err := f.private.Update(f.ctx, f.sess, PrivateUpdate{ExpectedRevision: partial.Snapshot.LifecycleRevision, Gender: &gender}); !errors.Is(err, ErrUnavailable) || failed != (PrivateUpdateResult{}) {
+				t.Fatal("rejected SQL write returned a private edit")
+			}
+			after = privateStored(t, f)
+			if !bytes.Equal(stable.blob, after.blob) || !stable.created.Equal(after.created) || !stable.updated.Equal(after.updated) ||
+				stable.revision != after.revision || loadProfileUser(t, f.profileDatabase, f.u.ID).LifecycleRevision != 9007199254740995 ||
+				profileIntentCount(t, f.profileDatabase, f.u.ID) != 2 {
+				t.Fatal("rejected SQL write changed protected data, revision or intent")
+			}
 		})
 	}
 }
