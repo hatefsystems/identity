@@ -382,9 +382,10 @@ release only once the complete package and its evidence have been validated.
 
 ### Complete-Snapshot Procedure
 
-1. Separately apply the guarded version-4 migration using the migrator identity.
+1. Apply the [canonical packaged migration inventory](#canonical-packaged-migration-inventory)
+   using the separate migrator identity.
    `geography check` and `geography import` never migrate or perform runtime DDL.
-   Fresh migration and version-3 upgrades preserve existing accounts/credentials.
+   Existing accounts and credentials are preserved when upgrading.
 2. Verify the approved T07 release and its exact places and types files. Prepare
    a separate T08 import manifest as an explicit operator assertion for the
    intended snapshot and database base revision. Its exact fields are `country:"IR"`, `source_release`,
@@ -409,8 +410,13 @@ release only once the complete package and its evidence have been validated.
    identity metadata and pointer atomically. A changed input, stale base or wrong
    acknowledgement fails closed and rolls back. Review/check again instead of
    overriding a stale digest. Identical active files are a true no-op, including
-   concurrent identical imports. Reusing an older non-current snapshot requires a
-   new check; it creates a new revision, not a rewrite of history.
+   concurrent identical imports against the same checked base. Reusing an older
+   snapshot requires a new check and creates a new revision.
+6. If the command reports an unknown commit outcome, rerun the import with the
+   same manifest and acknowledgement digests. If the original commit landed and
+   is still active, the retry returns its revision as a no-op. If the base is
+   still active, the original plan can apply. If the catalog advanced to a
+   different revision, check the current state and review a fresh plan.
 
 ```bash
 npm exec -- nx run identity-api:geography-check -- \
@@ -472,8 +478,9 @@ Uninitialized catalog/database/limiter failures return503, never empty success.
 `catalog_changed` requires explicit browser restart/retry, not cursor rebinding.
 
 Roll back compatible application binaries without deleting immutable catalog
-history or changing stored IDs/revisions. Version4 is forward-only; recovery uses
-an approved consistent backup or a newly reviewed complete import. A lookup
+history or changing stored IDs/revisions. The geography migration in the
+[canonical inventory](#canonical-packaged-migration-inventory) is forward-only.
+Recovery uses an approved consistent backup or a newly reviewed complete import. A lookup
 without revision cannot reconstruct an old reference's original meaning. Future
 T10 must revalidate and encrypt `catalog_revision` with IDs, bound to account/purpose.
 

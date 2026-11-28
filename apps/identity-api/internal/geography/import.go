@@ -242,14 +242,23 @@ func (s *Service) Import(ctx context.Context, snapshot *Snapshot, applyPlan, ret
 	}
 	base := baseOf(snapshot)
 	identical := false
+	activeRevision := int64(0)
+	retry := false
 	if active != nil {
-		catalog, err := q.GeographyCatalog(ctx, *active)
+		activeRevision = *active
+		catalog, err := q.GeographyCatalog(ctx, activeRevision)
 		if err != nil {
 			return Plan{}, ErrUnavailable
 		}
 		identical = catalogMatches(catalog, snapshot)
+		// Revisions are allocated consecutively under the import lock. Only
+		// the immediately preceding base can explain the current revision.
+		retry = identical && base == activeRevision-1 &&
+			catalog.SourceRelease == snapshot.manifest.SourceRelease &&
+			catalog.ImporterVersion == ImporterVersion &&
+			catalog.NormalizationVersion == NormalizationVersion
 	}
-	if !identical && (active == nil && base != 0 || active != nil && *active != base) {
+	if base != activeRevision && !retry {
 		return Plan{}, ErrCatalogChanged
 	}
 	// On an identical concurrent import, reconstruct the checked historical base
@@ -263,7 +272,7 @@ func (s *Service) Import(ctx context.Context, snapshot *Snapshot, applyPlan, ret
 	}
 	if identical {
 		plan.NoOp = true
-		plan.CatalogRevision = number(*active)
+		plan.CatalogRevision = number(activeRevision)
 		return plan, nil
 	}
 	revision, err := q.GeographyNextRevision(ctx)
@@ -307,8 +316,11 @@ func (s *Service) Import(ctx context.Context, snapshot *Snapshot, applyPlan, ret
 	if q.GeographyActivate(ctx, &revision) != nil {
 		return Plan{}, ErrUnavailable
 	}
-	if tx.Commit(ctx) != nil {
-		return Plan{}, ErrUnavailable
+	if err := tx.Commit(ctx); err != nil {
+		if errors.Is(err, pgx.ErrTxCommitRollback) {
+			return Plan{}, ErrUnavailable
+		}
+		return Plan{}, ErrCommitUnknown
 	}
 	plan.CatalogRevision = number(revision)
 	return plan, nil

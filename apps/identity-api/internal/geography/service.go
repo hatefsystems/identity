@@ -24,6 +24,7 @@ var (
 	ErrNotFound       = errors.New("geography: not found")
 	ErrCatalogChanged = errors.New("geography: catalog changed")
 	ErrUnavailable    = errors.New("geography: unavailable")
+	ErrCommitUnknown  = errors.New("geography: import commit outcome unknown")
 )
 
 // DB is implemented by pgxpool.Pool. Reads use one read-only snapshot.

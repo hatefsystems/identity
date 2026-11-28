@@ -234,6 +234,9 @@ func TestGeographySnapshotsNoOpConcurrencyAndHistory(t *testing.T) {
 	if third.CatalogRevision != "3" {
 		t.Fatal(third)
 	}
+	if _, err := f.svc.Import(f.ctx, initial, plan.PlanDigest, ""); !errors.Is(err, ErrCatalogChanged) {
+		t.Fatal("old approval accepted after reactivation", err)
+	}
 	identity, err := db.New(f.pool).GeographyIdentity(f.ctx, 13)
 	if err != nil || identity.FirstSeenRevision != 1 || identity.LastSeenRevision != 3 {
 		t.Fatal("stable identity lost", identity, err)
@@ -244,6 +247,91 @@ func TestGeographySnapshotsNoOpConcurrencyAndHistory(t *testing.T) {
 	}
 	if geoCount(t, f, `SELECT count(*) FROM geography_places`) != 7 || geoCount(t, f, `SELECT count(*) FROM geography_place_versions`) != 20 {
 		t.Fatal("not full immutable snapshots")
+	}
+}
+
+type geographyLostCommitResponse struct{ DB }
+
+func (d geographyLostCommitResponse) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := d.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return geographyLostCommitTx{tx}, nil
+}
+
+type geographyLostCommitTx struct{ pgx.Tx }
+
+func (tx geographyLostCommitTx) Commit(ctx context.Context) error {
+	if err := tx.Tx.Commit(ctx); err != nil {
+		return err
+	}
+	return errors.New("injected loss of commit response")
+}
+
+func TestGeographyCommitRetryAndCompetingPlans(t *testing.T) {
+	f := geographyFixture(t, false)
+	initial := fixtureSnapshot(t, syntheticCities, nil)
+	plan, err := f.svc.Check(f.ctx, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternateRelease := fixtureSnapshot(t, syntheticCities, nil)
+	alternateRelease.manifest.SourceRelease = "alternate-release"
+	alternatePlan, err := f.svc.Check(f.ctx, alternateRelease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted := New(geographyLostCommitResponse{f.pool})
+	if _, err := interrupted.Import(f.ctx, initial, plan.PlanDigest, ""); !errors.Is(err, ErrCommitUnknown) {
+		t.Fatal("missing uncertain commit result", err)
+	}
+	retry, err := f.svc.Import(f.ctx, initial, plan.PlanDigest, "")
+	if err != nil || !retry.NoOp || retry.CatalogRevision != "1" {
+		t.Fatal("committed import was not reconciled", retry, err)
+	}
+	if _, err := f.svc.Import(f.ctx, alternateRelease, alternatePlan.PlanDigest, ""); !errors.Is(err, ErrCatalogChanged) {
+		t.Fatal("different release was accepted as the committed import", err)
+	}
+	one := "1"
+	type candidate struct {
+		snapshot *Snapshot
+		plan     Plan
+	}
+	var candidates []candidate
+	for _, label := range []string{"Competing A", "Competing B"} {
+		snapshot := fixtureSnapshot(t, strings.Replace(syntheticCities, "Village", label, 1), &one)
+		checked, err := f.svc.Check(f.ctx, snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidates = append(candidates, candidate{snapshot, checked})
+	}
+	winners := make(chan Plan, len(candidates))
+	failures := make(chan error, len(candidates))
+	var wg sync.WaitGroup
+	for _, c := range candidates {
+		wg.Go(func() {
+			p, err := f.svc.Import(f.ctx, c.snapshot, c.plan.PlanDigest, c.plan.RetirementDigest)
+			if err != nil {
+				failures <- err
+				return
+			}
+			winners <- p
+		})
+	}
+	wg.Wait()
+	if len(winners) != 1 || len(failures) != 1 {
+		t.Fatalf("competing plans yielded %d commits and %d errors", len(winners), len(failures))
+	}
+	winner, refused := <-winners, <-failures
+	if winner.NoOp || winner.CatalogRevision != "2" || !errors.Is(refused, ErrCatalogChanged) {
+		t.Fatal("competing plan did not fail closed", winner, refused)
+	}
+	if geoCount(t, f, `SELECT count(*) FROM geography_catalogs`) != 2 ||
+		geoCount(t, f, `SELECT count(*) FROM geography_place_versions`) != 14 ||
+		geoCount(t, f, `SELECT active_revision FROM geography_catalog_state`) != 2 {
+		t.Fatal("competing imports did not leave two complete revisions")
 	}
 }
 
